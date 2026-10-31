@@ -37,18 +37,18 @@ const METHODS: &[&str] = &[
     "worktree.remove",
     "worktree.removeFromBibCode",
 ];
-const PROJECT: &str = "pw";
+pub(super) const PROJECT: &str = "pw";
 
-struct Fixture {
-    harness: Harness,
-    services: WorktreeCatalogRpcServices,
+pub(super) struct Fixture {
+    pub(super) harness: Harness,
+    pub(super) services: WorktreeCatalogRpcServices,
     catalog: WorktreeCatalogService,
     git: IsolatedGitConfig,
     root: TempDir,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         Self::quiesced_by(None).await
     }
 
@@ -156,7 +156,7 @@ impl Fixture {
         .clone()
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         self.services.operation_runtime().shutdown().await;
         self.catalog.shutdown().await;
         self.harness.shutdown().await;

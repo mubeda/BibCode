@@ -14,8 +14,9 @@ use super::{
     model::{
         ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, BrowserSessionRequest, BrowserSessionResult,
         CancelPairingOfferRequest, ClientMetadata, CreatePairingOfferRequest, CreatePairingRequest,
-        PairingOfferResult, RevokeClientRequest, RevokePairingRequest, SCOPE_ACCESS_READ,
-        SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest, WebSocketTicketResult,
+        McpAccessRequest, PairingOfferResult, RevokeClientRequest, RevokePairingRequest,
+        SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest,
+        WebSocketTicketResult,
     },
     pairing_code::{
         REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload, RemotePairingReach,
@@ -23,8 +24,8 @@ use super::{
     },
     pairing_offer::validate_pairing_offer_input,
     service::{
-        AuthError, AuthService, PairingOfferIssuance, PairingOfferReplay, PairingOfferReservation,
-        default_standard_scopes, format_iso, now_ms, parse_scopes,
+        AuthError, AuthService, McpAccessChange, PairingOfferIssuance, PairingOfferReplay,
+        PairingOfferReservation, default_standard_scopes, format_iso, now_ms, parse_scopes,
     },
 };
 use crate::http::AppState;
@@ -47,6 +48,7 @@ pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
         .route("/api/auth/clients", get(clients))
         .route("/api/auth/clients/revoke", post(revoke_client))
+        .route("/api/auth/clients/mcp-access", post(set_mcp_access))
         .route(
             "/api/auth/clients/revoke-others",
             post(revoke_other_clients),
@@ -573,15 +575,76 @@ async fn revoke_client(
     Json(payload): Json<RevokeClientRequest>,
 ) -> Response {
     match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE).await {
-        Ok(principal) => match state
-            .auth
-            .revoke_client(&principal.session_id, &payload.session_id)
-            .await
-        {
-            Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
-            Err(error) => auth_error_for_request(error, &headers, "client_session_revoke_failed"),
-        },
+        Ok(principal) => {
+            let revoked = if payload.interrupt_turns {
+                state
+                    .auth
+                    .stop_client(&principal.session_id, &payload.session_id)
+                    .await
+            } else {
+                state
+                    .auth
+                    .revoke_client(&principal.session_id, &payload.session_id)
+                    .await
+            };
+            match revoked {
+                Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
+                Err(error) => {
+                    auth_error_for_request(error, &headers, "client_session_revoke_failed")
+                }
+            }
+        }
         Err(error) => auth_error_for_request(error, &headers, "client_session_revoke_failed"),
+    }
+}
+
+/// **Take over** and **Hand back** for an outside agent (#139, slice X1).
+async fn set_mcp_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(payload): Json<McpAccessRequest>,
+) -> Response {
+    let principal =
+        match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE).await {
+            Ok(principal) => principal,
+            Err(error) => {
+                return auth_error_for_request(error, &headers, "client_mcp_access_failed");
+            }
+        };
+    // Every refusal is one typed 400; the log line says which.
+    let refused = |why: &str| {
+        tracing::warn!(why, "an MCP access change was refused");
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "EnvironmentRequestInvalidError",
+            json!({
+                "code": "invalid_request",
+                "reason": "invalid_mcp_access",
+                "traceId": Uuid::new_v4().to_string(),
+            }),
+        )
+    };
+    if principal.session_id == payload.session_id {
+        return refused("not-an-agent");
+    }
+    match state
+        .auth
+        .set_mcp_access(&payload.session_id, &payload.access)
+        .await
+    {
+        Ok(McpAccessChange::Changed) => {
+            Json(json!({ "sessionId": payload.session_id, "access": payload.access }))
+                .into_response()
+        }
+        Ok(McpAccessChange::NotFound) => refused("not-found"),
+        Ok(McpAccessChange::NotAnAgent) => refused("not-an-agent"),
+        Ok(McpAccessChange::InvalidAccess) => refused("invalid-level"),
+        Ok(McpAccessChange::NotTheHandBack) => refused("not-the-hand-back-level"),
+        Err(error) => {
+            tracing::warn!(?error, "an MCP access change failed");
+            auth_error_for_request(error, &headers, "client_mcp_access_failed")
+        }
     }
 }
 

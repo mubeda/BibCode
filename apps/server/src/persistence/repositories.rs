@@ -2069,6 +2069,31 @@ impl Repositories {
             })
             .await
     }
+    /// Sets a live session's MCP access and the level Hand back restores (#139, slice X1);
+    /// `false` when the session is gone.
+    pub async fn set_auth_session_mcp_access(
+        &self,
+        session_id: String,
+        access: String,
+        hand_back: Option<String>,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let updated = transaction.execute(
+                    "UPDATE auth_sessions SET mcp_access = ?, mcp_access_hand_back = ? \
+                     WHERE session_id = ? AND revoked_at IS NULL",
+                    params![access, hand_back, session_id],
+                )? == 1;
+                if updated {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(updated)
+            })
+            .await
+    }
     pub async fn list_active_auth_sessions(&self, now: Timestamp) -> Result<Vec<AuthSession>> {
         self.database.call(move |connection| collect(connection, &(AUTH_SESSION_SELECT.to_owned() + " WHERE revoked_at IS NULL AND expires_at > ? ORDER BY issued_at DESC, session_id DESC"), [now], decode_auth_session)).await
     }
@@ -2409,6 +2434,10 @@ pub struct ProjectionThread {
     /// panel ages a Working status from it (#187).
     #[serde(default)]
     pub last_activity_at: Option<Timestamp>,
+    /// `{ actor, purpose }` of a thread an outside agent created (#139, slice X1); `None` for
+    /// a person's thread.
+    #[serde(default)]
+    pub requester: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2436,6 +2465,12 @@ pub struct ProjectionThreadMessage {
     /// The failed message this server-admitted copy sends again.
     #[serde(default)]
     pub resend_of_message_id: Option<String>,
+    /// The outside agent that sent this user message (#139, slice X1).
+    #[serde(default)]
+    pub actor: Option<Value>,
+    /// The thread this message came from (a chat panel's provenance, slice X4).
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -2702,13 +2737,16 @@ pub struct AuthSession {
     pub off_host: Option<bool>,
     /// The MCP access ceiling of an `mcp-client` credential; `None` for every other kind.
     pub mcp_access: Option<String>,
+    /// The access a person's Take over replaced, which Hand back restores (#139, slice X1).
+    #[serde(default)]
+    pub mcp_access_hand_back: Option<String>,
     pub delivery_state: AuthSessionDeliveryState,
 }
 
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
-const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at FROM projection_threads";
+const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at, requester_json FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id, actor_json, source_thread_id FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
 const ACTIVITY_SELECT: &str = "SELECT activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at FROM projection_thread_activities";
 /// Activities without a provider sequence come first: SQLite sorts NULL before any value in
@@ -2726,7 +2764,7 @@ const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, la
 const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
 const PAIRING_OFFER_BY_KEY_SQL: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? AND principal_id = ? AND idempotency_key = ?";
 const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access FROM auth_sessions";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_access_hand_back FROM auth_sessions";
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -2833,6 +2871,9 @@ fn decode_optional_json(value: Option<String>, column: &str) -> rusqlite::Result
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
+    if event.metadata.get("actor").is_some() {
+        return "mcp-client";
+    }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",
         Some(command_id) if command_id.starts_with("server:") => "server",
@@ -2949,6 +2990,7 @@ fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
         host_thread_id: row.get(20)?,
         compaction: decode_optional_json(row.get(21)?, "compaction_json")?,
         last_activity_at: row.get(22)?,
+        requester: decode_optional_json(row.get(23)?, "requester_json")?,
     })
 }
 fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
@@ -2968,6 +3010,8 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         delivery_mode: row.get(12)?,
         delivery_held: row.get(13)?,
         resend_of_message_id: row.get(16)?,
+        actor: decode_optional_json(row.get(17)?, "actor_json")?,
+        source_thread_id: row.get(18)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })
@@ -3347,6 +3391,7 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         reach: row.get(14)?,
         off_host: row.get(15)?,
         mcp_access: row.get(17)?,
+        mcp_access_hand_back: row.get(18)?,
         delivery_state: row.get(16)?,
     })
 }

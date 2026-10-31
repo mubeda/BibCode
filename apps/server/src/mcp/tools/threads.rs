@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     mcp::{
+        activity::PURPOSE,
         control::{
             CLIENT_REQUEST_ID, Family, McpAccess, McpCapability, ProgressSink, ToolCall,
             ToolFuture, ToolResult, ToolSpec, invalid_argument, now_iso, object_schema,
@@ -133,6 +134,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
 fn tool_text(name: &str) -> (&'static str, Value) {
     let thread = json!({ "type": "string", "description": "A thread id, as list_projects_and_threads returns it." });
     let request_id = json!({ "type": "string", "description": CLIENT_REQUEST_ID });
+    let purpose = json!({ "type": "string", "maxLength": 200, "description": PURPOSE });
     let mode = json!({
         "type": "string",
         "enum": ["approval-required", "auto-accept-edits", "full-access"],
@@ -185,6 +187,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
                     "runtimeMode": mode,
                     "interactionMode": { "type": "string", "enum": ["default", "plan"] },
                     "attachments": attachments,
+                    "purpose": purpose,
                     "clientRequestId": request_id,
                 }),
                 &["projectId", "prompt"],
@@ -537,11 +540,13 @@ impl ToolCall<'_> {
             "runtimeMode",
             "interactionMode",
             "attachments",
+            "purpose",
             "clientRequestId",
         ])?;
         let attachments = self.attachments()?;
         let project_id = self.required("projectId")?;
         let prompt = self.required("prompt")?;
+        let purpose = self.purpose()?;
         if prompt.chars().count() > 120_000 {
             return Err(invalid_argument("prompt is longer than 120000 characters"));
         }
@@ -630,6 +635,7 @@ impl ToolCall<'_> {
                         "branch": null,
                         "worktreePath": null,
                         "createdAt": created_at,
+                        "purpose": purpose,
                     },
                 },
                 "createdAt": created_at,
@@ -801,6 +807,8 @@ impl ToolCall<'_> {
             "title": thread.title,
             "status": status,
             "runtimeMode": thread.runtime_mode,
+            // The agent that created it and why (slice X1); null for a person's thread.
+            "requester": thread.requester,
             "hasPendingApprovals": thread.pending_approval_count > 0,
             "hasPendingUserInput": thread.pending_user_input_count > 0,
             "session": page.session,
@@ -1622,7 +1630,7 @@ pub(crate) async fn read_message_page(
                 .unwrap_or(Value::Null);
             let (at, id) = before.unwrap_or_else(|| ("\u{10ffff}".to_owned(), String::new()));
             let mut statement = connection.prepare_cached(
-                "SELECT message_id, role, turn_id, substr(text, 1, ?), length(text), is_streaming, created_at FROM projection_thread_messages
+                "SELECT message_id, role, turn_id, substr(text, 1, ?), length(text), is_streaming, created_at, actor_json FROM projection_thread_messages
                  WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND message_id < ?))
                    AND COALESCE(delivery_state, '') <> 'queued'
                  ORDER BY created_at DESC, message_id DESC LIMIT ?",
@@ -1630,7 +1638,7 @@ pub(crate) async fn read_message_page(
             let mut rows_read = 0;
             let mut messages = statement
                 .query_map(params![MESSAGE_TEXT_CHARS, thread_id, at, at, id, limit + 1], |row| {
-                    Ok(json!({
+                    let mut message = json!({
                         "messageId": row.get::<_, String>(0)?,
                         "role": row.get::<_, String>(1)?,
                         "turnId": row.get::<_, Option<String>>(2)?,
@@ -1638,7 +1646,15 @@ pub(crate) async fn read_message_page(
                         "textLength": row.get::<_, i64>(4)?,
                         "streaming": row.get::<_, bool>(5)?,
                         "createdAt": row.get::<_, String>(6)?,
-                    }))
+                    });
+                    // The outside agent that sent a user message (slice X1).
+                    if let Some(actor) = row
+                        .get::<_, Option<String>>(7)?
+                        .and_then(|actor| serde_json::from_str::<Value>(&actor).ok())
+                    {
+                        message["actor"] = actor;
+                    }
+                    Ok(message)
                 })?
                 .inspect(|_| rows_read += 1)
                 .collect::<rusqlite::Result<Vec<_>>>()?;

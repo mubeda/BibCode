@@ -512,6 +512,8 @@ pub(super) struct Inner {
     sessions: Mutex<HashMap<String, Load>>,
     waits: AtomicUsize,
     owned: AtomicUsize,
+    /// Agent activity and who is active (slice X1, `activity.rs`).
+    activity: super::activity::McpActivity,
     /// The `clientRequestId`s whose recorded call runs in this process (`outcome.rs`).
     pub(super) claims: super::outcome::Claims,
     /// The preview host and devices the client twins of the provider tools use (slice D),
@@ -582,7 +584,9 @@ impl Drop for OwnedSlot {
                 sessions.remove(&self.session_id);
             }
         }
+        drop(sessions);
         self.inner.owned.fetch_sub(1, Ordering::AcqRel);
+        self.inner.activity.owned_changed(&self.session_id, false);
     }
 }
 
@@ -603,8 +607,22 @@ impl McpControl {
         engine: OrchestrationEngine,
         settings: watch::Receiver<McpServerSettings>,
     ) -> Self {
+        let activity = super::activity::McpActivity::new(engine.repositories().database().clone());
+        Self::new_with_activity(registry, auth, engine, settings, activity)
+    }
+
+    /// [`Self::new`] with the activity log `subscribeMcpActivity` streams, which the runtime
+    /// registers before the registry is finished.
+    #[must_use]
+    pub fn new_with_activity(
+        registry: RpcRegistry,
+        auth: AuthService,
+        engine: OrchestrationEngine,
+        settings: watch::Receiver<McpServerSettings>,
+        activity: super::activity::McpActivity,
+    ) -> Self {
         let repositories = engine.repositories();
-        Self {
+        let control = Self {
             inner: Arc::new(Inner {
                 registry,
                 auth,
@@ -615,11 +633,14 @@ impl McpControl {
                 sessions: Mutex::new(HashMap::new()),
                 waits: AtomicUsize::new(0),
                 owned: AtomicUsize::new(0),
+                activity,
                 claims: super::outcome::Claims::default(),
                 previews: std::sync::OnceLock::new(),
                 terminals: std::sync::OnceLock::new(),
             }),
-        }
+        };
+        super::activity::watch_stops(&control);
+        control
     }
 
     /// Refuses new calls, ends every wait in flight and interrupts every owned mutation, which
@@ -741,6 +762,13 @@ impl McpControl {
             Ok(admission) => admission,
             Err(refusal) => return refusal,
         };
+        // Activity (slice X1): the client is active while it calls, and a mutating call that
+        // runs work, not a retry of one, gets one row when it settles.
+        let session_id = principal.principal.session_id.as_str();
+        let label = self.inner.auth.client_label(session_id).await;
+        let _presence = self.inner.activity.call_started(session_id, label.clone());
+        let records_activity =
+            !spec.read_only && !super::activity::is_retry(self, session_id, arguments).await;
         let started = std::time::Instant::now();
         let call = ToolCall {
             control: self,
@@ -787,6 +815,9 @@ impl McpControl {
             );
         } else {
             tracing::debug!(tool = name, thread_id, duration_ms, "MCP tool call");
+        }
+        if records_activity {
+            super::activity::settle(self, session_id, label, &spec, arguments, &result).await;
         }
         result
     }
@@ -839,6 +870,8 @@ impl McpControl {
             return Err(busy());
         }
         load.owned += 1;
+        drop(sessions);
+        self.inner.activity.owned_changed(session_id, true);
         Ok(OwnedSlot {
             inner: Arc::clone(&self.inner),
             session_id: session_id.to_owned(),
@@ -859,6 +892,11 @@ impl McpControl {
 
     pub(crate) fn auth(&self) -> &AuthService {
         &self.inner.auth
+    }
+
+    /// The activity log and the active clients (slice X1).
+    pub(crate) fn activity(&self) -> &super::activity::McpActivity {
+        &self.inner.activity
     }
 
     pub(crate) fn settings_signal(&self) -> watch::Receiver<McpServerSettings> {

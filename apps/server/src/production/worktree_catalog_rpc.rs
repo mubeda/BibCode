@@ -617,6 +617,7 @@ impl WorktreeCatalogRpcServices {
             ref_name: branch.to_owned(),
             new_ref_name: None,
             base_ref_name: Some(branch.to_owned()),
+            purpose: None,
             thread_defaults: WorktreeAdoptThreadDefaults {
                 model_selection: defaults.model_selection,
                 runtime_mode: defaults.runtime_mode,
@@ -934,16 +935,28 @@ pub fn register_worktree_catalog_rpc(
     });
 
     let create_managed_services = services.clone();
-    registry.register_unary("worktree.createManaged", move |request, cancellation| {
-        let services = create_managed_services.clone();
-        async move { create_managed_worktree(&services, request, cancellation).await }
-    });
+    registry.register_unary_with_context(
+        "worktree.createManaged",
+        move |request, context, cancellation| {
+            let services = create_managed_services.clone();
+            async move {
+                let actor = crate::mcp::activity::principal_actor(&context).await;
+                create_managed_worktree(&services, request, actor, cancellation).await
+            }
+        },
+    );
 
     let create_panel_services = services.clone();
-    registry.register_unary("worktree.createPanel", move |request, cancellation| {
-        let services = create_panel_services.clone();
-        async move { create_worktree_panel(&services, request, cancellation).await }
-    });
+    registry.register_unary_with_context(
+        "worktree.createPanel",
+        move |request, context, cancellation| {
+            let services = create_panel_services.clone();
+            async move {
+                let actor = crate::mcp::activity::principal_actor(&context).await;
+                create_worktree_panel(&services, request, actor, cancellation).await
+            }
+        },
+    );
 
     let retarget_services = services.clone();
     registry.register_unary("worktree.retarget", move |request, cancellation| {
@@ -1184,6 +1197,7 @@ async fn replay_thread_operation(
 async fn create_managed_worktree(
     services: &WorktreeCatalogRpcServices,
     request: RpcRequest,
+    actor: Option<Value>,
     cancellation: CancellationToken,
 ) -> RpcResult {
     let input = decode::<WorktreeCreateManagedInput>(request)?;
@@ -1198,6 +1212,9 @@ async fn create_managed_worktree(
         acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
             .await
             .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    if let Some(actor) = actor {
+        command_claim.attribute_to(actor);
+    }
     if replay_thread_operation(services, &command_claim, &input.command_id, &payload_digest).await?
     {
         let thread = services
@@ -1341,6 +1358,7 @@ async fn create_managed_worktree_locked(
                     title: input.title,
                     kind: Some("workspace".to_owned()),
                     host_thread_id: None,
+                    purpose: input.purpose,
                     model_selection: input.thread_defaults.model_selection,
                     runtime_mode: input.thread_defaults.runtime_mode,
                     interaction_mode: input.thread_defaults.interaction_mode,
@@ -1399,6 +1417,7 @@ async fn create_managed_worktree_locked(
 async fn create_worktree_panel(
     services: &WorktreeCatalogRpcServices,
     request: RpcRequest,
+    actor: Option<Value>,
     cancellation: CancellationToken,
 ) -> RpcResult {
     let input = decode::<WorktreeCreatePanelInput>(request)?;
@@ -1413,6 +1432,9 @@ async fn create_worktree_panel(
         acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
             .await
             .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    if let Some(actor) = actor {
+        command_claim.attribute_to(actor);
+    }
     if replay_thread_operation(services, &command_claim, &input.command_id, &payload_digest).await?
     {
         return Ok(encode(WorktreeThreadResult {
@@ -1489,6 +1511,7 @@ async fn create_worktree_panel(
                                     title: input.title,
                                     kind: Some("panel".to_owned()),
                                     host_thread_id: Some(host.thread_id),
+                                    purpose: input.purpose,
                                     model_selection: input.thread_defaults.model_selection,
                                     runtime_mode: input.thread_defaults.runtime_mode,
                                     interaction_mode: input.thread_defaults.interaction_mode,
@@ -3454,6 +3477,9 @@ struct WorktreeCreateManagedInput {
     new_ref_name: Option<String>,
     base_ref_name: Option<String>,
     thread_defaults: WorktreeAdoptThreadDefaults,
+    /// Why an outside agent creates it (#139, slice X1); absent keeps the digest unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purpose: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -3464,6 +3490,9 @@ struct WorktreeCreatePanelInput {
     thread_id: String,
     title: String,
     thread_defaults: WorktreeAdoptThreadDefaults,
+    /// Why an outside agent creates it (#139, slices X1 and X4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purpose: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -4148,6 +4177,7 @@ mod mutation_invalidation_tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -5260,6 +5290,7 @@ mod mutation_invalidation_tests {
                         }
                     }),
                 ),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -5333,6 +5364,7 @@ mod mutation_invalidation_tests {
                 title: "Removed".to_owned(),
                 kind: Some("workspace".to_owned()),
                 host_thread_id: None,
+                purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
                 interaction_mode: "default".to_owned(),

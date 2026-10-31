@@ -191,7 +191,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // Crash dumps additionally need `orchestration:operate`, checked by the handler.
         "server.downloadDiagnosticLogs" => Some(SCOPE_DIAGNOSTICS_READ),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
-        "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
+        "subscribeAuthAccess" | "subscribeMcpActivity" => Some(SCOPE_ACCESS_READ),
         // Two-tier policy: a pending-pairing session confirms its OWN
         // delivery through the session capability gate (which bypasses this
         // scope, since standard device grants do not carry access scopes);

@@ -190,6 +190,19 @@ pub struct RevokePairingRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RevokeClientRequest {
     pub session_id: String,
+    /// **Stop** for an outside agent (#139, slice X1): also interrupt each running turn whose
+    /// latest user message it sent. A plain revocation interrupts nothing.
+    #[serde(default)]
+    pub interrupt_turns: bool,
+}
+
+/// `POST /api/auth/clients/mcp-access`: **Take over** sets `read-only`; **Hand back** restores
+/// the level Take over replaced, and nothing else.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAccessRequest {
+    pub session_id: String,
+    pub access: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -236,6 +249,12 @@ pub struct ClientSessionView {
     pub current: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reach: Option<String>,
+    /// An outside agent's access ceiling (`mcp-client` sessions only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_access: Option<String>,
+    /// The access a person's Take over replaced; set while the agent is taken over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_access_hand_back: Option<String>,
 }
 
 #[derive(Clone, Debug)]

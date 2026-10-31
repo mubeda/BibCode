@@ -728,12 +728,15 @@ impl ProductionRuntime {
                 terminal_services.clone(),
             ),
         );
+        let mcp_activity = crate::mcp::activity::McpActivity::new(repositories.database().clone());
+        crate::mcp::activity::register_mcp_activity_rpc(&mut registry, mcp_activity.clone());
         finalize_rpc_registry(&registry, &control)?;
-        let mcp_control = crate::mcp::control::McpControl::new(
+        let mcp_control = crate::mcp::control::McpControl::new_with_activity(
             registry.clone(),
             auth.clone(),
             orchestration.clone(),
             control.mcp_server_signal(),
+            mcp_activity,
         );
         mcp_control.attach_terminals(mcp_terminals);
 
