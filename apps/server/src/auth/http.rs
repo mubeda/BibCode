@@ -576,19 +576,36 @@ async fn revoke_client(
 ) -> Response {
     match authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE).await {
         Ok(principal) => {
-            let revoked = if payload.interrupt_turns {
+            // Stop answers with how its interrupts went (#139, slice X1).
+            let answer = if payload.interrupt_turns {
                 state
                     .auth
                     .stop_client(&principal.session_id, &payload.session_id)
                     .await
+                    .map(|stopped| {
+                        if stopped.failed > 0 || stopped.timed_out {
+                            tracing::warn!(
+                                failed = stopped.failed,
+                                timed_out = stopped.timed_out,
+                                "MCP Stop did not interrupt every turn"
+                            );
+                        }
+                        json!({
+                            "revoked": stopped.revoked,
+                            "interrupted": stopped.interrupted,
+                            "failed": stopped.failed,
+                            "timedOut": stopped.timed_out,
+                        })
+                    })
             } else {
                 state
                     .auth
                     .revoke_client(&principal.session_id, &payload.session_id)
                     .await
+                    .map(|revoked| json!({ "revoked": revoked }))
             };
-            match revoked {
-                Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
+            match answer {
+                Ok(answer) => Json(answer).into_response(),
                 Err(error) => {
                     auth_error_for_request(error, &headers, "client_session_revoke_failed")
                 }

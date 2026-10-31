@@ -729,6 +729,8 @@ impl ProductionRuntime {
             ),
         );
         let mcp_activity = crate::mcp::activity::McpActivity::new(repositories.database().clone());
+        // Startup maintenance: the 7-day retention, which readers only filter by.
+        mcp_activity.prune_expired().await;
         crate::mcp::activity::register_mcp_activity_rpc(&mut registry, mcp_activity.clone());
         crate::production::ui_intents_rpc::register_ui_intents_rpc(
             &mut registry,

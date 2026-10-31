@@ -100,9 +100,9 @@ pub struct AuthService {
     pairing_offer_issuance: Arc<Mutex<()>>,
     repositories: Option<Repositories>,
     access_events: Arc<broadcast::Sender<AuthAccessEvent>>,
-    /// Outside agents a person stopped (#139, slice X1): revoked with `interruptTurns`, so the
-    /// MCP service interrupts their running turns. A plain revocation is not a stop.
-    mcp_stops: Arc<broadcast::Sender<String>>,
+    /// How Stop (#139, slice X1) has the MCP service interrupt a stopped agent's turns: a
+    /// revocation with `interruptTurns`. A plain revocation is not a stop.
+    mcp_stop_handler: Arc<std::sync::Mutex<Option<McpStopHandler>>>,
     access_revision: Arc<AtomicU64>,
     authority_watcher_running: Arc<AtomicBool>,
     /// Redeemed single-use websocket ticket ids, pruned by expiry.
@@ -305,6 +305,34 @@ const MCP_ACCESS_LEVELS: [&str; 4] = [
     "auto-accept-edits",
     "full-access",
 ];
+
+/// How long Stop waits for its interrupts before it answers; they go on after it.
+pub(crate) const MCP_STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// What interrupting a stopped agent's turns did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpStopOutcome {
+    pub(crate) interrupted: usize,
+    pub(crate) failed: usize,
+}
+
+/// Interrupts the turns a stopped agent (its session id) started.
+pub(crate) type McpStopHandler = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = McpStopOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What [`AuthService::stop_client`] did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct McpStopResult {
+    /// The agent is revoked, now or earlier, and its turns were interrupted.
+    pub revoked: bool,
+    pub interrupted: usize,
+    pub failed: usize,
+    /// The interrupts were still running when Stop answered.
+    pub timed_out: bool,
+}
 
 /// What [`AuthService::set_mcp_access`] did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -562,7 +590,7 @@ impl AuthService {
             pairing_offer_issuance: Arc::new(Mutex::new(())),
             repositories,
             access_events: Arc::new(access_events),
-            mcp_stops: Arc::new(broadcast::channel(ACCESS_EVENT_CAPACITY).0),
+            mcp_stop_handler: Arc::new(std::sync::Mutex::new(None)),
             access_revision: Arc::new(AtomicU64::new(1)),
             authority_watcher_running: Arc::new(AtomicBool::new(false)),
             redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1850,26 +1878,55 @@ impl AuthService {
     }
 
     /// **Stop** (#139, slice X1): revokes an outside agent, which ends its calls and owned
-    /// mutations, then tells the MCP service to interrupt the turns it is running, also for an
-    /// agent revoked earlier. `false` for an unknown session, or one revoked earlier that was
-    /// not an outside agent's. Only Stop
-    /// announces, so a plain revocation (the `bibcode thread` CLI revokes its own credential
-    /// on the way out) never interrupts anything.
+    /// mutations, then has the MCP service interrupt the turns it started, also for an agent
+    /// revoked earlier, and answers with how that went: the turns interrupted, those whose
+    /// interrupt failed, and whether the interrupts were still running after
+    /// [`MCP_STOP_WAIT`] (they go on). `revoked: false` for an unknown session, or one revoked
+    /// earlier that was not an outside agent's. Only Stop interrupts, so a plain revocation
+    /// (the `bibcode thread` CLI revokes its own credential on the way out) never does.
     pub async fn stop_client(
         &self,
         current_session_id: &str,
         target_session_id: &str,
-    ) -> Result<bool, AuthError> {
+    ) -> Result<McpStopResult, AuthError> {
         let revoked = self
             .revoke_client(current_session_id, target_session_id)
             .await?;
         // An agent revoked earlier (Revoke, then Stop) may still be running turns; Stop
         // interrupts them too. Only a session that was an outside agent's is stopped.
         let stopped = revoked || self.was_revoked_mcp_client(target_session_id).await?;
-        if stopped {
-            let _ = self.mcp_stops.send(target_session_id.to_owned());
+        let mut result = McpStopResult {
+            revoked: stopped,
+            ..McpStopResult::default()
+        };
+        let handler = self
+            .mcp_stop_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let (true, Some(handler)) = (stopped, handler) {
+            let interrupting = tokio::spawn(handler(target_session_id.to_owned()));
+            match tokio::time::timeout(MCP_STOP_WAIT, interrupting).await {
+                Ok(Ok(outcome)) => {
+                    result.interrupted = outcome.interrupted;
+                    result.failed = outcome.failed;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "MCP Stop's interrupts ended abnormally");
+                    result.failed = 1;
+                }
+                Err(_) => result.timed_out = true,
+            }
         }
-        Ok(stopped)
+        Ok(result)
+    }
+
+    /// Lets the MCP service interrupt a stopped agent's turns; the last registration wins.
+    pub(crate) fn set_mcp_stop_handler(&self, handler: McpStopHandler) {
+        *self
+            .mcp_stop_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
     }
 
     /// Whether `session_id` is an outside agent's session that has been revoked.
@@ -1884,11 +1941,6 @@ impl AuthService {
         Ok(session.is_some_and(|session| {
             session.subject == MCP_CLIENT_SUBJECT && session.revoked_at.is_some()
         }))
-    }
-
-    /// The outside agents a person stopped, as their session ids.
-    pub(crate) fn subscribe_mcp_stops(&self) -> broadcast::Receiver<String> {
-        self.mcp_stops.subscribe()
     }
 
     /// The Authorized clients label of a live session.
