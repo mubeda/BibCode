@@ -132,8 +132,8 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   or, with `permanent`, an ignored file that permanent deletion leaves in place. A file whose
   folder is, or turns into, a symlink is kept too, whatever `permanent` says. On macOS and
   Linux, BiBCode first moves each file into a folder of its own in the repository's Git
-  directory (`bibcode-discard`), and the trash takes it from there, so **Put Back** in the
-  Trash returns it to that folder, not to the checkout.
+  directory (`bibcode-discard`), and the trash takes it from there. **Put Back** in the Trash
+  therefore does not return a file to the checkout; drag it back instead.
 
 ### Pull requests
 

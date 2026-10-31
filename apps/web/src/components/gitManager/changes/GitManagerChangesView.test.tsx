@@ -956,7 +956,7 @@ describe("GitManagerChangesView", () => {
     await vi.waitFor(() => expect(document.body.textContent).toContain("Move Changes to Trash?"));
     await act(async () => buttonWithText("Move to Trash").click());
     await vi.waitFor(() =>
-      expect(document.body.textContent).toContain("server reported that OS trash is unavailable"),
+      expect(document.body.textContent).toContain("The trash couldn't take these files"),
     );
 
     await act(async () => buttonWithText("Discard Permanently").click());
@@ -969,6 +969,42 @@ describe("GitManagerChangesView", () => {
         permitPermanent: true,
       },
     });
+  });
+
+  it("says which files a permanent discard kept and how to remove them", async () => {
+    h.status = statusWith("logs/debug.log");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard
+      .mockResolvedValueOnce(
+        AsyncResult.success({
+          trashed: [],
+          permanentlyDiscarded: [],
+          trashUnavailable: ["logs/debug.log"],
+        }),
+      )
+      .mockResolvedValueOnce(
+        AsyncResult.success({
+          trashed: [],
+          permanentlyDiscarded: [],
+          trashUnavailable: ["logs/debug.log"],
+        }),
+      );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+
+    await act(async () => listProps.onContextMenu("logs/debug.log", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("The trash couldn't take these files"),
+    );
+    await act(async () => buttonWithText("Discard Permanently").click());
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain(
+        "Kept logs/debug.log: ignored files and files in linked folders can't be discarded here. Remove it in your file manager.",
+      ),
+    );
   });
 
   it("reveals a file through the environment-scoped file-manager command", async () => {

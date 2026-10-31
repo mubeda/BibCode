@@ -3306,6 +3306,44 @@ source and fixed test-first:
   `a_refused_entry_never_goes_back_over_a_file_created_meanwhile`. The existing discard tests
   and the `git_manager` and MCP Git suites pass unchanged.
 
+**Discard staging follow-up (coordinator, round 3).** The coordinator accepted the
+link-versus-other-failure split and asked for staging as a hidden, uuid-named sibling in the
+entry's own folder, so that **Put Back** returns files there and a Git directory on another disk
+stops forcing permanent discard. That was rejected, and Git-directory staging kept, for two
+reasons:
+
+- **Security.** The trash resolves the staged path by string. A sibling's path runs through
+  the checkout's folders, which a branch switch or pull (open to an MCP agent through
+  `git_switch_branch` and `git_pull`) can replace with links. `git_status` would also list the
+  staged name while it waits. So the fd chain validated at staging would not cover the path
+  the trash resolves. The Git directory's folders sit outside every checkout operation and
+  every MCP tool.
+- **Put Back.** It would not work either way. A `.bibcode-discard-<uuid>-<name>` file reaches
+  the trash under that hidden name, which Finder's Trash does not show. A holder subfolder
+  makes **Put Back** aim at a hidden folder in the checkout.
+
+The same review found the gap in the Git-directory path, and it is now fixed and tested:
+
+- **Before the trash:** the staged path, resolved by string, must match the held handles, by
+  device and inode, for the Git directory, `bibcode-discard`, the holder and the entry.
+  `a_staging_folder_swapped_before_the_trash_resolves_it_is_never_followed` swaps
+  `bibcode-discard` for a link to a planted entry of the same staged name. It failed first:
+  the planted file was trashed. Now the trash is never called, and the entry goes back and is
+  kept.
+- **After a trash that answered success:** the entry must be gone from the held folder.
+  `a_trash_that_did_not_take_the_staged_entry_is_never_reported_as_trashed` failed first:
+  the entry was reported trashed and left staged.
+
+The remaining window is the trash process resolving the path just after the identity check.
+Only a writer inside the Git directory could use it, and such a writer could delete files
+directly. The post-trash check detects it. Panel follow-ups:
+
+- The trash dialog says **Put Back** won't return files there, except on a Windows server,
+  which stages nothing.
+- The permanent dialog says the trash couldn't take the files, which also covers kept links.
+- After a permanent discard, the panel names any path still kept and says to remove it in a
+  file manager. Until now a kept ignored file or linked-folder file closed the dialog silently.
+
 ## P (pull request tools) implementation notes (2026-10-30)
 
 Slice P was implemented on `claude/v0131-139-p`, from `claude/v0131-139-f0`. It adds
