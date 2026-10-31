@@ -7414,17 +7414,8 @@ async fn provider_stream_end_fences_starts_during_error_projection() {
     let abandoned = durable_turn_command("before-projection-race", "first turn");
     engine.dispatch(abandoned.clone()).await.unwrap();
     supervisor.handle_orchestration(abandoned).await.unwrap();
-    // The ended turn's checkpoint number is recorded before its session settles.
-    let checkpoint_pause = hooks.pause_before_next_command_persist();
-    drop(events_tx);
-    timeout(
-        Duration::from_secs(2),
-        checkpoint_pause.wait_until_entered(),
-    )
-    .await
-    .unwrap();
     let session_pause = hooks.pause_before_next_command_persist();
-    checkpoint_pause.release();
+    drop(events_tx);
     timeout(Duration::from_secs(2), session_pause.wait_until_entered())
         .await
         .unwrap();
@@ -7569,17 +7560,8 @@ async fn provider_stream_end_fence_timeout_releases_other_thread_control() {
             "messageId":message_id, "delta":"Partial response", "turnId":"provider-turn-1", "createdAt":NOW
         })).unwrap()).await.unwrap();
     }
-    // The ended turn's checkpoint number is recorded before its session settles.
-    let checkpoint_pause = hooks.pause_before_next_command_persist();
-    drop(events_tx);
-    timeout(
-        Duration::from_secs(2),
-        checkpoint_pause.wait_until_entered(),
-    )
-    .await
-    .unwrap();
     let session_pause = hooks.pause_before_next_command_persist();
-    checkpoint_pause.release();
+    drop(events_tx);
     timeout(Duration::from_secs(2), session_pause.wait_until_entered())
         .await
         .unwrap();

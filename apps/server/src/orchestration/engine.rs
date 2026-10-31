@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     path::Path,
     pin::Pin,
@@ -2007,6 +2007,9 @@ const CHECKPOINT_HOLD_LIMIT: Duration = Duration::from_secs(120);
 struct CheckpointHolds {
     enabled: Arc<AtomicBool>,
     turns: Arc<StdMutex<HeldTurns>>,
+    /// Threads the effects worker found in a Git checkout when a turn started (it captured or
+    /// found their baseline): their turns get checkpoint numbers.
+    checkpointed_threads: Arc<StdMutex<HashSet<String>>>,
 }
 
 /// The last hold id given out, and each held `(thread, turn)` with its hold's id.
@@ -2818,7 +2821,10 @@ impl OrchestrationEngine {
         };
         let engine = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(CHECKPOINT_HOLD_LIMIT).await;
+            tokio::select! {
+                () = tokio::time::sleep(CHECKPOINT_HOLD_LIMIT) => {}
+                () = engine.shutdown.cancelled() => return,
+            }
             if engine.release_checkpoint_holds(|(held, held_id)| *held == key && *held_id == id) {
                 tracing::warn!(
                     thread_id = %key.0,
@@ -2834,9 +2840,34 @@ impl OrchestrationEngine {
         self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
     }
 
-    /// Releases every checkpoint hold of a deleted thread.
+    /// Forgets a deleted thread: releases its checkpoint holds.
     pub(crate) fn release_thread_checkpoint_holds(&self, thread_id: &str) {
         self.release_checkpoint_holds(|((thread, _), _)| thread == thread_id);
+        self.checkpoint_holds
+            .checkpointed_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(thread_id);
+    }
+
+    /// The effects worker found the thread in a Git checkout as a turn started: its turns get
+    /// checkpoint numbers from now on.
+    pub(crate) fn note_checkpointed_thread(&self, thread_id: &str) {
+        self.checkpoint_holds
+            .checkpointed_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread_id.to_owned());
+    }
+
+    /// Whether the effects worker found the thread in a Git checkout as a turn started, since
+    /// this server started.
+    pub(crate) fn thread_is_checkpointed(&self, thread_id: &str) -> bool {
+        self.checkpoint_holds
+            .checkpointed_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(thread_id)
     }
 
     /// Releases the holds `matches` picks, waking delivery. Returns whether any was released.
