@@ -197,6 +197,11 @@ pub fn is_long_running(method: &str) -> bool {
             // (#139 slice X8).
             | "webhooks.sendTest"
             | "webhooks.redeliver"
+            // Run Claude Code's or Codex's own `mcp` command; `claude mcp get` health-checks
+            // the entry, which starts `bibcode mcp` and connects it back (up to 45 s).
+            | "mcpClients.getRegistrations"
+            | "mcpClients.register"
+            | "mcpClients.unregister"
     )
 }
 
@@ -1245,6 +1250,14 @@ mod tests {
             "webhooks.rotateSecret",
         ] {
             assert!(!is_long_running(method), "{method}");
+        }
+        // Connect an agent runs the tools' own CLIs, and a read health-checks the entry.
+        for method in [
+            "mcpClients.getRegistrations",
+            "mcpClients.register",
+            "mcpClients.unregister",
+        ] {
+            assert!(is_long_running(method), "{method}");
         }
     }
 

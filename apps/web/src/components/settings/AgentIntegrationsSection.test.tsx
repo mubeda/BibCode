@@ -31,6 +31,13 @@ const h = vi.hoisted(() => ({
   updateResult: null as unknown,
   webhooks: null as null | { endpoints: ReadonlyArray<Record<string, unknown>> },
   clients: [] as Array<{ connected: boolean }>,
+  primaryId: null as string | null,
+  copyFails: false,
+  registrations: null as null | { clients: ReadonlyArray<Record<string, unknown>> },
+  registrationsError: null as string | null,
+  refreshes: 0,
+  commands: [] as Array<{ command: string; environmentId: string; input: unknown }>,
+  commandResult: null as null | ((command: string, input: { client: string }) => Promise<unknown>),
 }));
 
 vi.mock("../../state/webhooks", () => ({
@@ -75,7 +82,9 @@ vi.mock("./diagnosticsEnvironment", () => ({
   useDiagnosticsEnvironment: () => ({
     environments: h.environments,
     connected: h.environments.filter((environment) => environment.connection.phase === "connected"),
-    primaryEnvironment: h.environments[0] ?? null,
+    primaryEnvironment:
+      h.environments.find((environment) => environment.environmentId === h.primaryId) ??
+      (h.primaryId === null ? (h.environments[0] ?? null) : null),
     environment: h.environments[0] ?? null,
     waitingFor: undefined,
   }),
@@ -92,10 +101,48 @@ vi.mock("../../hooks/useSettings", () => ({
 }));
 
 vi.mock("../../hooks/useCopyToClipboard", () => ({
-  useCopyToClipboard: () => ({
-    copyToClipboard: (text: string) => h.copied.push(text),
+  useCopyToClipboard: (options?: {
+    onCopy?: (context: unknown) => void;
+    onError?: (error: Error, context: unknown) => void;
+  }) => ({
+    copyToClipboard: (text: string, context: unknown) => {
+      if (h.copyFails) {
+        options?.onError?.(new Error("Clipboard API is unavailable."), context);
+        return;
+      }
+      h.copied.push(text);
+      options?.onCopy?.(context);
+    },
     isCopied: false,
   }),
+}));
+
+vi.mock("../../state/mcpClients", () => ({
+  mcpClientsEnvironment: { register: "register", unregister: "unregister" },
+  useMcpClientRegistrations: (environmentId: string | null) => ({
+    data: environmentId === null ? null : h.registrations,
+    error: environmentId === null ? null : h.registrationsError,
+    refresh: () => {
+      h.refreshes += 1;
+    },
+  }),
+}));
+
+vi.mock("../../state/use-atom-command", () => ({
+  useAtomCommand:
+    (command: string) => (value: { environmentId: string; input: { client: string } }) => {
+      h.commands.push({ command, ...value });
+      if (h.commandResult !== null) return h.commandResult(command, value.input);
+      return Promise.resolve({
+        _tag: "Success",
+        value: {
+          client: value.input.client,
+          installed: true,
+          registered: command === "register",
+          error: null,
+        },
+      });
+    },
 }));
 
 vi.mock("../ui/switch", () => ({
@@ -202,7 +249,33 @@ beforeEach(() => {
   h.updateResult = null;
   h.webhooks = null;
   h.clients = [];
+  h.primaryId = null;
+  h.copyFails = false;
+  h.registrations = { clients: ALL_CLIENTS.map((client) => registration(client)) };
+  h.registrationsError = null;
+  h.refreshes = 0;
+  h.commands = [];
+  h.commandResult = null;
 });
+
+const ALL_CLIENTS = ["claude", "codex", "cursor", "opencode"] as const;
+
+function registration(
+  client: (typeof ALL_CLIENTS)[number],
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { client, installed: true, registered: false, error: null, ...overrides };
+}
+
+function buttonNamed(container: HTMLElement, text: string): HTMLButtonElement | undefined {
+  return [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+    (button) => button.textContent?.trim() === text,
+  );
+}
+
+function clientLine(container: HTMLElement, name: string): HTMLElement {
+  return container.querySelector<HTMLElement>(`[data-mcp-client][aria-label="${name}"]`)!;
+}
 
 afterEach(() => {
   for (const { root, container } of mounted.splice(0)) {
@@ -212,7 +285,7 @@ afterEach(() => {
 });
 
 describe("AgentIntegrationsSection", () => {
-  it("shows the switch, the access limit and the copyable launch command", async () => {
+  it("shows the switch and the access limit", async () => {
     const container = await render();
     const toggle = container.querySelector<HTMLButtonElement>('[aria-label="MCP server"]')!;
     expect(toggle.getAttribute("aria-checked")).toBe("true");
@@ -224,21 +297,6 @@ describe("AgentIntegrationsSection", () => {
       "At any level above Read only, agents can also answer approvals, remove worktrees, discard changes, force-push and merge pull requests.",
     );
     expect(container.querySelector('[aria-label="Agents may"]')?.textContent).toBe("Supervised");
-    const command = container.querySelector('[aria-label="Launch command"]')?.textContent;
-    expect(command).toBe(
-      "/Applications/BiBCode.app/Contents/MacOS/BiBCode mcp --base-dir /Users/me/.bibcode",
-    );
-    const buttons = [...container.querySelectorAll("button")].filter((button) =>
-      button.textContent?.startsWith("Copy"),
-    );
-    for (const button of buttons) {
-      await act(async () => button.click());
-    }
-    expect(h.copied).toEqual([
-      command,
-      `claude mcp add bibcode -- ${command}`,
-      `codex mcp add bibcode -- ${command}`,
-    ]);
     expect(container.querySelector('[data-testid="environment-picker"]')).toBeNull();
   });
 
@@ -292,7 +350,7 @@ describe("AgentIntegrationsSection", () => {
     expect(
       container.querySelector(`[id="${toggle.getAttribute("aria-describedby")}"]`)?.textContent,
     ).toBe("Update this server to use outside agents.");
-    expect(container.querySelector('[aria-label="Launch command"]')).toBeNull();
+    expect(container.textContent).not.toContain("Connect an agent");
   });
 
   it("names the picker when several environments are connected, and the host for a remote one", async () => {
@@ -411,6 +469,210 @@ describe("AgentIntegrationsSection", () => {
     expect(container.textContent).toContain(
       "Revoking their paired MCP client turned off CI. Re-enable them in the Webhooks tab.",
     );
+  });
+
+  describe("Connect an agent", () => {
+    it("adds BiBCode to each tool in one click, without showing a path", async () => {
+      h.registrations = {
+        clients: [
+          registration("claude"),
+          registration("codex", { registered: true }),
+          registration("cursor"),
+          registration("opencode"),
+        ],
+      };
+      const container = await render();
+      expect(container.textContent).toContain("Connect an agent");
+      expect(container.textContent).toContain(
+        "Add BiBCode to the AI tools on this computer, so they can use this environment.",
+      );
+      expect(container.textContent).not.toContain("/Applications/BiBCode.app");
+      const lines = [...container.querySelectorAll("[data-mcp-client]")].map((line) =>
+        line.getAttribute("aria-label"),
+      );
+      expect(lines).toEqual(["Claude Code", "Codex", "Cursor", "OpenCode"]);
+      expect(clientLine(container, "Codex").textContent).toContain("Added to Codex");
+      expect(buttonNamed(clientLine(container, "Codex"), "Remove")).toBeDefined();
+      for (const name of ["Cursor", "OpenCode"]) {
+        expect(buttonNamed(clientLine(container, name), `Add to ${name}`)?.disabled, name).toBe(
+          false,
+        );
+      }
+
+      const add = buttonNamed(clientLine(container, "Claude Code"), "Add to Claude Code")!;
+      expect(add.disabled).toBe(false);
+      await act(async () => add.click());
+      expect(h.commands).toEqual([
+        { command: "register", environmentId: "local", input: { client: "claude" } },
+      ]);
+      expect(clientLine(container, "Claude Code").textContent).toContain("Added to Claude Code");
+      expect(buttonNamed(clientLine(container, "Claude Code"), "Remove")).toBeDefined();
+      expect(h.refreshes).toBe(1);
+    });
+
+    it("says it is adding while the tool runs, and removes on request", async () => {
+      let finish: (value: unknown) => void = () => undefined;
+      h.commandResult = () => new Promise((resolve) => (finish = resolve));
+      const container = await render();
+      await act(async () => buttonNamed(clientLine(container, "Cursor"), "Add to Cursor")!.click());
+      const busy = buttonNamed(clientLine(container, "Cursor"), "Adding…")!;
+      expect(busy.disabled).toBe(true);
+      await act(async () =>
+        finish({ _tag: "Success", value: registration("cursor", { registered: true }) }),
+      );
+      h.commandResult = null;
+      await act(async () => buttonNamed(clientLine(container, "Cursor"), "Remove")!.click());
+      expect(h.commands.at(-1)).toEqual({
+        command: "unregister",
+        environmentId: "local",
+        input: { client: "cursor" },
+      });
+      expect(buttonNamed(clientLine(container, "Cursor"), "Add to Cursor")).toBeDefined();
+    });
+
+    it("disables a tool that is not installed and says where it is missing", async () => {
+      h.registrations = {
+        clients: [
+          registration("claude"),
+          registration("codex", { installed: false }),
+          registration("cursor"),
+          registration("opencode"),
+        ],
+      };
+      const container = await render();
+      const add = buttonNamed(clientLine(container, "Codex"), "Add to Codex")!;
+      expect(add.disabled).toBe(true);
+      expect(describedText(container, add)).toBe("Codex isn't installed on this computer.");
+
+      h.primaryId = "elsewhere";
+      h.environments = [environment({ label: "Build box" })];
+      const remote = await render();
+      const remoteAdd = buttonNamed(clientLine(remote, "Codex"), "Add to Codex")!;
+      expect(describedText(remote, remoteAdd)).toBe("Codex isn't installed on Build box's host.");
+      expect(remote.textContent).toContain(
+        "Add BiBCode to the AI tools on Build box's host, so they can use this environment.",
+      );
+    });
+
+    it("shows what the tool said when adding fails, and keeps the action", async () => {
+      const message =
+        "Claude Code could not add BiBCode: permission denied. Check that `claude mcp list` works in a terminal, then try again.";
+      h.commandResult = () =>
+        Promise.resolve(
+          AsyncResult.failure(
+            Cause.fail({ _tag: "McpClientRegistrationError", reason: "failed", message }),
+          ),
+        );
+      const container = await render();
+      await act(async () =>
+        buttonNamed(clientLine(container, "Claude Code"), "Add to Claude Code")!.click(),
+      );
+      expect(
+        clientLine(container, "Claude Code").querySelector('[role="alert"]')?.textContent,
+      ).toBe(message);
+      expect(
+        buttonNamed(clientLine(container, "Claude Code"), "Add to Claude Code")?.disabled,
+      ).toBe(false);
+    });
+
+    it("shows a tool's own read error, and a failed check with a way to retry", async () => {
+      h.registrations = {
+        clients: [
+          registration("claude"),
+          registration("codex"),
+          registration("cursor", {
+            error:
+              "BiBCode left ~/.cursor/mcp.json unchanged because it isn't plain JSON (line 1). Fix the file, or add BiBCode to Cursor by hand from Other MCP clients.",
+          }),
+          registration("opencode"),
+        ],
+      };
+      const container = await render();
+      expect(clientLine(container, "Cursor").textContent).toContain(
+        "BiBCode left ~/.cursor/mcp.json unchanged because it isn't plain JSON (line 1).",
+      );
+
+      h.registrations = null;
+      h.registrationsError = "The authenticated token is missing required scope: access:read.";
+      const failed = await render();
+      expect(failed.textContent).toContain(
+        "Could not check your AI tools. The authenticated token is missing required scope: access:read.",
+      );
+      await act(async () => buttonNamed(failed, "Try again")!.click());
+      expect(h.refreshes).toBe(1);
+    });
+
+    it("keeps the command for other clients collapsed, shortened, and copies it in full", async () => {
+      const container = await render();
+      expect(container.querySelector('[aria-label="MCP launch command"]')).toBeNull();
+      const disclosure = buttonNamed(container, "Other MCP clients")!;
+      expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+      await act(async () => disclosure.click());
+      expect(disclosure.getAttribute("aria-expanded")).toBe("true");
+      const full =
+        "/Applications/BiBCode.app/Contents/MacOS/BiBCode mcp --base-dir /Users/me/.bibcode";
+      const shown = container.querySelector('[aria-label="MCP launch command"]')!;
+      expect(shown.textContent).toBe("…/BiBCode mcp --base-dir /Users/me/.bibcode");
+      expect(shown.getAttribute("title")).toBe(full);
+      expect(container.textContent).not.toContain("Development build");
+      await act(async () => buttonNamed(container, "Copy command")!.click());
+      await act(async () => buttonNamed(container, "Copy MCP config")!.click());
+      expect(h.copied).toEqual([
+        full,
+        JSON.stringify(
+          {
+            mcpServers: {
+              bibcode: {
+                command: "/Applications/BiBCode.app/Contents/MacOS/BiBCode",
+                args: ["mcp", "--base-dir", "/Users/me/.bibcode"],
+              },
+            },
+          },
+          null,
+          2,
+        ),
+      ]);
+    });
+
+    it("explains a development build's extra flags", async () => {
+      h.environments = [
+        environment({
+          serverConfig: {
+            mcpLaunch: {
+              argv: [
+                "/repo/target/debug/bibcode",
+                "mcp",
+                "--base-dir",
+                "/tmp/dev",
+                "--dev-url",
+                "http://localhost:5733/",
+              ],
+            },
+          },
+        }),
+      ];
+      const container = await render();
+      await act(async () => buttonNamed(container, "Other MCP clients")!.click());
+      expect(container.querySelector('[aria-label="MCP launch command"]')?.textContent).toBe(
+        "…/bibcode mcp --base-dir /tmp/dev --dev-url http://localhost:5733/",
+      );
+      expect(container.textContent).toContain(
+        "Development build: includes its data folder and dev server.",
+      );
+    });
+
+    it("reveals the full text to select when the clipboard refuses", async () => {
+      h.copyFails = true;
+      const container = await render();
+      await act(async () => buttonNamed(container, "Other MCP clients")!.click());
+      await act(async () => buttonNamed(container, "Copy command")!.click());
+      expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+        "Couldn't copy to the clipboard. Select the text below and copy it.",
+      );
+      expect(container.querySelector('[aria-label="Text to copy"]')?.textContent).toBe(
+        "/Applications/BiBCode.app/Contents/MacOS/BiBCode mcp --base-dir /Users/me/.bibcode",
+      );
+    });
   });
 
   it("quotes for the server host's own shell", () => {

@@ -338,8 +338,10 @@ it was already open):
 ### Outside agents over SSH
 
 1. With the host's server running, register `claude mcp add bibcode -- ssh <host> bibcode mcp`
-   on the desktop machine (or copy it from **Settings → Agents → Agent integrations**
-   with the SSH environment selected) and restart Claude Code.
+   on the desktop machine and restart Claude Code. (With the SSH environment selected,
+   **Settings → Agents → Agent integrations → Connect an agent** adds BiBCode to the
+   tools on the host itself; **Other MCP clients** shows the command to wrap in
+   `ssh <host> --`.)
 2. Start a thread in a disposable project on the host and wait for it. No tunnel or
    port forward is involved: `bibcode mcp` runs on the host and reaches its
    loopback server.

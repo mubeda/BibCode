@@ -64,6 +64,9 @@ reaches it in one of two ways:
 
 A plain-HTTP LAN address serves neither remotely: use SSH there.
 
+Settings adds the stdio relay to Claude Code, Codex, Cursor or OpenCode in one click
+(**Connect an agent**, below); other clients copy the command or the `mcpServers` JSON.
+
 ### Local stdio: `bibcode mcp`
 
 ```sh
@@ -78,7 +81,7 @@ unchanged to the environment's `/mcp` over loopback. Options:
 | Option              | Meaning                                                                                                                                                              |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--base-dir <root>` | The data root. `--base-dir`, else `BIBCODE_HOME`, else `~/.bibcode` (also the desktop app's root). A global option, so it may come before or after `mcp`.            |
-| `--dev-url <url>`   | A development build's dev state. The copied launch command adds it when needed.                                                                                      |
+| `--dev-url <url>`   | A development build's dev state. The registered launch command adds it when needed.                                                                                  |
 | `--access <level>`  | A lower ceiling than the environment allows: `read-only`, `approval-required`, `auto-accept-edits` or `full-access`. Higher than **Agents may** is refused at start. |
 | `--url <url>`       | The loopback address to reach the server at. It must be the address in the server's endpoint record, or `localhost` on its port. Normally omitted.                   |
 
@@ -131,9 +134,22 @@ The desktop app is also a server; its executable takes the same `mcp` command (a
 | Linux desktop   | `<path to the AppImage> mcp`                                       |
 | WSL environment | `wsl.exe -d <distro> --exec <server binary> mcp --base-dir <root>` |
 
-**Settings → Agents → Agent integrations → Launch command** shows the exact command for the
-selected environment, with **Copy for Claude Code** and **Copy for Codex**. A Windows update
-ends a desktop-hosted `mcp` process with the app; restart the MCP server in the agent.
+**Settings → Agents → Agent integrations → Connect an agent** registers the exact command
+for the selected environment in one click, on the host that environment runs on, for four
+tools:
+
+| Tool        | How BiBCode adds `bibcode`                                                                            |
+| ----------- | ----------------------------------------------------------------------------------------------------- |
+| Claude Code | `claude mcp add --scope user bibcode -- <command>` (read with `claude mcp get bibcode`)               |
+| Codex       | `codex mcp add bibcode -- <command>` (read with `codex mcp get bibcode`)                              |
+| Cursor      | the `mcpServers.bibcode` entry of `~/.cursor/mcp.json` (`command`, `args`)                            |
+| OpenCode    | the `mcp.bibcode` entry of `~/.config/opencode/opencode.json` (`type: "local"`, `command`, `enabled`) |
+
+**Remove** runs the tool's `mcp remove bibcode` or deletes only that entry. A config file that
+is not plain JSON is refused unchanged. These are the `mcpClients.*` RPC methods, which need
+`access:read` and `access:write`: an agent's own credential cannot call them. **Other MCP
+clients** shows the command and the `mcpServers` JSON to copy. A Windows update ends a
+desktop-hosted `mcp` process with the app; restart the MCP server in the agent.
 
 ### Over SSH
 

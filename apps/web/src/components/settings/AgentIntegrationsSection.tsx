@@ -1,4 +1,4 @@
-import type { EnvironmentId } from "@bibcode/contracts";
+import type { EnvironmentId, McpClientId, McpClientRegistration } from "@bibcode/contracts";
 import {
   DEFAULT_MCP_SERVER_ACCESS,
   DEFAULT_SERVER_SETTINGS,
@@ -7,22 +7,21 @@ import {
   type McpServerAccess,
   type UnifiedSettings,
 } from "@bibcode/contracts/settings";
+import { joinCommand, type LaunchShell } from "@bibcode/shared/launchCommand";
 import {
-  agentRegistrationCommand,
-  joinCommand,
-  type LaunchShell,
-} from "@bibcode/shared/launchCommand";
-import {
+  type AtomCommandResult,
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
-import { CheckIcon, CopyIcon, InfoIcon, TriangleAlertIcon } from "lucide-react";
+import { CheckIcon, ChevronRightIcon, CopyIcon, InfoIcon, TriangleAlertIcon } from "lucide-react";
 import { useId, useState } from "react";
 
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hooks/useSettings";
 import type { EnvironmentPresentation } from "../../state/environments";
 import { usePrimaryAgentAccess, usePrimaryMcpClients } from "../../state/mcpActivity";
+import { mcpClientsEnvironment, useMcpClientRegistrations } from "../../state/mcpClients";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { isFailingEndpoint, useWebhookList } from "../../state/webhooks";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -114,6 +113,7 @@ export function launchShellFor(argv: ReadonlyArray<string>): LaunchShell {
 }
 
 const WINDOWS_PATH = /^[A-Za-z]:[\\/]/;
+const PATH_SEPARATOR = /[\\/]/;
 
 type IntegrationsTab = "mcp" | "webhooks";
 
@@ -391,7 +391,12 @@ function EnvironmentMcpServer({
         onChange={(patch) => void save({ mcpCapabilities: patch })}
       />
       {supported && serverConfig?.mcpLaunch ? (
-        <LaunchCommandRow argv={serverConfig.mcpLaunch.argv} isPrimary={isPrimary} label={label} />
+        <ConnectAgentRow
+          environmentId={environmentId}
+          argv={serverConfig.mcpLaunch.argv}
+          isPrimary={isPrimary}
+          label={label}
+        />
       ) : null}
     </>
   );
@@ -478,56 +483,300 @@ function ReasonLine({ id, text }: { readonly id: string; readonly text: string }
   );
 }
 
-function LaunchCommandRow({
+/** The tools BiBCode adds itself to, in the order the server reports them. */
+const MCP_CLIENT_LABELS: Record<McpClientId, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  cursor: "Cursor",
+  opencode: "OpenCode",
+};
+
+/** Where the server runs, as the person would say it. */
+function hostPhrase(isPrimary: boolean, label: string): string {
+  return isPrimary ? "this computer" : `${label}'s host`;
+}
+
+/** The message of a failed command, or `null` when it succeeded or was interrupted. */
+function commandFailure(result: AtomCommandResult<unknown, unknown>, fallback: string) {
+  if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return null;
+  const failure = squashAtomCommandFailure(result);
+  const message =
+    typeof failure === "object" && failure !== null && "message" in failure
+      ? String((failure as { message: unknown }).message).trim()
+      : "";
+  return message.length > 0 ? message : fallback;
+}
+
+/**
+ * Connect an agent: one line per tool on the server's host, each added or removed in one
+ * click. The server runs the tool's own CLI or edits only its `bibcode` entry. The launch
+ * command and the standard MCP JSON wait under Other MCP clients.
+ */
+function ConnectAgentRow({
+  environmentId,
   argv,
   isPrimary,
   label,
 }: {
+  readonly environmentId: EnvironmentId;
   readonly argv: ReadonlyArray<string>;
   readonly isPrimary: boolean;
   readonly label: string;
 }) {
-  const command = joinCommand(argv, launchShellFor(argv));
-  const copies = [
-    { key: "command", label: "Copy", text: command },
-    {
-      key: "claude",
-      label: "Copy for Claude Code",
-      text: agentRegistrationCommand("claude", command),
-    },
-    { key: "codex", label: "Copy for Codex", text: agentRegistrationCommand("codex", command) },
-  ] as const;
+  const registrations = useMcpClientRegistrations(environmentId);
+  const where = hostPhrase(isPrimary, label);
+  const clients = registrations.data?.clients;
   return (
     <SettingsRow
-      title="Launch command"
-      description={
-        isPrimary
-          ? "Add this to your agent as an MCP server. It runs on this computer and needs BiBCode running."
-          : `Run this on ${label}'s host, or over SSH from here (ssh <host> -- followed by the command). It needs that server running.`
+      title="Connect an agent"
+      description={`Add BiBCode to the AI tools on ${where}, so they can use this environment.`}
+      status={
+        clients === undefined && registrations.error !== null ? (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-x-2 gap-y-1 text-destructive"
+          >
+            <TriangleAlertIcon aria-hidden className="size-3.5 shrink-0" />
+            <span>Could not check your AI tools. {registrations.error}</span>
+            <Button size="xs" variant="outline" onClick={registrations.refresh}>
+              Try again
+            </Button>
+          </div>
+        ) : null
       }
     >
-      <div className="space-y-2 pt-2.5 pb-3.5">
-        <code
-          aria-label="Launch command"
-          className="block overflow-x-auto rounded-md bg-muted px-2.5 py-2 font-mono text-xs break-all whitespace-pre-wrap text-foreground"
-        >
-          {command}
-        </code>
-        <div className="flex flex-wrap gap-2">
-          {copies.map((copy) => (
-            <CopyCommandButton key={copy.key} label={copy.label} text={copy.text} />
+      {clients === undefined ? (
+        registrations.error === null ? (
+          <p className="py-2.5 text-xs text-muted-foreground">Checking your AI tools…</p>
+        ) : null
+      ) : (
+        <ul className="divide-y divide-border/60">
+          {clients.map((client) => (
+            <McpClientLine
+              key={client.client}
+              environmentId={environmentId}
+              registration={client}
+              where={where}
+              onChanged={registrations.refresh}
+            />
           ))}
-        </div>
-      </div>
+        </ul>
+      )}
+      <OtherMcpClients argv={argv} isPrimary={isPrimary} where={where} />
     </SettingsRow>
   );
 }
 
-function CopyCommandButton({ label, text }: { readonly label: string; readonly text: string }) {
-  const { copyToClipboard, isCopied } = useCopyToClipboard();
+function McpClientLine({
+  environmentId,
+  registration,
+  where,
+  onChanged,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly registration: McpClientRegistration;
+  readonly where: string;
+  readonly onChanged: () => void;
+}) {
+  const name = MCP_CLIENT_LABELS[registration.client];
+  const register = useAtomCommand(mcpClientsEnvironment.register, { reportFailure: false });
+  const unregister = useAtomCommand(mcpClientsEnvironment.unregister, { reportFailure: false });
+  const [busy, setBusy] = useState<"add" | "remove" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // What the last change returned, until the next read of the tool replaces `registration`.
+  const [changed, setChanged] = useState<{
+    readonly basis: McpClientRegistration;
+    readonly registered: boolean;
+  } | null>(null);
+  const reasonId = useId();
+  const registered =
+    changed !== null && changed.basis === registration
+      ? changed.registered
+      : registration.registered;
+  const notInstalled = registration.installed ? null : `${name} isn't installed on ${where}.`;
+
+  const change = async (action: "add" | "remove") => {
+    setBusy(action);
+    setError(null);
+    const input = { environmentId, input: { client: registration.client } };
+    const result = await (action === "add" ? register(input) : unregister(input));
+    setBusy(null);
+    const failure = commandFailure(
+      result,
+      action === "add"
+        ? `Could not add BiBCode to ${name}. Check the connection and try again.`
+        : `Could not remove BiBCode from ${name}. Check the connection and try again.`,
+    );
+    if (failure !== null) {
+      setError(failure);
+      return;
+    }
+    if (result._tag === "Success") {
+      setChanged({ basis: registration, registered: action === "add" });
+      onChanged();
+    }
+  };
+
   return (
-    <Button size="xs" variant="outline" onClick={() => copyToClipboard(text, undefined)}>
-      {isCopied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+    <li
+      data-mcp-client
+      aria-label={name}
+      className="flex items-center justify-between gap-3 py-2.5 first:pt-3"
+    >
+      <div className="min-w-0 space-y-0.5">
+        <div className="text-[13px] font-medium text-foreground">{name}</div>
+        {registered ? (
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <CheckIcon aria-hidden className="size-3.5 shrink-0" />
+            <span>Added to {name}</span>
+          </div>
+        ) : null}
+        {notInstalled === null ? null : (
+          <div className="text-xs text-muted-foreground">
+            <ReasonLine id={reasonId} text={notInstalled} />
+          </div>
+        )}
+        {error === null && registration.error === null ? null : (
+          <div role="alert" className="flex items-start gap-1.5 text-xs text-destructive">
+            <TriangleAlertIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+            <span>{error ?? registration.error}</span>
+          </div>
+        )}
+      </div>
+      {registered ? (
+        <Button
+          size="sm"
+          variant="outline"
+          className="shrink-0"
+          aria-label={busy === "remove" ? undefined : `Remove BiBCode from ${name}`}
+          disabled={busy !== null}
+          onClick={() => void change("remove")}
+        >
+          {busy === "remove" ? "Removing…" : "Remove"}
+        </Button>
+      ) : (
+        <Button
+          size="sm"
+          variant="outline"
+          className="shrink-0"
+          disabled={busy !== null || notInstalled !== null}
+          aria-describedby={notInstalled === null ? undefined : reasonId}
+          onClick={() => void change("add")}
+        >
+          {busy === "add" ? "Adding…" : `Add to ${name}`}
+        </Button>
+      )}
+    </li>
+  );
+}
+
+/** `…/<executable> <args>`: the folder is noise on screen; copies keep the full path. */
+function displayCommand(argv: ReadonlyArray<string>, command: string): string {
+  const executable = argv[0] ?? "";
+  const name = executable.split(PATH_SEPARATOR).at(-1) ?? executable;
+  if (name === executable) return command;
+  const rest = joinCommand(argv.slice(1), launchShellFor(argv));
+  return rest.length > 0 ? `…/${name} ${rest}` : `…/${name}`;
+}
+
+/** The standard `mcpServers` entry most other MCP clients read. */
+function mcpConfigJson(argv: ReadonlyArray<string>): string {
+  return JSON.stringify(
+    { mcpServers: { bibcode: { command: argv[0] ?? "", args: argv.slice(1) } } },
+    null,
+    2,
+  );
+}
+
+function OtherMcpClients({
+  argv,
+  isPrimary,
+  where,
+}: {
+  readonly argv: ReadonlyArray<string>;
+  readonly isPrimary: boolean;
+  readonly where: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [unCopied, setUnCopied] = useState<string | null>(null);
+  const panelId = useId();
+  const command = joinCommand(argv, launchShellFor(argv));
+  const development = argv.includes("--dev-url");
+  return (
+    <div className="border-t border-border/60 pt-1.5 pb-2.5">
+      <Button
+        size="sm"
+        variant="ghost"
+        className="-ml-2"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ChevronRightIcon
+          aria-hidden
+          className={open ? "rotate-90 transition-transform" : "transition-transform"}
+        />
+        Other MCP clients
+      </Button>
+      {open ? (
+        <div id={panelId} className="space-y-2 pt-1.5">
+          <p className="text-xs text-muted-foreground">
+            {isPrimary
+              ? "For a tool not listed above, add this command to its MCP settings, or paste the config into them."
+              : `For a tool not listed above, on ${where}: add this command to its MCP settings, or paste the config into them. From another computer, put ssh <host> -- in front of it.`}
+          </p>
+          <code
+            aria-label="MCP launch command"
+            title={command}
+            className="block rounded-md bg-muted px-2.5 py-2 font-mono text-xs break-all whitespace-pre-wrap text-foreground select-text"
+          >
+            {displayCommand(argv, command)}
+          </code>
+          {development ? (
+            <p className="text-xs text-muted-foreground">
+              Development build: includes its data folder and dev server.
+            </p>
+          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <CopyButton label="Copy command" text={command} onFailed={setUnCopied} />
+            <CopyButton label="Copy MCP config" text={mcpConfigJson(argv)} onFailed={setUnCopied} />
+          </div>
+          {unCopied === null ? null : (
+            <div className="space-y-1.5">
+              <div role="alert" className="flex items-start gap-1.5 text-xs text-destructive">
+                <TriangleAlertIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+                <span>Couldn't copy to the clipboard. Select the text below and copy it.</span>
+              </div>
+              <pre
+                aria-label="Text to copy"
+                className="overflow-x-auto rounded-md bg-muted px-2.5 py-2 font-mono text-xs break-all whitespace-pre-wrap text-foreground select-all"
+              >
+                {unCopied}
+              </pre>
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CopyButton({
+  label,
+  text,
+  onFailed,
+}: {
+  readonly label: string;
+  readonly text: string;
+  readonly onFailed: (text: string | null) => void;
+}) {
+  const { copyToClipboard, isCopied } = useCopyToClipboard<string>({
+    onCopy: () => onFailed(null),
+    onError: (_error, copied) => onFailed(copied),
+  });
+  return (
+    <Button size="sm" variant="outline" onClick={() => copyToClipboard(text, text)}>
+      {isCopied ? <CheckIcon aria-hidden /> : <CopyIcon aria-hidden />}
       {isCopied ? "Copied" : label}
     </Button>
   );

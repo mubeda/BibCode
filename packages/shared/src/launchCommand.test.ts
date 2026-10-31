@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  agentRegistrationCommand,
   joinCommand,
   quotePosixArgument,
   quoteWindowsArgument,
@@ -83,14 +82,5 @@ describe("launch commands", () => {
       "--base-dir",
       "/home/me/.bibcode",
     ]);
-  });
-
-  it("registers the command with Claude Code and Codex", () => {
-    expect(agentRegistrationCommand("claude", "bibcode mcp")).toBe(
-      "claude mcp add bibcode -- bibcode mcp",
-    );
-    expect(agentRegistrationCommand("codex", "bibcode mcp")).toBe(
-      "codex mcp add bibcode -- bibcode mcp",
-    );
   });
 });

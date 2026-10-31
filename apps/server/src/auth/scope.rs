@@ -199,6 +199,10 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // Outbound webhooks (#139 slice X8): settings an outside agent's `mcp-client` session,
         // which never holds `access:*`, cannot read or change.
         "webhooks.list" | "webhooks.listDeliveries" => Some(SCOPE_ACCESS_READ),
+        // Connect an agent (#139): a person's own tool configuration, which an outside
+        // agent's credential can neither read nor change.
+        "mcpClients.getRegistrations" => Some(SCOPE_ACCESS_READ),
+        "mcpClients.register" | "mcpClients.unregister" => Some(SCOPE_ACCESS_WRITE),
         "webhooks.upsert"
         | "webhooks.delete"
         | "webhooks.rotateSecret"
@@ -317,10 +321,17 @@ mod tests {
         ] {
             assert_eq!(required_scope(method), Some(SCOPE_ACCESS_WRITE), "{method}");
         }
-        for method in ACTIVE_RPC_METHODS
-            .iter()
-            .filter(|method| method.name.starts_with("webhooks."))
-        {
+        assert_eq!(
+            required_scope("mcpClients.getRegistrations"),
+            Some(SCOPE_ACCESS_READ)
+        );
+        for method in ["mcpClients.register", "mcpClients.unregister"] {
+            assert_eq!(required_scope(method), Some(SCOPE_ACCESS_WRITE), "{method}");
+        }
+        // Webhooks and a person's tool registrations: no outside agent's credential reaches them.
+        for method in ACTIVE_RPC_METHODS.iter().filter(|method| {
+            method.name.starts_with("webhooks.") || method.name.starts_with("mcpClients.")
+        }) {
             let scope = required_scope(method.name).expect("a scope");
             assert!(
                 !super::super::model::scope_satisfies(

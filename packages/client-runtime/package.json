@@ -47,6 +47,10 @@
       "types": "./src/state/mcpActivity.ts",
       "default": "./src/state/mcpActivity.ts"
     },
+    "./state/mcpClients": {
+      "types": "./src/state/mcpClients.ts",
+      "default": "./src/state/mcpClients.ts"
+    },
     "./state/uiIntents": {
       "types": "./src/state/uiIntents.ts",
       "default": "./src/state/uiIntents.ts"
