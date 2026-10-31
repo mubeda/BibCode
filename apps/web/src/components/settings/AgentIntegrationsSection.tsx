@@ -22,12 +22,16 @@ import { useId, useState } from "react";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hooks/useSettings";
 import type { EnvironmentPresentation } from "../../state/environments";
+import { usePrimaryMcpClients } from "../../state/mcpActivity";
+import { isFailingEndpoint, useWebhookList } from "../../state/webhooks";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
 import { DiagnosticsEnvironmentSelect, useDiagnosticsEnvironment } from "./diagnosticsEnvironment";
 import { McpAgentsPanel } from "./McpAgentsPanel";
 import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayout";
+import { WebhooksTab } from "./WebhooksTab";
 
 const SERVER_TITLE = "MCP server";
 const SERVER_DESCRIPTION =
@@ -86,6 +90,7 @@ export const MCP_ACCESS_OPTIONS: ReadonlyArray<{
 ];
 
 const selectEnabled = (settings: UnifiedSettings) => settings.enableMcpServer;
+const selectWebhooksEnabled = (settings: UnifiedSettings) => settings.enableWebhooks;
 const selectAccess = (settings: UnifiedSettings) => settings.mcpServerAccess;
 const selectCapabilities = (settings: UnifiedSettings) => settings.mcpCapabilities;
 
@@ -109,15 +114,34 @@ export function launchShellFor(argv: ReadonlyArray<string>): LaunchShell {
 
 const WINDOWS_PATH = /^[A-Za-z]:[\\/]/;
 
-/** Settings → Agents → Agent integrations: the MCP server of the chosen environment. */
+type IntegrationsTab = "mcp" | "webhooks";
+
+/**
+ * Settings → Agents → Agent integrations of the chosen environment: its MCP server and its
+ * outbound webhooks, one tab each, under a status line that summarizes both.
+ */
 export function AgentIntegrationsSection() {
   // Kept here: unlike the Diagnostics page, no link chooses this section's environment.
   const [selectedEnvironmentId, setSelectedEnvironmentId] = useState<EnvironmentId | null>(null);
+  const [tab, setTab] = useState<IntegrationsTab>("mcp");
   const { environments, connected, primaryEnvironment, environment, waitingFor } =
     useDiagnosticsEnvironment(selectedEnvironmentId, setSelectedEnvironmentId);
   if (environment === null) return null;
+  const isPrimary = environment.environmentId === primaryEnvironment?.environmentId;
+  const supported =
+    environment.serverConfig !== null && environment.serverConfig.mcpLaunch !== undefined;
   return (
-    <SettingsSection title="Agent integrations">
+    <SettingsSection
+      title="Agent integrations"
+      headerAction={
+        <IntegrationsStatus
+          key={environment.environmentId}
+          environmentId={environment.environmentId}
+          isPrimary={isPrimary}
+          supported={supported}
+        />
+      }
+    >
       {connected.length > 1 || waitingFor !== undefined ? (
         <SettingsRow
           title="Environment"
@@ -136,13 +160,81 @@ export function AgentIntegrationsSection() {
           }
         />
       ) : null}
-      <EnvironmentMcpServer
-        key={environment.environmentId}
-        environment={environment}
-        isPrimary={environment.environmentId === primaryEnvironment?.environmentId}
-      />
-      {environment.environmentId === primaryEnvironment?.environmentId ? <McpAgentsPanel /> : null}
+      <Tabs
+        value={tab}
+        onValueChange={(next) => setTab(next === "webhooks" ? "webhooks" : "mcp")}
+        className="gap-0"
+      >
+        <div className="border-t border-border/60 px-4 py-3 first:border-t-0 sm:px-5">
+          <TabsList aria-label="Agent integrations">
+            <TabsTab value="mcp">MCP</TabsTab>
+            <TabsTab value="webhooks">Webhooks</TabsTab>
+          </TabsList>
+        </div>
+        <TabsPanel value="mcp" className="gap-0">
+          <EnvironmentMcpServer
+            key={environment.environmentId}
+            environment={environment}
+            isPrimary={isPrimary}
+          />
+          {isPrimary ? <McpAgentsPanel /> : null}
+        </TabsPanel>
+        <TabsPanel value="webhooks" className="gap-0">
+          <WebhooksTab
+            key={environment.environmentId}
+            environmentId={environment.environmentId}
+            isPrimary={isPrimary}
+            supported={supported}
+          />
+        </TabsPanel>
+      </Tabs>
     </SettingsSection>
+  );
+}
+
+/**
+ * The section header's summary: MCP on or off, the agents connected (known for the primary
+ * environment, whose access this app manages), and the webhook endpoints active and failing.
+ */
+function IntegrationsStatus({
+  environmentId,
+  isPrimary,
+  supported,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly isPrimary: boolean;
+  readonly supported: boolean;
+}) {
+  const mcpEnabled = useEnvironmentSettings(environmentId, selectEnabled);
+  const webhooksEnabled = useEnvironmentSettings(environmentId, selectWebhooksEnabled);
+  const clients = usePrimaryMcpClients();
+  const webhooks = useWebhookList(supported ? environmentId : null);
+  if (!supported) return null;
+  const parts = [mcpEnabled ? "MCP on" : "MCP off"];
+  if (isPrimary) {
+    const connected = clients.filter((client) => client.connected).length;
+    parts.push(`${connected} ${connected === 1 ? "agent" : "agents"} connected`);
+  }
+  const endpoints = webhooks.data?.endpoints;
+  if (!webhooksEnabled) {
+    parts.push("Webhooks off");
+  } else if (endpoints !== undefined) {
+    let failing = 0;
+    let active = 0;
+    for (const endpoint of endpoints) {
+      if (isFailingEndpoint(endpoint)) failing += 1;
+      else if (endpoint.enabled) active += 1;
+    }
+    parts.push(
+      failing > 0
+        ? `${active} ${active === 1 ? "webhook" : "webhooks"} active, ${failing} failing`
+        : `${active} ${active === 1 ? "webhook" : "webhooks"} active`,
+    );
+  }
+  return (
+    <p role="status" className="text-xs whitespace-nowrap text-muted-foreground">
+      {parts.join(" · ")}
+    </p>
   );
 }
 

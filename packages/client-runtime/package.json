@@ -51,6 +51,10 @@
       "types": "./src/state/uiIntents.ts",
       "default": "./src/state/uiIntents.ts"
     },
+    "./state/webhooks": {
+      "types": "./src/state/webhooks.ts",
+      "default": "./src/state/webhooks.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"

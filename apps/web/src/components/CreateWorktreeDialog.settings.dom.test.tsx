@@ -155,6 +155,12 @@ vi.mock("~/state/mcpActivity", () => ({
   usePrimaryMcpClients: () => [],
   takenOverLevel: () => null,
 }));
+// …and its header summarizes the webhook endpoints.
+vi.mock("~/state/webhooks", () => ({
+  useWebhookList: () => ({ data: null, error: null, refresh: vi.fn() }),
+  isFailingEndpoint: () => false,
+  webhooksEnvironment: {},
+}));
 vi.mock("~/state/worktrees", () => ({ worktreeEnvironment: { createManaged: h.createManaged } }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
 vi.mock("~/centerPanelStore", () => ({

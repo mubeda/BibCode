@@ -17,12 +17,7 @@ export const WEBHOOK_EVENT_CATEGORIES = [
   { key: "approvals", events: ["approval.requested", "approval.resolved"] },
   {
     key: "operations",
-    events: [
-      "clone.completed",
-      "scm.operation_completed",
-      "transfer.completed",
-      "transfer.failed",
-    ],
+    events: ["clone.completed", "scm.operation_completed", "transfer.completed", "transfer.failed"],
   },
   { key: "diagnostics", events: ["profiler.finding"] },
 ] as const;
