@@ -55,6 +55,15 @@ vi.mock("../../state/mcpActivity", () => ({
 
 // Covered by its own tests; here only its place in the MCP tab matters.
 vi.mock("./McpAgentsPanel", () => ({ McpAgentsPanel: () => <div data-testid="agents-panel" /> }));
+vi.mock("./McpRemoteAgentsPanel", () => ({
+  McpRemoteAgentsPanel: (props: AnyProps) => (
+    <div
+      data-testid="remote-agents-panel"
+      data-environment={props.environmentId as string}
+      data-primary={String(props.isPrimary)}
+    />
+  ),
+}));
 
 vi.mock("./WebhooksTab", () => ({
   WebhooksTab: (props: AnyProps) => (
@@ -375,6 +384,12 @@ describe("AgentIntegrationsSection", () => {
     expect(tabs).toEqual(["MCP", "Webhooks"]);
     expect(container.querySelector('[aria-label="MCP server"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="webhooks-tab"]')).toBeNull();
+    // Remote agents and their requests to connect sit in the MCP tab, after the Agents list.
+    const remote = container.querySelector('[data-testid="remote-agents-panel"]');
+    expect(remote?.getAttribute("data-environment")).toBe("local");
+    expect(remote?.getAttribute("data-primary")).toBe("true");
+    const agents = container.querySelector('[data-testid="agents-panel"]')!;
+    expect(agents.compareDocumentPosition(remote!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const webhooksTab = [...container.querySelectorAll<HTMLElement>('[role="tab"]')].find(
       (tab) => tab.textContent === "Webhooks",
     )!;

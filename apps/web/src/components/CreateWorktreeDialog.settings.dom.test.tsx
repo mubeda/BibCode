@@ -85,6 +85,8 @@ vi.mock("~/state/server", () => ({
 vi.mock("~/state/environments", () => ({
   usePrimaryEnvironment: () => ({ environmentId: "local" }),
   usePrimaryEnvironmentId: () => "local",
+  // Agent integrations' Remote agents row reads the environment's address (#139, slice R).
+  useEnvironmentHttpBaseUrl: () => null,
   // Settings → Agents also mounts Agent integrations, which picks among connected environments.
   useEnvironments: () => ({
     environments: [

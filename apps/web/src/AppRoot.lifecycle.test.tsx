@@ -85,6 +85,9 @@ vi.mock("./components/ServerReloadPrompt", () => ({
 vi.mock("./components/UiIntentNotifier", () => ({
   UiIntentNotifier: () => null,
 }));
+vi.mock("./components/McpAuthorizationNotifier", () => ({
+  McpAuthorizationNotifier: () => null,
+}));
 
 vi.mock("./components/preview/previewBridge", () => ({ previewBridge: null }));
 

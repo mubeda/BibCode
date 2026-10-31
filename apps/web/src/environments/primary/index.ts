@@ -32,6 +32,7 @@ export {
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   setServerMcpClientAccess,
+  decideServerMcpAuthorization,
   stopServerMcpClient,
   revokeServerPairingLink,
   stripPairingTokenFromUrl,
