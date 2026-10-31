@@ -83,6 +83,7 @@ function intent(overrides: Partial<UiFocusIntent> = {}): UiFocusIntent {
     actor: { kind: "mcp-client", clientId: "session-1", label: "Claude Code" },
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    expiresInMs: 60_000,
     ...overrides,
   };
 }
