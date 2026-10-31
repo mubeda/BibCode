@@ -107,6 +107,7 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/auth/pairing-links/revoke"),
     route(RouteMethod::Get, "/api/auth/clients"),
     route(RouteMethod::Post, "/api/auth/clients/revoke"),
+    route(RouteMethod::Post, "/api/auth/clients/mcp-access"),
     route(RouteMethod::Post, "/api/auth/clients/revoke-others"),
     route(RouteMethod::Get, "/api/orchestration/snapshot"),
     route(RouteMethod::Post, "/api/orchestration/dispatch"),

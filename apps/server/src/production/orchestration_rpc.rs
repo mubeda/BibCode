@@ -149,6 +149,10 @@ fn register_orchestration_rpc_inner(
                     .map_err(|error| {
                         orchestration_error("OrchestrationDispatchCommandError", error)
                     })?;
+                // Who sent it comes from the authenticated principal only (#139, slice X1).
+                if let Some(actor) = crate::mcp::activity::principal_actor(&context).await {
+                    command_claim.attribute_to(actor);
+                }
                 if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
                     let workspace_admission = if let Some(availability) = &availability {
                         Some(
@@ -1659,6 +1663,13 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
                     if let Some(resend_of) = &row.resend_of_message_id {
                         message["resendOf"] = json!(resend_of);
                     }
+                    // Who sent it and where from (#139, slices X1 and X4).
+                    if let Some(actor) = &row.actor {
+                        message["actor"] = actor.clone();
+                    }
+                    if let Some(source_thread_id) = &row.source_thread_id {
+                        message["sourceThreadId"] = json!(source_thread_id);
+                    }
                     message
                 })
                 .collect(),
@@ -2100,6 +2111,9 @@ fn thread_shell_with_records(
     if let Some(host_thread_id) = &thread.host_thread_id {
         shell["hostThreadId"] = json!(host_thread_id);
     }
+    if let Some(requester) = &thread.requester {
+        shell["requester"] = requester.clone();
+    }
     if let Some(last_activity_at) = &thread.last_activity_at {
         shell["lastActivityAt"] = json!(last_activity_at);
     }
@@ -2389,6 +2403,7 @@ mod tests {
                 pending_approval_count: 0,
                 pending_user_input_count: 0,
                 last_activity_at: None,
+                requester: None,
                 has_actionable_proposed_plan: 0,
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,
@@ -2413,6 +2428,8 @@ mod tests {
                     delivery_mode: None,
                     delivery_held: None,
                     resend_of_message_id: None,
+                    actor: None,
+                    source_thread_id: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.000Z".to_owned(),
                 },
@@ -2432,6 +2449,8 @@ mod tests {
                     delivery_mode: None,
                     delivery_held: None,
                     resend_of_message_id: None,
+                    actor: None,
+                    source_thread_id: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.001Z".to_owned(),
                 },
@@ -2451,6 +2470,8 @@ mod tests {
                     delivery_mode: None,
                     delivery_held: None,
                     resend_of_message_id: None,
+                    actor: None,
+                    source_thread_id: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.002Z".to_owned(),
                 },
@@ -2470,6 +2491,8 @@ mod tests {
                     delivery_mode: None,
                     delivery_held: None,
                     resend_of_message_id: None,
+                    actor: None,
+                    source_thread_id: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.003Z".to_owned(),
                 },
@@ -2489,6 +2512,8 @@ mod tests {
                     delivery_mode: None,
                     delivery_held: None,
                     resend_of_message_id: None,
+                    actor: None,
+                    source_thread_id: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.004Z".to_owned(),
                 },
@@ -2508,6 +2533,8 @@ mod tests {
                     delivery_mode: None,
                     delivery_held: None,
                     resend_of_message_id: None,
+                    actor: None,
+                    source_thread_id: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
                 },
@@ -2657,6 +2684,8 @@ mod tests {
             delivery_mode: None,
             delivery_held: None,
             resend_of_message_id: None,
+            actor: None,
+            source_thread_id: None,
             created_at: created_at.to_owned(),
             updated_at: created_at.to_owned(),
         }

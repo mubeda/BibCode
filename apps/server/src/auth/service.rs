@@ -100,6 +100,9 @@ pub struct AuthService {
     pairing_offer_issuance: Arc<Mutex<()>>,
     repositories: Option<Repositories>,
     access_events: Arc<broadcast::Sender<AuthAccessEvent>>,
+    /// Outside agents a person stopped (#139, slice X1): revoked with `interruptTurns`, so the
+    /// MCP service interrupts their running turns. A plain revocation is not a stop.
+    mcp_stops: Arc<broadcast::Sender<String>>,
     access_revision: Arc<AtomicU64>,
     authority_watcher_running: Arc<AtomicBool>,
     /// Redeemed single-use websocket ticket ids, pruned by expiry.
@@ -295,6 +298,28 @@ pub(crate) enum PairingOfferReplay {
     Fresh,
 }
 
+/// The MCP access levels, lowest first (the same names as `McpAccess`).
+const MCP_ACCESS_LEVELS: [&str; 4] = [
+    "read-only",
+    "approval-required",
+    "auto-accept-edits",
+    "full-access",
+];
+
+/// What [`AuthService::set_mcp_access`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpAccessChange {
+    Changed,
+    /// No live session has this id.
+    NotFound,
+    /// The session is not an outside agent's.
+    NotAnAgent,
+    /// The level is not an MCP access level.
+    InvalidAccess,
+    /// Only `read-only`, or the level Take over replaced, may be set.
+    NotTheHandBack,
+}
+
 pub(crate) enum PairingOfferIssuance {
     Reserved(PairingCredentialResult),
     Replay(PairingOfferReplay),
@@ -338,6 +363,8 @@ struct SessionRecord {
     off_host: Option<bool>,
     /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
     mcp_access: Option<String>,
+    /// The access a person's Take over replaced, which Hand back restores (#139, slice X1).
+    mcp_access_hand_back: Option<String>,
     delivery_state: AuthSessionDeliveryState,
 }
 
@@ -535,6 +562,7 @@ impl AuthService {
             pairing_offer_issuance: Arc::new(Mutex::new(())),
             repositories,
             access_events: Arc::new(access_events),
+            mcp_stops: Arc::new(broadcast::channel(ACCESS_EVENT_CAPACITY).0),
             access_revision: Arc::new(AtomicU64::new(1)),
             authority_watcher_running: Arc::new(AtomicBool::new(false)),
             redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1821,6 +1849,115 @@ impl AuthService {
         self.revoke_session(target_session_id).await
     }
 
+    /// **Stop** (#139, slice X1): revokes an outside agent, which ends its calls and owned
+    /// mutations, then tells the MCP service to interrupt the turns it is running. Only a
+    /// session this call revoked is announced, so a plain revocation (the `bibcode thread`
+    /// CLI revokes its own credential on the way out) never interrupts anything.
+    pub async fn stop_client(
+        &self,
+        current_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<bool, AuthError> {
+        let revoked = self
+            .revoke_client(current_session_id, target_session_id)
+            .await?;
+        if revoked {
+            let _ = self.mcp_stops.send(target_session_id.to_owned());
+        }
+        Ok(revoked)
+    }
+
+    /// The outside agents a person stopped, as their session ids.
+    pub(crate) fn subscribe_mcp_stops(&self) -> broadcast::Receiver<String> {
+        self.mcp_stops.subscribe()
+    }
+
+    /// The Authorized clients label of a live session.
+    pub(crate) async fn client_label(&self, session_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.client.label.clone())
+    }
+
+    /// **Take over** and **Hand back** (#139, slice X1). `read-only` remembers the level it
+    /// replaces; any other level must be that remembered level, so this never raises an agent
+    /// above what it was paired with. A change cancels the session's live work, so its owned
+    /// mutations stop (C4), and its next mutating call is refused.
+    pub(crate) async fn set_mcp_access(
+        &self,
+        target_session_id: &str,
+        access: &str,
+    ) -> Result<McpAccessChange, AuthError> {
+        if !MCP_ACCESS_LEVELS.contains(&access) {
+            return Ok(McpAccessChange::InvalidAccess);
+        }
+        let (next, hand_back) =
+            {
+                let state = self.state.lock().await;
+                let now = now_ms();
+                let Some(session) = state.sessions.get(target_session_id).filter(|session| {
+                    session.revoked_at_ms.is_none() && session.expires_at_ms > now
+                }) else {
+                    return Ok(McpAccessChange::NotFound);
+                };
+                if session.subject != MCP_CLIENT_SUBJECT {
+                    return Ok(McpAccessChange::NotAnAgent);
+                }
+                let current = session
+                    .mcp_access
+                    .clone()
+                    .unwrap_or_else(|| "read-only".to_owned());
+                if access == "read-only" {
+                    // Taking over twice keeps the first level.
+                    let hand_back = session
+                        .mcp_access_hand_back
+                        .clone()
+                        .or_else(|| (current != "read-only").then_some(current));
+                    ("read-only".to_owned(), hand_back)
+                } else if session.mcp_access_hand_back.as_deref() == Some(access) {
+                    (access.to_owned(), None)
+                } else {
+                    return Ok(McpAccessChange::NotTheHandBack);
+                }
+            };
+        if let Some(repositories) = &self.repositories {
+            let updated = repositories
+                .set_auth_session_mcp_access(
+                    target_session_id.to_owned(),
+                    next.clone(),
+                    hand_back.clone(),
+                )
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if !updated {
+                return Ok(McpAccessChange::NotFound);
+            }
+        }
+        let mut state = self.state.lock().await;
+        let Some(session) = state.sessions.get_mut(target_session_id) else {
+            return Ok(McpAccessChange::NotFound);
+        };
+        session.mcp_access = Some(next);
+        session.mcp_access_hand_back = hand_back;
+        let view = session.view(false);
+        // The session stays, so its connection guards still count themselves out.
+        for shutdown in state
+            .live_connections
+            .get(target_session_id)
+            .into_iter()
+            .flat_map(HashMap::values)
+        {
+            shutdown.cancel();
+        }
+        state.bump_authority_generation();
+        drop(state);
+        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        Ok(McpAccessChange::Changed)
+    }
+
     pub(crate) async fn revoke_failed_pairing_session(
         &self,
         session_id: &str,
@@ -2189,6 +2326,7 @@ impl AuthService {
             reach,
             off_host,
             mcp_access,
+            mcp_access_hand_back: None,
             delivery_state,
         };
         {
@@ -2363,6 +2501,9 @@ impl SessionRecord {
             connected: self.connected_count > 0,
             current,
             reach: self.reach.clone(),
+            // An outside agent's access, and what Take over replaced (#139, slice X1).
+            mcp_access: self.mcp_access.clone(),
+            mcp_access_hand_back: self.mcp_access_hand_back.clone(),
         }
     }
 }
@@ -2639,6 +2780,7 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
         reach: row.reach,
         off_host: row.off_host,
         mcp_access: row.mcp_access,
+        mcp_access_hand_back: row.mcp_access_hand_back,
         delivery_state: row.delivery_state,
     })
 }
@@ -5254,6 +5396,7 @@ mod tests {
                         reach: None,
                         off_host: None,
                         mcp_access: None,
+                        mcp_access_hand_back: None,
                         delivery_state: AuthSessionDeliveryState::Active,
                     },
                 );

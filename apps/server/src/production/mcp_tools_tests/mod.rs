@@ -3,6 +3,7 @@
 //! provider is faked: its events are dispatched to the engine as a provider runtime would.
 //! Each tool family has its own file; this one holds the shared harness.
 
+mod attribution;
 mod diagnostics;
 mod foundation;
 mod git;

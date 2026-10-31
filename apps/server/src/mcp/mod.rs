@@ -1,3 +1,4 @@
+pub(crate) mod activity;
 pub mod control;
 pub mod endpoint;
 pub(crate) mod outcome;

@@ -186,6 +186,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_stream("subscribeAuthAccess"),
     read_stream("subscribeDiscoveredLocalServers"),
     read_stream("subscribeGitManagerSignal"),
+    read_stream("subscribeMcpActivity"),
     read_stream("subscribePreviewEvents"),
     read_stream("subscribeProjectEntries"),
     read_stream("subscribeServerConfig"),

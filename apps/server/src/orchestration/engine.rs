@@ -144,7 +144,18 @@ pub struct ThreadMessageInput {
     pub role: String,
     pub text: String,
     pub attachments: Vec<Value>,
+    /// The thread this message came from (a chat panel's provenance, slice X4); it must be a
+    /// live thread of the same project.
+    #[serde(
+        rename = "sourceThreadId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_thread_id: Option<String>,
 }
+
+/// The longest `purpose` a created thread may carry.
+pub const MAX_THREAD_PURPOSE_CHARS: usize = 200;
 
 /// One historical message appended by `thread.history.import`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +247,9 @@ pub struct ThreadTurnStartBootstrapCreateThread {
     #[serde(default)]
     pub worktree_path: Option<String>,
     pub created_at: String,
+    /// Why an outside agent creates the thread (#139, slice X1), as on `thread.create`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -463,6 +477,10 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         host_thread_id: Option<String>,
+        /// Why an outside agent created the thread (untrusted text, at most 200 characters);
+        /// shown with the agent's label, never logged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
         #[serde(rename = "modelSelection")]
         model_selection: Value,
         #[serde(rename = "runtimeMode")]
@@ -1623,6 +1641,9 @@ pub(crate) struct CommandAdmissionClaim {
 
 struct CommandAdmissionClaimInner {
     command_id: String,
+    /// Who sent the command, stamped by the server from the authenticated principal (#139,
+    /// slice X1). Never read from the command itself, so no client can claim an actor.
+    actor: std::sync::OnceLock<Value>,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -1646,6 +1667,7 @@ impl CommandAdmissionFence {
         CommandAdmissionClaim {
             inner: Arc::new(CommandAdmissionClaimInner {
                 command_id: command_id.to_owned(),
+                actor: std::sync::OnceLock::new(),
                 _guard: gate.lock_owned().await,
             }),
         }
@@ -1671,6 +1693,16 @@ impl CommandAdmissionClaim {
                 command_id: command_id.to_owned(),
             })
         }
+    }
+
+    /// Attributes every event this claim's command plans to `actor` (`metadata.actor`). The
+    /// first attribution wins.
+    pub(crate) fn attribute_to(&self, actor: Value) {
+        let _ = self.inner.actor.set(actor);
+    }
+
+    fn actor(&self) -> Option<&Value> {
+        self.inner.actor.get()
     }
 }
 
@@ -3507,6 +3539,12 @@ async fn process_envelope(
         ));
     }
 
+    if let Some(actor) = command_claim.actor() {
+        for event in &mut planned {
+            event.metadata["actor"] = actor.clone();
+        }
+    }
+
     reserve_project_create_side_effect(
         repositories,
         command_claim,
@@ -4290,6 +4328,7 @@ async fn plan_command(
             title,
             kind,
             host_thread_id,
+            purpose,
             model_selection,
             runtime_mode,
             interaction_mode,
@@ -4298,6 +4337,15 @@ async fn plan_command(
             created_at,
         } => {
             require_project(model, command, project_id)?;
+            if purpose
+                .as_deref()
+                .is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS)
+            {
+                return invariant(
+                    command,
+                    format!("A thread's purpose is at most {MAX_THREAD_PURPOSE_CHARS} characters."),
+                );
+            }
             if kind.as_deref() == Some("default")
                 && model.threads.values().any(|thread| {
                     thread.project_id == project_id.as_str()
@@ -4340,6 +4388,7 @@ async fn plan_command(
                 "hostThreadId",
                 host_thread_id.as_ref().map(|v| json!(v)),
             );
+            insert_optional(&mut payload, "purpose", purpose.as_ref().map(|v| json!(v)));
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -4557,6 +4606,35 @@ async fn plan_command(
                         );
                     };
                     require_project(model, command, &create.project_id)?;
+                    if create
+                        .purpose
+                        .as_deref()
+                        .is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS)
+                    {
+                        return invariant(
+                            command,
+                            format!(
+                                "A thread's purpose is at most {MAX_THREAD_PURPOSE_CHARS} characters."
+                            ),
+                        );
+                    }
+                    let mut created_payload = json!({
+                        "threadId":thread_id,
+                        "projectId":create.project_id,
+                        "title":create.title,
+                        "modelSelection":create.model_selection,
+                        "runtimeMode":create.runtime_mode,
+                        "interactionMode":create.interaction_mode,
+                        "branch":create.branch,
+                        "worktreePath":create.worktree_path,
+                        "createdAt":create.created_at,
+                        "updatedAt":create.created_at,
+                    });
+                    insert_optional(
+                        &mut created_payload,
+                        "purpose",
+                        create.purpose.as_ref().map(|v| json!(v)),
+                    );
                     let event = make_event(
                         "thread.created",
                         "thread",
@@ -4564,18 +4642,7 @@ async fn plan_command(
                         &create.created_at,
                         command_id,
                         metadata.clone(),
-                        json!({
-                            "threadId":thread_id,
-                            "projectId":create.project_id,
-                            "title":create.title,
-                            "modelSelection":create.model_selection,
-                            "runtimeMode":create.runtime_mode,
-                            "interactionMode":create.interaction_mode,
-                            "branch":create.branch,
-                            "worktreePath":create.worktree_path,
-                            "createdAt":create.created_at,
-                            "updatedAt":create.created_at,
-                        }),
+                        created_payload,
                     );
                     (
                         ThreadState {
@@ -4621,6 +4688,24 @@ async fn plan_command(
                     );
                 }
             }
+            if let Some(source_thread_id) = &message.source_thread_id
+                && !model.threads.get(source_thread_id).is_some_and(|source| {
+                    source.deleted_at.is_none() && source.project_id == thread.project_id
+                })
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "Source thread '{source_thread_id}' is not a live thread of this project."
+                    ),
+                );
+            }
+            let mut user_payload = json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at});
+            insert_optional(
+                &mut user_payload,
+                "sourceThreadId",
+                message.source_thread_id.as_ref().map(|v| json!(v)),
+            );
             let user = make_event(
                 "thread.message-sent",
                 "thread",
@@ -4628,7 +4713,7 @@ async fn plan_command(
                 created_at,
                 command_id,
                 metadata.clone(),
-                json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
+                user_payload,
             );
             if *queued == Some(true) {
                 return Ok(created.into_iter().chain([user]).collect());
@@ -6837,10 +6922,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -6865,6 +6950,14 @@ fn apply_threads_projector_tx(
                 required_str(payload, "createdAt")?,
                 required_str(payload, "updatedAt")?,
                 optional_string(payload.get("hostThreadId")),
+                event
+                    .event
+                    .metadata
+                    .get("actor")
+                    .map(|actor| json_string(
+                        &json!({ "actor": actor, "purpose": payload.get("purpose") }),
+                    ))
+                    .transpose()?,
             ],
         )?;
     } else {
@@ -7281,14 +7374,16 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (message_id) DO UPDATE SET \
            thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_messages.text || excluded.text WHEN excluded.text = '' THEN projection_thread_messages.text ELSE excluded.text END, \
            attachments_json = COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
            is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, \
-           resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id)",
+           resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id), \
+           actor_json = COALESCE(excluded.actor_json, projection_thread_messages.actor_json), \
+           source_thread_id = COALESCE(excluded.source_thread_id, projection_thread_messages.source_thread_id)",
         params![
             required_str(payload, "messageId")?,
             required_str(payload, "threadId")?,
@@ -7300,6 +7395,15 @@ fn apply_messages_projector_tx(
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
             optional_string(payload.get("resendOf")),
+            // Only a message a person would send carries who sent it.
+            event
+                .event
+                .metadata
+                .get("actor")
+                .filter(|_| payload.get("role").and_then(Value::as_str) == Some("user"))
+                .map(json_string)
+                .transpose()?,
+            optional_string(payload.get("sourceThreadId")),
         ],
     )?;
     Ok(())
@@ -8120,6 +8224,9 @@ fn upsert_projection_state_tx(
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
+    if event.metadata.get("actor").is_some() {
+        return "mcp-client";
+    }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",
         Some(command_id) if command_id.starts_with("server:") => "server",
@@ -8864,6 +8971,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -9125,6 +9233,7 @@ mod tests {
                         title: id.to_owned(),
                         kind: Some(kind.to_owned()),
                         host_thread_id: host.map(str::to_owned),
+                        purpose: None,
                         model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                         runtime_mode: "full-access".to_owned(),
                         interaction_mode: "default".to_owned(),
@@ -9466,6 +9575,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -10331,6 +10441,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host_id.clone()),
+                purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
                 interaction_mode: "default".to_owned(),
@@ -10415,6 +10526,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host.to_owned()),
+                purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
                 interaction_mode: "default".to_owned(),

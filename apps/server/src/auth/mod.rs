@@ -31,9 +31,11 @@ pub(crate) use pairing_offer::{mint_offline_pairing_offer, validate_pairing_offe
 pub(crate) use rpc::register_rpc_handlers;
 pub(crate) use scope::{ACTIVITY_READ_SCOPE, authorization_error, required_scope};
 pub(crate) use secret_store::{SecretStore, SecretStoreError};
+#[cfg(test)]
+pub(crate) use service::McpAccessChange;
 pub(crate) use service::{
     AuthError, AuthService, AuthenticatedConnectionGuard, DESKTOP_BOOTSTRAP_SUBJECT,
-    SessionTransport, default_standard_scopes, diagnostics_scopes,
+    MCP_CLIENT_SUBJECT, SessionTransport, default_standard_scopes, diagnostics_scopes,
     issue_administrative_pairing_link, issue_mcp_pairing_link, issue_offline_share_pairing,
 };
 pub(crate) use service::{format_iso, now_ms};

@@ -57,6 +57,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (53, "pull_request_snapshots"),
     (55, "projection_thread_reasoning"),
     (58, "mcp_tool_requests"),
+    (60, "mcp_activity"),
 ];
 
 #[derive(Debug, Error)]
@@ -691,6 +692,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(57, "ProjectionThreadAgentStatus", migration_057),
     Migration::new(58, "McpClientAccessAndRequests", migration_058),
     Migration::new(59, "McpToolOutcomes", migration_059),
+    Migration::new(60, "McpActorAttribution", migration_060),
 ];
 
 impl Migration {
@@ -2731,6 +2733,38 @@ fn migration_059(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_060(transaction: &Transaction<'_>) -> Result<()> {
+    // Who acted (#139, slice X1): the outside agent behind a user message, a message's source
+    // thread (a panel's provenance), and the agent and purpose behind a thread it created; the
+    // session's access before a person took it over, so Hand back restores exactly that; and
+    // one content-free row per mutating MCP tool call.
+    for (table, column) in [
+        ("projection_thread_messages", "actor_json"),
+        ("projection_thread_messages", "source_thread_id"),
+        ("projection_threads", "requester_json"),
+        ("auth_sessions", "mcp_access_hand_back"),
+    ] {
+        if table_exists(transaction, table)? && !table_has_column(transaction, table, column)? {
+            transaction.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_activity (
+           activity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+           occurred_at TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           label TEXT,
+           tool TEXT NOT NULL,
+           thread_id TEXT,
+           outcome TEXT NOT NULL,
+           target_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_activity_occurred_at
+           ON mcp_activity(occurred_at);",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2943,7 +2977,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59]
+            [59, 60]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -2963,6 +2997,43 @@ mod tests {
     }
 
     #[test]
+    fn migration_060_adds_attribution_columns_and_the_activity_log() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(59))?;
+        assert!(!table_exists(&connection, "mcp_activity")?);
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [60]
+        );
+        for (table, column) in [
+            ("projection_thread_messages", "actor_json"),
+            ("projection_thread_messages", "source_thread_id"),
+            ("projection_threads", "requester_json"),
+            ("auth_sessions", "mcp_access_hand_back"),
+        ] {
+            assert!(
+                connection
+                    .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+                    .is_ok(),
+                "{table}.{column}"
+            );
+        }
+        connection.execute(
+            "INSERT INTO mcp_activity (occurred_at, session_id, label, tool, thread_id, outcome, target_json) VALUES ('2026-10-30T00:00:00Z', 's', 'Claude Code', 'git_commit', 't', 'success', '{}')",
+            [],
+        )?;
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_060(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_055_adds_the_reasoning_projection_and_its_indexes() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(54))?;
@@ -2975,7 +3046,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59]
+            [55, 56, 57, 58, 59, 60]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3704,7 +3775,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=59).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=60).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3766,6 +3837,7 @@ mod tests {
                 (57, "ProjectionThreadAgentStatus"),
                 (58, "McpClientAccessAndRequests"),
                 (59, "McpToolOutcomes"),
+                (60, "McpActorAttribution"),
             ],
         );
         assert_eq!(
@@ -3862,7 +3934,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 43);
+        assert_eq!(second.len(), 44);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -3872,6 +3944,7 @@ mod tests {
         assert_eq!(second[40].id, 57);
         assert_eq!(second[41].id, 58);
         assert_eq!(second[42].id, 59);
+        assert_eq!(second[43].id, 60);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3883,7 +3956,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 32);
+        assert_eq!(application_table_count, 33);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3979,7 +4052,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59
+                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60
             ]
         );
         let policy = connection.query_row(
@@ -4018,7 +4091,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59
+                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60
             ]
         );
         let pin = connection.query_row(
@@ -4048,7 +4121,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59
+                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60
             ]
         );
         let pin = connection.query_row(
@@ -4189,7 +4262,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
+            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60]
         );
         assert_eq!(
             connection.query_row(
@@ -4218,7 +4291,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 26);
+        assert_eq!(applied.len(), 27);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -4245,6 +4318,7 @@ mod tests {
         assert_eq!(applied[23].id, 57);
         assert_eq!(applied[24].id, 58);
         assert_eq!(applied[25].id, 59);
+        assert_eq!(applied[26].id, 60);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

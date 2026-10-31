@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     mcp::{
+        activity::PURPOSE,
         control::{
             CLIENT_REQUEST_ID, Family, McpAccess, ProgressSink, ToolCall, ToolFuture, ToolResult,
             ToolSpec, invalid_argument, object_schema, storage_failure,
@@ -103,6 +104,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
                         "enum": ["approval-required", "auto-accept-edits", "full-access"],
                         "description": "The host thread's mode; this connection's limit unless set, and never above it.",
                     },
+                    "purpose": { "type": "string", "maxLength": 200, "description": PURPOSE },
                     "clientRequestId": request_id,
                 }),
                 &["projectId", "branch"],
@@ -277,9 +279,11 @@ impl ToolCall<'_> {
             "providerInstanceId",
             "model",
             "runtimeMode",
+            "purpose",
             "clientRequestId",
         ])?;
         let project_id = self.required("projectId")?;
+        let purpose = self.purpose()?;
         let branch = self.required("branch")?.trim();
         let new_branch = self.trimmed("newBranch")?;
         let base_branch = self.trimmed("baseBranch")?;
@@ -348,6 +352,7 @@ impl ToolCall<'_> {
                     "refName": branch,
                     "newRefName": new_branch,
                     "baseRefName": base_branch,
+                    "purpose": purpose,
                     "threadDefaults": {
                         "modelSelection": selection,
                         "runtimeMode": runtime_mode.as_str(),
