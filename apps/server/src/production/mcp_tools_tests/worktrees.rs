@@ -43,8 +43,8 @@ struct Fixture {
     harness: Harness,
     services: WorktreeCatalogRpcServices,
     catalog: WorktreeCatalogService,
-    _git: IsolatedGitConfig,
-    _root: TempDir,
+    git: IsolatedGitConfig,
+    root: TempDir,
 }
 
 impl Fixture {
@@ -118,8 +118,8 @@ impl Fixture {
             harness,
             services,
             catalog,
-            _git: git,
-            _root: root,
+            git,
+            root,
         }
     }
 
@@ -680,4 +680,65 @@ async fn a_removal_nobody_waits_for_still_writes_its_audit_line() {
         "{text}"
     );
     child.complete();
+}
+
+/// A plan whose prune impact is too long to show in full cannot confirm the prune: it would
+/// remove registrations the agent never saw. Unix only: the stale worktrees' long paths
+/// exceed Windows' path limit.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_plan_too_long_to_show_in_full_refuses_a_repository_wide_prune() {
+    let fixture = Fixture::new().await;
+    let (agent, _) = fixture.harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, path) = fixture.create(&agent, "gone").await;
+    let main = fixture.root.path().join("main");
+    // Stale registrations with long paths, so their prune impact outgrows one tool result.
+    let top = fixture.root.path().join("s".repeat(200));
+    let deep = top
+        .join("t".repeat(200))
+        .join("u".repeat(200))
+        .join("v".repeat(200));
+    for index in 0..100 {
+        let stale = deep.join(format!("stale-{index}"));
+        run_git(
+            &fixture.git,
+            &main,
+            &["worktree", "add", "--detach", stale.to_str().unwrap()],
+        );
+    }
+    std::fs::remove_dir_all(&top).expect("stale folders removed");
+    std::fs::remove_dir_all(&path).expect("folder removed outside BiBCode");
+    let plan = fixture.plan(&agent, &thread_id).await;
+    assert_eq!(plan["availability"], "missing-registered");
+    assert_eq!(plan["truncated"], true);
+    assert_eq!(plan["pruneImpactCount"], 101);
+    assert!(plan["pruneImpact"].as_array().unwrap().len() < 101);
+
+    let mut prune = removal(&plan, &thread_id, "cleanup");
+    prune["confirmRepositoryWidePrune"] = json!(true);
+    let refused = fixture.call(&agent, "remove_worktree", prune).await;
+    assert_eq!(
+        error_tag(&refused),
+        "McpPruneImpactTooLongError",
+        "{refused}"
+    );
+    let registrations = || {
+        std::fs::read_dir(main.join(".git/worktrees"))
+            .unwrap()
+            .count()
+    };
+    assert_eq!(registrations(), 101, "nothing was pruned");
+
+    // The marked token still names the current plan: without the prune, the catalog takes the
+    // removal and answers for itself (a missing folder among other stale ones needs a prune).
+    let unconfirmed = fixture
+        .call(
+            &agent,
+            "remove_worktree",
+            removal(&plan, &thread_id, "cleanup"),
+        )
+        .await;
+    assert_eq!(reason(&unconfirmed), "prune-confirmation-required");
+    assert_eq!(registrations(), 101, "nothing was pruned");
+    fixture.shutdown().await;
 }
