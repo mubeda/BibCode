@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use super::{
-    control::{ToolCall, invalid_argument, storage_failure},
+    control::{McpControl, ToolCall, invalid_argument, storage_failure},
     protocol::typed_tool_failure,
 };
 
@@ -36,30 +36,54 @@ pub(crate) struct ThreadTarget {
 impl ToolCall<'_> {
     /// The thread `thread_id` names and the folder it works in.
     pub(crate) async fn target(&self, thread_id: &str) -> Result<ThreadTarget, Value> {
-        let thread = self.thread(thread_id).await?;
-        let cwd = match thread.worktree_path.clone().filter(|path| !path.is_empty()) {
-            Some(path) => path,
-            None => {
-                self.control
-                    .repositories()
-                    .get_project(thread.project_id.clone())
-                    .await
-                    .map_err(storage_failure)?
-                    .ok_or_else(|| {
-                        typed_tool_failure(
-                            "McpProjectNotFoundError",
-                            "This thread's project is gone.",
-                        )
-                    })?
-                    .workspace_root
-            }
-        };
-        Ok(ThreadTarget {
-            project_id: thread.project_id.clone(),
-            thread,
-            cwd,
-        })
+        thread_target(self.control, thread_id).await
     }
+}
+
+/// The thread row, unless it is missing or deleted, or a typed failure naming it.
+pub(crate) async fn live_thread(
+    control: &McpControl,
+    thread_id: &str,
+) -> Result<crate::persistence::ProjectionThread, Value> {
+    control
+        .repositories()
+        .get_thread(thread_id.to_owned())
+        .await
+        .map_err(storage_failure)?
+        .filter(|thread| thread.deleted_at.is_none())
+        .ok_or_else(|| {
+            typed_tool_failure(
+                "McpThreadNotFoundError",
+                &format!("No thread {thread_id}; list_projects_and_threads lists them."),
+            )
+        })
+}
+
+/// The thread `thread_id` names and the folder it works in.
+pub(crate) async fn thread_target(
+    control: &McpControl,
+    thread_id: &str,
+) -> Result<ThreadTarget, Value> {
+    let thread = live_thread(control, thread_id).await?;
+    let cwd = match thread.worktree_path.clone().filter(|path| !path.is_empty()) {
+        Some(path) => path,
+        None => {
+            control
+                .repositories()
+                .get_project(thread.project_id.clone())
+                .await
+                .map_err(storage_failure)?
+                .ok_or_else(|| {
+                    typed_tool_failure("McpProjectNotFoundError", "This thread's project is gone.")
+                })?
+                .workspace_root
+        }
+    };
+    Ok(ThreadTarget {
+        project_id: thread.project_id.clone(),
+        thread,
+        cwd,
+    })
 }
 
 fn refused(message: &str) -> Value {

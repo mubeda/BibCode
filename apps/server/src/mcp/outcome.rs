@@ -8,7 +8,9 @@
 //! environment's MCP server is turned off, its ceiling drops to read-only, the session is
 //! revoked, or `McpControl` shuts down; the RPC handler receives that token, so Git and the
 //! hosting client stop as on a UI disconnect. Work the token interrupted is `unknown`, never
-//! success: a push cut off mid-flight may or may not have reached the remote. Turning a
+//! success: a push cut off mid-flight may or may not have reached the remote. So is work that
+//! returns a failure marked by [`outcome_unknown`] (a host that stopped answering after the
+//! request may have reached it), with the work's own failure kept. Turning a
 //! capability set off does not interrupt work in flight (C4 lists only the four controls);
 //! it refuses the next call.
 //!
@@ -67,6 +69,8 @@ pub(crate) enum Interruption {
     Restarted,
     /// The work ended but its outcome could not be written.
     Unrecorded,
+    /// The host or remote stopped answering after the request may have reached it.
+    NoAnswer,
 }
 
 impl Interruption {
@@ -80,6 +84,7 @@ impl Interruption {
             Self::StreamEnded => "stream-ended",
             Self::Restarted => "restarted",
             Self::Unrecorded => "unrecorded",
+            Self::NoAnswer => "no-answer",
         }
     }
 
@@ -93,6 +98,7 @@ impl Interruption {
             Self::StreamEnded => "the operation stopped reporting before it finished",
             Self::Restarted => "BiBCode restarted while it ran",
             Self::Unrecorded => "BiBCode could not save its outcome",
+            Self::NoAnswer => "the host stopped answering before it reported a result",
         }
     }
 }
@@ -107,7 +113,18 @@ pub(crate) fn unknown_failure(interruption: Interruption) -> Value {
         ),
     );
     failure["structuredContent"]["error"]["reason"] = interruption.reason().into();
+    outcome_unknown(failure)
+}
+
+/// Marks `failure` as the failure of work that may have taken effect: [`ToolCall::recorded`]
+/// stores it as `unknown`, never `failed`, and a keyed retry replays it unchanged.
+pub(crate) fn outcome_unknown(mut failure: Value) -> Value {
+    failure["structuredContent"]["error"]["outcome"] = "unknown".into();
     failure
+}
+
+fn is_outcome_unknown(failure: &Value) -> bool {
+    failure["structuredContent"]["error"]["outcome"] == "unknown"
 }
 
 /// The `clientRequestId`s whose recorded call runs in this process. A second call with the
@@ -144,6 +161,7 @@ enum Claimed {
 /// token.
 #[derive(Clone)]
 pub(crate) struct Owned {
+    control: McpControl,
     registry: RpcRegistry,
     context: RpcSessionContext,
     cancellation: CancellationToken,
@@ -157,6 +175,15 @@ impl Owned {
     /// The token the live controls fire; pass it on to anything the work starts.
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// The thread `thread_id` names and the folder it works in, resolved inside the work so a
+    /// keyed retry reads its recorded outcome even after the thread is gone.
+    pub(crate) async fn target(
+        &self,
+        thread_id: &str,
+    ) -> Result<super::target::ThreadTarget, Value> {
+        super::target::thread_target(&self.control, thread_id).await
     }
 
     /// Runs unary RPC method `tag` with the call's credential and checks (B1).
@@ -396,6 +423,7 @@ impl ToolCall<'_> {
             let (result, interruption) = controls.run(work(owned)).await;
             let state = match (&result, interruption) {
                 (_, Some(_)) => "unknown",
+                (Err(failure), None) if is_outcome_unknown(failure) => "unknown",
                 (Ok(_), None) => "done",
                 (Err(_), None) => "failed",
             };
@@ -433,6 +461,7 @@ impl ToolCall<'_> {
 
     fn owned(&self, cancellation: CancellationToken) -> Owned {
         Owned {
+            control: self.control.clone(),
             registry: self.control.registry().clone(),
             context: self.context(),
             cancellation,
