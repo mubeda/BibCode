@@ -4192,6 +4192,18 @@ test-first on `claude/v0131-139-x3`:
   The worst left is one event larger than the budget, parsed alone in its call, plus one
   small previous session update per session update in the window.
 
+**Codex review round 3 (2026-10-31).** One P2, confirmed in source and fixed test-first: the
+4 MiB budget charged only the events in the window, but a session update's mapping also
+parses the thread's previous session update, whose `lastError` is an uncapped provider
+message. Each session update in the window is now also charged that previous payload's
+`octet_length` (the same stream-index lookup, sizes only), so the window stops before the
+event whose lookup would pass the budget; the first event is kept and charged. Charging
+was chosen over skipping the comparison for an oversized previous payload, which would turn
+a `turn.completed` into a `session.status`. A previous update that is itself in the window
+is charged twice, which only makes the cut earlier. Test:
+`a_previous_session_update_the_read_consults_counts_toward_the_budget` (two threads whose
+running update holds a 20 MiB error: one `turn.completed` per call, each still mapped).
+
 ## X4 implementation notes (2026-10-31)
 
 X4 was implemented on `claude/v0131-139-x4`, from the batch tip `8d400e20df` (slice 1, the CLI,

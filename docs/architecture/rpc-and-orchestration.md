@@ -3562,9 +3562,10 @@ instead of failing the call.
   `rpc/session.rs` and fails on an `Mcp…Error` literal the table lacks.
 - **`changes_since`** reads `Repositories::read_change_feed` in one SQLite transaction: at
   most 5,000 events after the cursor's sequence (a thread's through its stream index),
-  stopped before the event whose transition-type payload would bring the bytes SQLite parses
-  past 4 MiB (`octet_length` reads each size from the record header; the first event is
-  always kept), of which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
+  stopped before the event whose transition-type payload, and for a session update the
+  previous session update its mapping reads, would bring the bytes SQLite parses past 4 MiB
+  (`octet_length` reads each size from the record header; the first event is always kept and
+  charged), of which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
   `thread.session-set` and the approval and input `thread.activity-appended` events come
   back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`
   (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`);
