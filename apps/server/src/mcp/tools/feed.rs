@@ -610,6 +610,11 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Open a new terminal.",
     ),
     (
+        "McpTerminalInputFullError",
+        "The terminal's input queue (1 MiB) is full because its program is not reading input; none of the write was taken.",
+        "Read the terminal with terminal_read, and write again once the program reads.",
+    ),
+    (
         "McpProfilerUnavailableError",
         "This server has no profiler storage it can read.",
         "Diagnose through the other diagnostics tools.",

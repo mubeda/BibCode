@@ -8835,9 +8835,11 @@ mod tests {
                     .expect("within the bound"),
             );
         }
+        // A full queue is an input refusal with its own code, not an I/O fault: the terminal
+        // RPC must not report it as a failed working-directory stat.
         assert!(matches!(
             writer.enqueue(&process, &chunk, false),
-            Err(TerminalError::Io(_))
+            Err(TerminalError::Input(error)) if error.code == "capacity"
         ));
         gate.open();
         for mut write in pending {

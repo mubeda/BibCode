@@ -19,7 +19,7 @@ use std::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::{PtyProcess, TerminalError};
+use super::{PtyProcess, TerminalError, input::TerminalInputError};
 
 /// The bytes one process may have queued or in flight before more input is refused.
 pub(crate) const MOST_QUEUED_INPUT_BYTES: usize = 1 << 20;
@@ -113,10 +113,7 @@ impl TerminalWriter {
             return Err(TerminalError::PublicationCancelled);
         }
         if self.queued.load(Ordering::Acquire) + length > MOST_QUEUED_INPUT_BYTES {
-            return Err(TerminalError::Io(
-                "the terminal's program is not reading its input, and its input queue is full"
-                    .to_owned(),
-            ));
+            return Err(TerminalInputError::queue_full().into());
         }
         if queue.is_none() {
             *queue = Some(self.start(Arc::clone(process))?);
