@@ -24,7 +24,7 @@ use super::{
 };
 
 /// Findings kept in memory and in the compacted file.
-const MAX_FINDINGS: usize = 1000;
+pub(super) const MAX_FINDINGS: usize = 1000;
 /// Resolved findings last seen longer ago than this are dropped when the file is compacted.
 const RESOLVED_TTL_DAYS: i64 = 7;
 const CRASH_KIND_PREFIX: &str = "crash.";
