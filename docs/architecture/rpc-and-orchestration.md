@@ -638,6 +638,36 @@ application surface. Its unary methods are:
 | `gitManager.commit`, `gitManager.undoCommit`, `gitManager.discard`                                            | `orchestration:operate` | Commit or amend selected paths, undo the latest eligible local commit, or discard whole-file changes.                                                                                                                   |
 | `gitManager.stagePartial`, `gitManager.unstagePartial`, `gitManager.discardPartial`                           | `orchestration:operate` | Apply a generation-checked patch to the index or working tree.                                                                                                                                                          |
 
+**Whole-file discard** (`gitManager.discard`, for the Changes view and MCP's
+`git_discard`) restores tracked paths from Git and sends untracked ones to the
+server's trash. A path whose folder resolves outside the checkout refuses the whole
+call before anything moves. On macOS and Linux the trash takes a path and resolves it
+later, so each entry is first staged by folder handle:
+
+1. The canonical checkout is opened, and each folder of the path below it, with
+   `O_DIRECTORY|O_NOFOLLOW`, so a folder that is, or turns into, a link is never
+   entered.
+2. The entry is `renameat`ed by that handle into a new `0700` folder
+   `<git_dir>/bibcode-discard/<uuid>/`, created and opened the same way. That
+   folder sits on the repository's file system; Git never writes there, and no
+   checkout operation can reach it.
+3. Before the trash runs, the staged path, resolved by string, must name the
+   folders (from the Git directory down) and the entry BiBCode holds, by device and
+   inode. After a trash that answered success, the entry must be gone from the held
+   folder. If either check fails, the entry goes back and is kept.
+4. A refused entry is renamed back, never over a file created meanwhile
+   (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`).
+
+A folder that is a link keeps its entry in `trashUnavailable`, also under
+`permitPermanent`. Any other staging failure, such as a Git directory on another
+file system or a missing entry, counts as a trash refusal, so `permitPermanent`
+still removes the entry through `git clean`. Because the trash took the staged
+path, **Put Back** does not return a file to the checkout; the Changes view says
+so on a macOS or Linux server. On Windows the move re-checks the canonical path and
+refuses a folder that is a reparse point, leaving the PowerShell call's own path
+resolution as the remaining window. After a permanent discard, the Changes view
+names any path still kept (an ignored file, or one in a linked folder).
+
 `subscribeGitManagerSignal` is the read-scoped generation/health stream described in
 the VCS section above. `gitManager.runOperation` is the one operate-scoped
 streaming command for branch lifecycle, fetch/pull/push, stash, merge, history
