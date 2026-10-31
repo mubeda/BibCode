@@ -3252,7 +3252,7 @@ mod discard_staging {
 
 /// A canonical Windows path without its `\\?\` prefix, which the Recycle Bin refuses.
 #[cfg(windows)]
-fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
     let stripped = {
         let text = path.to_string_lossy();
         match text.strip_prefix(r"\\?\UNC\") {
@@ -3264,7 +3264,7 @@ fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 

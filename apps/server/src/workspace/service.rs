@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 #[cfg(test)]
@@ -12,8 +12,11 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::crypto::{lowercase_hex, sha256_hex};
 
+use super::beneath::{self, Dir, Kind, Open};
 use super::entries::{self, BrowseResult};
-use super::paths::{canonical_existing_within, resolve_relative, safe_mutation_target};
+use super::paths::{
+    canonical_existing_within, normalize_root, resolve_relative, safe_mutation_target,
+};
 use super::{EntryKind, WorkspaceError};
 
 const READ_LIMIT_BYTES: usize = 1024 * 1024;
@@ -31,6 +34,12 @@ pub(crate) trait WorkspaceWriteHook: Send + Sync {
 
     /// Runs after a guarded write's precondition held and before it writes.
     fn after_precondition_check<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Runs after an operation's paths were checked against the root and before it touches
+    /// the file system: the window a folder swapped for a symlink would exploit.
+    fn after_containment_check<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -99,30 +108,121 @@ enum ScannedFile {
     },
 }
 
-/// Hashes a file's whole content in chunks, without holding it in memory.
-///
-/// `binary` matches `read_file`'s test: a NUL byte within the first read-limit bytes.
-fn scan_file_blocking(path: &Path) -> Result<ScannedFile, WorkspaceError> {
-    // Stat before opening, as `read_file` does: opening a named pipe with no writer for reading
-    // blocks, so a pipe put in place of the file would stall every check and guarded save.
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => {
+/// A canonical target under a canonical root: the folder that holds it and its name, so an
+/// operation can reach it through a held folder handle ([`Dir`]) rather than by path.
+#[derive(Clone)]
+struct Place {
+    root: PathBuf,
+    target: PathBuf,
+    folder: PathBuf,
+    name: OsString,
+}
+
+impl Place {
+    /// `target` (canonical, under the canonical `root`), split into its folder and name. The
+    /// root itself is not a file any operation here can address.
+    fn new(root: PathBuf, target: PathBuf) -> Result<Self, WorkspaceError> {
+        let split = (target != root)
+            .then(|| target.parent().zip(target.file_name()))
+            .flatten()
+            .map(|(folder, name)| (folder.to_path_buf(), name.to_os_string()));
+        let Some((folder, name)) = split else {
+            return Err(WorkspaceError::NotFile { path: target });
+        };
+        Ok(Self {
+            root,
+            target,
+            folder,
+            name,
+        })
+    }
+
+    /// An I/O failure as a workspace error: a folder found swapped for a symlink is the
+    /// path resolving outside the root, anything else the operation that failed.
+    fn fault(&self, operation: &'static str, error: std::io::Error) -> WorkspaceError {
+        if beneath::is_escape(&error) {
+            WorkspaceError::ResolvedPathOutsideRoot {
+                root: self.root.clone(),
+                resolved_path: self.target.clone(),
+            }
+        } else {
+            WorkspaceError::operation(operation, &self.target, error)
+        }
+    }
+
+    /// The target's folder, held open. With `create`, missing folders are made.
+    fn folder(&self, create: bool) -> Result<Dir, WorkspaceError> {
+        Dir::open(&self.root, &self.folder, create).map_err(|error| self.fault("open", error))
+    }
+
+    /// The target's folder when it exists, `None` when it does not.
+    fn existing_folder(&self) -> Result<Option<Dir>, WorkspaceError> {
+        match Dir::open(&self.root, &self.folder, false) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(self.fault("open", error)),
+        }
+    }
+
+    /// What is at the target now, without following a symlink at it.
+    fn kind(&self) -> Result<Kind, WorkspaceError> {
+        match self.existing_folder()? {
+            Some(dir) => dir
+                .kind(&self.name)
+                .map_err(|error| self.fault("stat", error)),
+            None => Ok(Kind::Missing),
+        }
+    }
+
+    /// The target opened for reading, refused unless it is a regular file.
+    fn open_regular(&self) -> Result<std::fs::File, WorkspaceError> {
+        let file = self
+            .folder(false)?
+            .open_file(&self.name, Open::Read)
+            .map_err(|error| self.fault("open", error))?;
+        let metadata = file.metadata().map_err(|error| self.fault("stat", error))?;
+        if !metadata.is_file() {
             return Err(WorkspaceError::NotFile {
-                path: path.to_path_buf(),
+                path: self.target.clone(),
             });
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ScannedFile::Missing);
-        }
-        Err(error) => return Err(WorkspaceError::operation("stat", path, error)),
+        Ok(file)
     }
-    let mut file = match std::fs::File::open(path) {
+}
+
+/// Runs blocking file work off the runtime.
+async fn blocking<T: Send + 'static>(
+    path: &Path,
+    work: impl FnOnce() -> Result<T, WorkspaceError> + Send + 'static,
+) -> Result<T, WorkspaceError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| WorkspaceError::operation("read", path, std::io::Error::other(error)))?
+}
+
+/// Hashes a file's whole content in chunks, without holding it in memory.
+///
+/// `binary` matches `read_file`'s test: a NUL byte within the first read-limit bytes. A named
+/// pipe put in place of the file is opened without blocking and refused as not a file.
+fn scan_file_blocking(place: &Place) -> Result<ScannedFile, WorkspaceError> {
+    match place.kind()? {
+        Kind::Missing => return Ok(ScannedFile::Missing),
+        Kind::File => {}
+        _ => {
+            return Err(WorkspaceError::NotFile {
+                path: place.target.clone(),
+            });
+        }
+    }
+    let mut file = match place.open_regular() {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(WorkspaceError::Operation { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
             return Ok(ScannedFile::Missing);
         }
-        Err(error) => return Err(WorkspaceError::operation("open", path, error)),
+        Err(error) => return Err(error),
     };
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; VERSION_SCAN_CHUNK_BYTES];
@@ -133,7 +233,7 @@ fn scan_file_blocking(path: &Path) -> Result<ScannedFile, WorkspaceError> {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(WorkspaceError::operation("read", path, error)),
+            Err(error) => return Err(place.fault("read", error)),
         };
         let chunk = &buffer[..read];
         if !binary && byte_length < READ_LIMIT_BYTES as u64 {
@@ -150,13 +250,9 @@ fn scan_file_blocking(path: &Path) -> Result<ScannedFile, WorkspaceError> {
     })
 }
 
-async fn scan_file(path: PathBuf) -> Result<ScannedFile, WorkspaceError> {
-    let path_for_error = path.clone();
-    tokio::task::spawn_blocking(move || scan_file_blocking(&path))
-        .await
-        .map_err(|error| {
-            WorkspaceError::operation("read", path_for_error, std::io::Error::other(error))
-        })?
+async fn scan_file(place: Place) -> Result<ScannedFile, WorkspaceError> {
+    let path = place.target.clone();
+    blocking(&path, move || scan_file_blocking(&place)).await
 }
 
 /// One lock per canonical file path, so a guarded write's check and write are atomic against
@@ -209,6 +305,9 @@ fn write_may_change_index_classification(logical_path: &str, effective_target: &
 pub struct WorkspaceService {
     permits: Arc<Semaphore>,
     path_locks: PathLocks,
+    /// The system trash `projects.deleteEntry { toTrash }` uses: the one Source Control's
+    /// discard uses. Without it a trash request answers `trash_unavailable`.
+    trash: Option<Arc<dyn crate::git::FileTrash>>,
     #[cfg(test)]
     write_hook: Option<Arc<dyn WorkspaceWriteHook>>,
 }
@@ -224,9 +323,16 @@ impl WorkspaceService {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent_operations.max(1))),
             path_locks: PathLocks::default(),
+            trash: None,
             #[cfg(test)]
             write_hook: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_trash(mut self, trash: Arc<dyn crate::git::FileTrash>) -> Self {
+        self.trash = Some(trash);
+        self
     }
 
     #[cfg(test)]
@@ -243,37 +349,84 @@ impl WorkspaceService {
             .map_err(|_| WorkspaceError::Cancelled)
     }
 
+    /// The test hook between an operation's containment check and its first file system call.
+    async fn containment_checked(&self, target: &Path) -> Result<(), WorkspaceError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.write_hook {
+            hook.after_containment_check(target).await?;
+        }
+        let _ = target;
+        Ok(())
+    }
+
+    /// `relative_path` under `root`, resolved through every symlink and checked to stay
+    /// inside: the place a read or write of an existing file acts on.
+    async fn existing_place(
+        &self,
+        root: &Path,
+        relative_path: &str,
+    ) -> Result<(Place, String), WorkspaceError> {
+        let (target, normalized) = resolve_relative(root, relative_path)?;
+        let (canonical_root, canonical_target) = canonical_existing_within(root, &target).await?;
+        self.containment_checked(&canonical_target).await?;
+        Ok((Place::new(canonical_root, canonical_target)?, normalized))
+    }
+
+    /// `relative_path` under `root`, with its deepest existing folder resolved and checked to
+    /// stay inside: the place a write or creation acts on.
+    async fn mutation_place(
+        &self,
+        root: &Path,
+        relative_path: &str,
+    ) -> Result<(Place, String), WorkspaceError> {
+        let (target, normalized) = resolve_relative(root, relative_path)?;
+        let target = safe_mutation_target(root, &target).await?;
+        let canonical_root = normalize_root(root, false).await?;
+        Ok((Place::new(canonical_root, target)?, normalized))
+    }
+
+    /// The entry `relative_path` names itself (a symlink at it is the entry, not its target),
+    /// in its folder resolved and checked to stay inside: the place a rename or delete acts on.
+    /// The entry's own target must stay inside too, as before.
+    async fn entry_place(&self, root: &Path, relative_path: &str) -> Result<Place, WorkspaceError> {
+        let (target, _) = resolve_relative(root, relative_path)?;
+        if !tokio::fs::try_exists(&target)
+            .await
+            .map_err(|error| WorkspaceError::operation("exists", &target, error))?
+        {
+            return Err(WorkspaceError::NotFound { path: target });
+        }
+        canonical_existing_within(root, &target).await?;
+        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+            return Err(WorkspaceError::PathOutsideRoot {
+                relative_path: relative_path.to_owned(),
+            });
+        };
+        let (canonical_root, folder) = canonical_existing_within(root, parent).await?;
+        Place::new(canonical_root, folder.join(name))
+    }
+
     pub async fn read_file(
         &self,
         root: &Path,
         relative_path: &str,
     ) -> Result<ReadFileResult, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (target, normalized_relative) = resolve_relative(root, relative_path)?;
-        let (_, canonical_target) = canonical_existing_within(root, &target).await?;
-        let path_for_error = canonical_target.clone();
-        let (bytes, byte_length) = tokio::task::spawn_blocking(move || {
-            let metadata = std::fs::metadata(&canonical_target)
-                .map_err(|error| WorkspaceError::operation("stat", &canonical_target, error))?;
-            if !metadata.is_file() {
-                return Err(WorkspaceError::NotFile {
-                    path: canonical_target,
-                });
-            }
-            let byte_length = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-            let mut file = std::fs::File::open(&canonical_target)
-                .map_err(|error| WorkspaceError::operation("open", &canonical_target, error))?;
+        let (place, normalized_relative) = self.existing_place(root, relative_path).await?;
+        let target = place.target.clone();
+        let (bytes, byte_length) = blocking(&target, move || {
+            let file = place.open_regular()?;
+            let byte_length = file
+                .metadata()
+                .map(|metadata| usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+                .map_err(|error| place.fault("stat", error))?;
             let mut bytes = Vec::with_capacity(byte_length.min(READ_LIMIT_BYTES));
-            file.by_ref()
-                .take(READ_LIMIT_BYTES as u64)
+            file.take(READ_LIMIT_BYTES as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|error| WorkspaceError::operation("read", &canonical_target, error))?;
-            Ok::<_, WorkspaceError>((bytes, byte_length))
+                .map_err(|error| place.fault("read", error))?;
+            Ok((bytes, byte_length))
         })
-        .await
-        .map_err(|error| {
-            WorkspaceError::operation("read", path_for_error, std::io::Error::other(error))
-        })??;
+        .await?;
         if bytes.contains(&0) {
             return Err(WorkspaceError::BinaryFile { path: target });
         }
@@ -293,9 +446,8 @@ impl WorkspaceService {
         relative_path: &str,
     ) -> Result<FileVersion, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (target, _) = resolve_relative(root, relative_path)?;
-        let canonical_target = match canonical_existing_within(root, &target).await {
-            Ok((_, canonical_target)) => canonical_target,
+        let place = match self.existing_place(root, relative_path).await {
+            Ok((place, _)) => place,
             Err(WorkspaceError::Operation { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -303,7 +455,7 @@ impl WorkspaceService {
             }
             Err(error) => return Err(error),
         };
-        Ok(match scan_file(canonical_target).await? {
+        Ok(match scan_file(place).await? {
             ScannedFile::Missing => FileVersion::Missing,
             ScannedFile::Present {
                 version, binary, ..
@@ -330,10 +482,10 @@ impl WorkspaceService {
         contents: &str,
     ) -> Result<WriteFileOutcome, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (target, normalized) = resolve_relative(root, relative_path)?;
-        let target = safe_mutation_target(root, &target).await?;
-        let _path_lock = self.path_locks.lock(&target).await;
-        self.write_target(target, normalized, contents).await
+        let (place, normalized) = self.mutation_place(root, relative_path).await?;
+        let _path_lock = self.path_locks.lock(&place.target).await;
+        self.containment_checked(&place.target).await?;
+        self.write_target(place, normalized, contents).await
     }
 
     /// Writes only when the file on disk is still the state the caller's contents were based on.
@@ -349,10 +501,11 @@ impl WorkspaceService {
         precondition: &WritePrecondition,
     ) -> Result<WriteFileOutcome, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (target, normalized) = resolve_relative(root, relative_path)?;
-        let target = safe_mutation_target(root, &target).await?;
-        let _path_lock = self.path_locks.lock(&target).await;
-        match (precondition, scan_file(target.clone()).await?) {
+        let (place, normalized) = self.mutation_place(root, relative_path).await?;
+        let _path_lock = self.path_locks.lock(&place.target).await;
+        self.containment_checked(&place.target).await?;
+        let target = place.target.clone();
+        match (precondition, scan_file(place.clone()).await?) {
             (WritePrecondition::Version { .. }, ScannedFile::Missing) => {
                 return Err(WorkspaceError::FileMissingOnDisk { path: target });
             }
@@ -371,33 +524,35 @@ impl WorkspaceService {
         if let Some(hook) = &self.write_hook {
             hook.after_precondition_check(&target).await?;
         }
-        self.write_target(target, normalized, contents).await
+        self.write_target(place, normalized, contents).await
     }
 
-    /// Writes in place, creating missing parents, preserving today's symlink-target behaviour.
+    /// Writes in place through the folder's handle, creating missing folders. The target is
+    /// canonical, so a write to a symlink inside the root writes the file it names, as before;
+    /// a symlink found at the name now (a dangling one, or a swap) is refused.
     async fn write_target(
         &self,
-        target: PathBuf,
+        place: Place,
         normalized: String,
         contents: &str,
     ) -> Result<WriteFileOutcome, WorkspaceError> {
-        let target_existed = tokio::fs::try_exists(&target)
-            .await
-            .map_err(|error| WorkspaceError::operation("exists", &target, error))?;
-        let parent_existed = match target.parent() {
-            Some(parent) => tokio::fs::try_exists(parent)
-                .await
-                .map_err(|error| WorkspaceError::operation("exists", parent, error))?,
-            None => true,
-        };
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| WorkspaceError::operation("make-directory", parent, error))?;
-        }
-        tokio::fs::write(&target, contents)
-            .await
-            .map_err(|error| WorkspaceError::operation("write-file", &target, error))?;
+        let target = place.target.clone();
+        let bytes = contents.as_bytes().to_vec();
+        let (target_existed, parent_existed) = blocking(&target, move || {
+            let parent_existed = place.existing_folder()?.is_some();
+            let dir = place.folder(true)?;
+            let target_existed = dir
+                .kind(&place.name)
+                .map_err(|error| place.fault("exists", error))?
+                != Kind::Missing;
+            let mut file = dir
+                .open_file(&place.name, Open::Write)
+                .map_err(|error| place.fault("write-file", error))?;
+            file.write_all(&bytes)
+                .map_err(|error| place.fault("write-file", error))?;
+            Ok((target_existed, parent_existed))
+        })
+        .await?;
         #[cfg(test)]
         if let Some(hook) = &self.write_hook {
             hook.after_write(&target).await?;
@@ -420,32 +575,27 @@ impl WorkspaceService {
         kind: EntryKind,
     ) -> Result<String, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (target, normalized) = resolve_relative(root, relative_path)?;
-        let target = safe_mutation_target(root, &target).await?;
-        if tokio::fs::try_exists(&target)
-            .await
-            .map_err(|error| WorkspaceError::operation("exists", &target, error))?
-        {
-            return Err(WorkspaceError::AlreadyExists { path: target });
-        }
-        match kind {
-            EntryKind::Directory => tokio::fs::create_dir_all(&target)
-                .await
-                .map_err(|error| WorkspaceError::operation("make-directory", &target, error))?,
-            EntryKind::File => {
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                        WorkspaceError::operation("make-directory", parent, error)
-                    })?;
-                }
-                tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)
-                    .await
-                    .map_err(|error| WorkspaceError::operation("write-file", &target, error))?;
+        let (place, normalized) = self.mutation_place(root, relative_path).await?;
+        self.containment_checked(&place.target).await?;
+        let target = place.target.clone();
+        blocking(&target, move || {
+            if place.kind()? != Kind::Missing {
+                return Err(WorkspaceError::AlreadyExists {
+                    path: place.target.clone(),
+                });
             }
-        }
+            match kind {
+                EntryKind::Directory => Dir::open(&place.root, &place.target, true)
+                    .map(drop)
+                    .map_err(|error| place.fault("make-directory", error)),
+                EntryKind::File => place
+                    .folder(true)?
+                    .open_file(&place.name, Open::CreateNew)
+                    .map(drop)
+                    .map_err(|error| place.fault("write-file", error)),
+            }
+        })
+        .await?;
         Ok(normalized)
     }
 
@@ -456,59 +606,85 @@ impl WorkspaceService {
         to_relative_path: &str,
     ) -> Result<String, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (from, _) = resolve_relative(root, from_relative_path)?;
-        if !tokio::fs::try_exists(&from)
-            .await
-            .map_err(|error| WorkspaceError::operation("exists", &from, error))?
-        {
-            return Err(WorkspaceError::NotFound { path: from });
-        }
-        canonical_existing_within(root, &from).await?;
-        let (to, normalized) = resolve_relative(root, to_relative_path)?;
-        let to = safe_mutation_target(root, &to).await?;
-        if tokio::fs::try_exists(&to)
-            .await
-            .map_err(|error| WorkspaceError::operation("exists", &to, error))?
-        {
-            return Err(WorkspaceError::AlreadyExists { path: to });
-        }
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| WorkspaceError::operation("make-directory", parent, error))?;
-        }
-        tokio::fs::rename(&from, &to)
-            .await
-            .map_err(|error| WorkspaceError::operation("rename", &from, error))?;
+        let from = self.entry_place(root, from_relative_path).await?;
+        let (to, normalized) = self.mutation_place(root, to_relative_path).await?;
+        self.containment_checked(&to.target).await?;
+        let target = from.target.clone();
+        blocking(&target, move || {
+            if to.kind()? != Kind::Missing {
+                return Err(WorkspaceError::AlreadyExists {
+                    path: to.target.clone(),
+                });
+            }
+            let from_dir = from.folder(false)?;
+            let to_dir = to.folder(true)?;
+            from_dir
+                .rename(&from.name, &to_dir, &to.name)
+                .map_err(|error| from.fault("rename", error))
+        })
+        .await?;
         Ok(normalized)
     }
 
+    /// Deletes the entry permanently: a folder with everything in it, or a file or symlink.
     pub async fn delete_entry(
         &self,
         root: &Path,
         relative_path: &str,
     ) -> Result<String, WorkspaceError> {
         let _permit = self.permit().await?;
-        let (target, normalized) = resolve_relative(root, relative_path)?;
-        if !tokio::fs::try_exists(&target)
+        let (_, normalized) = resolve_relative(root, relative_path)?;
+        let place = self.entry_place(root, relative_path).await?;
+        self.containment_checked(&place.target).await?;
+        let target = place.target.clone();
+        blocking(&target, move || {
+            let dir = place.folder(false)?;
+            match dir
+                .kind(&place.name)
+                .map_err(|error| place.fault("stat", error))?
+            {
+                Kind::Missing => {
+                    return Err(WorkspaceError::NotFound {
+                        path: place.target.clone(),
+                    });
+                }
+                Kind::Directory => dir.remove_dir_all(&place.name),
+                _ => dir.remove_file(&place.name),
+            }
+            .map_err(|error| place.fault("remove", error))
+        })
+        .await?;
+        Ok(normalized)
+    }
+
+    /// Moves the entry to the system trash (`projects.deleteEntry` with `toTrash`, #139 X5).
+    /// A trash that cannot take it leaves it in place and answers `trash_unavailable`; this
+    /// never falls back to deleting it.
+    pub async fn trash_entry(
+        &self,
+        root: &Path,
+        relative_path: &str,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, WorkspaceError> {
+        let _permit = self.permit().await?;
+        let (_, normalized) = resolve_relative(root, relative_path)?;
+        let place = self.entry_place(root, relative_path).await?;
+        let Some(trash) = self.trash.clone() else {
+            return Err(WorkspaceError::TrashUnavailable { path: place.target });
+        };
+        self.containment_checked(&place.target).await?;
+        let target = place.target.clone();
+        let checked = blocking(&target, move || {
+            place
+                .folder(false)?
+                .checked_path(&place.name)
+                .map_err(|error| place.fault("trash", error))
+        })
+        .await?;
+        trash
+            .trash(checked, cancellation)
             .await
-            .map_err(|error| WorkspaceError::operation("exists", &target, error))?
-        {
-            return Err(WorkspaceError::NotFound { path: target });
-        }
-        let (_, canonical_target) = canonical_existing_within(root, &target).await?;
-        let metadata = tokio::fs::metadata(&canonical_target)
-            .await
-            .map_err(|error| WorkspaceError::operation("stat", &canonical_target, error))?;
-        if metadata.is_dir() {
-            tokio::fs::remove_dir_all(&target)
-                .await
-                .map_err(|error| WorkspaceError::operation("remove", &target, error))?;
-        } else {
-            tokio::fs::remove_file(&target)
-                .await
-                .map_err(|error| WorkspaceError::operation("remove", &target, error))?;
-        }
+            .map_err(|_| WorkspaceError::TrashUnavailable { path: target })?;
         Ok(normalized)
     }
 
@@ -525,15 +701,7 @@ impl WorkspaceService {
         {
             return Err(WorkspaceError::NotFound { path: source });
         }
-        let (_, canonical_source) = canonical_existing_within(root, &source).await?;
-        let metadata = tokio::fs::metadata(&canonical_source)
-            .await
-            .map_err(|error| WorkspaceError::operation("stat", &canonical_source, error))?;
-        if !metadata.is_file() {
-            return Err(WorkspaceError::NotFile {
-                path: canonical_source,
-            });
-        }
+        let (source, _) = self.existing_place(root, relative_path).await?;
         let source_path = Path::new(&normalized_source);
         let extension = source_path.extension().map(OsString::from);
         let stem = source_path
@@ -553,21 +721,35 @@ impl WorkspaceService {
                 name.push(extension);
             }
             let relative = parent.join(name);
-            let (candidate, normalized) = resolve_relative(root, &relative.to_string_lossy())?;
-            let candidate = safe_mutation_target(root, &candidate).await?;
-            if !tokio::fs::try_exists(&candidate)
-                .await
-                .map_err(|error| WorkspaceError::operation("exists", &candidate, error))?
-            {
-                tokio::fs::copy(&canonical_source, &candidate)
-                    .await
-                    .map_err(|error| {
-                        WorkspaceError::operation("copy-file", &canonical_source, error)
-                    })?;
+            let (candidate, normalized) = self
+                .mutation_place(root, &relative.to_string_lossy())
+                .await?;
+            let source = source.clone();
+            let target = candidate.target.clone();
+            let copied = blocking(&target, move || {
+                let mut reader = source.open_regular()?;
+                let mut writer = match candidate
+                    .folder(false)?
+                    .open_file(&candidate.name, Open::CreateNew)
+                {
+                    Ok(writer) => writer,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(candidate.fault("copy-file", error)),
+                };
+                std::io::copy(&mut reader, &mut writer)
+                    .map_err(|error| source.fault("copy-file", error))?;
+                Ok(true)
+            })
+            .await?;
+            if copied {
                 return Ok(normalized);
             }
         }
-        Err(WorkspaceError::AlreadyExists { path: source })
+        Err(WorkspaceError::AlreadyExists {
+            path: source.target,
+        })
     }
 
     pub async fn browse(
@@ -985,5 +1167,148 @@ mod tests {
             closed.browse(".", Some(root.path()), false).await,
             Err(WorkspaceError::Cancelled)
         ));
+    }
+
+    /// Swaps `parent` for a symlink to `outside` the first time an operation passes its
+    /// containment check: the check-then-use race a handle-bound operation must survive.
+    #[cfg(unix)]
+    struct SwapAfterContainmentCheck {
+        parent: PathBuf,
+        outside: PathBuf,
+        swapped: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl SwapAfterContainmentCheck {
+        fn service(parent: PathBuf, outside: PathBuf) -> WorkspaceService {
+            WorkspaceService::default().with_write_hook_for_test(Arc::new(Self {
+                parent,
+                outside,
+                swapped: std::sync::atomic::AtomicBool::new(false),
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    impl WorkspaceWriteHook for SwapAfterContainmentCheck {
+        fn after_write<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn after_containment_check<'a>(
+            &'a self,
+            _target: &'a Path,
+        ) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async move {
+                if !self.swapped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::fs::rename(&self.parent, self.parent.with_extension("moved")).unwrap();
+                    std::os::unix::fs::symlink(&self.outside, &self.parent).unwrap();
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn refused<T: std::fmt::Debug>(operation: &str, result: Result<T, WorkspaceError>) {
+        assert!(
+            matches!(result, Err(WorkspaceError::ResolvedPathOutsideRoot { .. })),
+            "{operation}: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_swapped_for_an_outside_symlink_after_the_check_is_never_followed() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let parent = root.path().join("sub");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(parent.join("victim-dir")).unwrap();
+        std::fs::create_dir(outside.path().join("victim-dir")).unwrap();
+        for name in ["secret.txt", "victim.txt", "a.txt"] {
+            std::fs::write(parent.join(name), "inside").unwrap();
+            std::fs::write(outside.path().join(name), "outside").unwrap();
+        }
+        std::fs::write(root.path().join("top.txt"), "top").unwrap();
+        let swap = || SwapAfterContainmentCheck::service(parent.clone(), outside.path().into());
+        let restore = || {
+            std::fs::remove_file(&parent).unwrap();
+            std::fs::rename(parent.with_extension("moved"), &parent).unwrap();
+        };
+        let root = root.path();
+
+        refused("read", swap().read_file(root, "sub/secret.txt").await);
+        restore();
+        refused("version", swap().file_version(root, "sub/secret.txt").await);
+        restore();
+        refused(
+            "write",
+            swap()
+                .write_file(root, "sub/a.txt", "agent")
+                .await
+                .map(|_| ()),
+        );
+        restore();
+        let missing = WritePrecondition::Missing;
+        refused(
+            "guarded write",
+            swap()
+                .write_file_if_unchanged(root, "sub/new.txt", "agent", &missing)
+                .await
+                .map(|_| ()),
+        );
+        restore();
+        refused(
+            "create folder",
+            swap()
+                .create_entry(root, "sub/created", EntryKind::Directory)
+                .await,
+        );
+        restore();
+        refused(
+            "create file",
+            swap()
+                .create_entry(root, "sub/created.txt", EntryKind::File)
+                .await,
+        );
+        restore();
+        refused(
+            "rename from",
+            swap().rename_entry(root, "sub/a.txt", "moved.txt").await,
+        );
+        restore();
+        refused(
+            "rename into",
+            swap().rename_entry(root, "top.txt", "sub/top.txt").await,
+        );
+        restore();
+        refused(
+            "delete file",
+            swap().delete_entry(root, "sub/victim.txt").await,
+        );
+        restore();
+        refused(
+            "delete folder",
+            swap().delete_entry(root, "sub/victim-dir").await,
+        );
+        restore();
+        refused("duplicate", swap().duplicate_entry(root, "sub/a.txt").await);
+        restore();
+
+        // Nothing outside was read, written, created, moved into or removed.
+        let mut names: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "secret.txt", "victim-dir", "victim.txt"]);
+        for name in ["a.txt", "secret.txt", "victim.txt"] {
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join(name)).unwrap(),
+                "outside"
+            );
+        }
+        assert!(root.join("top.txt").exists());
     }
 }
