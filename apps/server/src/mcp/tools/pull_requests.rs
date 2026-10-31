@@ -20,6 +20,7 @@ use crate::{
             CLIENT_REQUEST_ID, Family, McpCapability, ProgressSink, ToolCall, ToolFuture,
             ToolResult, ToolSpec, invalid_argument, object_schema,
         },
+        outcome::{Interruption, Owned, outcome_unknown, unknown_failure},
         protocol::{chars, tool_result, typed_tool_failure},
     },
 };
@@ -39,6 +40,16 @@ const OPERATE: &str = SCOPE_ORCHESTRATION_OPERATE;
 const SOURCE_CONTROL: Option<McpCapability> = Some(McpCapability::SourceControl);
 const RUN_ACTION: &str = "pullRequests.runAction";
 const STACKED_ACTION: &str = "git.runStackedAction";
+
+/// Host failure codes after which a write may have reached the host and taken effect: the CLI
+/// timed out or lost the host mid-request, or the host answered with output that could not be
+/// read. A write that fails with one of them is `unknown`, never a recorded failure.
+const MAY_HAVE_RUN: &[&str] = &[
+    "timeout",
+    "host_unreachable",
+    "invalid_response",
+    "output_limit",
+];
 
 /// The pull request tools, in the order `tools/list` shows them.
 pub(crate) const TOOLS: &[ToolSpec] = &[
@@ -402,10 +413,10 @@ impl ToolCall<'_> {
             .map(str::trim)
             .filter(|head| !head.is_empty());
         let draft = self.boolean("draft")?.unwrap_or(false);
-        let target = self.target(thread_id).await?;
+        // The folder is resolved inside the recorded work, so a keyed retry returns the stored
+        // outcome even after the thread is deleted.
         let mut payload = json!({
             "actionId": format!("mcp-{}", Uuid::new_v4()),
-            "cwd": target.cwd,
             "action": "create_pr",
             "pullRequestTitle": title,
             "pullRequestBaseBranch": base,
@@ -423,9 +434,10 @@ impl ToolCall<'_> {
                 "milestone": null, "removeSourceBranch": null, "squash": null,
             });
         }
-        let stream = payload.clone();
+        let mut stream = payload.clone();
         let thread_id = thread_id.to_owned();
         self.recorded("create_pull_request", &payload, move |owned| async move {
+            stream["cwd"] = owned.target(&thread_id).await?.cwd.into();
             let outcome = owned.invoke_stream(STACKED_ACTION, stream).await?;
             let result = &outcome.terminal["result"];
             let pr = &result["pr"];
@@ -464,7 +476,6 @@ impl ToolCall<'_> {
         if title.is_none() && body.is_none() && draft.is_none() {
             return Err(invalid_argument("give title, body or draft"));
         }
-        let target = self.target(thread_id).await?;
         let mut updated = Vec::new();
         if title.is_some() {
             updated.push("title");
@@ -472,22 +483,25 @@ impl ToolCall<'_> {
         if body.is_some() {
             updated.push("body");
         }
-        let edit = (!updated.is_empty()).then(|| {
-            json!({
-                "action": "editPullRequest", "cwd": target.cwd, "number": number,
-                "title": title, "body": body, "baseBranch": null,
-            })
+        // The folder is resolved inside the recorded work (see create); the row keeps the
+        // arguments.
+        let payload = json!({
+            "threadId": thread_id, "number": number, "title": title, "body": body, "draft": draft,
         });
-        let set_draft = draft.map(|draft| {
-            json!({ "action": "setDraft", "cwd": target.cwd, "number": number, "draft": draft })
-        });
-        let payload = json!([edit, set_draft]);
+        let thread_id = thread_id.to_owned();
         self.recorded("update_pull_request", &payload, move |owned| async move {
-            if let Some(edit) = edit {
-                owned.invoke(RUN_ACTION, edit).await?;
+            let cwd = owned.target(&thread_id).await?.cwd;
+            if !updated.is_empty() {
+                let edit = json!({
+                    "action": "editPullRequest", "cwd": cwd, "number": number,
+                    "title": title, "body": body, "baseBranch": null,
+                });
+                write(&owned, edit).await?;
             }
-            if let Some(set_draft) = set_draft {
-                if let Err(failure) = owned.invoke(RUN_ACTION, set_draft).await {
+            if let Some(draft) = draft {
+                let set_draft =
+                    json!({ "action": "setDraft", "cwd": cwd, "number": number, "draft": draft });
+                if let Err(failure) = write(&owned, set_draft).await {
                     if updated.is_empty() {
                         return Err(failure);
                     }
@@ -524,16 +538,18 @@ impl ToolCall<'_> {
         let head_sha = self.required("headSha")?.trim().to_owned();
         let delete_branch = self.boolean("deleteBranch")?.unwrap_or(false);
         let auto = self.boolean("auto")?.unwrap_or(false);
-        let target = self.target(thread_id).await?;
-        // `bypass` (an admin merge past branch protection) is never sent.
+        // `bypass` (an admin merge past branch protection) is never sent. The folder is
+        // resolved inside the recorded work (see create).
         let payload = json!({
-            "action": "merge", "cwd": target.cwd, "number": number, "method": method,
+            "action": "merge", "number": number, "method": method,
             "deleteBranch": delete_branch, "auto": auto, "bypass": false, "headSha": head_sha,
             "subject": null, "body": null,
         });
-        let action = payload.clone();
+        let mut action = payload.clone();
+        let thread_id = thread_id.to_owned();
         self.recorded("merge_pull_request", &payload, move |owned| async move {
-            let merged = owned.invoke(RUN_ACTION, action).await?;
+            action["cwd"] = owned.target(&thread_id).await?.cwd.into();
+            let merged = write(&owned, action).await?;
             Ok(tool_result(
                 json!({
                     "number": number,
@@ -547,23 +563,54 @@ impl ToolCall<'_> {
     }
 }
 
-/// The edit landed but the draft change did not: a partial outcome naming what changed, so a
-/// keyed retry replays the truth and the agent retries only the draft change.
+/// Runs one `pullRequests.runAction` write. A failure after which the host may have taken the
+/// write is `McpOutcomeUnknownError` (`no-answer`) carrying the host's `code`, never a
+/// definite failure.
+async fn write(owned: &Owned, action: Value) -> Result<Value, Value> {
+    owned.invoke(RUN_ACTION, action).await.map_err(|failure| {
+        let error = &failure["structuredContent"]["error"];
+        if error["_tag"] != "PullRequestsOperationError"
+            || !error["code"]
+                .as_str()
+                .is_some_and(|code| MAY_HAVE_RUN.contains(&code))
+        {
+            return failure;
+        }
+        let mut unknown = unknown_failure(Interruption::NoAnswer);
+        unknown["structuredContent"]["error"]["code"] = error["code"].clone();
+        unknown
+    })
+}
+
+/// The edit landed but the draft change did not, or may not have: a partial outcome naming what
+/// changed, so a keyed retry replays the truth and the agent retries only the draft change.
+/// When the host may have taken the draft change, it is `unknown` and recorded so.
 fn partial(updated: &[&str], failure: &Value) -> Value {
     let error = &failure["structuredContent"]["error"];
+    let unknown = error["_tag"] == crate::mcp::outcome::OUTCOME_UNKNOWN_TAG;
     let mut partial = typed_tool_failure(
         "McpPartialOutcomeError",
-        &format!(
-            "The pull request's {} changed, but its draft state did not: {} Call update_pull_request with draft alone to retry it.",
-            updated.join(" and "),
-            error["message"].as_str().unwrap_or("the host refused it.")
-        ),
+        &if unknown {
+            format!(
+                "The pull request's {} changed; whether its draft state changed is unknown, because the host stopped answering. Check view_pull_request before you change it again.",
+                updated.join(" and "),
+            )
+        } else {
+            format!(
+                "The pull request's {} changed, but its draft state did not: {} Call update_pull_request with draft alone to retry it.",
+                updated.join(" and "),
+                error["message"].as_str().unwrap_or("the host refused it.")
+            )
+        },
     );
     let fields = &mut partial["structuredContent"]["error"];
     fields["updated"] = json!(updated);
-    fields["failed"] = "draft".into();
+    fields[if unknown { "unknown" } else { "failed" }] = "draft".into();
     fields["cause"] = error["_tag"].clone();
     fields["code"] = error["code"].clone();
+    if unknown {
+        return outcome_unknown(partial);
+    }
     partial
 }
 

@@ -1014,18 +1014,7 @@ impl ToolCall<'_> {
         &self,
         thread_id: &str,
     ) -> Result<crate::persistence::ProjectionThread, Value> {
-        self.control
-            .repositories()
-            .get_thread(thread_id.to_owned())
-            .await
-            .map_err(storage_failure)?
-            .filter(|thread| thread.deleted_at.is_none())
-            .ok_or_else(|| {
-                typed_tool_failure(
-                    "McpThreadNotFoundError",
-                    &format!("No thread {thread_id}; list_projects_and_threads lists them."),
-                )
-            })
+        super::target::live_thread(self.control, thread_id).await
     }
 
     /// Refuses work that would advance a thread running above this connection's limit.

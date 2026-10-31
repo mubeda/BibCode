@@ -156,6 +156,11 @@ impl Host {
             "pullRequests.get" => Ok(detail(number, "A short body.")),
             "pullRequests.getChecks" => Ok(checks()),
             _ => match payload["action"].as_str().unwrap_or_default() {
+                // The CLI timed out: the host may have taken the write.
+                "merge" | "editPullRequest" if number == 11 => Err(host_error(
+                    "timeout",
+                    "The operation timed out or was cancelled. Try again.",
+                )),
                 "merge" if payload["headSha"] != HEAD => Err(host_error(
                     "stale_head",
                     "The head commit changed. Refresh before trying again.",
@@ -166,6 +171,10 @@ impl Host {
                 "setDraft" if number == 9 => Err(host_error(
                     "forbidden",
                     "This account does not have permission for this operation.",
+                )),
+                "setDraft" if number == 12 => Err(host_error(
+                    "host_unreachable",
+                    "The host could not be reached. Check the connection and retry.",
                 )),
                 _ => Ok(json!({ "kind": "done" })),
             },
@@ -479,6 +488,145 @@ async fn update_edits_then_sets_draft_and_names_a_partial_change() {
         )
         .await;
     assert_eq!(error_tag(&empty), "McpInvalidArgumentError");
+    harness.shutdown().await;
+}
+
+async fn row_state(harness: &Harness, key: &str) -> String {
+    let key = key.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT state FROM mcp_tool_requests WHERE client_request_id = ?",
+                [key],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_write_the_host_may_have_taken_is_unknown_never_a_recorded_failure() {
+    let host = Host::default();
+    let (harness, agent, thread) = setup(&host).await;
+
+    // The merge timed out: it may have merged, so a keyed retry must not replay a failure.
+    let arguments = json!({
+        "threadId": thread, "number": 11, "method": "merge", "headSha": HEAD,
+        "clientRequestId": "merge-timeout",
+    });
+    let merged = harness
+        .call(&agent, "merge_pull_request", arguments.clone())
+        .await;
+    assert_eq!(error_tag(&merged), "McpOutcomeUnknownError", "{merged}");
+    assert_eq!(merged["structuredContent"]["error"]["reason"], "no-answer");
+    assert_eq!(merged["structuredContent"]["error"]["code"], "timeout");
+    assert_eq!(row_state(&harness, "merge-timeout").await, "unknown");
+    let calls = host.requests("pullRequests.runAction").len();
+    let again = harness.call(&agent, "merge_pull_request", arguments).await;
+    assert_eq!(again, merged);
+    assert_eq!(host.requests("pullRequests.runAction").len(), calls);
+
+    // The edit timed out: unknown too.
+    let edited = harness
+        .call(
+            &agent,
+            "update_pull_request",
+            json!({ "threadId": thread, "number": 11, "title": "T", "clientRequestId": "edit-timeout" }),
+        )
+        .await;
+    assert_eq!(error_tag(&edited), "McpOutcomeUnknownError", "{edited}");
+    assert_eq!(row_state(&harness, "edit-timeout").await, "unknown");
+
+    // The edit landed and the draft change lost the host: a partial whose draft is unknown.
+    let partial = harness
+        .call(
+            &agent,
+            "update_pull_request",
+            json!({ "threadId": thread, "number": 12, "title": "T", "draft": true, "clientRequestId": "draft-lost" }),
+        )
+        .await;
+    assert_eq!(error_tag(&partial), "McpPartialOutcomeError", "{partial}");
+    let error = &partial["structuredContent"]["error"];
+    assert_eq!(error["updated"], json!(["title"]));
+    assert_eq!(error["unknown"], "draft");
+    assert_eq!(error["code"], "host_unreachable");
+    assert_eq!(row_state(&harness, "draft-lost").await, "unknown");
+
+    // A refusal the host answered stays a recorded failure.
+    let refused = harness
+        .call(
+            &agent,
+            "update_pull_request",
+            json!({ "threadId": thread, "number": 9, "title": "T", "draft": true, "clientRequestId": "draft-refused" }),
+        )
+        .await;
+    assert_eq!(refused["structuredContent"]["error"]["failed"], "draft");
+    assert_eq!(row_state(&harness, "draft-refused").await, "failed");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_recorded_outcome_is_returned_after_its_thread_is_deleted() {
+    let host = Host::default();
+    let (harness, agent, thread) = setup(&host).await;
+    let create = json!({
+        "threadId": thread, "title": "Add the thing", "baseBranch": "main",
+        "clientRequestId": "create-then-delete",
+    });
+    let created = harness
+        .call(&agent, "create_pull_request", create.clone())
+        .await;
+    let created = structured(&created).clone();
+    let merge = json!({
+        "threadId": thread, "number": 7, "method": "merge", "headSha": HEAD,
+        "clientRequestId": "merge-then-delete",
+    });
+    let merged = harness
+        .call(&agent, "merge_pull_request", merge.clone())
+        .await;
+    let merged = structured(&merged).clone();
+    let update = json!({
+        "threadId": thread, "number": 7, "title": "T", "clientRequestId": "update-then-delete",
+    });
+    let updated = harness
+        .call(&agent, "update_pull_request", update.clone())
+        .await;
+    let updated = structured(&updated).clone();
+
+    let deleted = thread.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE projection_threads SET deleted_at = ? WHERE thread_id = ?",
+                [CREATED_AT, deleted.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let again = harness.call(&agent, "create_pull_request", create).await;
+    assert_eq!(structured(&again), &created);
+    let again = harness.call(&agent, "merge_pull_request", merge).await;
+    assert_eq!(structured(&again), &merged);
+    let again = harness.call(&agent, "update_pull_request", update).await;
+    assert_eq!(structured(&again), &updated);
+    assert_eq!(host.creates(), 1);
+
+    // A new call on the deleted thread is refused.
+    let refused = harness
+        .call(
+            &agent,
+            "merge_pull_request",
+            json!({ "threadId": thread, "number": 7, "method": "merge", "headSha": HEAD }),
+        )
+        .await;
+    assert_eq!(error_tag(&refused), "McpThreadNotFoundError");
     harness.shutdown().await;
 }
 
