@@ -336,6 +336,8 @@ fn public_repository_api_inventory_is_explicit() {
     let mut expected = vec![
         "append_event",
         "event_pages",
+        "change_feed_heads",
+        "read_change_feed",
         "auth_authority_revision",
         "can_promote_queued_provider_turn",
         "claim_provider_turn",
