@@ -315,6 +315,11 @@ impl HttpRouteError {
     fn into_response(self) -> Response {
         json_response(self.status, self.headers, self.body)
     }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
 }
 
 pub fn add_routes<S>(router: Router<S>) -> Router<S>

@@ -31,6 +31,8 @@ pub enum TransferError {
     TooManyEntries { limit: usize },
     #[error("archive exceeds {limit} bytes")]
     TooManyBytes { limit: u64 },
+    #[error("the transfer ended because its access ended")]
+    Cancelled,
     #[error("upload exceeds {limit} bytes")]
     UploadTooLarge { limit: u64 },
     #[error("upload target already exists: {path}", path = .path.display())]
@@ -105,6 +107,10 @@ pub enum TransferClaims {
         root: PathBuf,
         relative: String,
         expires_at: u64,
+        /// The outside agent's session that minted it (#139 X5). The route serves it only
+        /// while that session's access lasts. The UI's tokens leave it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_session_id: Option<String>,
     },
     Upload {
         root: PathBuf,
@@ -114,7 +120,31 @@ pub enum TransferClaims {
         file_name: String,
         max_bytes: u64,
         expires_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_session_id: Option<String>,
+        /// Whether the upload may replace an existing file, decided at the mint. `None` (the
+        /// UI's tokens) leaves it to the route's `?overwrite=1`; a bound `false` refuses it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overwrite: Option<bool>,
     },
+}
+
+/// What a mint binds into a token beyond its target: the minting agent's session, and for an
+/// upload whether it may overwrite. [`Default`] is the UI's unbound token.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferBinding {
+    pub mcp_session_id: Option<String>,
+    pub overwrite: Option<bool>,
+}
+
+/// A short id of one transfer URL, the same at the mint and at the route, for the activity
+/// rows that attribute it (#139 X5). It reveals nothing of the token.
+#[must_use]
+pub fn transfer_id(url_or_token: &str) -> String {
+    let token = url_or_token.rsplit('/').next().unwrap_or(url_or_token);
+    let mut id = crate::crypto::sha256_hex(token);
+    id.truncate(24);
+    format!("t-{id}")
 }
 
 impl TransferClaims {
@@ -151,10 +181,21 @@ impl TransferAccess {
         root: &Path,
         relative: &str,
     ) -> Result<IssuedTransferUrl, TransferError> {
+        self.issue_download_bound(root, relative, &TransferBinding::default())
+    }
+
+    /// [`Self::issue_download`] bound to `binding`'s session.
+    pub fn issue_download_bound(
+        &self,
+        root: &Path,
+        relative: &str,
+        binding: &TransferBinding,
+    ) -> Result<IssuedTransferUrl, TransferError> {
         self.issue(TransferClaims::Download {
             root: root.to_path_buf(),
             relative: relative.to_owned(),
             expires_at: self.expiry(),
+            mcp_session_id: binding.mcp_session_id.clone(),
         })
     }
 
@@ -178,6 +219,24 @@ impl TransferAccess {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<IssuedTransferUrl, TransferError> {
+        self.issue_upload_bound(
+            root,
+            relative_dir,
+            file_name,
+            max_bytes,
+            &TransferBinding::default(),
+        )
+    }
+
+    /// [`Self::issue_upload_with_limit`] with `binding`.
+    pub fn issue_upload_bound(
+        &self,
+        root: &Path,
+        relative_dir: &str,
+        file_name: &str,
+        max_bytes: u64,
+        binding: &TransferBinding,
+    ) -> Result<IssuedTransferUrl, TransferError> {
         upload::validate_upload_file_name(file_name)?;
         self.issue(TransferClaims::Upload {
             root: root.to_path_buf(),
@@ -185,6 +244,8 @@ impl TransferAccess {
             file_name: file_name.to_owned(),
             max_bytes,
             expires_at: self.expiry(),
+            mcp_session_id: binding.mcp_session_id.clone(),
+            overwrite: binding.overwrite,
         })
     }
 
@@ -307,10 +368,72 @@ mod tests {
             file_name: "a.txt".to_owned(),
             max_bytes: MAX_UPLOAD_BYTES,
             expires_at: signed_token::now_millis().saturating_add(60_000),
+            mcp_session_id: None,
+            overwrite: None,
         };
         let as_asset = signed_token::sign(b"secret", "asset", &claims).unwrap();
         assert!(access.verify(&as_asset).is_none());
         let as_transfer = signed_token::sign(b"secret", TRANSFER_TOKEN_PURPOSE, &claims).unwrap();
         assert!(access.verify(&as_transfer).is_some());
+    }
+
+    fn claims_json(issued: &IssuedTransferUrl) -> serde_json::Value {
+        use base64::Engine as _;
+        let token = issued.relative_url.rsplit('/').next().unwrap();
+        let payload = token.split('.').next().unwrap();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_ui_token_carries_no_binding_and_an_agent_token_binds_its_session_and_overwrite() {
+        let access = TransferAccess::new(b"secret".to_vec());
+        let ui = access
+            .issue_upload(Path::new("/repo"), "", "a.txt")
+            .unwrap();
+        let fields = claims_json(&ui);
+        assert!(fields.get("mcp_session_id").is_none(), "{fields}");
+        assert!(fields.get("overwrite").is_none(), "{fields}");
+        let ui = access.issue_download(Path::new("/repo"), "a.txt").unwrap();
+        assert!(claims_json(&ui).get("mcp_session_id").is_none());
+
+        let binding = TransferBinding {
+            mcp_session_id: Some("session-1".into()),
+            overwrite: Some(false),
+        };
+        let bound = access
+            .issue_upload_bound(Path::new("/repo"), "", "a.txt", 10, &binding)
+            .unwrap();
+        let token = bound.relative_url.rsplit('/').next().unwrap();
+        match access.verify(token) {
+            Some(TransferClaims::Upload {
+                mcp_session_id,
+                overwrite,
+                ..
+            }) => {
+                assert_eq!(mcp_session_id.as_deref(), Some("session-1"));
+                assert_eq!(overwrite, Some(false));
+            }
+            other => panic!("unexpected claims: {other:?}"),
+        }
+        let bound = access
+            .issue_download_bound(Path::new("/repo"), "a.txt", &binding)
+            .unwrap();
+        let token = bound.relative_url.rsplit('/').next().unwrap();
+        assert!(matches!(
+            access.verify(token),
+            Some(TransferClaims::Download { mcp_session_id: Some(id), .. }) if id == "session-1"
+        ));
+        // The id is the same from the URL and from its token, and differs per URL.
+        assert_eq!(transfer_id(&bound.relative_url), transfer_id(token));
+        assert_ne!(
+            transfer_id(&bound.relative_url),
+            transfer_id(&ui.relative_url)
+        );
+        assert!(!transfer_id(token).contains(token));
     }
 }
