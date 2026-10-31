@@ -1500,9 +1500,16 @@ async fn finish_revert(
         .await?;
     }
     let created_at = now_iso();
+    // A revert whose files were not restored records its completion under a tag of its own, so
+    // a client waiting on it knows a failure follows instead of reading success.
+    let tag = if restored.is_ok() {
+        "checkpoint-revert-complete"
+    } else {
+        UNRESTORED_REVERT_TAG
+    };
     engine
         .dispatch(OrchestrationCommand::ThreadRevertComplete {
-            command_id: outcome_id("checkpoint-revert-complete", request.as_deref()),
+            command_id: outcome_id(tag, request.as_deref()),
             thread_id: thread_id.to_owned(),
             turn_count,
             created_at,
@@ -1971,6 +1978,10 @@ fn now_iso() -> String {
 fn server_id(tag: &str) -> String {
     format!("server:{tag}:{}", Uuid::new_v4())
 }
+
+/// The tag of a `thread.reverted` whose provider rewound but whose files were not restored; a
+/// `checkpoint.revert.failed` activity follows it.
+pub(crate) const UNRESTORED_REVERT_TAG: &str = "checkpoint-revert-unrestored";
 
 /// The command id of an outcome the worker records for request `request`: it contains
 /// `:{request}:`, so a client waiting on one revert is not answered by another revert of the

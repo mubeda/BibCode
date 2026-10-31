@@ -515,6 +515,67 @@ async fn revert_thread_to_turn_restores_the_checkpoint_and_reports_failures() {
     harness.shutdown().await;
 }
 
+/// A provider that rewound while the files could not be restored is a failed revert, never
+/// `reverted: true`: the thread forgot the later turns, but the files are as they were.
+#[tokio::test]
+async fn a_revert_whose_files_were_not_restored_fails() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    let checkout = checkpointed_checkout(&harness, &thread_id).await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut rewinds = Rewinds::new(&thread_id, checkout.path(), elsewhere.path());
+    // The checkpoint resolved when the revert was planned and is gone when it restores.
+    let (cwd, target) = (checkout.path().to_path_buf(), checkpoint_ref(&thread_id, 1));
+    rewinds.during_rewind = Some(Box::new(move || {
+        git(
+            &IsolatedGitConfig::new(),
+            &cwd,
+            &["update-ref", "-d", &target],
+        );
+        Box::pin(async { Ok(()) })
+    }));
+    let effects = OrchestrationEffects::start(
+        harness.engine.clone(),
+        Arc::new(crate::git::GitRepository::default()),
+        Arc::new(rewinds),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let failed = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": thread_id, "turnCount": 1 }),
+        )
+        .await;
+    assert_eq!(error_tag(&failed), "McpCheckpointRevertError", "{failed}");
+    assert!(
+        failed["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be restored"),
+        "{failed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.path().join("tracked.txt")).unwrap(),
+        "two\n"
+    );
+    // The revert itself was recorded: the thread's latest checkpoint is turn 1 now.
+    let refused = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": thread_id, "turnCount": 2 }),
+        )
+        .await;
+    assert_eq!(error_tag(&refused), "McpInvalidArgumentError", "{refused}");
+    effects.shutdown().await;
+    harness.shutdown().await;
+}
+
 /// Thread `thread_id`'s revert requests so far.
 async fn revert_requests(harness: &Harness, thread_id: &str) -> i64 {
     let thread_id = thread_id.to_owned();

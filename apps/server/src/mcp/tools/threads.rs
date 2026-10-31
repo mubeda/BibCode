@@ -1007,8 +1007,10 @@ impl ToolCall<'_> {
         }
         let deadline = tokio::time::Instant::now() + REVERT_WAIT;
         let shutdown = self.control.shutdown_token();
+        // The provider rewound but the files were not restored; the failure's detail follows.
+        let mut unrestored = false;
         loop {
-            if let Some((event_type, kind, detail)) = revert_outcome(
+            if let Some((event_type, kind, detail, rewound_only)) = revert_outcome(
                 self.control.repositories(),
                 &thread_id,
                 &request,
@@ -1017,22 +1019,25 @@ impl ToolCall<'_> {
             .await
             .map_err(storage_failure)?
             {
-                if kind.as_deref() == Some("checkpoint.revert.failed") {
+                if rewound_only {
+                    unrestored = true;
+                } else if kind.as_deref() == Some("checkpoint.revert.failed") {
                     return Err(typed_tool_failure(
                         "McpCheckpointRevertError",
                         &detail.unwrap_or_else(|| "The checkpoint revert failed.".to_owned()),
                     ));
+                } else {
+                    return Ok(tool_result(
+                        json!({
+                            "threadId": thread_id,
+                            "turnCount": turn_count,
+                            "reverted": true,
+                            // A provider that cannot rewind keeps the later messages.
+                            "conversationRewound": event_type == "thread.reverted",
+                        }),
+                        &[],
+                    ));
                 }
-                return Ok(tool_result(
-                    json!({
-                        "threadId": thread_id,
-                        "turnCount": turn_count,
-                        "reverted": true,
-                        // A provider that cannot rewind keeps the later messages.
-                        "conversationRewound": event_type == "thread.reverted",
-                    }),
-                    &[],
-                ));
             }
             // Wake on this thread's next event; a lagged receiver just reads the store again.
             let woke = tokio::select! {
@@ -1049,6 +1054,12 @@ impl ToolCall<'_> {
                     }
                 } => event,
             };
+            if !woke && unrestored {
+                return Err(typed_tool_failure(
+                    "McpCheckpointRevertError",
+                    "The conversation was rewound, but the files could not be restored.",
+                ));
+            }
             if !woke {
                 return Ok(tool_result(
                     json!({
@@ -1372,30 +1383,36 @@ async fn latest_checkpoint(
 
 /// The first outcome the effects worker recorded on `thread_id` after event `after` for revert
 /// request `request` (the worker's outcome command ids contain `:{request}:`): its event type,
-/// its activity kind, and the failure's detail.
+/// its activity kind, the failure's detail, and whether it is only the rewind of a revert whose
+/// files were not restored, which ranks after every final outcome.
 async fn revert_outcome(
     repositories: &Repositories,
     thread_id: &str,
     request: &str,
     after: i64,
-) -> crate::persistence::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> crate::persistence::Result<Option<(String, Option<String>, Option<String>, bool)>> {
     let thread_id = thread_id.to_owned();
     let request = format!(":{request}:");
+    let unrestored = format!(
+        "server:{}:",
+        crate::production::orchestration_effects::UNRESTORED_REVERT_TAG
+    );
     repositories
         .database()
         .call(move |connection| {
             connection
                 .query_row(
-                    "SELECT event_type, json_extract(payload_json, '$.activity.kind'), json_extract(payload_json, '$.activity.payload.detail')
+                    "SELECT event_type, json_extract(payload_json, '$.activity.kind'), json_extract(payload_json, '$.activity.payload.detail'),
+                            substr(command_id, 1, length(?4)) = ?4 AS unrestored
                        FROM orchestration_events
-                      WHERE aggregate_kind = 'thread' AND stream_id = ? AND sequence > ?
-                        AND instr(command_id, ?) > 0
+                      WHERE aggregate_kind = 'thread' AND stream_id = ?1 AND sequence > ?2
+                        AND instr(command_id, ?3) > 0
                         AND (event_type = 'thread.reverted'
                           OR (event_type = 'thread.activity-appended'
                               AND json_extract(payload_json, '$.activity.kind') IN ('checkpoint.revert.failed', 'checkpoint.revert.files-only')))
-                      ORDER BY sequence LIMIT 1",
-                    params![thread_id, after, request],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                      ORDER BY unrestored, sequence LIMIT 1",
+                    params![thread_id, after, request, unrestored],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(Into::into)
