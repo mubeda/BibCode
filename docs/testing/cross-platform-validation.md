@@ -1779,11 +1779,35 @@ from `apps/web`.
     verifies with the secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
     shows. Start a thread: the receiver gets `thread.status_changed` events, and
     `changes_since` from the first event's `cursor` returns the entries after it.
-14. **A remote OAuth connect** with Claude Code and with Codex: see the remote section of the
-    [MCP reference](../reference/mcp.md#remote-http-with-oauth) once slice R lands.
-    <!-- TODO(R): replace this step with the remote OAuth smoke (connect, consent in
-    BiBCode, a call, a refresh after an hour, revocation, and reauthorizing for the
-    terminal scope). -->
+14. **A remote OAuth connect**, once with Claude Code and once with Codex, on another
+    computer, through BiBCode Connect's managed tunnel and through an HTTPS reverse proxy
+    that follows the [Remote access](../user/remote-access.md#remote-ai-tools-over-https)
+    recipe (see the [MCP reference](../reference/mcp.md#remote-http-with-oauth) for the
+    flow):
+    1. **Connect.** Copy the command from **MCP → Remote agents**
+       (`claude mcp add --transport http bibcode https://<host>/mcp`, or
+       `codex mcp add bibcode --url https://<host>/mcp`) and run it. The tool opens a sign-in
+       page showing a code.
+    2. **Consent.** **Requests to connect** (and its toast) shows the same code and the tool's
+       name. Approve it at Supervised. The page returns to the tool, and **Authorized
+       clients** lists `MCP · <tool> (remote)`. Repeat once approving with
+       `bibcode mcp authorize <code>` on the host, and once with **Deny**: the tool reports
+       the sign-in was refused.
+    3. **A call.** Ask the tool to list projects and start a thread: it works at once after
+       sign-in. The same access token sent to the host's loopback address is refused (401).
+       A plain-HTTP LAN address answers no sign-in (404 on the metadata).
+    4. **A refresh after an hour.** Leave the tool idle for more than an hour, then ask for
+       `server_capabilities`: it answers without a new sign-in, and the grant's row stays
+       one row.
+    5. **Revocation.** **Revoke** the row: the next call fails, Codex says to run
+       `codex mcp login bibcode` and Claude Code shows **Re-authenticate**. Signing in again
+       makes a new row.
+    6. **Terminal re-authorization.** Turn **Terminals** on at Full access. The connected tool
+       still has no terminal tools, and a terminal call answers `McpScopeError` naming
+       `terminal:operate`. Sign in again asking for it (Codex:
+       `codex mcp login bibcode --scopes orchestration:read,orchestration:operate,terminal:operate`;
+       Claude Code: the server's `oauth.scopes`, then **Re-authenticate**), allow terminals
+       when approving, and open a terminal.
 
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.

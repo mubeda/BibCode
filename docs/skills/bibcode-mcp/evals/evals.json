@@ -98,6 +98,18 @@
         "Calls git_status after McpOutcomeUnknownError before any retry",
         "Retries only if the push did not land, with a new clientRequestId"
       ]
+    },
+    {
+      "id": 10,
+      "prompt": "BiBCode runs on my server, which is published through BiBCode Connect at https://bib.example.dev. There's no SSH from this laptop. Connect Claude Code to it and list my projects.",
+      "expected_output": "Gives `claude mcp add --transport http bibcode https://bib.example.dev/mcp` for the user to run and a restart, explains the sign-in page shows a code the user approves under Requests to connect (or with `bibcode mcp authorize <code>` on the host), does not try to approve it or propose a tunnel or token, then lists projects once connected.",
+      "files": [],
+      "expectations": [
+        "Gives `claude mcp add --transport http bibcode https://bib.example.dev/mcp` for the user to run, without running it itself",
+        "Tells the user to check the sign-in code and approve it in BiBCode (Requests to connect) or with `bibcode mcp authorize`",
+        "Proposes no SSH tunnel, port forward or token, and does not try to approve the request itself",
+        "Calls list_projects_and_threads only after the connection is approved"
+      ]
     }
   ]
 }
