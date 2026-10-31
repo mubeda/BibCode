@@ -1,32 +1,39 @@
 import { RegistryContext } from "@effect/atom-react";
-import type { EnvironmentId, UiCommitMessageIntent, UiIntent } from "@bibcode/contracts";
+import type { EnvironmentId, UiCommitMessageIntent } from "@bibcode/contracts";
 import { AsyncResult } from "effect/reactivity";
 import { useContext, useEffect, useState } from "react";
 
-import { isUiIntentPending } from "@bibcode/client-runtime/state/uiIntents";
+import {
+  isUiIntentPending,
+  type PendingUiIntent,
+  replacesCommitMessage,
+} from "@bibcode/client-runtime/state/uiIntents";
 
 import { sourceControlDraftKey } from "~/sourceControlDraft";
-import { useSourceControlPanelStore } from "~/sourceControlPanelStore";
+import { agentSuggestionOutcome, useSourceControlPanelStore } from "~/sourceControlPanelStore";
 import { uiIntentsEnvironment } from "~/state/uiIntents";
 
 import { Button } from "./ui/button";
 
+type PendingCommitMessage = PendingUiIntent & UiCommitMessageIntent;
+
 /**
- * The commit message an outside agent suggested for the folder `cwdKey` names with the highest
- * sequence, among those still pending at `now`.
+ * The newest commit message an outside agent suggested for the folder `cwdKey` names, among
+ * those still before their deadline on this client's clock at `now`. `intents` are in the order
+ * they arrived; within a server boot the higher sequence wins, and another boot is newer.
  */
 export function latestCommitMessageSuggestion(
-  intents: ReadonlyArray<UiIntent>,
+  intents: ReadonlyArray<PendingUiIntent>,
   environmentId: EnvironmentId,
   cwdKey: string,
   now: number = Date.now(),
-): UiCommitMessageIntent | null {
-  let latest: UiCommitMessageIntent | null = null;
+): PendingCommitMessage | null {
+  let latest: PendingCommitMessage | null = null;
   for (const intent of intents) {
     if (
       intent.kind === "commitMessage" &&
       isUiIntentPending(intent, now) &&
-      (latest === null || intent.sequence > latest.sequence) &&
+      (latest === null || replacesCommitMessage(latest, intent)) &&
       sourceControlDraftKey({ environmentId, cwd: intent.cwd }) === cwdKey
     ) {
       latest = intent;
@@ -55,20 +62,24 @@ function useCommitMessageSuggestion(
   environmentId: EnvironmentId,
   cwdKey: string | null,
   legacyThreadKey: string | undefined,
-): UiCommitMessageIntent | null {
+): PendingCommitMessage | null {
   const registry = useContext(RegistryContext);
   const [current, setCurrent] = useState<{
     readonly cwdKey: string;
-    readonly intent: UiCommitMessageIntent | null;
+    readonly intent: PendingCommitMessage | null;
   } | null>(null);
   useEffect(() => {
     if (cwdKey === null) return;
+    // Each suggestion is applied once while the panel shows it: clearing the box later never
+    // pulls it in again.
+    let received: string | null = null;
     return registry.subscribe(
       uiIntentsEnvironment.intents({ environmentId, input: null }),
       (result) => {
         if (!AsyncResult.isSuccess(result)) return;
         const intent = latestCommitMessageSuggestion(result.value, environmentId, cwdKey);
-        if (intent !== null) {
+        if (intent !== null && intent.intentId !== received) {
+          received = intent.intentId;
           // The store promotes the thread's older draft before it applies the suggestion.
           useSourceControlPanelStore
             .getState()
@@ -85,16 +96,16 @@ function useCommitMessageSuggestion(
   }, [cwdKey, environmentId, legacyThreadKey, registry]);
   const intent = current !== null && current.cwdKey === cwdKey ? current.intent : null;
   const intentId = intent?.intentId ?? null;
-  const expiresAt = intent?.expiresAt ?? null;
+  const deadline = intent?.deadline ?? null;
   useEffect(() => {
-    if (intentId === null || expiresAt === null) return;
+    if (intentId === null || deadline === null) return;
     const expire = () =>
       setCurrent((previous) =>
         previous?.intent?.intentId === intentId ? { ...previous, intent: null } : previous,
       );
-    const timer = setTimeout(expire, Math.max(0, Date.parse(expiresAt) - Date.now()));
+    const timer = setTimeout(expire, Math.max(0, deadline - Date.now()));
     return () => clearTimeout(timer);
-  }, [expiresAt, intentId]);
+  }, [deadline, intentId]);
   return intent;
 }
 
@@ -114,18 +125,17 @@ export function SourceControlAgentSuggestion(props: {
   const { environmentId, cwd, legacyThreadKey, draftMessage } = props;
   const cwdKey = cwd === null ? null : sourceControlDraftKey({ environmentId, cwd });
   const suggestion = useCommitMessageSuggestion(environmentId, cwdKey, legacyThreadKey);
-  const handled = useSourceControlPanelStore((state) =>
+  const record = useSourceControlPanelStore((state) =>
     cwdKey === null ? undefined : state.agentSuggestionByCwdKey[cwdKey],
   );
   const accept = useSourceControlPanelStore((state) => state.acceptAgentCommitSuggestion);
   const undo = useSourceControlPanelStore((state) => state.undoAgentCommitSuggestion);
   const dismiss = useSourceControlPanelStore((state) => state.dismissAgentCommitSuggestion);
 
-  if (cwdKey === null || suggestion === null || handled?.intentId !== suggestion.intentId) {
-    return null;
-  }
+  if (cwdKey === null || suggestion === null) return null;
+  const outcome = agentSuggestionOutcome(record, suggestion.intentId);
   const agent = agentName(suggestion);
-  if (handled.outcome === "offered") {
+  if (outcome === "offered") {
     const firstLine = suggestion.message.trim().split("\n", 1)[0] ?? "";
     return (
       <div
@@ -151,10 +161,10 @@ export function SourceControlAgentSuggestion(props: {
       </div>
     );
   }
-  if (handled.outcome === "filled" && draftMessage === suggestion.message) {
+  if (outcome === "filled" && draftMessage === suggestion.message) {
     return <p className="px-0.5 text-xs text-muted-foreground">Message from {agent}</p>;
   }
-  if (handled.outcome === "used" && draftMessage === suggestion.message) {
+  if (outcome === "used" && draftMessage === suggestion.message) {
     // Use it replaced what the person typed, so they can put it back.
     return (
       <div className="flex items-center gap-1 px-0.5 text-xs text-muted-foreground">

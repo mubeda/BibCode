@@ -4,11 +4,13 @@ import { beforeEach, describe, expect, it } from "vite-plus/test";
 import { createJSONStorage } from "zustand/middleware";
 
 import {
+  agentSuggestionOutcome,
   selectThreadSourceControlDraft,
   useSourceControlPanelStore,
 } from "./sourceControlPanelStore";
 
 const THREAD_REF = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("thread-1"));
+const STORAGE_NAME = "bibcode:source-control-panel-state:v1";
 
 describe("sourceControlPanelStore", () => {
   beforeEach(() => useSourceControlPanelStore.setState({ byThreadKey: {} }));
@@ -41,16 +43,43 @@ describe("sourceControlPanelStore", () => {
 
   describe("an agent's commit message suggestion", () => {
     const CWD = "environment-1::/repo";
+    const OTHER = "environment-1::/other";
     const store = () => useSourceControlPanelStore.getState();
+    const outcome = (intentId: string) =>
+      agentSuggestionOutcome(store().agentSuggestionByCwdKey[CWD], intentId);
+    const persisted = new Map<string, string>();
+    const saved = () => JSON.parse(persisted.get(STORAGE_NAME) ?? "{}").state;
+    /** What another tab saved after this one loaded. */
+    const otherTabSaved = (byCwdKey: Record<string, { message: string }>) =>
+      persisted.set(
+        STORAGE_NAME,
+        JSON.stringify({
+          state: { byThreadKey: {}, byCwdKey, agentSuggestionByCwdKey: {} },
+          version: 2,
+        }),
+      );
 
-    beforeEach(() =>
-      useSourceControlPanelStore.setState({ byCwdKey: {}, agentSuggestionByCwdKey: {} }),
-    );
+    beforeEach(() => {
+      persisted.clear();
+      useSourceControlPanelStore.persist.setOptions({
+        storage: createJSONStorage(() => ({
+          getItem: (name: string) => persisted.get(name) ?? null,
+          setItem: (name: string, value: string) => void persisted.set(name, value),
+          removeItem: (name: string) => void persisted.delete(name),
+        })),
+      });
+      useSourceControlPanelStore.setState({
+        byThreadKey: {},
+        byCwdKey: {},
+        agentSuggestionByCwdKey: {},
+      });
+    });
 
     it("fills an empty draft once, and never again after the draft is cleared", () => {
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
       expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser");
-      expect(store().agentSuggestionByCwdKey[CWD]).toEqual({
+      expect(outcome("intent-1")).toBe("filled");
+      expect(saved().agentSuggestionByCwdKey[CWD]).toEqual({
         intentId: "intent-1",
         outcome: "filled",
       });
@@ -60,81 +89,67 @@ describe("sourceControlPanelStore", () => {
       expect(store().byCwdKey[CWD]).toBeUndefined();
     });
 
-    it("keeps a draft with text and offers the suggestion instead", () => {
+    it("offers over a draft with text and writes nothing", () => {
       store().setCwdMessage(CWD, "my own words");
+      const before = persisted.get(STORAGE_NAME);
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
       expect(store().byCwdKey[CWD]?.message).toBe("my own words");
-      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("offered");
+      expect(outcome("intent-1")).toBe("offered");
+      expect(persisted.get(STORAGE_NAME)).toBe(before);
 
       store().dismissAgentCommitSuggestion(CWD, "intent-1");
       expect(store().byCwdKey[CWD]?.message).toBe("my own words");
-      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("dismissed");
+      expect(outcome("intent-1")).toBe("dismissed");
     });
 
-    it("uses an offered suggestion only when the person asks", () => {
+    it("uses an offered suggestion only when the person asks, and Undo restores", () => {
       store().setCwdMessage(CWD, "my own words");
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
-      // A stale button, for an older suggestion, does nothing.
-      store().acceptAgentCommitSuggestion(CWD, "intent-0", "Older");
       expect(store().byCwdKey[CWD]?.message).toBe("my own words");
       store().acceptAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
       expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser");
-      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("used");
+      expect(outcome("intent-1")).toBe("used");
+      // A handled suggestion is not used again.
+      store().setCwdMessage(CWD, "Fix the parser!");
+      store().acceptAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
+      expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser!");
+      store().setCwdMessage(CWD, "Fix the parser");
       // A misclick is undone: the person's words come back.
       store().undoAgentCommitSuggestion(CWD, "intent-1");
       expect(store().byCwdKey[CWD]?.message).toBe("my own words");
-      expect(store().agentSuggestionByCwdKey[CWD]).toEqual({
-        intentId: "intent-1",
-        outcome: "dismissed",
-      });
+      expect(outcome("intent-1")).toBe("dismissed");
     });
 
     it("never overwrites a draft an earlier suggestion filled", () => {
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "First");
       store().receiveAgentCommitSuggestion(CWD, "intent-2", "Second");
       expect(store().byCwdKey[CWD]?.message).toBe("First");
-      expect(store().agentSuggestionByCwdKey[CWD]).toEqual({
-        intentId: "intent-2",
-        outcome: "offered",
-      });
+      expect(outcome("intent-2")).toBe("offered");
     });
 
-    it("never fills over words another tab saved, and keeps that tab's other folders", () => {
-      const persisted = new Map<string, string>();
-      useSourceControlPanelStore.persist.setOptions({
-        storage: createJSONStorage(() => ({
-          getItem: (name: string) => persisted.get(name) ?? null,
-          setItem: (name: string, value: string) => void persisted.set(name, value),
-          removeItem: (name: string) => void persisted.delete(name),
-        })),
-      });
-      const OTHER = "environment-1::/other";
-      const saved = () =>
-        JSON.parse(persisted.get("bibcode:source-control-panel-state:v1") ?? "{}").state;
-      // Tab A typed after this tab loaded: this tab still holds empty drafts.
-      const tabA = (byCwdKey: Record<string, { message: string }>) =>
-        persisted.set(
-          "bibcode:source-control-panel-state:v1",
-          JSON.stringify({
-            state: { byThreadKey: {}, byCwdKey, agentSuggestionByCwdKey: {} },
-            version: 2,
-          }),
-        );
-      tabA({ [CWD]: { message: "tab A words" }, [OTHER]: { message: "tab A other" } });
+    it("never lets a stale tab's draft write over what another tab saved", () => {
+      // This tab typed "Fix" earlier; another tab has since saved "Fix parser".
+      store().setCwdMessage(CWD, "Fix");
+      otherTabSaved({ [CWD]: { message: "Fix parser" } });
+      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Agent message");
+      expect(saved().byCwdKey[CWD]).toEqual({ message: "Fix parser" });
+      expect(outcome("intent-1")).toBe("offered");
+    });
 
-      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
-      expect(store().byCwdKey[CWD]?.message).toBe("tab A words");
-      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("offered");
+    it("offers, and writes nothing, when only the saved draft has text", () => {
+      otherTabSaved({ [CWD]: { message: "tab A words" } });
+      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Agent message");
       expect(saved().byCwdKey[CWD]).toEqual({ message: "tab A words" });
-      expect(saved().byCwdKey[OTHER]).toEqual({ message: "tab A other" });
+      expect(store().byCwdKey[CWD]).toBeUndefined();
+      expect(outcome("intent-1")).toBe("offered");
+    });
 
-      // An empty folder is filled, and the fill changes only that folder.
-      useSourceControlPanelStore.setState({ byCwdKey: {}, agentSuggestionByCwdKey: {} });
-      tabA({ [OTHER]: { message: "tab A other" } });
-      store().receiveAgentCommitSuggestion(CWD, "intent-2", "Fix the parser");
-      expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser");
-      expect(saved().byCwdKey[OTHER]).toEqual({ message: "tab A other" });
-      expect(saved().byCwdKey[CWD]).toEqual({ message: "Fix the parser" });
+    it("fills only its own folder and keeps another folder's saved draft", () => {
+      otherTabSaved({ [OTHER]: { message: "other folder words" } });
+      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Agent message");
+      expect(store().byCwdKey[CWD]?.message).toBe("Agent message");
+      expect(saved().byCwdKey[OTHER]).toEqual({ message: "other folder words" });
+      expect(saved().byCwdKey[CWD]).toEqual({ message: "Agent message" });
     });
 
     it("promotes a draft from before folder drafts before it applies a suggestion", () => {
@@ -142,7 +157,7 @@ describe("sourceControlPanelStore", () => {
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser", "env:thread");
       expect(store().byCwdKey[CWD]?.message).toBe("half");
       expect(store().byThreadKey).toEqual({});
-      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("offered");
+      expect(outcome("intent-1")).toBe("offered");
     });
 
     it("remembers a bounded number of folders", () => {
