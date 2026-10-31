@@ -2534,7 +2534,7 @@ Destructive: deletes a branch on a remote, leaving any local branch alone. It al
 
 #### `git_discard`
 
-Destructive: discards the changes of files or folders, restoring tracked files to HEAD and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in `trashUnavailable`, unless `permanent` is true. An ignored file that permanent deletion leaves in place is listed there too. Staged changes of the discarded paths are unstaged before the restore.
+Destructive: discards the changes of files or folders, restoring tracked files to HEAD and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in `trashUnavailable`, unless `permanent` is true. An ignored file that permanent deletion leaves in place is listed there too. Staged changes of the discarded paths are unstaged before the restore. On macOS 15 and later the system trash is reached through `/usr/bin/trash`, without Finder automation (older macOS asks Finder, which needs Automation consent); on macOS a trash that has not answered within 10 seconds counts as unavailable.
 
 - **Set / scope:** Source control · `orchestration:operate`
 - **Access:** operate (hidden at read-only)
