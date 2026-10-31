@@ -3416,6 +3416,12 @@ and `terminal/manager.rs`, and adds the **What agents can use** switches and the
   `resize` for an unknown one. `terminal_write` reads the status first and answers
   `McpTerminalExitedError` (with `exitCode`); `terminal_write`, `terminal_resize` and
   `terminal_close` answer `McpTerminalNotFoundError` for a terminal the thread does not have.
+- **"The UI shows it" needs a center panel.** The web adopts a server terminal only when its
+  summary has `centerPanel: true` (`centerPanelAdoption.ts`), and keys it by the host thread;
+  a plain drawer terminal it did not open itself never appears. `terminal_open` therefore
+  sends `centerPanel: true`, and every terminal tool works on the owner thread: a chat
+  panel's host (`hostThreadId`, as slice D's device owner), else the thread itself. Results
+  echo the `threadId` the agent passed.
 - **Capability labels.** `McpCapability::label()` (used in `McpCapabilityDisabledError`) says
   "Workspace" and "Source control", but the switches the design names are **Threads and
   worktrees** and **Source Control and pull requests**. `label()` was not changed, because

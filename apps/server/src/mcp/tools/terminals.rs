@@ -31,6 +31,7 @@ use crate::{
         },
         protocol::{Cut, chars, tool_result, typed_tool_failure},
     },
+    persistence::ProjectionThread,
     terminal::{TerminalError, TerminalManager, TerminalStatus},
 };
 
@@ -122,16 +123,26 @@ impl TerminalServices {
             .manager
             .read_history(thread_id, terminal_id, None, 0)
             .await
-            .map_err(|error| lookup_failure(&error, thread_id, terminal_id))?;
+            .map_err(|error| lookup_failure(&error, terminal_id))?;
         Ok((read.status, read.exit_code, read.window.end))
     }
 }
 
-fn lookup_failure(error: &TerminalError, thread_id: &str, terminal_id: &str) -> Value {
+/// The thread whose terminals `thread` uses: a chat panel's host, else itself. The UI shows
+/// a host thread's terminals in its center panel.
+fn terminal_owner(thread: &ProjectionThread, thread_id: &str) -> String {
+    thread
+        .host_thread_id
+        .clone()
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| thread_id.to_owned())
+}
+
+fn lookup_failure(error: &TerminalError, terminal_id: &str) -> Value {
     match error {
         TerminalError::NotFound { .. } => typed_tool_failure(
             "McpTerminalNotFoundError",
-            &format!("No terminal {terminal_id} in thread {thread_id}; terminal_list lists them."),
+            &format!("No terminal {terminal_id} in this thread; terminal_list lists them."),
         ),
         _ => unavailable(),
     }
@@ -311,6 +322,11 @@ impl ToolCall<'_> {
         self.control.terminals().cloned().ok_or_else(unavailable)
     }
 
+    /// The thread whose terminals `thread_id` uses, once it is known to exist.
+    async fn terminal_owner(&self, thread_id: &str) -> Result<String, Value> {
+        Ok(terminal_owner(&self.thread(thread_id).await?, thread_id))
+    }
+
     /// The dimension `key`, within 1 and `most`, else `default`.
     fn dimension(&self, key: &str, most: i64, default: Option<i64>) -> Result<i64, Value> {
         match self.integer(key)?.or(default) {
@@ -324,10 +340,10 @@ impl ToolCall<'_> {
         self.only(&["threadId"])?;
         let thread_id = self.required("threadId")?;
         let services = self.terminals()?;
-        self.thread(thread_id).await?;
+        let owner = self.terminal_owner(thread_id).await?;
         let terminals: Vec<Value> = services
             .manager
-            .thread_sessions(thread_id)
+            .thread_sessions(&owner)
             .await
             .into_iter()
             .map(|summary| {
@@ -362,13 +378,16 @@ impl ToolCall<'_> {
             // Resolved inside the work, so a keyed retry reads its outcome after the thread
             // is gone.
             let target = owned.target(&thread_id).await?;
+            // A center-panel terminal of the host thread: the one kind every client adopts,
+            // so the person sees it and can close it.
             let snapshot = owned
                 .invoke(
                     "terminal.open",
                     json!({
-                        "threadId": thread_id, "terminalId": terminal_id,
+                        "threadId": terminal_owner(&target.thread, &thread_id),
+                        "terminalId": terminal_id,
                         "cwd": target.cwd, "worktreePath": target.thread.worktree_path,
-                        "cols": cols, "rows": rows,
+                        "cols": cols, "rows": rows, "centerPanel": true,
                     }),
                 )
                 .await?;
@@ -405,10 +424,10 @@ impl ToolCall<'_> {
         // The stored request keeps the length, never the data: the digest already binds it.
         let stored = json!({ "threadId": thread_id, "terminalId": terminal_id, "chars": length });
         self.recorded("terminal_write", &stored, move |owned| async move {
-            owned.target(&thread_id).await?;
-            let lock = services.write_lock(&thread_id, &terminal_id);
+            let owner = terminal_owner(&owned.target(&thread_id).await?.thread, &thread_id);
+            let lock = services.write_lock(&owner, &terminal_id);
             let _writing = lock.lock().await;
-            let (status, exit_code, cursor) = services.status(&thread_id, &terminal_id).await?;
+            let (status, exit_code, cursor) = services.status(&owner, &terminal_id).await?;
             if matches!(status, TerminalStatus::Exited | TerminalStatus::Error) {
                 let mut failure = typed_tool_failure(
                     "McpTerminalExitedError",
@@ -420,7 +439,7 @@ impl ToolCall<'_> {
             owned
                 .invoke(
                     "terminal.write",
-                    json!({ "threadId": thread_id, "terminalId": terminal_id, "data": data }),
+                    json!({ "threadId": owner, "terminalId": terminal_id, "data": data }),
                 )
                 .await?;
             Ok(tool_result(
@@ -464,13 +483,13 @@ impl ToolCall<'_> {
         };
         let raw = self.boolean("raw")?.unwrap_or(false);
         let services = self.terminals()?;
-        self.thread(thread_id).await?;
+        let owner = self.terminal_owner(thread_id).await?;
         loop {
             let read = services
                 .manager
-                .read_history(thread_id, terminal_id, cursor, limit)
+                .read_history(&owner, terminal_id, cursor, limit)
                 .await
-                .map_err(|error| lookup_failure(&error, thread_id, terminal_id))?;
+                .map_err(|error| lookup_failure(&error, terminal_id))?;
             let window = read.window;
             let (text, end) = if raw {
                 (window.text, window.end)
@@ -512,12 +531,12 @@ impl ToolCall<'_> {
         let cols = self.dimension("cols", MOST_COLS, None)?;
         let rows = self.dimension("rows", MOST_ROWS, None)?;
         let services = self.terminals()?;
-        self.thread(thread_id).await?;
+        let owner = self.terminal_owner(thread_id).await?;
         // The handler ignores an unknown terminal; say so instead.
-        services.status(thread_id, terminal_id).await?;
+        services.status(&owner, terminal_id).await?;
         self.invoke(
             "terminal.resize",
-            json!({ "threadId": thread_id, "terminalId": terminal_id, "cols": cols, "rows": rows }),
+            json!({ "threadId": owner, "terminalId": terminal_id, "cols": cols, "rows": rows }),
         )
         .await?;
         Ok(tool_result(
@@ -531,11 +550,11 @@ impl ToolCall<'_> {
         let thread_id = self.required("threadId")?;
         let terminal_id = self.required("terminalId")?;
         let services = self.terminals()?;
-        self.thread(thread_id).await?;
-        services.status(thread_id, terminal_id).await?;
+        let owner = self.terminal_owner(thread_id).await?;
+        services.status(&owner, terminal_id).await?;
         self.invoke(
             "terminal.close",
-            json!({ "threadId": thread_id, "terminalId": terminal_id }),
+            json!({ "threadId": owner, "terminalId": terminal_id }),
         )
         .await?;
         Ok(tool_result(
