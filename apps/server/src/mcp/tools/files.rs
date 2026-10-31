@@ -259,6 +259,9 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         Some("trash_unavailable") => format!(
             "The system trash could not take {path}; it was left in place. Delete it with permanent: true only if the person asked for that."
         ),
+        Some("path_busy") => format!(
+            "{path} is being written or uploaded by someone else through BiBCode right now. Try again when that ends."
+        ),
         Some("partially_removed") => {
             let left_at = error["leftAt"].as_str().map_or_else(
                 || path.to_owned(),
@@ -297,6 +300,9 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
                 "_tag" | "failure" | "message" | "outcome" | "leftAt"
             )
         });
+    }
+    if failure["structuredContent"]["error"]["failure"] == "path_busy" {
+        failure["structuredContent"]["error"]["_tag"] = BUSY_TAG.into();
     }
     failure["structuredContent"]["error"]["message"] = message.clone().into();
     failure["content"] = json!([{ "type": "text", "text": message }]);
@@ -551,6 +557,9 @@ fn handle_bound(supported: bool) -> Result<(), Value> {
 }
 
 pub(crate) const PLATFORM_UNSUPPORTED_TAG: &str = "McpPlatformUnsupportedError";
+/// A write refused because another BiBCode writer (an upload, or a write that did not end in
+/// time) holds the file.
+const BUSY_TAG: &str = "McpFileBusyError";
 
 /// The base a transfer URL is built on: the address this server is bound to, which the local
 /// relay and `bibcode thread` reach. Remote OAuth sessions (slice R) get their own origin here.

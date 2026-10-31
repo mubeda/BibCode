@@ -635,6 +635,11 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Read it again from offset 0.",
     ),
     (
+        "McpFileBusyError",
+        "Another BiBCode writer holds the file: an upload in progress, or another write that did not finish in time.",
+        "Retry when it ends; read the file again first if you write with expectedVersion.",
+    ),
+    (
         "McpTransferUnavailableError",
         "This BiBCode server has no transfer address yet: it is still starting.",
         "Retry in a moment.",
