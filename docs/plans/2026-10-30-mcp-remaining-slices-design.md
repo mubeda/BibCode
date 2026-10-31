@@ -5413,6 +5413,17 @@ fixed with a failing-first test, one commit each, and the reference updated to m
   example opens a tab first; a `webhook.test` body can carry `dropped`; minting a download URL
   writes no activity row.
 
+**Remote section filled after R** (`claude/v0131-139-z2`, from `b24fcc5a9d`). The reference's
+**Remote HTTP with OAuth** section is now a step-by-step flow written from `auth/oauth.rs`,
+`auth/http.rs`, `auth/consent_page.rs`, `production/connect_mcp.rs` and
+`mcp/authorize_cli.rs`: eligible origins, the 401 challenge, both metadata documents,
+registration, authorize with PKCE and the consent code, the status poll, the code exchange,
+the first `/mcp` call, refresh with single-use rotation, audience, terminals, revocation and
+remote transfer URLs, each with a worked HTTP exchange. The Connecting, credential and
+`/mcp` contract text no longer says remote HTTP is unavailable; runbook step 14 is the real
+remote smoke; the `bibcode-mcp` skill gains the HTTPS connect guidance and eval 10. The live
+smoke itself was not run here (it needs a real tunnel).
+
 ## R implementation notes (2026-10-31)
 
 **Revision 4 (P1) is met.** The session-token verifier

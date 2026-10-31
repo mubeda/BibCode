@@ -37,6 +37,19 @@ a message when the server is off, not running, or not this BiBCode; tell the use
 message. MCP servers load when the agent starts, so the user restarts the agent after
 adding one. Give the user these commands to run: they change the agent's own configuration.
 
+**A remote host over HTTPS.** When the environment is reachable over HTTPS (BiBCode
+Connect's managed tunnel, or a reverse proxy on the host), connect to its `/mcp` with OAuth
+instead of a command: `claude mcp add --transport http bibcode https://<host>/mcp` or
+`codex mcp add bibcode --url https://<host>/mcp` (Settings → Agents → Agent integrations →
+MCP → Remote agents shows the URL). The tool opens a sign-in page with a code such as
+`ABCD-2345`; tell the user to check the code and approve it under **Requests to connect** in
+BiBCode, or with `bibcode mcp authorize ABCD-2345` on the host. Never approve it yourself
+and never ask for the code to be sent anywhere else. Over plain HTTP on a LAN address there
+is no sign-in: use `ssh <host> bibcode mcp`. Terminals need a new sign-in that asks for
+`terminal:operate`. A 401 or **Re-authenticate** after a revoke means signing in again;
+transfer URLs then name the public host. The flow is in
+[`docs/reference/mcp.md`](../../reference/mcp.md#remote-http-with-oauth).
+
 Without the MCP server, a shell can call the same tools with `bibcode thread list`,
 `start <project|.> <message|->`, `send <thread> <message|->` and `show <thread>`; `--wait`
 waits for the turn and `--json` prints `{ threadId, messageId, status, reply, requestId, error }`.
