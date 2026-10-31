@@ -233,9 +233,13 @@ set, and all but `refresh_providers` work at read-only.
 | `process_diagnostics`  | BiBCode's processes now and over a window (15 minutes unless `historyWindowMs` says, at most an hour): CPU, memory and attribution           |
 | `trace_diagnostics`    | Trace counts, log counts per level, and the most frequent, slowest and failing spans by name                                                 |
 
-- **Projections, not redaction.** Each result is built from named fields. No prompt, message,
-  command line, log line, failure cause, path, setting or account reaches an agent. An event
-  of a kind the profiler does not document keeps only its envelope.
+- **Projections, not redaction.** Each result is built from named fields.
+  `diagnose_environment`, `refresh_providers`, `process_diagnostics` and `trace_diagnostics`
+  return no prompt, message, command line, log line, failure cause, path, setting or account.
+  The profiler tools return the profiler's own records, which hold no prompt, message or
+  terminal content: their paths show the home directory as `~`, and a panic's text is what
+  the profiler redacted when it wrote it. An event keeps its envelope and the fields its kind
+  documents; an undocumented kind keeps only its envelope.
 - **Catching up on findings.** `profiler_findings { since }` (inclusive) returns findings
   oldest first by `lastSeen`; follow `nextCursor` until it is null. A finding that recurs
   later comes again with its new `lastSeen` and `count`. Up to 1,000 findings are kept.
