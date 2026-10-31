@@ -860,7 +860,9 @@ turn's number, ref, status and changed files.
    turn) records the turn's number, the latest plus one, with status `missing`
    before the session settles (`record_turn_end`). A turn that already has a
    number is left alone, and a record that cannot be written fails the
-   projection before the session settles. It also takes a checkpoint hold for
+   projection before the session settles. Only a thread with a recorded
+   checkpoint, or one whose turn start the worker found in a Git checkout, is
+   numbered; a project outside Git gets no checkpoints. It also takes a checkpoint hold for
    the turn: the thread's queue promotion waits while any of its ended turns
    is held, so a queued follow-up cannot edit the checkout before the capture.
    Holds exist only while the effects worker runs, a deleted thread's holds

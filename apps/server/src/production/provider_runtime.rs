@@ -29172,15 +29172,11 @@ done
             message_id: &str,
         ) -> crate::orchestration::engine::AdmissionCommitPause {
             // The hooks are unfiltered and take-once. No other command producer
-            // may run until the pauses have caught the completion's commands.
+            // may run until both pauses have caught the completion's commands.
             self.stream(turn_id, message_id).await;
             let hooks = self.engine.test_hooks();
-            // The turn's checkpoint number is recorded before its session settles.
-            let checkpoint = hooks.pause_before_next_command_persist();
-            self.emit("turn.completed", turn_id, message_id).await;
-            checkpoint.wait_until_entered().await;
             let ready = hooks.pause_before_next_command_persist();
-            checkpoint.release();
+            self.emit("turn.completed", turn_id, message_id).await;
             ready.wait_until_entered().await;
             let settlement = hooks.pause_before_next_command_persist();
             ready.release();

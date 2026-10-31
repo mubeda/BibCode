@@ -5830,7 +5830,11 @@ Provider ingestion records a turn's end; the effects worker captures it.
    store a later checkout as this turn's. The number is `max + 1`, so it is durable and dense
    whether or not the capture ever happens. A record that cannot be written fails the
    `turn.completed` projection before the session settles, as a failed session write would,
-   so a turn is never settled without its number.
+   so a turn is never settled without its number. Only a thread with a recorded checkpoint,
+   or one whose turn start the worker found in a Git checkout (an in-memory note set by
+   `ensure_baseline`), is numbered, so a project outside Git gets no checkpoint rows, revert
+   buttons or Diff panel turns, as before. Residual: a thread's very first turn that ends
+   before the worker has handled its start gets no number.
 2. Before dispatching that record it takes a **checkpoint hold** for that turn
    (`OrchestrationEngine::hold_promotion_for_checkpoint(thread, turn)`, beside
    `AskRecoveryHold`). `promote_settled_threads` holds a thread's queue while any of its ended
@@ -5915,6 +5919,16 @@ baseline already has.
   diff does not, and a revert across it rewinds the provider by every turn.
 - A provider stream that ends while a turn runs synthesizes a failed `turn.completed` for the
   active turn, so that turn is recorded and captured like any other.
+- The record names the turn by the id on the provider's `turn.completed`, the id its
+  assistant messages carry and the revert projection filters messages by. Were a driver's
+  send to report a different id, the record would land on the row those messages already
+  upsert under the event's id, not create a new kind of row.
+- A turn that ends between the provider supervisor's start and the effects worker's start
+  (startup only) commits its record below the worker's floor, so it stays `missing` like a
+  cut-off turn.
+- `revert_thread_to_turn` bounds `turnCount` by every recorded number, `missing` included, as
+  the worker's own check does; a target whose ref never got written is refused by the worker
+  with its existing "Filesystem checkpoint is unavailable" message.
 - Duplicate or replayed completions are no-ops: a turn with a number is left alone. A stale
   completion of an earlier turn arriving after the next turn started records nothing new for
   the same reason; ingestion still settles the session on it, a pre-existing behaviour this
@@ -5980,6 +5994,11 @@ Reviewed the revised decision with its implementation. Dispositions:
   number is never recorded again (step 1).
 - Note: the stream-end residual was overstated; a stream end synthesizes `turn.completed`.
   Corrected.
+
+After round 2, the advisor's review found that a project outside Git would have gained a
+`missing` row per turn (and with it revert buttons and Diff panel turns that could only fail).
+Fixed by numbering only threads with a recorded checkpoint or a Git baseline (step 1). Each
+hold's expiry timer also stops with the engine.
 
 ### Tests
 

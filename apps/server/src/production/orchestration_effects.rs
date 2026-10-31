@@ -1162,19 +1162,22 @@ async fn ensure_baseline(
     if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
         return Ok(());
     }
-    let checkpoints = engine
+    // Its turns get checkpoint numbers from now on (`record_turn_end`).
+    engine.note_checkpointed_thread(thread_id);
+    // One read of the thread's turns, so the number and the history it is judged by agree even
+    // when a turn's end is recorded meanwhile.
+    let turns = engine
         .repositories()
-        .list_checkpoints_by_thread(thread_id.to_owned())
+        .list_turns_by_thread(thread_id.to_owned())
         .await?;
-    let turn_count = checkpoints
+    let turn_count = turns
         .iter()
-        .map(|checkpoint| checkpoint.checkpoint_turn_count)
+        .filter_map(|turn| turn.checkpoint_turn_count)
         .max()
         .unwrap_or(0);
     let starting_message = event.event.payload.get("messageId").and_then(Value::as_str);
-    let stale_first_baseline = baseline == Baseline::TurnStart
-        && checkpoints.is_empty()
-        && had_turns_before_checkpoints(engine, thread_id, starting_message).await?;
+    let stale_first_baseline =
+        baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
     let reference = checkpoint_ref(thread_id, turn_count);
     if stale_first_baseline || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
         capture_checkpoint_with_cancellation(
@@ -1189,29 +1192,30 @@ async fn ensure_baseline(
     Ok(())
 }
 
-/// Whether a thread with no recorded checkpoint already ran turns, and no turn other than the
-/// one `starting_message` starts runs now. Its ref 0 was captured before the first of those
-/// turns (they predate turn checkpoints), so the checkout as it is now is the baseline of the
-/// turn that starts. If that turn is already running (the worker is behind), the checkout is
-/// captured as a first turn's baseline would be: the same window, never an old ref 0.
-async fn had_turns_before_checkpoints(
-    engine: &OrchestrationEngine,
-    thread_id: &str,
+/// Whether a thread with no recorded checkpoint already ran turns before the one
+/// `starting_message` starts, and no other turn runs now. Its ref 0 was captured before the
+/// first of those turns (they predate turn checkpoints), so the checkout as it is now is the
+/// baseline of the turn that starts. If that turn is already running (the worker is behind),
+/// the checkout is captured as a first turn's baseline would be: the same window, never an old
+/// ref 0. Once any turn has a number, the thread has checkpoints and its ref 0 stands.
+fn had_turns_before_checkpoints(
+    turns: &[crate::persistence::ProjectionTurn],
     starting_message: Option<&str>,
-) -> Result<bool, OrchestrationEffectsError> {
-    let turns = engine
-        .repositories()
-        .list_turns_by_thread(thread_id.to_owned())
-        .await?;
-    let another_turn_runs = turns.iter().any(|turn| {
-        turn.turn_id.is_some()
-            && turn.state == "running"
-            && turn.pending_message_id.as_deref() != starting_message
-    });
-    Ok(!another_turn_runs
+) -> bool {
+    let earlier = |turn: &&crate::persistence::ProjectionTurn| {
+        turn.turn_id.is_some() && turn.pending_message_id.as_deref() != starting_message
+    };
+    turns
+        .iter()
+        .all(|turn| turn.checkpoint_turn_count.is_none())
+        && !turns
+            .iter()
+            .filter(earlier)
+            .any(|turn| turn.state == "running")
         && turns
             .iter()
-            .any(|turn| turn.turn_id.is_some() && turn.state != "running"))
+            .filter(earlier)
+            .any(|turn| turn.state != "running")
 }
 
 /// A turn's checkpoint, as the read model records it.
@@ -1254,10 +1258,12 @@ pub(crate) enum TurnEnd {
 /// when the capture never happens. A turn that already has a number is left alone: a repeated
 /// end never asks for a second capture, which could store a later checkout as this turn's. A
 /// live end holds the thread's queued messages until the capture, so a follow-up cannot edit the
-/// checkout first. A cut-off turn is numbered only after a recorded one: before any, the next
-/// turn's baseline starts the thread's checkpoints after it. A compaction's own turn is not a
-/// turn of the thread; callers never pass one. An error leaves the turn unnumbered and is the
-/// caller's, so a turn's end is never settled without its number.
+/// checkout first. Only a thread with a recorded checkpoint, or (live) one whose turn start the
+/// worker found in a Git checkout, is numbered: a project outside Git gets none, as before. A
+/// cut-off turn before any recorded one is not numbered: the next turn's baseline starts the
+/// thread's checkpoints after it. A compaction's own turn is not a turn of the thread; callers
+/// never pass one. An error leaves the turn unnumbered and is the caller's, so a turn's end is
+/// never settled without its number.
 pub(crate) async fn record_turn_end(
     engine: &OrchestrationEngine,
     thread_id: &str,
@@ -1279,7 +1285,11 @@ pub(crate) async fn record_turn_end(
         .into_iter()
         .map(|checkpoint| checkpoint.checkpoint_turn_count)
         .max();
-    if end == TurnEnd::CutOff && latest.is_none() {
+    // Only a thread with checkpoints, or one the worker found in a Git checkout when a turn
+    // started, numbers its turns: a turn outside Git has nothing to diff or revert to.
+    let checkpointed =
+        latest.is_some() || (end == TurnEnd::Live && engine.thread_is_checkpointed(thread_id));
+    if !checkpointed {
         return Ok(());
     }
     if end == TurnEnd::Live {
@@ -2280,6 +2290,58 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Ref 0 is captured again only for a thread whose earlier turns predate checkpoints: never
+    /// once any turn has a number (a short first turn's end can be recorded before the worker
+    /// handles its start), and never while another turn runs.
+    #[test]
+    fn only_turns_before_checkpoints_refresh_ref_zero() {
+        let turn = |turn_id: &str, message: &str, state: &str, number: Option<i64>| {
+            crate::persistence::ProjectionTurn {
+                thread_id: "t".to_owned(),
+                turn_id: Some(turn_id.to_owned()),
+                pending_message_id: Some(message.to_owned()),
+                source_proposed_plan_thread_id: None,
+                source_proposed_plan_id: None,
+                assistant_message_id: None,
+                state: state.to_owned(),
+                requested_at: String::new(),
+                started_at: None,
+                completed_at: None,
+                checkpoint_turn_count: number,
+                checkpoint_ref: None,
+                checkpoint_status: number.map(|_| "missing".to_owned()),
+                checkpoint_files: json!([]),
+            }
+        };
+        let old = turn("old", "m-old", "completed", None);
+        let starting = Some("m-new");
+        // A thread's first turn, running or already ended and numbered.
+        assert!(!had_turns_before_checkpoints(&[], starting));
+        assert!(!had_turns_before_checkpoints(
+            &[turn("new", "m-new", "running", None)],
+            starting
+        ));
+        assert!(!had_turns_before_checkpoints(
+            &[turn("new", "m-new", "completed", Some(1))],
+            starting
+        ));
+        // A thread with turns before checkpoints, the new turn not started or already running.
+        assert!(had_turns_before_checkpoints(&[old.clone()], starting));
+        assert!(had_turns_before_checkpoints(
+            &[old.clone(), turn("new", "m-new", "running", None)],
+            starting
+        ));
+        // ... but not once a turn has a number, nor while another turn runs.
+        assert!(!had_turns_before_checkpoints(
+            &[old.clone(), turn("new", "m-new", "completed", Some(1))],
+            starting
+        ));
+        assert!(!had_turns_before_checkpoints(
+            &[old, turn("other", "m-other", "running", None)],
+            starting
+        ));
+    }
+
     /// A turn a restart cut off keeps its place among the recorded turns, `missing`, so a revert
     /// across it rewinds the provider by every turn. Before any recorded turn it is not numbered:
     /// the next turn's baseline starts the thread's checkpoints after it.
@@ -2314,6 +2376,11 @@ mod tests {
         };
 
         record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::CutOff)
+            .await
+            .unwrap();
+        assert_eq!(numbers().await, []);
+        // Nor is a live turn of a thread the worker never found in a Git checkout.
+        record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::Live)
             .await
             .unwrap();
         assert_eq!(numbers().await, []);
