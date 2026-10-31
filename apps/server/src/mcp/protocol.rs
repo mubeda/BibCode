@@ -248,7 +248,11 @@ pub enum Cut {
 pub fn tool_result(mut content: Value, lists: &[(&str, Cut)]) -> Value {
     let mut text = to_json(&content);
     if chars(&text) > MAX_RESULT_CHARS {
-        content["truncated"] = true.into();
+        // A bare string, number or array has nowhere to carry `truncated` (indexing it by key
+        // panics) and no list to cut, so it becomes the note below.
+        if content.is_object() {
+            content["truncated"] = true.into();
+        }
         for &(pointer, cut) in lists {
             loop {
                 text = to_json(&content);
@@ -261,7 +265,7 @@ pub fn tool_result(mut content: Value, lists: &[(&str, Cut)]) -> Value {
                 }
             }
         }
-        if chars(&text) > MAX_RESULT_CHARS {
+        if !content.is_object() || chars(&text) > MAX_RESULT_CHARS {
             content = json!({
                 "truncated": true,
                 "error": "The result is too long to return; ask for fewer or newer records.",
@@ -389,6 +393,18 @@ mod tests {
             panic!("expected a reply");
         };
         assert_eq!(reply["error"]["code"], UNSUPPORTED_VERSION);
+    }
+
+    #[test]
+    fn a_bare_value_over_the_cap_becomes_the_too_long_note() {
+        for value in [json!("x".repeat(200_000)), json!(vec![1_u8; 100_000])] {
+            let result = tool_result(value, &[]);
+            assert_eq!(result["structuredContent"]["truncated"], true);
+            assert!(result["structuredContent"]["error"].is_string());
+            assert!(result["content"][0]["text"].as_str().unwrap().len() < MAX_RESULT_CHARS);
+        }
+        let short = tool_result(json!("fits"), &[]);
+        assert_eq!(short["structuredContent"], "fits");
     }
 
     #[test]
