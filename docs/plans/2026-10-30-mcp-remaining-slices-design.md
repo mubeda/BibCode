@@ -4729,3 +4729,63 @@ CLI, F0 and waves 1 to 3 with their review fixes). It adds five tools to the `gi
   runs both sides together.
 - **Not changed:** `git_log` with both `ref` and `cursor` follows the cursor's tip and only
   echoes `ref`; its description does not say so.
+
+**Review round 2 (Codex, 2026-10-31).** Six P1s and four P2s, all checked in source and all
+confirmed; each fix has a test that failed first. The threat model is another process in the
+workspace (the provider's own agent) moving or swapping folders. The branch first merged the
+batch branch (`e2fec73382`, whose tree equals the batch's) so `feed::ERRORS` was there.
+
+- **P1 held folder moved out (confirmed).** `Dir::contained` walks `..` from the held handle
+  to the root's recorded identity; it runs before every mutating call (`open_file` to write,
+  `remove_file`, `rename`) and again after a rename, which is undone (no-replace) if either
+  folder left. `a_held_folder_moved_out_of_the_root_receives_nothing` fails with the check
+  disabled. The `..` walk was chosen over `F_GETPATH` and `/proc/self/fd`: one code path on
+  both systems, and it compares identities, not paths. The window left is the call itself.
+- **P1 root handle (confirmed).** `beneath::Root::new` records the canonical root's device
+  and inode when the place is built (right after canonicalization); `Dir::open` opens the
+  root with `O_DIRECTORY | O_NOFOLLOW` (macOS answers `ENOTDIR`, Linux `ELOOP`, both refused)
+  and compares identities. `a_root_replaced_after_its_check_is_refused` covers a symlink and
+  another folder put in its place.
+- **P1 Windows (confirmed; refused, not implemented).** Handle-bound Windows operations
+  through `windows-sys` could not be built or tested here (the Windows cross-check cannot
+  compile `aws-lc-sys`), and shipping unverified `unsafe` Win32 code for a security fix was
+  rejected. The MCP tools that change files answer `McpPlatformUnsupportedError` on any
+  non-Unix server (`files::changes_files_here`, unit-tested through `handle_bound`); reads,
+  listing, search and downloads stay. The Files panel's Windows path (re-check, then act by
+  path) is pre-existing behavior, now documented in `rpc-and-orchestration.md` and
+  `docs/user/mcp.md`. Follow-up: `FILE_FLAG_OPEN_REPARSE_POINT` opens per component,
+  `SetFileInformationByHandle(FileRenameInfo { RootDirectory })` and `FileDispositionInfoEx`,
+  verified on Windows, then lift the refusal.
+- **P1 folder downloads (confirmed).** `archive_body_from` takes the folder handle the route
+  opened and walks it with `Dir::names` (`fdopendir` on a copy of the descriptor), `open_dir`
+  and `open_file`, all no-follow; an entry that became a symlink after it was listed is
+  skipped. The UI's `archive_body(plan, path)` opens its folder the same way. The route's
+  size plan still walks by path: it only sizes, and the stream re-reads by handle.
+- **P1 upload reservation (confirmed).** The reservation's identity is kept from its
+  descriptor. A no-overwrite upload removes the name only while it is still that empty file
+  (`Dir::remove_own`) and then renames with no-replace; a person's file written into or in
+  place of it stays and the upload answers 409. Cleanup removes the partial and the
+  reservation only while each is still the upload's. Where `std` reports no identity
+  (Windows), only kind and emptiness are checked.
+- **P1 createOnly (confirmed).** `missing` creates with `O_EXCL`. A version-checked write now
+  writes a hidden sibling (`partial_transfer_file_name`, suffix `bibcode-write.part`), copies
+  the file's permissions, re-scans the target (same identity, same version), and renames over
+  it, so the Files panel's saves (which use `projects.writeFileIfUnchanged`) are atomic too.
+  A replaced file gets a new inode: hard links to it no longer share it. `projects.writeFile`
+  (no precondition) still writes in place.
+- **P2 rename (confirmed).** `projects.renameEntry` uses the no-replace rename; covered at the
+  `beneath` level (`a_no_replace_rename_and_an_own_removal_leave_other_files_alone`), since the
+  window sits inside one blocking closure no service hook reaches.
+- **P2 delete rollback (confirmed).** The restore is no-replace, and any stop part-way is
+  `WorkspaceError::PartiallyRemoved` (`partially_removed`, with `leftAt`: the entry's own name
+  when it was restored, else its `.bibcode-delete-<uuid>` name). The Files panel shows the
+  message, which names the place; `files_delete` says it with the agent's relative path.
+- **P2 mixed pages (confirmed).** `files_read` past offset 0 needs `version`; a different one
+  is `McpFileChangedError` (in `feed::ERRORS`, with `McpFileTooLargeError`,
+  `McpTransferUnavailableError` and `McpPlatformUnsupportedError`, which were missing).
+- **P2 host paths (confirmed).** `file_failure` rewrites any workspace failure it does not
+  name, and any message holding a path, to the agent's path plus the system's reason, and
+  keeps only `_tag`, `failure`, `message`, `outcome` and `leftAt`. `KEPT_ERROR_FIELDS` gains
+  `leftAt` (a name).
+- **Not mine, seen while testing:** `feed::tests::the_error_table_holds_every_tag_the_mcp_sources_return`
+  fails on the batch tree for X6's `McpCloneNotFoundError` and `McpCloneRefusedError`.

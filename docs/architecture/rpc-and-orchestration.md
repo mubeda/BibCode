@@ -3701,9 +3701,25 @@ waits on that unpinned clone.
   component at a time with `O_DIRECTORY | O_NOFOLLOW`, acting on the entry by name through
   that handle (`openat`, `unlinkat`, `renameat`, `mkdirat`; `workspace::beneath`). A symlink
   met on the walk means the tree changed since the check and is `resolved_path_outside_root`.
-  Every caller, the Files panel included, gets this. A folder's recursive removal renames it
-  through the handle to a fresh name first; the trash, which takes a path, re-checks the
-  folder just before the call, and on Windows every operation re-checks its folder.
+  Every caller, the Files panel included, gets this. The root is opened with
+  `O_DIRECTORY | O_NOFOLLOW` and must have the device and inode recorded when it was
+  validated (`beneath::Root`). Before each mutating call a held folder must still be under
+  the root (`Dir::contained`: `..` walked by handle to the root's identity), and a rename is
+  checked again after and undone if either folder left. A folder's recursive removal renames
+  it through the handle to a fresh name first, restores what is left with a no-replace rename
+  if it stops, and reports where (`partially_removed`, `leftAt`); the trash, which takes a
+  path, re-checks the folder just before the call. Folder downloads walk and open each entry
+  through no-follow handles (`archive_body_from`).
+- **No replacement by surprise.** `projects.renameEntry`, an upload without `overwrite` and a
+  delete's restore use the kernel's no-replace rename (`renameat2(RENAME_NOREPLACE)`,
+  `renameatx_np(RENAME_EXCL)`). `projects.writeFileIfUnchanged` with `missing` creates with
+  `O_EXCL`; with a `version` it writes a sibling, re-checks the file is the one hashed
+  (identity and content), and renames the sibling over it, keeping the permissions. An upload
+  replaces or removes its name only while it is still its own empty reservation
+  (`Dir::remove_own`).
+- **Windows.** `std` has no `*at` calls there, so every operation re-checks its folder and
+  works by path, as the Files panel did before; the MCP tools that change files answer
+  `McpPlatformUnsupportedError` instead of running with that race.
 - **Trash.** `projects.deleteEntry { toTrash }` uses the same `FileTrash` as Source
   Control's discard and fails `trash_unavailable` rather than deleting.
 - **Errors.** A workspace error's `failure` is kept on the tool failure, and the message is
