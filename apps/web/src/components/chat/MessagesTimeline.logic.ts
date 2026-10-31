@@ -1053,16 +1053,25 @@ export function deriveMessagesTimelineRows(
   }
 
   if (input.isWorking) {
+    // The last message so far is the answer only while nothing of the turn came after it: a
+    // tool call or an approval request after it means the turn is still working, or waiting
+    // on a person, not on the provider to close it.
+    const answerIndex =
+      unsettledTurnId === null
+        ? -1
+        : timelineEntries.findIndex(
+            (entry) =>
+              entry.kind === "message" &&
+              entry.message.role === "assistant" &&
+              entry.message.turnId === unsettledTurnId &&
+              !entry.message.streaming &&
+              terminalAssistantMessageIds.has(entry.message.id),
+          );
     const answerDelivered =
-      unsettledTurnId !== null &&
-      timelineEntries.some(
-        (entry) =>
-          entry.kind === "message" &&
-          entry.message.role === "assistant" &&
-          entry.message.turnId === unsettledTurnId &&
-          !entry.message.streaming &&
-          terminalAssistantMessageIds.has(entry.message.id),
-      );
+      answerIndex >= 0 &&
+      !timelineEntries
+        .slice(answerIndex + 1)
+        .some((entry) => entry.kind === "work" && entry.entry.turnId === unsettledTurnId);
     nextRows.push({
       kind: "working",
       id: "working-indicator-row",
