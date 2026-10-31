@@ -2680,7 +2680,6 @@ async fn crosses_reparse_point(root: &Path, path: &str) -> bool {
 #[cfg(unix)]
 mod discard_staging {
     use std::{
-        collections::HashSet,
         ffi::{CStr, CString, OsStr},
         io::{self, Read, Write},
         os::{
@@ -2688,7 +2687,6 @@ mod discard_staging {
             unix::{ffi::OsStrExt, fs::OpenOptionsExt},
         },
         path::{Component, Path, PathBuf},
-        sync::Mutex,
     };
 
     /// The folder in the Git directory that holds entries on their way to the trash.
@@ -2696,41 +2694,15 @@ mod discard_staging {
     /// Ends the name of a holder's origin record, `<uuid>.origin`, beside the holder.
     const RECORD: &str = ".origin";
 
-    /// Holders this process is using, which recovery leaves alone.
-    static IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-    /// Marks a holder in use until dropped.
-    struct InFlight(String);
-
-    impl InFlight {
-        fn new(holder: &str) -> Self {
-            IN_FLIGHT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_or_insert_with(HashSet::new)
-                .insert(holder.to_owned());
-            Self(holder.to_owned())
-        }
-
-        fn contains(holder: &str) -> bool {
-            IN_FLIGHT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(|holders| holders.contains(holder))
-        }
-    }
-
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            if let Some(holders) = IN_FLIGHT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_mut()
-            {
-                holders.remove(&self.0);
-            }
-        }
+    /// Takes the exclusive advisory lock on open holder folder `holder` without waiting. A
+    /// discard holds it from just after creating the holder (before its origin record exists)
+    /// until it is done with the holder, so recovery, which needs the same lock, never touches
+    /// a holder a live discard owns, in this process (a lock belongs to each open file) or
+    /// another. The operating system releases it when a process dies, so an abandoned holder
+    /// becomes recoverable.
+    fn lock(holder: &OwnedFd) -> bool {
+        // SAFETY: `holder` is an open descriptor.
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
     }
 
     /// Why an entry was not staged.
@@ -2751,7 +2723,6 @@ mod discard_staging {
         record_name: CString,
         name: CString,
         path: PathBuf,
-        _in_flight: InFlight,
     }
 
     impl Staged {
@@ -2857,7 +2828,8 @@ mod discard_staging {
     }
 
     /// Moves back entries a crash left in `<git_dir>/bibcode-discard` (staged, with an origin
-    /// record, but no discard of this process holding them), each into the folder it came from
+    /// record, and a holder whose lock no live discard in any process holds), each into the
+    /// folder it came from
     /// below `worktree_root` (the checkout this Git directory belongs to) when that place is
     /// free; otherwise it stays, and is logged. Holders whose entry is gone (the trash took it
     /// before the record was removed) are removed with their record. A record is not trusted:
@@ -2885,9 +2857,6 @@ mod discard_staging {
             else {
                 continue;
             };
-            if InFlight::contains(holder) {
-                continue;
-            }
             if !restore(&staging, holder, worktree_root) {
                 tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
             }
@@ -2913,6 +2882,10 @@ mod discard_staging {
             }
             Err(_) => return false,
         };
+        // A live discard, here or in another server process, still owns it.
+        if !lock(&holder_fd) {
+            return true;
+        }
         let Some(name) = relative.file_name().and_then(|name| c_name(name).ok()) else {
             return false;
         };
@@ -3006,11 +2979,13 @@ mod discard_staging {
         let holder_name = CString::new(holder_text.clone()).map_err(|_| Unstaged::Failed)?;
         let record_name =
             CString::new(format!("{holder_text}{RECORD}")).map_err(|_| Unstaged::Failed)?;
-        let in_flight = InFlight::new(&holder_text);
         make_folder(&staging, &holder_name).map_err(|_| Unstaged::Failed)?;
-        let Ok(holder) = open_child(&staging, &holder_name) else {
-            remove_folder(&staging, &holder_name);
-            return Err(Unstaged::Failed);
+        let holder = match open_child(&staging, &holder_name) {
+            Ok(holder) if lock(&holder) => holder,
+            _ => {
+                remove_folder(&staging, &holder_name);
+                return Err(Unstaged::Failed);
+            }
         };
         // Where the entry came from, written before it moves, so a crash before the trash
         // takes it leaves a record a later discard restores it from.
@@ -3052,7 +3027,6 @@ mod discard_staging {
             holder_name,
             record_name,
             name: name_c,
-            _in_flight: in_flight,
             path: git_dir
                 .join(OsStr::from_bytes(FOLDER.to_bytes()))
                 .join(holder_text)
@@ -4987,6 +4961,65 @@ mod tests {
         }
         discard.abort();
         assert!(discard.await.is_err(), "the discard was stopped");
+    }
+
+    /// A holder another server process is still using (it holds the holder folder's lock while
+    /// its entry waits for the trash) is never recovered; once that lock is released, as it is
+    /// when the process dies, the entry is restored. Another open of the folder stands in for
+    /// the other process: `flock` locks belong to each open file, not to the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_leaves_a_holder_another_process_still_holds() {
+        use std::os::fd::AsRawFd;
+
+        let (fixture, root) = staging_fixture();
+        strand(&fixture, "dir/victim.txt").await;
+        let staging = root.join(".git/bibcode-discard");
+        let holder = std::fs::read_dir(&staging)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.path().is_dir())
+            .expect("a holder")
+            .path();
+        let other_process = std::fs::File::open(&holder).unwrap();
+        // SAFETY: the descriptor is open for the duration of the call.
+        let locked =
+            unsafe { libc::flock(other_process.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(locked, 0, "the other process takes the holder's lock");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let discard_other = || async {
+            std::fs::write(root.join("other.txt"), "other\n").unwrap();
+            discard_paths(
+                &GitRepository::default(),
+                Arc::new(RecordingTrash {
+                    destination: trash_directory.path().to_path_buf(),
+                    trashed: Mutex::new(Vec::new()),
+                }),
+                DiscardRequest {
+                    cwd: fixture.path().to_path_buf(),
+                    paths: vec!["other.txt".into()],
+                    permit_permanent: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the discard runs");
+        };
+
+        discard_other().await;
+        assert!(
+            !root.join("dir/victim.txt").exists(),
+            "a held holder is left alone"
+        );
+        assert!(holder.join("victim.txt").exists());
+
+        drop(other_process);
+        discard_other().await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "inside\n",
+            "an abandoned holder is restored"
+        );
     }
 
     /// A record BiBCode did not write cannot move a staged entry anywhere but its place in this

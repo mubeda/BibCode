@@ -669,9 +669,12 @@ first staged by folder handle:
 4. A refused entry is renamed back, never over a file created meanwhile
    (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). The holder and its
    record are removed once the entry is trashed or back.
-5. Each discard first recovers what a crash left behind. A record whose holder still
-   holds its entry, and that no discard in this process is using, has the entry moved
-   back the same way, from the worktree root down, when its place is free. Otherwise
+5. Each discard first recovers what a crash left behind. A discard holds an
+   exclusive `flock` on its holder folder from just after creating it until it is
+   done, so recovery, which takes that lock without waiting, never touches a holder a
+   live discard in any server process owns. The OS drops a dead process's lock. A
+   record whose holder recovery can lock, and that still holds its entry, has the
+   entry moved back the same way, from the worktree root down, when its place is free. Otherwise
    the entry stays and a warning is logged. A record whose holder is empty is removed.
    Records are not trusted. One whose path has anything but plain parts (a root, `.`
    or `..`), a NUL, or starts with `.git` is ignored. Its path is opened without
