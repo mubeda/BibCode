@@ -75,6 +75,10 @@ struct Shared {
     messages: Mutex<Vec<Message>>,
     /// The last `commitMessage` sequence, written only while `messages` is locked.
     sequence: AtomicU64,
+    /// Random per server process (one `UiIntents` per server). A client compares sequences only
+    /// within one boot and takes another boot's message as newer: the store does not survive a
+    /// restart, and a clock set back across one can issue a lower sequence.
+    boot_id: String,
     published: broadcast::Sender<Value>,
 }
 
@@ -105,6 +109,7 @@ impl UiIntents {
                 pending: Mutex::new(Vec::new()),
                 messages: Mutex::new(Vec::new()),
                 sequence: AtomicU64::new(0),
+                boot_id: Uuid::new_v4().to_string(),
                 published: broadcast::channel(INTENT_CAPACITY).0,
             }),
         }
@@ -112,20 +117,26 @@ impl UiIntents {
 
     /// The newest [`SNAPSHOT_INTENTS`] `focus` intents still pending, oldest first, then every
     /// pending `commitMessage` intent (at most [`MOST_COMMIT_MESSAGES`]); expired ones are
-    /// dropped. One server is one environment, so this is the subscriber's environment.
+    /// dropped. Each carries the time it has left now (`expiresInMs`). One server is one
+    /// environment, so this is the subscriber's environment.
     pub(crate) fn snapshot(&self) -> Vec<Value> {
+        let now = Instant::now();
         let mut snapshot: Vec<Value> = {
             let mut pending = self.lock();
             prune(&mut pending);
             let skip = pending.len().saturating_sub(SNAPSHOT_INTENTS);
             pending[skip..]
                 .iter()
-                .map(|entry| entry.intent.clone())
+                .map(|entry| with_time_left(&entry.intent, entry.expires, now))
                 .collect()
         };
         let mut messages = self.lock_messages();
         prune_messages(&mut messages);
-        snapshot.extend(messages.iter().map(|entry| entry.intent.clone()));
+        snapshot.extend(
+            messages
+                .iter()
+                .map(|entry| with_time_left(&entry.intent, entry.expires, now)),
+        );
         snapshot
     }
 
@@ -166,6 +177,7 @@ impl UiIntents {
             "actor": actor,
             "createdAt": iso(now),
             "expiresAt": iso(now + FOCUS_TTL),
+            "expiresInMs": millis(FOCUS_TTL),
         });
         {
             let mut pending = self.lock();
@@ -239,6 +251,7 @@ impl UiIntents {
         let intent = json!({
             "kind": "commitMessage",
             "intentId": Uuid::new_v4().to_string(),
+            "bootId": self.shared.boot_id,
             "sequence": sequence,
             "threadId": thread_id,
             "cwd": cwd,
@@ -246,6 +259,7 @@ impl UiIntents {
             "actor": actor,
             "createdAt": iso(now),
             "expiresAt": iso(now + COMMIT_MESSAGE_TTL),
+            "expiresInMs": millis(COMMIT_MESSAGE_TTL),
         });
         prune_messages(&mut messages);
         messages.retain(|entry| entry.cwd != cwd);
@@ -285,6 +299,18 @@ fn prune(pending: &mut Vec<Pending>) {
 fn prune_messages(messages: &mut Vec<Message>) {
     let now = Instant::now();
     messages.retain(|entry| entry.expires > now);
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `intent` with the time it has left at `now` (`expiresInMs`), which a client adds to the
+/// moment it arrives, so its own clock never decides whether an intent has expired.
+fn with_time_left(intent: &Value, expires: Instant, now: Instant) -> Value {
+    let mut intent = intent.clone();
+    intent["expiresInMs"] = millis(expires.saturating_duration_since(now)).into();
+    intent
 }
 
 /// Why `message` cannot be a suggested commit message, if it cannot: it must hold text, at
@@ -712,6 +738,39 @@ mod tests {
         let after = UiIntents::new();
         let (second, _) = after.publish_commit_message("t1", "/repo", "After", actor());
         assert!(second["sequence"].as_u64() > first["sequence"].as_u64());
+    }
+
+    #[test]
+    fn a_commit_message_names_its_server_boot() {
+        // The client compares sequences only within one boot: a clock set back across a
+        // restart can issue a lower sequence, and the newer boot still wins.
+        let first = UiIntents::new();
+        let (one, _) = first.publish_commit_message("t1", "/repo", "One", actor());
+        let (two, _) = first.publish_commit_message("t1", "/repo", "Two", actor());
+        let restarted = UiIntents::new();
+        let (three, _) = restarted.publish_commit_message("t1", "/repo", "Three", actor());
+        let boot = |intent: &Value| intent["bootId"].as_str().expect("a boot id").to_owned();
+        assert_eq!(boot(&one), boot(&two));
+        assert_ne!(boot(&one), boot(&three));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_intent_says_how_long_it_has_left_when_it_is_sent() {
+        // Clients set their own deadline from it, so a client clock that is off never drops a
+        // fresh intent or keeps a stale one.
+        let intents = UiIntents::new();
+        let mut stream = intents.subscribe();
+        let (message, _) = intents.publish_commit_message("t1", "/repo", "Fix", actor());
+        let (focus, _) = intents
+            .publish_focus("t1", "thread", None, actor())
+            .unwrap();
+        assert_eq!(message["expiresInMs"], 86_400_000);
+        assert_eq!(focus["expiresInMs"], 60_000);
+        assert_eq!(stream.try_recv().unwrap()["expiresInMs"], 86_400_000);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let snapshot = intents.snapshot();
+        assert_eq!(snapshot[0]["expiresInMs"], 30_000, "focus");
+        assert_eq!(snapshot[1]["expiresInMs"], 86_370_000, "commitMessage");
     }
 
     #[test]

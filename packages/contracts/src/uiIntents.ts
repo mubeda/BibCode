@@ -29,6 +29,11 @@ export const UiFocusIntent = Schema.Struct({
   createdAt: IsoDateTime,
   /** When clients stop offering it: 60 seconds after `createdAt`. */
   expiresAt: IsoDateTime,
+  /**
+   * How long it had left when the server sent it. A client sets its own deadline from this and
+   * the moment it arrived, so a client clock that is off never misjudges it.
+   */
+  expiresInMs: NonNegativeInt,
 });
 export type UiFocusIntent = typeof UiFocusIntent.Type;
 
@@ -46,8 +51,13 @@ export const UiCommitMessageIntent = Schema.Struct({
   kind: Schema.Literal("commitMessage"),
   intentId: TrimmedNonEmptyString,
   /**
-   * Rises with every commit message the server publishes (from the clock, so it keeps rising
-   * across a restart). A client keeps a folder's highest, whatever order they arrive in.
+   * The server process that published it. Its store does not survive a restart, so a client
+   * takes a message from another boot as newer than anything it holds.
+   */
+  bootId: TrimmedNonEmptyString,
+  /**
+   * Rises with every commit message one boot publishes. Within a boot, a client keeps a
+   * folder's highest, whatever order they arrive in.
    */
   sequence: NonNegativeInt,
   threadId: ThreadId,
@@ -58,6 +68,8 @@ export const UiCommitMessageIntent = Schema.Struct({
   createdAt: IsoDateTime,
   /** When clients stop offering it: 24 hours after `createdAt`. */
   expiresAt: IsoDateTime,
+  /** How long it had left when the server sent it (see {@link UiFocusIntent}). */
+  expiresInMs: NonNegativeInt,
 });
 export type UiCommitMessageIntent = typeof UiCommitMessageIntent.Type;
 
