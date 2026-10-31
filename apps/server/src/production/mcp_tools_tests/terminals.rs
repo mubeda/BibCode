@@ -1072,3 +1072,41 @@ async fn the_log_and_the_profiler_never_see_terminal_input_or_output() {
     );
     child.complete();
 }
+
+/// Slice R: a tool whose scope the credential lacks is hidden from `tools/list`, as `call`
+/// refuses it, and the refusal names the scope and how to gain it.
+#[tokio::test]
+async fn a_credential_without_the_terminal_scope_lists_no_terminal_tools() {
+    let (fixture, _) = Fixture::echo().await;
+    let (agent, _) = fixture.harness.agent(McpAccess::FullAccess).await;
+    let listed = fixture.harness.control.tools(&agent);
+    let names = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().all(|name| !TOOLS.contains(&name.as_str())),
+        "{names:?}"
+    );
+    let with_scope = fixture.agent().await;
+    let listed = fixture.harness.control.tools(&with_scope);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "terminal_list")
+    );
+    let refused = fixture
+        .call(&agent, "terminal_list", json!({ "threadId": THREAD }))
+        .await;
+    let message = refused["structuredContent"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("terminal:operate"), "{message}");
+    assert!(message.contains("signs in again"), "{message}");
+    fixture.shutdown().await;
+}
