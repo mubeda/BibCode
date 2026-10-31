@@ -111,6 +111,23 @@ describe("McpAuthorizationNotifier", () => {
     expect(navigate).toHaveBeenCalledWith({ to: "/settings/agents" });
   });
 
+  it("takes a notice down once its request is approved, denied or gone", async () => {
+    h.requests = [request("a"), request("b")];
+    const root = await render();
+    expect(h.added).toHaveLength(2);
+    // "a" was decided: it left the pending list, so its notice goes; "b" still waits.
+    h.requests = [request("b")];
+    await act(async () => {
+      root.render(<McpAuthorizationNotifier router={{ navigate } as never} />);
+    });
+    expect(h.closed).toEqual(["toast-1"]);
+    h.requests = [];
+    await act(async () => {
+      root.render(<McpAuthorizationNotifier router={{ navigate } as never} />);
+    });
+    expect(h.closed).toEqual(["toast-1", "toast-2"]);
+  });
+
   it("raises nothing without access:write, or for an expired request", async () => {
     h.canManage = false;
     h.requests = [request("a")];
