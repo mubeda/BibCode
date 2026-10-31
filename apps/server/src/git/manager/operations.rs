@@ -2383,16 +2383,27 @@ pub async fn discard_paths(
     cancellation: &CancellationToken,
 ) -> Result<DiscardOutcome, DiscardError> {
     validate_pathspecs("GitManager.discard", &request.cwd, &request.paths)?;
-    let root = contain_discard_paths(&request.cwd, &request.paths).await?;
+    // Git's metadata is never discarded, also through a path that resolves into it; on unix,
+    // entries are staged in the Git directory on their way to the trash (see `move_to_trash`).
+    let roots = repository
+        .resolve_watch_roots(&request.cwd, cancellation)
+        .await?;
+    let root = contain_discard_paths(
+        &request.cwd,
+        &request.paths,
+        &[&roots.git_dir, &roots.common_dir],
+    )
+    .await?;
     let tracked = repository
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
-    // Entries are staged here on their way to the trash (see `move_to_trash`).
     #[cfg(unix)]
-    let git_dir = repository
-        .resolve_watch_roots(&request.cwd, cancellation)
-        .await?
-        .git_dir;
+    let git_dir = roots.git_dir;
+    #[cfg(unix)]
+    {
+        let staging_dir = git_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || discard_staging::recover(&staging_dir)).await;
+    }
     let mut outcome = DiscardOutcome::default();
     let mut restore_only = Vec::new();
     for path in &request.paths {
@@ -2474,22 +2485,41 @@ pub async fn discard_paths(
 
 /// Refuses every path whose folder resolves outside the checkout, before anything is trashed or
 /// restored (#139 slice G, C5): a symlinked folder inside the checkout that points elsewhere
-/// cannot route a discard outside it. Returns the checkout's canonical path.
-async fn contain_discard_paths(cwd: &Path, paths: &[String]) -> Result<PathBuf, DiscardError> {
-    let refused = || {
+/// cannot route a discard outside it. A path that resolves into, or holds, one of
+/// `metadata` (the Git directory and common directory) is refused too (review round 4).
+/// Returns the checkout's canonical path.
+async fn contain_discard_paths(
+    cwd: &Path,
+    paths: &[String],
+    metadata: &[&Path],
+) -> Result<PathBuf, DiscardError> {
+    let refused = |detail: &str| {
         DiscardError::Git(GitCommandError {
             tag: "GitCommandError",
             operation: "GitManager.discard".into(),
             command: "git".into(),
             cwd: cwd.to_string_lossy().into(),
             diagnostics: None,
-            detail: "A discard path leaves the checkout through a symlinked folder.".into(),
+            detail: detail.into(),
         })
     };
-    let root = tokio::fs::canonicalize(cwd).await.map_err(|_| refused())?;
+    const ESCAPES: &str = "A discard path leaves the checkout through a symlinked folder.";
+    let root = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|_| refused(ESCAPES))?;
+    let metadata = metadata
+        .iter()
+        .map(|folder| without_verbatim_prefix(folder.to_path_buf()))
+        .collect::<Vec<_>>();
     for path in paths {
-        if contained_path(&root, cwd, path).await.is_none() {
-            return Err(refused());
+        let Some(resolved) = contained_path(&root, cwd, path).await else {
+            return Err(refused(ESCAPES));
+        };
+        if metadata
+            .iter()
+            .any(|folder| resolved.starts_with(folder) || folder.starts_with(&resolved))
+        {
+            return Err(refused("A discard path names Git's own metadata."));
         }
     }
     Ok(root)
@@ -2639,17 +2669,58 @@ async fn crosses_reparse_point(root: &Path, path: &str) -> bool {
 #[cfg(unix)]
 mod discard_staging {
     use std::{
+        collections::HashSet,
         ffi::{CStr, CString, OsStr},
-        io,
+        io::{self, Read, Write},
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::{ffi::OsStrExt, fs::OpenOptionsExt},
         },
         path::{Component, Path, PathBuf},
+        sync::Mutex,
     };
 
     /// The folder in the Git directory that holds entries on their way to the trash.
     const FOLDER: &CStr = c"bibcode-discard";
+    /// Ends the name of a holder's origin record, `<uuid>.origin`, beside the holder.
+    const RECORD: &str = ".origin";
+
+    /// Holders this process is using, which recovery leaves alone.
+    static IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+    /// Marks a holder in use until dropped.
+    struct InFlight(String);
+
+    impl InFlight {
+        fn new(holder: &str) -> Self {
+            IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(HashSet::new)
+                .insert(holder.to_owned());
+            Self(holder.to_owned())
+        }
+
+        fn contains(holder: &str) -> bool {
+            IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|holders| holders.contains(holder))
+        }
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            if let Some(holders) = IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                holders.remove(&self.0);
+            }
+        }
+    }
 
     /// Why an entry was not staged.
     pub(super) enum Unstaged {
@@ -2666,8 +2737,10 @@ mod discard_staging {
         staging: OwnedFd,
         holder: OwnedFd,
         holder_name: CString,
+        record_name: CString,
         name: CString,
         path: PathBuf,
+        _in_flight: InFlight,
     }
 
     impl Staged {
@@ -2686,25 +2759,56 @@ mod discard_staging {
                 }
                 return false;
             }
-            remove_folder(&self.staging, &self.holder_name);
+            self.release();
             true
         }
 
         /// Renames the entry back into the folder it came from, never over an entry created
-        /// there since. Returns whether it went back; if not, it stays staged.
+        /// there since. Returns whether it went back; if not, it stays staged with its origin
+        /// record, for a later discard's [`recover`] to try again.
         pub(super) fn put_back(self) -> bool {
             let back =
                 rename_no_replace(&self.holder, &self.name, &self.parent, &self.name).is_ok();
             if back {
-                remove_folder(&self.staging, &self.holder_name);
+                self.release();
             }
             back
         }
+
+        /// Removes the emptied holder and its origin record.
+        fn release(&self) {
+            remove_folder(&self.staging, &self.holder_name);
+            remove_file(&self.staging, &self.record_name);
+        }
     }
 
-    /// Stages the entry at `relative` below `root` into a new holder folder under `git_dir`.
-    pub(super) fn stage(root: &Path, git_dir: &Path, relative: &str) -> Result<Staged, Unstaged> {
-        let relative = Path::new(relative);
+    /// Whether a staging folder with owner `uid` and `mode` is private to the user `ours`: owned
+    /// by it and writable by no group or other user, so nobody else can rename a holder in it.
+    pub(super) fn is_private(uid: u32, mode: u32, ours: u32) -> bool {
+        uid == ours && mode & 0o022 == 0
+    }
+
+    /// Whether open folder `folder` is private to this process's user (see [`is_private`]).
+    fn private(folder: &OwnedFd) -> bool {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `folder` is an open descriptor and `status` is writable.
+        if unsafe { libc::fstat(folder.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: `fstat` succeeded and filled `status`.
+        let status = unsafe { status.assume_init() };
+        // SAFETY: `geteuid` has no preconditions.
+        let ours = unsafe { libc::geteuid() };
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "the field types differ between platforms"
+        )]
+        is_private(status.st_uid as u32, status.st_mode as u32, ours as u32)
+    }
+
+    /// Opens the folder that holds `relative` (below `root`) from `root` one part at a time,
+    /// never following a link, and returns it with the entry's name.
+    fn open_parent<'a>(root: &Path, relative: &'a Path) -> Result<(OwnedFd, &'a OsStr), Unstaged> {
         let name = relative.file_name().ok_or(Unstaged::Escapes)?;
         let mut parent = open_folder(root).map_err(|_| Unstaged::Failed)?;
         for component in relative.parent().into_iter().flat_map(Path::components) {
@@ -2721,21 +2825,175 @@ mod discard_staging {
                 _ => return Err(Unstaged::Escapes),
             }
         }
-        let git = open_folder(git_dir).map_err(|_| Unstaged::Failed)?;
-        match make_folder(&git, FOLDER) {
+        Ok((parent, name))
+    }
+
+    /// Opens `<git_dir>/bibcode-discard`, creating it, when it is private to this user.
+    fn open_staging(git: &OwnedFd) -> Result<OwnedFd, Unstaged> {
+        match make_folder(git, FOLDER) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(Unstaged::Failed),
         }
-        let staging = open_child(&git, FOLDER).map_err(|_| Unstaged::Failed)?;
+        let staging = open_child(git, FOLDER).map_err(|_| Unstaged::Failed)?;
+        if !private(&staging) {
+            tracing::warn!(
+                "BiBCode's discard staging folder is not private to this user; not used"
+            );
+            return Err(Unstaged::Failed);
+        }
+        Ok(staging)
+    }
+
+    /// Moves back entries a crash left in `<git_dir>/bibcode-discard` (staged, with an origin
+    /// record, but no discard of this process holding them), each into the folder it came from
+    /// when that place is free; otherwise it stays, and is logged. Holders whose entry is gone
+    /// (the trash took it before the record was removed) are removed with their record.
+    pub(super) fn recover(git_dir: &Path) {
+        let Ok(git) = open_folder(git_dir) else {
+            return;
+        };
+        let Ok(staging) = open_child(&git, FOLDER) else {
+            return;
+        };
+        if !private(&staging) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(git_dir.join(OsStr::from_bytes(FOLDER.to_bytes())))
+        else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(holder) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(RECORD))
+            else {
+                continue;
+            };
+            if InFlight::contains(holder) {
+                continue;
+            }
+            if !restore(&staging, holder) {
+                tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
+            }
+        }
+    }
+
+    /// Restores the entry of `holder` from its origin record; returns false when it stays.
+    fn restore(staging: &OwnedFd, holder: &str) -> bool {
+        let (Ok(holder_name), Ok(record_name)) = (
+            CString::new(holder),
+            CString::new(format!("{holder}{RECORD}")),
+        ) else {
+            return false;
+        };
+        let Some((root, relative)) = read_record(staging, &record_name) else {
+            return false;
+        };
+        let holder_fd = match open_child(staging, &holder_name) {
+            Ok(holder) => holder,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                remove_file(staging, &record_name);
+                return true;
+            }
+            Err(_) => return false,
+        };
+        let Some(name) = relative.file_name().and_then(|name| c_name(name).ok()) else {
+            return false;
+        };
+        if identity_at(&holder_fd, &name).is_none() {
+            remove_folder(staging, &holder_name);
+            remove_file(staging, &record_name);
+            return true;
+        }
+        let Ok((parent, _)) = open_parent(&root, &relative) else {
+            return false;
+        };
+        if rename_no_replace(&holder_fd, &name, &parent, &name).is_err() {
+            return false;
+        }
+        remove_folder(staging, &holder_name);
+        remove_file(staging, &record_name);
+        true
+    }
+
+    /// Writes `<uuid>.origin`: the checkout's root, a NUL, and the entry's path below it.
+    fn write_record(
+        staging: &OwnedFd,
+        record_name: &CStr,
+        root: &Path,
+        relative: &Path,
+    ) -> io::Result<()> {
+        // SAFETY: `staging` is an open descriptor and `record_name` is NUL-terminated; the
+        // file is new (`O_EXCL`) and never a link.
+        let descriptor = unsafe {
+            libc::openat(
+                staging.as_raw_fd(),
+                record_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new descriptor that nothing else owns.
+        let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut record = root.as_os_str().as_bytes().to_vec();
+        record.push(0);
+        record.extend_from_slice(relative.as_os_str().as_bytes());
+        file.write_all(&record)?;
+        file.sync_all()
+    }
+
+    /// The checkout root and entry path a record names.
+    fn read_record(staging: &OwnedFd, record_name: &CStr) -> Option<(PathBuf, PathBuf)> {
+        // SAFETY: `staging` is an open descriptor and `record_name` is NUL-terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                staging.as_raw_fd(),
+                record_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return None;
+        }
+        // SAFETY: `openat` returned a new descriptor that nothing else owns.
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut record = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut record).ok()?;
+        let split = record.iter().position(|byte| *byte == 0)?;
+        let root = PathBuf::from(OsStr::from_bytes(&record[..split]));
+        let relative = PathBuf::from(OsStr::from_bytes(&record[split + 1..]));
+        (root.is_absolute() && !relative.as_os_str().is_empty()).then_some((root, relative))
+    }
+
+    /// Stages the entry at `relative` below `root` into a new holder folder under `git_dir`.
+    pub(super) fn stage(root: &Path, git_dir: &Path, relative: &str) -> Result<Staged, Unstaged> {
+        let relative = Path::new(relative);
+        let (parent, name) = open_parent(root, relative)?;
+        let name_c = c_name(name)?;
+        let git = open_folder(git_dir).map_err(|_| Unstaged::Failed)?;
+        let staging = open_staging(&git)?;
         let holder_text = uuid::Uuid::new_v4().to_string();
         let holder_name = CString::new(holder_text.clone()).map_err(|_| Unstaged::Failed)?;
+        let record_name =
+            CString::new(format!("{holder_text}{RECORD}")).map_err(|_| Unstaged::Failed)?;
+        let in_flight = InFlight::new(&holder_text);
         make_folder(&staging, &holder_name).map_err(|_| Unstaged::Failed)?;
         let Ok(holder) = open_child(&staging, &holder_name) else {
             remove_folder(&staging, &holder_name);
             return Err(Unstaged::Failed);
         };
-        let name_c = c_name(name)?;
+        // Where the entry came from, written before it moves, so a crash before the trash
+        // takes it leaves a record a later discard restores it from.
+        if write_record(&staging, &record_name, root, relative).is_err() {
+            remove_file(&staging, &record_name);
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        }
         #[cfg(test)]
         super::discard_hooks::run(
             super::discard_hooks::Point::BeforeMove,
@@ -2752,6 +3010,7 @@ mod discard_staging {
             )
         };
         if renamed != 0 {
+            remove_file(&staging, &record_name);
             remove_folder(&staging, &holder_name);
             return Err(Unstaged::Failed);
         }
@@ -2762,7 +3021,9 @@ mod discard_staging {
             staging,
             holder,
             holder_name,
+            record_name,
             name: name_c,
+            _in_flight: in_flight,
             path: git_dir
                 .join(OsStr::from_bytes(FOLDER.to_bytes()))
                 .join(holder_text)
@@ -2887,6 +3148,12 @@ mod discard_staging {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Removes file `name` in `folder`, if it is there.
+    fn remove_file(folder: &OwnedFd, name: &CStr) {
+        // SAFETY: `folder` is an open descriptor and `name` is NUL-terminated.
+        unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) };
     }
 
     /// Removes empty folder `name` in `folder`; a folder that is not empty stays.
@@ -4487,6 +4754,281 @@ mod tests {
                 Err(TrashUnavailable)
             })
         }
+    }
+
+    /// Git's own metadata is never a discard target, for any caller: `.git` as the first part of
+    /// a path (in any case), and any path that resolves into the Git directory, are refused
+    /// before anything moves. Staging shares the validator and refuses them too (review
+    /// round 4).
+    #[tokio::test]
+    async fn git_metadata_is_never_a_discard_target() {
+        let (fixture, root) = metadata_fixture();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join(".git"), root.join("meta")).expect("link");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+        let mut refused_paths = vec![
+            ".git/objects",
+            ".git",
+            "./.git/HEAD",
+            ".GIT/config",
+            ".git/",
+        ];
+        if cfg!(unix) {
+            refused_paths.push("meta/objects");
+        }
+        for path in refused_paths {
+            let refused = discard_paths(
+                &GitRepository::default(),
+                trash.clone(),
+                DiscardRequest {
+                    cwd: fixture.path().to_path_buf(),
+                    paths: vec!["untracked.txt".into(), path.into()],
+                    permit_permanent: true,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(refused.is_err(), "{path} was accepted");
+        }
+        assert!(trash.trashed.lock().unwrap().is_empty());
+        assert!(root.join(".git/objects").is_dir() && root.join(".git/HEAD").is_file());
+        assert!(
+            root.join("untracked.txt").exists(),
+            "a refused call moves nothing"
+        );
+        let staged = GitRepository::default()
+            .stage_files(
+                fixture.path(),
+                &[".git/config".to_owned()],
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(staged.is_err(), "staging takes the same validator");
+
+        // A linked worktree's `.git` is a file that points at its Git directory.
+        let linked = root.parent().unwrap().join(format!(
+            "{}-linked",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let refused = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: linked.clone(),
+                paths: vec![".git".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a linked worktree's .git file was accepted"
+        );
+        assert!(linked.join(".git").is_file());
+        std::fs::remove_dir_all(&linked).ok();
+    }
+
+    /// A repository with one commit and `untracked.txt`, and its canonical path.
+    fn metadata_fixture() -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("untracked.txt"), "untracked\n").expect("untracked");
+        let root = fixture.path().canonicalize().expect("canonical checkout");
+        (fixture, root)
+    }
+
+    /// A staging folder BiBCode does not keep private (another owner, or writable by group or
+    /// others) is never used: such a user could rename the holder after the identity check. The
+    /// entry stays where it was, the trash is never called, and `permanent` still works
+    /// through Git.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_staging_folder_others_can_write_is_never_used() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, root) = staging_fixture();
+        let staging = root.join(".git/bibcode-discard");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert!(trash.trashed.lock().unwrap().is_empty());
+        assert!(root.join("dir/victim.txt").exists());
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// The ownership rule itself, for an owner a test cannot create.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_staging_folder_of_ours_without_group_or_other_write_is_private() {
+        assert!(discard_staging::is_private(501, 0o40700, 501));
+        assert!(discard_staging::is_private(501, 0o40755, 501));
+        assert!(
+            !discard_staging::is_private(0, 0o40700, 501),
+            "another owner"
+        );
+        assert!(
+            !discard_staging::is_private(501, 0o40770, 501),
+            "group write"
+        );
+        assert!(
+            !discard_staging::is_private(501, 0o40702, 501),
+            "other write"
+        );
+    }
+
+    /// Never answers.
+    #[cfg(unix)]
+    struct StuckTrash {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for StuckTrash {
+        fn trash<'a>(
+            &'a self,
+            _path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Stops a discard while its entry waits for the trash, as a crash would, and returns once
+    /// the entry is staged.
+    #[cfg(unix)]
+    async fn strand(fixture: &tempfile::TempDir, path: &str) {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trash = Arc::new(StuckTrash {
+            called: called.clone(),
+        });
+        let (cwd, path) = (fixture.path().to_path_buf(), path.to_owned());
+        let discard = tokio::spawn(async move {
+            discard_paths(
+                &GitRepository::default(),
+                trash,
+                DiscardRequest {
+                    cwd,
+                    paths: vec![path],
+                    permit_permanent: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        while !called.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        discard.abort();
+        assert!(discard.await.is_err(), "the discard was stopped");
+    }
+
+    /// An entry a crash left in the staging folder is moved back to where it came from by the
+    /// next discard in that repository; one whose place is taken again stays staged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_discard_restores_entries_a_crash_left_in_staging() {
+        let (fixture, root) = staging_fixture();
+        strand(&fixture, "dir/victim.txt").await;
+        assert!(
+            !root.join("dir/victim.txt").exists(),
+            "the entry is stranded"
+        );
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+        let discard = |path: &str| DiscardRequest {
+            cwd: fixture.path().to_path_buf(),
+            paths: vec![path.into()],
+            permit_permanent: false,
+        };
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            discard("other.txt"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(outcome.trashed, ["other.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "inside\n",
+            "the stranded entry went back"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".git/bibcode-discard"))
+                .unwrap()
+                .count(),
+            0,
+            "its holder and record are gone"
+        );
+
+        // Stranded again, and its place taken meanwhile: it stays staged.
+        strand(&fixture, "dir/victim.txt").await;
+        std::fs::write(root.join("dir/victim.txt"), "new\n").unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        discard_paths(
+            &GitRepository::default(),
+            trash,
+            discard("other.txt"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "new\n"
+        );
+        assert_ne!(
+            std::fs::read_dir(root.join(".git/bibcode-discard"))
+                .unwrap()
+                .count(),
+            0,
+            "the stranded entry is kept, not dropped"
+        );
     }
 
     /// An entry the trash refuses goes back where it was, but never over a file created there
