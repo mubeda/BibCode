@@ -1,5 +1,5 @@
 diff --git a/react.js b/react.js
-index 5b171eb..2934929 100644
+index 5b171eb..31c827e 100644
 --- a/react.js
 +++ b/react.js
 @@ -1978,2 +1978,8 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -11,12 +11,45 @@ index 5b171eb..2934929 100644
 +    state.mvcpAnchorLock = void 0;
 +  }
    const didCancelMaintainScrollAtEnd = isUserScrollEvent && newScroll < prevScroll && !!(state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd);
-@@ -2628,3 +2634,3 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
+@@ -2145,3 +2151,8 @@ function scrollTo(ctx, params) {
+   const state = ctx.state;
+-  const { noScrollingTo, forceScroll, ...scrollTarget } = params;
++  const { noScrollingTo, forceScroll, adjustAtRequest, ...scrollTarget } = params;
++  if (adjustAtRequest !== void 0) {
++    // BiBCode patch: rows that resized since the request moved the content it asked for, and the
++    // list scrolled by the same amount to hold it; the request lands where that content is now.
++    scrollTarget.offset += state.scrollAdjustHandler.getAdjust() - adjustAtRequest;
++  }
+   const {
+@@ -2159,4 +2170,4 @@ function scrollTo(ctx, params) {
+   const shouldPreserveRawInitialOffsetRequest = !!isInitialScroll && ((_a3 = state.initialScrollSession) == null ? void 0 : _a3.kind) === "offset";
+-  const targetOffset = clampScrollOffset(ctx, requestedOffset, scrollTarget);
+-  const offset = shouldPreserveRawInitialOffsetRequest ? requestedOffset : targetOffset;
++  let targetOffset = clampScrollOffset(ctx, requestedOffset, scrollTarget);
++  let offset = shouldPreserveRawInitialOffsetRequest ? requestedOffset : targetOffset;
+   state.scrollHistory.length = 0;
+@@ -2185,3 +2196,15 @@ function scrollTo(ctx, params) {
+     } else {
++      const adjustBefore = state.scrollAdjustHandler.getAdjust();
+       updateScroll(ctx, targetOffset, true, { markHasScrolled: false });
++      const adjusted = state.scrollAdjustHandler.getAdjust() - adjustBefore;
++      if (Math.abs(adjusted) > 0.1) {
++        // BiBCode patch: moving to the target laid out rows that resized before it, and the list
++        // scrolled by their growth to hold the content; the target moved with that content.
++        targetOffset = clampScrollOffset(ctx, targetOffset + adjusted, scrollTarget);
++        offset = targetOffset;
++        state.scrollPending = targetOffset;
++        if (state.scrollingTo) {
++          state.scrollingTo.targetOffset = targetOffset;
++        }
++      }
+     }
+@@ -2628,3 +2651,3 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
  }
 -function schedulePreservedEndAnchorCorrection(ctx) {
 +function schedulePreservedEndAnchorCorrection(ctx, immediate = false) {
    if (getPreservedEndAnchorOffsetDiff(ctx) === void 0) {
-@@ -2632,4 +2638,15 @@ function schedulePreservedEndAnchorCorrection(ctx) {
+@@ -2632,4 +2655,15 @@ function schedulePreservedEndAnchorCorrection(ctx) {
    }
 -  const correction = {};
 -  schedulePreservedEndAnchorCorrectionFrame(ctx, correction);
@@ -34,7 +67,7 @@ index 5b171eb..2934929 100644
 +    }
 +  }
    return true;
-@@ -2652,4 +2669,7 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+@@ -2652,4 +2686,7 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
      if (hasObservedNativeScrollAfterRequest) {
 -      activeCorrection.lastRequestTime = Date.now();
 -      requestAdjust(ctx, offsetDiff);
@@ -44,22 +77,22 @@ index 5b171eb..2934929 100644
 +        requestAdjust(ctx, remaining);
 +      }
      }
-@@ -3144,3 +3164,3 @@ function checkFinishedScrollFallback(ctx) {
+@@ -3144,3 +3181,3 @@ function checkFinishedScrollFallback(ctx) {
  // src/core/initialScrollLifecycle.ts
 -function retargetActiveInitialScrollAtEnd(ctx) {
 +function retargetActiveInitialScrollAtEnd(ctx, immediate = false) {
    var _a3;
-@@ -3149,3 +3169,3 @@ function retargetActiveInitialScrollAtEnd(ctx) {
+@@ -3149,3 +3186,3 @@ function retargetActiveInitialScrollAtEnd(ctx) {
    if (state.didFinishInitialScroll) {
 -    return schedulePreservedEndAnchorCorrection(ctx);
 +    return schedulePreservedEndAnchorCorrection(ctx, immediate);
    }
-@@ -4277,3 +4297,3 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+@@ -4277,3 +4314,3 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
    maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
 -  if (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
 +  if (viewabilityConfigCallbackPairs && visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
      updateViewableItems(
-@@ -4398,13 +4418,13 @@ function calculateItemsInView(ctx, params = {}) {
+@@ -4398,13 +4435,13 @@ function calculateItemsInView(ctx, params = {}) {
          if (!isInMVCPActiveMode(state)) {
 -          if (viewabilityConfigCallbackPairs) {
 -            updateViewabilityForCachedRange(
@@ -84,13 +117,17 @@ index 5b171eb..2934929 100644
 +            scrollBottom
 +          );
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
-@@ -7313,3 +7333,3 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
+@@ -7313,3 +7350,3 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
      updateScroll(ctx, state.scroll, true, { markHasScrolled: false });
 -    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx);
 +    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx, insetDiff > 0);
      if (!didRetargetInitialScroll && wasWithinEndThreshold && (insetDiff > 0)) {
-@@ -7590,2 +7610,71 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+@@ -7590,6 +7627,80 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
      }),
+-    scrollToOffset: (params) => runScrollWithPromise(() => {
+-      scrollTo(ctx, params);
+-      return true;
+-    }),
 +    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
 +    // so none runs over them later: a request still waiting for layout to settle, and the
 +    // completion checks and target of one under way. An animated scroll the browser is still
@@ -160,9 +197,18 @@ index 5b171eb..2934929 100644
 +        updateScroll(ctx, observed, true, { markHasScrolled: false });
 +      }
 +    },
-     scrollToOffset: (params) => runScrollWithPromise(() => {
++    scrollToOffset: (params) => {
++      // BiBCode patch: the offset was read from the list as it is now. The request can wait for
++      // rows to settle, so it remembers how far the list has scrolled to hold content so far.
++      const adjustAtRequest = state.scrollAdjustHandler.getAdjust();
++      return runScrollWithPromise(() => {
++        scrollTo(ctx, { ...params, adjustAtRequest });
++        return true;
++      });
++    },
+     setItemSize: (itemKey, size) => {
 diff --git a/react.mjs b/react.mjs
-index cf549ca..85c5847 100644
+index cf549ca..3ba6d7b 100644
 --- a/react.mjs
 +++ b/react.mjs
 @@ -1957,2 +1957,8 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -174,12 +220,45 @@ index cf549ca..85c5847 100644
 +    state.mvcpAnchorLock = void 0;
 +  }
    const didCancelMaintainScrollAtEnd = isUserScrollEvent && newScroll < prevScroll && !!(state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd);
-@@ -2607,3 +2613,3 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
+@@ -2124,3 +2130,8 @@ function scrollTo(ctx, params) {
+   const state = ctx.state;
+-  const { noScrollingTo, forceScroll, ...scrollTarget } = params;
++  const { noScrollingTo, forceScroll, adjustAtRequest, ...scrollTarget } = params;
++  if (adjustAtRequest !== void 0) {
++    // BiBCode patch: rows that resized since the request moved the content it asked for, and the
++    // list scrolled by the same amount to hold it; the request lands where that content is now.
++    scrollTarget.offset += state.scrollAdjustHandler.getAdjust() - adjustAtRequest;
++  }
+   const {
+@@ -2138,4 +2149,4 @@ function scrollTo(ctx, params) {
+   const shouldPreserveRawInitialOffsetRequest = !!isInitialScroll && ((_a3 = state.initialScrollSession) == null ? void 0 : _a3.kind) === "offset";
+-  const targetOffset = clampScrollOffset(ctx, requestedOffset, scrollTarget);
+-  const offset = shouldPreserveRawInitialOffsetRequest ? requestedOffset : targetOffset;
++  let targetOffset = clampScrollOffset(ctx, requestedOffset, scrollTarget);
++  let offset = shouldPreserveRawInitialOffsetRequest ? requestedOffset : targetOffset;
+   state.scrollHistory.length = 0;
+@@ -2164,3 +2175,15 @@ function scrollTo(ctx, params) {
+     } else {
++      const adjustBefore = state.scrollAdjustHandler.getAdjust();
+       updateScroll(ctx, targetOffset, true, { markHasScrolled: false });
++      const adjusted = state.scrollAdjustHandler.getAdjust() - adjustBefore;
++      if (Math.abs(adjusted) > 0.1) {
++        // BiBCode patch: moving to the target laid out rows that resized before it, and the list
++        // scrolled by their growth to hold the content; the target moved with that content.
++        targetOffset = clampScrollOffset(ctx, targetOffset + adjusted, scrollTarget);
++        offset = targetOffset;
++        state.scrollPending = targetOffset;
++        if (state.scrollingTo) {
++          state.scrollingTo.targetOffset = targetOffset;
++        }
++      }
+     }
+@@ -2607,3 +2630,3 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
  }
 -function schedulePreservedEndAnchorCorrection(ctx) {
 +function schedulePreservedEndAnchorCorrection(ctx, immediate = false) {
    if (getPreservedEndAnchorOffsetDiff(ctx) === void 0) {
-@@ -2611,4 +2617,15 @@ function schedulePreservedEndAnchorCorrection(ctx) {
+@@ -2611,4 +2634,15 @@ function schedulePreservedEndAnchorCorrection(ctx) {
    }
 -  const correction = {};
 -  schedulePreservedEndAnchorCorrectionFrame(ctx, correction);
@@ -197,7 +276,7 @@ index cf549ca..85c5847 100644
 +    }
 +  }
    return true;
-@@ -2631,4 +2648,7 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+@@ -2631,4 +2665,7 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
      if (hasObservedNativeScrollAfterRequest) {
 -      activeCorrection.lastRequestTime = Date.now();
 -      requestAdjust(ctx, offsetDiff);
@@ -207,22 +286,22 @@ index cf549ca..85c5847 100644
 +        requestAdjust(ctx, remaining);
 +      }
      }
-@@ -3123,3 +3143,3 @@ function checkFinishedScrollFallback(ctx) {
+@@ -3123,3 +3160,3 @@ function checkFinishedScrollFallback(ctx) {
  // src/core/initialScrollLifecycle.ts
 -function retargetActiveInitialScrollAtEnd(ctx) {
 +function retargetActiveInitialScrollAtEnd(ctx, immediate = false) {
    var _a3;
-@@ -3128,3 +3148,3 @@ function retargetActiveInitialScrollAtEnd(ctx) {
+@@ -3128,3 +3165,3 @@ function retargetActiveInitialScrollAtEnd(ctx) {
    if (state.didFinishInitialScroll) {
 -    return schedulePreservedEndAnchorCorrection(ctx);
 +    return schedulePreservedEndAnchorCorrection(ctx, immediate);
    }
-@@ -4256,3 +4276,3 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+@@ -4256,3 +4293,3 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
    maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
 -  if (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
 +  if (viewabilityConfigCallbackPairs && visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
      updateViewableItems(
-@@ -4377,13 +4397,13 @@ function calculateItemsInView(ctx, params = {}) {
+@@ -4377,13 +4414,13 @@ function calculateItemsInView(ctx, params = {}) {
          if (!isInMVCPActiveMode(state)) {
 -          if (viewabilityConfigCallbackPairs) {
 -            updateViewabilityForCachedRange(
@@ -247,13 +326,17 @@ index cf549ca..85c5847 100644
 +            scrollBottom
 +          );
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
-@@ -7292,3 +7312,3 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
+@@ -7292,3 +7329,3 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
      updateScroll(ctx, state.scroll, true, { markHasScrolled: false });
 -    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx);
 +    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx, insetDiff > 0);
      if (!didRetargetInitialScroll && wasWithinEndThreshold && (insetDiff > 0)) {
-@@ -7569,2 +7589,71 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+@@ -7569,6 +7606,80 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
      }),
+-    scrollToOffset: (params) => runScrollWithPromise(() => {
+-      scrollTo(ctx, params);
+-      return true;
+-    }),
 +    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
 +    // so none runs over them later: a request still waiting for layout to settle, and the
 +    // completion checks and target of one under way. An animated scroll the browser is still
@@ -323,4 +406,13 @@ index cf549ca..85c5847 100644
 +        updateScroll(ctx, observed, true, { markHasScrolled: false });
 +      }
 +    },
-     scrollToOffset: (params) => runScrollWithPromise(() => {
++    scrollToOffset: (params) => {
++      // BiBCode patch: the offset was read from the list as it is now. The request can wait for
++      // rows to settle, so it remembers how far the list has scrolled to hold content so far.
++      const adjustAtRequest = state.scrollAdjustHandler.getAdjust();
++      return runScrollWithPromise(() => {
++        scrollTo(ctx, { ...params, adjustAtRequest });
++        return true;
++      });
++    },
+     setItemSize: (itemKey, size) => {

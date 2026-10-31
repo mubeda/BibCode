@@ -3125,7 +3125,12 @@ view), or free scrolling.
   turn, binds with that turn.
 - **Withdrawn requests.** LegendList can hold an imperative scroll for up to
   800 ms while rows settle, clamps it to the content it has laid out, and a
-  wheel or key scroll does not cancel it. Every takeover withdraws them
+  wheel or key scroll does not cancel it. An offset ChatView asked for is
+  read from the list as it was, so when rows resize before the request runs,
+  or as it lays them out, and LegendList scrolls to hold the content, the
+  patch moves the request's target by the same amount; otherwise the request
+  would undo that hold, and a row that grew above the reader would shift the
+  view by its growth (#214). Every takeover withdraws held requests
   through `cancelScrollRequests()`, which
   `patches/@legendapp__list@3.3.10.patch` adds. It drops a request waiting for
   rows to settle and the completion checks and target of a scroll under way,

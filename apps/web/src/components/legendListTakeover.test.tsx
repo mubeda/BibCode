@@ -18,6 +18,22 @@ const HELD = 160;
 
 let domWindow: Window | null = null;
 let root: Root | null = null;
+// LegendList keeps one observer for the module's lifetime, so the observers outlive each test.
+const observers: Array<{ targets: Set<Element>; callback: (entries: unknown[]) => void }> = [];
+let heights = new Map<Element, number>();
+
+/** The element grows or shrinks to `height`, and the observers watching it report it. */
+function resize(element: Element, height: number) {
+  heights.set(element, height);
+  const entry = {
+    target: element,
+    borderBoxSize: [{ blockSize: height, inlineSize: 800 }],
+    contentRect: { top: 0, left: 0, width: 800, height },
+  };
+  for (const observer of observers) {
+    if (observer.targets.has(element)) observer.callback([entry]);
+  }
+}
 
 beforeEach(() => {
   domWindow = new Window({ url: "https://bibcode.test/" });
@@ -31,10 +47,21 @@ beforeEach(() => {
     Event: domWindow.Event,
     requestAnimationFrame: domWindow.requestAnimationFrame.bind(domWindow),
     cancelAnimationFrame: domWindow.cancelAnimationFrame.bind(domWindow),
+    // Each observer reports a size only when a test resizes an element it observes.
     ResizeObserver: class {
-      observe() {}
-      unobserve() {}
-      disconnect() {}
+      readonly targets = new Set<Element>();
+      constructor(readonly callback: (entries: unknown[]) => void) {
+        observers.push(this);
+      }
+      observe(target: Element) {
+        this.targets.add(target);
+      }
+      unobserve(target: Element) {
+        this.targets.delete(target);
+      }
+      disconnect() {
+        this.targets.clear();
+      }
     },
   };
   for (const [name, value] of Object.entries(globals)) vi.stubGlobal(name, value);
@@ -42,12 +69,8 @@ beforeEach(() => {
   vi.spyOn(domWindow.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
     this: HTMLElement,
   ) {
-    return new domWindow!.DOMRect(
-      0,
-      0,
-      800,
-      this.style.overflow === "auto" ? VIEW_HEIGHT : ROW_HEIGHT,
-    );
+    const height = heights.get(this) ?? (this.style.overflow === "auto" ? VIEW_HEIGHT : ROW_HEIGHT);
+    return new domWindow!.DOMRect(0, 0, 800, height);
   });
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -56,6 +79,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root?.unmount());
   root = null;
+  heights = new Map();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   await domWindow?.happyDOM.abort();
@@ -70,24 +94,19 @@ async function frames(count = 3) {
   }
 }
 
-/**
- * A list of 20 rows, gliding to its end when a key takes it over: the browser runs the glide
- * itself (a smooth scroll it does not finish here), and LegendList holds an adjustment for the
- * bottom inset that grew during it.
- */
-async function glidingList() {
+/** A list of 20 rows in a 500 px view, scrolled to 1200 px, as the patched LegendList draws it. */
+async function mountList() {
   const { LegendList } = await import("@legendapp/list/react");
   const ref = createRef<LegendListRef>();
   const container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  const data = Array.from({ length: 20 }, (_, index) => ({ id: `row-${index}` }));
-  const render = (endInset: number) =>
+  const render = ({ rows = 20, endInset = 0 }: { rows?: number; endInset?: number } = {}) =>
     act(async () => {
       root!.render(
         <LegendList
           ref={ref}
-          data={data}
+          data={Array.from({ length: rows }, (_, index) => ({ id: `row-${index}` }))}
           keyExtractor={(item) => item.id}
           estimatedItemSize={ROW_HEIGHT}
           recycleItems={false}
@@ -98,7 +117,7 @@ async function glidingList() {
         />,
       );
     });
-  await render(0);
+  await render();
   await frames();
   const list = ref.current!;
   const scroller = list.getScrollableNode() as unknown as HTMLElement;
@@ -112,9 +131,18 @@ async function glidingList() {
     scroller.scrollTop = top;
     scroller.dispatchEvent(new Event("scroll"));
   };
-
   browserScrolls(1_200);
   await frames();
+  return { list, scroller, render, browserScrolls };
+}
+
+/**
+ * The list gliding to its end when a key takes it over: the browser runs the glide itself (a
+ * smooth scroll it does not finish here), and LegendList holds an adjustment for the bottom
+ * inset that grew during it.
+ */
+async function glidingList() {
+  const { list, scroller, render, browserScrolls } = await mountList();
   const writes: Array<ScrollToOptions> = [];
   const scrollTo = scroller.scrollTo.bind(scroller);
   scroller.scrollTo = ((options: ScrollToOptions) => {
@@ -125,7 +153,7 @@ async function glidingList() {
   await frames(1);
   browserScrolls(KEY_SCROLL);
   await frames(1);
-  await render(HELD);
+  await render({ endInset: HELD });
   expect(list.getState().scroll).toBe(KEY_SCROLL + HELD);
   expect(scroller.scrollTop).toBe(KEY_SCROLL);
   writes.length = 0;
@@ -183,5 +211,27 @@ describe("cancelScrollRequests during a glide", () => {
 
     expect(scroller.scrollTop).toBe(GLIDE_TARGET);
     expect(writes.length).toBe(stopWrites);
+  });
+});
+
+describe("scrollToOffset", () => {
+  it("lands where the content it was asked for moved when a row above grew meanwhile", async () => {
+    // ChatView asks for an offset from the list's metrics. On packaged macOS x64 a row above
+    // grew 160 px before the request ran; LegendList held the content by scrolling 160 px, and
+    // the request then scrolled to its stale offset, dropping that compensation: the reader's
+    // line moved 144 px at the next scroll key (#214).
+    const { list, scroller, render } = await mountList();
+    // A data change locks LegendList's anchor, so it compensates a resize on the next frame.
+    await render({ rows: 21 });
+    const rowAbove = observers
+      .flatMap((observer) => [...observer.targets])
+      .find((element) => element.textContent === "row-8")!;
+    resize(rowAbove, ROW_HEIGHT + 160);
+
+    void list.scrollToOffset({ offset: 1_500, animated: false });
+    await frames();
+
+    expect(list.getState().scroll).toBe(1_660);
+    expect(scroller.scrollTop).toBe(1_660);
   });
 });
