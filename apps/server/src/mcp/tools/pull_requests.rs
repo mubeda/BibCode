@@ -167,7 +167,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
             ),
         ),
         "merge_pull_request" => (
-            "Merges a pull request, or with auto turns on auto-merge. It never bypasses branch protection. headSha must be the head view_pull_request returned: when the branch moved since, the host refuses the merge. Merge only when the person asked for it.",
+            "Merges a pull request, or with auto turns on auto-merge. It never bypasses branch protection. headSha must be the head view_pull_request returned: when the branch moved since, the host refuses the merge. merged says whether it merged now; mergedSha is null when the host did not report the commit (check view_pull_request). Merge only when the person asked for it.",
             object(
                 json!({
                     "threadId": thread,
@@ -550,9 +550,12 @@ impl ToolCall<'_> {
         self.recorded("merge_pull_request", &payload, move |owned| async move {
             action["cwd"] = owned.target(&thread_id).await?.cwd.into();
             let merged = write(&owned, action).await?;
+            // The host took a merge now unless it only turned auto-merge on; the commit may be
+            // unknown (`null`) even so, when the host did not report it.
             Ok(tool_result(
                 json!({
                     "number": number,
+                    "merged": merged["autoMergeEnabled"] != true,
                     "mergedSha": merged["mergedSha"],
                     "autoMergeEnabled": merged["autoMergeEnabled"],
                 }),

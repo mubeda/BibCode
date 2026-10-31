@@ -2785,9 +2785,15 @@ Merges a pull request, or with `auto` turns on auto-merge. It never bypasses bra
 | `auto`            | boolean | no       | `false`                       | Merge when the requirements are met instead of now.                                                                 |
 | `clientRequestId` | string  | no       | 1 to 256 characters           | Makes a retry replay.                                                                                               |
 
-**Result** (`structuredContent`): `{ number, mergedSha, autoMergeEnabled }`.
+**Result** (`structuredContent`): `{ number, merged, mergedSha, autoMergeEnabled }`.
 
-- `mergedSha` (string or null): the merge commit; null when `auto` only turned on auto-merge.
+- `merged` (boolean): `true` when the host took the merge now, `false` when `auto` only
+  turned on auto-merge.
+- `mergedSha` (string or null): the merge commit. `gh` and `glab` do not print it, and GitLab
+  can finish a merge after it answers, so the server reads the pull request once more (for up
+  to 10 seconds) to find it. It is `null` when `auto` only turned on auto-merge, and also when
+  `merged` is `true` but the host had not reported the commit by then; `view_pull_request`
+  (`state`) is authoritative.
 - `autoMergeEnabled` (boolean): `true` when auto-merge was turned on instead of merging now.
   (There is no `threadId` in this result.)
 
@@ -2828,11 +2834,12 @@ Merging a pull request with the head sha that `view_pull_request` returned.
     "content": [
       {
         "type": "text",
-        "text": "{\"number\":142,\"mergedSha\":\"a17c3e5b9d2f40816ce7b5a3d1f9e8c7b6a50412\",\"autoMergeEnabled\":false}"
+        "text": "{\"number\":142,\"merged\":true,\"mergedSha\":\"a17c3e5b9d2f40816ce7b5a3d1f9e8c7b6a50412\",\"autoMergeEnabled\":false}"
       }
     ],
     "structuredContent": {
       "number": 142,
+      "merged": true,
       "mergedSha": "a17c3e5b9d2f40816ce7b5a3d1f9e8c7b6a50412",
       "autoMergeEnabled": false
     }

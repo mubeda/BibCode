@@ -73,6 +73,8 @@ pub struct PullRequestsService {
 
 /// The stored context row's kind; its key is empty.
 const CONTEXT_KIND: &str = "context";
+/// How long a merge answered without its commit waits for one more read of the request.
+const MERGED_SHA_REREAD: Duration = Duration::from_secs(10);
 
 impl PullRequestsService {
     /// A service with a private host observation (see `HostCommandRunner::new`);
@@ -962,7 +964,27 @@ impl PullRequestsService {
             error.message = message;
             return Err(error);
         }
-        host.run_action(scope, action, &raw.context, c).await
+        let result = host.run_action(scope, action, &raw.context, c).await?;
+        // `gh pr merge` and `glab mr merge` print no commit, and GitLab may finish a merge after
+        // answering: read the request once more, briefly, for it. Without it the sha is unknown.
+        if result
+            == (ActionResult::Merged {
+                merged_sha: None,
+                auto_merge_enabled: false,
+            })
+            && let Ok(Ok(detail)) = tokio::time::timeout(
+                MERGED_SHA_REREAD,
+                host.action_detail(scope, action.target().number, &context, c),
+            )
+            .await
+            && let Some(sha) = detail.context.merge_commit_sha
+        {
+            return Ok(ActionResult::Merged {
+                merged_sha: Some(sha),
+                auto_merge_enabled: false,
+            });
+        }
+        Ok(result)
     }
 
     fn invalidate_contexts(&self) {
@@ -1524,6 +1546,139 @@ mod service_tests {
     fn merge_action() -> serde_json::Value {
         serde_json::json!({"action":"merge","method":"squash","deleteBranch":false,
             "auto":false,"bypass":false,"headSha":"head-sha","subject":null,"body":null})
+    }
+
+    /// A host whose merge answers without the merge commit, as `gh pr merge` and
+    /// `glab mr merge` do, and whose request shows `sha` once read again.
+    struct MergingHost {
+        inner: ActionHost,
+        sha: Option<String>,
+        details: AtomicUsize,
+    }
+
+    impl PullRequestHost for MergingHost {
+        fn kind(&self) -> crate::source_control::ProviderKind {
+            self.inner.kind()
+        }
+        fn capabilities(&self, version: Option<&host::HostVersion>) -> HostCapabilities {
+            self.inner.capabilities(version)
+        }
+        fn context<'a>(
+            &'a self,
+            scope: &'a host::HostScope,
+            c: &'a CancellationToken,
+        ) -> host::HostFuture<'a, host::HostContext> {
+            self.inner.context(scope, c)
+        }
+        fn vocabulary<'a>(
+            &'a self,
+            _: &'a host::HostScope,
+            _: VocabularyKind,
+            _: Option<&'a str>,
+            _: &'a CancellationToken,
+        ) -> host::HostFuture<'a, Vocabulary> {
+            unreachable!()
+        }
+        fn list<'a>(
+            &'a self,
+            _: &'a host::HostScope,
+            _: &'a ListQuery,
+            _: &'a CancellationToken,
+        ) -> host::HostFuture<'a, ListPage> {
+            unreachable!()
+        }
+        fn detail<'a>(
+            &'a self,
+            scope: &'a host::HostScope,
+            number: u64,
+            context: &'a host::HostContext,
+            c: &'a CancellationToken,
+        ) -> host::HostFuture<'a, DetailRaw> {
+            Box::pin(async move {
+                let mut raw = self.inner.detail(scope, number, context, c).await?;
+                // The first read is the merge's own check; later ones see the merge.
+                if self.details.fetch_add(1, Ordering::SeqCst) > 0 {
+                    raw.merge_commit_sha.clone_from(&self.sha);
+                }
+                Ok(raw)
+            })
+        }
+        fn run_action<'a>(
+            &'a self,
+            _: &'a host::HostScope,
+            action: &'a ActionRequest,
+            _: &'a ActionContext,
+            _: &'a CancellationToken,
+        ) -> host::HostFuture<'a, ActionResult> {
+            let auto = matches!(action, ActionRequest::Merge { auto: true, .. });
+            Box::pin(async move {
+                Ok(ActionResult::Merged {
+                    merged_sha: None,
+                    auto_merge_enabled: auto,
+                })
+            })
+        }
+        fn head_ref_spec(&self, _: u64) -> String {
+            unreachable!()
+        }
+    }
+
+    async fn merge_on(sha: Option<&str>, auto: bool) -> (ActionResult, usize) {
+        let host = Arc::new(MergingHost {
+            inner: ActionHost {
+                inputs: permissions::tests::gitlab_inputs(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                context_calls: None,
+                block_first: None,
+            },
+            sha: sha.map(str::to_owned),
+            details: AtomicUsize::new(0),
+        });
+        let service = PullRequestsService {
+            runner: Arc::new(HostCommandRunner::new(PathBuf::new())),
+            github: host.clone(),
+            gitlab: host.clone(),
+            gitlab_host: Arc::new(gitlab::GitLabHost::new(Arc::new(HostCommandRunner::new(
+                PathBuf::new(),
+            )))),
+            action_gates: Arc::default(),
+            database: None,
+            pollers: Arc::default(),
+            hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
+        };
+        let scope = host::HostScope {
+            cwd: PathBuf::from("/repo"),
+            host: "github.com".into(),
+            repository: "owner/repo".into(),
+            provider: model::PullRequestsProvider::Github,
+        };
+        let mut action = merge_action();
+        action["auto"] = serde_json::json!(auto);
+        let result = service
+            .run_scoped_action(&scope, &edit_action(action), &CancellationToken::new())
+            .await
+            .unwrap();
+        (result, host.details.load(Ordering::SeqCst))
+    }
+
+    /// A merge the host answered without its commit (GitLab may still be finishing it) reads
+    /// the request once more for it; an auto-merge, which merged nothing yet, does not.
+    #[tokio::test]
+    async fn a_merge_without_its_sha_reads_the_request_once_more_for_it() {
+        let merged = |sha: Option<&str>, auto| ActionResult::Merged {
+            merged_sha: sha.map(str::to_owned),
+            auto_merge_enabled: auto,
+        };
+        assert_eq!(
+            merge_on(Some("merge-sha"), false).await,
+            (merged(Some("merge-sha"), false), 2)
+        );
+        assert_eq!(merge_on(None, false).await, (merged(None, false), 2));
+        assert_eq!(
+            merge_on(Some("merge-sha"), true).await,
+            (merged(None, true), 1)
+        );
     }
 
     #[tokio::test]
