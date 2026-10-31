@@ -2398,11 +2398,14 @@ pub async fn discard_paths(
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
     #[cfg(unix)]
-    let git_dir = roots.git_dir;
+    let (git_dir, worktree_root) = (roots.git_dir, roots.worktree_root);
     #[cfg(unix)]
     {
-        let staging_dir = git_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || discard_staging::recover(&staging_dir)).await;
+        let (staging_dir, recovery_root) = (git_dir.clone(), worktree_root.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            discard_staging::recover(&staging_dir, &recovery_root);
+        })
+        .await;
     }
     let mut outcome = DiscardOutcome::default();
     let mut restore_only = Vec::new();
@@ -2421,7 +2424,14 @@ pub async fn discard_paths(
             continue;
         }
         #[cfg(unix)]
-        let moved = move_to_trash(trash.as_ref(), &root, &git_dir, path, cancellation).await;
+        let moved = move_to_trash(
+            trash.as_ref(),
+            &root,
+            (&git_dir, &worktree_root),
+            path,
+            cancellation,
+        )
+        .await;
         #[cfg(not(unix))]
         let moved = move_to_trash(trash.as_ref(), &root, &request.cwd, path, cancellation).await;
         match moved {
@@ -2576,13 +2586,14 @@ enum Moved {
 async fn move_to_trash(
     trash: &dyn FileTrash,
     root: &Path,
-    git_dir: &Path,
+    (git_dir, worktree_root): (&Path, &Path),
     path: &str,
     cancellation: &CancellationToken,
 ) -> Moved {
     let (root, git_dir, relative) = (root.to_path_buf(), git_dir.to_path_buf(), path.to_owned());
+    let worktree_root = worktree_root.to_path_buf();
     let staged = match tokio::task::spawn_blocking(move || {
-        discard_staging::stage(&root, &git_dir, &relative)
+        discard_staging::stage(&root, (&git_dir, &worktree_root), &relative)
     })
     .await
     {
@@ -2847,9 +2858,12 @@ mod discard_staging {
 
     /// Moves back entries a crash left in `<git_dir>/bibcode-discard` (staged, with an origin
     /// record, but no discard of this process holding them), each into the folder it came from
-    /// when that place is free; otherwise it stays, and is logged. Holders whose entry is gone
-    /// (the trash took it before the record was removed) are removed with their record.
-    pub(super) fn recover(git_dir: &Path) {
+    /// below `worktree_root` (the checkout this Git directory belongs to) when that place is
+    /// free; otherwise it stays, and is logged. Holders whose entry is gone (the trash took it
+    /// before the record was removed) are removed with their record. A record is not trusted:
+    /// one naming anything but a plain path below the checkout, outside Git's metadata, is
+    /// ignored, and the path is opened without following a link.
+    pub(super) fn recover(git_dir: &Path, worktree_root: &Path) {
         let Ok(git) = open_folder(git_dir) else {
             return;
         };
@@ -2874,21 +2888,21 @@ mod discard_staging {
             if InFlight::contains(holder) {
                 continue;
             }
-            if !restore(&staging, holder) {
+            if !restore(&staging, holder, worktree_root) {
                 tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
             }
         }
     }
 
     /// Restores the entry of `holder` from its origin record; returns false when it stays.
-    fn restore(staging: &OwnedFd, holder: &str) -> bool {
+    fn restore(staging: &OwnedFd, holder: &str, worktree_root: &Path) -> bool {
         let (Ok(holder_name), Ok(record_name)) = (
             CString::new(holder),
             CString::new(format!("{holder}{RECORD}")),
         ) else {
             return false;
         };
-        let Some((root, relative)) = read_record(staging, &record_name) else {
+        let Some(relative) = read_record(staging, &record_name) else {
             return false;
         };
         let holder_fd = match open_child(staging, &holder_name) {
@@ -2907,7 +2921,7 @@ mod discard_staging {
             remove_file(staging, &record_name);
             return true;
         }
-        let Ok((parent, _)) = open_parent(&root, &relative) else {
+        let Ok((parent, _)) = open_parent(worktree_root, &relative) else {
             return false;
         };
         if rename_no_replace(&holder_fd, &name, &parent, &name).is_err() {
@@ -2918,13 +2932,9 @@ mod discard_staging {
         true
     }
 
-    /// Writes `<uuid>.origin`: the checkout's root, a NUL, and the entry's path below it.
-    fn write_record(
-        staging: &OwnedFd,
-        record_name: &CStr,
-        root: &Path,
-        relative: &Path,
-    ) -> io::Result<()> {
+    /// Writes `<uuid>.origin`: the entry's path below the checkout's root, the folder Git
+    /// reports for this Git directory, so the root is never read from the record.
+    fn write_record(staging: &OwnedFd, record_name: &CStr, relative: &Path) -> io::Result<()> {
         // SAFETY: `staging` is an open descriptor and `record_name` is NUL-terminated; the
         // file is new (`O_EXCL`) and never a link.
         let descriptor = unsafe {
@@ -2940,15 +2950,13 @@ mod discard_staging {
         }
         // SAFETY: `openat` returned a new descriptor that nothing else owns.
         let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-        let mut record = root.as_os_str().as_bytes().to_vec();
-        record.push(0);
-        record.extend_from_slice(relative.as_os_str().as_bytes());
-        file.write_all(&record)?;
+        file.write_all(relative.as_os_str().as_bytes())?;
         file.sync_all()
     }
 
-    /// The checkout root and entry path a record names.
-    fn read_record(staging: &OwnedFd, record_name: &CStr) -> Option<(PathBuf, PathBuf)> {
+    /// The entry path a record names, when it is one BiBCode could have written (see
+    /// [`is_record_path`]).
+    fn read_record(staging: &OwnedFd, record_name: &CStr) -> Option<PathBuf> {
         // SAFETY: `staging` is an open descriptor and `record_name` is NUL-terminated.
         let descriptor = unsafe {
             libc::openat(
@@ -2964,14 +2972,31 @@ mod discard_staging {
         let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
         let mut record = Vec::new();
         file.take(64 * 1024).read_to_end(&mut record).ok()?;
-        let split = record.iter().position(|byte| *byte == 0)?;
-        let root = PathBuf::from(OsStr::from_bytes(&record[..split]));
-        let relative = PathBuf::from(OsStr::from_bytes(&record[split + 1..]));
-        (root.is_absolute() && !relative.as_os_str().is_empty()).then_some((root, relative))
+        let relative = PathBuf::from(OsStr::from_bytes(&record));
+        is_record_path(&record, &relative).then_some(relative)
+    }
+
+    /// Whether `relative` (`bytes`) is a plain path below a checkout: no NUL, only plain parts
+    /// (no root, `.` or `..`), and not under `.git` in any case, as `validate_pathspecs`
+    /// requires of every discard path.
+    fn is_record_path(bytes: &[u8], relative: &Path) -> bool {
+        !bytes.is_empty()
+            && !bytes.contains(&0)
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            && relative
+                .components()
+                .next()
+                .is_some_and(|first| !first.as_os_str().eq_ignore_ascii_case(".git"))
     }
 
     /// Stages the entry at `relative` below `root` into a new holder folder under `git_dir`.
-    pub(super) fn stage(root: &Path, git_dir: &Path, relative: &str) -> Result<Staged, Unstaged> {
+    pub(super) fn stage(
+        root: &Path,
+        (git_dir, worktree_root): (&Path, &Path),
+        relative: &str,
+    ) -> Result<Staged, Unstaged> {
         let relative = Path::new(relative);
         let (parent, name) = open_parent(root, relative)?;
         let name_c = c_name(name)?;
@@ -2989,7 +3014,11 @@ mod discard_staging {
         };
         // Where the entry came from, written before it moves, so a crash before the trash
         // takes it leaves a record a later discard restores it from.
-        if write_record(&staging, &record_name, root, relative).is_err() {
+        let Ok(below_root) = root.strip_prefix(worktree_root) else {
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        };
+        if write_record(&staging, &record_name, &below_root.join(relative)).is_err() {
             remove_file(&staging, &record_name);
             remove_folder(&staging, &holder_name);
             return Err(Unstaged::Failed);
@@ -4958,6 +4987,68 @@ mod tests {
         }
         discard.abort();
         assert!(discard.await.is_err(), "the discard was stopped");
+    }
+
+    /// A record BiBCode did not write cannot move a staged entry anywhere but its place in this
+    /// checkout: a record naming another root, a `..`, an absolute path, Git's metadata, or a
+    /// path through a symlinked folder is ignored, and its entry stays staged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_origin_record_never_moves_an_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, root) = staging_fixture();
+        let outside = tempfile::tempdir().expect("outside folder");
+        let outside_path = outside.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside_path, root.join("link")).expect("link");
+        let staging = root.join(".git/bibcode-discard");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut root_elsewhere = outside_path.as_os_str().as_encoded_bytes().to_vec();
+        root_elsewhere.extend_from_slice(b"\0x.txt");
+        let records: Vec<Vec<u8>> = vec![
+            root_elsewhere,
+            b"../outside/x.txt".to_vec(),
+            format!("{}/x.txt", outside_path.display()).into_bytes(),
+            b"link/x.txt".to_vec(),
+            b".git/x.txt".to_vec(),
+            b"./x.txt".to_vec(),
+        ];
+        let mut holders = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            let holder = format!("forged-{index}");
+            std::fs::create_dir(staging.join(&holder)).unwrap();
+            std::fs::write(staging.join(&holder).join("x.txt"), "staged\n").unwrap();
+            std::fs::write(staging.join(format!("{holder}.origin")), record).unwrap();
+            holders.push(holder);
+        }
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+
+        discard_paths(
+            &GitRepository::default(),
+            Arc::new(RecordingTrash {
+                destination: trash_directory.path().to_path_buf(),
+                trashed: Mutex::new(Vec::new()),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["other.txt".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        for holder in &holders {
+            assert!(
+                staging.join(holder).join("x.txt").exists(),
+                "{holder}'s entry was moved"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&outside_path).unwrap().count(), 0);
+        assert!(!root.join("x.txt").exists() && !root.join(".git/x.txt").exists());
     }
 
     /// An entry a crash left in the staging folder is moved back to where it came from by the
