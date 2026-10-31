@@ -23,7 +23,8 @@ use crate::{
         STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
         VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf,
         clone_policy::{
-            ClonePlan, ClonePolicy, CloneRefusal, DESTINATION_REFUSED, OUTSIDE_PROJECTS,
+            ClonePlan, ClonePolicy, CloneRefusal, DESTINATION_REFUSED, DETACH_REFUSED, DETACHED,
+            NOT_OWNED, OTHERS_CLONE, OUTSIDE_PROJECTS,
         },
         validate_pathspecs,
     },
@@ -945,6 +946,11 @@ impl GitVcsRpcServices {
                     .map_err(|error| {
                         vcs_error("vcs.clone", &input.parent_dir, &error.to_string())
                     })?;
+                // An agent's clone ends with its call: a detached one would outlive every live
+                // control (review round 2). The tool owns long clones instead.
+                if input.detach && is_agent(&context) {
+                    return Err(CloneRefusal::new(DETACH_REFUSED, DETACHED).into_error(&parent_dir));
+                }
                 // An outside agent is checked before it can start or join anything.
                 let plan = self
                     .agent_clone_plan(&context, &input.url, &leaf, &parent_dir, &cancellation)
@@ -961,6 +967,7 @@ impl GitVcsRpcServices {
                             attach: input.attach,
                             detach: input.detach,
                             plan,
+                            owner: agent_session(&context),
                         },
                         context.admission_permit(),
                         &cancellation,
@@ -980,10 +987,21 @@ impl GitVcsRpcServices {
                     .map_err(|error| {
                         vcs_error("vcs.cancelClone", &input.parent_dir, &error.to_string())
                     })?;
-                let cancelled = self
-                    .clone_operations
-                    .cancel(&input.url, &parent_dir, &leaf)
-                    .await;
+                // An agent cancels only a clone it started; a person's call is unchanged.
+                let cancelled = match agent_session(&context) {
+                    None => {
+                        self.clone_operations
+                            .cancel(&input.url, &parent_dir, &leaf)
+                            .await
+                    }
+                    Some(agent) => self
+                        .clone_operations
+                        .cancel_as_agent(&input.url, &parent_dir, &leaf, &agent)
+                        .await
+                        .ok_or_else(|| {
+                            CloneRefusal::new(NOT_OWNED, OTHERS_CLONE).into_error(&parent_dir)
+                        })?,
+                };
                 Ok(json!({ "cancelled": cancelled }))
             }
             "vcs.generateCommitMessage" => {
@@ -1890,6 +1908,7 @@ impl GitVcsRpcServices {
                     attach: false,
                     detach: false,
                     plan,
+                    owner: agent_session(context),
                 },
                 context.admission_permit(),
                 cancellation,
@@ -3375,9 +3394,15 @@ fn same_removal_path(left: &Path, right: &Path) -> bool {
 }
 /// Whether the request's credential is an outside agent's (`mcp-client`).
 fn is_agent(context: &RpcSessionContext) -> bool {
+    agent_session(context).is_some()
+}
+
+/// The session of an outside agent's (`mcp-client`) credential.
+fn agent_session(context: &RpcSessionContext) -> Option<String> {
     context
         .principal()
-        .is_some_and(|principal| principal.subject == crate::auth::MCP_CLIENT_SUBJECT)
+        .filter(|principal| principal.subject == crate::auth::MCP_CLIENT_SUBJECT)
+        .map(|principal| principal.session_id.clone())
 }
 
 fn source_control_error(provider: &str, operation: &str, detail: &str) -> Value {

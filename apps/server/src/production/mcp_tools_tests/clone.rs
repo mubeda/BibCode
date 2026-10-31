@@ -187,8 +187,13 @@ struct Fixture {
 struct Options {
     /// Admit the fixture's `http://` and loopback addresses.
     admit_local: bool,
-    /// The test `GIT_CONFIG_GLOBAL` every Git command of the policy and the clone reads.
-    global_config: String,
+    /// The person's global configuration: `~/.gitconfig` in a test `HOME` the server's Git
+    /// commands inherit. `{PORT}` is the fixture server's port.
+    home_config: String,
+    /// More environment the server's Git commands inherit, such as a proxy.
+    environment: Vec<(&'static str, String)>,
+    /// Makes the folder that holds the project a repository with this local configuration.
+    parent_repo_config: Option<String>,
     /// Adds files to the source repository before its one commit.
     source: Box<dyn FnOnce(&Path)>,
 }
@@ -197,7 +202,9 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             admit_local: true,
-            global_config: String::new(),
+            home_config: String::new(),
+            environment: Vec::new(),
+            parent_repo_config: None,
             source: Box::new(|_| {}),
         }
     }
@@ -238,8 +245,35 @@ async fn fixture(options: Options) -> Fixture {
     git(&bare, &["update-server-info"]);
     let server = HttpFixture::start(Serve::Files(served)).await;
 
-    let global = base.join("global.gitconfig");
-    std::fs::write(&global, &options.global_config).expect("global config");
+    let home = base.join("home");
+    std::fs::create_dir_all(home.join(".config")).expect("home");
+    std::fs::write(
+        home.join(".gitconfig"),
+        options
+            .home_config
+            .replace("{PORT}", &server.port.to_string()),
+    )
+    .expect("global config");
+    if let Some(config) = &options.parent_repo_config {
+        git(&projects, &["init", "-q"]);
+        let local = projects.join(".git/config");
+        let mut text = std::fs::read_to_string(&local).expect("local config");
+        text.push_str(config);
+        std::fs::write(&local, text).expect("local config");
+    }
+    let mut environment = vec![
+        ("HOME".into(), home.clone().into_os_string()),
+        (
+            "XDG_CONFIG_HOME".into(),
+            home.join(".config").into_os_string(),
+        ),
+    ];
+    environment.extend(
+        options
+            .environment
+            .iter()
+            .map(|(key, value)| ((*key).into(), value.into())),
+    );
     let policy = ClonePolicy::admitting_fixture(
         resolver(&[
             (HOST, "127.0.0.1"),
@@ -247,7 +281,7 @@ async fn fixture(options: Options) -> Fixture {
             ("public.example.com", "93.184.215.14"),
         ]),
         FixtureAllowance {
-            environment: vec![("GIT_CONFIG_GLOBAL".into(), global.into_os_string())],
+            environment,
             admit_local: options.admit_local,
         },
     );
@@ -473,7 +507,8 @@ async fn a_destination_holding_anything_else_is_refused() {
 async fn a_redirect_is_not_followed() {
     let fixture = fixture(Options::default()).await;
     let moved = HttpFixture::start(Serve::RedirectTo(format!(
-        "http://{HOST}:{}",
+        // By address, so a followed redirect would reach it without a pin.
+        "http://127.0.0.1:{}",
         fixture.server.port
     )))
     .await;
@@ -507,7 +542,7 @@ async fn lfs_smudge_never_contacts_the_lfsconfig_endpoint() {
     let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
     let lfs_port = lfs.port;
     let fixture = fixture(Options {
-        global_config: format!(
+        home_config: format!(
             "[filter \"lfs\"]\n\tsmudge = sh {}\n\trequired = true\n",
             smudge.display()
         ),
@@ -543,7 +578,8 @@ async fn lfs_smudge_never_contacts_the_lfsconfig_endpoint() {
 async fn agents_clone_over_https_from_public_hosts_only() {
     let fixture = fixture(Options {
         admit_local: false,
-        global_config: "[url \"https://10.1.2.3/\"]\n\tinsteadOf = https://public.example.com/private/\n[url \"file:///srv/\"]\n\tinsteadOf = https://public.example.com/local/\n".to_owned(),
+        // Rewrites the clone's own folder configures: the rewritten URL is checked again.
+        parent_repo_config: Some("[url \"https://10.1.2.3/\"]\n\tinsteadOf = https://public.example.com/private/\n[url \"file:///srv/\"]\n\tinsteadOf = https://public.example.com/local/\n".to_owned()),
         ..Options::default()
     })
     .await;
@@ -617,6 +653,7 @@ async fn agents_clone_over_https_from_public_hosts_only() {
     let entries = std::fs::read_dir(&fixture.projects)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != ".git")
         .collect::<Vec<_>>();
     assert_eq!(entries, [PROJECT]);
 
@@ -809,6 +846,17 @@ async fn cancelling_an_agent_clone_that_joined_a_persons_leaves_the_persons_runn
         )
         .await;
     let clone_id = structured(&joined)["cloneId"].as_str().unwrap().to_owned();
+    // Review round 2: an agent cannot cancel a person's clone through the RPC either.
+    let refused = fixture
+        .rpc(
+            "vcs.cancelClone",
+            json!({ "url": url, "parentDir": fixture.projects, "directoryName": "shared" }),
+            fixture.agent_context(&fixture.agent),
+        )
+        .await
+        .expect_err("not the agent's clone");
+    assert_eq!(refused["reason"], "clone_not_owned", "{refused}");
+    assert!(folder.exists(), "the person's clone was stopped");
     let cancelled = fixture
         .harness
         .call(
@@ -824,5 +872,185 @@ async fn cancelling_an_agent_clone_that_joined_a_persons_leaves_the_persons_runn
     let path = person.await.unwrap().expect("the person's clone finishes");
     assert_eq!(path["path"], folder.to_string_lossy().as_ref());
     assert!(folder.join("README.md").is_file());
+    fixture.harness.shutdown().await;
+}
+
+/// Review round 2: an agent clone runs with an isolated Git configuration, so programs the
+/// person's global configuration names (a hooks folder with `post-checkout`, an fsmonitor, a
+/// filter driver a repository's `.gitattributes` asks for) never run for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_persons_hooks_fsmonitor_and_filters_never_run_for_an_agent_clone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let programs = tempfile::tempdir().unwrap();
+    let markers = programs.path().join("markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    let touch = programs.path().join("touch.sh");
+    std::fs::write(
+        &touch,
+        format!("#!/bin/sh\ntouch '{}'/\"$1\"\ncat\n", markers.display()),
+    )
+    .unwrap();
+    let hooks = programs.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'/hook\n", markers.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let touch = touch.display().to_string();
+    let fixture = fixture(Options {
+        home_config: format!(
+            "[core]\n\thooksPath = {hooks}\n\tfsmonitor = sh {touch} fsmonitor\n\
+             [filter \"evil\"]\n\tsmudge = sh {touch} filter\n\trequired = true\n",
+            hooks = hooks.display(),
+        ),
+        source: Box::new(|source| {
+            std::fs::write(source.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+            std::fs::write(source.join("notes.txt"), "notes\n").unwrap();
+        }),
+        ..Options::default()
+    })
+    .await;
+    let result = fixture
+        .clone(&fixture.agent, json!({ "url": fixture.url() }))
+        .await;
+    let fired = std::fs::read_dir(&markers)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        fired.is_empty(),
+        "programs from the person's config ran: {fired:?}"
+    );
+    assert_eq!(structured(&result)["state"], "done", "{result}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.projects.join("repo/notes.txt")).unwrap(),
+        "notes\n"
+    );
+    fixture.harness.shutdown().await;
+}
+
+/// Review round 2: the person's URL-specific proxy and global rewrite, and an inherited
+/// proxy, never reach an agent clone.
+#[tokio::test]
+async fn the_persons_proxy_and_rewrites_never_reach_an_agent_clone() {
+    let config_proxy = HttpFixture::start(Serve::Files(PathBuf::from("/nonexistent"))).await;
+    let env_proxy = HttpFixture::start(Serve::Files(PathBuf::from("/nonexistent"))).await;
+    let fixture = fixture(Options {
+        home_config: format!(
+            "[http \"http://{HOST}:{{PORT}}/\"]\n\tproxy = http://127.0.0.1:{proxy}\n\
+             [url \"http://{HOST}:{{PORT}}/missing.git\"]\n\tinsteadOf = http://{HOST}:{{PORT}}/repo.git\n",
+            proxy = config_proxy.port,
+        ),
+        environment: vec![
+            ("http_proxy", format!("http://127.0.0.1:{}", env_proxy.port)),
+            ("all_proxy", format!("http://127.0.0.1:{}", env_proxy.port)),
+        ],
+        ..Options::default()
+    })
+    .await;
+    let result = fixture
+        .clone(&fixture.agent, json!({ "url": fixture.url() }))
+        .await;
+    assert_eq!(
+        config_proxy.connections(),
+        0,
+        "the configured proxy was used"
+    );
+    assert_eq!(env_proxy.connections(), 0, "the inherited proxy was used");
+    // Not rewritten to the missing repository.
+    assert_eq!(structured(&result)["state"], "done", "{result}");
+    fixture.harness.shutdown().await;
+}
+/// Review round 2: an inherited proxy alone is not used either.
+#[tokio::test]
+async fn an_inherited_proxy_never_carries_an_agent_clone() {
+    let env_proxy = HttpFixture::start(Serve::Files(PathBuf::from("/nonexistent"))).await;
+    let fixture = fixture(Options {
+        environment: vec![("http_proxy", format!("http://127.0.0.1:{}", env_proxy.port))],
+        ..Options::default()
+    })
+    .await;
+    let result = fixture
+        .clone(&fixture.agent, json!({ "url": fixture.url() }))
+        .await;
+    assert_eq!(env_proxy.connections(), 0, "the inherited proxy was used");
+    assert_eq!(structured(&result)["state"], "done", "{result}");
+    fixture.harness.shutdown().await;
+}
+
+/// Review round 2: a URL-specific `http.<url>.followRedirects` in the person's config does
+/// not undo the agent clone's redirect ban.
+#[tokio::test]
+async fn a_url_specific_setting_cannot_turn_redirects_back_on() {
+    let target = fixture(Options::default()).await;
+    let moved = HttpFixture::start(Serve::RedirectTo(format!(
+        "http://127.0.0.1:{}",
+        target.server.port
+    )))
+    .await;
+    let fixture = fixture(Options {
+        home_config: format!(
+            "[http \"http://{HOST}:{}/\"]\n\tfollowRedirects = true\n",
+            moved.port
+        ),
+        ..Options::default()
+    })
+    .await;
+    let url = format!("http://{HOST}:{}/repo.git", moved.port);
+    let result = fixture.clone(&fixture.agent, json!({ "url": url })).await;
+    assert_eq!(error_tag(&result), "GitCommandError", "{result}");
+    assert_eq!(target.server.connections(), 0, "the redirect was followed");
+    fixture.harness.shutdown().await;
+    target.harness.shutdown().await;
+}
+
+/// Review round 2: through the RPC an agent cannot start a clone that outlives its call, and
+/// cancels only a clone it started.
+#[tokio::test]
+async fn an_agent_may_not_detach_a_clone_and_cancels_only_its_own() {
+    let fixture = fixture(Options::default()).await;
+    let agent = fixture.agent_context(&fixture.agent);
+    let detached = fixture
+        .rpc(
+            "vcs.clone",
+            json!({ "url": fixture.url(), "parentDir": fixture.projects, "directoryName": "detached", "detach": true }),
+            agent.clone(),
+        )
+        .await
+        .expect_err("refused");
+    assert_eq!(detached["reason"], "clone_detach_refused", "{detached}");
+    assert!(!fixture.projects.join("detached").exists());
+
+    fixture.server.stall();
+    let registry = fixture.harness.control.registry().clone();
+    let payload =
+        json!({ "url": fixture.url(), "parentDir": fixture.projects, "directoryName": "own" });
+    let started = tokio::spawn({
+        let agent = agent.clone();
+        async move {
+            registry
+                .invoke_local("vcs.clone", payload, agent, CancellationToken::new())
+                .await
+        }
+    });
+    let folder = fixture.projects.join("own");
+    wait_until(|| folder.exists(), "the agent's clone reserved its folder").await;
+    let cancelled = fixture
+        .rpc(
+            "vcs.cancelClone",
+            json!({ "url": fixture.url(), "parentDir": fixture.projects, "directoryName": "own" }),
+            agent,
+        )
+        .await
+        .expect("an agent cancels its own clone");
+    assert_eq!(cancelled["cancelled"], true);
+    assert!(started.await.unwrap().is_err());
+    assert!(!folder.exists());
+    fixture.server.release();
     fixture.harness.shutdown().await;
 }
