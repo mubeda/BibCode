@@ -1757,27 +1757,34 @@ staticDescribe("project header context menu", () => {
     );
   });
 
-  it("warns before force-removing a project with threads and honors 'Delete anyway'", async () => {
+  // A destructive choice belongs in a dialog the person answers, not in a toast that times out.
+  it("asks in a dialog before removing a project with threads, and removes them only on yes", async () => {
     const header = projectHeaderProps();
     fakeLocalApi();
     h.spies.contextMenuShow.mockImplementation(async (items: Array<{ id: string }>) => {
       return items.find((item) => item.id?.startsWith("delete:"))!.id;
     });
+    h.spies.dialogConfirm.mockResolvedValue(false);
     invoke(header, "onContextMenu", mouseEvent());
     await flush();
 
-    const warningToast = h.spies.toastAdd.mock.calls
-      .map((call) => call[0] as { title?: string; actionProps?: { onClick?: () => void } })
-      .find((toast) => toast.title === "Project is not empty");
-    expect(warningToast).toBeDefined();
-    warningToast!.actionProps!.onClick!();
-    await flush();
-
-    expect(h.spies.toastClose).toHaveBeenCalledWith("toast-1");
-    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(expect.stringContaining("Remove project"));
-    expect(h.state.commandCalls.map((call: { label: string }) => call.label)).toContain(
+    expect(h.spies.toastAdd).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Project is not empty" }),
+    );
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      expect.stringMatching(/^Remove project ".+" and delete its \d+ threads?\?/),
+    );
+    expect(h.state.commandCalls.map((call: { label: string }) => call.label)).not.toContain(
       "project.delete",
     );
+
+    h.spies.dialogConfirm.mockResolvedValue(true);
+    invoke(header, "onContextMenu", mouseEvent());
+    await flush();
+    const deleted = h.state.commandCalls.find(
+      (call: { label: string }) => call.label === "project.delete",
+    ) as { input: { input: { force?: boolean } } } | undefined;
+    expect(deleted?.input.input.force).toBe(true);
   });
 
   it("opens the same menu from the ⋯ button, anchored below it", async () => {
