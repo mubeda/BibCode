@@ -443,6 +443,17 @@ fn public_repository_api_inventory_is_explicit() {
         "upsert_turn_by_id",
         "verify_prepared_command_receipt",
         "complete_worktree_removal_receipt",
+        "register_mcp_oauth_client",
+        "get_mcp_oauth_client",
+        "create_mcp_oauth_authorization",
+        "get_mcp_oauth_authorization",
+        "get_mcp_oauth_authorization_by_code",
+        "list_pending_mcp_oauth_authorizations",
+        "decide_mcp_oauth_authorization",
+        "attach_mcp_oauth_code",
+        "exchange_mcp_oauth_code",
+        "revoke_replayed_mcp_oauth_code",
+        "rotate_mcp_oauth_refresh_token",
     ]
     .into_iter()
     .map(str::to_owned)

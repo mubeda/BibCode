@@ -1806,6 +1806,31 @@ impl Repositories {
                     params![now, now, now],
                     |row| row.get::<_, Option<String>>(0),
                 )?;
+                let now_ms = parse_epoch_ms(&now).unwrap_or_default();
+                let pending_mcp_authorizations = collect(
+                    &transaction,
+                    &(MCP_OAUTH_AUTHORIZATION_SELECT.to_owned()
+                        + " WHERE a.status = 'pending' AND a.expires_at > ? \
+                           ORDER BY a.created_at ASC, a.id ASC"),
+                    [now_ms],
+                    decode_mcp_oauth_authorization,
+                )?;
+                // A pending authorization's expiry is the next time the authority changes too.
+                let next_expiry_at = match (
+                    next_expiry_at,
+                    pending_mcp_authorizations
+                        .iter()
+                        .map(|row| row.expires_at_ms)
+                        .min(),
+                ) {
+                    (Some(sooner), Some(pending))
+                        if parse_epoch_ms(&sooner).is_some_and(|sooner| sooner <= pending) =>
+                    {
+                        Some(sooner)
+                    }
+                    (_, Some(pending)) => Some(format_epoch_ms(pending)),
+                    (next, None) => next,
+                };
                 transaction.commit()?;
                 Ok(AuthAuthoritySnapshot {
                     revision,
@@ -1813,6 +1838,7 @@ impl Repositories {
                     pairings,
                     offers,
                     sessions,
+                    pending_mcp_authorizations,
                 })
             })
             .await
@@ -2071,13 +2097,16 @@ impl Repositories {
     }
 
     pub async fn create_auth_session(&self, row: NewAuthSession) -> Result<()> {
-        self.database.call(move |connection| {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state, mcp_access) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str(),row.mcp_access])?;
-            bump_auth_authority_revision_on(&transaction)?;
-            transaction.commit()?;
-            Ok(())
-        }).await
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                insert_auth_session_on(&transaction, &row, None)?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
     }
     pub async fn get_auth_session(&self, session_id: String) -> Result<Option<AuthSession>> {
         self.database
@@ -2295,6 +2324,394 @@ impl Repositories {
             transaction.commit()?;
             Ok(())
         }).await
+    }
+
+    /// Registers an MCP OAuth client (#139, slice R) under the admission limits, after
+    /// pruning what has expired. A source past its hourly registrations is refused; when the
+    /// global cap of never-approved clients is full, the oldest never-approved client of the
+    /// source holding the most is evicted, with its pending authorizations.
+    pub async fn register_mcp_oauth_client(
+        &self,
+        client: McpOAuthClient,
+        now_ms: i64,
+        limits: McpOAuthLimits,
+    ) -> Result<McpOAuthAdmission> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut changed = prune_mcp_oauth_on(&transaction, now_ms, limits)?;
+                let recent: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_clients WHERE source_key = ? AND created_at > ?",
+                    params![client.source_key, now_ms - 60 * 60 * 1_000],
+                    |row| row.get(0),
+                )?;
+                let admission = if recent >= limits.registrations_per_source_per_hour {
+                    McpOAuthAdmission::Refused
+                } else {
+                    let unapproved: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM mcp_oauth_clients WHERE approved_at IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if unapproved >= limits.unapproved_clients {
+                        let victim = transaction
+                            .query_row(
+                                "SELECT client_id FROM mcp_oauth_clients WHERE approved_at IS NULL \
+                                 AND source_key = (SELECT source_key FROM mcp_oauth_clients \
+                                   WHERE approved_at IS NULL GROUP BY source_key \
+                                   ORDER BY COUNT(*) DESC, MIN(created_at) ASC LIMIT 1) \
+                                 ORDER BY created_at ASC, client_id ASC LIMIT 1",
+                                [],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?;
+                        if let Some(victim) = victim {
+                            changed |= transaction.execute(
+                                "DELETE FROM mcp_oauth_authorizations \
+                                 WHERE client_id = ? AND status = 'pending'",
+                                [&victim],
+                            )? > 0;
+                            transaction.execute(
+                                "DELETE FROM mcp_oauth_clients WHERE client_id = ?",
+                                [&victim],
+                            )?;
+                        }
+                    }
+                    transaction.execute(
+                        "INSERT INTO mcp_oauth_clients (client_id, client_name, redirect_uris_json, \
+                         source_key, created_at, approved_at, last_used_at) \
+                         VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                        params![
+                            client.client_id,
+                            client.client_name,
+                            encode_json(&serde_json::json!(client.redirect_uris))?,
+                            client.source_key,
+                            client.created_at_ms,
+                        ],
+                    )?;
+                    McpOAuthAdmission::Admitted
+                };
+                if changed {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(admission)
+            })
+            .await
+    }
+    pub async fn get_mcp_oauth_client(&self, client_id: String) -> Result<Option<McpOAuthClient>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &(MCP_OAUTH_CLIENT_SELECT.to_owned() + " WHERE client_id = ?"),
+                        [client_id],
+                        decode_mcp_oauth_client,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+    /// Creates a pending authorization under the admission limits. A client or a source at
+    /// its own cap is refused; when the global cap is full (or, for a source that already has
+    /// one pending, all but the reserved headroom), the oldest pending entry of the source
+    /// holding the most is evicted, so one source's flood evicts its own entries.
+    pub async fn create_mcp_oauth_authorization(
+        &self,
+        row: NewMcpOAuthAuthorization,
+        now_ms: i64,
+        limits: McpOAuthLimits,
+    ) -> Result<McpOAuthAdmission> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pruned = prune_mcp_oauth_on(&transaction, now_ms, limits)?;
+                let for_client: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_authorizations \
+                     WHERE client_id = ? AND status = 'pending' AND expires_at > ?",
+                    params![row.client_id, now_ms],
+                    |row| row.get(0),
+                )?;
+                let for_source: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_authorizations \
+                     WHERE source_key = ? AND status = 'pending' AND expires_at > ?",
+                    params![row.source_key, now_ms],
+                    |row| row.get(0),
+                )?;
+                if for_client >= limits.pending_per_client
+                    || for_source >= limits.pending_per_source
+                {
+                    if pruned {
+                        bump_auth_authority_revision_on(&transaction)?;
+                    }
+                    transaction.commit()?;
+                    return Ok(McpOAuthAdmission::Refused);
+                }
+                let total: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_authorizations \
+                     WHERE status = 'pending' AND expires_at > ?",
+                    params![now_ms],
+                    |row| row.get(0),
+                )?;
+                let room = if for_source == 0 {
+                    limits.pending
+                } else {
+                    limits.pending - limits.pending_reserved
+                };
+                if total >= room {
+                    transaction.execute(
+                        "DELETE FROM mcp_oauth_authorizations WHERE id = (\
+                           SELECT id FROM mcp_oauth_authorizations \
+                           WHERE status = 'pending' AND expires_at > ?1 \
+                           AND source_key = (SELECT source_key FROM mcp_oauth_authorizations \
+                             WHERE status = 'pending' AND expires_at > ?1 GROUP BY source_key \
+                             ORDER BY COUNT(*) DESC, MIN(created_at) ASC LIMIT 1) \
+                           ORDER BY created_at ASC, id ASC LIMIT 1)",
+                        params![now_ms],
+                    )?;
+                }
+                transaction.execute(
+                    "INSERT INTO mcp_oauth_authorizations (id, user_code, client_id, redirect_uri, \
+                     code_challenge, state, resource, scopes, origin, source_key, \
+                     status_cookie_hash, status, approved_access, approved_scopes, code_hash, \
+                     code_expires_at, session_id, created_at, expires_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, \
+                     NULL, ?, ?)",
+                    params![
+                        row.id,
+                        row.user_code,
+                        row.client_id,
+                        row.redirect_uri,
+                        row.code_challenge,
+                        row.state,
+                        row.resource,
+                        row.scopes,
+                        row.origin,
+                        row.source_key,
+                        row.status_cookie_hash,
+                        row.created_at_ms,
+                        row.expires_at_ms,
+                    ],
+                )?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(McpOAuthAdmission::Admitted)
+            })
+            .await
+    }
+    pub async fn get_mcp_oauth_authorization(
+        &self,
+        id: String,
+    ) -> Result<Option<McpOAuthAuthorization>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &(MCP_OAUTH_AUTHORIZATION_SELECT.to_owned() + " WHERE a.id = ?"),
+                        [id],
+                        decode_mcp_oauth_authorization,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+    pub async fn get_mcp_oauth_authorization_by_code(
+        &self,
+        code_hash: String,
+    ) -> Result<Option<McpOAuthAuthorization>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &(MCP_OAUTH_AUTHORIZATION_SELECT.to_owned() + " WHERE a.code_hash = ?"),
+                        [code_hash],
+                        decode_mcp_oauth_authorization,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+    /// The authorizations still waiting for a person, oldest first.
+    pub async fn list_pending_mcp_oauth_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<McpOAuthAuthorization>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &(MCP_OAUTH_AUTHORIZATION_SELECT.to_owned()
+                        + " WHERE a.status = 'pending' AND a.expires_at > ? \
+                           ORDER BY a.created_at ASC, a.id ASC"),
+                    [now_ms],
+                    decode_mcp_oauth_authorization,
+                )
+            })
+            .await
+    }
+    /// Approves (with the access and scopes a person chose) or denies a pending
+    /// authorization; `false` when it is no longer pending.
+    pub async fn decide_mcp_oauth_authorization(
+        &self,
+        id: String,
+        decision: McpOAuthDecision,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let changed = match &decision {
+                    McpOAuthDecision::Approve { access, scopes } => {
+                        let changed = transaction.execute(
+                            "UPDATE mcp_oauth_authorizations \
+                             SET status = 'approved', approved_access = ?, approved_scopes = ? \
+                             WHERE id = ? AND status = 'pending' AND expires_at > ?",
+                            params![access, scopes, id, now_ms],
+                        )? == 1;
+                        if changed {
+                            transaction.execute(
+                                "UPDATE mcp_oauth_clients \
+                                 SET approved_at = COALESCE(approved_at, ?) WHERE client_id = \
+                                 (SELECT client_id FROM mcp_oauth_authorizations WHERE id = ?)",
+                                params![now_ms, id],
+                            )?;
+                        }
+                        changed
+                    }
+                    McpOAuthDecision::Deny => {
+                        transaction.execute(
+                            "UPDATE mcp_oauth_authorizations SET status = 'denied' \
+                             WHERE id = ? AND status = 'pending' AND expires_at > ?",
+                            params![id, now_ms],
+                        )? == 1
+                    }
+                };
+                if changed {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(changed)
+            })
+            .await
+    }
+    /// Stores the hash of a new authorization code on an approved authorization that has none
+    /// yet; `false` when it already has one, is not approved, or has expired.
+    pub async fn attach_mcp_oauth_code(
+        &self,
+        id: String,
+        code_hash: String,
+        code_expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                Ok(connection.execute(
+                    "UPDATE mcp_oauth_authorizations SET code_hash = ?, code_expires_at = ? \
+                     WHERE id = ? AND status = 'approved' AND code_hash IS NULL AND expires_at > ?",
+                    params![code_hash, code_expires_at_ms, id, now_ms],
+                )? == 1)
+            })
+            .await
+    }
+    /// Exchanges an approved authorization's code, once: in one transaction the authorization
+    /// becomes `exchanged`, and the grant's session and first refresh token are written. A
+    /// code already exchanged (a replay, or the loser of a race) revokes the session it
+    /// minted instead.
+    pub async fn exchange_mcp_oauth_code(
+        &self,
+        exchange: McpOAuthCodeExchange,
+        now_ms: i64,
+    ) -> Result<McpOAuthExchangeOutcome> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let claimed = transaction.execute(
+                    "UPDATE mcp_oauth_authorizations SET status = 'exchanged', session_id = ? \
+                     WHERE id = ? AND code_hash = ? AND status = 'approved' \
+                     AND code_expires_at > ?",
+                    params![
+                        exchange.session.session_id,
+                        exchange.authorization_id,
+                        exchange.code_hash,
+                        now_ms
+                    ],
+                )? == 1;
+                if !claimed {
+                    let revoked = revoke_replayed_code_on(
+                        &transaction,
+                        &exchange.code_hash,
+                        &exchange.revoked_at,
+                    )?;
+                    transaction.commit()?;
+                    return Ok(match revoked {
+                        Some(session_id) => McpOAuthExchangeOutcome::Replayed { session_id },
+                        None => McpOAuthExchangeOutcome::Refused,
+                    });
+                }
+                insert_auth_session_on(&transaction, &exchange.session, Some(&exchange.resource))?;
+                transaction.execute(
+                    "INSERT INTO mcp_oauth_refresh_tokens \
+                     (token_hash, session_id, client_id, issued_at, used_at) \
+                     VALUES (?, ?, ?, ?, NULL)",
+                    params![
+                        exchange.refresh_token_hash,
+                        exchange.session.session_id,
+                        exchange.client_id,
+                        now_ms
+                    ],
+                )?;
+                transaction.execute(
+                    "UPDATE mcp_oauth_clients SET last_used_at = ? WHERE client_id = ?",
+                    params![now_ms, exchange.client_id],
+                )?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(McpOAuthExchangeOutcome::Exchanged)
+            })
+            .await
+    }
+    /// A second use of a code that was already exchanged revokes the session it minted
+    /// (RFC 6749 §4.1.2); `None` when the code names no exchanged authorization.
+    pub async fn revoke_replayed_mcp_oauth_code(
+        &self,
+        code_hash: String,
+        revoked_at: Timestamp,
+    ) -> Result<Option<String>> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let revoked = revoke_replayed_code_on(&transaction, &code_hash, &revoked_at)?;
+                transaction.commit()?;
+                Ok(revoked)
+            })
+            .await
+    }
+    /// Rotates a refresh token, once. In one transaction an unused token of a live session,
+    /// for this client and resource, is marked used, its successor is stored, and the
+    /// session's expiry moves to `new_expires_at` (narrowing its scopes when asked). Any use
+    /// of a token already used revokes the whole grant (RFC 9700 §4.14.2).
+    pub async fn rotate_mcp_oauth_refresh_token(
+        &self,
+        rotation: McpOAuthRefreshRotation,
+        now_ms: i64,
+    ) -> Result<McpOAuthRefreshOutcome> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let outcome = rotate_refresh_token_on(&transaction, &rotation, now_ms)?;
+                transaction.commit()?;
+                Ok(outcome)
+            })
+            .await
     }
 
     async fn delete(&self, sql: &'static str, id: String) -> Result<()> {
@@ -2689,6 +3106,135 @@ pub struct AuthAuthoritySnapshot {
     pub pairings: Vec<AuthPairingLink>,
     pub offers: Vec<AuthPairingOffer>,
     pub sessions: Vec<AuthSession>,
+    /// Remote MCP authorizations waiting for a person (#139, slice R).
+    #[serde(skip)]
+    pub pending_mcp_authorizations: Vec<McpOAuthAuthorization>,
+}
+/// A dynamically registered public OAuth client of remote MCP (#139, slice R).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthClient {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uris: Vec<String>,
+    pub source_key: String,
+    pub created_at_ms: i64,
+    pub approved_at_ms: Option<i64>,
+    pub last_used_at_ms: Option<i64>,
+}
+/// The admission limits of the unauthenticated OAuth routes, and how long rows are kept.
+#[derive(Clone, Copy, Debug)]
+pub struct McpOAuthLimits {
+    pub registrations_per_source_per_hour: i64,
+    pub unapproved_clients: i64,
+    pub pending_per_client: i64,
+    pub pending_per_source: i64,
+    pub pending: i64,
+    /// Of `pending`, the entries kept for sources that have none pending.
+    pub pending_reserved: i64,
+    pub unapproved_client_ttl_ms: i64,
+    pub approved_client_idle_ms: i64,
+    /// How long an authorization row outlives its expiry, so a replayed code still finds it.
+    pub finished_authorization_ttl_ms: i64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpOAuthAdmission {
+    Admitted,
+    /// The client or the source is at its own cap.
+    Refused,
+}
+#[derive(Clone, Debug)]
+pub struct NewMcpOAuthAuthorization {
+    pub id: String,
+    pub user_code: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub state: Option<String>,
+    pub resource: String,
+    /// Space-separated.
+    pub scopes: String,
+    pub origin: String,
+    pub source_key: String,
+    pub status_cookie_hash: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthAuthorization {
+    pub id: String,
+    pub user_code: String,
+    pub client_id: String,
+    /// The client's registered name (untrusted text); empty once the client is gone.
+    pub client_name: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub state: Option<String>,
+    pub resource: String,
+    /// Space-separated.
+    pub scopes: String,
+    pub origin: String,
+    pub source_key: String,
+    pub status_cookie_hash: String,
+    /// `pending`, `approved`, `denied` or `exchanged`.
+    pub status: String,
+    pub approved_access: Option<String>,
+    pub approved_scopes: Option<String>,
+    pub code_hash: Option<String>,
+    pub code_expires_at_ms: Option<i64>,
+    pub session_id: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+#[derive(Clone, Debug)]
+pub enum McpOAuthDecision {
+    /// `scopes` space-separated.
+    Approve {
+        access: String,
+        scopes: String,
+    },
+    Deny,
+}
+#[derive(Clone, Debug)]
+pub struct McpOAuthCodeExchange {
+    pub authorization_id: String,
+    pub code_hash: String,
+    pub client_id: String,
+    pub resource: String,
+    pub session: NewAuthSession,
+    pub refresh_token_hash: String,
+    /// When a replay revokes the session it minted.
+    pub revoked_at: Timestamp,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthExchangeOutcome {
+    Exchanged,
+    /// The code was used before: the session it minted is revoked.
+    Replayed {
+        session_id: String,
+    },
+    Refused,
+}
+#[derive(Clone, Debug)]
+pub struct McpOAuthRefreshRotation {
+    pub token_hash: String,
+    pub new_token_hash: String,
+    pub client_id: String,
+    pub resource: String,
+    /// A narrower set the client asked for; `None` keeps the grant's.
+    pub scopes: Option<Vec<String>>,
+    pub new_expires_at: Timestamp,
+    pub now: Timestamp,
+}
+#[derive(Clone, Debug)]
+pub enum McpOAuthRefreshOutcome {
+    Rotated(Box<AuthSession>),
+    /// A token used before: the grant is revoked (`revoked` is whether it was still live).
+    Reused {
+        session_id: String,
+        revoked: bool,
+    },
+    InvalidGrant,
+    InvalidScope,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthPairingOfferCancellation {
@@ -2765,6 +3311,10 @@ pub struct AuthSession {
     #[serde(default)]
     pub mcp_access_hand_back: Option<String>,
     pub delivery_state: AuthSessionDeliveryState,
+    /// The resource (`<origin>/mcp`) a remote OAuth session is bound to (#139, slice R);
+    /// `None` for every other session.
+    #[serde(default)]
+    pub mcp_resource: Option<String>,
 }
 
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
@@ -2788,7 +3338,250 @@ const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, la
 const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
 const PAIRING_OFFER_BY_KEY_SQL: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? AND principal_id = ? AND idempotency_key = ?";
 const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_access_hand_back FROM auth_sessions";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_access_hand_back, mcp_resource FROM auth_sessions";
+
+const MCP_OAUTH_CLIENT_SELECT: &str = "SELECT client_id, client_name, redirect_uris_json, source_key, created_at, approved_at, last_used_at FROM mcp_oauth_clients";
+const MCP_OAUTH_AUTHORIZATION_SELECT: &str = "SELECT a.id, a.user_code, a.client_id, a.redirect_uri, a.code_challenge, a.state, a.resource, a.scopes, a.origin, a.source_key, a.status_cookie_hash, a.status, a.approved_access, a.approved_scopes, a.code_hash, a.code_expires_at, a.session_id, a.created_at, a.expires_at, c.client_name FROM mcp_oauth_authorizations AS a LEFT JOIN mcp_oauth_clients AS c ON c.client_id = a.client_id";
+
+fn decode_mcp_oauth_client(row: &Row<'_>) -> rusqlite::Result<McpOAuthClient> {
+    Ok(McpOAuthClient {
+        client_id: row.get(0)?,
+        client_name: row.get(1)?,
+        redirect_uris: decode_string_list(row.get(2)?)?,
+        source_key: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        approved_at_ms: row.get(5)?,
+        last_used_at_ms: row.get(6)?,
+    })
+}
+
+fn decode_mcp_oauth_authorization(row: &Row<'_>) -> rusqlite::Result<McpOAuthAuthorization> {
+    Ok(McpOAuthAuthorization {
+        id: row.get(0)?,
+        user_code: row.get(1)?,
+        client_id: row.get(2)?,
+        redirect_uri: row.get(3)?,
+        code_challenge: row.get(4)?,
+        state: row.get(5)?,
+        resource: row.get(6)?,
+        scopes: row.get(7)?,
+        origin: row.get(8)?,
+        source_key: row.get(9)?,
+        status_cookie_hash: row.get(10)?,
+        status: row.get(11)?,
+        approved_access: row.get(12)?,
+        approved_scopes: row.get(13)?,
+        code_hash: row.get(14)?,
+        code_expires_at_ms: row.get(15)?,
+        session_id: row.get(16)?,
+        created_at_ms: row.get(17)?,
+        expires_at_ms: row.get(18)?,
+        client_name: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+    })
+}
+
+fn decode_string_list(value: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+/// Epoch milliseconds as an RFC 3339 timestamp.
+fn format_epoch_ms(epoch_ms: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
+        .ok()
+        .and_then(|date| {
+            date.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+}
+
+/// An RFC 3339 timestamp as epoch milliseconds; `None` when it does not parse.
+fn parse_epoch_ms(value: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .and_then(|timestamp| i64::try_from(timestamp.unix_timestamp_nanos() / 1_000_000).ok())
+}
+
+/// Removes what the OAuth routes no longer need: clients never approved after a day,
+/// approved clients unused for 90 days (with their pending authorizations), authorizations
+/// past their expiry by the kept window, and the refresh tokens of sessions that are gone.
+/// Whether a pending authorization went, which the authority must announce.
+fn prune_mcp_oauth_on(
+    connection: &Connection,
+    now_ms: i64,
+    limits: McpOAuthLimits,
+) -> Result<bool> {
+    connection.execute(
+        "DELETE FROM mcp_oauth_clients WHERE approved_at IS NULL AND created_at <= ?",
+        params![now_ms - limits.unapproved_client_ttl_ms],
+    )?;
+    connection.execute(
+        "DELETE FROM mcp_oauth_clients WHERE approved_at IS NOT NULL \
+         AND COALESCE(last_used_at, approved_at) <= ?",
+        params![now_ms - limits.approved_client_idle_ms],
+    )?;
+    let pending_gone = connection.execute(
+        "DELETE FROM mcp_oauth_authorizations WHERE status = 'pending' AND client_id NOT IN \
+         (SELECT client_id FROM mcp_oauth_clients)",
+        [],
+    )? > 0;
+    connection.execute(
+        "DELETE FROM mcp_oauth_authorizations WHERE expires_at <= ?",
+        params![now_ms - limits.finished_authorization_ttl_ms],
+    )?;
+    connection.execute(
+        "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id NOT IN \
+         (SELECT session_id FROM auth_sessions WHERE revoked_at IS NULL)",
+        [],
+    )?;
+    Ok(pending_gone)
+}
+
+fn revoke_session_on(connection: &Connection, session_id: &str, revoked_at: &str) -> Result<bool> {
+    Ok(connection.execute(
+        "UPDATE auth_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+        params![revoked_at, session_id],
+    )? == 1)
+}
+
+fn revoke_replayed_code_on(
+    connection: &Connection,
+    code_hash: &str,
+    revoked_at: &str,
+) -> Result<Option<String>> {
+    let exchanged = connection
+        .query_row(
+            "SELECT session_id FROM mcp_oauth_authorizations \
+             WHERE code_hash = ? AND status = 'exchanged'",
+            [code_hash],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(session_id) = exchanged else {
+        return Ok(None);
+    };
+    revoke_session_on(connection, &session_id, revoked_at)?;
+    connection.execute(
+        "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id = ?",
+        [&session_id],
+    )?;
+    bump_auth_authority_revision_on(connection)?;
+    Ok(Some(session_id))
+}
+
+fn rotate_refresh_token_on(
+    connection: &Connection,
+    rotation: &McpOAuthRefreshRotation,
+    now_ms: i64,
+) -> Result<McpOAuthRefreshOutcome> {
+    let presented = connection
+        .query_row(
+            "SELECT session_id, client_id, used_at FROM mcp_oauth_refresh_tokens \
+             WHERE token_hash = ?",
+            [&rotation.token_hash],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((session_id, client_id, used_at)) = presented else {
+        return Ok(McpOAuthRefreshOutcome::InvalidGrant);
+    };
+    if used_at.is_some() {
+        let revoked = revoke_session_on(connection, &session_id, &rotation.now)?;
+        connection.execute(
+            "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id = ?",
+            [&session_id],
+        )?;
+        bump_auth_authority_revision_on(connection)?;
+        return Ok(McpOAuthRefreshOutcome::Reused {
+            session_id,
+            revoked,
+        });
+    }
+    let session = connection
+        .query_row(
+            &(AUTH_SESSION_SELECT.to_owned() + " WHERE session_id = ?"),
+            [&session_id],
+            decode_auth_session,
+        )
+        .optional()?
+        .filter(|session| {
+            session.revoked_at.is_none()
+                && parse_epoch_ms(&session.expires_at).is_some_and(|expiry| expiry > now_ms)
+        });
+    let Some(mut session) = session else {
+        return Ok(McpOAuthRefreshOutcome::InvalidGrant);
+    };
+    if client_id != rotation.client_id
+        || session.mcp_resource.as_deref() != Some(rotation.resource.as_str())
+    {
+        return Ok(McpOAuthRefreshOutcome::InvalidGrant);
+    }
+    let granted = session
+        .scopes
+        .as_array()
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|scope| scope.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(requested) = &rotation.scopes
+        && (requested.is_empty() || requested.iter().any(|scope| !granted.contains(scope)))
+    {
+        return Ok(McpOAuthRefreshOutcome::InvalidScope);
+    }
+    connection.execute(
+        "UPDATE mcp_oauth_refresh_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+        params![now_ms, rotation.token_hash],
+    )?;
+    connection.execute(
+        "INSERT INTO mcp_oauth_refresh_tokens (token_hash, session_id, client_id, issued_at, \
+         used_at) VALUES (?, ?, ?, ?, NULL)",
+        params![rotation.new_token_hash, session_id, client_id, now_ms],
+    )?;
+    if let Some(requested) = &rotation.scopes {
+        // Narrowing keeps the grant's order, so the access token's scopes match the session.
+        let narrowed = granted
+            .into_iter()
+            .filter(|scope| requested.contains(scope))
+            .collect::<Vec<_>>();
+        session.scopes = serde_json::json!(narrowed);
+    }
+    connection.execute(
+        "UPDATE auth_sessions SET expires_at = ?, scopes = ? WHERE session_id = ?",
+        params![
+            rotation.new_expires_at,
+            encode_json(&session.scopes)?,
+            session_id
+        ],
+    )?;
+    connection.execute(
+        "UPDATE mcp_oauth_clients SET last_used_at = ? WHERE client_id = ?",
+        params![now_ms, client_id],
+    )?;
+    session.expires_at = rotation.new_expires_at.clone();
+    bump_auth_authority_revision_on(connection)?;
+    Ok(McpOAuthRefreshOutcome::Rotated(Box::new(session)))
+}
+
+fn insert_auth_session_on(
+    connection: &Connection,
+    row: &NewAuthSession,
+    mcp_resource: Option<&str>,
+) -> Result<()> {
+    connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_resource) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str(),row.mcp_access,mcp_resource])?;
+    Ok(())
+}
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -3653,6 +4446,7 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         mcp_access: row.get(17)?,
         mcp_access_hand_back: row.get(18)?,
         delivery_state: row.get(16)?,
+        mcp_resource: row.get(19)?,
     })
 }
 
