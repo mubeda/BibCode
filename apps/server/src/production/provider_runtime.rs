@@ -2794,6 +2794,7 @@ async fn reconcile_abandoned_provider_session(
             &turn_id,
             &settled_at,
             super::orchestration_effects::TurnEnd::CutOff,
+            None,
         )
         .await
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
@@ -11231,6 +11232,7 @@ async fn project_provider_event(
                 turn_id,
                 &created_at,
                 super::orchestration_effects::TurnEnd::Live,
+                Some(&launch.cwd),
             )
             .await
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;

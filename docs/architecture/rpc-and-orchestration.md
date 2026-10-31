@@ -851,28 +851,37 @@ before the thread's first recorded turn. Turn `n`'s patch is ref `n - 1` to ref
 turn's number, ref, status and changed files.
 
 1. **Turn start.** `thread.turn-start-requested` (and a non-imported user
-   `thread.message-sent`) captures ref `n` (the thread's latest number) if it
-   is missing. A thread with settled turns but no recorded checkpoint, whose
-   turns predate turn checkpoints, captures ref 0 again on
-   `thread.turn-start-requested` unless another turn runs, so its first
-   recorded turn does not reach back to the thread's first turn.
+   `thread.message-sent`) captures ref `n`, `n` being the latest number among
+   the turns before the starting one, if it is missing. A thread with settled
+   turns but no recorded checkpoint, whose turns predate turn checkpoints,
+   captures ref 0 again on `thread.turn-start-requested` unless another turn
+   runs, so its first recorded turn does not reach back to the thread's first
+   turn. A latest turn whose checkpoint went stale (step 3) gets no ref.
 2. **Turn end.** Provider ingestion's `turn.completed` (not a compaction's own
    turn) records the turn's number, the latest plus one, with status `missing`
    before the session settles (`record_turn_end`). A turn that already has a
    number is left alone, and a record that cannot be written fails the
    projection before the session settles. Only a thread with a recorded
-   checkpoint, or one whose turn start the worker found in a Git checkout, is
-   numbered; a project outside Git gets no checkpoints. It also takes a checkpoint hold for
-   the turn: the thread's queue promotion waits while any of its ended turns
-   is held, so a queued follow-up cannot edit the checkout before the capture.
-   Holds exist only while the effects worker runs, a deleted thread's holds
-   are released, and each expires after 120 seconds.
+   checkpoint, or a turn whose working directory lies in a Git work tree (a
+   `.git` in it or above), is numbered, so numbering never waits for the
+   effects worker and a project outside Git gets no checkpoints. It also takes
+   a checkpoint hold for the turn: turn delivery holds every turn of the
+   thread (direct starts, Send now, promoted follow-ups, steers, MCP sends)
+   while any of its ended turns is held, so no turn edits the checkout before
+   the capture. Holds exist only while the effects worker runs, and a deleted
+   thread's holds are released.
 3. **Capture.** The worker handles the `missing` record: it captures ref `n`
    (never overwriting one that exists), diffs it against ref `n - 1`, records
    `ready` with the changed files and the turn's own answer id, appends a
    `checkpoint.captured` activity, and releases that turn's hold however it
-   ends. A failed capture stays `missing` with a `checkpoint.capture.failed`
-   activity; the next turn start then writes ref `n`.
+   ends. `ready` requires ref `n - 1`; without it, and after a failed capture,
+   the turn stays `missing` with a `checkpoint.capture.failed` activity, and
+   the next turn start writes ref `n` if it is still missing. A hold still
+   pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds) marks
+   the turn's checkpoint stale and is released, with a warning and a
+   `checkpoint.capture.failed` activity: the worker never captures or records
+   that turn `ready`, and no later baseline writes its ref, so a revert to it
+   is refused. The stale mark lives in memory.
 4. **Restart.** Startup reconciliation records a turn the restart cut off as
    `missing`, without a capture, when the thread already has a recorded
    checkpoint, so the numbers stay dense and a revert's provider rewind

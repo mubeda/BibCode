@@ -1579,7 +1579,7 @@ Stops a thread's running turn: the one `turnId` names, else the thread's latest 
 
 #### `get_turn_diff`
 
-Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only (a project outside Git has none). Turns that ended before BiBCode recorded checkpoints have none, and neither does a turn whose capture failed or that a restart cut off (its changes show in the next turn's patch). In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
+Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only (a project outside Git has none). Turns that ended before BiBCode recorded checkpoints have none. A turn whose capture failed or that a restart cut off is not captured (the default skips it); asked for by `turnCount`, its patch also holds anything changed before the next turn started. A turn whose capture was still pending after 120 seconds has no patch at all, and the next turn's patch cannot be read either. While a turn's checkpoint is being captured, the thread's next turn waits. In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
 
 - **Set / scope:** Workspace · `orchestration:read`
 - **Access:** any level

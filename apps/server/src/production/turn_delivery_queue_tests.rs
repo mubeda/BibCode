@@ -779,6 +779,9 @@ struct GatedRewind {
     suspended: std::sync::atomic::AtomicBool,
     reopen_entered: Notify,
     reopen_release: Notify,
+    /// The worker's next workspace lookup waits for `workspace_release`, like Git hung on it.
+    hold_workspace: std::sync::atomic::AtomicBool,
+    workspace_release: Notify,
 }
 
 impl GatedRewind {
@@ -798,7 +801,15 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks for 
         &'a self,
         _thread_id: &'a str,
     ) -> crate::production::orchestration_effects::BoxEffectFuture<'a, Option<PathBuf>> {
-        Box::pin(async move { Ok(Some(self.cwd.clone())) })
+        Box::pin(async move {
+            if self
+                .hold_workspace
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.workspace_release.notified().await;
+            }
+            Ok(Some(self.cwd.clone()))
+        })
     }
 
     fn rollback_provider<'a>(
@@ -899,8 +910,15 @@ fn revert_checkout() -> tempfile::TempDir {
 
 impl RevertFixture {
     async fn new() -> Self {
+        Self::with_options(crate::production::orchestration_effects::EffectsOptions::default())
+            .await
+    }
+
+    async fn with_options(
+        options: crate::production::orchestration_effects::EffectsOptions,
+    ) -> Self {
         use crate::production::orchestration_effects::{
-            EffectsOptions, OrchestrationEffects, capture_checkpoint, checkpoint_ref,
+            OrchestrationEffects, capture_checkpoint, checkpoint_ref,
         };
         let repository = revert_checkout();
         let cwd = repository.path().to_path_buf();
@@ -927,12 +945,14 @@ impl RevertFixture {
             suspended: std::sync::atomic::AtomicBool::new(false),
             reopen_entered: Notify::new(),
             reopen_release: Notify::new(),
+            hold_workspace: std::sync::atomic::AtomicBool::new(false),
+            workspace_release: Notify::new(),
         });
         let effects = OrchestrationEffects::start(
             engine.clone(),
             Arc::new(crate::git::GitRepository::default()),
             rewind.clone(),
-            EffectsOptions::default(),
+            options,
         )
         .await
         .unwrap();
@@ -1065,18 +1085,23 @@ async fn a_reverting_threads_later_effects_run_after_the_revert() {
         .unwrap();
     fixture.rewind.reopen_release.notify_one();
     fixture.event("thread.reverted", |_| true).await;
-    fixture
-        .event("thread.turn-diff-completed", |payload| {
-            payload["turnId"] == "turn-late" && payload["status"] == "ready"
-        })
-        .await;
+    // Turn 5 has no checkpoint before it, so it is never `ready`; its own ref is still captured.
     let captured = format!(
         "{}:tracked.txt",
         crate::production::orchestration_effects::checkpoint_ref("t", 5)
     );
+    let contents = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(contents) = fixture.git_output(&["show", &captured]) {
+                return contents;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the late checkpoint is captured");
     assert_eq!(
-        fixture.git_output(&["show", &captured]).as_deref(),
-        Some("one\n"),
+        contents, "one\n",
         "the late checkpoint was captured before the revert restored the files"
     );
     fixture.shutdown().await;
@@ -1227,9 +1252,16 @@ async fn a_queued_follow_up_waits_for_the_ended_turns_checkpoint() {
     let (service, mut routes) = service(&engine);
     quiet(&mut routes).await;
     std::fs::write(fixture.rewind.cwd.join("tracked.txt"), "three\n").unwrap();
-    record_turn_end(&engine, "t", "turn-3", TIME, TurnEnd::Live)
-        .await
-        .unwrap();
+    record_turn_end(
+        &engine,
+        "t",
+        "turn-3",
+        TIME,
+        TurnEnd::Live,
+        Some(&fixture.rewind.cwd),
+    )
+    .await
+    .unwrap();
     session(&engine, "ready", "ready-third").await;
     received(&mut routes, "queued").await;
     service.shutdown().await;
@@ -1262,32 +1294,134 @@ async fn a_queued_follow_up_waits_for_the_ended_turns_checkpoint() {
     assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
 
     fixture.shutdown().await;
-    engine.hold_promotion_for_checkpoint("t", "turn-4");
-    assert!(!engine.promotion_held_for_checkpoint("t"));
+    assert_eq!(engine.hold_turns_for_checkpoint("t", "turn-4"), None);
+    assert!(!engine.turns_held_for_checkpoint("t"));
 }
 
-/// Each ended turn holds the queue for itself: when two turns end before the effects worker
+/// Each ended turn holds the thread for itself: when two turns end before the effects worker
 /// catches up, capturing the first does not release the second's hold. Deleting the thread
 /// releases them all.
 #[tokio::test]
 async fn each_ended_turn_holds_the_queue_until_its_own_checkpoint() {
     let engine = engine().await;
-    engine.set_checkpoint_holds_enabled(true);
-    engine.hold_promotion_for_checkpoint("t", "turn-1");
-    engine.hold_promotion_for_checkpoint("t", "turn-2");
+    engine.set_checkpoint_hold_limit(Some(Duration::from_secs(60)));
+    engine.hold_turns_for_checkpoint("t", "turn-1");
+    engine.hold_turns_for_checkpoint("t", "turn-2");
     engine.release_checkpoint_hold("t", "turn-1");
-    assert!(engine.promotion_held_for_checkpoint("t"));
+    assert!(engine.turns_held_for_checkpoint("t"));
     engine.release_checkpoint_hold("t", "turn-2");
-    assert!(!engine.promotion_held_for_checkpoint("t"));
+    assert!(!engine.turns_held_for_checkpoint("t"));
 
-    engine.hold_promotion_for_checkpoint("t", "turn-3");
-    engine.hold_promotion_for_checkpoint("other", "turn-1");
+    engine.hold_turns_for_checkpoint("t", "turn-3");
+    engine.hold_turns_for_checkpoint("other", "turn-1");
     engine.release_thread_checkpoint_holds("t");
-    assert!(!engine.promotion_held_for_checkpoint("t"));
-    assert!(engine.promotion_held_for_checkpoint("other"));
-    engine.set_checkpoint_holds_enabled(false);
-    assert!(!engine.promotion_held_for_checkpoint("other"));
+    assert!(!engine.turns_held_for_checkpoint("t"));
+    assert!(engine.turns_held_for_checkpoint("other"));
+    engine.set_checkpoint_hold_limit(None);
+    assert!(!engine.turns_held_for_checkpoint("other"));
     engine.shutdown().await;
+}
+
+/// A direct start (the composer, MCP `send_message`, `start_thread` and panel messages, which
+/// all dispatch `thread.turn.start`) and **Send now** (`thread.turn.promote`) are delivered only
+/// once the checkpoint of the thread's last turn is recorded, like a queued follow-up: no turn
+/// edits the checkout before it is captured.
+#[tokio::test]
+async fn direct_starts_and_send_now_wait_for_the_ended_turns_checkpoint() {
+    for send_now in [false, true] {
+        let engine = engine().await;
+        engine.set_checkpoint_hold_limit(Some(Duration::from_secs(60)));
+        session(&engine, "running", "running").await;
+        let held = engine.hold_turns_for_checkpoint("t", "running");
+        assert!(held.is_some());
+        session(&engine, "ready", "ready").await;
+        let (service, mut routes) = service(&engine);
+        if send_now {
+            enqueue(&engine, "next", true).await;
+            engine.dispatch(command(json!({"type":"thread.turn.promote", "commandId":"send-now", "threadId":"t", "messageId":"next", "createdAt":TIME}))).await.unwrap();
+        } else {
+            enqueue(&engine, "next", false).await;
+        }
+        quiet(&mut routes).await;
+        assert_eq!(row(&engine, "next").await.attempts, 0);
+        engine.release_checkpoint_hold("t", "running");
+        received(&mut routes, "next").await;
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+}
+
+/// A capture still pending when its hold expires (Git hung, or a long backlog) is given up:
+/// the thread's turns go on, the turn's checkpoint is recorded stale and never `ready`, and the
+/// next turn's baseline does not stand in for it, since the checkout may hold the next turn's
+/// edits by then.
+#[tokio::test]
+async fn an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_thread() {
+    use crate::production::orchestration_effects::{
+        EffectsOptions, TurnEnd, checkpoint_ref, record_turn_end,
+    };
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: Duration::from_millis(300),
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    session(&engine, "running", "running-third").await;
+    enqueue(&engine, "queued", true).await;
+    let (service, mut routes) = service(&engine);
+    quiet(&mut routes).await;
+    std::fs::write(
+        fixture.rewind.cwd.join("tracked.txt"),
+        "three
+",
+    )
+    .unwrap();
+    fixture
+        .rewind
+        .hold_workspace
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    record_turn_end(
+        &engine,
+        "t",
+        "turn-3",
+        TIME,
+        TurnEnd::Live,
+        Some(&fixture.rewind.cwd),
+    )
+    .await
+    .unwrap();
+    session(&engine, "ready", "ready-third").await;
+    // The worker is stuck on the capture; the hold expires and the follow-up goes.
+    received(&mut routes, "queued").await;
+    service.shutdown().await;
+    assert!(engine.checkpoint_is_stale("t", "turn-3"));
+
+    // The worker then gets past the capture: it records nothing for the stale turn.
+    fixture.rewind.workspace_release.notify_one();
+    assert!(fixture.other_thread_gets_its_baseline().await);
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 3)
+        .await
+        .unwrap()
+        .expect("checkpoint 3");
+    assert_eq!(checkpoint.status, "missing");
+    assert_eq!(
+        fixture.git_output(&["rev-parse", "--verify", "--quiet", &checkpoint_ref("t", 3)]),
+        None
+    );
+    let stale_records = crate::orchestration::load_snapshot(&engine.repositories())
+        .await
+        .unwrap()
+        .activities
+        .into_iter()
+        .filter(|activity| {
+            activity.kind == "checkpoint.capture.failed"
+                && activity.turn_id.as_deref() == Some("turn-3")
+        })
+        .count();
+    assert!(stale_records >= 1, "{stale_records}");
+    fixture.shutdown().await;
 }
 
 /// Five chats sharing one checkout revert, one more than are prepared at once, while every
