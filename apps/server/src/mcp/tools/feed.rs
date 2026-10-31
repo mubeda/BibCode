@@ -516,6 +516,16 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Try again in a moment.",
     ),
     (
+        "McpCloneNotFoundError",
+        "No clone with this cloneId was started on this MCP connection in the last 24 hours.",
+        "Use the cloneId clone_repository returned on this connection; after a restart, clone again.",
+    ),
+    (
+        "McpCloneRefusedError",
+        "The parent project's folder is a filesystem root, so there is no folder beside it to clone into.",
+        "Pass a parentProjectId whose folder sits inside another folder.",
+    ),
+    (
         "McpProjectNotFoundError",
         "No project has this id, or the thread's project is gone.",
         "Use list_projects_and_threads to find it.",
