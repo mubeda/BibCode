@@ -3529,6 +3529,8 @@ function ChatViewContent(props: ChatViewProps) {
   // the reader's place away, so it stays released until the next send or thread (#190).
   const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
   const cancelTimelineLiveFollowForUserNavigation = useCallback((input?: TimelineTakeoverInput) => {
+    // [DEBUG-214]
+    (globalThis as { __k64Trace?: (kind: string, value: unknown) => void }).__k64Trace?.("cv-takeover", { input: input ?? null });
     // A send names its row pending before the previous one stops being positioned, so the
     // newest send is the one released.
     releasedTimelineAnchorRef.current =
@@ -3723,6 +3725,8 @@ function ChatViewContent(props: ChatViewProps) {
         const outOfTime =
           attempt > SENT_ROW_LANDING_ATTEMPTS ||
           performance.now() - startedAt > SENT_ROW_LANDING_MAX_MS;
+        // [DEBUG-214]
+        (globalThis as { __k64Trace?: (kind: string, value: unknown) => void }).__k64Trace?.("cv-land", { attempt, delta: delta ?? null, outOfTime, live: scrollNode.scrollTop, stateScroll: list.getState().scroll });
         if (delta === undefined || delta === null || outOfTime) {
           if (attempt === 1) {
             // Stop the glide where it is; it would otherwise go on under the follow.
@@ -3971,6 +3975,13 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
+      // [DEBUG-214]
+      (globalThis as { __k64Trace?: (kind: string, value: unknown) => void }).__k64Trace?.("cv-follow", {
+        stateScroll: list.getState().scroll,
+        live: list.getScrollableNode().scrollTop,
+        delta: metrics.scrollDeltaToRevealEnd,
+        nextOffset,
+      });
       void list.scrollToOffset({ offset: nextOffset, animated: false });
       // LegendList clamps a scroll to the content height it has laid out, which can lag the
       // rows it has measured. A clamped scroll leaves the end hidden until the next delivery,
