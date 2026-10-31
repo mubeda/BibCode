@@ -188,7 +188,10 @@ takes a `threadId`, the thread the agent acts for. They are in the **Workspace**
 - **Devices** need **Device previews** on. A device belongs to the thread that started it (a
   chat panel's thread counts as its host's): an agent acting for another thread can see it but
   cannot reuse or stop it.
-- Preview pages are untrusted content.
+- Preview pages are untrusted content. Like every result, a preview or device result's text is
+  capped at 80,000 characters (a longer one, such as a large `preview_evaluate` value, comes
+  back as `truncated` with a note), and hidden or control characters in it are shown as escapes.
+  Screenshots come back whole, as images.
 
 ### Terminals
 

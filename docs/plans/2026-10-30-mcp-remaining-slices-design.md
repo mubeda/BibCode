@@ -3450,6 +3450,17 @@ agents' separate tabs through a real broker and a fake UI host; read-only and th
 set turned off; device twins without `DeviceTools`; and, on unix with the fake SDK,
 `device_list` on and off and a close refused for another thread (`DeviceBusyError`).
 
+**Review round 3 (Codex P2, `claude/v0131-139-r3`).** Twins bypassed F0's text-result
+contract (confirmed: a 200,000-character `preview_evaluate` value came back whole, and U+202E
+reached the text raw). Twin results now go through `client_result`: `structuredContent`
+through `tool_result`, so the text is at most 80,000 characters (past that, `truncated` and the
+standard "too long" note replace the result) and `EscapeControls` escapes hidden and control
+characters, while `structuredContent` stays raw. Image content items, such as a snapshot's
+screenshot, are appended unchanged, so an image never counts toward the cap. Twin failures,
+including device ones, are rebuilt through `typed_tool_failure`, so their message is bounded
+and made plain. `run`, the provider path, is unchanged: a test compares its result for the
+same answer byte for byte. This supersedes "Results are the provider results, unchanged" above.
+
 ## T (terminals) implementation notes (2026-10-30)
 
 Slice T was implemented on `claude/v0131-139-t`, from the batch tip `1d4eda69bd` (slice 1, the

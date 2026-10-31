@@ -224,6 +224,107 @@ async fn the_preview_scope_names_the_agent_the_thread_and_its_host() {
     harness.shutdown().await;
 }
 
+/// An invoker that answers each operation with its entry in `answers`.
+fn answering_invoker(answers: Value) -> PreviewInvoker {
+    PreviewInvoker::new(move |_scope, operation, _input, _tab_id, _cancellation| {
+        let answer = answers[operation.as_str()].clone();
+        async move { Ok(answer) }
+    })
+}
+
+/// A twin's text follows the client result policy: a page result past 80,000 characters is
+/// replaced by the standard truncation note, and hidden Unicode in the text is escaped while
+/// `structuredContent` keeps it raw. The provider tool's result is untouched.
+#[tokio::test]
+async fn twin_text_is_capped_and_escapes_hidden_unicode_like_every_client_result() {
+    let harness = harness().await;
+    let (agent, _) = harness.agent(McpAccess::ApprovalRequired).await;
+
+    let large = json!({ "result": "x".repeat(200_000) });
+    let hidden = json!({ "title": "safe\u{202e}txt.exe", "tag": "a\u{e0041}b" });
+    let answers = json!({ "evaluate": large, "status": hidden });
+    harness
+        .control
+        .attach_previews(services(answering_invoker(answers.clone())));
+    let capped = harness
+        .call(
+            &agent,
+            "preview_evaluate",
+            json!({ "threadId": THREAD, "expression": "document.body.innerHTML" }),
+        )
+        .await;
+    let text = capped["content"][0]["text"].as_str().unwrap();
+    assert!(
+        crate::mcp::protocol::chars(text) <= crate::mcp::protocol::MAX_RESULT_CHARS,
+        "{} characters",
+        text.len()
+    );
+    assert_eq!(structured(&capped)["truncated"], true, "{capped}");
+    // The provider path, the same dispatch, still returns the result unchanged.
+    let scope = PreviewScope {
+        environment_id: ENVIRONMENT.into(),
+        thread_id: THREAD.into(),
+        owner_thread_id: THREAD.into(),
+        provider_session_id: "provider-session".into(),
+        provider_instance_id: "codex".into(),
+    };
+    let provider = crate::mcp::tools::previews::run(
+        scope.clone(),
+        "preview_evaluate",
+        json!({}),
+        tokio_util::sync::CancellationToken::new(),
+        &answering_invoker(answers),
+        None,
+    )
+    .await;
+    assert_eq!(
+        provider,
+        json!({
+            "isError": false,
+            "structuredContent": large,
+            "content": [{ "type": "text", "text": large.to_string() }],
+        })
+    );
+
+    let escaped = harness
+        .call(&agent, "preview_status", json!({ "threadId": THREAD }))
+        .await;
+    let text = escaped["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains('\u{202e}') && !text.contains('\u{e0041}'),
+        "{text}"
+    );
+    assert!(text.contains("\\u202e"), "{text}");
+    assert_eq!(structured(&escaped), &hidden);
+    harness.shutdown().await;
+}
+
+/// A twin keeps a snapshot's image content as the provider returns it, beside policy text.
+#[tokio::test]
+async fn a_twin_snapshot_keeps_its_image() {
+    let harness = harness().await;
+    let (agent, _) = harness.agent(McpAccess::ApprovalRequired).await;
+    let image = "iVBORw0KGgo".repeat(10_000);
+    harness
+        .control
+        .attach_previews(services(answering_invoker(json!({ "snapshot": {
+            "url": "http://localhost:5173/\u{200b}",
+            "screenshot": { "data": image, "mimeType": "image/png", "width": 800, "height": 600 },
+        } }))));
+    let snapshot = harness
+        .call(&agent, "preview_snapshot", json!({ "threadId": THREAD }))
+        .await;
+    let content = snapshot["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{snapshot}");
+    assert!(content[0]["text"].as_str().unwrap().contains("\\u200b"));
+    assert_eq!(
+        content[1],
+        json!({ "type": "image", "data": image, "mimeType": "image/png" })
+    );
+    assert_eq!(structured(&snapshot)["screenshot"]["width"], 800);
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn preview_open_with_no_automation_host_returns_the_typed_error() {
     let harness = harness().await;
