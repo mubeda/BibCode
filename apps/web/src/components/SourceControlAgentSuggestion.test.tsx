@@ -1,11 +1,7 @@
 // @vitest-environment happy-dom
 import { RegistryContext } from "@effect/atom-react";
-import {
-  EnvironmentId,
-  ThreadId,
-  type UiCommitMessageIntent,
-  type UiIntent,
-} from "@bibcode/contracts";
+import { EnvironmentId, ThreadId, type UiCommitMessageIntent } from "@bibcode/contracts";
+import type { PendingUiIntent } from "@bibcode/client-runtime/state/uiIntents";
 import { AsyncResult } from "effect/reactivity";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -45,12 +41,16 @@ function fakeRegistry() {
   };
 }
 
+type PendingSuggestion = PendingUiIntent & UiCommitMessageIntent;
+
 let sequence = 0;
-function suggestion(overrides: Partial<UiCommitMessageIntent> = {}): UiCommitMessageIntent {
+/** A suggestion as the fold holds it: `deadline` is on this client's clock. */
+function suggestion(overrides: Partial<PendingSuggestion> = {}): PendingSuggestion {
   sequence += 1;
   return {
     kind: "commitMessage",
     intentId: `intent-${sequence}`,
+    bootId: "boot-1",
     sequence,
     threadId: ThreadId.make("thread-1"),
     cwd: CWD,
@@ -58,6 +58,8 @@ function suggestion(overrides: Partial<UiCommitMessageIntent> = {}): UiCommitMes
     actor: { kind: "mcp-client", clientId: "session-1", label: "Claude Code" },
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    expiresInMs: 86_400_000,
+    deadline: Date.now() + 86_400_000,
     ...overrides,
   };
 }
@@ -106,7 +108,7 @@ async function mount(
   );
 }
 
-const emit = (registry: ReturnType<typeof fakeRegistry>, intents: UiIntent[]) =>
+const emit = (registry: ReturnType<typeof fakeRegistry>, intents: PendingUiIntent[]) =>
   act(async () => registry.emit(`intents:${environmentId}`, AsyncResult.success(intents)));
 
 const textarea = () => container.querySelector("textarea")!;
@@ -152,17 +154,35 @@ describe("SourceControlAgentSuggestion review round 2", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const registry = fakeRegistry();
     await mount(registry);
-    await emit(registry, [suggestion({ expiresAt: new Date(Date.now() - 1).toISOString() })]);
+    await emit(registry, [suggestion({ deadline: Date.now() - 1 })]);
     expect(textarea().value).toBe("");
 
     await act(async () => useSourceControlPanelStore.getState().setCwdMessage(CWD_KEY, "mine"));
-    await emit(registry, [suggestion({ expiresAt: new Date(Date.now() + 60_000).toISOString() })]);
+    await emit(registry, [suggestion({ deadline: Date.now() + 60_000 })]);
     expect(container.textContent).toContain("suggested a message");
     await act(async () => {
       vi.advanceTimersByTime(60_001);
     });
     expect(container.textContent).not.toContain("suggested a message");
     expect(textarea().value).toBe("mine");
+  });
+
+  it("fills a fresh suggestion on a client whose clock runs 25 hours ahead", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const serverNow = Date.now();
+    vi.setSystemTime(serverNow + 25 * 3_600_000);
+    const registry = fakeRegistry();
+    await mount(registry);
+    // By this clock the server's expiresAt is an hour gone; its deadline, set on arrival, is not.
+    await emit(registry, [
+      suggestion({
+        message: "Fresh",
+        expiresAt: new Date(serverNow + 86_400_000).toISOString(),
+        deadline: Date.now() + 86_400_000,
+      }),
+    ]);
+    expect(textarea().value).toBe("Fresh");
+    expect(container.textContent).toContain("Message from Agent Claude Code");
   });
 });
 
@@ -244,6 +264,8 @@ describe("SourceControlAgentSuggestion", () => {
         actor: { kind: "mcp-client", clientId: "s", label: "Claude Code" },
         createdAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        expiresInMs: 60_000,
+        deadline: Date.now() + 60_000,
       },
     ]);
     expect(textarea().value).toBe("");
