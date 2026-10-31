@@ -165,9 +165,12 @@ impl Host {
                     "stale_head",
                     "The head commit changed. Refresh before trying again.",
                 )),
-                "merge" => Ok(
-                    json!({ "kind": "merged", "mergedSha": "merged-1", "autoMergeEnabled": false }),
-                ),
+                // Number 13 merges, but the host never reported its commit.
+                "merge" => {
+                    let auto = payload["auto"] == true;
+                    let sha = (number != 13 && !auto).then_some("merged-1");
+                    Ok(json!({ "kind": "merged", "mergedSha": sha, "autoMergeEnabled": auto }))
+                }
                 "setDraft" if number == 9 => Err(host_error(
                     "forbidden",
                     "This account does not have permission for this operation.",
@@ -387,6 +390,7 @@ async fn merge_sends_the_head_never_bypass_and_a_stale_head_is_refused() {
             json!({ "threadId": thread, "number": 7, "method": "squash", "headSha": HEAD, "deleteBranch": true }),
         )
         .await;
+    assert_eq!(structured(&merged)["merged"], true);
     assert_eq!(structured(&merged)["mergedSha"], "merged-1");
     let sent = &host.requests("pullRequests.runAction")[0];
     assert_eq!(sent["action"], "merge");
@@ -395,6 +399,26 @@ async fn merge_sends_the_head_never_bypass_and_a_stale_head_is_refused() {
     assert_eq!(sent["method"], "squash");
     assert_eq!(sent["deleteBranch"], true);
     assert_eq!(sent["auto"], false);
+
+    // Merged without a reported commit is still merged; an auto-merge merged nothing yet.
+    let unreported = harness
+        .call(
+            &agent,
+            "merge_pull_request",
+            json!({ "threadId": thread, "number": 13, "method": "merge", "headSha": HEAD }),
+        )
+        .await;
+    assert_eq!(structured(&unreported)["merged"], true);
+    assert_eq!(structured(&unreported)["mergedSha"], Value::Null);
+    let auto = harness
+        .call(
+            &agent,
+            "merge_pull_request",
+            json!({ "threadId": thread, "number": 7, "method": "merge", "headSha": HEAD, "auto": true }),
+        )
+        .await;
+    assert_eq!(structured(&auto)["merged"], false);
+    assert_eq!(structured(&auto)["autoMergeEnabled"], true);
 
     let stale = harness
         .call(
@@ -424,7 +448,7 @@ async fn merge_sends_the_head_never_bypass_and_a_stale_head_is_refused() {
         .await;
     assert_eq!(error_tag(&headless), "McpInvalidArgumentError");
     let requests = host.requests("pullRequests.runAction");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert!(requests.iter().all(|sent| sent["bypass"] == false));
 
     // Merging is destructive: it is listed so, and never as safe to repeat.
