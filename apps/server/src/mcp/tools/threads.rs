@@ -156,7 +156,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
     });
     match name {
         "list_projects_and_threads" => (
-            "BiBCode projects, with their folders, and their threads, newest first, with each thread's status (idle, running, queued, awaiting_approval, awaiting_input, delivery_failed, error, interrupted), pending flags, latest turn, provider and model.",
+            "BiBCode projects, with their folders, and their threads, newest first, with each thread's status (idle, running, awaiting_approval, awaiting_input, delivery_failed, error, interrupted), pending flags, latest turn, provider and model.",
             object(
                 json!({
                     "projectId": { "type": "string", "description": "Only this project's threads." },
@@ -1836,6 +1836,14 @@ pub(crate) fn diff_page(patch: &str, file_index: usize, offset: usize, budget: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread summary's status is the thread's own; `queued` is only what `wait_for_thread`
+    /// says of a message not yet admitted.
+    #[test]
+    fn the_thread_list_does_not_promise_a_queued_status() {
+        let (list, _) = tool_text("list_projects_and_threads");
+        assert!(!list.contains("queued"), "{list}");
+    }
 
     #[test]
     fn a_long_patch_is_read_in_full_through_its_cursor() {
