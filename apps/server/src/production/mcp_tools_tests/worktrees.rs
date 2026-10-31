@@ -729,7 +729,31 @@ async fn a_plan_too_long_to_show_in_full_refuses_a_repository_wide_prune() {
     };
     assert_eq!(registrations(), 101, "nothing was pruned");
 
-    // The marked token still names the current plan: without the prune, the catalog takes the
+    // Nothing in the token the agent holds says it was truncated: an edited token (any marker
+    // stripped) is refused all the same, since the server works it out from the plan itself.
+    let mut stripped = removal(&plan, &thread_id, "cleanup");
+    stripped["planToken"] = json!(
+        plan["planToken"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("partial-impact:")
+    );
+    stripped["confirmRepositoryWidePrune"] = json!(true);
+    let refused = fixture.call(&agent, "remove_worktree", stripped).await;
+    assert_eq!(
+        error_tag(&refused),
+        "McpPruneImpactTooLongError",
+        "{refused}"
+    );
+    // Nor can the agent forge a token: one the server did not sign is refused.
+    let mut forged = removal(&plan, &thread_id, "cleanup");
+    forged["planToken"] = json!("0".repeat(64));
+    forged["confirmRepositoryWidePrune"] = json!(true);
+    let refused = fixture.call(&agent, "remove_worktree", forged).await;
+    assert_eq!(error_tag(&refused), "McpInvalidArgumentError", "{refused}");
+    assert_eq!(registrations(), 101, "nothing was pruned");
+
+    // The token still names the current plan: without the prune, the catalog takes the
     // removal and answers for itself (a missing folder among other stale ones needs a prune).
     let unconfirmed = fixture
         .call(

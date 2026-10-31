@@ -73,7 +73,9 @@ an agent waits longer by calling it again.
 | `remove_worktree`           | Removes a worktree and its host thread; destructive                                                             |
 
 `remove_worktree` takes the `planToken` and `generation` the plan returned, so an agent has
-read the change counts first, and a worktree that changed since is refused. Its modes:
+read the change counts first, and a worktree that changed since is refused. The token is
+opaque and signed by BiBCode: an edited token is refused, and one from before BiBCode restarted
+needs a fresh plan. Its modes:
 
 - **`delete`** runs `git worktree remove`. It refuses uncommitted or untracked changes unless
   `discardChanges` is true, which loses them for good.

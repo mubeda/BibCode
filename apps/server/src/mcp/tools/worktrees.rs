@@ -7,8 +7,9 @@
 //! cancelled. Creation and removal carry a `commandId`, so a retry with the same
 //! `clientRequestId` replays the stored request by its receipt ([`ToolCall::commands`]).
 
-use std::time::Instant;
+use std::{sync::OnceLock, time::Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -24,6 +25,7 @@ use crate::{
         protocol::{Cut, fit_list, tool_result, typed_tool_failure},
     },
     persistence::ProjectionThread,
+    signed_token,
 };
 
 const READ: &str = SCOPE_ORCHESTRATION_READ;
@@ -33,8 +35,6 @@ const REMOVE: &str = "worktree.remove";
 const DETACH: &str = "worktree.removeFromBibCode";
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MOST_LIST_LIMIT: usize = 200;
-/// Starts the `planToken` of a plan whose `pruneImpact` did not fit in the result.
-const PARTIAL_IMPACT: &str = "partial-impact:";
 
 /// The worktree tools, in the order `tools/list` shows them.
 pub(crate) const TOOLS: &[ToolSpec] = &[
@@ -387,12 +387,16 @@ impl ToolCall<'_> {
             .await?;
         plan["threadId"] = thread_id.into();
         plan["pruneImpactCount"] = plan["pruneImpact"].as_array().map_or(0, Vec::len).into();
-        // A confirmed prune removes every registration the token covers, so a plan that cannot
-        // show them all marks its token, and remove_worktree refuses to prune with it.
-        if fit_list(&mut plan, "/pruneImpact", Cut::Back, 0) > 0 {
-            let token = plan["planToken"].as_str().unwrap_or_default();
-            plan["planToken"] = format!("{PARTIAL_IMPACT}{token}").into();
-        }
+        // A confirmed prune removes every registration the token covers, so the token records,
+        // under the server's signature, whether the plan showed them all; remove_worktree
+        // refuses to prune with one that did not. The signed token is about 100 characters
+        // longer than the catalog's, within the 256 characters fit_list leaves.
+        let complete = fit_list(&mut plan, "/pruneImpact", Cut::Back, 0) == 0;
+        let token = plan["planToken"].as_str().unwrap_or_default().to_owned();
+        plan["planToken"] =
+            signed_token::sign(plan_secret(), PLAN_PURPOSE, &PlanClaims { token, complete })
+                .map_err(storage_failure)?
+                .into();
         Ok(tool_result(plan, &[]))
     }
 
@@ -418,17 +422,7 @@ impl ToolCall<'_> {
         let prune = self.boolean("confirmRepositoryWidePrune")?.unwrap_or(false);
         let plan = match git_mode {
             Some(_) => Some((
-                {
-                    let token = self.required("planToken")?;
-                    let shown = token.strip_prefix(PARTIAL_IMPACT);
-                    if prune && shown.is_some() {
-                        return Err(typed_tool_failure(
-                            "McpPruneImpactTooLongError",
-                            "This plan's pruneImpact was too long to show in full, so confirmRepositoryWidePrune would prune worktrees you have not seen. Remove the worktree without it, or ask the person to remove it in BiBCode, which shows every worktree the prune affects.",
-                        ));
-                    }
-                    shown.unwrap_or(token)
-                },
+                self.required("planToken")?,
                 self.integer("expectedGeneration")?.ok_or_else(|| {
                     invalid_argument(
                         "expectedGeneration is required: pass the generation get_worktree_removal_plan returned",
@@ -446,6 +440,13 @@ impl ToolCall<'_> {
         // replays the stored request by its receipt.
         let fresh = async || {
             let host = self.worktree_host(thread_id).await?;
+            // Opened only for a new request: a replay sends the stored catalog token.
+            let plan = match plan {
+                Some((plan_token, generation)) => {
+                    Some((opened_plan_token(plan_token, prune)?, generation))
+                }
+                None => None,
+            };
             let command_id = Uuid::new_v4().to_string();
             let (method, payload) = match (git_mode, plan) {
                 (Some(git_mode), Some((plan_token, generation))) => (
@@ -600,4 +601,45 @@ impl ToolCall<'_> {
             .map(str::trim)
             .filter(|value| !value.is_empty()))
     }
+}
+
+/// Signs plan tokens: the purpose keeps them apart from every other signed token.
+const PLAN_PURPOSE: &str = "mcp-worktree-removal-plan";
+
+/// What a plan token carries: the catalog's token and whether the plan showed its whole
+/// `pruneImpact`.
+#[derive(Serialize, Deserialize)]
+struct PlanClaims {
+    token: String,
+    complete: bool,
+}
+
+/// The key plan tokens are signed with, new each process: a token from before a restart is
+/// refused, and the agent reads the plan again (its generation is stale by then anyway).
+fn plan_secret() -> &'static [u8] {
+    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let mut secret = [0; 32];
+        getrandom::fill(&mut secret).expect("the operating system supplies random bytes");
+        secret
+    })
+}
+
+/// The catalog's token inside plan token `token`. A token the server did not sign, or one
+/// whose plan could not show its whole `pruneImpact` when `prune` is confirmed, is refused:
+/// nothing the agent can edit decides either.
+fn opened_plan_token(token: &str, prune: bool) -> Result<String, Value> {
+    let claims: PlanClaims = signed_token::verify(plan_secret(), PLAN_PURPOSE, token)
+        .ok_or_else(|| {
+            invalid_argument(
+                "planToken is not one get_worktree_removal_plan returned (or BiBCode restarted since); read the plan again",
+            )
+        })?;
+    if prune && !claims.complete {
+        return Err(typed_tool_failure(
+            "McpPruneImpactTooLongError",
+            "This plan's pruneImpact was too long to show in full, so confirmRepositoryWidePrune would prune worktrees you have not seen. Remove the worktree without it, or ask the person to remove it in BiBCode, which shows every worktree the prune affects.",
+        ));
+    }
+    Ok(claims.token)
 }
