@@ -79,8 +79,11 @@ export type TimelineTakeoverDocument = Pick<
   "body" | "documentElement" | "addEventListener" | "removeEventListener"
 >;
 
-/** How the reader took the timeline's scroll over: a scroll key, or the wheel, touch or a press. */
-export type TimelineTakeoverInput = "keyboard" | "pointer";
+/**
+ * How the reader took the timeline's scroll over: a scroll key, the wheel or a touch move
+ * (`pointer`), or a press, which scrolls nothing itself.
+ */
+export type TimelineTakeoverInput = "keyboard" | "pointer" | "press";
 
 /**
  * Listens for the reader taking the timeline's scroll over and calls `onTakeover` (#190): the
@@ -90,8 +93,8 @@ export type TimelineTakeoverInput = "keyboard" | "pointer";
  * not focus on click (WebKit's buttons), leaves focus on the body, and the browser then scrolls
  * the timeline with the key. Keys are heard on the document after they bubble, so a control's
  * `preventDefault`, including one React makes at its root, is already seen. `onTakeover` is told
- * whether a key took over: the browser scrolls for a key only after the keydown, and on a slow
- * webview up to several hundred milliseconds later (#207). Returns a function that removes the
+ * whether a key, the wheel or a touch, or a press took over: the browser scrolls for a key only
+ * after the keydown, and on a slow webview up to several hundred milliseconds later (#207). Returns a function that removes the
  * listeners.
  */
 export function bindTimelineTakeoverListeners(
@@ -103,7 +106,7 @@ export function bindTimelineTakeoverListeners(
   const handleNavigation = () => onTakeover("pointer");
   const handlePointerDown = (event: PointerEvent) => {
     if (pointerPressStopsLiveFollow(event.target)) {
-      onTakeover("pointer");
+      onTakeover("press");
     }
   };
   const handleDocumentPointerDown = (event: PointerEvent) => {

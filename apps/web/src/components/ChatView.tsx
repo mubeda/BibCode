@@ -3554,8 +3554,12 @@ function ChatViewContent(props: ChatViewProps) {
     }
     // The browser scrolls for a key only after the keydown, and a scroll LegendList makes before
     // then, such as holding the row below a streamed reply in place as it grows, cancels the
-    // key's scroll. The wheel, touch and a press scroll at once, and end a key's hold: held,
-    // the list keeps no content position, so growth above the view would move their line.
+    // key's scroll. The wheel and touch scroll at once, and end a key's hold: held, the list
+    // keeps no content position, so growth above the view would move their line. A press scrolls
+    // nothing, so a key's scroll may still be about to start, and the hold goes on.
+    if (input === "press") {
+      return;
+    }
     if (timelineNativeScrollTimerRef.current !== null) {
       window.clearTimeout(timelineNativeScrollTimerRef.current);
       timelineNativeScrollTimerRef.current = null;

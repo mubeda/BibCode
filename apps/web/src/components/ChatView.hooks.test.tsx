@@ -2495,7 +2495,7 @@ describe("ChatView effects (captured and run manually)", () => {
 
   // Held, LegendList keeps no content position, and streamed growth above the view would move the
   // line a reader scrolling by wheel or touch is reading.
-  for (const takeover of ["wheel", "touchmove", "pointerdown"] as const) {
+  for (const takeover of ["wheel", "touchmove"] as const) {
     it(`ends a scroll key's hold once the reader takes over by ${takeover}`, async () => {
       const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
         scrollHeight: 400,
@@ -2523,6 +2523,39 @@ describe("ChatView effects (captured and run manually)", () => {
       for (const cleanup of cleanups) cleanup();
     });
   }
+
+  it("keeps a scroll key's hold through a press, which scrolls nothing", async () => {
+    // Clicking the timeline's text before WebKit starts the key's scroll must not let a scroll of
+    // the list's own cancel it (#207).
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      scrollHeight: 400,
+      clientHeight: 200,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+    const before = h.setStateCalls.length;
+    fireDocument("keydown", timelineKey("PageUp", ["button"]));
+    const held = h.setStateCalls
+      .slice(before)
+      .filter((call) => call.next === true && h.stateCalls[call.index]?.initial === false);
+    expect(held).toHaveLength(1);
+    const index = held[0]!.index;
+    const holdCalls = () =>
+      h.setStateCalls
+        .slice(before)
+        .filter((call) => call.index === index)
+        .map((call) => call.next);
+
+    list.scrollNode.fire("pointerdown", { target: { closest: () => null } });
+    // The press still takes over following, but the key's hold goes on.
+    expect(list.calls.cancelScrollRequests).toBeGreaterThanOrEqual(1);
+    expect(holdCalls()).toEqual([true]);
+
+    // The hold ends on its own once the key's scroll has had time to start.
+    runWindowTimeouts();
+    expect(holdCalls()).toEqual([true, false]);
+    for (const cleanup of cleanups) cleanup();
+  });
 
   it("keeps following for keys that move nothing or belong to a control", async () => {
     for (const [key, matches, scrollTop] of [
