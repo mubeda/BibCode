@@ -32,6 +32,9 @@ const MARKER: &str = "MARKER-x2-ignore-previous-instructions";
 const HOME_PATH: &str = "/Users/someone/private-folder";
 /// A client-chosen string shaped like an id.
 const TOKEN: &str = "privateToken123";
+/// A panic message naming a path outside home, with marker text.
+const PANIC_MESSAGE: &str =
+    "failed opening /mnt/private/customer.txt: MARKER-x2-ignore-previous-instructions";
 
 const TOOLS: [&str; 8] = [
     "profiler_status",
@@ -68,7 +71,7 @@ fn assert_clean(result: &Value) {
 fn assert_clean_of_tokens(result: &Value) {
     assert_clean(result);
     let text = result.to_string();
-    for leak in [TOKEN, "private-builds", "/builds/private"] {
+    for leak in [TOKEN, "private-builds", "/builds/private", "/mnt/private"] {
         assert!(!text.contains(leak), "{leak} in {text}");
     }
 }
@@ -557,7 +560,7 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
             "crash.panic-1",
             "crash.panic",
             ago(5),
-            json!({ "thread": "main", "location": "/builds/private/repo/src/main.rs:12", "message": "boom" }),
+            json!({ "thread": "main", "location": "/builds/private/repo/src/main.rs:12", "message": PANIC_MESSAGE }),
         ),
     ]
     .iter()
@@ -592,7 +595,13 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     request["clientId"] = format!("{MARKER} x").into();
     request["correlationId"] = TOKEN.into();
     request["method"] = "git.status".into();
-    let events: String = [&action, &custom, &batch, &sample, &request]
+    // A panic's message, which the hook redacts only for home paths.
+    let mut panic = envelope(5, "panic");
+    panic["thread"] = "main".into();
+    panic["message"] = PANIC_MESSAGE.into();
+    panic["location"] = "apps/server/src/lib.rs:42".into();
+    panic["frames"] = json!([{ "module": "bibcode", "debugId": "ABC123", "offset": 4112 }]);
+    let events: String = [&action, &custom, &batch, &sample, &request, &panic]
         .iter()
         .map(|event| format!("{event}\n"))
         .collect();
@@ -604,7 +613,7 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
         json!({
             "id": crash_id, "createdAt": ago(20), "version": "0.13.1", "os": "macos",
             "arch": "aarch64", "processKind": "server", "note": MARKER,
-            "lastEvents": [action, batch],
+            "lastEvents": [action, batch, panic],
         })
         .to_string(),
     )
@@ -666,6 +675,11 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     );
     assert_eq!(findings[4]["evidence"]["path"], "~/projects/kept");
     assert_eq!(findings[5]["evidence"]["location"], "main.rs:12");
+    // A panic's message is never returned; its kind, location and thread are.
+    assert_eq!(
+        findings[5]["evidence"],
+        json!({ "thread": "main", "location": "main.rs:12" })
+    );
 
     let events = over_mcp("profiler_events", json!({})).await;
     let raw = stdio(&dir, "profiler_events", json!({}));
@@ -679,7 +693,11 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
         .collect();
     assert_eq!(structured(&events)["events"], json!(projected));
     let events = structured(&events)["events"].as_array().unwrap();
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[5]["kind"], "panic");
+    assert!(events[5].get("message").is_none(), "{}", events[5]);
+    assert_eq!(events[5]["location"], "apps/server/src/lib.rs:42");
+    assert_eq!(events[5]["frames"][0]["debugId"], "ABC123");
     assert_eq!(events[0]["action"], "commit");
     assert_eq!(events[0]["eventId"], "aaaa1111-0");
     assert_eq!(
@@ -708,6 +726,8 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     assert_eq!(crash["crash"]["id"], crash_id);
     assert_eq!(crash["crash"]["processKind"], "server");
     assert_eq!(crash["crash"]["lastEvents"][0]["action"], "commit");
+    assert_eq!(crash["crash"]["lastEvents"][2]["kind"], "panic");
+    assert!(crash["crash"]["lastEvents"][2].get("message").is_none());
     assert_eq!(crash["dump"], "missing");
     let missing = harness
         .call(&agent, "profiler_crash", json!({ "id": "nope" }))
