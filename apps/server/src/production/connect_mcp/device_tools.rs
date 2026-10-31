@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{PreviewScope, snapshot_tool_result, tool_failure};
+use super::{PreviewScope, keep_device_fields, snapshot_tool_result, tool_failure};
 use crate::device::{
     DeviceManager, DeviceOpError,
     catalog::{DeviceSnapshot, DeviceState, Platform},
@@ -359,10 +359,12 @@ fn success(value: Value) -> Value {
 
 fn failure(error: &DeviceOpError) -> Value {
     let rpc = error.to_rpc_error();
-    tool_failure(
+    let mut failure = tool_failure(
         rpc["_tag"].as_str().unwrap_or("DeviceError"),
         &error.to_string(),
-    )
+    );
+    keep_device_fields(&rpc, &mut failure);
+    failure
 }
 
 pub(crate) fn device_tool_descriptors() -> Vec<Value> {

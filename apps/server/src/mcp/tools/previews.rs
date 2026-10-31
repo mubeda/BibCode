@@ -291,6 +291,12 @@ fn client_result(mut result: Value) -> Value {
 /// A preview host's failure keeps its own tag, which the provider result folds into its
 /// message (`"<tag>: <message>"`), and a missing host says how to get one.
 fn host_failure(result: Value) -> Value {
+    let mut failure = host_failure_of(&result);
+    keep_device_fields(&result["structuredContent"]["error"], &mut failure);
+    failure
+}
+
+fn host_failure_of(result: &Value) -> Value {
     let error = &result["structuredContent"]["error"];
     // As every client failure: the message bounded, hidden and control characters replaced.
     let own = || {
@@ -374,6 +380,25 @@ pub(crate) async fn run(
             "content":[{"type":"text","text":value.to_string()}]
         }),
         Err(message) => tool_failure("PreviewAutomationExecutionError", &message),
+    }
+}
+
+/// Fields of a device failure an agent can act on, each a short id or state name: the SDK
+/// problem's `kind`, the `running` device a full server names, the `imageId` another thread
+/// holds, and the `state` a device that is not ready is in.
+const DEVICE_ERROR_FIELDS: &[&str] = &["kind", "running", "imageId", "state"];
+
+/// Copies the [`DEVICE_ERROR_FIELDS`] of the RPC error `from` that are short strings into the
+/// tool failure `to`.
+pub(crate) fn keep_device_fields(from: &Value, to: &mut Value) {
+    for field in DEVICE_ERROR_FIELDS {
+        if let Some(value) = from.get(*field).filter(|value| {
+            value
+                .as_str()
+                .is_some_and(|text| text.chars().count() <= 128)
+        }) {
+            to["structuredContent"]["error"][*field] = value.clone();
+        }
     }
 }
 
@@ -466,4 +491,34 @@ pub(crate) fn preview_tool_descriptors() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_failure_keeps_the_ids_and_states_an_agent_can_act_on() {
+        for (tag, field, value) in [
+            ("DeviceSdkUnavailableError", "kind", "sdkMissing"),
+            ("DeviceLimitError", "running", "emulator-5554"),
+            ("DeviceBusyError", "imageId", "Pixel"),
+            ("DeviceNotReadyError", "state", "booting"),
+        ] {
+            let mut failure = tool_failure(tag, "No.");
+            failure["structuredContent"]["error"][field] = value.into();
+            let shown = host_failure(failure);
+            let error = &shown["structuredContent"]["error"];
+            assert_eq!(
+                (error["_tag"].as_str(), error[field].as_str()),
+                (Some(tag), Some(value))
+            );
+        }
+        // Only short strings, and nothing else the host put on the error.
+        let mut failure = tool_failure("DeviceBusyError", "No.");
+        failure["structuredContent"]["error"]["imageId"] = "x".repeat(500).into();
+        failure["structuredContent"]["error"]["cwd"] = "/home/someone".into();
+        let error = host_failure(failure)["structuredContent"]["error"].clone();
+        assert!(error["imageId"].is_null() && error["cwd"].is_null());
+    }
 }

@@ -394,6 +394,8 @@ A tool that runs but fails returns a tool result, not a JSON-RPC error:
 - An error from the operation the tool ran (a Git, workspace, worktree or hosting error)
   keeps its own `_tag` and only these fields: `code`, `blocked`, `phase`, `reason`,
   `failure`, `leftAt`, `restored`. Each tool lists the ones it can return.
+  A browser or device preview failure keeps instead `kind`, `running`, `imageId` and `state`
+  (short ids and state names; see the Device tools).
 - `outcome: "unknown"` on an error marks a change that may have taken effect (see
   [Unknown outcomes](#unknown-outcomes)).
 - Unknown arguments, missing required ones and values out of range are
@@ -3155,7 +3157,7 @@ Family-wide rules:
 - Device twins stay listed when Device previews are off in Settings. Calling one then returns `DevicePreviewsDisabledError` ("Device previews are off. Turn on Device previews in Settings to start a device."). The same error is returned if the device service is not attached to this server.
 - Unknown arguments. The preview twins accept any arguments (`additionalProperties: true`) and forward them, except `threadId` and `tabId`, to the preview host; the host validates them. `device_open` refuses an unknown argument with `DeviceInputError`; the other device twins ignore extra arguments.
 - Timing. All twins are long-running (no server-side progress is sent). For `preview_*` the server waits at most 15,000 ms in total for the host to answer, whatever `timeoutMs` says (see below); `device_open` waits up to 180 s for the device to boot. A call cancelled by the client ends the wait; a booting device keeps booting.
-- Failures return only a tag and message. Fields such as `kind`, `running`, `imageId` or `state` that the device service produces are dropped; read the message.
+- A failure carries its tag, its message and, when the device service sets them, `kind` (why the SDK is unusable), `running` (the device a full server names), `imageId` (the image another thread holds) and `state` (the state a device that is not ready is in). They are short strings; nothing else of the service's error is kept.
 
 **Errors every `preview_*` twin can return** (tags other than these are passed through as the host reports them; any tag that starts with `PreviewAutomation` and ends with `Error` is kept):
 
