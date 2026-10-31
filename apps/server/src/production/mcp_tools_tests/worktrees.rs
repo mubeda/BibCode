@@ -13,11 +13,18 @@ use std::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use tokio_util::sync::CancellationToken;
+
 use super::{Harness, basic_start, command, error_tag, start, structured};
 use crate::{
     git::GitRepository,
     mcp::control::{ClientPrincipal, McpAccess},
-    production::worktree_catalog_rpc::{WorktreeCatalogRpcServices, register_worktree_catalog_rpc},
+    production::worktree_catalog_rpc::{
+        WorktreeCatalogRpcServices, WorktreeRemovalCleanupAdmission,
+        WorktreeRemovalLiveSessionsFuture, WorktreeRemovalQuiesceFuture,
+        WorktreeRemovalQuiesceLease, WorktreeRemovalQuiesceRequest, WorktreeRemovalQuiescer,
+        register_worktree_catalog_rpc,
+    },
     rpc::RpcRegistry,
     test_support::isolated_git_config::IsolatedGitConfig,
     worktree_catalog::{CatalogRefreshTrigger, WorktreeCatalogService},
@@ -42,6 +49,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::quiesced_by(None).await
+    }
+
+    /// A fixture whose removals call `quiescer` after Git work is prepared, just before it
+    /// runs: the window after the catalog took the removal over.
+    async fn quiesced_by(quiescer: Option<Arc<dyn WorktreeRemovalQuiescer>>) -> Self {
         let inner: Arc<OnceLock<RpcRegistry>> = Arc::default();
         let harness = Harness::with_methods(|registry| {
             for method in METHODS {
@@ -94,7 +107,10 @@ impl Fixture {
             .refresh(PROJECT, CatalogRefreshTrigger::Explicit)
             .await
             .expect("seed catalog");
-        let services = WorktreeCatalogRpcServices::new(catalog.clone(), harness.engine.clone());
+        let mut services = WorktreeCatalogRpcServices::new(catalog.clone(), harness.engine.clone());
+        if let Some(quiescer) = quiescer {
+            services = services.with_removal_quiescer(quiescer);
+        }
         let mut registry = RpcRegistry::empty();
         register_worktree_catalog_rpc(&mut registry, services.clone());
         assert!(inner.set(registry).is_ok());
@@ -505,4 +521,51 @@ async fn a_removal_reaches_the_profiler_once_across_a_retry() {
     assert_eq!(removals.len(), 1, "{removals:?}");
     assert_eq!(removals[0]["ok"], true);
     child.complete();
+}
+
+/// Runs `0` when a removal quiesces its threads: after the catalog took the removal over and
+/// prepared it, before Git runs.
+struct OnQuiesce(Box<dyn Fn() + Send + Sync>);
+
+impl WorktreeRemovalQuiescer for OnQuiesce {
+    fn live_session_thread_ids(&self, _: Vec<String>) -> WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn quiesce(
+        &self,
+        _: WorktreeRemovalCleanupAdmission,
+        _: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture {
+        (self.0)();
+        Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
+    }
+}
+
+/// A call cancelled after the catalog took the removal over still removes the worktree: the
+/// handed-off operation runs under a server-owned token, not the call's.
+#[tokio::test]
+async fn a_removal_cancelled_after_handoff_still_finishes() {
+    let cancel = CancellationToken::new();
+    let fixture = Fixture::quiesced_by(Some(Arc::new(OnQuiesce(Box::new({
+        let cancel = cancel.clone();
+        move || cancel.cancel()
+    })))))
+    .await;
+    let (agent, _) = fixture.harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, path) = fixture.create(&agent, "cancelled").await;
+    let plan = fixture.plan(&agent, &thread_id).await;
+    let Value::Object(arguments) = removal(&plan, &thread_id, "delete") else {
+        unreachable!()
+    };
+    let removed = fixture
+        .harness
+        .control
+        .call(&agent, "remove_worktree", &arguments, None, cancel.clone())
+        .await;
+    assert!(cancel.is_cancelled(), "the call was cancelled mid-removal");
+    let removed = structured(&removed);
+    assert_eq!(removed["gitOutcome"], "removed", "{removed}");
+    assert!(!path.exists());
+    fixture.shutdown().await;
 }

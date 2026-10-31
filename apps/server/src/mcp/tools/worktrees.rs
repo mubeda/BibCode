@@ -410,7 +410,13 @@ impl ToolCall<'_> {
                 ));
             }
         };
-        let removed = self.invoke(method, stored["payload"].clone()).await?;
+        // A removal the catalog took over finishes even when this call is cancelled (C4: a
+        // handler-owned operation), so it runs under the server's token, not the call's.
+        let handed_off = ToolCall {
+            cancellation: self.control.shutdown_token(),
+            ..*self
+        };
+        let removed = handed_off.invoke(method, stored["payload"].clone()).await?;
         Ok(tool_result(
             json!({
                 "threadId": thread_id,
