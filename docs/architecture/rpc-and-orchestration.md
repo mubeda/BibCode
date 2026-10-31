@@ -3392,11 +3392,14 @@ handlers, so creation and removal keep their command claims, generation checks,
   meets the current ceiling. The thread is resolved only for a new request, since a
   completed removal deletes it.
 - **Removal plan.** `remove_worktree` sends `planToken` and `expectedGeneration`
-  as the agent passed them and never fetches a plan itself. When `pruneImpact` does
-  not fit in the result (`pruneImpactCount` gives the total), the plan's token is
-  marked `partial-impact:`. `remove_worktree` strips the mark, and refuses
-  `confirmRepositoryWidePrune` with `McpPruneImpactTooLongError`, since the prune
-  would remove registrations the agent never saw.
+  as the agent passed them and never fetches a plan itself. The tool's `planToken`
+  is opaque: the catalog's token and whether `pruneImpact` fit in the result
+  (`pruneImpactCount` gives the total), signed under a per-process key
+  (`signed_token`, purpose `mcp-worktree-removal-plan`). A new removal opens it and
+  sends the catalog's token on; one the server did not sign is refused, and so is
+  `confirmRepositoryWidePrune` with a plan that did not fit
+  (`McpPruneImpactTooLongError`), since the prune would remove registrations the
+  agent never saw. A keyed replay sends the stored catalog token.
 - **Handoff.** The removal RPC runs in a task of its own under `McpControl`'s
   shutdown token, not the call's, so a call cancelled or dropped after the catalog
   took the removal over does not stop it. `McpControl::call` writes the

@@ -3128,6 +3128,21 @@ in source, and each fix has a test that failed first:
   waited removal then adds exactly one more. `record_removal_outcome` is unchanged: both
   paths still reach the catalog handlers.
 
+**Review round 3 (Codex P2, `claude/v0131-139-r3`).** The `partial-impact:` prefix was an
+editable part of the token: an agent that stripped it pruned every unseen registration
+(reproduced, 101 of them). The prefix is gone. `get_worktree_removal_plan` now returns an
+opaque `planToken`, signed with the shared `signed_token` format under a per-process key
+(purpose `mcp-worktree-removal-plan`), that holds the catalog's token and whether the plan
+showed its whole `pruneImpact`. A new `remove_worktree` request opens it before anything is
+stored. A token the server did not sign is `McpInvalidArgumentError`, and a confirmed prune with
+a plan that did not show everything is `McpPruneImpactTooLongError`. A keyed replay sends the
+stored catalog token, so it never needs the key. A token from before a restart is refused, and
+by then its generation is stale anyway. Reading the plan again at removal was rejected:
+`worktree.getRemovalPlan` refreshes the catalog and bumps its generation, so the agent's plan
+would always be stale. Keeping a set of truncated tokens was rejected too: it needs a bound,
+and an agent could evict entries from it. The test strips the old prefix and forges a token;
+both are refused, and nothing is pruned.
+
 ## G (git write tools) implementation notes (2026-10-30)
 
 G was implemented on `claude/v0131-139-g`, from `claude/v0131-139-f0`. It registers the
