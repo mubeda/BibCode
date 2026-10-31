@@ -95,6 +95,10 @@ pub(crate) fn plan_dir(root: &Dir, limits: ArchiveLimits) -> Result<ArchivePlan,
     while let Some(folder) = stack.pop() {
         let folder = folder.as_ref().unwrap_or(root);
         for child in folder.names().map_err(failed)? {
+            // Git's own metadata (a nested repository's `.git`) is never archived.
+            if crate::git::names_git_metadata(Path::new(&child)) {
+                continue;
+            }
             let entry = folder.entry(&child).map_err(failed)?;
             // Skips symlinks (never followed) and any other non-regular entry (sockets,
             // FIFOs, device nodes, ...): opening those for reading can block forever (FIFO)
@@ -209,6 +213,9 @@ fn write_archive<W: Write>(root: &Dir, limits: ArchiveLimits, sink: W) -> io::Re
         let mut children = folder.names()?;
         children.sort();
         for child in children {
+            if crate::git::names_git_metadata(Path::new(&child)) {
+                continue;
+            }
             let name = format!("{prefix}{}", child.to_string_lossy());
             match folder.kind(&child)? {
                 Kind::Directory => match folder.open_dir(&child) {
@@ -256,6 +263,38 @@ fn write_archive<W: Write>(root: &Dir, limits: ArchiveLimits, sink: W) -> io::Re
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// A nested repository's `.git`, in any letter case, is never planned or archived; a
+    /// `.github` folder is (#139 X5 review round 6).
+    #[tokio::test]
+    async fn a_folder_download_leaves_out_gits_own_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        std::fs::create_dir_all(root.join("lib/.git/hooks")).unwrap();
+        std::fs::write(root.join("lib/.git/config"), b"[core]\n").unwrap();
+        std::fs::create_dir_all(root.join(".GIT")).unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(root.join(".github/ci.yml"), b"x").unwrap();
+        std::fs::write(root.join("lib/a.txt"), b"a").unwrap();
+
+        let plan = plan_archive(&root).await.unwrap();
+        assert_eq!(plan.entries, 4); // .github/, .github/ci.yml, lib/, lib/a.txt
+        let body = archive_body(plan, root.clone());
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, [".github/", ".github/ci.yml", "lib/", "lib/a.txt"]);
+    }
 
     #[tokio::test]
     async fn plans_and_streams_a_zip_skipping_symlinks() {

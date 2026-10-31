@@ -46,6 +46,8 @@ pub enum WorkspaceError {
     PathBusy { path: PathBuf },
     #[error("{path} has more than one hard link; writing it would change its other names too", path = .path.display())]
     HardLinked { path: PathBuf },
+    #[error("{path} is Git's own metadata (.git), which BiBCode does not read or change outside Git", path = .path.display())]
+    GitMetadata { path: PathBuf },
     #[error(
         "writing {path} failed after it was emptied ({reason}); {outcome}",
         path = .path.display(),
@@ -124,6 +126,7 @@ impl WorkspaceError {
             Self::TrashUnavailable { .. } => "trash_unavailable",
             Self::PathBusy { .. } => "path_busy",
             Self::HardLinked { .. } => "hard_linked",
+            Self::GitMetadata { .. } => "git_metadata",
             Self::WriteFailed { .. } => "write_failed",
             Self::KeptInStaging { .. } => "kept_in_staging",
             Self::PartiallyRemoved { .. } => "partially_removed",
@@ -162,7 +165,8 @@ impl WorkspaceError {
             | Self::FileMissingOnDisk { path }
             | Self::TrashUnavailable { path }
             | Self::PathBusy { path }
-            | Self::HardLinked { path } => {
+            | Self::HardLinked { path }
+            | Self::GitMetadata { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
             }
             Self::KeptInStaging {

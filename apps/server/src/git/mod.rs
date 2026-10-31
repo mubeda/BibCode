@@ -49,7 +49,9 @@ pub use repository::{
 pub(crate) use repository::{CloneLeaf, CloneReservation, clone_destination_leaf};
 pub(crate) use repository::{NETWORK_TRANSFER_STALLED, reports_stalled_transfer};
 #[allow(unused_imports)]
-pub(crate) use repository::{StatusObservation, validate_pathspecs};
+pub(crate) use repository::{
+    StatusObservation, checkout_git_dirs, names_git_metadata, validate_pathspecs,
+};
 pub use status_owner::StatusMutationGuard;
 pub(crate) use status_owner::{STATUS_SAFETY_INTERVAL, StatusReadFence};
 pub use summary::GitStatusSummaryService;

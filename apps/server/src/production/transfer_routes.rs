@@ -447,6 +447,10 @@ fn uploads(
                     .map_err(|_| not_found())?
                     .1
             };
+            // Refused at the mint too; checked again here as the folder is resolved again.
+            if paths::refuse_git_metadata(&canonical_root, &directory.join(&file_name)).is_err() {
+                return Err(not_found());
+            }
             // The path is this upload's from its reservation to its install: a Files-panel
             // save or `files_write` of it meanwhile is refused (`path_busy`).
             let Ok(_held) = locks.lock_upload(&directory.join(&file_name)).await else {

@@ -15,7 +15,8 @@ use crate::crypto::{lowercase_hex, sha256_hex};
 use super::beneath::{self, Dir, Identity, Kind, Open, Removal, Replace, Root};
 use super::entries::{self, BrowseResult};
 use super::paths::{
-    canonical_existing_within, normalize_root, resolve_relative, safe_mutation_target,
+    canonical_existing_anywhere_within, canonical_existing_within, normalize_root,
+    refuse_git_metadata, resolve_relative, safe_mutation_target,
 };
 use super::{EntryKind, WorkspaceError};
 
@@ -159,6 +160,8 @@ impl Place {
         let Some((folder, name)) = split else {
             return Err(WorkspaceError::NotFile { path: target });
         };
+        // Every operation here builds its place: none reaches Git's own metadata.
+        refuse_git_metadata(&root, &target)?;
         let root = Root::new(&root).map_err(|error| {
             if beneath::is_escape(&error) {
                 WorkspaceError::RootNotDirectory { path: root.clone() }
@@ -575,7 +578,9 @@ impl WorkspaceService {
         {
             return Err(WorkspaceError::NotFound { path: target });
         }
-        canonical_existing_within(root, &target).await?;
+        // A symlink to Git's metadata may itself be renamed or deleted: only the link changes.
+        // The entry's own path is checked below, by `Place::new`.
+        canonical_existing_anywhere_within(root, &target).await?;
         let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
             return Err(WorkspaceError::PathOutsideRoot {
                 relative_path: relative_path.to_owned(),
@@ -1083,15 +1088,8 @@ impl WorkspaceService {
     /// of the root, under the server's state directory.
     #[cfg(unix)]
     fn trash_holder(&self, root: &Path) -> Option<PathBuf> {
-        let dot_git = root.join(".git");
-        match std::fs::symlink_metadata(&dot_git) {
-            Ok(metadata) if metadata.is_dir() => return Some(dot_git),
-            Ok(metadata) if metadata.is_file() => {
-                let text = std::fs::read_to_string(&dot_git).ok()?;
-                let named = text.strip_prefix("gitdir:")?.trim();
-                return std::fs::canonicalize(root.join(named)).ok();
-            }
-            _ => {}
+        if let Some(git_dir) = crate::git::checkout_git_dirs(root).into_iter().next() {
+            return Some(git_dir);
         }
         let state = self.trash_state.as_ref()?;
         let mut name = sha256_hex(root.as_os_str().as_encoded_bytes());
@@ -1914,6 +1912,78 @@ mod tests {
             std::fs::read_to_string(parent.with_extension("moved").join("victim.txt")).unwrap(),
             "inside"
         );
+    }
+
+    /// The Files panel's operations never read or change Git's own metadata either: the
+    /// service refuses it for every caller (#139 X5 review round 6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_service_never_reads_or_changes_gits_own_metadata() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        std::fs::write(root.path().join(".git/config"), "[core]\n").unwrap();
+        std::fs::write(root.path().join("notes.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(".git", root.path().join("gitlink")).unwrap();
+        let service = WorkspaceService::default();
+        let refused = |result: Result<(), WorkspaceError>, what: &str| {
+            assert!(
+                matches!(result, Err(WorkspaceError::GitMetadata { .. })),
+                "{what}: {result:?}"
+            );
+        };
+
+        refused(
+            service
+                .read_file(root.path(), ".GIT/config")
+                .await
+                .map(|_| ()),
+            "read",
+        );
+        refused(
+            service
+                .read_file(root.path(), "gitlink/config")
+                .await
+                .map(|_| ()),
+            "read through a link",
+        );
+        refused(
+            service
+                .write_file(root.path(), ".git/hooks/post-commit", "#!/bin/sh\n")
+                .await
+                .map(|_| ()),
+            "write",
+        );
+        refused(
+            service
+                .create_entry(root.path(), "./.git/hooks/x", EntryKind::File)
+                .await
+                .map(|_| ()),
+            "create",
+        );
+        refused(
+            service
+                .rename_entry(root.path(), "notes.txt", ".git/hooks/post-commit")
+                .await
+                .map(|_| ()),
+            "rename into",
+        );
+        refused(
+            service
+                .rename_entry(root.path(), ".git/config", "config.txt")
+                .await
+                .map(|_| ()),
+            "rename out of",
+        );
+        refused(
+            service.delete_entry(root.path(), ".git").await.map(|_| ()),
+            "delete",
+        );
+        assert!(root.path().join(".git/config").exists());
+        assert!(!root.path().join(".git/hooks/post-commit").exists());
+        assert!(root.path().join("notes.txt").exists());
+        // The link itself is only a link.
+        service.delete_entry(root.path(), "gitlink").await.unwrap();
+        assert!(root.path().join(".git/config").exists());
     }
 
     /// Refuses every entry, after something else has taken the entry's original name.
