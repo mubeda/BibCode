@@ -157,6 +157,32 @@ These work on the repository of the folder a thread works in, through the provid
 - A retry with the same `clientRequestId` returns the recorded outcome even after the
   thread is deleted.
 
+### Browser preview and devices
+
+An outside agent drives the collaborative browser preview and the server's Android
+emulators and iOS simulators with the same tools a provider BiBCode launched uses. Each one
+takes a `threadId`, the thread the agent acts for. They are in the **Workspace** set and need
+**Agents may** above read-only, the read tools included.
+
+| Tool                                                                                                                     | What it does                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `preview_status`, `preview_snapshot`                                                                                     | The preview's state, and a snapshot of its tab with a screenshot                                  |
+| `preview_open`, `preview_navigate`, `preview_resize`, `preview_click`, `preview_type`, `preview_press`, `preview_scroll` | Open, navigate, resize and drive the preview page                                                 |
+| `preview_wait_for`, `preview_recording_start`, `preview_recording_stop`                                                  | Wait for something on the page; record the tab                                                    |
+| `preview_evaluate`                                                                                                       | **Destructive.** Runs JavaScript in the preview page                                              |
+| `device_list`, `device_open`, `device_screenshot`                                                                        | The devices and images, start one and wait for it to boot, and a screenshot at most 1,080 px wide |
+| `device_close`                                                                                                           | **Destructive.** Stops a device the thread started                                                |
+
+- **The preview runs in BiBCode.** It needs an open BiBCode window (the desktop app or the
+  web UI) for the environment; with none, a call returns
+  `PreviewAutomationNoAvailableHostError`.
+- **Tabs.** Each agent gets its own preview tab per thread, so two agents, or an agent and the
+  thread's own provider, do not take each other's tab.
+- **Devices** need **Device previews** on. A device belongs to the thread that started it (a
+  chat panel's thread counts as its host's): an agent acting for another thread can see it but
+  cannot reuse or stop it.
+- Preview pages are untrusted content.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
