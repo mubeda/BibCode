@@ -4512,8 +4512,10 @@ changes a settled decision.
 - **Activity at the route.** One row per started agent transfer, tool `files_download` or
   `files_upload`, outcome `success`, `McpAccessEndedError`, `TransferEntryExistsError`,
   `TransferTooLargeError`, `TransferFailedError`, or `McpCancelledError` when the client went
-  away mid-download (written from `Drop`). A transfer refused at the start writes none, as X1
-  writes none for gate refusals. Rows carry no thread id: the claims hold none.
+  away mid-download (written from `Drop`). A transfer admitted and then refused (its path
+  gone, a folder too large to zip) records that refusal (`TransferNotFoundError`,
+  `TransferArchiveTooLargeError`). A transfer refused at the gate writes none, as X1 writes
+  none for gate refusals. Rows carry no thread id: the claims hold none.
 - **Upload cancellation** selects on the token while streaming and checks it once more just
   before `renameat`; a fired token removes the partial and the reservation and answers 404.
 - **Transfer base.** `McpControl` gained a `transfer_base` `OnceLock` with

@@ -97,6 +97,7 @@ async fn controls_for(
             transfer,
             transfer_id: String::new(),
             recorded: false,
+            pending: NOT_FOUND_TAG,
         },
     )))
 }
@@ -121,7 +122,7 @@ fn downloads(
                 tracing::warn!("download rejected: transfer capability is invalid or expired");
                 return Err(not_found());
             };
-            let watched = controls_for(
+            let mut watched = controls_for(
                 mcp.as_ref(),
                 mcp_session_id.as_deref(),
                 TransferUse::Download,
@@ -160,12 +161,18 @@ fn downloads(
                 {
                     Ok(plan) => plan,
                     Err(transfer::TransferError::TooManyEntries { limit }) => {
+                        if let Some((_, finish)) = watched.as_mut() {
+                            finish.pending = "TransferArchiveTooLargeError";
+                        }
                         return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
                             limit: u64::try_from(limit).unwrap_or(u64::MAX),
                             unit: TransferArchiveLimitUnit::Entries,
                         });
                     }
                     Err(transfer::TransferError::TooManyBytes { limit }) => {
+                        if let Some((_, finish)) = watched.as_mut() {
+                            finish.pending = "TransferArchiveTooLargeError";
+                        }
                         return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
                             limit,
                             unit: TransferArchiveLimitUnit::Bytes,
@@ -236,7 +243,9 @@ const ACCESS_ENDED_TAG: &str = "McpAccessEndedError";
 
 /// `body`, ended with an error as soon as the agent's access ends, so a client sees a broken
 /// transfer, never a short one that looks complete. Its activity row is written when it ends.
-fn watched_body(body: Body, controls: TransferControls, finish: Finish) -> Body {
+fn watched_body(body: Body, controls: TransferControls, mut finish: Finish) -> Body {
+    // Once the body streams, ending without a result means the client went away.
+    finish.pending = "McpCancelledError";
     let token = controls.token();
     let state = Some((body.into_data_stream(), controls, finish));
     Body::from_stream(futures_util::stream::unfold(state, move |state| {
@@ -265,14 +274,19 @@ fn watched_body(body: Body, controls: TransferControls, finish: Finish) -> Body 
     }))
 }
 
-/// One activity row for an agent's transfer, written once when it ends; a transfer dropped
-/// before it ended (the client went away) records `McpCancelledError`.
+/// The tag of a transfer refused after it was admitted (its path is gone): the route's 404.
+const NOT_FOUND_TAG: &str = "TransferNotFoundError";
+
+/// One activity row for an agent's transfer, written once when it ends. One that returns
+/// before recording records `pending`: the refusal it answered, or, once a download's body
+/// streams, `McpCancelledError` (the client went away).
 struct Finish {
     mcp: McpControl,
     session_id: String,
     transfer: TransferUse,
     transfer_id: String,
     recorded: bool,
+    pending: &'static str,
 }
 
 impl Finish {
@@ -304,7 +318,7 @@ impl Drop for Finish {
         if self.recorded {
             return;
         }
-        let row = self.row("McpCancelledError");
+        let row = self.row(self.pending);
         let mcp = self.mcp.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -466,7 +480,7 @@ fn not_found() -> HttpRouteError {
     HttpRouteError::new(
         StatusCode::NOT_FOUND,
         json!({
-            "_tag": "TransferNotFoundError",
+            "_tag": NOT_FOUND_TAG,
             "message": "Transfer was not found or its access token expired."
         }),
     )

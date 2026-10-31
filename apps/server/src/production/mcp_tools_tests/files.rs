@@ -870,3 +870,20 @@ async fn an_upload_records_its_mint_and_its_finish_with_one_transfer_id() {
     }
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_transfer_refused_after_admission_records_the_refusal_not_a_cancel() {
+    let fixture = fixture().await;
+    fixture.write("gone.txt", "x");
+    let token = fixture.download_url("gone.txt").await;
+    std::fs::remove_file(fixture.folder.join("gone.txt")).unwrap();
+    assert_eq!(fixture.download(&token).await, Err(404));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let rows = fixture.harness.control.activity().recent().await.unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row["tool"] == "files_download")
+        .expect("a download row");
+    assert_eq!(row["outcome"], "TransferNotFoundError");
+    fixture.shutdown().await;
+}
