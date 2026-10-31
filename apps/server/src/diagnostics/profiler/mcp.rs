@@ -7,6 +7,7 @@
 //! characters, inside an agent's tool-output budget.
 
 use std::{
+    collections::{BTreeMap, HashSet},
     io::{self, BufRead, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
@@ -17,15 +18,16 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{
     cli::parse_since,
+    findings::MAX_FINDINGS,
     reader::Reader,
     symbolicate::{Target, symbolicate},
 };
-use crate::mcp::protocol::{
-    self, Cut, INTERNAL_ERROR, Incoming, METHOD_NOT_FOUND, fit_list, invalid, rpc_error,
-    tool_descriptor, tool_failure, tool_result,
-};
 #[cfg(test)]
-use crate::mcp::protocol::{MAX_MESSAGE_CHARS, MAX_RESULT_CHARS};
+use crate::mcp::protocol::MAX_MESSAGE_CHARS;
+use crate::mcp::protocol::{
+    self, Cut, INTERNAL_ERROR, Incoming, MAX_RESULT_CHARS, METHOD_NOT_FOUND, chars, invalid,
+    rpc_error, tool_descriptor, tool_failure, tool_result,
+};
 
 /// `(default, most)` records per call.
 const FINDINGS_LIMIT: (u64, u64) = (50, 100);
@@ -287,53 +289,120 @@ pub(crate) fn findings_content(
     reader: &Reader,
     args: &Map<String, Value>,
 ) -> Result<(Value, Cuts), Refusal> {
+    findings_page(reader, args, Value::clone)
+}
+
+/// [`findings_content`] with each finding passed through `project` (the `/mcp` twin's
+/// allowlist) before the page is fitted, so the page that is measured is the one returned.
+pub(crate) fn findings_page(
+    reader: &Reader,
+    args: &Map<String, Value>,
+    project: fn(&Value) -> Value,
+) -> Result<(Value, Cuts), Refusal> {
     let (since, kind, limit) = query(args, FINDINGS_LIMIT, &["since", "kind", "limit", "cursor"])?;
     let cursor = string(args, "cursor")?.map(parse_cursor).transpose()?;
     if since.is_none() && cursor.is_none() {
-        return Ok((
-            json!({ "findings": reader.findings(None, kind, limit) }),
-            &[("/findings", Cut::Back)],
-        ));
+        let findings: Vec<Value> = reader
+            .findings(None, kind, limit)
+            .iter()
+            .map(project)
+            .collect();
+        return Ok((json!({ "findings": findings }), &[("/findings", Cut::Back)]));
     }
     // `lastSeen` is whole seconds and the book keeps no position of its own, so a cursor names
-    // the second its page ended in and marks each finding it returned in that second by id and
-    // count. That second is read again: a finding written into it later, or one that recurred
+    // the second its page ended in and marks the count it returned of each finding in that
+    // second. That second is read again: a finding written into it later, or one that recurred
     // in it (a new count), is returned; one already read is not.
-    let mut after: Vec<(FindingKey, Value)> = reader
+    let all: Vec<(FindingKey, Value)> = reader
         .findings(since, kind, usize::MAX)
         .into_iter()
         .filter_map(|finding| Some((FindingKey::of(&finding)?, finding)))
-        .filter(|(key, _)| {
-            cursor.as_ref().is_none_or(|(second, read)| {
-                key.at > *second || (key.at == *second && !read.contains(&key.mark()))
-            })
-        })
         .collect();
+    let unread = |key: &FindingKey| match &cursor {
+        None => true,
+        Some((second, read)) => {
+            key.at > *second
+                || (key.at == *second && read.get(&key.id_mark()) != Some(&key.count_mark()))
+        }
+    };
+    let mut after: Vec<&(FindingKey, Value)> = all.iter().filter(|(key, _)| unread(key)).collect();
     after.sort_by(|(left, _), (right, _)| (left.at, &left.id).cmp(&(right.at, &right.id)));
     let more = after.len() > limit;
     after.truncate(limit);
-    let (keys, findings): (Vec<_>, Vec<_>) = after.into_iter().unzip();
-    let mut content = json!({ "findings": findings });
-    // Fitted before the cursor is set, so following it skips nothing that was cut.
-    let kept = keys.len() - fit_list(&mut content, "/findings", Cut::Back, 1);
-    content["nextCursor"] = match keys.get(kept.wrapping_sub(1)) {
-        Some(last) if more || kept < keys.len() => {
-            let mut read: Vec<String> = match &cursor {
-                Some((second, read)) if *second == last.at => read.clone(),
-                _ => Vec::new(),
-            };
-            read.extend(
-                keys[..kept]
-                    .iter()
-                    .filter(|key| key.at == last.at)
-                    .map(FindingKey::mark),
-            );
-            cursor_text(last.at, &read).into()
+    let keys: Vec<&FindingKey> = after.iter().map(|(key, _)| key).collect();
+    let mut findings: Vec<Value> = after.iter().map(|(_, finding)| project(finding)).collect();
+    // The cursor after the first `kept` findings: the marks it carried for that second, of
+    // findings still there, and the page's own. One mark per finding the book holds in that
+    // second, so it never outgrows `MOST_CURSOR_CHARS`.
+    let next_cursor = |kept: usize| -> Value {
+        let Some(last) = keys.get(kept.wrapping_sub(1)) else {
+            return Value::Null;
+        };
+        if !more && kept == keys.len() {
+            return Value::Null;
         }
-        _ => Value::Null,
+        let present: HashSet<String> = all
+            .iter()
+            .filter(|(key, _)| key.at == last.at)
+            .map(|(key, _)| key.id_mark())
+            .collect();
+        let mut read = match &cursor {
+            Some((second, read)) if *second == last.at => read.clone(),
+            _ => Read::new(),
+        };
+        read.retain(|id, _| present.contains(id));
+        for key in keys[..kept].iter().filter(|key| key.at == last.at) {
+            read.insert(key.id_mark(), key.count_mark());
+        }
+        cursor_text(last.at, &read).into()
     };
-    Ok((content, &[]))
+    // The page is fitted with its own cursor, dropping findings from its end and never the
+    // cursor. A finding too large to return alone comes without its evidence, so every page
+    // makes progress.
+    let mut kept = findings.len();
+    loop {
+        let mut content = json!({ "findings": &findings[..kept] });
+        if kept < findings.len() {
+            content["truncated"] = true.into();
+        }
+        content["nextCursor"] = next_cursor(kept);
+        if kept == 0 || fits(&content) {
+            return Ok((content, &[]));
+        }
+        if kept == 1 {
+            let Some(finding) = findings[0].as_object_mut() else {
+                return Ok((content, &[]));
+            };
+            if finding.remove("evidence").is_none() {
+                return Ok((content, &[]));
+            }
+            finding.insert("evidenceOmitted".into(), true.into());
+            continue;
+        }
+        let mut excess = serialized_chars(&content).saturating_sub(MAX_RESULT_CHARS);
+        loop {
+            kept -= 1;
+            excess = excess.saturating_sub(serialized_chars(&findings[kept]) + 1);
+            if kept == 1 || excess == 0 {
+                break;
+            }
+        }
+    }
 }
+
+/// Whether `content` is returned whole, not replaced by the too-long note.
+fn fits(content: &Value) -> bool {
+    tool_result(content.clone(), &[])["structuredContent"]
+        .get("error")
+        .is_none()
+}
+
+fn serialized_chars(value: &Value) -> usize {
+    chars(&value.to_string())
+}
+
+/// A cursor's marks for its second: each finding's id mark and the count mark it was read at.
+type Read = BTreeMap<String, String>;
 
 /// A finding's place in cursor order (`lastSeen`, then id) and its count.
 struct FindingKey {
@@ -351,41 +420,53 @@ impl FindingKey {
         })
     }
 
-    /// 12 hex characters of SHA-256 over the id and the count: a recurrence marks anew.
-    fn mark(&self) -> String {
+    /// 10 hex characters of SHA-256 over the id. Two of the book's 1,000 ids share one with a
+    /// chance under one in a million; they would then share one mark.
+    fn id_mark(&self) -> String {
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(format!("{}\0{}", self.id, self.count));
-        digest[..6]
+        Sha256::digest(self.id.as_bytes())[..5]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+
+    /// The count's low 24 bits as 6 hex characters: a recurrence changes it.
+    fn count_mark(&self) -> String {
+        format!("{:06x}", self.count & 0xff_ffff)
+    }
 }
 
-/// The longest cursor: a mark for each of the book's 1,000 findings, all in one second.
-const MOST_CURSOR_CHARS: usize = 16_384;
+/// A mark: an id mark and a count mark.
+const MARK_CHARS: usize = 16;
+/// The longest cursor: its second and a mark for each of the book's findings, all in one
+/// second. Every cursor this server emits fits.
+const MOST_CURSOR_CHARS: usize = 64 + MAX_FINDINGS * (MARK_CHARS + 1);
 
-fn cursor_text(second: OffsetDateTime, read: &[String]) -> String {
+fn cursor_text(second: OffsetDateTime, read: &Read) -> String {
+    let marks: Vec<String> = read
+        .iter()
+        .map(|(id, count)| format!("{id}{count}"))
+        .collect();
     format!(
         "{}|{}",
         second.format(&Rfc3339).unwrap_or_default(),
-        read.join(",")
+        marks.join(",")
     )
 }
 
-fn parse_cursor(cursor: &str) -> Result<(OffsetDateTime, Vec<String>), Refusal> {
+fn parse_cursor(cursor: &str) -> Result<(OffsetDateTime, Read), Refusal> {
     let refused = || "cursor must be the nextCursor of an earlier profiler_findings call";
-    let (second, read) = cursor
+    let (second, marks) = cursor
         .split_once('|')
         .filter(|_| cursor.len() <= MOST_CURSOR_CHARS)
         .ok_or_else(refused)?;
     let second = OffsetDateTime::parse(second, &Rfc3339).map_err(|_| refused())?;
-    let read: Vec<String> = read.split(',').map(str::to_owned).collect();
-    let marks = read
-        .iter()
-        .all(|mark| mark.len() == 12 && mark.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    if !marks {
-        return Err(refused().into());
+    let mut read = Read::new();
+    for mark in marks.split(',') {
+        if mark.len() != MARK_CHARS || !mark.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(refused().into());
+        }
+        read.insert(mark[..10].to_owned(), mark[10..].to_owned());
     }
     Ok((second, read))
 }
@@ -775,6 +856,155 @@ mod tests {
             "{}",
             responses[0]
         );
+    }
+
+    /// Writes `findings.ndjson` with one `rpc.slow` finding per `(id, lastSeen, count)`, each
+    /// with `pad` characters of evidence.
+    fn write_findings(dir: &Path, findings: &[(String, &str, u64)], pad: usize) {
+        let lines: String = findings
+            .iter()
+            .map(|(id, last_seen, count)| {
+                let finding = json!({
+                    "id": id, "fingerprint": id, "kind": "rpc.slow", "severity": "warn",
+                    "firstSeen": "2026-10-09T09:00:00Z", "lastSeen": last_seen, "count": count,
+                    "source": "server", "title": "Slow request", "summary": "s", "state": "open",
+                    "evidence": { "pad": "x".repeat(pad) },
+                });
+                format!("{finding}\n")
+            })
+            .collect();
+        fs::write(dir.join("findings.ndjson"), lines).unwrap();
+    }
+
+    /// Follows `nextCursor` from `since` until it is null, checking each page is a result (not
+    /// the too-long note) whose cursor parses, and returns every `(id, count)` read.
+    fn follow(
+        dir: &Path,
+        cursor: Option<String>,
+        pages: usize,
+    ) -> (Vec<(String, u64)>, Option<String>) {
+        let mut read = Vec::new();
+        let mut cursor = cursor;
+        for _ in 0..pages {
+            let mut arguments = json!({ "since": "2026-10-09T09:00:00Z", "limit": 100 });
+            if let Some(cursor) = &cursor {
+                arguments["cursor"] = cursor.clone().into();
+            }
+            let responses = exchange(dir, &[call_tool(1, "profiler_findings", arguments)]);
+            let result = &responses[0]["result"];
+            assert_ne!(result["isError"], true, "{}", result["content"][0]["text"]);
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.chars().count() <= MAX_RESULT_CHARS);
+            let content = &result["structuredContent"];
+            assert!(
+                content.get("error").is_none(),
+                "a page was replaced: {content}"
+            );
+            let findings = content["findings"].as_array().unwrap();
+            assert!(!findings.is_empty(), "every page makes progress");
+            read.extend(findings.iter().map(|finding| {
+                (
+                    finding["id"].as_str().unwrap().to_owned(),
+                    finding["count"].as_u64().unwrap(),
+                )
+            }));
+            match content["nextCursor"].as_str() {
+                Some(next) => {
+                    assert!(next.len() <= MOST_CURSOR_CHARS, "{}", next.len());
+                    cursor = Some(next.to_owned());
+                }
+                None => return (read, None),
+            }
+        }
+        (read, cursor)
+    }
+
+    /// A second holding the book's 1,000 findings, half read, then every one recurring: the
+    /// cursor keeps one mark per finding, so it always fits its own limit and every page after
+    /// the recurrence is reachable (#139, review round 3).
+    #[test]
+    fn a_busy_second_with_recurrences_keeps_its_cursor_within_the_limit() {
+        let (_state, dir) = seeded(0, 0);
+        let second = "2026-10-09T10:00:00Z";
+        let ids: Vec<String> = (0..1000)
+            .map(|index| format!("rpc.slow-{index:04}"))
+            .collect();
+        let at = |count: u64| -> Vec<(String, &str, u64)> {
+            ids.iter().map(|id| (id.clone(), second, count)).collect()
+        };
+        write_findings(&dir, &at(1), 0);
+        let (first, cursor) = follow(&dir, None, 5);
+        assert_eq!(first.len(), 500);
+        write_findings(&dir, &at(2), 0);
+        let (second_pass, cursor) = follow(&dir, cursor, 20);
+        assert_eq!(cursor, None, "paging ends");
+        let expected: Vec<(String, u64)> = ids.iter().map(|id| (id.clone(), 2)).collect();
+        assert_eq!(second_pass, expected, "each recurrence once, oldest first");
+        // A third recurrence of all of them still pages through within the limit.
+        write_findings(&dir, &at(3), 0);
+        let (third, cursor) = follow(&dir, None, 20);
+        assert_eq!((third.len(), cursor), (1000, None));
+    }
+
+    /// A same-second backlog of large findings behind a long cursor: each page is fitted with
+    /// its own cursor, dropping findings, never the cursor; a finding too large alone comes
+    /// without its evidence, so every page still makes progress (#139, review round 3).
+    #[test]
+    fn a_large_page_keeps_its_cursor_and_makes_progress() {
+        let (_state, dir) = seeded(0, 0);
+        let second = "2026-10-09T10:00:00Z";
+        // 899 small findings build a long cursor (899 marks); then 100 of about 800 characters
+        // each in the same second, and one too large to return whole: the book's 1,000.
+        let mut findings: Vec<(String, &str, u64)> = (0..899)
+            .map(|index| (format!("rpc.slow-a{index:03}"), second, 1))
+            .collect();
+        findings.extend((0..100).map(|index| (format!("rpc.slow-b{index:03}"), second, 1)));
+        let lines: String = findings
+            .iter()
+            .map(|(id, last_seen, count)| {
+                let pad = if id.starts_with("rpc.slow-b") { 800 } else { 0 };
+                let finding = json!({
+                    "id": id, "fingerprint": id, "kind": "rpc.slow", "severity": "warn",
+                    "firstSeen": "2026-10-09T09:00:00Z", "lastSeen": last_seen, "count": count,
+                    "source": "server", "title": "Slow request", "summary": "s", "state": "open",
+                    "evidence": { "pad": "x".repeat(pad) },
+                });
+                format!("{finding}\n")
+            })
+            .collect::<String>()
+            + &format!(
+                "{}\n",
+                json!({
+                    "id": "rpc.slow-huge", "fingerprint": "huge", "kind": "rpc.slow",
+                    "severity": "warn", "firstSeen": "2026-10-09T09:00:00Z",
+                    "lastSeen": "2026-10-09T10:00:01Z", "count": 1, "source": "server",
+                    "title": "t", "summary": "s", "state": "open",
+                    "evidence": { "pad": "x".repeat(90_000) },
+                })
+            );
+        fs::write(dir.join("findings.ndjson"), lines).unwrap();
+
+        let (read, end) = follow(&dir, None, 40);
+
+        assert_eq!(end, None);
+        let mut expected: Vec<(String, u64)> = findings
+            .iter()
+            .map(|(id, _, count)| (id.clone(), *count))
+            .collect();
+        expected.push(("rpc.slow-huge".into(), 1));
+        assert_eq!(read, expected, "each once, in order");
+        let responses = exchange(
+            &dir,
+            &[call_tool(
+                1,
+                "profiler_findings",
+                json!({ "since": "2026-10-09T10:00:01Z" }),
+            )],
+        );
+        let huge = &responses[0]["result"]["structuredContent"]["findings"][0];
+        assert_eq!(huge["id"], "rpc.slow-huge");
+        assert_eq!(huge["evidenceOmitted"], true, "{huge}");
+        assert!(huge.get("evidence").is_none());
     }
 
     /// `lastSeen` is whole seconds, so a cursor that ended inside a second replays that second:
