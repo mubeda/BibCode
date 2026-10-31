@@ -322,13 +322,16 @@ at read-only.
   and its panels, or between two panels of one host; anything else is
   `McpNotSameWorktreeError`. The message shows **From <panel title>** beside the agent's
   chip, and `read_thread` returns its `sourceThreadId`. BiBCode accepts that origin only on
-  an agent's panel message, so nothing else can claim one. With `includeLastReply`, the
+  an agent's panel message from a thread that agent opened or last sent a message to, so
+  no one can speak as another agent's panel (`McpSourceThreadNotOwnedError`). With
+  `includeLastReply`, the
   source thread's last reply is quoted after the text, at most 16,000 characters of it.
 - **Suggestions never move anything.** `focus_ui` raises a small notice in every BiBCode
   window showing the environment, **Agent <name> wants to show <what>**, with **Show**.
   Nothing changes until you click it, so a suggestion never takes focus while you type.
   A notice goes away after 60 seconds, a window that was hidden shows it when you come back
-  if it is still pending, and at most 16 may wait per thread. The result says how many
+  if it is still pending, and at most 16 may wait per thread and 64 per agent. The result
+  says how many
   windows were watching. `path` is a file relative to the thread's folder, for `files` and
   `diff` only.
 - A panel an agent opened carries an **Agent** badge on its tab; its tooltip names the agent

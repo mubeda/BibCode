@@ -3645,7 +3645,9 @@ Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
   thread of the target's worktree (the same host thread, or one hosts the other). A
   person's client and an agent naming an unrelated thread are both refused as an invariant,
   with nothing projected. MCP clients reach dispatch only through tools, and only
-  `send_panel_message` sets the field (after its own `McpNotSameWorktreeError` check);
+  `send_panel_message` sets the field, after its own `McpNotSameWorktreeError` check and a
+  check that the calling agent owns the source: it is the thread's `requester`, or its
+  actor sent the thread's latest user message (`McpSourceThreadNotOwnedError` otherwise);
   `send_message` refuses an unknown argument.
 - **`includeLastReply`** appends the source's latest assistant message as a Markdown quote,
   at most 16,000 characters with a note of where it was cut. Message and quote together stay
@@ -3654,10 +3656,11 @@ Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
   unary) accepts only an `mcp-client` principal and stamps its actor; it repeats the shape
   checks (`surface`, a relative literal `path` for `files` and `diff`). An intent
   `{ kind: "focus", intentId, threadId, surface, path, actor, createdAt, expiresAt }` lives
-  in memory for 60 seconds, at most 16 pending per thread (`UiIntentError`, `reason:
-  "limit"`), and the result reports how many streams were subscribed.
-  `subscribeUiIntents` (`orchestration:read`, read stream) sends the pending intents and
-  then each new one (a lagging stream gets a fresh snapshot). The kind field lets slice X7
+  in memory for 60 seconds, at most 16 pending per thread and 64 per agent credential
+  (`UiIntentError`, `reason: "limit"`), and at most 256 in all, past which the oldest are
+  dropped; the result reports how many streams were subscribed.
+  `subscribeUiIntents` (`orchestration:read`, read stream) sends the newest 64 pending
+  intents (one server is one environment) and then each new one (a lagging stream gets a fresh snapshot). The kind field lets slice X7
   add `commitMessage` with its own retention.
 - **Clients.** `UiIntentNotifier` (one per environment, outside the router) raises a
   non-modal toast per intent, **Agent <label> wants to show <surface>** with **Show**, and
