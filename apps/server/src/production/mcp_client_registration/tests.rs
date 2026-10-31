@@ -397,6 +397,44 @@ async fn a_tool_that_is_not_found_is_not_installed_and_nothing_is_created() {
 }
 
 #[tokio::test]
+async fn an_entry_whose_health_check_fails_is_still_replaced() {
+    let sandbox = TestSandbox::new("mcp-client-stale");
+    let mut clients = Clients::installed(&sandbox);
+    let state = sandbox.path("claude-stale.state");
+    let log_path = sandbox.path("claude-stale.log");
+    std::fs::write(&state, "old").unwrap();
+    // A registered entry pointing at a build that no longer exists: `get` fails its check.
+    clients.claude = sandbox.executable_script(
+        "claude-stale",
+        &format!(
+            r#"echo "$*" >> '{log}'
+case "$2" in
+  get) echo 'bibcode: Failed to connect' >&2; exit 3 ;;
+  add) if [ -f '{state}' ]; then echo 'MCP server bibcode already exists' >&2; exit 1; fi; echo new > '{state}'; exit 0 ;;
+  remove) rm -f '{state}'; exit 0 ;;
+esac"#,
+            log = log_path.display(),
+            state = state.display(),
+        ),
+        "",
+    );
+    register(
+        &clients.settings(),
+        launch(),
+        json!({ "client": "claude" }),
+        &Host::for_home(&home(&sandbox)),
+    )
+    .await
+    .expect("replaces the stale entry");
+    assert_eq!(std::fs::read_to_string(&state).unwrap().trim(), "new");
+    assert!(
+        log(&sandbox, "claude-stale")
+            .iter()
+            .any(|line| line == "mcp remove --scope user bibcode")
+    );
+}
+
+#[tokio::test]
 async fn a_failing_add_says_what_the_cli_said_and_removes_nothing() {
     let sandbox = TestSandbox::new("mcp-client-failure");
     let mut clients = Clients::installed(&sandbox);
