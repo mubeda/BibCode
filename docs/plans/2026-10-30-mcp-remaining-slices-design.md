@@ -5142,3 +5142,40 @@ first; each new test was seen failing against the round-one code:
 - **Contract.** `WebhookEndpoint.droppedDeliveries` and the `queued` reason; fixtures
   regenerated, counts unchanged. **UI.** The status line names dropped deliveries; the log
   names `queue_full` and `endpoint_changed`.
+
+**Codex review round 3 (2026-10-31).** The three race P2s were confirmed and fixed test
+first; each new test was seen failing against the round-two code:
+
+- **A stale snapshot could enqueue after an edit.** The dispatcher reads the endpoints, then
+  maps and enqueues a page; an edit committing in between abandoned what was queued but not
+  what came next. Each `NewDelivery` now carries the `Fence` it was chosen under (the
+  endpoint's URL, project and event list), and `enqueue` compares it with the endpoint row
+  inside its own transaction, dropping a delivery whose endpoint changed, was disabled or is
+  gone. A row picked by `due` before an edit is covered too: `deliver` takes the endpoint's
+  token, then its send lock, then re-reads the row (still `pending`) and the endpoint; an
+  edit committed before those reads already abandoned the row as `endpoint_changed`, and one
+  committed after them cancels the token. Test:
+  `an_edit_between_the_snapshot_and_the_enqueue_or_the_send_sends_nothing_stale` (an
+  enqueue with the pre-edit snapshot queues nothing; a row picked before an edit is not sent
+  and its log says `endpoint_changed`). **Drift from the requested shape:** the fence compares
+  the three fields themselves rather than a stored `revision` column stamped on each row.
+  Migration 61 is already applied by the batch branch's development stores and 62 is R's, so
+  a column would need a migration renumbering for no stronger guarantee: every edit that
+  changes the fence abandons the endpoint's pending rows in its transaction, so every pending
+  row was enqueued under the current fence, and a row is never sent stale.
+- **A drop during an announcement replayed the acknowledged one.** Drops are now numbered
+  batches (`dropped:<id>` holds `[{ seq, count, fromCursor, toCursor, sinceLastSeen }]`,
+  numbered from one `drop_seq` counter in `webhook_state`). A request announces the sum of
+  the batches pending when it is sent and a 2xx removes exactly those batch numbers
+  (`acknowledge_dropped`), so a batch recorded meanwhile is announced on the next delivery
+  alone. Test: `a_drop_during_an_announcement_is_announced_next_without_repeating_the_first`
+  (the second delivery names only the second batch, the third names none).
+- **Lock waiters held slots and spun the loop.** The dispatcher now takes an endpoint's send
+  lock with `try_lock_owned` before giving it a slot and hands the guard to the task; an
+  endpoint whose lock a test event or redelivery holds is skipped (that send wakes the loop
+  when it ends) and is left out of the next wake time with the busy ones. With all eight
+  slots taken the loop waits for a completion or the poll, never a due time. `due` now
+  returns every endpoint's due head so a held one does not crowd out a ready one. Test:
+  `endpoints_held_by_manual_sends_neither_block_a_ready_one_nor_spin_the_loop` (eight
+  endpoints held by 4-second test events and a ninth whose event goes out before any of them
+  ends; at most three passes in the following second).
