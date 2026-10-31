@@ -44,6 +44,7 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "revoke-client-session",
   "revoke-other-client-sessions",
   "set-mcp-client-access",
+  "decide-mcp-authorization",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -667,6 +668,45 @@ export async function setServerMcpClientAccess(
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "set-mcp-client-access",
       sessionId,
+      cause: error,
+    });
+  }
+}
+
+/**
+ * **Approve** or **Deny** a remote AI tool's request to connect (#139, slice R). Approval names
+ * the access, at most the environment's, and whether terminals are allowed.
+ */
+export async function decideServerMcpAuthorization(
+  decision:
+    | {
+        readonly kind: "approve";
+        readonly id: string;
+        readonly access: AuthMcpAccessLevel;
+        readonly terminals: boolean;
+      }
+    | { readonly kind: "deny"; readonly id: string },
+): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          decision.kind === "approve"
+            ? client.auth.approveMcpAuthorization({
+                headers: {},
+                payload: {
+                  id: decision.id,
+                  access: decision.access,
+                  terminals: decision.terminals,
+                },
+              })
+            : client.auth.denyMcpAuthorization({ headers: {}, payload: { id: decision.id } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "decide-mcp-authorization",
       cause: error,
     });
   }

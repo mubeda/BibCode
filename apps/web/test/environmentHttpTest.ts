@@ -119,6 +119,10 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
             .handle("clients", () => unexpectedEndpoint("auth.clients"))
             .handle("revokeClient", () => unexpectedEndpoint("auth.revokeClient"))
             .handle("setMcpAccess", () => unexpectedEndpoint("auth.setMcpAccess"))
+            .handle("approveMcpAuthorization", () =>
+              unexpectedEndpoint("auth.approveMcpAuthorization"),
+            )
+            .handle("denyMcpAuthorization", () => unexpectedEndpoint("auth.denyMcpAuthorization"))
             .handle("revokeOtherClients", () => unexpectedEndpoint("auth.revokeOtherClients")),
         ),
       ]),

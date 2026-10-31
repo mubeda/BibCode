@@ -30,6 +30,7 @@ import { Switch } from "../ui/switch";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
 import { DiagnosticsEnvironmentSelect, useDiagnosticsEnvironment } from "./diagnosticsEnvironment";
 import { McpAgentsPanel } from "./McpAgentsPanel";
+import { McpRemoteAgentsPanel } from "./McpRemoteAgentsPanel";
 import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayout";
 import { WebhooksTab } from "./WebhooksTab";
 
@@ -179,6 +180,7 @@ export function AgentIntegrationsSection() {
           />
           {isPrimary ? <McpAgentsPanel /> : null}
           {isPrimary ? <RevokedPairingNotice environmentId={environment.environmentId} /> : null}
+          <McpRemoteAgentsPanel environmentId={environment.environmentId} isPrimary={isPrimary} />
         </TabsPanel>
         <TabsPanel value="webhooks" className="gap-0">
           <WebhooksTab
