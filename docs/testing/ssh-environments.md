@@ -347,7 +347,12 @@ it was already open):
    works without restarting the agent.
 4. For a WSL environment, register
    `wsl.exe -d <distro> --exec <server binary> mcp --base-dir <root>` and repeat.
-5. Exit the agent and check that the host lists no **MCP · …** row in Authorized
+5. In the host's app, press **Take over** for the agent, then **Hand back**, then
+   **Stop**: the SSH agent's change is refused while taken over, works after hand back,
+   and its next call after Stop says its access ended. Ask it for `files_download`: the URL
+   names the host's loopback address, so the desktop agent cannot open it; `scp` the file
+   instead, as the [MCP reference](../reference/mcp.md#over-ssh) says.
+6. Exit the agent and check that the host lists no **MCP · …** row in Authorized
    clients and no file in `<state dir>/mcp-clients/`.
 
 ### Cleanup

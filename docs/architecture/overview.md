@@ -2612,8 +2612,10 @@ with the setting off the tools disappear from `tools/list` and a call fails
 with `DevicePreviewsDisabledError`. There is no per-call scope check, by
 invariant: a valid provider MCP credential is issued only by `provider_runtime`
 when it launches a thread's provider, so holding it is the operate grant, as
-for the `preview_*` tools. If MCP credentials are ever issued to
-lower-privileged principals, both tool families need a real scope check.
+for the `preview_*` tools. Outside agents' `mcp-client` credentials reach these
+tools only through their client twins in `mcp/tools/previews.rs`, which
+`McpControl` gates by scope, access ceiling and the Workspace set like every
+other client tool (see [Outside agents over MCP](#outside-agents-over-mcp)).
 `DeviceTools::call` receives the calling thread's `PreviewScope` and logs its
 environment, thread, and owner ids with the operation at `debug`, never the
 arguments.
@@ -2648,10 +2650,52 @@ runtime only; the
 [iOS simulator runbook](../testing/macos-desktop.md#ios-simulator-previews)
 repeats it on each Xcode or runtime a release supports.
 
+## Outside agents over MCP
+
+`apps/server/src/mcp/` (#139) lets an AI agent BiBCode did not start operate an
+environment through the same `/mcp` endpoint providers use, with tools of its
+own. The agent-facing contract is the [MCP reference](../reference/mcp.md); the
+person's guide is [Outside agents over MCP](../user/mcp.md); the tool-to-RPC
+mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-thread-tools).
+
+- **Transport.** `bibcode mcp` (and `<desktop exe> mcp`, `ssh <host> bibcode
+  mcp`) is a stdio relay (`mcp/relay.rs`). It finds the server through the
+  endpoint record and its per-boot proof (`mcp/endpoint.rs`), mints its own
+  `mcp-client` credential in the data root's store, relays each JSON-RPC message
+  to `POST /mcp`, and revokes the credential when it exits. `bibcode thread`
+  (`mcp/thread_cli.rs`) calls the same tools from a shell. Both protocol eras
+  are served (`mcp/protocol.rs`). Remote Streamable HTTP with OAuth is slice R.
+- **Registry.** Tools are registered in families (`mcp/tools/*.rs`, listed in
+  `control::FAMILIES`). Each `ToolSpec` names its scope, RPC methods, MCP
+  annotations, capability set and timing class; `McpControl::call` checks the
+  off switch, scope, set, access ceiling and per-session limits before the
+  family runs, and every tool reaches the UI's own RPC handlers through
+  `RpcRegistry::invoke_local`, so scope checks, maintenance admission and
+  command receipts are shared.
+- **Access.** The credential's ceiling and the live `mcpServerAccess` give the
+  effective ceiling; `mcpCapabilities` turns tool sets on and off;
+  `terminal:operate` is minted only with Terminals on at Full access.
+- **Retries and live controls** (`mcp/outcome.rs`). Engine-backed tools replay
+  stored commands by receipt; Git, pull request, terminal, file and clone tools
+  run keyed work at most once as owned mutations whose outcome rows
+  (`mcp_tool_requests`) replay on retry. Owned work runs under a token that the
+  off switch, read-only, revocation and shutdown cancel, and is recorded
+  `unknown`, never success, when interrupted.
+- **Attribution.** An agent's commands stamp an `mcp-client` actor on their
+  events; each mutating call writes a content-free `mcp_activity` row
+  (`mcp/activity.rs`); Stop, Take over and Hand back act on the session.
+- **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
+  the activity log by a monotonic cursor without reading payload text; the
+  webhook dispatcher follows the same pages.
+- **Drift test.** `mcp::reference_docs` fails when a registered client tool,
+  a `feed::ERRORS` tag or a webhook event type is missing from
+  `docs/reference/`.
+
 ## Outbound webhooks
 
 `apps/server/src/webhooks/` (#139 slice X8) posts signed events to the HTTPS
-endpoints a person registers per environment ([user guide](../user/webhooks.md)).
+endpoints a person registers per environment ([user guide](../user/webhooks.md),
+[receiver reference](../reference/webhooks.md)).
 
 - **Sources, never the broadcast.** The dispatcher reads X3's change feed through
   `mcp::tools::feed::page_after` (the page `changes_since` returns) from a stored
