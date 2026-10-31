@@ -166,17 +166,22 @@ describe("McpRemoteAgentsPanel", () => {
 
   // A proxy or tunnel BiBCode does not run (ngrok, say) is invisible to the app's own
   // address; the server saw it on a request to connect, or on a remote agent's sign-in.
-  it("shows the HTTPS address a waiting request to connect arrived on", async () => {
+  // Any process on this computer can send X-Forwarded-Host, so a request nobody approved
+  // proves nothing about BiBCode's address.
+  it("never shows the forwarded host of a request to connect", async () => {
     h.baseUrl = "http://127.0.0.1:3773";
-    h.requests = [request({ origin: "https://abc.ngrok.example" })];
+    h.requests = [request({ origin: "https://attacker.example" })];
     const container = await render();
-    expect(container.querySelector('[aria-label="Remote MCP URL"]')?.textContent).toBe(
-      "https://abc.ngrok.example/mcp",
-    );
-    expect(container.textContent).toContain("through a proxy or tunnel that BiBCode does not run");
+    // Its card still says where it asked through; the Remote agents row never takes it up.
+    expect(container.textContent).not.toContain("reached BiBCode at https://attacker.example");
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
+    expect(container.textContent).not.toContain("Copy for Claude Code");
+    expect(container.textContent).toContain("Remote agents need an HTTPS address");
   });
 
-  it("shows the address of a remote agent connected in the last ten minutes, and only then", async () => {
+  // A grant the person approved shows where agents reached BiBCode, as information only: setup
+  // commands are offered only for the environment's own address.
+  it("names the address an approved agent reached BiBCode at, without setup commands", async () => {
     h.baseUrl = "http://127.0.0.1:3773";
     const agent = (lastConnectedAt: number, connected: boolean) => ({
       sessionId: "s-1",
@@ -185,20 +190,22 @@ describe("McpRemoteAgentsPanel", () => {
       lastConnectedAt: DateTime.makeUnsafe(lastConnectedAt),
       mcpResource: "https://abc.ngrok.example/mcp",
     });
+    const reached = "Remote agents reached BiBCode at https://abc.ngrok.example/mcp";
     h.clients = [agent(Date.now() - 2 * 60_000, false)];
     let container = await render();
-    expect(container.querySelector('[aria-label="Remote MCP URL"]')?.textContent).toBe(
-      "https://abc.ngrok.example/mcp",
-    );
+    expect(container.textContent).toContain(reached);
+    expect(container.textContent).toContain("Remote agents need an HTTPS address");
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
+    expect(container.textContent).not.toContain("Copy for Claude Code");
     h.clients = [agent(Date.now() - 60 * 60_000, false)];
     container = await render();
-    expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
+    expect(container.textContent).not.toContain(reached);
     h.clients = [agent(Date.now() - 60 * 60_000, true)];
     container = await render();
-    expect(container.querySelector('[aria-label="Remote MCP URL"]')).not.toBeNull();
+    expect(container.textContent).toContain(reached);
     // Another environment's row never shows this one's observations.
     container = await render(false);
-    expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
+    expect(container.textContent).not.toContain(reached);
   });
 
   it("shows the MCP URL and copies the Claude Code and Codex commands", async () => {

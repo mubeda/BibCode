@@ -2392,8 +2392,13 @@ The number is assigned in the [migration summary](#persistence-and-migration-sum
   a saved HTTPS endpoint), it shows the MCP URL with **Copy for Claude Code**
   (`claude mcp add --transport http bibcode <url>`) and **Copy for Codex**
   (`codex mcp add bibcode --url <url>`, which starts sign-in itself).
-  - Otherwise it says: "Remote agents need an HTTPS address. Use the launch command over
-    SSH instead."
+  - Otherwise it says how to get an HTTPS address (BiBCode Connect, or a reverse proxy, with
+    **Reverse proxy setup** opening the recipe). After the v0.13.1 end-to-end test it also
+    names, as information only, the address a grant the person approved is bound to while
+    that agent is connected or was in the last ten minutes ("Remote agents reached BiBCode
+    at `<url>`"). A pending request's origin is never shown and no setup commands are
+    offered for an observed address: any loopback peer can send `X-Forwarded-Host`, so it
+    could make the panel advertise its own host (Codex review, P2).
 - **Requests to connect.** A card for each pending authorization, with:
   - the client name (untrusted text), the redirect host, the request origin, the scopes
     asked for, and the code;

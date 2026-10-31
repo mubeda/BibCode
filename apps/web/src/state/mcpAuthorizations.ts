@@ -71,20 +71,15 @@ export function remoteMcpUrl(httpBaseUrl: string | null): string | null {
 const OBSERVED_ADDRESS_MS = 10 * 60_000;
 
 /**
- * An HTTPS MCP URL this server was reached on recently, through a proxy or tunnel it does not
- * run (#139, slice R): a waiting request to connect's origin, else the address of a remote
- * agent connected now or in the last ten minutes, the newest first. `null` when none: an old
- * observation may name a tunnel that is gone.
+ * The HTTPS MCP URL an approved remote agent reached this server at (#139, slice R): the
+ * address its grant is bound to, while it is connected or was in the last ten minutes, the
+ * newest first. `null` when none: an old one may name a tunnel that is gone. A request to
+ * connect nobody approved is never a source, since any local process can forward a host.
  */
 export function observedRemoteMcpUrl(
-  requests: ReadonlyArray<Pick<AuthPendingMcpAuthorization, "origin">>,
   clients: ReadonlyArray<Pick<AuthClientSession, "connected" | "lastConnectedAt" | "mcpResource">>,
   now: number = Date.now(),
 ): string | null {
-  for (const request of requests) {
-    const url = remoteMcpUrl(request.origin);
-    if (url !== null) return url;
-  }
   let newest: { readonly url: string; readonly at: number } | null = null;
   for (const client of clients) {
     const url = remoteMcpUrl(client.mcpResource ?? null);

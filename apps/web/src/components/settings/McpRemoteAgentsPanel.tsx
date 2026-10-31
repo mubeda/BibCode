@@ -82,18 +82,27 @@ function RemoteAgentsRow({
   readonly environmentId: EnvironmentId;
   readonly isPrimary: boolean;
 }) {
-  const ownUrl = remoteMcpUrl(useEnvironmentHttpBaseUrl(environmentId));
-  // What the server saw, which only the primary environment's access stream holds.
-  const { requests } = usePrimaryMcpAuthorizations();
+  // Setup commands only for the environment's own address: BiBCode Connect's, or the HTTPS
+  // address this app was set up to reach it at.
+  const url = remoteMcpUrl(useEnvironmentHttpBaseUrl(environmentId));
+  // Where an approved agent reached BiBCode, which only the primary's access stream holds.
   const clients = usePrimaryMcpClients();
-  const observedUrl = ownUrl === null && isPrimary ? observedRemoteMcpUrl(requests, clients) : null;
-  const url = ownUrl ?? observedUrl;
+  const reachedUrl = url === null && isPrimary ? observedRemoteMcpUrl(clients) : null;
   const enabled = useEnvironmentSettings(environmentId, selectEnabled);
   if (url === null) {
     return (
       <SettingsRow
         title="Remote agents"
-        description={NO_HTTPS_MESSAGE}
+        description={
+          reachedUrl === null ? (
+            NO_HTTPS_MESSAGE
+          ) : (
+            <>
+              <span className="block break-all">Remote agents reached BiBCode at {reachedUrl}</span>
+              {NO_HTTPS_MESSAGE}
+            </>
+          )
+        }
         control={
           <Button
             variant="outline"
@@ -110,11 +119,7 @@ function RemoteAgentsRow({
   return (
     <SettingsRow
       title="Remote agents"
-      description={
-        observedUrl === null
-          ? "AI tools on other computers connect to this address over HTTPS and sign in. You approve each sign-in here."
-          : "AI tools on other computers reached this environment at this address, through a proxy or tunnel that BiBCode does not run; it works while that stays up. They sign in, and you approve each sign-in here."
-      }
+      description="AI tools on other computers connect to this address over HTTPS and sign in. You approve each sign-in here."
       status={enabled ? null : <Reason text={SERVER_OFF_MESSAGE} />}
     >
       <div className="space-y-2 pt-2.5 pb-3.5">

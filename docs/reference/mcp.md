@@ -215,14 +215,16 @@ claude mcp add --transport http bibcode https://<host>/mcp
 codex mcp add bibcode --url https://<host>/mcp
 ```
 
-The URL is the app's own address when that is HTTPS. Otherwise the row shows an HTTPS
-address the server itself was reached on, through a proxy or tunnel it does not run (ngrok,
-say): the origin of a request to connect still waiting, or the address a remote grant is
-bound to (`mcpResource` on the client session) while that agent is connected or was in the
-last ten minutes. Nothing else is remembered, so a tunnel that went away stops being shown.
-With neither, the row says to connect through BiBCode Connect or put an HTTPS reverse proxy
-in front of the environment, and **Reverse proxy setup** opens the recipe in
-[Remote access](../user/remote-access.md#reverse-proxies).
+The URL and its setup commands are offered only for the environment's own address: BiBCode
+Connect's, or the HTTPS address the app reaches it at. Otherwise the row says to connect
+through BiBCode Connect or put an HTTPS reverse proxy in front of the environment, and
+**Reverse proxy setup** opens the recipe in
+[Remote access](../user/remote-access.md#reverse-proxies). Behind a proxy or tunnel BiBCode
+does not run (ngrok, say), it also says "Remote agents reached BiBCode at `<url>`", as
+information with no setup commands: the address a grant the person approved is bound to
+(`mcpResource` on the client session), while that agent is connected or was in the last ten
+minutes. A request to connect is never a source, approved or not: any process on the host
+can send `X-Forwarded-Host`, so its origin proves nothing about BiBCode's address.
 
 Both tools then run the flow below by themselves and open the sign-in page in a browser;
 the person approves there. An agent writing its own client follows the same steps.

@@ -115,9 +115,13 @@ that follows the recipe above. Plain HTTP on a LAN address is refused; use
 1. In **Settings → Agents → Agent integrations → MCP**, the **Remote agents** row
    shows the MCP URL (`https://<host>/mcp`) with **Copy for Claude Code**
    (`claude mcp add --transport http bibcode <url>`) and **Copy for Codex**
-   (`codex mcp add bibcode --url <url>`). Behind a proxy or tunnel BiBCode does not
-   run, the row shows its address once a tool has used it (a request to connect, or
-   an agent connected in the last ten minutes); until then, start from that address.
+   (`codex mcp add bibcode --url <url>`), for BiBCode Connect's address or the
+   HTTPS address the app reaches the environment at. Behind a proxy or tunnel
+   BiBCode does not run (ngrok, say), it offers no commands: build them from the
+   tunnel's own address. Once an agent you approved has connected through it, the
+   row says "Remote agents reached BiBCode at `<url>`" (for ten minutes after its
+   last connection). A request to connect never sets that address: any program on
+   the host can forge the forwarded host it arrives with.
 2. Run the copied command on the other computer. The tool registers itself and
    opens a sign-in page in its browser that shows a code such as `ABCD-2345`.
 3. Approve the request where this environment's access is managed: under
