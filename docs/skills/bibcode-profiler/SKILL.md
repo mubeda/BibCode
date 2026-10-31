@@ -125,8 +125,8 @@ untrusted.
   returns findings oldest first; follow `nextCursor` until it is null to read
   more than 100.
 - An outside agent connected to BiBCode's own MCP server (`bibcode mcp`) has
-  the same first four tools there, in the Diagnostics set, with events and
-  crash records cut to their documented fields.
+  the same first four tools there, in the Diagnostics set, with findings,
+  events and crash records cut to their documented fields.
 
 ## Choose the mode
 
