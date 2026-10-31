@@ -3375,6 +3375,27 @@ that failed first:
   recover, to keep this minimal. Test: `a_discard_restores_entries_a_crash_left_in_staging`
   stops a discard while the trash holds its entry. The next discard restores the entry,
   and a stranded entry whose place was taken stays staged.
+- **Security review: recovery trusted the record.** The record held a root, and recovery
+  restored into it. Anyone who could write a record into the staging folder could therefore
+  move a staged entry into any folder. That needs the server's own user, since the folder
+  must be private, but the record is not trusted now:
+  - It holds only the entry's path below the worktree root Git reports for the Git
+    directory, so a record can name no other checkout.
+  - Recovery accepts only plain parts: no root, `.`, `..` or NUL, and nothing starting with
+    `.git`, the `validate_pathspecs` rule. It opens the path from the worktree root through
+    the same no-follow folder chain as staging.
+  - Test: `a_forged_origin_record_never_moves_an_entry` covers six forged records (another
+    root, `../outside`, an absolute path, a path through a symlinked folder, `.git/`, `./`).
+    None moves its entry. The root case failed first: its entry was moved outside the
+    checkout. The genuine stranded entry is still restored.
+
+  Records are not signed. The server's `SecretStore` (`<state>/secrets`) would hold a
+  per-user key, but the Git layer cannot reach it without threading it through
+  `GitManagerRpcServices`, `lifecycle.rs` and the test setups. A record can now only send an
+  entry that is already in the private staging folder back to a place inside its own
+  checkout, which anyone able to write that folder could do directly. A process-random key
+  was rejected too: after a restart, records written before it would be ignored, and the
+  crash recovery would never run.
 
 ## P (pull request tools) implementation notes (2026-10-30)
 
