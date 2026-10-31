@@ -37,6 +37,14 @@ impl TerminalInputError {
         }
     }
 
+    /// A terminal whose program is not reading has as much input queued as it may hold.
+    pub(crate) fn queue_full() -> Self {
+        Self::new(
+            "capacity",
+            "The terminal's program is not reading its input, and its input queue is full.",
+        )
+    }
+
     fn closed() -> Self {
         Self::new(
             "closed",

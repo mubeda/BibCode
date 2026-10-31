@@ -169,6 +169,21 @@ fn exited(exit_code: Option<i32>) -> Value {
     failure
 }
 
+/// Whether `failure` is the terminal runtime refusing input because its queue is full.
+fn input_queue_full(failure: &Value) -> bool {
+    let error = &failure["structuredContent"]["error"];
+    error["_tag"] == "TerminalInputError" && error["code"] == "capacity"
+}
+
+/// A write refused because the terminal's input queue is full: none of it was taken, so
+/// writing again once the program reads is safe.
+fn input_full() -> Value {
+    typed_tool_failure(
+        "McpTerminalInputFullError",
+        "The program in this terminal is not reading its input, and the terminal's input queue is full. None of this write was taken. Read the terminal with terminal_read, and write again once the program reads.",
+    )
+}
+
 /// A write the terminal did not take in time: it may still go in, so it is never success.
 fn not_taken() -> Value {
     let mut failure = typed_tool_failure(
@@ -512,6 +527,8 @@ impl ToolCall<'_> {
                         .and_then(|(_, exit_code, _)| exit_code);
                     return Err(exited(exit_code));
                 }
+                // The queue is refused whole, before any of this write is taken.
+                Ok(Err(failure)) if input_queue_full(&failure) => return Err(input_full()),
                 Ok(result) => result?,
             };
             Ok(tool_result(
@@ -645,6 +662,30 @@ impl ToolCall<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_input_queue_is_an_mcp_error_that_says_nothing_was_taken() {
+        let mut rpc = serde_json::to_value(crate::terminal::TerminalInputError::queue_full())
+            .expect("an input error serializes");
+        rpc["_tag"] = "TerminalInputError".into();
+        let answered = crate::mcp::control::rpc_failure(&rpc);
+        assert!(input_queue_full(&answered));
+        let failure = input_full();
+        assert_eq!(
+            failure["structuredContent"]["error"]["_tag"],
+            "McpTerminalInputFullError"
+        );
+        assert!(
+            failure["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("None of this write was taken")
+        );
+        let closed = crate::mcp::control::rpc_failure(
+            &json!({ "_tag": "TerminalInputError", "code": "closed", "message": "x" }),
+        );
+        assert!(!input_queue_full(&closed));
+    }
 
     #[test]
     fn csi_osc_and_short_escapes_are_removed() {
