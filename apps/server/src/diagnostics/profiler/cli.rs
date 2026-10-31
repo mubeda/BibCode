@@ -145,9 +145,11 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
     let command = std::env::args_os().nth(1);
     if command.as_deref() == Some(OsStr::new("mcp")) {
         // Stdout carries only JSON-RPC: an agent's pipes are not a console, and attaching the
-        // parent's would mix its output in.
+        // parent's would mix its output in. `mcp authorize` (slice R) is a person's command,
+        // so it always uses the console.
         use std::io::IsTerminal as _;
-        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        let authorize = std::env::args_os().nth(2).as_deref() == Some(OsStr::new("authorize"));
+        if authorize || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
             attach_console();
         }
         return Some(desktop_mcp_dispatch());
@@ -221,8 +223,8 @@ fn desktop_mcp_dispatch() -> i32 {
             return error.exit_code();
         }
     };
-    let options = match crate::config::relay_options(cli.base_dir, cli.dev_url, cli.args) {
-        Ok(options) => options,
+    let action = match crate::config::mcp_action(cli.base_dir, cli.dev_url, cli.args) {
+        Ok(action) => action,
         Err(error) => {
             let _ = writeln!(io::stderr(), "bibcode: {error}");
             return 1;
@@ -232,7 +234,17 @@ fn desktop_mcp_dispatch() -> i32 {
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(crate::mcp::relay::run_mcp_cli(options)),
+        Ok(runtime) => runtime.block_on(async move {
+            match action {
+                crate::config::CliAction::McpAuthorize { options, args } => {
+                    crate::mcp::authorize_cli::run_mcp_authorize(options, args).await
+                }
+                crate::config::CliAction::Mcp(options) => {
+                    crate::mcp::relay::run_mcp_cli(options).await
+                }
+                _ => 1,
+            }
+        }),
         Err(error) => {
             let _ = writeln!(io::stderr(), "bibcode: {error}");
             1
@@ -272,6 +284,7 @@ fn desktop_thread_dispatch() -> i32 {
         crate::config::McpArgs {
             url: None,
             access: None,
+            command: None,
         },
     ) {
         Ok(options) => options,

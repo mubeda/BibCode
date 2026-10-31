@@ -206,6 +206,7 @@ fn context(headers: HeaderMap) -> RouteContext {
     RouteContext {
         headers,
         uri: Uri::from_static("http://127.0.0.1:43123/mcp"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     }
 }
@@ -216,6 +217,7 @@ fn cancelled_context(headers: HeaderMap) -> RouteContext {
     RouteContext {
         headers,
         uri: Uri::from_static("http://127.0.0.1:43123/mcp"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation,
     }
 }
@@ -399,6 +401,7 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
     let ipv6 = RouteContext {
         headers: HeaderMap::new(),
         uri: "http://[::1]:43123/mcp".parse().unwrap(),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     };
     assert!(allowed_origin(Some(&valid), &ipv6));
@@ -418,6 +421,7 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
     let origin_form = |headers| RouteContext {
         headers,
         uri: Uri::from_static("/api/connect/link-proof"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     };
     let loopback = json!({"localHttpHost":"127.0.0.1","localHttpPort":43123});
@@ -721,6 +725,7 @@ async fn connect_routes_validate_payload_origin_and_runtime_failures() {
             RouteContext {
                 headers: HeaderMap::new(),
                 uri: Uri::from_static("https://remote.example/mcp"),
+                origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
                 cancellation: CancellationToken::new(),
             },
         ),
@@ -1036,16 +1041,15 @@ async fn cloud_health_and_mint_fail_closed_at_each_dependency() {
 #[tokio::test]
 async fn mcp_transport_enforces_auth_capacity_expiry_and_session_ownership() {
     let harness = harness(2, 1).await;
-    assert_eq!(
-        error(
-            harness
-                .service
-                .mcp(Method::GET, Vec::new(), context(HeaderMap::new()))
-                .await
-        )
-        .status,
-        StatusCode::METHOD_NOT_ALLOWED
+    // An unauthenticated GET is a discovery probe (slice R): 401, naming the metadata.
+    let probe = error(
+        harness
+            .service
+            .mcp(Method::GET, Vec::new(), context(HeaderMap::new()))
+            .await,
     );
+    assert_eq!(probe.status, StatusCode::UNAUTHORIZED);
+    assert!(probe.headers["www-authenticate"].contains("resource_metadata="));
 
     let first = harness
         .service
@@ -3067,5 +3071,190 @@ async fn a_wait_with_a_progress_token_streams_progress_then_its_result() {
     let last = messages.last().unwrap();
     assert_eq!(last["id"], 1);
     assert_eq!(last["result"]["structuredContent"]["timedOut"], true);
+    tools.shutdown().await;
+}
+
+/// A request as it arrives through the managed tunnel at `origin`, or through a local proxy.
+fn arriving(headers: HeaderMap, class: crate::RequestClass, origin: &str) -> RouteContext {
+    RouteContext {
+        headers,
+        uri: Uri::from_static("/mcp"),
+        origin: crate::RequestOrigin {
+            class,
+            origin: Some(origin.to_owned()),
+            source_key: "tunnel".to_owned(),
+        },
+        cancellation: CancellationToken::new(),
+    }
+}
+
+fn ping() -> Vec<u8> {
+    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"ping"})).unwrap()
+}
+
+/// Slice R: each bearer kind is accepted only where it belongs. A provider's token and a
+/// relay session work on a direct request and get 401 through the tunnel or a proxy; a
+/// remote OAuth session works only at the origin its grant is bound to.
+#[tokio::test]
+async fn each_bearer_is_accepted_only_where_it_belongs() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (_agent, relay_token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let provider = service
+        .issue_mcp_credential("thread", "thread", "provider")
+        .await
+        .unwrap();
+    let provider_token = provider
+        .authorization_header
+        .strip_prefix("Bearer ")
+        .unwrap()
+        .to_owned();
+    let tunnel = "https://env-1.connect.example";
+    let (oauth_token, _) = crate::auth::oauth::test_remote_grant(
+        &tools.auth,
+        tunnel,
+        "approval-required",
+        "orchestration:read orchestration:operate",
+    )
+    .await;
+
+    for token in [&relay_token, &provider_token] {
+        let modern = |token: &str| {
+            let mut headers = bearer(token);
+            headers.insert(
+                "mcp-protocol-version",
+                HeaderValue::from_static("2025-11-25"),
+            );
+            headers
+        };
+        let direct = service
+            .mcp(Method::POST, ping(), context(modern(token)))
+            .await;
+        // A provider's legacy ping needs its session (400); neither is refused as a credential.
+        assert!(
+            direct
+                .as_ref()
+                .map_or_else(|error| error.status != StatusCode::UNAUTHORIZED, |_| true),
+            "a direct request is authenticated"
+        );
+        for (class, origin) in [
+            (crate::RequestClass::ManagedTunnel, tunnel),
+            (crate::RequestClass::LocalProxy, "https://proxy.example"),
+        ] {
+            let refused = error(
+                service
+                    .mcp(Method::POST, ping(), arriving(modern(token), class, origin))
+                    .await,
+            );
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{class:?}");
+        }
+    }
+
+    // The OAuth grant works at its own origin only.
+    let through_tunnel = service
+        .mcp(
+            Method::POST,
+            ping(),
+            arriving(
+                bearer(&oauth_token),
+                crate::RequestClass::ManagedTunnel,
+                tunnel,
+            ),
+        )
+        .await;
+    assert!(through_tunnel.is_ok());
+    for refused in [
+        context(bearer(&oauth_token)),
+        arriving(
+            bearer(&oauth_token),
+            crate::RequestClass::LocalProxy,
+            "https://other.example",
+        ),
+    ] {
+        assert_eq!(
+            error(service.mcp(Method::POST, ping(), refused).await).status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    tools.shutdown().await;
+}
+
+/// The 401 names the protected resource metadata on an eligible origin, for POST and GET
+/// alike; an authenticated GET is 405, and an outside agent has no session to DELETE.
+#[tokio::test]
+async fn the_challenge_names_the_metadata_on_an_eligible_origin_only() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (_agent, token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    for method in [Method::POST, Method::GET] {
+        let challenged = error(
+            service
+                .mcp(method.clone(), ping(), context(HeaderMap::new()))
+                .await,
+        );
+        assert_eq!(challenged.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenged.headers["www-authenticate"],
+            "Bearer resource_metadata=\"http://127.0.0.1:43123/.well-known/oauth-protected-resource/mcp\", scope=\"orchestration:read orchestration:operate\""
+        );
+        let tunnel = error(
+            service
+                .mcp(
+                    method.clone(),
+                    ping(),
+                    arriving(
+                        HeaderMap::new(),
+                        crate::RequestClass::ManagedTunnel,
+                        "https://env-1.connect.example",
+                    ),
+                )
+                .await,
+        );
+        assert!(
+            tunnel.headers["www-authenticate"]
+                .contains("https://env-1.connect.example/.well-known/oauth-protected-resource/mcp")
+        );
+        // A plain-HTTP LAN origin, or any other, serves no OAuth: a plain challenge.
+        let lan = error(
+            service
+                .mcp(
+                    method.clone(),
+                    ping(),
+                    arriving(
+                        HeaderMap::new(),
+                        crate::RequestClass::Direct,
+                        "http://192.168.1.5:3773",
+                    ),
+                )
+                .await,
+        );
+        assert_eq!(lan.headers["www-authenticate"], "Bearer");
+    }
+    assert_eq!(
+        error(
+            service
+                .mcp(Method::GET, Vec::new(), context(bearer(&token)))
+                .await
+        )
+        .status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let mut delete = bearer(&token);
+    delete.insert("mcp-session-id", HeaderValue::from_static("anything"));
+    assert_eq!(
+        error(
+            service
+                .mcp(Method::DELETE, Vec::new(), context(delete))
+                .await
+        )
+        .status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
     tools.shutdown().await;
 }

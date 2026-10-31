@@ -386,6 +386,15 @@ impl PreviewGateway {
             .and_then(|host| self.inner.relay_hosts.preview_slot(host))
     }
 
+    /// The managed endpoint's hostname when a request came through the Connect tunnel (a
+    /// loopback socket, and `Host` naming that hostname); `None` for every other request.
+    /// Remote MCP fixes such a request's origin to `https://<hostname>` (#139, slice R).
+    #[must_use]
+    pub(crate) fn managed_hostname(&self, local_ip: IpAddr, host: Option<&str>) -> Option<String> {
+        let hosts = self.inner.relay_hosts.current()?;
+        relay::is_relay_reach(&hosts, local_ip, host).then_some(hosts.hostname)
+    }
+
     /// Where to send a request that reached Cloudflare over plain HTTP for a published relay
     /// hostname: the same URL over `https`. BiBCode and its previews are served through the
     /// tunnel over HTTPS only (a page there over HTTP would frame previews it can't load).

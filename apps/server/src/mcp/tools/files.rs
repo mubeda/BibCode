@@ -605,8 +605,17 @@ const HARD_LINKED_TAG: &str = "McpHardLinkedFileError";
 const TRASH_STAGED_TAG: &str = "McpTrashStagedError";
 
 /// The base a transfer URL is built on: the address this server is bound to, which the local
-/// relay and `bibcode thread` reach. Remote OAuth sessions (slice R) get their own origin here.
+/// relay and `bibcode thread` reach. A remote OAuth session (slice R) gets the origin its
+/// grant is bound to, the only address its agent can reach.
 fn transfer_base(call: &ToolCall<'_>) -> Result<String, Value> {
+    if let Some(origin) = call
+        .principal
+        .resource
+        .as_deref()
+        .and_then(|resource| resource.strip_suffix("/mcp"))
+    {
+        return Ok(origin.to_owned());
+    }
     call.control
         .transfer_base()
         .map(str::to_owned)

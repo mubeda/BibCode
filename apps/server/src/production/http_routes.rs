@@ -201,6 +201,19 @@ pub struct RouteContext {
     pub headers: HeaderMap,
     pub uri: Uri,
     pub cancellation: CancellationToken,
+    /// How the request reached this server (slice R): `/mcp` checks a bearer's audience
+    /// against it. [`RequestClass::Other`](crate::RequestClass::Other) unless the router's
+    /// forwarded-header layer classified it.
+    pub origin: crate::RequestOrigin,
+}
+
+/// The class the router's forwarded-header layer gave a request, or the fail-closed default.
+fn request_origin(parts: &axum::http::request::Parts) -> crate::RequestOrigin {
+    parts
+        .extensions
+        .get::<crate::RequestOrigin>()
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub struct JsonRouteResponse {
@@ -356,7 +369,7 @@ where
         .route("/api/preview/open-url", post(preview_open_url))
         .route(DEVICE_MEDIA_PATH, get(device_media))
         .route(DEVICE_MEDIA_E2EE_PATH, get(device_media_e2ee))
-        .route("/mcp", post(mcp_post).delete(mcp_delete))
+        .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .route(crate::mcp::endpoint::PROOF_PATH, post(mcp_endpoint_proof))
 }
 
@@ -569,6 +582,7 @@ async fn diagnostic_logs(State(state): State<HttpRoutesState>, request: Request)
         ));
     }
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -613,6 +627,7 @@ async fn json_request(
         },
     };
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -657,6 +672,7 @@ async fn asset(
     let _guard = CancellationGuard(cancellation.clone());
     let (parts, _) = request.into_parts();
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -688,6 +704,7 @@ async fn transfer_download(
     let _guard = CancellationGuard(cancellation.clone());
     let (parts, _) = request.into_parts();
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -748,6 +765,7 @@ async fn transfer_upload(
         .get("overwrite")
         .is_some_and(|value| value == "1" || value == "true");
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -804,6 +822,7 @@ async fn preview_open_url(State(state): State<HttpRoutesState>, request: Request
         Err(_) => return payload_too_large(),
     };
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -812,6 +831,12 @@ async fn preview_open_url(State(state): State<HttpRoutesState>, request: Request
         Ok(response) => json_response(response.status, response.headers, response.body),
         Err(error) => error.into_response(),
     }
+}
+
+/// `GET /mcp`: no stream is served. An unauthenticated GET still gets the 401 challenge, so
+/// a client's discovery probe finds the metadata; an authenticated one gets 405.
+async fn mcp_get(State(state): State<HttpRoutesState>, request: Request) -> Response {
+    mcp_request(state, Method::GET, request).await
 }
 
 async fn mcp_post(State(state): State<HttpRoutesState>, request: Request) -> Response {
@@ -831,6 +856,7 @@ async fn mcp_request(state: HttpRoutesState, method: Method, request: Request) -
         Err(_) => return payload_too_large(),
     };
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,

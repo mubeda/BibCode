@@ -1,4 +1,5 @@
 pub(crate) mod activity;
+pub mod authorize_cli;
 pub mod control;
 pub mod endpoint;
 pub(crate) mod outcome;

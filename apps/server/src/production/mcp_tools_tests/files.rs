@@ -153,6 +153,7 @@ fn context() -> RouteContext {
     RouteContext {
         headers: axum::http::HeaderMap::new(),
         uri: axum::http::Uri::from_static("/api/transfers/token"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     }
 }
@@ -1100,4 +1101,48 @@ async fn an_upload_holds_its_file_against_the_panel_and_the_agent_until_it_insta
         .await;
     assert!(saved.is_ok(), "{saved:?}");
     fixture.shutdown().await;
+}
+
+/// Slice R: a remote OAuth session's transfer URL is built on the origin its grant is bound
+/// to, the only address its agent can reach; a relay session keeps the bound address.
+#[tokio::test]
+async fn a_remote_session_s_transfer_url_uses_its_own_origin() {
+    let fixture = fixture().await;
+    fixture.write("a.txt", "hello");
+    let (token, _) = crate::auth::oauth::test_remote_grant(
+        &fixture.harness.auth,
+        "https://env-1.connect.example",
+        "approval-required",
+        "orchestration:read orchestration:operate",
+    )
+    .await;
+    let remote = fixture
+        .harness
+        .control
+        .authenticate(&token)
+        .await
+        .expect("the grant authenticates");
+    let minted = fixture
+        .harness
+        .call(
+            &remote,
+            "files_download",
+            json!({ "threadId": THREAD, "path": "a.txt" }),
+        )
+        .await;
+    let url = structured(&minted)["url"].as_str().unwrap().to_owned();
+    assert!(
+        url.starts_with("https://env-1.connect.example/api/transfers/"),
+        "{url}"
+    );
+    let relay = fixture
+        .call("files_download", json!({ "path": "a.txt" }))
+        .await;
+    assert!(
+        structured(&relay)["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(BASE),
+        "{relay}"
+    );
 }
