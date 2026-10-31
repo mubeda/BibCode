@@ -4,6 +4,7 @@
 //! Each tool family has its own file; this one holds the shared harness.
 
 mod attribution;
+mod clone;
 mod diagnostics;
 mod feed;
 mod foundation;

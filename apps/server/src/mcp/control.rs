@@ -411,6 +411,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     super::tools::diagnostics::FAMILY,
     super::tools::feed::FAMILY,
     super::tools::panels::FAMILY,
+    super::tools::clone::FAMILY,
 ];
 
 /// The spec and family of `name` for `kind` in `families`.
