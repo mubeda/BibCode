@@ -14,6 +14,7 @@
 
 mod cli;
 mod config_file;
+mod ordered_json;
 #[cfg(all(test, unix))]
 mod tests;
 
@@ -100,6 +101,14 @@ impl Host {
     }
 }
 
+/// Whether a tool has `bibcode`, and whether that entry runs this server's launch command:
+/// `None` when the entry cannot be read back or there is no launch command to compare.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    Absent,
+    Present { up_to_date: Option<bool> },
+}
+
 /// How BiBCode changes one tool on this host.
 enum Target {
     Cli(cli::Cli),
@@ -141,14 +150,15 @@ fn locate(settings: &Value, client: McpClient, host: &Host) -> Option<Target> {
 }
 
 impl Target {
-    async fn is_registered(
+    async fn read(
         &self,
+        launch: Option<&[String]>,
         host: &Host,
         cancellation: &CancellationToken,
-    ) -> Result<bool, Value> {
+    ) -> Result<State, Value> {
         match self {
-            Self::Cli(cli) => cli.is_registered(&host.home, cancellation).await,
-            Self::File(file) => file.is_registered().await,
+            Self::Cli(cli) => cli.read(launch, &host.home, cancellation).await,
+            Self::File(file) => file.read(launch).await,
         }
     }
 
@@ -193,11 +203,19 @@ fn decode(payload: Value) -> Result<McpClient, Value> {
         .map_err(|error| refusal("invalid", &format!("Invalid request: {error}")))
 }
 
-fn status(client: McpClient, installed: bool, registered: bool, error: Option<&Value>) -> Value {
+/// One tool's line. `upToDate` is `false` when its entry runs another command (an older
+/// install or data root) and `null` when that cannot be told; either way Settings offers
+/// Update.
+fn status(client: McpClient, installed: bool, state: State, error: Option<&Value>) -> Value {
+    let (registered, up_to_date) = match state {
+        State::Absent => (false, None),
+        State::Present { up_to_date } => (true, up_to_date),
+    };
     json!({
         "client": client.id(),
         "installed": installed,
         "registered": registered,
+        "upToDate": up_to_date,
         "error": error.and_then(|error| error.get("message")).cloned().unwrap_or(Value::Null),
     })
 }
@@ -206,16 +224,17 @@ fn status(client: McpClient, installed: bool, registered: bool, error: Option<&V
 /// read reports its own `error` instead of failing the whole read.
 pub(crate) async fn registrations(
     settings: &Value,
+    launch: Option<&[String]>,
     host: &Host,
     cancellation: &CancellationToken,
 ) -> Value {
     let reads = McpClient::ALL.map(|client| async move {
         let Some(target) = locate(settings, client, host) else {
-            return status(client, false, false, None);
+            return status(client, false, State::Absent, None);
         };
-        match target.is_registered(host, cancellation).await {
-            Ok(registered) => status(client, true, registered, None),
-            Err(error) => status(client, true, false, Some(&error)),
+        match target.read(launch, host, cancellation).await {
+            Ok(state) => status(client, true, state, None),
+            Err(error) => status(client, true, State::Absent, Some(&error)),
         }
     });
     let [claude, codex, cursor, opencode] = reads;
@@ -241,7 +260,14 @@ pub(crate) async fn register(
     let target = locate(settings, client, host).ok_or_else(|| not_installed(client))?;
     target.add(&launch, host).await?;
     tracing::info!(client = client.id(), "added BiBCode to an MCP client");
-    Ok(status(client, true, true, None))
+    Ok(status(
+        client,
+        true,
+        State::Present {
+            up_to_date: Some(true),
+        },
+        None,
+    ))
 }
 
 /// `mcpClients.unregister`: removes `bibcode` and nothing else. An entry that is already
@@ -255,5 +281,5 @@ pub(crate) async fn unregister(
     let target = locate(settings, client, host).ok_or_else(|| not_installed(client))?;
     target.remove(host).await?;
     tracing::info!(client = client.id(), "removed BiBCode from an MCP client");
-    Ok(status(client, true, false, None))
+    Ok(status(client, true, State::Absent, None))
 }

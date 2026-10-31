@@ -1902,10 +1902,14 @@ impl ProductionServerControl for NativeServerControl {
                 "mcpClients.getRegistrations" => {
                     let settings = control.settings.read().await.clone();
                     let host = mcp_client_registration::Host::current(&control.config.base_dir);
-                    Ok(
-                        mcp_client_registration::registrations(&settings, &host, &cancellation)
-                            .await,
+                    let launch = mcp_launch_argv(&control.config);
+                    Ok(mcp_client_registration::registrations(
+                        &settings,
+                        launch.as_deref(),
+                        &host,
+                        &cancellation,
                     )
+                    .await)
                 }
                 "mcpClients.register" => {
                     let settings = control.settings.read().await.clone();

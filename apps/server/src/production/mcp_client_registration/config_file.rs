@@ -1,197 +1,128 @@
-//! Cursor and OpenCode: their documented user config, edited one key at a time. The file is
-//! parsed into an order-keeping tree, only `bibcode` in the MCP section changes, and the result
-//! replaces the file atomically (a temporary file in the same folder, the old file's mode, then
-//! a rename). A file that is not plain JSON, comments included, is refused and left untouched:
-//! rewriting it would drop what BiBCode cannot parse.
+//! Cursor and OpenCode: their documented user config, edited one key at a time.
+//!
+//! Every file the tool reads is looked at: OpenCode merges `opencode.json` and
+//! `opencode.jsonc`, so a `bibcode` entry in either counts, and a change goes to the file that
+//! already holds the entry. A file is parsed into an order-keeping tree, only `bibcode` in the
+//! MCP section changes, and the result replaces the file atomically: a temporary file in the
+//! same folder with the old file's mode and owner, a check that nobody saved the file since it
+//! was read, then a rename. BiBCode's own changes to one tool run one at a time. A file with
+//! comments can be read but not written without losing them, so a change it would need is
+//! refused, as is a file that is not JSON at all and a link to a file outside the tool's own
+//! folder. Extended attributes and ACLs on a replaced file are not kept.
 
 use std::{
-    fmt,
+    collections::HashMap,
     io::Write as _,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
+    time::SystemTime,
 };
 
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{MapAccess, SeqAccess, Visitor},
-    ser::{SerializeMap, SerializeSeq},
-};
 use serde_json::Value;
 
-use super::{McpClient, SERVER_NAME, refusal};
+use super::{
+    McpClient, SERVER_NAME, State,
+    ordered_json::{Json, parse_jsonc},
+    refusal,
+};
 
-/// A JSON value whose objects keep their keys in file order.
-#[derive(Clone, Debug, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Number(serde_json::Number),
-    String(String),
-    Array(Vec<Json>),
-    Object(Vec<(String, Json)>),
-}
+/// Reads and replaces before giving up on a file someone else keeps saving.
+const ATTEMPTS: usize = 3;
 
-impl Json {
-    fn string(text: &str) -> Self {
-        Self::String(text.to_owned())
-    }
+/// One lock per config file path: BiBCode's own changes never race each other.
+static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
 
-    fn object(entries: impl IntoIterator<Item = (&'static str, Json)>) -> Self {
-        Self::Object(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key.to_owned(), value))
-                .collect(),
-        )
-    }
-}
+/// A test's stand-in for another program saving the file during a change.
+#[cfg(all(test, unix))]
+type Interference = Arc<dyn Fn(&Path) + Send + Sync>;
 
-impl<'de> Deserialize<'de> for Json {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonVisitor)
-    }
-}
-
-struct JsonVisitor;
-
-impl<'de> Visitor<'de> for JsonVisitor {
-    type Value = Json;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Json, E> {
-        Ok(Json::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Json, E> {
-        Ok(Json::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Json, E> {
-        Ok(Json::Number(value.into()))
-    }
-
-    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Json, E> {
-        serde_json::Number::from_f64(value)
-            .map(Json::Number)
-            .ok_or_else(|| E::custom("a number JSON cannot hold"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Json, E> {
-        Ok(Json::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Json, E> {
-        Ok(Json::String(value))
-    }
-
-    fn visit_unit<E>(self) -> Result<Json, E> {
-        Ok(Json::Null)
-    }
-
-    fn visit_none<E>(self) -> Result<Json, E> {
-        Ok(Json::Null)
-    }
-
-    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Json, D::Error> {
-        Json::deserialize(deserializer)
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Json, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = sequence.next_element()? {
-            items.push(item);
-        }
-        Ok(Json::Array(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
-        let mut entries: Vec<(String, Json)> = Vec::new();
-        while let Some((key, value)) = map.next_entry::<String, Json>()? {
-            // A repeated key keeps its first place and its last value, as JSON readers do.
-            match entries.iter_mut().find(|(existing, _)| *existing == key) {
-                Some(entry) => entry.1 = value,
-                None => entries.push((key, value)),
-            }
-        }
-        Ok(Json::Object(entries))
-    }
-}
-
-impl Serialize for Json {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Null => serializer.serialize_unit(),
-            Self::Bool(value) => serializer.serialize_bool(*value),
-            Self::Number(value) => value.serialize(serializer),
-            Self::String(value) => serializer.serialize_str(value),
-            Self::Array(items) => {
-                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    sequence.serialize_element(item)?;
-                }
-                sequence.end()
-            }
-            Self::Object(entries) => {
-                let mut map = serializer.serialize_map(Some(entries.len()))?;
-                for (key, value) in entries {
-                    map.serialize_entry(key, value)?;
-                }
-                map.end()
-            }
-        }
-    }
-}
-
-/// One tool's user config file and the object in it that holds MCP servers.
+/// One tool's user config files and the object in them that holds MCP servers.
+#[derive(Clone)]
 pub(super) struct ConfigFile {
     client: McpClient,
     directory: PathBuf,
-    path: PathBuf,
+    /// Every file the tool reads; a new entry goes to the first that exists, else the first.
+    paths: Vec<PathBuf>,
     section: &'static str,
-    /// The path as the person would write it (`~/…`), for messages.
-    shown: String,
+    home: PathBuf,
+    /// Runs just before the check that precedes a rename, as another program's save would.
+    #[cfg(all(test, unix))]
+    interfere: Option<Interference>,
+}
+
+/// A file as read: its bytes and modification time tell whether it was saved since.
+struct Loaded {
+    path: PathBuf,
+    original: Vec<u8>,
+    modified: Option<SystemTime>,
+    /// `false` for JSONC, which can be read but not written back.
+    writable: bool,
+    document: Json,
+}
+
+enum Change<'a> {
+    Add(&'a [String]),
+    Remove,
+}
+
+enum ReplaceError {
+    /// Someone saved the file after it was read.
+    Changed,
+    Io(std::io::Error),
 }
 
 impl ConfigFile {
     /// `~/.cursor/mcp.json`, `{ "mcpServers": { "bibcode": { "command", "args" } } }`.
     pub(super) fn cursor(directory: PathBuf, home: &Path) -> Self {
-        let path = directory.join("mcp.json");
-        Self::new(McpClient::Cursor, directory, path, "mcpServers", home)
+        let paths = vec![directory.join("mcp.json")];
+        Self::new(McpClient::Cursor, directory, paths, "mcpServers", home)
     }
 
-    /// `~/.config/opencode/opencode.json` (or an existing `opencode.jsonc` when there is no
-    /// `.json`), `{ "mcp": { "bibcode": { "type": "local", "command": [...], "enabled" } } }`.
+    /// `opencode.json` and `opencode.jsonc` in OpenCode's config folder, which it merges:
+    /// `{ "mcp": { "bibcode": { "type": "local", "command": [...], "enabled": true } } }`.
     pub(super) fn opencode(directory: PathBuf, home: &Path) -> Self {
-        let json = directory.join("opencode.json");
-        let jsonc = directory.join("opencode.jsonc");
-        let path = if !json.exists() && jsonc.exists() {
-            jsonc
-        } else {
-            json
-        };
-        Self::new(McpClient::Opencode, directory, path, "mcp", home)
+        let paths = vec![
+            directory.join("opencode.json"),
+            directory.join("opencode.jsonc"),
+        ];
+        Self::new(McpClient::Opencode, directory, paths, "mcp", home)
     }
 
     fn new(
         client: McpClient,
         directory: PathBuf,
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         section: &'static str,
         home: &Path,
     ) -> Self {
-        let shown = path.strip_prefix(home).map_or_else(
-            |_| path.display().to_string(),
-            |relative| format!("~/{}", relative.display()),
-        );
         Self {
             client,
             directory,
-            path,
+            paths,
             section,
-            shown,
+            home: home.to_path_buf(),
+            #[cfg(all(test, unix))]
+            interfere: None,
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn with_interference(mut self, interfere: Interference) -> Self {
+        self.interfere = Some(interfere);
+        self
+    }
+
+    /// The path as the person would write it (`~/…`), for messages.
+    fn shown(&self, path: &Path) -> String {
+        let canonical_home = std::fs::canonicalize(&self.home).ok();
+        [Some(self.home.as_path()), canonical_home.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|home| path.strip_prefix(home).ok())
+            .map_or_else(
+                || path.display().to_string(),
+                |relative| format!("~/{}", relative.display()),
+            )
     }
 
     fn entry(&self, launch: &[String]) -> Json {
@@ -210,21 +141,146 @@ impl ConfigFile {
         }
     }
 
-    pub(super) async fn is_registered(&self) -> Result<bool, Value> {
-        let document = self.load().await?;
-        Ok(document
-            .as_ref()
-            .and_then(|document| section(document, self.section))
-            .is_some_and(|servers| servers.iter().any(|(key, _)| key == SERVER_NAME)))
+    /// The command an entry launches, when it is one BiBCode can read.
+    fn launch_of(&self, entry: &Json) -> Option<Vec<String>> {
+        match self.client {
+            McpClient::Opencode => entry.get("command")?.strings(),
+            _ => {
+                let mut launch = vec![entry.get("command")?.as_str()?.to_owned()];
+                if let Some(args) = entry.get("args") {
+                    launch.extend(args.strings()?);
+                }
+                Some(launch)
+            }
+        }
+    }
+
+    /// Whether any file holds `bibcode`, and whether every such entry runs `launch`.
+    pub(super) async fn read(&self, launch: Option<&[String]>) -> Result<State, Value> {
+        let file = self.clone();
+        let launch = launch.map(<[String]>::to_vec);
+        blocking(move || file.read_now(launch.as_deref())).await
     }
 
     pub(super) async fn add(&self, launch: &[String]) -> Result<(), Value> {
-        let mut document = self.load().await?.unwrap_or(Json::Object(Vec::new()));
-        let Json::Object(entries) = &mut document else {
+        let file = self.clone();
+        let launch = launch.to_vec();
+        blocking(move || file.change_now(&Change::Add(&launch))).await
+    }
+
+    pub(super) async fn remove(&self) -> Result<(), Value> {
+        let file = self.clone();
+        blocking(move || file.change_now(&Change::Remove)).await
+    }
+
+    fn read_now(&self, launch: Option<&[String]>) -> Result<State, Value> {
+        let loaded = self.load()?;
+        let entries = loaded
+            .iter()
+            .filter_map(|file| self.servers(&file.document)?.get(SERVER_NAME))
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(State::Absent);
+        }
+        Ok(State::Present {
+            up_to_date: launch.map(|launch| {
+                entries
+                    .iter()
+                    .all(|entry| self.launch_of(entry).as_deref() == Some(launch))
+            }),
+        })
+    }
+
+    fn servers<'a>(&self, document: &'a Json) -> Option<&'a Json> {
+        document.get(self.section)
+    }
+
+    fn change_now(&self, change: &Change<'_>) -> Result<(), Value> {
+        let locks = self.locks();
+        let _guards = locks
+            .iter()
+            .map(|lock| lock.lock().unwrap_or_else(PoisonError::into_inner))
+            .collect::<Vec<_>>();
+        for _ in 0..ATTEMPTS {
+            match self.change_once(change) {
+                Err(ReplaceError::Changed) => {}
+                Err(ReplaceError::Io(error)) => {
+                    tracing::warn!(client = self.client.id(), %error, "could not save an MCP client's config");
+                    return Err(refusal(
+                        "failed",
+                        &format!(
+                            "BiBCode could not save {}'s settings ({}). Check the file's permissions, then try again.",
+                            self.client.label(),
+                            error.kind()
+                        ),
+                    ));
+                }
+                Ok(result) => return result,
+            }
+        }
+        Err(refusal(
+            "failed",
+            &format!(
+                "{} kept changing while BiBCode was saving it. Close the apps that edit it, then try again.",
+                self.shown(&self.paths[0])
+            ),
+        ))
+    }
+
+    /// One read and replace. The outer `Err` asks for another attempt or reports an I/O
+    /// failure; the inner one is a refusal to change anything.
+    fn change_once(&self, change: &Change<'_>) -> Result<Result<(), Value>, ReplaceError> {
+        let loaded = match self.load() {
+            Ok(loaded) => loaded,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let holding = loaded
+            .iter()
+            .filter(|file| {
+                self.servers(&file.document)
+                    .and_then(|servers| servers.get(SERVER_NAME))
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        let targets: Vec<Option<&Loaded>> = match change {
+            Change::Remove => holding.into_iter().map(Some).collect(),
+            Change::Add(_) if holding.is_empty() => vec![loaded.first()],
+            Change::Add(_) => holding.into_iter().map(Some).collect(),
+        };
+        let mut writes = Vec::with_capacity(targets.len());
+        for target in targets {
+            let (path, mut document) = match target {
+                Some(file) if !file.writable => {
+                    return Ok(Err(self.invalid(
+                        &file.path,
+                        "it has comments or trailing commas, which BiBCode would lose",
+                    )));
+                }
+                Some(file) => (file.path.clone(), file.document.clone()),
+                None => (self.paths[0].clone(), Json::Object(Vec::new())),
+            };
+            let destination = match self.destination(&path) {
+                Ok(destination) => destination,
+                Err(refused) => return Ok(Err(refused)),
+            };
+            self.apply(&mut document, change);
+            let mut contents =
+                serde_json::to_vec_pretty(&document).expect("a JSON tree serializes");
+            contents.push(b'\n');
+            writes.push((destination, target, contents));
+        }
+        for (destination, target, contents) in writes {
+            self.replace(&destination, target, &contents)?;
+        }
+        Ok(Ok(()))
+    }
+
+    fn apply(&self, document: &mut Json, change: &Change<'_>) {
+        let Json::Object(entries) = document else {
             unreachable!("load accepts only an object");
         };
-        let servers = match entries.iter_mut().find(|(key, _)| key == self.section) {
-            Some((_, servers)) => servers,
+        let servers = match entries.iter_mut().position(|(key, _)| key == self.section) {
+            Some(index) => &mut entries[index].1,
             None => {
                 entries.push((self.section.to_owned(), Json::Object(Vec::new())));
                 &mut entries.last_mut().expect("just pushed").1
@@ -233,154 +289,208 @@ impl ConfigFile {
         let Json::Object(servers) = servers else {
             unreachable!("load accepts only an object section");
         };
-        let entry = self.entry(launch);
-        match servers.iter_mut().find(|(key, _)| key == SERVER_NAME) {
-            Some(existing) => existing.1 = entry,
-            None => servers.push((SERVER_NAME.to_owned(), entry)),
-        }
-        self.write(&document).await
-    }
-
-    pub(super) async fn remove(&self) -> Result<(), Value> {
-        let Some(mut document) = self.load().await? else {
-            return Ok(());
-        };
-        let Json::Object(entries) = &mut document else {
-            unreachable!("load accepts only an object");
-        };
-        let Some((_, Json::Object(servers))) =
-            entries.iter_mut().find(|(key, _)| key == self.section)
-        else {
-            return Ok(());
-        };
-        let before = servers.len();
-        servers.retain(|(key, _)| key != SERVER_NAME);
-        if servers.len() == before {
-            return Ok(());
-        }
-        self.write(&document).await
-    }
-
-    /// The file as an object whose MCP section, if any, is an object; `None` when it does not
-    /// exist yet.
-    async fn load(&self) -> Result<Option<Json>, Value> {
-        let text = match tokio::fs::read_to_string(&self.path).await {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                tracing::warn!(client = self.client.id(), %error, "could not read an MCP client's config");
-                return Err(refusal(
-                    "failed",
-                    &format!(
-                        "BiBCode could not read {} ({}). Check its permissions, then try again.",
-                        self.shown,
-                        error.kind()
-                    ),
-                ));
+        match change {
+            Change::Add(launch) => {
+                let entry = self.entry(launch);
+                match servers.iter_mut().find(|(key, _)| key == SERVER_NAME) {
+                    Some(existing) => existing.1 = entry,
+                    None => servers.push((SERVER_NAME.to_owned(), entry)),
+                }
             }
-        };
-        if text.trim().is_empty() {
-            return Ok(None);
+            Change::Remove => servers.retain(|(key, _)| key != SERVER_NAME),
         }
-        let document = serde_json::from_str::<Json>(&text)
-            .map_err(|error| self.invalid(&format!("it isn't plain JSON ({error})")))?;
-        let Json::Object(entries) = &document else {
-            return Err(self.invalid("it isn't a JSON object"));
-        };
-        if entries
-            .iter()
-            .any(|(key, value)| key == self.section && !matches!(value, Json::Object(_)))
-        {
-            return Err(self.invalid(&format!("its \"{}\" isn't an object", self.section)));
-        }
-        Ok(Some(document))
     }
 
-    fn invalid(&self, why: &str) -> Value {
+    /// Every file that exists, each an object whose MCP section, if any, is an object.
+    fn load(&self) -> Result<Vec<Loaded>, Value> {
+        let mut loaded = Vec::new();
+        for path in &self.paths {
+            let original = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(client = self.client.id(), %error, "could not read an MCP client's config");
+                    return Err(refusal(
+                        "failed",
+                        &format!(
+                            "BiBCode could not read {} ({}). Check its permissions, then try again.",
+                            self.shown(path),
+                            error.kind()
+                        ),
+                    ));
+                }
+            };
+            let modified = std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            let text = String::from_utf8_lossy(&original);
+            let (document, writable) = if text.trim().is_empty() {
+                (Json::Object(Vec::new()), true)
+            } else {
+                match serde_json::from_str::<Json>(&text) {
+                    Ok(document) => (document, true),
+                    Err(strict) => match parse_jsonc(&text) {
+                        Ok(document) => (document, false),
+                        Err(_) => {
+                            return Err(
+                                self.invalid(path, &format!("it isn't valid JSON ({strict})"))
+                            );
+                        }
+                    },
+                }
+            };
+            if !matches!(document, Json::Object(_)) {
+                return Err(self.invalid(path, "it isn't a JSON object"));
+            }
+            if document
+                .get(self.section)
+                .is_some_and(|servers| !matches!(servers, Json::Object(_)))
+            {
+                return Err(
+                    self.invalid(path, &format!("its \"{}\" isn't an object", self.section))
+                );
+            }
+            loaded.push(Loaded {
+                path: path.clone(),
+                original,
+                modified,
+                writable,
+                document,
+            });
+        }
+        Ok(loaded)
+    }
+
+    fn invalid(&self, path: &Path, why: &str) -> Value {
         refusal(
             "invalid_config",
             &format!(
                 "BiBCode left {} unchanged because {why}. Fix the file, or add BiBCode to {} by hand from Other MCP clients.",
-                self.shown,
+                self.shown(path),
                 self.client.label()
             ),
         )
     }
 
-    async fn write(&self, document: &Json) -> Result<(), Value> {
-        let mut contents = serde_json::to_vec_pretty(document).expect("a JSON tree serializes");
-        contents.push(b'\n');
-        let directory = self.directory.clone();
-        let path = self.path.clone();
-        let written =
-            tokio::task::spawn_blocking(move || replace_file(&directory, &path, &contents)).await;
-        match written {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                tracing::warn!(client = self.client.id(), %error, "could not write an MCP client's config");
-                Err(refusal(
-                    "failed",
-                    &format!(
-                        "BiBCode could not save {} ({}). Check its permissions, then try again.",
-                        self.shown,
-                        error.kind()
-                    ),
-                ))
-            }
-            Err(error) => {
-                tracing::warn!(client = self.client.id(), %error, "writing an MCP client's config stopped");
-                Err(refusal(
-                    "failed",
-                    "BiBCode could not save the change. Try again.",
-                ))
-            }
+    /// Where a write lands: the file, or the file a link inside the tool's folder points to.
+    /// A link out of that folder (a dotfiles checkout, say) is not BiBCode's to replace.
+    fn destination(&self, path: &Path) -> Result<PathBuf, Value> {
+        if !path.is_symlink() {
+            return Ok(path.to_path_buf());
         }
+        let target = std::fs::canonicalize(path)
+            .map_err(|_| self.invalid(path, "it is a link to a file that does not exist"))?;
+        let folder =
+            std::fs::canonicalize(&self.directory).unwrap_or_else(|_| self.directory.clone());
+        if target.starts_with(&folder) {
+            Ok(target)
+        } else {
+            Err(self.invalid(
+                path,
+                &format!(
+                    "it is a link to {}, outside {}",
+                    self.shown(&target),
+                    self.shown(&self.directory)
+                ),
+            ))
+        }
+    }
+
+    fn locks(&self) -> Vec<Arc<Mutex<()>>> {
+        let mut table = LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+        self.paths
+            .iter()
+            .map(|path| table.entry(path.clone()).or_default().clone())
+            .collect()
+    }
+
+    /// Replaces `destination` with `contents` in one rename, keeping the old file's mode and
+    /// owner, unless the file is no longer what `read` saw.
+    fn replace(
+        &self,
+        destination: &Path,
+        read: Option<&Loaded>,
+        contents: &[u8],
+    ) -> Result<(), ReplaceError> {
+        std::fs::create_dir_all(&self.directory).map_err(ReplaceError::Io)?;
+        let parent = destination.parent().unwrap_or(&self.directory);
+        let name = destination.file_name().map_or_else(
+            || "config".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let temporary = parent.join(format!(
+            ".{name}.bibcode-{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let result = (|| {
+            let mut file = std::fs::File::create_new(&temporary).map_err(ReplaceError::Io)?;
+            file.write_all(contents).map_err(ReplaceError::Io)?;
+            file.sync_all().map_err(ReplaceError::Io)?;
+            drop(file);
+            if let Ok(metadata) = std::fs::metadata(destination) {
+                std::fs::set_permissions(&temporary, metadata.permissions())
+                    .map_err(ReplaceError::Io)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let created = std::fs::metadata(&temporary).map_err(ReplaceError::Io)?;
+                    if (created.uid(), created.gid()) != (metadata.uid(), metadata.gid()) {
+                        std::os::unix::fs::chown(
+                            &temporary,
+                            Some(metadata.uid()),
+                            Some(metadata.gid()),
+                        )
+                        .map_err(ReplaceError::Io)?;
+                    }
+                }
+            }
+            #[cfg(all(test, unix))]
+            if let Some(interfere) = &self.interfere {
+                interfere(destination);
+            }
+            if !unchanged(destination, read).map_err(ReplaceError::Io)? {
+                return Err(ReplaceError::Changed);
+            }
+            std::fs::rename(&temporary, destination).map_err(ReplaceError::Io)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 }
 
-fn section<'a>(document: &'a Json, name: &str) -> Option<&'a [(String, Json)]> {
-    let Json::Object(entries) = document else {
-        return None;
+/// Whether the file is still what was read: absent if it was absent, else the same bytes
+/// and modification time.
+fn unchanged(path: &Path, read: Option<&Loaded>) -> std::io::Result<bool> {
+    let current = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
     };
-    entries.iter().find_map(|(key, value)| match value {
-        Json::Object(servers) if key == name => Some(servers.as_slice()),
-        _ => None,
+    Ok(match (read, current) {
+        (None, None) => true,
+        (Some(read), Some(current)) => {
+            current == read.original
+                && std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    == read.modified
+        }
+        _ => false,
     })
 }
 
-/// Replaces `path` with `contents` in one rename: through a symlink to its target, keeping the
-/// old file's mode. The folder is created only for a tool BiBCode found installed.
-fn replace_file(directory: &Path, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(directory)?;
-    let target = if path.is_symlink() {
-        std::fs::canonicalize(path)?
-    } else {
-        path.to_path_buf()
-    };
-    let permissions = std::fs::metadata(&target)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let parent = target.parent().unwrap_or(directory);
-    let name = target.file_name().map_or_else(
-        || "config".to_owned(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let temporary = parent.join(format!(
-        ".{name}.bibcode-{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        let mut file = std::fs::File::create_new(&temporary)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        if let Some(permissions) = permissions {
-            std::fs::set_permissions(&temporary, permissions)?;
-        }
-        std::fs::rename(&temporary, &target)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, Value> + Send + 'static,
+) -> Result<T, Value> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "an MCP client config change stopped");
+            Err(refusal(
+                "failed",
+                "BiBCode could not finish the change. Try again.",
+            ))
+        })
 }
