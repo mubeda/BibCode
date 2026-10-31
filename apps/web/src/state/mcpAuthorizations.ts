@@ -1,4 +1,9 @@
-import type { AuthMcpAccessLevel, AuthPendingMcpAuthorization } from "@bibcode/contracts";
+import type {
+  AuthClientSession,
+  AuthMcpAccessLevel,
+  AuthPendingMcpAuthorization,
+} from "@bibcode/contracts";
+import * as DateTime from "effect/DateTime";
 
 import { decideServerMcpAuthorization } from "../environments/primary";
 import { authEnvironment } from "./auth";
@@ -60,4 +65,38 @@ export function remoteMcpUrl(httpBaseUrl: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+/** How long a remote agent's last connection still vouches for the address it used. */
+const OBSERVED_ADDRESS_MS = 10 * 60_000;
+
+/**
+ * An HTTPS MCP URL this server was reached on recently, through a proxy or tunnel it does not
+ * run (#139, slice R): a waiting request to connect's origin, else the address of a remote
+ * agent connected now or in the last ten minutes, the newest first. `null` when none: an old
+ * observation may name a tunnel that is gone.
+ */
+export function observedRemoteMcpUrl(
+  requests: ReadonlyArray<Pick<AuthPendingMcpAuthorization, "origin">>,
+  clients: ReadonlyArray<Pick<AuthClientSession, "connected" | "lastConnectedAt" | "mcpResource">>,
+  now: number = Date.now(),
+): string | null {
+  for (const request of requests) {
+    const url = remoteMcpUrl(request.origin);
+    if (url !== null) return url;
+  }
+  let newest: { readonly url: string; readonly at: number } | null = null;
+  for (const client of clients) {
+    const url = remoteMcpUrl(client.mcpResource ?? null);
+    if (url === null) continue;
+    const at = client.connected
+      ? now
+      : client.lastConnectedAt === null
+        ? Number.NEGATIVE_INFINITY
+        : DateTime.toEpochMillis(client.lastConnectedAt);
+    if (now - at <= OBSERVED_ADDRESS_MS && (newest === null || at > newest.at)) {
+      newest = { url, at };
+    }
+  }
+  return newest?.url ?? null;
 }

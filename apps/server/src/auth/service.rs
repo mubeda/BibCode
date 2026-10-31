@@ -1280,9 +1280,11 @@ impl AuthService {
                 refreshed.last_connected_at_ms = current.last_connected_at_ms;
             }
             (refreshed.view(false) != previous_view)
-                .then(|| AuthAccessChange::ClientUpserted(refreshed.view(false)))
+                .then(|| AuthAccessChange::ClientUpserted(Box::new(refreshed.view(false))))
         } else {
-            Some(AuthAccessChange::ClientUpserted(refreshed.view(false)))
+            Some(AuthAccessChange::ClientUpserted(Box::new(
+                refreshed.view(false),
+            )))
         };
         state.sessions.insert(session_id.to_owned(), refreshed);
         if change.is_some() {
@@ -2131,7 +2133,7 @@ impl AuthService {
         state.sessions.insert(record.session_id.clone(), record);
         state.bump_authority_generation();
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         self.ensure_authority_watcher();
         Ok(McpOAuthMint::Minted(McpOAuthTokens {
             access_token,
@@ -2340,7 +2342,7 @@ impl AuthService {
         }
         state.bump_authority_generation();
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         Ok(McpAccessChange::Changed)
     }
 
@@ -2621,7 +2623,7 @@ impl AuthService {
         {
             tracing::error!(%error, %session_id, "failed to persist session connection time");
         }
-        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         Ok(guard)
     }
 
@@ -2647,7 +2649,7 @@ impl AuthService {
         };
         drop(state);
         if let Some(view) = view {
-            self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+            self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         }
     }
 
@@ -2758,7 +2760,7 @@ impl AuthService {
         state.sessions.insert(session_id.clone(), record);
         state.bump_authority_generation();
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         self.ensure_authority_watcher();
         if let Some(guard) = &mut pending_issuance_guard {
             guard.disarm();
@@ -2891,6 +2893,7 @@ impl SessionRecord {
             // An outside agent's access, and what Take over replaced (#139, slice X1).
             mcp_access: self.mcp_access.clone(),
             mcp_access_hand_back: self.mcp_access_hand_back.clone(),
+            mcp_resource: self.mcp_resource.clone(),
         }
     }
 }
@@ -2998,10 +3001,14 @@ async fn reconcile_authority_snapshot(
                 session.last_connected_at_ms = current.last_connected_at_ms;
             }
             if session.view(false) != previous_view {
-                changes.push(AuthAccessChange::ClientUpserted(session.view(false)));
+                changes.push(AuthAccessChange::ClientUpserted(Box::new(
+                    session.view(false),
+                )));
             }
         } else {
-            changes.push(AuthAccessChange::ClientUpserted(session.view(false)));
+            changes.push(AuthAccessChange::ClientUpserted(Box::new(
+                session.view(false),
+            )));
         }
         next_sessions.insert(session.session_id.clone(), session);
     }
@@ -3952,6 +3959,18 @@ mod tests {
         );
         assert_eq!(credential.access.as_deref(), Some("approval-required"));
         assert!(credential.principal.expires_at_ms < now_ms() + 3_601_000);
+        // The person's view of the grant names the address it was granted on, which Remote
+        // agents shows when the app's own address is not HTTPS.
+        let view = service
+            .list_clients("person")
+            .await
+            .into_iter()
+            .find(|client| client.session_id == credential.principal.session_id)
+            .unwrap();
+        assert_eq!(
+            view.mcp_resource.as_deref(),
+            Some("http://127.0.0.1:3773/mcp")
+        );
         let grant_expiry = service
             .active_session_expiry(&credential.principal.session_id)
             .await
