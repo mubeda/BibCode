@@ -94,6 +94,13 @@ function timeText(iso: string): string {
 
 /** What an endpoint is doing, in a few words. */
 export function endpointStatusText(endpoint: WebhookEndpoint): string {
+  const state = endpointStateText(endpoint);
+  if (endpoint.droppedDeliveries === 0) return state;
+  const count = endpoint.droppedDeliveries;
+  return `${state} · ${count} ${count === 1 ? "delivery" : "deliveries"} dropped when the queue was full`;
+}
+
+function endpointStateText(endpoint: WebhookEndpoint): string {
   if (endpoint.disabledReason === "failures") return "Turned off after 10 failed deliveries";
   if (endpoint.disabledReason === "client-revoked") return "Turned off: its MCP client was revoked";
   if (!endpoint.enabled) return "Off";
@@ -115,7 +122,11 @@ export function deliveryStatusText(delivery: WebhookDelivery): string {
     case "sending":
       return "Sending";
     case "abandoned":
-      return "Not sent: webhooks or the endpoint were turned off";
+      return delivery.lastError === "queue_full"
+        ? "Not sent: the queue was full"
+        : delivery.lastError === "endpoint_changed"
+          ? "Not sent: the endpoint's URL or events changed"
+          : "Not sent: webhooks or the endpoint were turned off";
     case "failed":
       return `Failed (${status ?? ERROR_LABELS[delivery.lastError ?? ""] ?? delivery.lastError ?? "unknown"})`;
   }

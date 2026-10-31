@@ -158,6 +158,7 @@ function endpoint(overrides: Record<string, unknown> = {}): Record<string, unkno
     disabledReason: null,
     pendingDeliveries: 0,
     lastDeliveryState: null,
+    droppedDeliveries: 0,
     createdAt: "2026-10-31T00:00:00Z",
     updatedAt: "2026-10-31T00:00:00Z",
     ...overrides,
@@ -278,6 +279,31 @@ describe("WebhooksTab", () => {
       command: "upsert",
       request: { environmentId: "local", input: { id: "w1", enabled: true } },
     });
+  });
+
+  it("says when deliveries were dropped from a full queue or by an edit", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ droppedDeliveries: 3 })];
+    h.deliveries = [
+      {
+        deliveryId: "d3",
+        eventId: "ev_3",
+        eventType: "thread.status_changed",
+        state: "abandoned",
+        attempts: 0,
+        lastStatus: null,
+        lastError: "endpoint_changed",
+        latencyMs: null,
+        nextAttemptAt: null,
+        createdAt: "2026-10-31T00:00:00Z",
+        updatedAt: "2026-10-31T00:00:00Z",
+      },
+    ];
+    const container = await render();
+    expect(container.textContent).toContain("On · 3 deliveries dropped when the queue was full");
+    await act(async () => button(container, "Recent deliveries").click());
+    expect(container.textContent).toContain("Not sent: the endpoint's URL or events changed");
+    expect(button(container, "Redeliver").disabled).toBe(false);
   });
 
   it("asks before deleting an endpoint, since its delivery log goes with it", async () => {
