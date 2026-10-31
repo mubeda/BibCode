@@ -51,6 +51,7 @@ function suggestion(overrides: Partial<UiCommitMessageIntent> = {}): UiCommitMes
   return {
     kind: "commitMessage",
     intentId: `intent-${sequence}`,
+    sequence,
     threadId: ThreadId.make("thread-1"),
     cwd: CWD,
     message: "Fix the parser\n\nIt skipped the last line.",
@@ -62,8 +63,12 @@ function suggestion(overrides: Partial<UiCommitMessageIntent> = {}): UiCommitMes
 }
 
 /** The message box and the suggestion, as the Source Control panel lays them out. */
-function Panel(props: { readonly cwd: string }) {
-  const draft = useSourceControlDraft({ environmentId, cwd: props.cwd });
+function Panel(props: { readonly cwd: string; readonly legacyThreadKey?: string | undefined }) {
+  const draft = useSourceControlDraft({
+    environmentId,
+    cwd: props.cwd,
+    ...(props.legacyThreadKey === undefined ? {} : { legacyThreadKey: props.legacyThreadKey }),
+  });
   return (
     <>
       <textarea
@@ -74,6 +79,7 @@ function Panel(props: { readonly cwd: string }) {
       <SourceControlAgentSuggestion
         environmentId={environmentId}
         cwd={props.cwd}
+        legacyThreadKey={props.legacyThreadKey}
         draftMessage={draft.message}
       />
     </>
@@ -82,7 +88,11 @@ function Panel(props: { readonly cwd: string }) {
 
 const roots: ReturnType<typeof createRoot>[] = [];
 let container: HTMLDivElement;
-async function mount(registry: ReturnType<typeof fakeRegistry>, cwd = CWD) {
+async function mount(
+  registry: ReturnType<typeof fakeRegistry>,
+  cwd = CWD,
+  legacyThreadKey?: string,
+) {
   container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -90,7 +100,7 @@ async function mount(registry: ReturnType<typeof fakeRegistry>, cwd = CWD) {
   await act(async () =>
     root.render(
       <RegistryContext.Provider value={registry as never}>
-        <Panel cwd={cwd} />
+        <Panel cwd={cwd} legacyThreadKey={legacyThreadKey} />
       </RegistryContext.Provider>,
     ),
   );
@@ -109,12 +119,51 @@ const click = (name: string) =>
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  useSourceControlPanelStore.setState({ byCwdKey: {}, agentSuggestionByCwdKey: {} });
+  window.localStorage.clear();
+  useSourceControlPanelStore.setState({
+    byThreadKey: {},
+    byCwdKey: {},
+    agentSuggestionByCwdKey: {},
+  });
 });
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await act(async () => root.unmount());
   document.body.replaceChildren();
+  vi.useRealTimers();
+});
+
+describe("SourceControlAgentSuggestion review round 2", () => {
+  it("keeps a half-written draft from before folder drafts when a suggestion is pending", async () => {
+    // Reload: the v1 draft is keyed by thread, and the suggestion is already in the snapshot.
+    const legacyThreadKey = "env-1:thread-1";
+    useSourceControlPanelStore.setState({
+      byThreadKey: { [legacyThreadKey]: { message: "half" } },
+    });
+    const registry = fakeRegistry();
+    await emit(registry, [suggestion({ message: "Fix it" })]);
+    await mount(registry, CWD, legacyThreadKey);
+    expect(textarea().value).toBe("half");
+    expect(container.textContent).toContain("Agent Claude Code suggested a message");
+    expect(useSourceControlPanelStore.getState().byThreadKey).toEqual({});
+  });
+
+  it("never applies a suggestion that expired, and hides one when it expires", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const registry = fakeRegistry();
+    await mount(registry);
+    await emit(registry, [suggestion({ expiresAt: new Date(Date.now() - 1).toISOString() })]);
+    expect(textarea().value).toBe("");
+
+    await act(async () => useSourceControlPanelStore.getState().setCwdMessage(CWD_KEY, "mine"));
+    await emit(registry, [suggestion({ expiresAt: new Date(Date.now() + 60_000).toISOString() })]);
+    expect(container.textContent).toContain("suggested a message");
+    await act(async () => {
+      vi.advanceTimersByTime(60_001);
+    });
+    expect(container.textContent).not.toContain("suggested a message");
+    expect(textarea().value).toBe("mine");
+  });
 });
 
 describe("SourceControlAgentSuggestion", () => {

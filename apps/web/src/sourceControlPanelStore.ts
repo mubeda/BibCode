@@ -45,8 +45,17 @@ interface SourceControlPanelStoreState {
   setCwdMessage: (cwdKey: string, message: string) => void;
   clearCwdDraft: (cwdKey: string) => void;
   promoteThreadDraft: (threadKey: string, cwdKey: string) => void;
-  /** A suggestion arrived: fill an empty draft, else offer it. Each intent is handled once. */
-  receiveAgentCommitSuggestion: (cwdKey: string, intentId: string, message: string) => void;
+  /**
+   * A suggestion arrived: fill an empty draft, else offer it. Each intent is handled once. The
+   * thread's draft from before folder drafts (`legacyThreadKey`) is promoted first, and what
+   * another tab saved is read again, so a suggestion never takes the place of typed words.
+   */
+  receiveAgentCommitSuggestion: (
+    cwdKey: string,
+    intentId: string,
+    message: string,
+    legacyThreadKey?: string,
+  ) => void;
   /** The person chose **Use it**: the suggestion replaces the draft. */
   acceptAgentCommitSuggestion: (cwdKey: string, intentId: string, message: string) => void;
   /** The person chose **Undo** after **Use it**: the draft it replaced comes back. */
@@ -76,7 +85,7 @@ function receiveSuggestion(
   intentId: string,
   message: string,
 ): Partial<SourceControlPanelStoreState> {
-  if (state.agentSuggestionByCwdKey[cwdKey]?.intentId === intentId) return state;
+  if (state.agentSuggestionByCwdKey[cwdKey]?.intentId === intentId) return {};
   const draft = state.byCwdKey[cwdKey]?.message ?? "";
   if (draft.trim().length > 0) {
     return {
@@ -92,6 +101,71 @@ function receiveSuggestion(
       intentId,
       outcome: "filled",
     }),
+  };
+}
+
+/** Moves the thread's draft from before folder drafts to the folder, unless the folder has one. */
+function promote(
+  state: SourceControlPanelStoreState,
+  threadKey: string,
+  cwdKey: string,
+): Partial<SourceControlPanelStoreState> {
+  const legacyDraft = state.byThreadKey[threadKey];
+  if (legacyDraft === undefined) return {};
+  const { [threadKey]: _promoted, ...byThreadKey } = state.byThreadKey;
+  if (cwdKey in state.byCwdKey || legacyDraft.message.length === 0) {
+    return { byThreadKey };
+  }
+  return { byThreadKey, byCwdKey: { ...state.byCwdKey, [cwdKey]: { ...legacyDraft } } };
+}
+
+const STORAGE_NAME = "bibcode:source-control-panel-state:v1";
+const STORAGE_VERSION = 2;
+
+type SavedDrafts = Pick<SourceControlPanelStoreState, "byCwdKey" | "agentSuggestionByCwdKey">;
+
+/**
+ * The folder drafts and suggestions saved to storage now, which another tab may have written
+ * since this one loaded; `null` when there are none of this version, or storage reads later.
+ */
+function readSavedDrafts(): SavedDrafts | null {
+  const saved = useSourceControlPanelStore.persist.getOptions().storage?.getItem(STORAGE_NAME);
+  if (saved === null || saved === undefined || saved instanceof Promise) return null;
+  if (saved.version !== STORAGE_VERSION) return null;
+  const state = saved.state as Partial<SavedDrafts> | undefined;
+  return {
+    byCwdKey: state?.byCwdKey ?? {},
+    agentSuggestionByCwdKey: state?.agentSuggestionByCwdKey ?? {},
+  };
+}
+
+/**
+ * Applies an arriving suggestion against what is saved, not only this tab's memory: the saved
+ * folder drafts and suggestion records are taken as they are (another tab may have typed or
+ * handled the suggestion since this one loaded), and only this folder changes. A draft with
+ * text in this tab, a promoted legacy draft included, is kept over the saved one.
+ */
+function receiveAgainstSaved(
+  state: SourceControlPanelStoreState,
+  cwdKey: string,
+  intentId: string,
+  message: string,
+): Partial<SourceControlPanelStoreState> {
+  const saved = readSavedDrafts();
+  if (saved === null) return receiveSuggestion(state, cwdKey, intentId, message);
+  const own = state.byCwdKey[cwdKey];
+  const draft = own !== undefined && own.message.trim().length > 0 ? own : saved.byCwdKey[cwdKey];
+  const { [cwdKey]: _stale, ...savedOthers } = saved.byCwdKey;
+  const merged: SourceControlPanelStoreState = {
+    ...state,
+    byCwdKey: draft === undefined ? savedOthers : { ...savedOthers, [cwdKey]: draft },
+    agentSuggestionByCwdKey: { ...state.agentSuggestionByCwdKey, ...saved.agentSuggestionByCwdKey },
+  };
+  return {
+    byThreadKey: merged.byThreadKey,
+    byCwdKey: merged.byCwdKey,
+    agentSuggestionByCwdKey: merged.agentSuggestionByCwdKey,
+    ...receiveSuggestion(merged, cwdKey, intentId, message),
   };
 }
 
@@ -138,23 +212,21 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
           return { byCwdKey };
         }),
       promoteThreadDraft: (threadKey, cwdKey) =>
+        set((state) =>
+          threadKey in state.byThreadKey ? promote(state, threadKey, cwdKey) : state,
+        ),
+      receiveAgentCommitSuggestion: (cwdKey, intentId, message, legacyThreadKey) =>
         set((state) => {
-          const legacyDraft = state.byThreadKey[threadKey];
-          if (legacyDraft === undefined) return state;
-          const { [threadKey]: _promoted, ...byThreadKey } = state.byThreadKey;
-          if (cwdKey in state.byCwdKey || legacyDraft.message.length === 0) {
-            return { byThreadKey };
+          const legacy = legacyThreadKey !== undefined && legacyThreadKey in state.byThreadKey;
+          // Handled here already: nothing to read or write.
+          if (!legacy && state.agentSuggestionByCwdKey[cwdKey]?.intentId === intentId) {
+            return state;
           }
-          return {
-            byThreadKey,
-            byCwdKey: {
-              ...state.byCwdKey,
-              [cwdKey]: { ...legacyDraft },
-            },
-          };
+          const promoted = legacy
+            ? { ...state, ...promote(state, legacyThreadKey, cwdKey) }
+            : state;
+          return receiveAgainstSaved(promoted, cwdKey, intentId, message);
         }),
-      receiveAgentCommitSuggestion: (cwdKey, intentId, message) =>
-        set((state) => receiveSuggestion(state, cwdKey, intentId, message)),
       acceptAgentCommitSuggestion: (cwdKey, intentId, message) =>
         set((state) => {
           if (state.agentSuggestionByCwdKey[cwdKey]?.intentId !== intentId) return state;
@@ -191,8 +263,8 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
         }),
     }),
     {
-      name: "bibcode:source-control-panel-state:v1",
-      version: 2,
+      name: STORAGE_NAME,
+      version: STORAGE_VERSION,
       storage: createJSONStorage(() =>
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
