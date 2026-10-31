@@ -29,7 +29,7 @@ use crate::production::http_routes::{
     TransferUploadHttpOutcome,
 };
 use crate::transfer::{self, TransferAccess, TransferClaims};
-use crate::workspace::beneath::{Dir, Open};
+use crate::workspace::beneath::{Dir, Open, Root};
 use crate::workspace::paths;
 
 /// Invoked after a successful upload so the owner of the workspace entry index can drop its
@@ -183,18 +183,26 @@ fn downloads(
                         return Err(not_found());
                     }
                 };
-                // The folder still resolves to itself just before it streams; the archive then
-                // reads by path (a residual window, see `workspace::beneath`).
-                if tokio::fs::canonicalize(&canonical).await.ok().as_ref() != Some(&canonical) {
-                    return Err(not_found());
-                }
+                // The folder is held open from here, and the archive walks it through
+                // no-follow handles, so a swap after the check above is never followed.
+                let label = canonical.clone();
+                let folder = tokio::task::spawn_blocking(move || {
+                    Root::new(&canonical_root)
+                        .and_then(|root| Dir::open(&root, &canonical, false))
+                        .map_err(|error| {
+                            tracing::warn!(%error, "folder download open failed");
+                            not_found()
+                        })
+                })
+                .await
+                .map_err(|_| not_found())??;
                 TransferDownloadHttpResponse {
                     file_name,
                     content_type: "application/zip",
                     // A zip is produced as it streams, so its length is unknown until the
                     // last entry: the archive response stays chunked.
                     content_length: None,
-                    body: transfer::archive::archive_body(plan, canonical),
+                    body: transfer::archive::archive_body_from(plan, folder, label),
                 }
             } else {
                 // Opened through a handle on its folder, never by a path that could have
@@ -202,7 +210,8 @@ fn downloads(
                 let file = tokio::task::spawn_blocking(move || {
                     let folder = canonical.parent().ok_or_else(not_found)?;
                     let name = canonical.file_name().ok_or_else(not_found)?;
-                    let file = Dir::open(&canonical_root, folder, false)
+                    let file = Root::new(&canonical_root)
+                        .and_then(|root| Dir::open(&root, folder, false))
                         .and_then(|dir| dir.open_file(name, Open::Read))
                         .map_err(|error| {
                             tracing::warn!(%error, "download file open failed");
