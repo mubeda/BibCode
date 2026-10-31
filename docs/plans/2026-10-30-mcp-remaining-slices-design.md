@@ -3343,7 +3343,14 @@ edit.
   `…_with_a_client_twin_of_its_own`) and
   `providers_and_outside_agents_share_mcp_with_separate_tools_and_checks` asserted that no twin
   exists. The latter now proves the provider still reaches its own `preview_status` with its
-  credential's scope, and that a client call of that name is the twin's.
+  credential's scope, and that a client call of that name is the twin's. In
+  `connect_mcp/device_tools.rs`, besides the accessor, the `DeviceTools` comment that said
+  "if MCP credentials are ever issued to lower-privileged principals, both tool families
+  need a scope check" now says where outside agents are checked.
+- **`bibcode thread` cannot reach the twins.** Its subcommands are fixed (`list`, `start`,
+  `send`, …) and it has no generic tool call. If one is added, each run mints a new session,
+  so its `mcp:<sid>:<threadId>` tab assignment would not carry over between runs; key it on
+  the CLI's shared label then, as `stored_request` does.
 - **The missing host was not a typed error.** `run` folds every invoker failure into
   `PreviewAutomationExecutionError` with the broker's tag in the message
   (`"PreviewAutomationNoAvailableHostError: …"`). The client path splits a
