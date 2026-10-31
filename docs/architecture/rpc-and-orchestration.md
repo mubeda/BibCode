@@ -3702,10 +3702,15 @@ waits on that unpinned clone.
 **Threat model.** Other processes work in the same folder, the provider's own agent among
 them, and can move, swap or write anything there at any moment.
 
-- (a) **Containment, guaranteed.** No operation touches anything outside the workspace or
-  follows a swapped link, whatever any concurrent process does.
-- (b) **BiBCode's own writers are serialized, guaranteed.** An agent's `files_*` call and a
-  person's Files-panel save or upload of the same path never race: both go through this
+- (a) **Containment.** BiBCode never follows a link and never resolves a swapped path
+  component outside the workspace: every operation walks through no-follow handles, and every
+  held folder is re-checked right before each mutation. **Residual:** a concurrent process
+  moving an already-opened folder out of the workspace in the instant between that check and
+  the system call. BiBCode detects it afterwards where it can (a rename is undone, a folder it
+  just created is removed, a delete stops) and refuses further work, but cannot prevent it
+  without kernel support (`openat2` with `RESOLVE_BENEATH` is Linux-only).
+- (b) **BiBCode's own writers are serialized.** An agent's `files_*` call and a person's
+  Files-panel save, upload, rename or delete of the same path never race: all go through this
   server and take the same per-path lock.
 - (c) **Not guaranteed:** atomicity against an editor outside BiBCode writing the same file.
   POSIX has no compare-and-swap on file contents, so a write between a guarded write's check
@@ -3722,29 +3727,42 @@ them, and can move, swap or write anything there at any moment.
   the root (`Dir::contained`: `..` walked by handle to the root's identity), and a rename is
   checked again after and undone if either folder left. Each folder a walk creates is made
   only while its parent is under the root, checked before and after `mkdirat`, and removed
-  through the parent's handle if the parent moved out. A folder's permanent removal renames
-  it through the handle to a fresh name, opens that name by handle, empties it with `openat`
-  and `unlinkat`, and removes the name only while it is still that folder, so a folder put at
-  the parked name survives; if it stops, what is left goes back with a no-replace rename and
-  the caller learns where (`partially_removed`, `leftAt`). The trash, which takes a path,
-  re-checks the folder just before the call. Folder downloads walk and open each entry
-  through no-follow handles (`archive_body_from`) and enforce the entry and size limits while
-  the zip streams.
+  through the parent's handle if the parent moved out (one that something was already put in
+  stays, and the error says so). A folder's permanent removal renames it through the handle
+  to a fresh name, opens that name by handle, and empties it with `openat` and `unlinkat`,
+  re-checking that it is under the root before each removal and stopping at the first failed
+  check; it removes the name only while it is still that folder, so a folder put at the
+  parked name survives. If it stops, what is left goes back with a no-replace rename and the
+  caller learns where (`partially_removed`, `leftAt`). Folder downloads plan and stream
+  through the same no-follow handles (`plan_dir`, `archive_body_from`) and enforce the entry
+  and size limits while the zip streams.
+- **Trash by staging.** `projects.deleteEntry { toTrash }` reuses Source Control's discard
+  staging (`git::trash_by_staging`): the entry is renamed by handle into a private
+  `bibcode-discard` holder (in the workspace's Git directory, else under the server's state
+  directory, `workspace-trash/<hash of the root>`), each folder on the staged path is checked
+  against what BiBCode holds, and only that path goes to the native trash. No workspace path
+  is handed to it. A holder on another file system, or one without the no-replace rename,
+  stages nothing: `trash_unavailable`.
 - **One writer per path.** `PathLocks` (in the workspace service, shared with the upload
-  route) serializes a guarded or plain write and an upload of one path, keyed by its
-  canonical path. An upload holds it from its reservation to its install; a write arriving
-  meanwhile is refused at once (`path_busy`, `McpFileBusyError` for agents), and a write
-  waits at most 10 seconds for another write.
+  route), keyed by canonical path, serializes a guarded or plain write, an upload, a delete
+  or trash, and a rename (both its paths, in key order). An upload holds it from its
+  reservation to its install; a write arriving meanwhile is refused at once (`path_busy`,
+  `McpFileBusyError` for agents), and other writers wait at most 10 seconds.
 - **Writes in place.** `projects.writeFileIfUnchanged` with `missing` creates with `O_EXCL`;
   with a `version` it opens the file `O_RDWR | O_NOFOLLOW` through the re-validated folder,
   checks its identity and content through that descriptor, then truncates and writes it, so
-  the file keeps its inode, links, owner, permissions, ACLs and extended attributes.
+  the file keeps its inode, links, owner, permissions, ACLs and extended attributes. The old
+  content (up to 16 MiB) is kept and written back if the write fails after the truncation;
+  `write_failed` says whether it came back. With `singleLinkOnly` (set by `files_write`, not
+  by the Files panel) a file with more than one hard link is refused (`hard_linked`,
+  `McpHardLinkedFileError`): writing it in place would change its other names, which can be
+  outside the workspace. A person may save their own hard-linked file.
 - **No replacement by surprise.** `projects.renameEntry`, an upload without `overwrite` and a
   delete's restore use one no-replace rename (`beneath::rename_no_replace`, shared with
   Source Control's discard staging): `renameat2(RENAME_NOREPLACE)` or
-  `renameatx_np(RENAME_EXCL)`, and on a file system without the flag a hard link and unlink
-  for a file and a refusal for a folder. An upload replaces or removes its name only while it
-  is still its own empty reservation (`Dir::remove_own`).
+  `renameatx_np(RENAME_EXCL)`. A file system without the flag is refused
+  (`ErrorKind::Unsupported`), for files and folders alike. An upload replaces or removes its
+  name only while it is still its own empty reservation (`Dir::remove_own`).
 - **Windows.** `std` has no `*at` calls there, so every operation re-checks its folder and
   works by path, as the Files panel did before; the MCP tools that change files answer
   `McpPlatformUnsupportedError` instead of running with that race.
