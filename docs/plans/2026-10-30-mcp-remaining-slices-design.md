@@ -3020,6 +3020,38 @@ in the threads family (`mcp/tools/threads.rs`); its tests are
   provider resuming. The revert test runs `OrchestrationEffects` over a real Git checkout
   with checkpoints, so the files are really restored.
 
+**Codex review fixes (`claude/v0131-139-a-r2`):**
+
+- **Each revert reads its own outcome.** The effects worker's revert outcomes
+  (`thread.reverted`, and the `checkpoint.revert.files-only` and `checkpoint.revert.failed`
+  activities) now have command ids of the form `server:{tag}:{request command id}:{uuid}`,
+  and `revert_thread_to_turn` reads only the outcomes whose command id contains
+  `:{its commandId}:`. Before, a revert asked while another revert of the thread was still
+  running returned the earlier one's result. A fresh UUID stays in the id because a
+  deterministic one would collide with its own receipt (a different `createdAt`, so a
+  digest conflict) when the worker re-runs a request after a crash. Changing the
+  `ThreadRevertComplete` payload or event correlation was rejected: both are engine-owned.
+- **A revert whose files were not restored fails.** Once the provider has rewound, the
+  worker records the revert even when restoring the files fails, then appends
+  `checkpoint.revert.failed`. That completion now uses its own tag,
+  `checkpoint-revert-unrestored` (`UNRESTORED_REVERT_TAG`), so the tool ranks it after any
+  final outcome and keeps waiting for the failure, returning `McpCheckpointRevertError`
+  with the worker's detail ("The conversation was rewound, but the files could not be
+  restored: …"), or a generic message of the same meaning if the wait ends first. The UI's
+  work log is unchanged.
+- **Uploads no admitted turn owns are released.** `start_thread` and `send_message` record
+  the upload ids their `fresh` step staged and, after `commands()`, cancel those the
+  returned commands do not name (the call failed after staging, or another call with the
+  same `clientRequestId` stored its commands first). A turn start whose dispatch fails and
+  that the engine did not admit (no receipt, or a `rejected` one) cancels its uploads, so a
+  refused call no longer holds the 16-upload session quota for 600 s. The trade-off: a
+  retry with the same `clientRequestId` after such a failure gets
+  `McpAttachmentExpiredError` ("send it again without clientRequestId") instead of the
+  original refusal. A receipt still `reserved` or `prepared` keeps its uploads.
+- **Files touched beyond slice A's:** `production/orchestration_effects.rs`, for the
+  outcome command ids (`outcome_id`, `RevertPlan::request`, `UNRESTORED_REVERT_TAG`). No
+  event type, payload or activity kind changed.
+
 ## W (worktree tools) implementation notes (2026-10-30)
 
 W was implemented on `claude/v0131-139-w`, from `claude/v0131-139-f0`. It adds
