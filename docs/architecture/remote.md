@@ -1769,8 +1769,13 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   **local proxy** (loopback peer and `Host` with `X-Forwarded-Host`; origin
   `<X-Forwarded-Proto or http>://<X-Forwarded-Host>`), or **other** (anything
   else, preview gateway hostnames included). The class also carries the
-  admission source key: the peer's /24 or /64 network (a loopback peer's last
-  `X-Forwarded-For` entry), or `tunnel`.
+  admission source key, `<class>:<network>`: the peer's /24 or /64 network, or
+  for a local proxy the last `X-Forwarded-For` entry's (`X-Forwarded-For` is
+  read for no other class), or `tunnel:`. The documented recipe overwrites
+  `X-Forwarded-For` with the client's address, but the server cannot prove it
+  did, so the `proxy` class is unproven: it shares a class cap and never evicts
+  another request (see
+  [Environment authentication](../cloud/environment-auth.md#remote-mcp-oauth)).
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently

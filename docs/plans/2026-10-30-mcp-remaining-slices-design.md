@@ -5486,8 +5486,9 @@ scopes, admission limits, secrets), `auth/consent_page.rs` (the pages), the rout
   BiBCode app that manages the environment, or with `bibcode mcp authorize` on the host.
 - **Status cookie.** One per authorization (`bibcode_mcp_authorization_<id>`,
   `Path=/oauth/authorize`, `Secure` on HTTPS), so two sign-ins in one browser do not collide.
-- **Source key.** `v4:a.b.c.0/24`, `v6:…/64`, `loopback`, `unspecified` or `tunnel`, from the
-  peer, or a loopback peer's last `X-Forwarded-For` entry (`effective_preauth_peer`).
+- **Source key.** `<class>:<network>` since review round 2 (below): `direct:`, `proxy:`,
+  `tunnel:` or `other:`, then `v4:a.b.c.0/24`, `v6:…/64`, `loopback`, `unspecified` or
+  `unknown`. Only the `proxy` class reads `X-Forwarded-For`.
 - **Toast copy.** "Claude Code wants to operate <environment>" with "Check the code
   XXXX-XXXX, then approve or deny it." and **Review**, which opens Settings → Agents and
   scrolls to the requests.
@@ -5507,3 +5508,39 @@ and the route list), `apps/web/src/AppRoot.tsx` (the notifier's mount),
 `codex mcp add --url` through an HTTPS proxy and through BiBCode Connect, across a refresh)
 needs a real tunnel and was not run. Whether Claude Code refreshes one token from two
 processes at once is still unknown; if it does, strict reuse shows **Re-authenticate**.
+
+### R review round 2 (2026-10-31)
+
+Codex's security review of R found nothing in consent, redirect matching, audience, scope or
+the live controls, and three P2s, each fixed with a failing-first test:
+
+- **A captured code could revoke a grant without the verifier.** The binding (client,
+  redirect URI, origin, resource) and the PKCE proof were checked only while the
+  authorization was `approved`, so an `exchanged` code with any client and verifier reached
+  the replay path and revoked the session. They are now checked in every state, before a
+  replay is treated as one: a code without them is `invalid_grant` and revokes nothing.
+  Test: `replayed_codes_denials_and_revocation_end_the_grant` (a wrong verifier, then a
+  wrong client, leave the agent signed in; the full binding still revokes).
+- **Spoofed admission sources behind the documented proxy.** The source key took the last
+  `X-Forwarded-For` entry from any loopback peer, and the nginx recipe passed the client's
+  own header through, so a caller could rotate addresses past the per-source caps and fill
+  the global ones. The recipe now sets `proxy_set_header X-Forwarded-For $remote_addr;`
+  (no other proxy is documented). On the server the key is `<class>:<network>`, and only the
+  `proxy` class (the narrowed forwarded-header rule's) reads `X-Forwarded-For`. That class
+  is unproven: it shares a class cap (16 pending, 16 registrations an hour) and never
+  evicts. At the global caps every request evicts only within its own class, and is refused
+  when its class has nothing to give, so no source can evict another class's requests.
+  Tests: `rotating_forwarded_for_through_a_proxy_cannot_dodge_the_caps_or_evict_others`
+  (40 rotated addresses through the proxy class: at most 16 admitted, the direct request
+  kept) and `the_global_cap_evicts_only_within_a_proven_source_class` (with the global cap
+  full, a proxy or tunnel request is refused and a direct one evicts a direct one). The
+  admission flow test now sends its sources through the proxy class.
+- **Unbounded refresh-token history.** Each rotation kept the used hash, and pruning kept
+  every hash of an unrevoked session. A rotation now keeps the current token and the 32 most
+  recently used ones (reuse of those still revokes; an older one is unknown,
+  `invalid_grant`), and pruning deletes every token of a revoked or expired grant. Test:
+  `a_thousand_refreshes_keep_the_token_history_bounded` (1,000 rotations keep at most 33
+  rows; reusing the token from five rotations back still revokes).
+
+Residual: the server still cannot prove that a proxy overwrote `X-Forwarded-For`; an
+unrecipe'd proxy only lets its callers crowd the `proxy` class, never another class.

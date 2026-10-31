@@ -89,6 +89,7 @@ location / {
   proxy_pass http://127.0.0.1:3773;
   proxy_set_header X-Forwarded-Host $http_host;
   proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-For $remote_addr;
   proxy_http_version 1.1;
   proxy_set_header Upgrade $http_upgrade;
   proxy_set_header Connection "upgrade";
@@ -97,7 +98,10 @@ location / {
 
 Without `X-Forwarded-Host`, nginx sends `Host: 127.0.0.1:3773`, and a browser
 signed in with its session cookie gets `403` on every change and on the live
-connection. Clients that use a bearer token are not affected. A proxy that sends
+connection. Clients that use a bearer token are not affected. Set
+`X-Forwarded-For` to the client's own address, as above, rather than appending
+to what the client sent: BiBCode counts remote sign-in requests per client
+address, and an appended value would let a client pick its own. A proxy that sends
 the public host in `Host` itself loses `X-Forwarded-Proto`: browsers still work,
 but remote AI tools cannot sign in through it.
 
