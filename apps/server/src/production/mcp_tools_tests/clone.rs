@@ -1101,11 +1101,12 @@ const KEPT: &str = "BIBCODE_X6_KEPT";
 /// Review round 2: an agent clone's commands inherit only an allowlist of the server's
 /// variables. In a process of its own that inherits a repository location
 /// (`GIT_WORK_TREE`, `GIT_DIR`, `GIT_INDEX_FILE`) outside the destination, the TLS trust
-/// overrides (exported empty), a `GIT_TEMPLATE_DIR` with an active `pre-commit` hook, a
-/// `GIT_EXEC_PATH` with fake `git-remote-http(s)` helpers that record being run, and
-/// `GIT_TRACE`, `GIT_TRACE2` and `GIT_TRACE_PACKFILE` files: the clone lands in its folder with
-/// no hooks, the helpers never run, no trace file appears, and nothing is written outside. A
-/// person's commands keep the whole environment.
+/// overrides (exported empty, except the two the server's own HTTP client needs on Linux), a
+/// `GIT_TEMPLATE_DIR` with an active `pre-commit` hook, a `GIT_EXEC_PATH` with fake
+/// `git-remote-http(s)` helpers that record being run, and `GIT_TRACE`, `GIT_TRACE2` and
+/// `GIT_TRACE_PACKFILE` files: the clone lands in its folder with no hooks, the helpers never
+/// run, no trace file appears, and nothing is written outside. A person's commands keep the
+/// whole environment.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_inherited_server_environment_never_reaches_an_agent_clone() {
@@ -1138,11 +1139,25 @@ async fn an_inherited_server_environment_never_reaches_an_agent_clone() {
                 &format!("#!/bin/sh\ntouch '{}/helper-ran'\nexit 1\n", base.display()),
             );
         }
+        // The server's own HTTP client reads these, and on Linux an empty value leaves it
+        // with no trusted certificates: point them at the system bundle and an empty folder.
+        let system_bundle = [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("a system CA bundle");
+        let certificates = base.join("certificates");
+        std::fs::create_dir_all(&certificates).unwrap();
         reexec::run(INHERITED_TEST, INHERITED_PHASE, None, |command| {
             for name in INHERITED {
                 command.env(name, "");
             }
             command
+                .env("SSL_CERT_FILE", system_bundle)
+                .env("SSL_CERT_DIR", &certificates)
                 .env("GIT_WORK_TREE", outside.path())
                 .env("GIT_DIR", outside.path().join("git-dir"))
                 .env("GIT_INDEX_FILE", outside.path().join("index"))

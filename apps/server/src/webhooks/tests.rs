@@ -513,12 +513,15 @@ async fn a_signed_delivery_verifies_with_the_secret_over_its_timestamp_and_holds
             .collect::<Vec<_>>(),
         cursors[1..]
     );
-    let deliveries = harness.deliveries(&endpoint).await;
-    assert!(
-        deliveries
+    // The receiver answers before the dispatcher records the outcome.
+    eventually("every delivery recorded as delivered", async || {
+        harness
+            .deliveries(&endpoint)
+            .await
             .iter()
             .all(|delivery| delivery["state"] == "delivered")
-    );
+    })
+    .await;
     harness.webhooks.shutdown().await;
 }
 
