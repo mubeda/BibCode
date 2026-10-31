@@ -3209,6 +3209,38 @@ G was implemented on `claude/v0131-139-g`, from `claude/v0131-139-f0`. It regist
 - **Docs.** `docs/user/mcp.md` gains a **Git** subsection. Its "Not available" and
   approvals bullets are slice Z's cross-cutting text and still say these tools do not exist.
 
+**Codex review fixes (2026-10-30, `claude/v0131-139-gp-r2`).** All four findings were
+confirmed in source and fixed test-first:
+
+- **Implicit remote as an option.** Git accepts a configured remote such as `--all`, and
+  `choose_remote` returned the upstream's, `origin` or the sole remote unchecked, so
+  `git_fetch` ran `git fetch --prune … --all` (reproduced). Every remote it picks now passes
+  the named remote's shape check. At the Git boundary the `runOperation` handler refuses,
+  for every caller, a fetch, pull, push, publish, force-push or remote-branch-delete whose
+  remote or branch starts with `-` (`invalid-request`). `--` was not used: `git pull` hands
+  its remote to `git fetch` without one, and push's options follow its operands.
+- **Discard containment race.** The trash takes a path (osascript, gio and PowerShell
+  resolve it), so an `openat`-style handle cannot be bound. The containment check now runs
+  again right before each move, and the move gets the checked folder's canonical path (on
+  Windows without the `\\?\` prefix the Recycle Bin refuses). A path whose folder now
+  resolves outside the checkout is kept and listed in `trashUnavailable`, also under
+  `permanent`. The window left is the native command resolving the canonical path.
+- **Branch delete when the remote step stops reporting.** It is now
+  `McpPartialOutcomeError` with `local: "deleted"`, `remote: "unknown"`, `remoteName`,
+  `remoteBranch` and `recovery`, recorded `unknown` through `outcome_unknown`, so a keyed
+  retry replays the target the deleted branch can no longer give. The message says to run
+  `git_fetch` before finishing. Turning MCP off mid-delete gives the same partial: a work's
+  own unknown failure returned within the grace period is kept over the bare
+  `McpOutcomeUnknownError`.
+- **Permanent discard of an ignored file.** The fallback (`git clean -fd` without `-x`,
+  after a status that excludes ignored files) leaves it. After the fallback, an untracked
+  path that still exists moves from `permanentlyDiscarded` to `trashUnavailable`; a tracked
+  path exists again because it was restored. The Source Control panel only reads
+  `trashUnavailable` after a trash request, so its behavior is unchanged.
+- **Not changed:** G's `place()` still resolves the thread before `recorded`, so a keyed G
+  retry after the thread is deleted answers `McpThreadNotFoundError`. Codex raised this for
+  P only; moving it needs `finish`'s status read to handle a missing folder.
+
 ## P (pull request tools) implementation notes (2026-10-30)
 
 Slice P was implemented on `claude/v0131-139-p`, from `claude/v0131-139-f0`. It adds
@@ -3258,3 +3290,28 @@ failed it. P changed it (`foundation.rs`, outside P's files) to check that every
 tool is listed; sibling slices that make the same change will conflict trivially. `vp run
 typecheck` and `vp run check:contracts` build the server with whatever `cargo` is first on
 `PATH`, so run them with the pinned toolchain first too.
+
+**Codex review fixes (2026-10-30, `claude/v0131-139-gp-r2`).** Both findings were
+confirmed in source and fixed test-first:
+
+- **Host timeouts.** A merge or update failing with `PullRequestsOperationError` code
+  `timeout`, `host_unreachable`, `invalid_response` or `output_limit` may have taken effect
+  (`host_unreachable` also covers a stderr that mentions a timeout), so it is
+  `McpOutcomeUnknownError` with `reason: "no-answer"` and the host's `code`, recorded
+  `unknown`. An edit that landed followed by such a `setDraft` failure is the partial with
+  `unknown: "draft"` instead of `failed: "draft"`, recorded `unknown`. A refusal the host
+  answered stays `failed`. The create stream was not changed: its early end was already
+  `unknown`.
+- **Thread deletion.** `create_pull_request`, `update_pull_request` and
+  `merge_pull_request` resolve the thread's folder inside the recorded work
+  (`Owned::target`), so a keyed retry returns the stored outcome after the thread is
+  deleted; a new call on it is still `McpThreadNotFoundError`. The stored payload is the
+  arguments, not one RPC payload, as for G's push. A first call on a deleted thread now
+  takes an owned slot briefly and records its `McpThreadNotFoundError` as `failed`.
+
+**`outcome.rs` API added (shared with G):** `outcome_unknown(failure)` marks a failure
+(`error.outcome = "unknown"`) that `recorded` stores as `unknown` while keeping the work's
+own body, and `unknown_failure` now sets the same marker; `Interruption::NoAnswer`
+(`no-answer`); and `Owned::target(thread_id)`. `target.rs` gains `thread_target` and
+`live_thread`, which take the control; `ToolCall::target` and `ToolCall::thread`
+(`control.rs`, one delegating line outside P's files) call them.
