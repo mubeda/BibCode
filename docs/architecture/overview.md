@@ -2053,6 +2053,12 @@ bounded memory, and works while the server is stopped.
   `MCP destructive tool` line. The MCP service stops right after `begin_stopping()`,
   ending every wait in flight and interrupting owned mutations (recorded `unknown`),
   before the orchestration engine shuts down.
+- **Webhook dispatcher.** Outbound HTTP is not a child process. `webhooks.sendTest`
+  and `webhooks.redeliver` wait on a person's endpoint and are long-running; the
+  other `webhooks.*` methods are timed as usual. A failed delivery logs a
+  `tracing::warn!` with the endpoint id, status and error tag, never the URL. The
+  dispatcher stops right after the MCP service in the quiesce sequence, before the
+  profiler's teardown (see [Outbound webhooks](#outbound-webhooks)).
 
 ### Known limits
 
@@ -2641,6 +2647,42 @@ checks each one. The iOS live path was checked on Xcode 27 with the iOS 26.5
 runtime only; the
 [iOS simulator runbook](../testing/macos-desktop.md#ios-simulator-previews)
 repeats it on each Xcode or runtime a release supports.
+
+## Outbound webhooks
+
+`apps/server/src/webhooks/` (#139 slice X8) posts signed events to the HTTPS
+endpoints a person registers per environment ([user guide](../user/webhooks.md)).
+
+- **Sources, never the broadcast.** The dispatcher reads X3's change feed through
+  `mcp::tools::feed::page_after` (the page `changes_since` returns) from a stored
+  cursor, and the profiler's findings book from the `lastSeen` second and the
+  `(id, count)` marks it last delivered. Each read's deliveries and its new position
+  are written in one SQLite transaction (migration 61: `webhook_endpoints`,
+  `webhook_deliveries`, `webhook_state`), so a restart resumes without loss or
+  repeats. The engine's in-process event broadcast, which drops under load, is not a
+  source; Authorized-clients changes only wake the dispatcher.
+- **Queue.** Delivery rows are the queue and the log: one request in flight per
+  endpoint, oldest first, at most eight endpoints at once; retries after 30 s, 2, 5,
+  10 and 15 minutes on a timeout, connection error, unresolved host, 5xx or 429;
+  10 failed deliveries in a row disable the endpoint; at most 10,000 pending, oldest
+  abandoned past that; finished rows kept 7 days, 1,000 per endpoint.
+- **Outbound trust boundary.** HTTPS only; every resolved address must be public by
+  `git::clone_policy::is_public` (shared with agent clones); the client connects to
+  the checked addresses only (reqwest's resolve override, every other name refused),
+  ignores proxies, follows no redirects, and gives up after 10 seconds without
+  reading the body.
+- **Content.** Payloads carry ids, kinds, statuses and the feed cursor (or a
+  finding's `{ id, count, lastSeen }`); an agent label passes through
+  `redact_sensitive_text`. Each body is HMAC-SHA256 signed over its timestamp with
+  the endpoint's secret, kept in the secret store as `webhook-<id>`.
+- **Controls.** `enableWebhooks` (default off) is a live setting: off cancels every
+  request in flight, abandons the queue and resets the positions to the heads.
+  Disabling an endpoint does the same for it; revoking its paired MCP client
+  (read from `auth_sessions` each pass) disables it. `profiler.finding` is queued
+  only while MCP and its Diagnostics set are on.
+- **Administration.** `webhooks.list` and `listDeliveries` need `access:read`;
+  `upsert`, `delete`, `rotateSecret`, `sendTest` and `redeliver` need
+  `access:write`, which an `mcp-client` session never holds.
 
 ## Request and event flow
 
