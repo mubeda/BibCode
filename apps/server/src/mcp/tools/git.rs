@@ -408,27 +408,37 @@ async fn finish(call: &ToolCall<'_>, thread_id: &str, result: ToolResult) -> Too
     Ok(tool_result(content, &[("/status/files", Cut::Back)]))
 }
 
-/// [`finish`] for the tools that move or remove a branch: the thread's recorded branch follows
-/// the folder's checkout, as it does after the Source Control panel's own switch, so a label
-/// never names a branch the folder left or one that is gone. Best effort: the Git work is done.
-async fn finish_checkout(call: &ToolCall<'_>, thread_id: &str, result: ToolResult) -> ToolResult {
-    let finished = finish(call, thread_id, result).await?;
-    if let Some(branch) = finished["structuredContent"]["status"]["branch"].as_str()
-        && let Ok(thread) = call.thread(thread_id).await
-        && thread.branch.as_deref() != Some(branch)
-    {
-        let update = json!({
-            "type": "thread.meta.update", "commandId": Uuid::new_v4().to_string(),
-            "threadId": thread_id, "branch": branch,
-        });
-        if let Err(failure) = call.dispatch(update).await {
-            tracing::warn!(
-                error = failure["structuredContent"]["error"]["_tag"].as_str(),
-                "the thread's branch did not follow an agent's checkout"
-            );
-        }
+/// Moves the thread's recorded branch to a checkout this call's Git work made, as the Source
+/// Control panel's own switch does, so a label never names a branch the folder left or one
+/// that is gone. It runs inside the recorded work, so a replayed outcome changes nothing, and
+/// takes the branch only while it is still the folder's current one (one of `produced`): a
+/// person may have switched since. Best effort: the Git work is done either way.
+async fn follow_checkout(owned: &Owned, thread_id: &str, cwd: &str, produced: &[&str]) {
+    let Ok(refs) = refs(owned, cwd).await else {
+        return;
+    };
+    let Some(current) = refs["headRef"]
+        .as_str()
+        .filter(|head| produced.contains(head))
+    else {
+        return;
+    };
+    let Ok(target) = owned.target(thread_id).await else {
+        return;
+    };
+    if target.thread.branch.as_deref() == Some(current) {
+        return;
     }
-    Ok(finished)
+    let update = json!({
+        "type": "thread.meta.update", "commandId": Uuid::new_v4().to_string(),
+        "threadId": thread_id, "branch": current,
+    });
+    if let Err(failure) = owned.invoke("orchestration.dispatchCommand", update).await {
+        tracing::warn!(
+            error = failure["structuredContent"]["error"]["_tag"].as_str(),
+            "the thread's branch did not follow an agent's checkout"
+        );
+    }
 }
 
 /// The folder's branch, upstream, ahead/behind and changed files, as `git_status` returns
@@ -843,11 +853,14 @@ async fn create_branch(call: &ToolCall<'_>) -> ToolResult {
                 "name": name, "startPoint": start_point, "checkout": checkout,
             });
             let mut done = operate(&owned, sent).await?;
+            if checkout {
+                follow_checkout(&owned, &thread, &cwd, &[name.as_str()]).await;
+            }
             done["branch"] = name.into();
             Ok(done)
         })
         .await;
-    finish_checkout(call, &thread_id, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
@@ -889,6 +902,10 @@ async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
             .await;
             match checkout {
                 Ok(mut done) => {
+                    let local = name
+                        .split_once('/')
+                        .map_or(name.as_str(), |(_, local)| local);
+                    follow_checkout(&owned, &thread, &cwd, &[name.as_str(), local]).await;
                     done["branch"] = name.into();
                     done["stashed"] = stashed.into();
                     Ok(done)
@@ -901,7 +918,7 @@ async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
             }
         })
         .await;
-    finish_checkout(call, &thread_id, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
@@ -947,6 +964,14 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
                 }),
             )
             .await?;
+            // A label must not name the branch this call deleted: it takes the folder's own.
+            if let Ok(thread_target) = owned.target(&thread).await
+                && thread_target.thread.branch.as_deref() == Some(name.as_str())
+                && let Ok(refs) = refs(&owned, &cwd).await
+                && let Some(head) = refs["headRef"].as_str()
+            {
+                follow_checkout(&owned, &thread, &cwd, &[head]).await;
+            }
             let Some((remote, remote_branch)) = target else {
                 return Ok(json!({ "branch": name, "local": "deleted", "remote": "not-requested" }));
             };
@@ -977,7 +1002,7 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             }
         })
         .await;
-    finish_checkout(call, &thread_id, result).await
+    finish(call, &thread_id, result).await
 }
 
 /// The local branch is gone and the remote one is not, or may not be (`unknown`, when the
