@@ -216,6 +216,34 @@ Turning **Terminals** off, or lowering **Agents may**, refuses the next call at 
 - **Privacy.** BiBCode never logs what an agent types or reads, and never puts it in the
   profiler. Terminal output is untrusted content.
 
+### Diagnostics
+
+These read how this environment is doing: the profiler's records, the providers and
+hosting CLIs, BiBCode's processes and the server's trace. They are in the **Diagnostics**
+set, and all but `refresh_providers` work at read-only.
+
+| Tool                   | What it does                                                                                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `profiler_status`      | Whether the profiler records, its disk use and capture capabilities, the newest findings, and the newest crash ids                           |
+| `profiler_findings`    | Findings with their evidence: the newest, or with `since` or `cursor` oldest first and paged with `nextCursor`                               |
+| `profiler_events`      | Recorded events, newest last, each with its envelope and the fields its kind documents                                                       |
+| `profiler_crash`       | One crash record, the events before it, and its stack named from symbols already on the machine                                              |
+| `diagnose_environment` | Server version, platform and capability flags; each provider's install, version, status and sign-in state; config issue counts; Git and CLIs |
+| `refresh_providers`    | Checks every provider again, as Settings → Providers does, and returns their state                                                           |
+| `process_diagnostics`  | BiBCode's processes now and over a window (15 minutes unless `historyWindowMs` says, at most an hour): CPU, memory and attribution           |
+| `trace_diagnostics`    | Trace counts, log counts per level, and the most frequent, slowest and failing spans by name                                                 |
+
+- **Projections, not redaction.** Each result is built from named fields. No prompt, message,
+  command line, log line, failure cause, path, setting or account reaches an agent. An event
+  of a kind the profiler does not document keeps only its envelope.
+- **Catching up on findings.** `profiler_findings { since }` (inclusive) returns findings
+  oldest first by `lastSeen`; follow `nextCursor` until it is null. A finding that recurs
+  later comes again with its new `lastSeen` and `count`. Up to 1,000 findings are kept.
+- The profiler tools read the profiler's directory whether recording is on or off. Without a
+  profiler runtime they return `McpProfilerUnavailableError`.
+- `profiler_symbolicate` and symbol downloads stay on `bibcode profiler mcp`, and the server
+  log and the diagnostics bundle stay in the app.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
