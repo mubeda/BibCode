@@ -175,6 +175,16 @@ describe("ServerSettings device previews", () => {
   });
 });
 
+describe("ServerSettings webhooks", () => {
+  it("defaults enableWebhooks to off and accepts a boolean patch only", () => {
+    expect(DEFAULT_SERVER_SETTINGS.enableWebhooks).toBe(false);
+    expect(decodeServerSettingsPatch({ enableWebhooks: true })).toEqual({
+      enableWebhooks: true,
+    });
+    expect(() => decodeServerSettingsPatch({ enableWebhooks: "yes" })).toThrow();
+  });
+});
+
 describe("ServerSettings MCP server", () => {
   it("defaults on and Supervised, and an older document decodes to the defaults", () => {
     expect(DEFAULT_SERVER_SETTINGS.enableMcpServer).toBe(true);

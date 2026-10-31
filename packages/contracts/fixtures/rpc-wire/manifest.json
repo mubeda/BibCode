@@ -690,6 +690,34 @@
       "mode": "unary"
     },
     {
+      "name": "webhooks.delete",
+      "mode": "unary"
+    },
+    {
+      "name": "webhooks.list",
+      "mode": "unary"
+    },
+    {
+      "name": "webhooks.listDeliveries",
+      "mode": "unary"
+    },
+    {
+      "name": "webhooks.redeliver",
+      "mode": "unary"
+    },
+    {
+      "name": "webhooks.rotateSecret",
+      "mode": "unary"
+    },
+    {
+      "name": "webhooks.sendTest",
+      "mode": "unary"
+    },
+    {
+      "name": "webhooks.upsert",
+      "mode": "unary"
+    },
+    {
       "name": "worktree.adopt",
       "mode": "unary"
     },
@@ -1164,6 +1192,20 @@
     "typed-failures/vcs__unstageFiles-01.json",
     "typed-failures/vcs__unstageFiles-02.json",
     "typed-failures/vcs__unstageFiles-03.json",
+    "typed-failures/webhooks__delete-00.json",
+    "typed-failures/webhooks__delete-01.json",
+    "typed-failures/webhooks__list-00.json",
+    "typed-failures/webhooks__list-01.json",
+    "typed-failures/webhooks__listDeliveries-00.json",
+    "typed-failures/webhooks__listDeliveries-01.json",
+    "typed-failures/webhooks__redeliver-00.json",
+    "typed-failures/webhooks__redeliver-01.json",
+    "typed-failures/webhooks__rotateSecret-00.json",
+    "typed-failures/webhooks__rotateSecret-01.json",
+    "typed-failures/webhooks__sendTest-00.json",
+    "typed-failures/webhooks__sendTest-01.json",
+    "typed-failures/webhooks__upsert-00.json",
+    "typed-failures/webhooks__upsert-01.json",
     "typed-failures/worktree__adopt-00.json",
     "typed-failures/worktree__adopt-01.json",
     "typed-failures/worktree__adopt-02.json",
@@ -1486,10 +1528,10 @@
     "stream-shapes/subscribePreviewEvents-04.json": "0e8bac1a898590398b306a6611fd4676d2c1d122d5029999c62a462fdf938ea5",
     "stream-shapes/subscribePreviewEvents-05.json": "e90b7e4ce2b85d04010ece2f05878ca18fcfc97a7e00e6675717aea37f63da1c",
     "stream-shapes/subscribeProjectEntries-00.json": "fb0eccee51b5c2656e762ae9e52783c5c9a78ef4b3f7c46a9a1dcdfa609c8670",
-    "stream-shapes/subscribeServerConfig-00.json": "c447e9389789ce83246df53835c8c9bdc81c75c834e2acde3f199e59b8d9d92d",
+    "stream-shapes/subscribeServerConfig-00.json": "0164437badcfda90e6cc0dbff7afe643a5f817e3c7407d770cbe7a48cd9557d6",
     "stream-shapes/subscribeServerConfig-01.json": "cf4979d2d52440102cf23f92653caeb3570e2df19a7b5a68bcb6602e06a33120",
     "stream-shapes/subscribeServerConfig-02.json": "2005009f8a5fa67a57b693b663b2d4b015c59bfd2b098035ee8a0f54d7e69464",
-    "stream-shapes/subscribeServerConfig-03.json": "09bb84b2838c15431351878c1826f48133798eeee3f6a9fbf73279f34f15d5aa",
+    "stream-shapes/subscribeServerConfig-03.json": "dad237962e9f609b7d9320e96a244dc4ad55b6677aba454fd989e753b1da3770",
     "stream-shapes/subscribeServerLifecycle-00.json": "69df2248ee07bd0105a6ec0978539f887ce139b75ad57fe65212450cfd1e0072",
     "stream-shapes/subscribeServerLifecycle-01.json": "d9c64e346ba79dfc2f5bd319eadbad4c191700826b5db2d2d5768405131c152f",
     "stream-shapes/subscribeTerminalEvents-00.json": "a33bc3be33b80b3bade2e3e4e7f6f25f2ca7c9ba87dd3ea9a781b4f3cb5bea82",
@@ -1629,6 +1671,20 @@
     "typed-failures/vcs__unstageFiles-01.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/vcs__unstageFiles-02.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/vcs__unstageFiles-03.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__delete-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__delete-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__list-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__list-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__listDeliveries-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__listDeliveries-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__redeliver-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__redeliver-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__rotateSecret-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__rotateSecret-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__sendTest-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__sendTest-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/webhooks__upsert-00.json": "2aee102c1e7be7381066e8d826df3e362ca390bcf801f727a97de28b8acf0ebc",
+    "typed-failures/webhooks__upsert-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/worktree__adopt-00.json": "ae7d174fab0e9209371e3c5707f686af0523aaaf39df9b95080b7e266ad1a595",
     "typed-failures/worktree__adopt-01.json": "51fdf9a89f3c27cc2d150c339caf415628d5a5a7518c44f23765e63f63244181",
     "typed-failures/worktree__adopt-02.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
@@ -2131,6 +2187,20 @@
     "typed-failures/vcs__unstageFiles-01.json",
     "typed-failures/vcs__unstageFiles-02.json",
     "typed-failures/vcs__unstageFiles-03.json",
+    "typed-failures/webhooks__delete-00.json",
+    "typed-failures/webhooks__delete-01.json",
+    "typed-failures/webhooks__list-00.json",
+    "typed-failures/webhooks__list-01.json",
+    "typed-failures/webhooks__listDeliveries-00.json",
+    "typed-failures/webhooks__listDeliveries-01.json",
+    "typed-failures/webhooks__redeliver-00.json",
+    "typed-failures/webhooks__redeliver-01.json",
+    "typed-failures/webhooks__rotateSecret-00.json",
+    "typed-failures/webhooks__rotateSecret-01.json",
+    "typed-failures/webhooks__sendTest-00.json",
+    "typed-failures/webhooks__sendTest-01.json",
+    "typed-failures/webhooks__upsert-00.json",
+    "typed-failures/webhooks__upsert-01.json",
     "typed-failures/worktree__adopt-00.json",
     "typed-failures/worktree__adopt-01.json",
     "typed-failures/worktree__adopt-02.json",

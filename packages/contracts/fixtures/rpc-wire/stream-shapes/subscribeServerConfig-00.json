@@ -52,6 +52,7 @@
           "enableProfiler": false,
           "enableDevicePreviews": false,
           "enableMcpServer": true,
+          "enableWebhooks": false,
           "mcpServerAccess": "approval-required",
           "mcpCapabilities": {
             "workspace": true,
