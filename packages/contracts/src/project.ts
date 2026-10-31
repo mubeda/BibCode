@@ -196,6 +196,8 @@ export const ProjectFileFailure = Schema.Literals([
   "file_missing_on_disk",
   // A delete asked for the system trash, which could not take the entry; it was left in place.
   "trash_unavailable",
+  // A folder delete stopped part-way; `leftAt` names where what is left now is.
+  "partially_removed",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
@@ -223,6 +225,7 @@ type ProjectFileFailureContext = {
   readonly resolvedWorkspaceRoot?: string;
   readonly operation?: ProjectFileOperation;
   readonly operationPath?: string;
+  readonly leftAt?: string;
   readonly cause?: unknown;
 };
 
@@ -406,6 +409,8 @@ export class ProjectDeleteEntryError extends Schema.TaggedError<ProjectDeleteEnt
     resolvedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
     operation: Schema.optional(ProjectFileOperation),
     operationPath: Schema.optional(TrimmedNonEmptyString),
+    // With `partially_removed`: the name, in the entry's own folder, where what is left now is.
+    leftAt: Schema.optional(TrimmedNonEmptyString),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },

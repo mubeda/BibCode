@@ -144,6 +144,19 @@ describe("project RPC inputs", () => {
       }).failure,
     ).toBe("trash_unavailable");
   });
+
+  it("says where a folder delete that stopped part-way left what remains", () => {
+    const decoded = decodeDeleteError({
+      _tag: "ProjectDeleteEntryError",
+      cwd: "/workspace",
+      relativePath: "build",
+      failure: "partially_removed",
+      leftAt: ".bibcode-delete-0f3a",
+      message: "Deleting build stopped part-way; what is left is at .bibcode-delete-0f3a.",
+    });
+    expect(decoded.failure).toBe("partially_removed");
+    expect(decoded.leftAt).toBe(".bibcode-delete-0f3a");
+  });
 });
 
 describe("project RPC errors", () => {
