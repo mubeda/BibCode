@@ -414,13 +414,24 @@ read and download tools work at read-only.
 - **Paths stay inside.** Paths are literal and relative to the thread's folder: `..`, an
   absolute path, a glob or pathspec character, and a symlinked folder that leads outside are
   refused. Each operation reaches the file through a folder handle opened without following
-  symlinks, so a folder swapped for a symlink after the check is refused too.
+  symlinks, and checks just before it changes anything that the folder is still inside, so a
+  folder another program swaps for a symlink, or moves out, after the check is refused too.
 - **No lost edits.** `files_write` needs the `version` `files_read` returned, or `createOnly`
-  for a new file. A file changed since is refused (`file_changed_on_disk`); read it again. A
-  file over 1 MiB, or a binary one, cannot be read or written here: download it.
+  for a new file. A file changed since is refused (`file_changed_on_disk`); read it again.
+  Even a save that lands while the write runs is kept: `createOnly` never replaces a file,
+  and a versioned write replaces the file only while it is still the one that was read.
+  Pages after the first need the `version` the first page returned; a file changed between
+  pages is refused (`McpFileChangedError`). A file over 1 MiB, or a binary one, cannot be
+  read or written here: download it.
+- **Nothing replaced by surprise.** `files_rename` and an upload without `overwrite` never
+  replace a file, even one created while they run.
 - **Delete goes to the trash.** If the trash cannot take an entry, it is left in place
-  (`trash_unavailable`); nothing falls back to a permanent delete. `files_delete` takes a
-  `clientRequestId`.
+  (`trash_unavailable`); nothing falls back to a permanent delete. A permanent delete of a
+  folder that stops part-way says where what is left is (`partially_removed`). `files_delete`
+  takes a `clientRequestId`.
+- **Windows.** On a BiBCode server running on Windows, the tools that change files
+  (`files_write`, `files_create`, `files_rename`, `files_delete`, `files_upload`) are refused
+  (`McpPlatformUnsupportedError`); reading, listing, searching and downloading work.
 - **Transfers.** No file bytes pass through MCP. A transfer URL works for 5 minutes, for one
   file or folder, and only while the agent's access lasts: Stop, Revoke, turning the MCP
   server or **Files** off, or (for an upload) **Take over** or read-only ends it, also
