@@ -4447,3 +4447,103 @@ still working; a clone past the wait that answers `running` and later its projec
 its folder; and cancelling an agent clone that joined a person's leaving the person's to
 finish. Take over and Stop reach the same live-controls token (X1) and are not tested again
 here.
+
+## X5 implementation notes (2026-10-31)
+
+X5 was implemented on `claude/v0131-139-x5`, from the batch tip `8d400e20df` (slice 1, the
+CLI, F0, wave 1, D, T, X2 and X1 with their review fixes). It adds `mcp/tools/files.rs` (nine
+tools in the Files set), `workspace/beneath.rs` and `mcp_tools_tests/files.rs`. Nothing below
+changes a settled decision.
+
+**Containment (the slice's core):**
+
+- **The workspace service is bound to folder handles, for every caller.** Every
+  `WorkspaceService` operation used to canonicalize a path, check it, then act on a path:
+  `delete_entry` even removed the raw `root/<relative>` it had not canonicalized. A folder
+  swapped for a symlink in between routed the call outside. On Unix, `beneath::Dir::open`
+  walks the canonical folder from the canonical root with `O_DIRECTORY | O_NOFOLLOW` (a
+  symlink met there is a swap, answered `resolved_path_outside_root`), and the entry is
+  reached by name through the held handle (`openat` with `O_NOFOLLOW | O_NONBLOCK`,
+  `unlinkat`, `renameat`, `mkdirat`). Reads, versions, writes, creation, rename, delete,
+  duplicate, a file download and every upload step use it. The Files panel gets the same
+  protection; its behavior for valid input is unchanged (the existing service, RPC and route
+  tests pass unchanged).
+- **What re-checks instead.** The trash takes a path, so the folder is canonicalized again
+  just before the call (as G's discard does); a folder's recursive removal is first renamed
+  through the handle to a random `.bibcode-delete-<uuid>` name, so a swap after that sends
+  `remove_dir_all` to a name that does not exist; a failure renames what is left back.
+  Windows has no `*at` calls in `std`, so every operation there re-checks its folder and works
+  by path. A folder download (zip) re-checks the folder, then the archive walks by path as
+  before. Those are the remaining windows.
+- **One behavior changed at the edge, toward containment:** a write to a dangling symlink
+  used to follow it and create its target (possibly outside the root); it is now refused. A
+  rename or delete of a symlink still acts on the link itself, now through its folder's
+  handle, and still requires the link's target to stay inside, as before.
+- **Tests that fail first.** `workspace::service` swaps the folder for an outside symlink
+  between the containment check and the first call (a new `after_containment_check` test
+  hook) for each of the eleven operations; `transfer::upload` does the same for an upload's
+  folder. Disabling `O_NOFOLLOW` and the re-check makes both fail (checked).
+
+**Transfers:**
+
+- **The session comes from the principal, not the payload.** `workspace_preview.rs` (not in
+  X5's rows) now registers `projects.createDownloadUrl` and `projects.createUploadUrl` with
+  the request context; an `mcp-client` principal's session id is bound into the claims. A
+  payload field would have let any client attribute a transfer's activity row to an agent.
+- **Claims.** `mcp_session_id` on both, and `overwrite: Option<bool>` on `Upload`, both
+  `skip_serializing_if = None`, so a UI token is byte-identical to before. Bound `false` with
+  `?overwrite=1` answers 400 ("does not allow overwriting"), not 404: it confirms nothing
+  about the path. Bound `true` overwrites without the query flag. The `overwrite` input is in
+  `packages/contracts/src/transfer.ts` (the upload input lives there, not in `project.ts`).
+- **Live controls (`McpControl::transfer_controls`, `mcp/outcome.rs`).** `LiveControls` was
+  not reused: it always fires on read-only and ignores capabilities, and a download must
+  survive both while stopping on Files off. The accessor registers the transfer through
+  `mark_connected_guard`, checks MCP on, Files on, an `mcp-client` session, and for an upload
+  `min(session mcp_access, mcpServerAccess) > read-only` (the session's level read from
+  `access_snapshot`, so `auth/service.rs` is untouched). Take over cancels a session's live
+  tokens without revoking it, so when the guard's token fires the watcher re-admits: a
+  download goes on, an upload under read-only stops, a revoked session stops both. A settings
+  change re-runs the check. No owned-mutation slot is taken.
+- **`transferId`** is `t-` and 24 hex characters of the token's SHA-256
+  (`transfer::transfer_id`), computed by the tool from the minted URL and by the route from
+  the token, so the mint's row (`files_upload`, via X1's `target`) and the route's row share
+  it without a claims field. `files_download` is read-only, so only the route's row exists
+  for a download.
+- **Activity at the route.** One row per started agent transfer, tool `files_download` or
+  `files_upload`, outcome `success`, `McpAccessEndedError`, `TransferEntryExistsError`,
+  `TransferTooLargeError`, `TransferFailedError`, or `McpCancelledError` when the client went
+  away mid-download (written from `Drop`). A transfer refused at the start writes none, as X1
+  writes none for gate refusals. Rows carry no thread id: the claims hold none.
+- **Upload cancellation** selects on the token while streaming and checks it once more just
+  before `renameat`; a fired token removes the partial and the reservation and answers 404.
+- **Transfer base.** `McpControl` gained a `transfer_base` `OnceLock` with
+  `attach_transfer_base`, set in `lifecycle.rs` (not in X5's rows) right after
+  `set_own_port`, with `local_http_base(local_addr)`. Without it a transfer tool answers
+  `McpTransferUnavailableError`. **For R:** `files.rs::transfer_base` is the one place to
+  return the origin of the session's `mcp_resource` for a remote OAuth session.
+- **Handlers.** `transfer_routes::download_handler` and `upload_handler` keep their
+  signatures (the integration test uses them); `*_with_mcp` variants serve agent tokens and
+  are what `ProductionRuntime` wires.
+
+**Other drift:**
+
+- **`KEPT_ERROR_FIELDS` keeps `failure`** (`mcp/control.rs`), so a workspace error's
+  `file_changed_on_disk`, `trash_unavailable` and the rest reach the agent. `files.rs`
+  rewrites those messages to name the agent's path, never the host's absolute path.
+- **Delete when the trash cannot take it** fails `trash_unavailable`
+  (`ProjectFileFailure`, `project.ts`) and leaves the entry; it never falls back. The service
+  shares `ProductionRuntime`'s one `NativeFileTrash` with Source Control.
+- **A trash re-check failure is reported as operation `open`**, an existing
+  `ProjectFileOperation`, to keep the contract enum unchanged.
+- **`git::without_verbatim_prefix`** is now `pub` (G's `operations.rs`) for the trash path.
+- **`files_upload` with `directory: "escape"`** where `escape` is itself a symlink out passes
+  `validate_paths` (a path that is a symlink is allowed, as for Git) and is refused by the
+  mint (`outside_root`); a path through it is refused by the tool.
+- **Files touched beyond X5's rows:** `lifecycle.rs` (one call), `production/workspace_preview.rs`
+  (the context-aware mint registration), `production/http_routes.rs` (a `cfg(test)` status
+  accessor), `git/manager/operations.rs` and `git/mod.rs` (the helper export),
+  `packages/contracts/src/transfer.ts` and its test, and F0's
+  `a_capability_set_turned_off_hides_and_refuses_its_tools_live`, which now lets the Files
+  tools remain with Workspace and Source control off (as P and X2 did for theirs).
+- **Not run:** a Windows build. The cross-check cannot compile `aws-lc-sys` without the
+  Windows SDK; the non-Unix `beneath` code is type-checked only by Windows CI.
