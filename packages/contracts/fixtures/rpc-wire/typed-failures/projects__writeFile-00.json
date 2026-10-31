@@ -8,10 +8,11 @@
         "_tag": "Fail",
         "error": {
           "_tag": "ProjectWriteFileError",
-          "resolvedPath": "",
-          "operation": "rename",
-          "message": "toString",
-          "cause": 1.796585672128265e-276
+          "failure": "write_failed",
+          "resolvedWorkspaceRoot": "[",
+          "operationPath": "\"",
+          "message": "iQ~!B1CkYn",
+          "cause": 3.9456679256378954e256
         }
       }
     ]
