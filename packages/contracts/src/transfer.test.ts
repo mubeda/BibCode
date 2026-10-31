@@ -14,12 +14,12 @@ const decodeDownloadInput = Schema.decodeUnknownSync(ProjectCreateDownloadUrlInp
 const decodeDownloadResult = Schema.decodeUnknownSync(ProjectCreateDownloadUrlResult);
 const decodeUploadInput = Schema.decodeUnknownSync(ProjectCreateUploadUrlInput);
 const decodeUploadResult = Schema.decodeUnknownSync(ProjectCreateUploadUrlResult);
+const decodeTransferError = Schema.decodeUnknownSync(ProjectTransferError);
 
 describe("transfer contracts", () => {
   it("names a transfer refused because it is Git's own metadata", () => {
-    const decode = Schema.decodeUnknownSync(ProjectTransferError);
     expect(
-      decode({
+      decodeTransferError({
         _tag: "ProjectTransferError",
         cwd: "/repo",
         relativePath: ".git",
