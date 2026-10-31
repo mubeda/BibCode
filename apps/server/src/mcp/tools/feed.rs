@@ -491,6 +491,21 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Use list_projects_and_threads to find it.",
     ),
     (
+        "McpNotAHostThreadError",
+        "A chat panel can only be opened on a host thread, and this thread is itself a panel.",
+        "Open the panel on its host thread instead.",
+    ),
+    (
+        "McpNotSameWorktreeError",
+        "The two threads belong to different worktrees.",
+        "Name a thread of the target's own worktree: its host or one of its panels.",
+    ),
+    (
+        "McpSourceThreadNotOwnedError",
+        "This agent neither opened the source thread nor sent its latest message.",
+        "Name a panel this agent opened or last drove, or omit the source.",
+    ),
+    (
         "McpProjectNotFoundError",
         "No project has this id, or the thread's project is gone.",
         "Use list_projects_and_threads to find it.",
