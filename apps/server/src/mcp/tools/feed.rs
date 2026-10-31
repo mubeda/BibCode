@@ -506,16 +506,6 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Name a panel this agent opened or last drove, or omit the source.",
     ),
     (
-        "McpFileTooLargeError",
-        "The file is larger than 1 MiB, or binary, so files_read can't return it as text.",
-        "Use files_download for its contents.",
-    ),
-    (
-        "McpTransferUnavailableError",
-        "This server has no transfer address yet, so it can't mint a download or upload URL.",
-        "Try again in a moment.",
-    ),
-    (
         "McpCloneNotFoundError",
         "No clone with this cloneId was started on this MCP connection in the last 24 hours.",
         "Use the cloneId clone_repository returned on this connection; after a restart, clone again.",
