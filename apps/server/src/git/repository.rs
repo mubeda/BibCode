@@ -11550,9 +11550,13 @@ fn parse_git_manager_head_commit(
 /// The global option every command that takes a caller's file paths runs with (#139 slice G,
 /// C5): each path is a literal file or folder name, so `:(glob)**`, `*.rs` or `:/` names a
 /// file that matches nothing, never pathspec magic or a wildcard over the tree. A folder still
-/// names every file under it. `validate_pathspecs` only refuses absolute and `..` paths.
+/// names every file under it. `validate_pathspecs` refuses absolute, `.`, `..` and `.git` paths.
 const LITERAL_PATHSPECS: &str = "--literal-pathspecs";
 
+/// Refuses a caller's file pathspec that is empty, absolute, holds anything but plain parts
+/// (`.`, `..`), or starts with `.git` in any case: Git's own metadata (a main checkout's Git
+/// directory, a linked worktree's `.git` file) is never staged, unstaged, stashed or discarded
+/// (#139 review round 4). Discard also refuses a path that resolves into the Git directory.
 pub(crate) fn validate_pathspecs(
     operation: &str,
     cwd: &Path,
@@ -11570,6 +11574,17 @@ pub(crate) fn validate_pathspecs(
                 operation,
                 cwd,
                 "File pathspec must be a non-empty repository-relative path without traversal.",
+            ));
+        }
+        if parsed
+            .components()
+            .next()
+            .is_some_and(|first| first.as_os_str().eq_ignore_ascii_case(".git"))
+        {
+            return Err(simple_error(
+                operation,
+                cwd,
+                "File pathspec must not name Git's own metadata (.git).",
             ));
         }
     }
