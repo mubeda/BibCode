@@ -2328,9 +2328,10 @@ impl Repositories {
 
     /// Registers an MCP OAuth client (#139, slice R) under the admission limits, after
     /// pruning what has expired. A source past its hourly registrations, or an unproven class
-    /// past its own, is refused. When the global cap of never-approved clients is full, the
-    /// oldest never-approved client of the source holding the most *within the requester's
-    /// class* is evicted, with its pending authorizations; an unproven class evicts nothing.
+    /// past its own, is refused. When the requester's class holds its share of the live
+    /// never-approved clients, or the global cap is full, the oldest never-approved client of
+    /// the source holding the most *within the requester's class* is evicted, with its pending
+    /// authorizations; an unproven class evicts nothing and is refused.
     pub async fn register_mcp_oauth_client(
         &self,
         client: McpOAuthClient,
@@ -2365,8 +2366,18 @@ impl Repositories {
                     [],
                     |row| row.get(0),
                 )?;
-                // At the global cap, room is made only within the requester's own proven class.
-                let victim = if unapproved >= limits.unapproved_clients && !unproven {
+                // Never-approved clients live a day, longer than any hourly cap: each class may
+                // hold only its share of them, so no class takes over the table (round 3).
+                let class_unapproved: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_clients \
+                     WHERE approved_at IS NULL AND source_key LIKE ?",
+                    [&class_pattern],
+                    |row| row.get(0),
+                )?;
+                let needs_room = unapproved >= limits.unapproved_clients
+                    || class_unapproved >= limits.class_unapproved_clients;
+                // Room is made only within the requester's own proven class.
+                let victim = if needs_room && !unproven {
                     transaction
                         .query_row(
                             "SELECT client_id FROM mcp_oauth_clients WHERE approved_at IS NULL \
@@ -2384,7 +2395,7 @@ impl Repositories {
                 };
                 let admission = if recent >= limits.registrations_per_source_per_hour
                     || class_recent >= limits.unproven_class_registrations_per_hour
-                    || (unapproved >= limits.unapproved_clients && victim.is_none())
+                    || (needs_room && victim.is_none())
                 {
                     McpOAuthAdmission::Refused
                 } else {
@@ -2436,7 +2447,8 @@ impl Repositories {
             .await
     }
     /// Creates a pending authorization under the admission limits. A client, a source or an
-    /// unproven class at its own cap is refused. When the global cap is full (or, for a source
+    /// unproven class at its own cap is refused. When a proven class holds its share, or the
+    /// global cap is full (or, for a source
     /// that already has one pending, all but the reserved headroom), the oldest pending entry
     /// of the source holding the most within the requester's own class is evicted, so a flood
     /// evicts only its class's entries; an unproven class evicts nothing and is refused.
@@ -2466,19 +2478,16 @@ impl Repositories {
                 let class = source_class(&row.source_key);
                 let unproven = limits.unproven_classes.contains(&class);
                 let class_pattern = format!("{class}:%");
-                let for_class: i64 = if unproven {
-                    transaction.query_row(
-                        "SELECT COUNT(*) FROM mcp_oauth_authorizations \
-                         WHERE source_key LIKE ? AND status = 'pending' AND expires_at > ?",
-                        params![class_pattern, now_ms],
-                        |row| row.get(0),
-                    )?
-                } else {
-                    0
-                };
+                let for_class: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_authorizations \
+                     WHERE source_key LIKE ? AND status = 'pending' AND expires_at > ?",
+                    params![class_pattern, now_ms],
+                    |row| row.get(0),
+                )?;
+                let class_full = for_class >= limits.class_pending;
                 if for_client >= limits.pending_per_client
                     || for_source >= limits.pending_per_source
-                    || for_class >= limits.unproven_class_pending
+                    || (class_full && unproven)
                 {
                     if pruned {
                         bump_auth_authority_revision_on(&transaction)?;
@@ -2499,7 +2508,7 @@ impl Repositories {
                 };
                 // At the global cap, room is made only within the requester's own proven class:
                 // an unproven class evicts nothing, and no class evicts another's.
-                if total >= room {
+                if total >= room || class_full {
                     let evicted = !unproven
                         && transaction.execute(
                             "DELETE FROM mcp_oauth_authorizations WHERE id = (\
@@ -3181,8 +3190,12 @@ pub struct McpOAuthLimits {
     /// Source classes whose per-source key the server cannot prove (a local proxy's
     /// `X-Forwarded-For`): they share a class cap and never evict another entry.
     pub unproven_classes: &'static [&'static str],
-    /// Pending authorizations an unproven class may hold in all.
-    pub unproven_class_pending: i64,
+    /// Pending authorizations one source class may hold in all; the classes' shares sum to
+    /// no more than `pending`.
+    pub class_pending: i64,
+    /// Never-approved clients one source class may hold in all; the classes' shares sum to no
+    /// more than `unapproved_clients`.
+    pub class_unapproved_clients: i64,
     /// Registrations an unproven class may make in an hour, in all.
     pub unproven_class_registrations_per_hour: i64,
     pub unapproved_client_ttl_ms: i64,

@@ -186,12 +186,14 @@ routes serve only an eligible origin (see
   `tunnel`, `other`). Per client 2 pending authorizations; per source 8
   registrations an hour and 4 pending authorizations; the unproven `proxy`
   class, whose network comes from `X-Forwarded-For`, 16 registrations an hour
-  and 16 pending authorizations in all (429 past any of these). Global: 64
-  never-approved clients and 64 pending authorizations, of which 16 are kept
-  for sources with none pending. At the global cap a request evicts the oldest
-  entry of the source holding the most _within its own class_; an unproven
-  class, or a class with nothing of its own to evict, is refused instead, so no
-  request can evict another class's. Never-approved clients go after a day,
+  and 16 pending authorizations in all (429 past any of these). Each class
+  holds at most 16 live never-approved clients and 16 pending authorizations,
+  so the four classes' shares fit the global 64 of each, of which 16 pending
+  are kept for sources with none pending. A proven class at its share, or at
+  the global cap, evicts the oldest entry of the source holding the most
+  _within its own class_; the unproven `proxy` class, or a class with nothing
+  of its own to evict, is refused instead, so no request can evict another
+  class's, and no class can take over the table. Never-approved clients go after a day,
   approved ones after 90 days unused.
 - **Secrets.** Codes, refresh tokens and the status cookie are stored only as
   SHA-256 hashes, compared in constant time, and never logged or recorded by the

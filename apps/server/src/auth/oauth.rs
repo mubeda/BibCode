@@ -52,7 +52,10 @@ pub(crate) const LIMITS: McpOAuthLimits = McpOAuthLimits {
     pending: 64,
     pending_reserved: 16,
     unproven_classes: &["proxy"],
-    unproven_class_pending: 16,
+    // Four source classes (direct, proxy, tunnel, other) of 16 each: no class can hold more
+    // than its share of the 64 never-approved clients or 64 pending requests.
+    class_pending: 16,
+    class_unapproved_clients: 16,
     unproven_class_registrations_per_hour: 16,
     unapproved_client_ttl_ms: 24 * 60 * 60 * 1_000,
     approved_client_idle_ms: 90 * 24 * 60 * 60 * 1_000,
@@ -660,13 +663,29 @@ mod tests {
             .unwrap()
     }
 
-    /// Review round 2: with the global cap full, a request evicts only within its own source
-    /// class, and an unproven class (a local proxy's `X-Forwarded-For`) evicts nothing.
+    /// Review rounds 2 and 3: each class holds at most its share of the pending requests. A
+    /// proven class at its share evicts only its own oldest entry; an unproven class (a local
+    /// proxy's `X-Forwarded-For`) evicts nothing and is refused; neither touches another
+    /// class, so a full direct class still leaves the tunnel room to ask.
     #[tokio::test]
-    async fn the_global_cap_evicts_only_within_a_proven_source_class() {
+    async fn each_class_keeps_to_its_share_and_evicts_only_its_own() {
         use crate::persistence::McpOAuthAdmission::{Admitted, Refused};
         let repositories = store().await;
-        // 64 pending from 64 direct networks, the whole global cap.
+        let pending = |repositories: &crate::persistence::Repositories| {
+            let repositories = repositories.clone();
+            async move {
+                repositories
+                    .list_pending_mcp_oauth_authorizations(super::super::now_ms())
+                    .await
+                    .unwrap()
+            }
+        };
+        let of_class = |rows: &[crate::persistence::McpOAuthAuthorization], class: &str| {
+            rows.iter()
+                .filter(|row| row.source_key.starts_with(class))
+                .count()
+        };
+        // 64 direct networks ask; the class keeps its 16 newest.
         for network in 0..64 {
             assert_eq!(
                 ask(
@@ -678,36 +697,106 @@ mod tests {
                 Admitted
             );
         }
-        let pending = |repositories: &crate::persistence::Repositories| {
-            let repositories = repositories.clone();
-            async move {
-                repositories
-                    .list_pending_mcp_oauth_authorizations(super::super::now_ms())
-                    .await
-                    .unwrap()
+        assert_eq!(of_class(&pending(&repositories).await, "direct:"), 16);
+        // The proxy class fills its own share, then is refused, evicting nothing.
+        for network in 0..4 {
+            for index in 0..4 {
+                assert_eq!(
+                    ask(
+                        &repositories,
+                        &format!("proxy:v4:203.0.{network}.0/24"),
+                        index
+                    )
+                    .await,
+                    Admitted
+                );
             }
-        };
-        assert_eq!(pending(&repositories).await.len(), 64);
-        // A proxy-class request cannot make room by evicting a direct one.
+        }
         assert_eq!(
-            ask(&repositories, "proxy:v4:203.0.113.0/24", 0).await,
+            ask(&repositories, "proxy:v4:198.51.100.0/24", 0).await,
             Refused
         );
-        assert_eq!(pending(&repositories).await.len(), 64);
-        // A tunnel request cannot either: it has nothing of its own class to evict.
-        assert_eq!(ask(&repositories, "tunnel:", 0).await, Refused);
-        // A new direct network evicts the oldest entry of the direct source holding the most.
+        // The tunnel still asks, and a new direct network evicts only a direct entry.
+        assert_eq!(ask(&repositories, "tunnel:", 0).await, Admitted);
         assert_eq!(
             ask(&repositories, "direct:v4:10.9.9.0/24", 0).await,
             Admitted
         );
         let after = pending(&repositories).await;
-        assert_eq!(after.len(), 64);
-        assert!(
-            after
-                .iter()
-                .all(|row| row.source_key.starts_with("direct:"))
+        assert_eq!(of_class(&after, "direct:"), 16);
+        assert_eq!(of_class(&after, "proxy:"), 16);
+        assert_eq!(of_class(&after, "tunnel:"), 1);
+    }
+
+    /// Review round 3: a class holds at most its share of the live never-approved clients
+    /// and pending requests, so one proxy source registering 8 an hour all day cannot fill
+    /// the global caps, and a tunnel client still registers and asks.
+    #[tokio::test]
+    async fn one_class_registering_all_day_leaves_room_for_another_class() {
+        use crate::persistence::McpOAuthAdmission::Admitted;
+        let repositories = store().await;
+        let start = super::super::now_ms();
+        let hour = 60 * 60 * 1_000;
+        let register = |source_key: &'static str, name: String, now: i64| {
+            let repositories = repositories.clone();
+            async move {
+                repositories
+                    .register_mcp_oauth_client(
+                        crate::persistence::McpOAuthClient {
+                            client_id: name,
+                            client_name: "c".to_owned(),
+                            redirect_uris: vec!["http://localhost/cb".to_owned()],
+                            source_key: source_key.to_owned(),
+                            created_at_ms: now,
+                            approved_at_ms: None,
+                            last_used_at_ms: None,
+                        },
+                        now,
+                        LIMITS,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut admitted = 0;
+        for hour_index in 0..24 {
+            let now = start + hour_index * hour;
+            for index in 0..8 {
+                let name = format!("mcp-proxy-{hour_index}-{index}");
+                if register("proxy:v4:203.0.113.0/24", name, now).await == Admitted {
+                    admitted += 1;
+                }
+            }
+        }
+        assert!(admitted <= 16, "{admitted} proxy clients live at once");
+        let now = start + 23 * hour;
+        assert_eq!(
+            register("tunnel:", "mcp-tunnel".to_owned(), now).await,
+            Admitted
         );
+        let asked = repositories
+            .create_mcp_oauth_authorization(
+                crate::persistence::NewMcpOAuthAuthorization {
+                    id: "tunnel-request".to_owned(),
+                    user_code: random_user_code().unwrap(),
+                    client_id: "mcp-tunnel".to_owned(),
+                    redirect_uri: "http://localhost/cb".to_owned(),
+                    code_challenge: s256(&"v".repeat(43)),
+                    state: None,
+                    resource: "https://e.example/mcp".to_owned(),
+                    scopes: "orchestration:read".to_owned(),
+                    origin: "https://e.example".to_owned(),
+                    source_key: "tunnel:".to_owned(),
+                    status_cookie_hash: secret_hash("c"),
+                    created_at_ms: now,
+                    expires_at_ms: now + AUTHORIZATION_TTL_MS,
+                },
+                now,
+                LIMITS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(asked, Admitted);
     }
 
     fn settings(terminals: bool) -> McpOAuthSettings {

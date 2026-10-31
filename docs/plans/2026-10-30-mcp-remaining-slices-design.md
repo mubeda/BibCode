@@ -5542,5 +5542,16 @@ the live controls, and three P2s, each fixed with a failing-first test:
   `a_thousand_refreshes_keep_the_token_history_bounded` (1,000 rotations keep at most 33
   rows; reusing the token from five rotations back still revokes).
 
+- **Re-review: one class could still fill the never-approved table.** The proxy class's cap
+  counted registrations per hour, but a never-approved client lives a day, so one proxy
+  source registering 8 an hour for 8 hours held all 64 global slots, and a tunnel client then
+  had nothing of its own class to evict (429). Each class now holds at most 16 _live_
+  never-approved clients and 16 pending authorizations, four shares that fit the global 64 of
+  each. A proven class at its share evicts its own oldest entry; the proxy class is refused.
+  Tests: `one_class_registering_all_day_leaves_room_for_another_class` (a proxy source
+  registering 8 an hour for a simulated day keeps at most 16 live, and a tunnel client still
+  registers and asks) and `each_class_keeps_to_its_share_and_evicts_only_its_own` (64 direct
+  networks keep 16; the proxy class fills its 16 and is refused; the tunnel still asks).
+
 Residual: the server still cannot prove that a proxy overwrote `X-Forwarded-For`; an
 unrecipe'd proxy only lets its callers crowd the `proxy` class, never another class.
