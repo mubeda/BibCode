@@ -1242,19 +1242,58 @@ async fn pull_requests_rpc_merge_results_and_special_paths() {
             }
             if gitlab && special == "bypass" {
                 f.response(json!({"data":{"mergeRequestUpdate":{"errors":[]}}}));
+                // Queued ahead of the re-read's GraphQL read, which takes the same role.
+                f.role("graphql");
             }
             f.raw_response("");
+            // `gh pr merge` and `glab mr merge` print no commit: a merge now (not an auto-merge)
+            // reads the request once more for it, and only once.
+            let merging_now = special != "auto";
+            if merging_now {
+                let read = |call: usize| -> Value {
+                    serde_json::from_str(
+                        &fs::read_to_string(f.root.path().join(format!("response-{call}")))
+                            .unwrap(),
+                    )
+                    .unwrap()
+                };
+                if gitlab {
+                    let mut detail = read(7);
+                    detail["merge_commit_sha"] = json!("merge-sha");
+                    let (approvals, reviewers, metadata, project) =
+                        (read(8), read(9), read(10), read(11));
+                    f.gitlab_action_reads([&detail, &approvals, &reviewers, &metadata, &project]);
+                } else {
+                    let detail = read(7);
+                    let mut metadata = read(8);
+                    metadata["data"]["repository"]["pullRequest"]["mergeCommit"] =
+                        json!({"oid": "merge-sha"});
+                    f.response(detail);
+                    f.response(metadata);
+                }
+            }
             assert_eq!(
                 f.rpc(request).await.unwrap(),
-                json!({"kind":"merged","mergedSha":null,"autoMergeEnabled":special=="auto"})
+                json!({
+                    "kind": "merged",
+                    "mergedSha": if merging_now { json!("merge-sha") } else { Value::Null },
+                    "autoMergeEnabled": special == "auto",
+                }),
+                "{gitlab} {special}"
             );
+            let reread = if merging_now {
+                if gitlab { 5 } else { 2 }
+            } else {
+                0
+            };
             assert_eq!(
                 f.count(),
                 if gitlab {
                     12 + usize::from(special == "bypass")
                 } else {
                     9
-                }
+                } + reread,
+                "{gitlab} {special}"
             );
         }
     }
