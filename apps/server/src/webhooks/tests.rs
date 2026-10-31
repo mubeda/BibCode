@@ -1438,6 +1438,7 @@ async fn deliveries_dropped_from_a_full_queue_are_logged_shown_and_announced_onc
             event_type: events::THREAD_STATUS_CHANGED.to_owned(),
             body: json!({ "id": format!("ev_{index}"), "type": events::THREAD_STATUS_CHANGED, "cursor": cursor })
                 .to_string(),
+            addressed: None,
         })
         .collect();
     let abandoned = harness
@@ -1509,6 +1510,190 @@ async fn a_retry_waiting_behind_its_delay_does_not_spin_the_dispatcher() {
     let passes = harness.webhooks.passes() - before;
     assert!(passes <= 3, "{passes} passes in one second");
     assert_eq!(harness.receiver.received().len(), 1);
+    harness.webhooks.shutdown().await;
+}
+
+fn queued(endpoint: &store::Endpoint, cursors: &[&str], tag: &str) -> Vec<store::NewDelivery> {
+    cursors
+        .iter()
+        .map(|cursor| store::NewDelivery {
+            delivery_id: format!("{tag}-{cursor}"),
+            endpoint_id: endpoint.id.clone(),
+            event_id: format!("ev_{tag}_{cursor}"),
+            event_type: events::THREAD_STATUS_CHANGED.to_owned(),
+            body: json!({ "id": format!("ev_{tag}_{cursor}"), "type": events::THREAD_STATUS_CHANGED, "cursor": cursor })
+                .to_string(),
+            addressed: Some(endpoint.fence()),
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_between_the_snapshot_and_the_enqueue_or_the_send_sends_nothing_stale() {
+    let harness = Harness::new_timed(Timing {
+        retry_delays: SLOW_RETRIES.to_vec(),
+        poll: Duration::from_secs(60),
+        ..Timing::default()
+    })
+    .await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let store = harness.webhooks.store();
+    // The dispatcher's snapshot of the endpoint, taken before the edit.
+    let snapshot = store.endpoint(&id).await.unwrap().unwrap();
+    let edit = |url: String| json!({ "id": id, "name": "CI", "url": url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] });
+    harness
+        .call("upsert", edit(format!("{}/moved", harness.receiver.url)))
+        .await
+        .unwrap();
+    // Let the pass the edit woke finish, so only this test sends what it picks below.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Chosen under the old URL: never queued for the new one.
+    store
+        .enqueue(queued(&snapshot, &["v1.1.0"], "stale"), Vec::new(), 0)
+        .await
+        .unwrap();
+    assert!(harness.deliveries(&id).await.is_empty());
+
+    // Queued under the current settings, then the endpoint is edited while the dispatcher
+    // holds the row it picked: it is not sent to the new URL.
+    let current = store.endpoint(&id).await.unwrap().unwrap();
+    store
+        .enqueue(queued(&current, &["v1.2.0"], "picked"), Vec::new(), 0)
+        .await
+        .unwrap();
+    let picked = store
+        .due(super::now_ms() + 1, Vec::new(), 8)
+        .await
+        .unwrap()
+        .remove(0);
+    harness
+        .call("upsert", edit(format!("{}/again", harness.receiver.url)))
+        .await
+        .unwrap();
+    harness.webhooks.deliver(picked, None).await;
+    assert!(harness.receiver.received().is_empty());
+    let log = harness.deliveries(&id).await;
+    assert_eq!(log[0]["state"], "abandoned");
+    assert_eq!(log[0]["lastError"], "endpoint_changed");
+    harness.webhooks.shutdown().await;
+}
+
+/// A drop recorded while an announcement is in flight is announced next, alone: the first
+/// 2xx acknowledges only the batch it carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_during_an_announcement_is_announced_next_without_repeating_the_first() {
+    let harness = Harness::new_timed(Timing {
+        max_pending: 2,
+        ..Timing::default()
+    })
+    .await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let store = harness.webhooks.store();
+    let endpoint = store.endpoint(&id).await.unwrap().unwrap();
+    harness.receiver.script(&[Reply::Delay(800)]);
+    // c1..c4: c1 and c2 dropped (batch one); c3 goes out, announcing them, and stays open.
+    store
+        .enqueue(
+            queued(&endpoint, &["v1.1.0", "v1.2.0", "v1.3.0", "v1.4.0"], "a"),
+            Vec::new(),
+            0,
+        )
+        .await
+        .unwrap();
+    eventually("the announcing request in flight", async || {
+        harness.receiver.state.hung.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // Meanwhile c5..c8: c3 to c6 dropped (batch two).
+    store
+        .enqueue(
+            queued(&endpoint, &["v1.5.0", "v1.6.0", "v1.7.0", "v1.8.0"], "b"),
+            Vec::new(),
+            0,
+        )
+        .await
+        .unwrap();
+    eventually("the next delivery", async || {
+        harness.receiver.received().len() >= 2
+    })
+    .await;
+    let received = harness.receiver.received();
+    assert_eq!(
+        received[0].json()["dropped"],
+        json!({ "count": 2, "fromCursor": "v1.1.0", "toCursor": "v1.2.0" })
+    );
+    assert_eq!(received[1].json()["cursor"], "v1.7.0");
+    assert_eq!(
+        received[1].json()["dropped"],
+        json!({ "count": 4, "fromCursor": "v1.3.0", "toCursor": "v1.6.0" })
+    );
+    eventually("the last delivery", async || {
+        harness.receiver.received().len() == 3
+    })
+    .await;
+    assert!(
+        harness.receiver.received()[2]
+            .json()
+            .get("dropped")
+            .is_none()
+    );
+    harness.webhooks.shutdown().await;
+}
+
+/// Eight endpoints held by slow manual sends never take the dispatcher's slots: a ninth
+/// endpoint's delivery goes out at once, and the loop does not spin meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endpoints_held_by_manual_sends_neither_block_a_ready_one_nor_spin_the_loop() {
+    let harness = Harness::new_timed(Timing {
+        poll: Duration::from_secs(1),
+        ..Timing::default()
+    })
+    .await;
+    harness.receiver.answer_by_default(Reply::Delay(4_000));
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await.0);
+    }
+    let (ready, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    let sends: Vec<_> = held
+        .iter()
+        .map(|id| {
+            let webhooks = harness.webhooks.clone();
+            let payload = json!({ "id": id });
+            tokio::spawn(async move { webhooks.send_test(payload).await })
+        })
+        .collect();
+    eventually("eight manual sends open", async || {
+        harness.receiver.state.open.load(Ordering::SeqCst) == 8
+    })
+    .await;
+    // One event for all nine endpoints; the ninth's delivery is queued last.
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "idle", "activeTurnId": null } }),
+        )
+        .await;
+    eventually("the ready endpoint's delivery", async || {
+        harness
+            .receiver
+            .received()
+            .iter()
+            .any(|request| request.json()["type"] == events::THREAD_STATUS_CHANGED)
+    })
+    .await;
+    assert!(sends.iter().all(|send| !send.is_finished()));
+    let delivered: Vec<Value> = harness.deliveries(&ready).await;
+    assert_eq!(delivered.len(), 1);
+    let before = harness.webhooks.passes();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let passes = harness.webhooks.passes() - before;
+    assert!(passes <= 3, "{passes} passes in one second");
+    for send in sends {
+        send.await.unwrap().unwrap();
+    }
     harness.webhooks.shutdown().await;
 }
 
