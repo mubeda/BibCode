@@ -3635,6 +3635,39 @@ gets no plan and is unchanged. A request that joins a running clone shares the s
 Git, so an agent that joins a person's clone of the same URL, after its own check passed,
 waits on that unpinned clone.
 
+### Files tools
+
+`mcp::tools::files` serves the `files` set over the Files panel's own handlers.
+
+| Tool             | Maps to                                                                      | Scope   |
+| ---------------- | ---------------------------------------------------------------------------- | ------- |
+| `files_list`     | `projects.listEntries`, at most 200 entries                                  | read    |
+| `files_search`   | `projects.searchEntries`                                                     | read    |
+| `files_read`     | `projects.readFile`, paged to 16,000 characters (halved until the page fits) | read    |
+| `files_write`    | `projects.writeFileIfUnchanged` with a `version` or `missing` precondition   | operate |
+| `files_create`   | `projects.createEntry`                                                       | operate |
+| `files_rename`   | `projects.renameEntry`                                                       | operate |
+| `files_delete`   | `projects.deleteEntry` with `toTrash` unless `permanent`, recorded (C4)      | operate |
+| `files_download` | `projects.createDownloadUrl`, on the transfer base                           | read    |
+| `files_upload`   | `projects.createUploadUrl` with `overwrite` bound, on the transfer base      | operate |
+
+- **Containment.** Paths pass `validate_paths` (C5) first. The workspace service then
+  resolves the target's folder canonically and opens it from the canonical root one
+  component at a time with `O_DIRECTORY | O_NOFOLLOW`, acting on the entry by name through
+  that handle (`openat`, `unlinkat`, `renameat`, `mkdirat`; `workspace::beneath`). A symlink
+  met on the walk means the tree changed since the check and is `resolved_path_outside_root`.
+  Every caller, the Files panel included, gets this. A folder's recursive removal renames it
+  through the handle to a fresh name first; the trash, which takes a path, re-checks the
+  folder just before the call, and on Windows every operation re-checks its folder.
+- **Trash.** `projects.deleteEntry { toTrash }` uses the same `FileTrash` as Source
+  Control's discard and fails `trash_unavailable` rather than deleting.
+- **Errors.** A workspace error's `failure` is kept on the tool failure, and the message is
+  rewritten to name the path the agent gave, never the host's absolute path.
+- **Transfers.** `McpControl::attach_transfer_base` holds the bound address
+  (`local_http_base`, set after bind); the URL is that base plus the minted relative URL, and
+  `transferId` (`transfer::transfer_id`, a hash of the token) ties the mint's activity row to
+  the route's.
+
 ### Actor attribution and agent activity
 
 Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
@@ -4610,7 +4643,19 @@ H.264 video does not travel over RPC. The ticket from
   `overwrite=1`, never replacing directories, and removing the partial and any
   reservation this server created on failure. The upload handler
   invalidates the entries index for that root and notifies the Git status
-  broadcaster.
+  broadcaster. Every step of an upload, and a file download, goes through a
+  handle on its folder opened without following symlinks below the root
+  (`workspace::beneath`). A token an outside agent minted (both mints run with
+  the caller's credential) also names the agent's session inside its claims, and
+  an upload token can bind `overwrite` (bound `false` refuses `?overwrite=1`
+  with 400). The route serves such a token only while that session is live, the
+  MCP server and the Files set are on, and for an upload the session's ceiling
+  is above read-only; it then runs the transfer under the session's live
+  controls (`McpControl::transfer_controls`): a download's body breaks off with
+  an error when access ends, and an upload stops while streaming and is checked
+  once more before its final rename, removing its partial. An ended access
+  answers 404 like an expired token. Such a transfer writes one `mcp_activity`
+  row (`files_download` or `files_upload`, with its `transferId`) when it ends.
 - Cancellation flows from client interrupt or socket closure until the
   operation's documented handoff. After a durable engine handoff, the
   server-owned lifecycle continues to a terminal receipt while only the caller

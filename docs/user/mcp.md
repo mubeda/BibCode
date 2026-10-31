@@ -369,6 +369,42 @@ it, and add the clone as a project. These tools are in the **Workspace** set.
   folder holding anything else is refused and left as it is.
 - Git 2.37 or later is needed on the server.
 
+### Files
+
+These work with the files in a thread's folder (its worktree, else its project's folder), as
+the Files panel does. They are in the **Files** set, which is on by default; the list, search,
+read and download tools work at read-only.
+
+| Tool             | What it does                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------ |
+| `files_list`     | Files and folders in the thread's folder, at most 200 (`limit`)                                              |
+| `files_search`   | Files and folders whose path matches `query`, best first                                                     |
+| `files_read`     | A text file in pages of up to 16,000 characters from `offset`, with the whole file's `version`               |
+| `files_write`    | Replaces a text file (at most 1 MiB), given the `version` it read or `createOnly`                            |
+| `files_create`   | Creates an empty file or a folder                                                                            |
+| `files_rename`   | Renames or moves a file or folder; refused when the target exists                                            |
+| `files_delete`   | **Destructive.** Moves a file or folder to the system trash, or deletes it with `permanent: true`            |
+| `files_download` | A URL that downloads a file, or a folder as a zip, with GET                                                  |
+| `files_upload`   | **Destructive** with `overwrite`. A URL that takes one file's bytes as a POST body and writes it in a folder |
+
+- **Paths stay inside.** Paths are literal and relative to the thread's folder: `..`, an
+  absolute path, a glob or pathspec character, and a symlinked folder that leads outside are
+  refused. Each operation reaches the file through a folder handle opened without following
+  symlinks, so a folder swapped for a symlink after the check is refused too.
+- **No lost edits.** `files_write` needs the `version` `files_read` returned, or `createOnly`
+  for a new file. A file changed since is refused (`file_changed_on_disk`); read it again. A
+  file over 1 MiB, or a binary one, cannot be read or written here: download it.
+- **Delete goes to the trash.** If the trash cannot take an entry, it is left in place
+  (`trash_unavailable`); nothing falls back to a permanent delete. `files_delete` takes a
+  `clientRequestId`.
+- **Transfers.** No file bytes pass through MCP. A transfer URL works for 5 minutes, for one
+  file or folder, and only while the agent's access lasts: Stop, Revoke, turning the MCP
+  server or **Files** off, or (for an upload) **Take over** or read-only ends it, also
+  mid-transfer, and an upload cut off this way leaves nothing behind. An upload URL created
+  without `overwrite` never replaces a file. Each transfer an agent's URL ran is listed in
+  **Agent activity** when it ends. The URL is this computer's address, so an agent connected
+  with `ssh <host> bibcode mcp` cannot reach it and should copy the file with `scp`.
+
 ### Who acted, Stop and Take over
 
 BiBCode marks what an outside agent does, whoever is looking:
