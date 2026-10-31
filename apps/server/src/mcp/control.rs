@@ -880,7 +880,7 @@ impl McpControl {
     }
 
     /// Lets the terminal tools reach the terminals. The first attachment wins.
-    pub fn attach_terminals(&self, manager: crate::terminal::TerminalManager) {
+    pub(crate) fn attach_terminals(&self, manager: crate::terminal::TerminalManager) {
         let _ = self
             .inner
             .terminals

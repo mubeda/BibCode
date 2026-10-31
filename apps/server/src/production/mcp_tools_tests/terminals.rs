@@ -531,6 +531,54 @@ async fn an_agent_runs_a_command_in_a_real_shell_and_reads_only_new_output_from_
     fixture.shutdown().await;
 }
 
+/// The UI adopts only a center-panel terminal, on its host thread, so an agent's terminal
+/// opens as one; a chat panel's thread uses its host's terminals.
+#[tokio::test]
+async fn an_agents_terminal_is_a_center_panel_of_the_host_thread() {
+    let (fixture, _) = Fixture::echo().await;
+    fixture
+        .harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.create", "commandId": "create-terminal-panel",
+            "threadId": "terminal-panel", "projectId": "p1", "title": "Panel",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
+            "worktreePath": null, "kind": "panel", "hostThreadId": THREAD,
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("panel created");
+    let agent = fixture.agent().await;
+    let opened = fixture
+        .call(
+            &agent,
+            "terminal_open",
+            json!({ "threadId": "terminal-panel" }),
+        )
+        .await;
+    assert_eq!(structured(&opened)["threadId"], "terminal-panel");
+    let terminal_id = structured(&opened)["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sessions = fixture.manager.thread_sessions(THREAD).await;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].terminal_id, terminal_id);
+    assert!(sessions[0].center_panel);
+    // The host and the panel list the same terminal.
+    for thread in [THREAD, "terminal-panel"] {
+        let listed = fixture
+            .call(&agent, "terminal_list", json!({ "threadId": thread }))
+            .await;
+        assert_eq!(
+            structured(&listed)["terminals"][0]["terminalId"],
+            terminal_id
+        );
+    }
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_old_cursor_reports_dropped_after_more_than_a_mebibyte_of_output() {
     let (fixture, backend) = Fixture::echo().await;

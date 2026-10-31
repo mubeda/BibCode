@@ -198,14 +198,15 @@ Turning **Terminals** off, or lowering **Agents may**, refuses the next call at 
 | Tool              | What it does                                                                                              |
 | ----------------- | --------------------------------------------------------------------------------------------------------- |
 | `terminal_list`   | The thread's terminals, yours included: id, label, status and exit code                                   |
-| `terminal_open`   | Opens a shell in the thread's folder; you see it in BiBCode, and it stays open after the agent leaves     |
+| `terminal_open`   | Opens a shell in the thread's folder as a tab in its center panel; it stays open after the agent leaves   |
 | `terminal_write`  | **Destructive.** Types up to 16,384 characters into a terminal; returns a `cursor` for reading the output |
 | `terminal_read`   | The last 4,000 characters (`tailChars`, up to 16,000), or up to 16,000 written after a `cursor`           |
 | `terminal_resize` | Sets a terminal's columns and rows                                                                        |
 | `terminal_close`  | **Destructive.** Closes a terminal and ends what runs in it                                               |
 
 - **Your terminals too.** An agent can list, read, type into and close the terminals you
-  opened in that thread. What it types is not marked as the agent's.
+  opened in that thread. What it types is not marked as the agent's. A chat panel's thread
+  uses its host thread's terminals.
 - **Reading.** `terminal_read` returns `nextCursor`; reading from it returns only newer
   output, and `more` says whether more follows. A terminal keeps about 1 MiB of output, so a
   cursor older than that comes back with `dropped: true` and starts at the oldest output kept.
