@@ -2558,7 +2558,7 @@ async fn contained_path(root: &Path, cwd: &Path, path: &str) -> Option<PathBuf> 
 }
 
 /// What became of one entry a discard sent to the trash.
-enum Moved {
+pub(crate) enum Moved {
     Trashed,
     /// The trash could not take it, and it is where it was: a permanent discard may remove it.
     NotTaken,
@@ -2624,6 +2624,29 @@ async fn move_to_trash(
     })
     .await
     .unwrap_or(Moved::Kept)
+}
+
+/// The Files tools' and Files panel's trash (#139 X5), by the same staging as a discard: the
+/// entry at `path` (relative to `root`, the canonical workspace) is renamed by handle into a
+/// holder under `<holder_parent>/bibcode-discard/` (the Git directory, or a private folder
+/// under the server's state directory for a folder that is no repository), checked, and only
+/// that staged path goes to the trash. Entries a crash left staged there are first moved back
+/// below `root`. Another file system, or one without the no-replace rename, stages nothing:
+/// `NotTaken`.
+#[cfg(unix)]
+pub(crate) async fn trash_by_staging(
+    trash: &dyn FileTrash,
+    root: &Path,
+    holder_parent: &Path,
+    path: &str,
+    cancellation: &CancellationToken,
+) -> Moved {
+    let (staging_dir, recovery_root) = (holder_parent.to_path_buf(), root.to_path_buf());
+    let _ = tokio::task::spawn_blocking(move || {
+        discard_staging::recover(&staging_dir, &recovery_root);
+    })
+    .await;
+    move_to_trash(trash, root, (holder_parent, root), path, cancellation).await
 }
 
 /// Moves the entry at `path` to the trash by the checked folder's canonical path. The trash
@@ -2987,6 +3010,16 @@ mod discard_staging {
                 return Err(Unstaged::Failed);
             }
         };
+        // An entry staged here can only come back without replacing anything if this file
+        // system has the no-replace rename: without it the trash is unavailable, and nothing
+        // moves. Renaming the holder onto itself answers which.
+        if matches!(
+            rename_no_replace(&staging, &holder_name, &staging, &holder_name),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported
+        ) {
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        }
         // Where the entry came from, written before it moves, so a crash before the trash
         // takes it leaves a record a later discard restores it from.
         let Ok(below_root) = root.strip_prefix(worktree_root) else {
@@ -3166,8 +3199,8 @@ mod discard_staging {
     }
 
     /// Renames `from_name` in `from` to `to_name` in `to`, never over an existing entry: the
-    /// workspace's shared no-replace rename, which falls back to a hard link where the file
-    /// system lacks the kernel's flag, and refuses a folder there (it then stays staged).
+    /// workspace's shared no-replace rename, refused (`Unsupported`) where the file system lacks
+    /// the kernel's flag; [`stage`] then stages nothing, so the trash is unavailable.
     fn rename_no_replace(
         from: &OwnedFd,
         from_name: &CStr,

@@ -151,67 +151,59 @@ fn downloads(
                 })?;
             let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
             let outcome = if metadata.is_dir() {
-                // The plan both enforces the archive limits and proves to `archive_body` that
-                // they were enforced, so an oversized folder fails before the response starts.
-                let plan = match transfer::archive::plan_archive_with_limits(
-                    &canonical,
+                // The folder is held open from here; the plan and the archive both walk it
+                // through no-follow handles, so a swap after the check above is never followed.
+                let limits = transfer::archive::ArchiveLimits {
                     max_entries,
                     max_bytes,
-                )
-                .await
-                {
-                    Ok(plan) => plan,
-                    Err(transfer::TransferError::TooManyEntries { limit }) => {
-                        if let Some((_, finish)) = watched.as_mut() {
-                            finish.pending = "TransferArchiveTooLargeError";
-                        }
-                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
-                            limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                            unit: TransferArchiveLimitUnit::Entries,
-                        });
-                    }
-                    Err(transfer::TransferError::TooManyBytes { limit }) => {
-                        if let Some((_, finish)) = watched.as_mut() {
-                            finish.pending = "TransferArchiveTooLargeError";
-                        }
-                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
-                            limit,
-                            unit: TransferArchiveLimitUnit::Bytes,
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "folder download preparation failed");
-                        return Err(not_found());
-                    }
                 };
-                // The folder is held open from here, and the archive walks it through
-                // no-follow handles, so a swap after the check above is never followed.
                 let label = canonical.clone();
-                let folder = tokio::task::spawn_blocking(move || {
-                    Root::new(&canonical_root)
+                let opened = tokio::task::spawn_blocking(move || {
+                    let folder = Root::new(&canonical_root)
                         .and_then(|root| Dir::open(&root, &canonical, false))
                         .map_err(|error| {
                             tracing::warn!(%error, "folder download open failed");
-                            not_found()
-                        })
+                            None
+                        })?;
+                    // The plan both enforces the archive limits and proves to `archive_body`
+                    // that they were enforced, so an oversized folder fails before the
+                    // response starts.
+                    transfer::archive::plan_dir(&folder, limits)
+                        .map(|plan| (plan, folder))
+                        .map_err(Some)
                 })
                 .await
-                .map_err(|_| not_found())??;
+                .map_err(|_| not_found())?;
+                let (plan, folder) = match opened {
+                    Ok(opened) => opened,
+                    Err(None) => return Err(not_found()),
+                    Err(Some(error)) => {
+                        let (limit, unit) = match error {
+                            transfer::TransferError::TooManyEntries { limit } => (
+                                u64::try_from(limit).unwrap_or(u64::MAX),
+                                TransferArchiveLimitUnit::Entries,
+                            ),
+                            transfer::TransferError::TooManyBytes { limit } => {
+                                (limit, TransferArchiveLimitUnit::Bytes)
+                            }
+                            error => {
+                                tracing::warn!(%error, "folder download preparation failed");
+                                return Err(not_found());
+                            }
+                        };
+                        if let Some((_, finish)) = watched.as_mut() {
+                            finish.pending = "TransferArchiveTooLargeError";
+                        }
+                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge { limit, unit });
+                    }
+                };
                 TransferDownloadHttpResponse {
                     file_name,
                     content_type: "application/zip",
                     // A zip is produced as it streams, so its length is unknown until the
                     // last entry: the archive response stays chunked.
                     content_length: None,
-                    body: transfer::archive::archive_body_from(
-                        plan,
-                        folder,
-                        label,
-                        transfer::archive::ArchiveLimits {
-                            max_entries,
-                            max_bytes,
-                        },
-                    ),
+                    body: transfer::archive::archive_body_from(plan, folder, label, limits),
                 }
             } else {
                 // Opened through a handle on its folder, never by a path that could have
