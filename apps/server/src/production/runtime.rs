@@ -598,6 +598,7 @@ impl ProductionRuntime {
         ));
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
+        let mcp_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
@@ -734,6 +735,7 @@ impl ProductionRuntime {
             orchestration.clone(),
             control.mcp_server_signal(),
         );
+        mcp_control.attach_terminals(mcp_terminals);
 
         Ok(Self {
             mcp_control,

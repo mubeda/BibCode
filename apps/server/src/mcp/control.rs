@@ -407,6 +407,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     super::tools::previews::FAMILY,
     super::tools::worktrees::FAMILY,
     super::tools::pull_requests::FAMILY,
+    super::tools::terminals::FAMILY,
 ];
 
 /// The spec and family of `name` for `kind` in `families`.
@@ -515,6 +516,8 @@ pub(super) struct Inner {
     /// The preview host and devices the client twins of the provider tools use (slice D),
     /// attached by the Connect service that owns them.
     previews: std::sync::OnceLock<super::tools::previews::PreviewServices>,
+    /// The terminal manager the terminal tools use (slice T), attached by the runtime.
+    terminals: std::sync::OnceLock<super::tools::terminals::TerminalServices>,
 }
 
 #[derive(Default)]
@@ -613,6 +616,7 @@ impl McpControl {
                 owned: AtomicUsize::new(0),
                 claims: super::outcome::Claims::default(),
                 previews: std::sync::OnceLock::new(),
+                terminals: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -873,6 +877,19 @@ impl McpControl {
     /// The attached preview services; `None` on a server without the Connect service.
     pub(crate) fn previews(&self) -> Option<&super::tools::previews::PreviewServices> {
         self.inner.previews.get()
+    }
+
+    /// Lets the terminal tools reach the terminals. The first attachment wins.
+    pub fn attach_terminals(&self, manager: crate::terminal::TerminalManager) {
+        let _ = self
+            .inner
+            .terminals
+            .set(super::tools::terminals::TerminalServices::new(manager));
+    }
+
+    /// The attached terminals; `None` on a server that attached none.
+    pub(crate) fn terminals(&self) -> Option<&super::tools::terminals::TerminalServices> {
+        self.inner.terminals.get()
     }
 }
 

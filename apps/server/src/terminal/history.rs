@@ -21,6 +21,20 @@ pub(crate) struct TerminalHistory {
     line_limit: usize,
     total_bytes: usize,
     byte_limit: usize,
+    /// Every byte ever pushed, eviction and clearing included: the end offset of the output,
+    /// which a reader's cursor counts in.
+    total_bytes_written: u64,
+}
+
+/// A run of retained output between two byte offsets of everything ever written.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HistoryWindow {
+    pub(crate) text: String,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    /// The requested offset is no longer retained (evicted, cleared, or from an earlier
+    /// session), so the window starts at the oldest retained byte instead.
+    pub(crate) dropped: bool,
 }
 
 #[derive(Debug)]
@@ -101,6 +115,7 @@ impl TerminalHistory {
             line_limit,
             total_bytes: 0,
             byte_limit,
+            total_bytes_written: 0,
         }
     }
 
@@ -108,7 +123,90 @@ impl TerminalHistory {
         self.line_limit
     }
 
+    pub(crate) fn total_bytes_written(&self) -> u64 {
+        self.total_bytes_written
+    }
+
+    /// The offset of the oldest retained byte.
+    fn oldest(&self) -> u64 {
+        self.total_bytes_written - self.total_bytes as u64
+    }
+
+    /// At most `max_chars` characters of retained output from offset `from`. An offset no
+    /// longer retained, or past the end, starts at the oldest retained byte and reports
+    /// `dropped`; one inside a character starts at the next character.
+    pub(crate) fn read_window(&self, from: u64, max_chars: usize) -> HistoryWindow {
+        let oldest = self.oldest();
+        let dropped = from < oldest || from > self.total_bytes_written;
+        let mut skip = if dropped {
+            0
+        } else {
+            usize::try_from(from - oldest).unwrap_or(usize::MAX)
+        };
+        let mut start = if dropped { oldest } else { from };
+        let mut text = String::new();
+        let mut remaining = max_chars;
+        for chunk in &self.chunks {
+            let retained = chunk.retained();
+            if skip >= retained.len() {
+                skip -= retained.len();
+                continue;
+            }
+            let mut offset = skip;
+            while !retained.is_char_boundary(offset) {
+                offset += 1;
+            }
+            start += (offset - skip) as u64;
+            skip = 0;
+            let piece = &retained[offset..];
+            let taken = piece
+                .char_indices()
+                .nth(remaining)
+                .map_or(piece.len(), |(index, _)| index);
+            text.push_str(&piece[..taken]);
+            remaining -= piece[..taken].chars().count();
+            if remaining == 0 {
+                break;
+            }
+        }
+        let end = start + text.len() as u64;
+        HistoryWindow {
+            text,
+            start,
+            end,
+            dropped,
+        }
+    }
+
+    /// The last `max_chars` characters of retained output, ending at the total.
+    pub(crate) fn tail(&self, max_chars: usize) -> HistoryWindow {
+        let mut pieces = Vec::new();
+        let mut remaining = max_chars;
+        for chunk in self.chunks.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let retained = chunk.retained();
+            let cut = retained
+                .char_indices()
+                .rev()
+                .nth(remaining.saturating_sub(1))
+                .map_or(0, |(index, _)| index);
+            let piece = &retained[cut..];
+            remaining -= piece.chars().count().min(remaining);
+            pieces.push(piece);
+        }
+        let text: String = pieces.into_iter().rev().collect();
+        HistoryWindow {
+            start: self.total_bytes_written - text.len() as u64,
+            end: self.total_bytes_written,
+            text,
+            dropped: false,
+        }
+    }
+
     pub(crate) fn push(&mut self, data: &str) {
+        self.total_bytes_written += data.len() as u64;
         if self.line_limit == 0 || self.byte_limit == 0 {
             self.clear();
             return;
@@ -480,5 +578,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_window_reads_forward_from_a_cursor_and_counts_every_byte_written() {
+        let mut history = TerminalHistory::new(100);
+        history.push("one\n");
+        history.push("twö\n");
+        assert_eq!(history.total_bytes_written(), 9);
+        let all = history.read_window(0, 100);
+        assert_eq!(
+            (all.text.as_str(), all.start, all.end),
+            ("one\ntwö\n", 0, 9)
+        );
+        assert!(!all.dropped);
+        let rest = history.read_window(4, 100);
+        assert_eq!((rest.text.as_str(), rest.start, rest.end), ("twö\n", 4, 9));
+        // At most `max_chars` characters, ending on a character boundary.
+        let page = history.read_window(4, 3);
+        assert_eq!((page.text.as_str(), page.end), ("twö", 8));
+        // Nothing new past the end.
+        let caught_up = history.read_window(9, 100);
+        assert_eq!(
+            (caught_up.text.as_str(), caught_up.start, caught_up.end),
+            ("", 9, 9)
+        );
+        // A cursor inside a character starts at the next one.
+        let inside = history.read_window(7, 100);
+        assert_eq!((inside.text.as_str(), inside.start), ("\n", 8));
+    }
+
+    #[test]
+    fn an_evicted_cursor_reports_dropped_and_starts_at_the_oldest_retained_byte() {
+        let mut history = TerminalHistory::new(5_000);
+        history.push("first\n");
+        let cursor = history.total_bytes_written();
+        let block = "x".repeat(64 * 1024);
+        for _ in 0..17 {
+            history.push(&block);
+        }
+        assert!(history.total_bytes_written() > 1_048_576 + cursor);
+        let window = history.read_window(cursor, 10);
+        assert!(window.dropped);
+        let oldest = history.total_bytes_written() - history.snapshot().len() as u64;
+        assert_eq!(window.start, oldest);
+        assert_eq!(window.text, "x".repeat(10));
+        // Clearing keeps the count, so an old cursor is dropped, never reused.
+        history.clear();
+        let after = history.total_bytes_written();
+        let cleared = history.read_window(cursor, 10);
+        assert!(cleared.dropped);
+        assert_eq!(
+            (cleared.start, cleared.end, cleared.text.as_str()),
+            (after, after, "")
+        );
+        history.push("new");
+        assert_eq!(history.read_window(after, 10).text, "new");
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_is_dropped_and_starts_at_the_oldest_byte() {
+        // A restarted terminal has a new history, so an old session's cursor can lie ahead.
+        let mut history = TerminalHistory::new(100);
+        history.push("fresh");
+        let window = history.read_window(1_000, 100);
+        assert!(window.dropped);
+        assert_eq!((window.start, window.text.as_str()), (0, "fresh"));
+    }
+
+    #[test]
+    fn the_tail_is_the_last_characters_and_ends_at_the_total() {
+        let mut history = TerminalHistory::new(100);
+        history.push("abc\n");
+        history.push("déf");
+        let tail = history.tail(4);
+        assert_eq!((tail.text.as_str(), tail.start, tail.end), ("\ndéf", 3, 8));
+        assert!(!tail.dropped);
+        let all = history.tail(100);
+        assert_eq!((all.text.as_str(), all.start), ("abc\ndéf", 0));
     }
 }

@@ -5,5 +5,6 @@
 pub(crate) mod git;
 pub(crate) mod previews;
 pub(crate) mod pull_requests;
+pub(crate) mod terminals;
 pub(crate) mod threads;
 pub(crate) mod worktrees;

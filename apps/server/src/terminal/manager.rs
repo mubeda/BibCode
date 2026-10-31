@@ -20,7 +20,8 @@ use super::{
     PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
     TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput,
     TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
-    TerminalStatus, TerminalSummary, history::TerminalHistory,
+    TerminalStatus, TerminalSummary,
+    history::{HistoryWindow, TerminalHistory},
 };
 use super::{TerminalAgentStatus, TerminalAgentStatusState};
 use crate::{
@@ -234,6 +235,16 @@ pub enum TerminalError {
 struct SizeOwner {
     claim: String,
     attachment: uuid::Uuid,
+}
+
+/// A bounded read of one session's output, and the state of its process.
+#[derive(Debug)]
+pub(crate) struct TerminalHistoryRead {
+    pub(crate) window: HistoryWindow,
+    /// The offset just past everything the session has written.
+    pub(crate) total: u64,
+    pub(crate) status: TerminalStatus,
+    pub(crate) exit_code: Option<i32>,
 }
 
 struct Session {
@@ -3801,6 +3812,42 @@ impl TerminalManager {
                 reason,
             });
         }
+    }
+
+    /// The summaries of one thread's sessions, by terminal id.
+    pub(crate) async fn thread_sessions(&self, thread_id: &str) -> Vec<TerminalSummary> {
+        let sessions = self.inner.sessions.read().await;
+        let mut listed = Vec::new();
+        for ((thread, _), session) in sessions.iter() {
+            if thread == thread_id {
+                listed.push(session.lock().await.summary());
+            }
+        }
+        listed.sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
+        listed
+    }
+
+    /// A bounded window of one session's retained output, from memory: from byte offset
+    /// `from`, or its last `max_chars` characters when `from` is `None`.
+    pub(crate) async fn read_history(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        from: Option<u64>,
+        max_chars: usize,
+    ) -> Result<TerminalHistoryRead, TerminalError> {
+        let session = self.require_session(thread_id, terminal_id).await?;
+        let session = session.lock().await;
+        let window = match from {
+            Some(from) => session.history.read_window(from, max_chars),
+            None => session.history.tail(max_chars),
+        };
+        Ok(TerminalHistoryRead {
+            window,
+            total: session.history.total_bytes_written(),
+            status: session.status,
+            exit_code: session.exit_code,
+        })
     }
 
     /// Terminal sessions whose process is starting or running.
@@ -8285,6 +8332,67 @@ mod tests {
         assert_eq!(restarted_session.lock().await.history.line_limit(), 2);
         assert_eq!(backend.processes.lock().expect("processes lock").len(), 2);
 
+        manager.shutdown().await;
+    }
+
+    /// The outside-agent terminal tools list one thread's sessions and read bounded windows
+    /// of their history from memory (#139 slice T).
+    #[tokio::test]
+    async fn a_threads_sessions_list_and_read_bounded_history_windows() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for (thread, terminal) in [
+            ("thread-a", "term-2"),
+            ("thread-a", "term-1"),
+            ("thread-b", "term-1"),
+        ] {
+            manager
+                .open(TerminalOpenInput::new(
+                    thread,
+                    terminal,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let listed: Vec<String> = manager
+            .thread_sessions("thread-a")
+            .await
+            .into_iter()
+            .map(|summary| summary.terminal_id)
+            .collect();
+        assert_eq!(listed, ["term-1", "term-2"]);
+
+        let mut events = manager.subscribe_events();
+        backend.latest().emit("only thread-b\n");
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("output timeout")
+            .expect("output event");
+        let tail = manager
+            .read_history("thread-b", "term-1", None, 4)
+            .await
+            .unwrap();
+        assert_eq!((tail.window.text.as_str(), tail.window.end), ("d-b\n", 14));
+        assert_eq!(tail.status, TerminalStatus::Running);
+        let from = manager
+            .read_history("thread-b", "term-1", Some(5), 100)
+            .await
+            .unwrap();
+        assert_eq!(from.window.text, "thread-b\n");
+        assert!(matches!(
+            manager.read_history("thread-a", "term-9", None, 10).await,
+            Err(TerminalError::NotFound { .. })
+        ));
         manager.shutdown().await;
     }
 
