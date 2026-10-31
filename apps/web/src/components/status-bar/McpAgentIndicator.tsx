@@ -21,9 +21,13 @@ export const McpAgentIndicator = memo(function McpAgentIndicator() {
   const agent = active[0];
   if (agent === undefined) return null;
   const others = active.slice(1);
-  const handBack = takenOverLevel(clients.find((client) => client.sessionId === agent.clientId));
+  // A revoked agent whose turns still run is no authorized client: it can be stopped, not
+  // taken over.
+  const client = clients.find((entry) => entry.sessionId === agent.clientId);
+  const handBack = takenOverLevel(client);
   const busy = actions.pendingClientId === agent.clientId;
   const text = agentChipText(agent.label);
+  const turns = agent.runningTurns;
 
   return (
     <div className="inline-flex shrink-0 items-center gap-1" data-testid="mcp-agent-indicator">
@@ -56,6 +60,13 @@ export const McpAgentIndicator = memo(function McpAgentIndicator() {
                   ? "It is working in this environment now."
                   : "It acted in this environment in the last two minutes."}
             </div>
+            {turns > 0 ? (
+              <div className="text-muted-foreground">
+                {turns === 1
+                  ? "A turn it started is still running; Stop interrupts it."
+                  : `${turns} turns it started are still running; Stop interrupts them.`}
+              </div>
+            ) : null}
             {others.length > 0 ? (
               <div className="text-muted-foreground">
                 Also active: {others.map((other) => other.label?.trim() || "MCP agent").join(", ")}.
@@ -75,7 +86,7 @@ export const McpAgentIndicator = memo(function McpAgentIndicator() {
           >
             Stop
           </button>
-          {handBack !== null ? (
+          {client === undefined ? null : handBack !== null ? (
             <button
               type="button"
               className={ACTION_CLASS}

@@ -136,9 +136,16 @@ export function useAgentCommitLabels(environmentId: EnvironmentId): ReadonlyMap<
   return useMemo(() => (rows === null ? NO_AGENT_COMMITS : agentCommitLabels(rows)), [rows]);
 }
 
-/** **Stop**: revoke the agent and interrupt the turns it is running. */
-export function stopMcpAgent(sessionId: AuthSessionId): Promise<void> {
-  return stopServerMcpClient(sessionId);
+/**
+ * **Stop**: revoke the agent and interrupt the turns it is running, also after a Revoke.
+ * Fails when the server stopped nothing, so the person is not told it worked.
+ */
+export async function stopMcpAgent(sessionId: AuthSessionId): Promise<void> {
+  if (!(await stopServerMcpClient(sessionId))) {
+    throw new Error(
+      "BiBCode no longer knows this agent. Interrupt its threads from the thread itself.",
+    );
+  }
 }
 
 /** **Revoke**: end the agent's access; its running turns go on. */

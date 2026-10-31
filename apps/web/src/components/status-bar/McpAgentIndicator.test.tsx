@@ -108,6 +108,23 @@ describe("McpAgentIndicator", () => {
     expect(h.setAccess).toHaveBeenCalledWith("s-1", "auto-accept-edits");
   });
 
+  it("keeps Stop for a revoked agent whose turn still runs, without Take over", async () => {
+    h.active = [
+      { clientId: "s-1", label: "Claude Code", lastCallAt: null, running: true, runningTurns: 2 },
+    ];
+    h.clients = [];
+    const container = await render();
+    expect(container.textContent).toContain("Agent active · Claude Code");
+    expect(container.querySelector("[data-tooltip-popup]")?.textContent).toContain(
+      "2 turns it started are still running",
+    );
+    expect([...container.querySelectorAll("button")].map((entry) => entry.textContent)).toEqual([
+      "Stop",
+    ]);
+    await act(async () => button(container, "Stop").click());
+    expect(h.stop).toHaveBeenCalledWith("s-1");
+  });
+
   it("shows no controls to a session that may not manage access", async () => {
     h.active = [{ clientId: "s-1", label: "Claude Code", lastCallAt: null, running: true }];
     h.canManage = false;

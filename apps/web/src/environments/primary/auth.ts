@@ -622,11 +622,12 @@ export async function revokeServerClientSession(sessionId: AuthSessionId): Promi
 
 /**
  * **Stop** an outside agent (#139, slice X1): revoke it, which ends its calls and owned work,
- * and interrupt each running turn whose latest user message it sent.
+ * and interrupt each running turn whose latest user message it sent, also after a Revoke.
+ * `false` when the server stopped nothing: it no longer knows the agent.
  */
-export async function stopServerMcpClient(sessionId: AuthSessionId): Promise<void> {
+export async function stopServerMcpClient(sessionId: AuthSessionId): Promise<boolean> {
   try {
-    await runPrimaryHttp(
+    const result = await runPrimaryHttp(
       PrimaryEnvironmentHttpClient.pipe(
         Effect.flatMap((client) =>
           client.auth.revokeClient({
@@ -636,6 +637,7 @@ export async function stopServerMcpClient(sessionId: AuthSessionId): Promise<voi
         ),
       ),
     );
+    return result.revoked;
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "revoke-client-session",

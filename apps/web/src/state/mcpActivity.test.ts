@@ -9,14 +9,33 @@ vi.mock("@bibcode/client-runtime/state/mcpActivity", () => ({
 vi.mock("./auth", () => ({ authEnvironment: { accessChanges: () => null } }));
 vi.mock("./environments", () => ({ usePrimaryEnvironment: () => null }));
 vi.mock("./query", () => ({ useEnvironmentQuery: () => ({ data: null }) }));
+const stopServerMcpClient = vi.hoisted(() => vi.fn(async (): Promise<boolean> => true));
 vi.mock("../environments/primary", () => ({
   revokeServerClientSession: vi.fn(),
   setServerMcpClientAccess: vi.fn(),
-  stopServerMcpClient: vi.fn(),
+  stopServerMcpClient,
   usePrimarySessionState: () => ({ data: null }),
 }));
 
-import { agentCommitLabels, agentLabelForCommit, takenOverLevel } from "./mcpActivity";
+import { AuthSessionId } from "@bibcode/contracts";
+
+import {
+  agentCommitLabels,
+  agentLabelForCommit,
+  stopMcpAgent,
+  takenOverLevel,
+} from "./mcpActivity";
+
+describe("stopMcpAgent", () => {
+  it("fails when the server stopped nothing", async () => {
+    stopServerMcpClient.mockResolvedValueOnce(true);
+    await expect(stopMcpAgent(AuthSessionId.make("s-1"))).resolves.toBeUndefined();
+    stopServerMcpClient.mockResolvedValueOnce(false);
+    await expect(stopMcpAgent(AuthSessionId.make("s-1"))).rejects.toThrow(
+      "BiBCode no longer knows this agent",
+    );
+  });
+});
 
 function row(id: number, sha: string | undefined, outcome = "success"): McpActivityRow {
   return {
