@@ -143,7 +143,9 @@ signature is `v1=35495024f4ef3f94e5a93e22221544c4b75e9a42300cd965ab81cb85cd994e9
   on a finished delivery only, never one still queued or being sent.
 - Changing an endpoint's URL, project or events drops what was waiting for it (the log shows
   "Not sent: the endpoint's URL or events changed"): nothing queued for the old destination
-  or filters goes to the new one. Renaming it keeps the queue.
+  or filters goes to the new one. Renaming it keeps the queue. A test event or redelivery
+  waiting to be sent when the endpoint is edited, or turned off or on, is not sent: it says
+  the endpoint changed, and you can send it again.
 - Ten failed deliveries in a row turn the endpoint off, with a warning and **Re-enable**.
 - Turning **Webhooks** off, or an endpoint, stops its request in flight and drops what was
   waiting for it. Turning webhooks on again starts from that moment; what happened while

@@ -5179,3 +5179,36 @@ first; each new test was seen failing against the round-two code:
   `endpoints_held_by_manual_sends_neither_block_a_ready_one_nor_spin_the_loop` (eight
   endpoints held by 4-second test events and a ninth whose event goes out before any of them
   ends; at most three passes in the following second).
+
+**Codex review round 4 (2026-10-31).** The three remaining P2s came down to one missing
+generation. Each was fixed test first; the three dispatcher tests were seen failing against
+the round-three code:
+
+- **An endpoint `revision` after all (supersedes round 3's value fence).** Migration 61 is
+  unreleased, so it was amended, as X1 and X3 amended 60: `webhook_endpoints.revision` and
+  `webhook_deliveries.endpoint_revision` (`INTEGER NOT NULL DEFAULT 0`) are in its table
+  definitions, and `ensure_webhook_revisions` adds either one only when it is missing. The
+  ledger never runs 61 again on a store that ran the first 61, so the dispatcher also calls it
+  once when it starts (`Store::ensure_revisions`), which is what keeps such development
+  stores working. A URL, project or event-list edit, and turning the endpoint off or on
+  (including the automatic disable after failures and a revoked pairing), bump `revision` in
+  the same transaction that abandons the queue. Tests: `migration_061_adds_the_webhook_tables`
+  (the columns) and `a_store_that_ran_the_earlier_061_gains_the_revisions` (columns dropped,
+  then restored, twice safely); these two passed with the amended migration and so were not
+  seen failing.
+- **A→B→A fooled the value fence.** Each queued row now carries the revision it was chosen
+  under (`NewDelivery.addressed`), and `enqueue` compares it with the endpoint's revision in its
+  own transaction, stamping the row with it. `deliver` drops a picked row whose stamp differs
+  from the endpoint's revision (`endpoint_changed`) besides re-checking it is still pending.
+  Test: `an_edit_and_its_undo_still_fence_off_what_was_chosen_before_them`.
+- **A manual send used a pre-edit read.** `send_now` now takes the endpoint's send lock
+  (waiting only until shutdown), then its token, then re-reads the endpoint; a revision other
+  than the one the request was built from abandons the `sending` row as `endpoint_changed`
+  and refuses with the new `WebhookError` reason `endpoint_changed`. An edit after that read
+  cancels the token. Test: `a_manual_send_built_before_an_edit_is_refused` (the test holds the
+  lock, so the edit lands after the read and before the lock and token).
+- **An old acknowledgement erased a new batch after off/on.** Turning webhooks off cleared all
+  of `webhook_state`, `drop_seq` included, so batch numbers restarted. It now keeps `drop_seq`,
+  so numbers are never reused for the life of the store. Test:
+  `an_acknowledgement_paused_across_off_and_on_keeps_a_newer_drop`.
+- **Contract.** The `endpoint_changed` reason; fixtures regenerated, counts unchanged.
