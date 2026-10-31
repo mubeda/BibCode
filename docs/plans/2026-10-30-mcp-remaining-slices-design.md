@@ -3315,3 +3315,65 @@ own body, and `unknown_failure` now sets the same marker; `Interruption::NoAnswe
 (`no-answer`); and `Owned::target(thread_id)`. `target.rs` gains `thread_target` and
 `live_thread`, which take the control; `ToolCall::target` and `ToolCall::thread`
 (`control.rs`, one delegating line outside P's files) call them.
+
+## D (device and browser previews) implementation notes (2026-10-30)
+
+Slice D was implemented on `claude/v0131-139-d`, from `claude/issue-batch-after-v0.13.0` at
+`882c8e4077` (slice 1, the CLI, F0 and wave 1). The 17 client twins sit beside the provider
+specs in `mcp/tools/previews.rs` and reach the provider dispatch, `previews::run`; the tests
+are `production/mcp_tools_tests/previews.rs`. The provider `tools/list` is unchanged: it is
+still built from `preview_tool_descriptors` and `device_tool_descriptors`, which D did not
+edit.
+
+**Drift found:**
+
+- **`McpControl` had no way to reach the preview host or the devices.** The invoker, the
+  `DeviceTools` and the environment id live in `ConnectMcpService` (built in `lifecycle.rs`),
+  and `ToolCall` carries only the control, the principal, the arguments and the token. `Inner`
+  gained a `OnceLock<PreviewServices>` with `attach_previews` and `previews`
+  (`mcp/control.rs`), and `ConnectMcpService::with_control` attaches its own
+  (`production/connect_mcp.rs`). `McpControl::new` is unchanged. Without the Connect service a
+  preview twin answers `PreviewAutomationNoAvailableHostError` and a device twin
+  `DevicePreviewsDisabledError`.
+- **Files outside D's ownership:** `mcp/control.rs` (that field, the two methods, and one
+  assertion of `each_kind_is_refused_the_other_kinds_tools`); `production/connect_mcp.rs`
+  (the attach, and `device_tool_descriptors` re-exported `pub(crate)`);
+  `production/connect_mcp/tests.rs`, whose
+  `every_listed_provider_tool_is_registered_for_providers_only` (now
+  `…_with_a_client_twin_of_its_own`) and
+  `providers_and_outside_agents_share_mcp_with_separate_tools_and_checks` asserted that no twin
+  exists. The latter now proves the provider still reaches its own `preview_status` with its
+  credential's scope, and that a client call of that name is the twin's.
+- **The missing host was not a typed error.** `run` folds every invoker failure into
+  `PreviewAutomationExecutionError` with the broker's tag in the message
+  (`"PreviewAutomationNoAvailableHostError: …"`). The client path splits a
+  `PreviewAutomation…Error` tag back out and adds "Open BiBCode … then try again"; provider
+  results are unchanged.
+
+**Choices made while implementing:**
+
+- **The ceiling gates every twin,** the four read-only ones too, as the design's Gates say:
+  each acts in the user's preview or on a device. `tools()` lists read-only specs at a
+  read-only ceiling, so those four are listed there and refused with
+  `McpAccessCeilingError`. Hiding them needs a per-family list hook in `control.rs`.
+- **Device twins stay listed with device previews off** (a provider's list hides them) and
+  answer `DevicePreviewsDisabledError`, for the same reason.
+- **Hints follow the design's list,** so the client `preview_wait_for` is not read-only and
+  no twin sets `openWorldHint`, although the provider descriptors set both.
+- **Arguments.** A preview twin passes every argument but `threadId` (and `tabId`, as for a
+  provider) to the host, so its schema is open, as the provider's is. A device twin's schema
+  is the provider tool's plus `threadId`, read from `device_tool_descriptors`, so the two
+  cannot drift.
+- **No `clientRequestId`.** The twins are not recorded: an open of an image the thread runs
+  returns that device, and the other mutating twins act on what is on screen.
+- **Results are the provider results,** unchanged: they are not cut to 80,000 characters, and
+  a large `preview_snapshot` or `preview_evaluate` result can exceed the `_meta` size the
+  descriptor declares.
+
+**Tests** (written first; all nine failed before the twins existed): the listing and hints;
+`threadId` required and an unknown thread refused; the scope (the agent's
+`mcp:<sid>:<threadId>` session, `mcp-client`, a panel thread's host as the owner, `threadId`
+and `tabId` kept from the page); no host, typed, both with and without the services; two
+agents' separate tabs through a real broker and a fake UI host; read-only and the Workspace
+set turned off; device twins without `DeviceTools`; and, on unix with the fake SDK,
+`device_list` on and off and a close refused for another thread (`DeviceBusyError`).
