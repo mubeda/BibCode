@@ -1,6 +1,7 @@
 import type {
   AuthBrowserSessionResult,
   AuthClientMetadata,
+  AuthClientSessionRevokeResult,
   AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
   AuthMcpAccessLevel,
@@ -622,10 +623,12 @@ export async function revokeServerClientSession(sessionId: AuthSessionId): Promi
 
 /**
  * **Stop** an outside agent (#139, slice X1): revoke it, which ends its calls and owned work,
- * and interrupt each running turn whose latest user message it sent, also after a Revoke.
- * `false` when the server stopped nothing: it no longer knows the agent.
+ * and interrupt each running turn it started, also after a Revoke. The answer says whether it
+ * was stopped (`revoked: false`: the server no longer knows it) and how its interrupts went.
  */
-export async function stopServerMcpClient(sessionId: AuthSessionId): Promise<boolean> {
+export async function stopServerMcpClient(
+  sessionId: AuthSessionId,
+): Promise<AuthClientSessionRevokeResult> {
   try {
     const result = await runPrimaryHttp(
       PrimaryEnvironmentHttpClient.pipe(
@@ -637,7 +640,7 @@ export async function stopServerMcpClient(sessionId: AuthSessionId): Promise<boo
         ),
       ),
     );
-    return result.revoked;
+    return result;
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "revoke-client-session",

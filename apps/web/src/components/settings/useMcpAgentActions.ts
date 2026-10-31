@@ -33,7 +33,7 @@ export function useMcpAgentActions() {
   );
   return {
     pendingClientId,
-    stop: (clientId: string) => run(clientId, "The agent was not stopped", stopMcpAgent),
+    stop: (clientId: string) => run(clientId, "Stop did not finish", stopMcpAgent),
     revoke: (clientId: string) => run(clientId, "The agent was not revoked", revokeMcpAgent),
     takeOver: (clientId: string) =>
       run(clientId, "The agent was not taken over", (id) => setMcpAgentAccess(id, "read-only")),
