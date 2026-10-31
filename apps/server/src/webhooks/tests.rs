@@ -1732,7 +1732,13 @@ async fn an_edit_and_its_undo_still_fence_off_what_was_chosen_before_them() {
 async fn a_manual_send_built_before_an_edit_is_refused() {
     let harness = Harness::new().await;
     let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    // The test holds the endpoint's lock; the edit queues for it first, then the test event
+    // reads the endpoint (still the old revision) and queues behind the edit.
     let turn = harness.webhooks.send_lock(&id).lock_owned().await;
+    let editor = harness.webhooks.clone();
+    let edit_payload = json!({ "id": id, "name": "CI", "url": format!("{}/moved", harness.receiver.url), "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] });
+    let edit = tokio::spawn(async move { editor.upsert(edit_payload).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let webhooks = harness.webhooks.clone();
     let payload = json!({ "id": id });
     let send = tokio::spawn(async move { webhooks.send_test(payload).await });
@@ -1740,14 +1746,8 @@ async fn a_manual_send_built_before_an_edit_is_refused() {
         harness.deliveries(&id).await.len() == 1
     })
     .await;
-    harness
-        .call(
-            "upsert",
-            json!({ "id": id, "name": "CI", "url": format!("{}/moved", harness.receiver.url), "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] }),
-        )
-        .await
-        .unwrap();
     drop(turn);
+    edit.await.unwrap().unwrap();
     let refused = send.await.unwrap().unwrap_err();
     assert_eq!(refused["reason"], "endpoint_changed", "{refused}");
     assert!(harness.receiver.received().is_empty());
@@ -1790,6 +1790,64 @@ async fn an_acknowledgement_paused_across_off_and_on_keeps_a_newer_drop() {
         .unwrap()
         .expect("the newer drop stays");
     assert_eq!(pending.from_cursor.as_deref(), Some("v1.3.0"));
+    harness.webhooks.shutdown().await;
+}
+
+/// Holds the next sender just after its revision read until `release`.
+async fn edit_while_a_sender_is_past_its_revision_read(
+    harness: &Harness,
+    id: &str,
+    pause: Arc<super::Pause>,
+) -> tokio::task::JoinHandle<Result<Value, Value>> {
+    tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .expect("a sender past its revision read");
+    let webhooks = harness.webhooks.clone();
+    let payload = json!({ "id": id, "name": "CI", "url": format!("{}/moved", harness.receiver.url), "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] });
+    let edit = tokio::spawn(async move { webhooks.upsert(payload).await });
+    // The edit waits for the sender: it cannot commit while one may still post to the old URL.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!edit.is_finished(), "the edit committed under a sender");
+    pause.release.notify_one();
+    edit
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_waits_for_a_manual_send_past_its_revision_read_and_stops_it() {
+    let harness = Harness::new().await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let pause = harness.webhooks.pause_next_sender_after_revision_read();
+    let webhooks = harness.webhooks.clone();
+    let payload = json!({ "id": id });
+    let send = tokio::spawn(async move { webhooks.send_test(payload).await });
+    let edit = edit_while_a_sender_is_past_its_revision_read(&harness, &id, pause).await;
+    edit.await.unwrap().unwrap();
+    let sent = send.await.unwrap().unwrap();
+    assert_eq!(sent["delivery"]["state"], "abandoned", "{sent}");
+    assert!(harness.receiver.received().is_empty());
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_waits_for_a_queued_send_past_its_revision_read_and_stops_it() {
+    let harness = Harness::new().await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    let pause = harness.webhooks.pause_next_sender_after_revision_read();
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "idle", "activeTurnId": null } }),
+        )
+        .await;
+    let edit = edit_while_a_sender_is_past_its_revision_read(&harness, &id, pause).await;
+    edit.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(harness.receiver.received().is_empty());
+    let log = harness.deliveries(&id).await;
+    assert_eq!(log[0]["state"], "abandoned");
+    assert_eq!(log[0]["lastError"], "endpoint_changed");
     harness.webhooks.shutdown().await;
 }
 
