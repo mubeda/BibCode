@@ -22,7 +22,7 @@ import { useId, useState } from "react";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hooks/useSettings";
 import type { EnvironmentPresentation } from "../../state/environments";
-import { usePrimaryMcpClients } from "../../state/mcpActivity";
+import { usePrimaryAgentAccess, usePrimaryMcpClients } from "../../state/mcpActivity";
 import { isFailingEndpoint, useWebhookList } from "../../state/webhooks";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -178,6 +178,7 @@ export function AgentIntegrationsSection() {
             isPrimary={isPrimary}
           />
           {isPrimary ? <McpAgentsPanel /> : null}
+          {isPrimary ? <RevokedPairingNotice environmentId={environment.environmentId} /> : null}
         </TabsPanel>
         <TabsPanel value="webhooks" className="gap-0">
           <WebhooksTab
@@ -189,6 +190,22 @@ export function AgentIntegrationsSection() {
         </TabsPanel>
       </Tabs>
     </SettingsSection>
+  );
+}
+
+/** Webhook endpoints a revoked agent's pairing turned off, named in the MCP tab too. */
+function RevokedPairingNotice({ environmentId }: { readonly environmentId: EnvironmentId }) {
+  const access = usePrimaryAgentAccess();
+  const webhooks = useWebhookList(access.canRead ? environmentId : null);
+  const names = (webhooks.data?.endpoints ?? [])
+    .filter((endpoint) => endpoint.disabledReason === "client-revoked")
+    .map((endpoint) => endpoint.name);
+  if (names.length === 0) return null;
+  return (
+    <SettingsRow
+      title="Webhooks turned off"
+      description={`Revoking their paired MCP client turned off ${names.join(", ")}. Re-enable them in the Webhooks tab.`}
+    />
   );
 }
 
@@ -208,7 +225,10 @@ function IntegrationsStatus({
   const mcpEnabled = useEnvironmentSettings(environmentId, selectEnabled);
   const webhooksEnabled = useEnvironmentSettings(environmentId, selectWebhooksEnabled);
   const clients = usePrimaryMcpClients();
-  const webhooks = useWebhookList(supported ? environmentId : null);
+  const access = usePrimaryAgentAccess();
+  // Only where this app knows the session may read them (the primary environment's
+  // `access:read`): elsewhere the Webhooks tab reads them when opened.
+  const webhooks = useWebhookList(supported && isPrimary && access.canRead ? environmentId : null);
   if (!supported) return null;
   const parts = [mcpEnabled ? "MCP on" : "MCP off"];
   if (isPrimary) {
@@ -232,7 +252,7 @@ function IntegrationsStatus({
     );
   }
   return (
-    <p role="status" className="text-xs whitespace-nowrap text-muted-foreground">
+    <p role="status" className="truncate text-xs text-muted-foreground" title={parts.join(" · ")}>
       {parts.join(" · ")}
     </p>
   );
