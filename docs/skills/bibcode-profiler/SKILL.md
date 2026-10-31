@@ -121,7 +121,12 @@ untrusted.
   ```
 
 - Tools: `profiler_status`, `profiler_findings`, `profiler_events`,
-  `profiler_crash`, `profiler_symbolicate`.
+  `profiler_crash`, `profiler_symbolicate`. `profiler_findings` with `since`
+  returns findings oldest first; follow `nextCursor` until it is null to read
+  more than 100.
+- An outside agent connected to BiBCode's own MCP server (`bibcode mcp`) has
+  the same first four tools there, in the Diagnostics set, with events and
+  crash records cut to their documented fields.
 
 ## Choose the mode
 

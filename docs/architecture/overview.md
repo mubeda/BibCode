@@ -2009,12 +2009,29 @@ bounded memory, and works while the server is stopped.
   [Observability](../operations/observability.md#from-the-command-line)).
   Its framing (protocol eras, version checks, result shapes and the 80,000
   character cap) lives in `mcp/protocol.rs`, which `/mcp` shares.
+  `profiler_findings` without `since` or `cursor` returns the newest findings;
+  with either it returns them oldest first by `lastSeen` and id, `since`
+  inclusive, with an opaque `nextCursor` while more remain, so a gap of any
+  size is caught up page by page.
+- **Profiler tools on `/mcp`.** Outside agents get `profiler_status`,
+  `profiler_findings`, `profiler_events` and `profiler_crash` in the
+  Diagnostics set (`mcp/tools/diagnostics.rs`, slice X2 of #139). They run the
+  stdio handlers in process over the server's own profiler directory (the
+  installed `ProfilerHandle`'s), in `spawn_blocking`, and take no RPC
+  admission. Events and crash records are projected: an event keeps its
+  envelope and the payload fields its kind documents in
+  [`events.md`](../skills/bibcode-profiler/references/events.md), client-chosen
+  ids only when id-shaped, and an undocumented kind its envelope only.
+  `profiler_symbolicate` stays on stdio. `git.stacked-action` records only a
+  supported action name, or `unknown`, since the client chooses that text.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
 - **MCP tool calls.** Each `/mcp` tool call is timed as `mcp.<tool>` (`rpc.timing`
   and the hang check). A tool is long-running when its `ToolSpec` says so
   (`mcp.wait_for_thread`, every `mcp.preview_*` and `mcp.device_*` call, network
-  tools) or its RPC method is long-running; a client tool and a provider tool of one
+  tools) or its RPC method is long-running (so `mcp.refresh_providers` and
+  `mcp.diagnose_environment`, through `server.refreshProviders` and
+  `server.discoverSourceControl`); a client tool and a provider tool of one
   name are both asked. The tools' own RPC dispatches keep their RPC names' timing.
   `/mcp` logs a failed call's tool, thread id and error type, never its arguments,
   prompts or replies; a destructive tool also writes one content-free

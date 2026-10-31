@@ -3457,6 +3457,26 @@ attaches the `TerminalManager` to `McpControl` (`attach_terminals`).
   session. Every terminal tool works on that owner thread.
 - **Content.** Terminal input and output never reach a log line or a profiler record.
 
+### Diagnostics tools
+
+`mcp::tools::diagnostics` serves the `diagnostics` set. Every result is an allowlisted
+projection built from named fields, never the RPC's own reply.
+
+| Tool                   | Maps to                                                                                                     | Scope   |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------- | ------- |
+| `profiler_status`      | the stdio `profiler_status` handler over the server's own profiler directory, in `spawn_blocking`           | read    |
+| `profiler_findings`    | the same for `profiler_findings`, with its cursor                                                           | read    |
+| `profiler_events`      | the same for `profiler_events`; each event keeps its envelope and its kind's documented fields              | read    |
+| `profiler_crash`       | the same for `profiler_crash` (local symbols only); the record and its events projected                     | read    |
+| `diagnose_environment` | `server.getConfig`, `server.discoverSourceControl` (never `recordHosts`) and `server.getProfilerStatus`     | read    |
+| `refresh_providers`    | `server.refreshProviders` with no `instanceId`                                                              | operate |
+| `process_diagnostics`  | `server.getProcessDiagnostics` and `server.getProcessResourceHistory`, without commands, labels or messages | read    |
+| `trace_diagnostics`    | `server.getTraceDiagnostics`, without paths, causes or log entries                                          | read    |
+
+The profiler tools take no RPC admission: they read files in process, as the stdio
+server does. A section of `diagnose_environment` that fails carries its error's tag
+instead of failing the call.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop

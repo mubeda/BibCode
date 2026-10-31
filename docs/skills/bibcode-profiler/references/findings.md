@@ -496,7 +496,8 @@ The remaining kinds come from the read-only scan in
   that cancelled. Builds through v0.10.2 recorded no stacked-action outcome at
   all: the stream reports a failure as an `action_failed` item and then ends
   successfully, so `rpc.histogram` showed only `first-item` (#158).
-- **Fingerprint:** `[action, phase, reason, operation]`. `phase` is `branch`,
+- **Fingerprint:** `[action, phase, reason, operation]`. `action` is a supported
+  action name, or `unknown` for any other, as in the event. `phase` is `branch`,
   `commit`, `push`, `pr`, or `preflight` before the first step. `reason` is
   `git-failed`, `provider-failed` or `internal`. `operation` is the failing Git
   operation's tag, such as `GitVcsDriver.pushCurrentBranch`, or empty. No path:

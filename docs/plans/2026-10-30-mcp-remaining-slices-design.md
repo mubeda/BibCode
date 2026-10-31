@@ -3466,3 +3466,100 @@ subscriber and a running profiler, and finds no canary from the input, the outpu
 write or a write to a missing terminal. The interleaving test passes without the tool's lock,
 since the manager already serializes a terminal's writes (its publication lock, and the PTY
 writer's lock); the lock keeps the guarantee in the tool layer, as the design asks.
+
+## X2 (diagnostics tools) implementation notes (2026-10-30)
+
+X2 was implemented on `claude/v0131-139-x2`, from the batch tip `1d4eda69bd` (slice 1, the
+CLI, F0, wave 1 and D). It adds `mcp/tools/diagnostics.rs` (the eight tools and their
+projections) and `production/mcp_tools_tests/diagnostics.rs`, changes
+`diagnostics/profiler/mcp.rs` and `diagnostics/profiler/git_actions.rs`, and adds one
+registration line each in `mcp/tools/mod.rs`, `control::FAMILIES` and `mcp_tools_tests/mod.rs`.
+No contract, migration, RPC method or `latency.rs` entry changed.
+
+**Revision 4 requirements:**
+
+- **Rejected action text (X2).** `record_stacked_action_outcome` maps `action` to one of the
+  five names `validate_stacked_action_input` accepts, or `unknown`, before anything uses it,
+  so the event, the repeat key, the finding's fingerprint, summary and evidence all carry
+  the normalized name. Fixing only the event would have left the finding's `summary` and
+  `evidence.action` returning the client's text through `profiler_status` and
+  `profiler_findings`. The test records a marker action as `git.runStackedAction` passes it
+  (once refused, three times failing to raise the finding) with a live profiler, and reads
+  both back over `/mcp`; it failed with the normalization removed.
+- **Event allowlist (X2).** `profiler_events` and `profiler_crash`'s `lastEvents` keep the
+  envelope (`v`, `bibcode`, `ts`, `sid`, `seq`, `eventId`, `kind`, `source`) and the payload
+  fields `events.md` documents for the kind (`event_fields`); an undocumented kind keeps its
+  envelope only. Lists inside an event (`procs`, `frames`, `histograms`) keep their
+  documented fields, `stalls` and `interactions` their numbers. Client-chosen strings
+  (`clientId`, `correlationId`, `envId`, `appVersion`, and `source`'s `client:<id>`) are kept
+  only when id-shaped (`[A-Za-z0-9._:+-]{1,64}`), and a client batch's `capabilities` only
+  when known. A crash record keeps its documented fields, its frames' files go through
+  `redact_path` and `stackError` through `redact_message`.
+- **Findings cursor (X8).** Without `since` or `cursor`, `profiler_findings` is unchanged
+  (the newest `limit`, newest first). With either, findings at or after `since` and after
+  `cursor` come oldest first by parsed `lastSeen`, then id, at most 100 a page, with
+  `nextCursor` (`<lastSeen>|<id>`, opaque to agents) while more remain and null at the end.
+  The page is fitted (`fit_list`) before the cursor is set. A finding that recurs moves to
+  its new `lastSeen`, so a reader following the cursor sees it again; at most the book's
+  1,000 findings are ever held. The stdio server gets the same cursor (same handler): its
+  only visible change is that `since` now returns oldest first. Its tests and the skill's
+  tool line say so.
+
+**Drift found:**
+
+- **"Each profiler tool over `/mcp` matches the stdio result"** holds for `profiler_status`
+  and `profiler_findings`. For `profiler_events` and `profiler_crash` the Revision 4
+  allowlist supersedes it: the test asserts `/mcp` equals the stdio events, each projected.
+  The stdio server keeps returning raw events: it is a person's own tool over files they can
+  read, and the requirement names records returned to outside agents.
+- **The handlers' seam.** The stdio handlers returned a finished `tool_result`, which cuts
+  after any cursor and leaves no room to project, so each became a `pub(crate)` content
+  producer returning `(content, cuts)` and a `Refusal` (`Invalid` or `Missing`) that the stdio
+  server turns into `tool_failure` and `/mcp` into `McpInvalidArgumentError` or
+  `McpCrashNotFoundError`. Their descriptions and schemas are `pub(crate)` too.
+- **Reaching the server's own directory.** `McpControl` holds no state directory, and
+  `control.rs` is X1's in this wave, so `profiler::mcp::server_reader()` builds a `Reader`
+  from the installed `ProfilerHandle`'s directory (a child module may read its private
+  field). The runtime installs the handle with recording off too, so the tools read the
+  files either way, as the stdio server does. With no handle (no runtime, or one that could
+  not lock its directory) the tools return `McpProfilerUnavailableError`.
+- **`diagnose_environment` and `discoverSourceControl`.** Discovery is already long-running
+  in `latency.rs`, so `mcp.diagnose_environment` is too, through its method; nothing was
+  added there. `refresh_providers` is long-running through `server.refreshProviders`. The
+  tool sends `{}`: `recordHosts` rewrites the recorded hosts, which only Settings' scan does.
+- **Files touched beyond X2's.** F0's
+  `a_capability_set_turned_off_hides_and_refuses_its_tools_live` (`foundation.rs`) asserted
+  an empty list with Workspace and Source control off; Diagnostics is on by default, so it
+  now asserts that only Diagnostics tools remain. The docs beyond `docs/user/mcp.md`:
+  `rpc-and-orchestration.md` (a "Diagnostics tools" subsection, per the Docs section),
+  `overview.md`, and the profiler skill's `SKILL.md`, `events.md` and `findings.md`; the
+  skill's frontmatter is unchanged, so its stubs are too.
+
+**Choices made while implementing:**
+
+- **`diagnose_environment`** returns `environment` (server version, platform, remote
+  protocol versions, and the capability flags that are numbers or booleans under plain
+  keys), `providers` (`instanceId`, `driver`, `enabled`, `installed`, `version`, `status`,
+  `availability`, and `auth` as its status), `configIssues` (a count per kind),
+  `sourceControl` (each system's and CLI's kind, status, version, and a CLI's sign-in
+  status; no executable, hint, detail, host or account) and `profiler` (its state without
+  findings). A section whose RPC fails carries its error's tag instead of failing the call.
+- **`refresh_providers`** is an operate tool marked idempotent, not recorded, and returns
+  the same provider projection.
+- **`process_diagnostics`** takes `historyWindowMs` (15 minutes unless set, clamped to one
+  minute to one hour) and `bucketMs` (a fifteenth of the window unless set, clamped so there
+  are at most 120 buckets and none under a second), since the RPC has no defaults. An error
+  becomes `readFailed: true`; `uiCoverage` keeps its status only.
+- **`trace_diagnostics`** takes `limit` (1 to 20, 10 unless set) per list, returns no trace
+  or span ids, and keeps the error's `kind` only.
+
+**Tests** (`production/mcp_tools_tests/diagnostics.rs`): listing, hints, read-only and the
+set turned off; process and trace projections against the real wire shapes with a marker in
+every free-text field and a home path in every path; `diagnose_environment` the same, and
+that discovery is never asked to record hosts; `refresh_providers`; and two tests in
+processes of their own (the profiler handle is process-global): the profiler tools over a
+real runtime and store (unavailable before it starts, status and findings equal to stdio,
+events and crash projected, typed refusals), and the rejected action. The cursor is tested
+on the stdio server (`a_cursor_catches_up_more_than_100_findings_oldest_first`: 250 findings,
+ties on `lastSeen` broken by id) and over `/mcp` for its refusal. The git action and cursor
+tests were each seen failing before their fix.
