@@ -4814,6 +4814,34 @@ CLI, F0 and waves 1 to 3 with their review fixes). It adds five tools to the `gi
 - **Not changed:** `git_log` with both `ref` and `cursor` follows the cursor's tip and only
   echoes `ref`; its description does not say so.
 
+**Review round 2 (Codex, 2026-10-31).** Four P2s, each confirmed and fixed test-first:
+
+- **A pending suggestion could erase a draft from before folder drafts.** The suggestion's
+  subscription (a child effect) ran before the panel's promotion effect, filled the folder
+  draft, and promotion then dropped the thread's draft. `receiveAgentCommitSuggestion` now
+  takes the thread's legacy key and promotes in the same store update before it applies the
+  suggestion. Test: a v1 draft plus a suggestion already in the snapshot; the words survive
+  and the suggestion is offered.
+- **A stale tab could save over another tab's draft.** The store persists its whole state to
+  one key. Before applying a new suggestion it now reads the saved state: a saved draft with
+  text for that folder is kept (and the suggestion offered), the saved suggestion records are
+  merged so another tab's handling counts, and the saved drafts of other folders are taken
+  as saved, so the automatic write changes only its folder. A draft with text in this tab,
+  a just-promoted one included, still wins over the saved one. Not done: a `storage` event
+  listener that keeps every tab's drafts in sync; ordinary typing in two tabs can still save
+  over each other, as before X7.
+- **Expired suggestions still applied.** The client fold now runs at the time each event
+  arrived (Effect's `Clock`, not `Date.now()`, which the Effect lint refuses there) and drops
+  expired intents. The panel ignores a suggestion past `expiresAt` and hides a shown one with
+  a timer when it expires. Tests use fixed and fake clocks.
+- **Concurrent publishers could reorder a folder's messages.** The server takes the
+  sequence, updates the folder and broadcasts under one lock, and each `commitMessage`
+  intent carries `sequence` (contract field; at least the clock in milliseconds, so it keeps
+  rising across a restart). The fold and the panel keep a folder's highest sequence, so a
+  live event older than a snapshot never wins. Tests: four threads publishing 100 messages
+  are announced in strictly rising order with the kept one last, and a second server's
+  first sequence is above the first's. Wire fixtures were regenerated; counts unchanged.
+
 ## X8 implementation notes (2026-10-31)
 
 X8 was implemented on `claude/v0131-139-x8`, from the batch tip `4d4287c818` (slice 1, the
