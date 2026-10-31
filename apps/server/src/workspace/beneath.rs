@@ -67,6 +67,13 @@ pub(crate) enum Replace {
 /// A file's identity: its device and inode. Platforms that report none (Windows, through
 /// `std`) give `None`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "no platform but Unix reports an identity through std"
+    )
+)]
 pub(crate) struct Identity {
     dev: u64,
     ino: u64,
@@ -101,6 +108,7 @@ pub(crate) struct Entry {
     pub(crate) id: Option<Identity>,
 }
 
+#[cfg(unix)]
 impl Entry {
     const MISSING: Self = Self {
         kind: Kind::Missing,
@@ -124,6 +132,8 @@ pub(crate) fn is_escape(error: &io::Error) -> bool {
 #[derive(Clone, Debug)]
 pub(crate) struct Root {
     path: PathBuf,
+    /// Only Unix opens the root by handle and compares it.
+    #[cfg(unix)]
     id: Option<Identity>,
 }
 
@@ -136,6 +146,7 @@ impl Root {
         }
         Ok(Self {
             path: path.to_path_buf(),
+            #[cfg(unix)]
             id: Identity::of_metadata(&metadata),
         })
     }
@@ -257,6 +268,10 @@ impl Dir {
 
     /// Fails with [`is_escape`] unless the folder's path still resolves to itself and the
     /// folder is still under the root.
+    #[cfg_attr(
+        all(unix, not(test)),
+        allow(dead_code, reason = "Unix checks by handle")
+    )]
     pub(crate) fn recheck(&self) -> io::Result<()> {
         match std::fs::canonicalize(&self.path) {
             Ok(path) if path == self.path => self.contained(),
@@ -268,6 +283,7 @@ impl Dir {
     /// The path of `name` in this folder, after [`Self::recheck`], for a call that takes a
     /// path (the system trash). Windows gets it without the `\\?\` prefix the Recycle Bin
     /// refuses.
+    #[cfg(not(unix))]
     pub(crate) fn checked_path(&self, name: &OsStr) -> io::Result<PathBuf> {
         self.recheck()?;
         Ok(crate::git::without_verbatim_prefix(self.path.join(name)))
@@ -291,7 +307,9 @@ mod imp {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
 
-    use super::{Dir, Entry, Identity, Kind, Open, Removal, Replace, Root, escape, hooks};
+    use super::{
+        Dir, ESCAPE_MESSAGE, Entry, Identity, Kind, Open, Removal, Replace, Root, escape, hooks,
+    };
 
     /// The deepest a folder can sit below the root before [`contained`] gives up.
     const MOST_DEPTH: usize = 4_096;
@@ -572,7 +590,15 @@ mod imp {
             if created {
                 let c = c_name(name)?;
                 // SAFETY: `c` is NUL-terminated and `parent` open.
-                unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+                let removed =
+                    unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+                if removed != 0 {
+                    // Something was put in it already: it stays where the moved parent went.
+                    return Err(io::Error::other(format!(
+                        "{ESCAPE_MESSAGE}; the folder BiBCode had just made there could not be removed: {}",
+                        io::Error::last_os_error()
+                    )));
+                }
             }
             return Err(escape());
         }
@@ -605,18 +631,17 @@ mod imp {
     }
 
     /// Renames `from_name` in `from` to `to_name` in `to`, never over an existing entry, for
-    /// every BiBCode caller (the workspace service, uploads, discard staging). The kernel's
-    /// no-replace rename is tried first; a file system that does not support it (`EINVAL`,
-    /// `ENOSYS`, `ENOTSUP`) gets a hard link, which refuses an existing target by construction,
-    /// then the source name removed. A folder cannot be linked, so there it is refused with
-    /// [`NO_REPLACE_UNSUPPORTED`].
+    /// every BiBCode caller (the workspace service, uploads, discard staging), with the
+    /// kernel's no-replace rename. A file system without it (`EINVAL`, `ENOSYS`, `ENOTSUP`) is
+    /// refused with [`NO_REPLACE_UNSUPPORTED`] (`ErrorKind::Unsupported`), for files and folders
+    /// alike: a link-and-unlink stand-in is not one atomic step.
     pub(crate) fn rename_no_replace(
         from: BorrowedFd<'_>,
         from_name: &CStr,
         to: BorrowedFd<'_>,
         to_name: &CStr,
     ) -> io::Result<()> {
-        let native = if hooks::link_fallback_forced() {
+        let native = if hooks::no_replace_unsupported() {
             Err(io::Error::from_raw_os_error(libc::EINVAL))
         } else {
             native_no_replace(from.as_raw_fd(), from_name, to.as_raw_fd(), to_name)
@@ -628,54 +653,19 @@ mod imp {
                     Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::EOPNOTSUPP)
                 ) =>
             {
-                link_no_replace(from, from_name, to, to_name)
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    NO_REPLACE_UNSUPPORTED,
+                ))
             }
             other => other,
         }
     }
 
-    /// The refusal of a no-replace rename of a folder on a file system without the kernel's
-    /// no-replace rename.
+    /// The refusal of a no-replace rename on a file system without the kernel's no-replace
+    /// rename.
     pub(crate) const NO_REPLACE_UNSUPPORTED: &str =
-        "this file system cannot rename a folder without the risk of replacing another";
-
-    fn link_no_replace(
-        from: BorrowedFd<'_>,
-        from_name: &CStr,
-        to: BorrowedFd<'_>,
-        to_name: &CStr,
-    ) -> io::Result<()> {
-        // SAFETY: zeroed is a valid `stat` to be overwritten.
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `from_name` is NUL-terminated and `stat` a valid out pointer.
-        check(unsafe {
-            libc::fstatat(
-                from.as_raw_fd(),
-                from_name.as_ptr(),
-                &raw mut stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                NO_REPLACE_UNSUPPORTED,
-            ));
-        }
-        // SAFETY: both names are NUL-terminated and both descriptors open; flag 0 links a
-        // symlink itself, never its target.
-        check(unsafe {
-            libc::linkat(
-                from.as_raw_fd(),
-                from_name.as_ptr(),
-                to.as_raw_fd(),
-                to_name.as_ptr(),
-                0,
-            )
-        })?;
-        // SAFETY: `from_name` is NUL-terminated and `from` open.
-        check(unsafe { libc::unlinkat(from.as_raw_fd(), from_name.as_ptr(), 0) }).map(|_| ())
-    }
+        "this file system cannot rename without the risk of replacing another entry";
 
     #[cfg(target_os = "linux")]
     fn native_no_replace(
@@ -750,7 +740,7 @@ mod imp {
         #[cfg(test)]
         hooks::after_park(&parked);
         let still_ours = || entry_at(&dir.fd, &parked).is_ok_and(|entry| entry.id == Some(id));
-        let emptied = dir.contained().and_then(|()| empty_tree(&fd, 0));
+        let emptied = empty_tree(&fd, dir.root.id, 0);
         drop(fd);
         match emptied {
             Ok(()) if still_ours() => match remove_empty(&dir.fd, &parked) {
@@ -781,8 +771,11 @@ mod imp {
         }
     }
 
-    /// Removes everything in held folder `folder`, depth first, through descriptors only.
-    fn empty_tree(folder: &OwnedFd, depth: usize) -> io::Result<()> {
+    /// Removes everything in held folder `folder`, depth first, through descriptors only. The
+    /// folder must still be under the root (identity `root`) right before each removal; the
+    /// first check that fails stops the removal and leaves the rest, so a folder another process
+    /// moves out mid-way loses at most the one entry whose removal was already under way.
+    fn empty_tree(folder: &OwnedFd, root: Option<Identity>, depth: usize) -> io::Result<()> {
         if depth > MOST_DEPTH {
             return Err(io::Error::other(
                 "the folder is nested too deeply to delete",
@@ -791,10 +784,14 @@ mod imp {
         for child in names_of(folder)? {
             if entry_at(folder, &child)?.kind == Kind::Directory {
                 let inner = open_child(folder, &child)?;
-                empty_tree(&inner, depth + 1)?;
+                empty_tree(&inner, root, depth + 1)?;
                 drop(inner);
+                contained_fd(folder, root)?;
                 remove_empty(folder, &child)?;
             } else {
+                #[cfg(test)]
+                hooks::before_unlink(&child);
+                contained_fd(folder, root)?;
                 let c = c_name(&child)?;
                 // SAFETY: `c` is NUL-terminated and `folder` open.
                 check(unsafe { libc::unlinkat(folder.as_raw_fd(), c.as_ptr(), 0) })?;
@@ -824,19 +821,28 @@ mod hooks {
     thread_local! {
         static AFTER_CREATE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static AFTER_PARK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-        static LINK_FALLBACK: Cell<bool> = const { Cell::new(false) };
+        static BEFORE_UNLINK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static NO_REPLACE_OFF: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) fn after_create(name: &OsStr) {
         AFTER_CREATE.with_borrow_mut(|hook| hook.as_mut().map(|hook| hook(name)));
     }
 
+    pub(super) fn before_unlink(name: &OsStr) {
+        BEFORE_UNLINK.with_borrow_mut(|hook| hook.as_mut().map(|hook| hook(name)));
+    }
+
+    pub(crate) fn on_unlink(hook: impl FnMut(&OsStr) + 'static) {
+        BEFORE_UNLINK.set(Some(Box::new(hook)));
+    }
+
     pub(super) fn after_park(name: &OsStr) {
         AFTER_PARK.with_borrow_mut(|hook| hook.as_mut().map(|hook| hook(name)));
     }
 
-    pub(super) fn link_fallback_forced() -> bool {
-        LINK_FALLBACK.get()
+    pub(super) fn no_replace_unsupported() -> bool {
+        NO_REPLACE_OFF.get()
     }
 
     pub(crate) fn on_create(hook: impl FnMut(&OsStr) + 'static) {
@@ -847,27 +853,30 @@ mod hooks {
         AFTER_PARK.set(Some(Box::new(hook)));
     }
 
-    pub(crate) fn force_link_fallback(forced: bool) {
-        LINK_FALLBACK.set(forced);
+    pub(crate) fn force_no_replace_unsupported(forced: bool) {
+        NO_REPLACE_OFF.set(forced);
     }
 
     pub(crate) fn clear() {
         AFTER_CREATE.set(None);
         AFTER_PARK.set(None);
-        LINK_FALLBACK.set(false);
+        BEFORE_UNLINK.set(None);
+        NO_REPLACE_OFF.set(false);
     }
 }
 
-/// Outside tests nothing forces the link fallback.
+/// Outside tests nothing switches the no-replace rename off.
 #[cfg(all(unix, not(test)))]
 mod hooks {
-    pub(super) const fn link_fallback_forced() -> bool {
+    pub(super) const fn no_replace_unsupported() -> bool {
         false
     }
 }
 
 #[cfg(all(test, unix))]
-pub(crate) use hooks::{clear as clear_test_hooks, force_link_fallback, on_create, on_park};
+pub(crate) use hooks::{
+    clear as clear_test_hooks, force_no_replace_unsupported, on_create, on_park, on_unlink,
+};
 #[cfg(unix)]
 pub(crate) use imp::rename_no_replace;
 
@@ -1240,16 +1249,76 @@ mod tests {
     }
 
     #[test]
-    fn the_no_replace_rename_falls_back_to_a_link_where_the_flag_is_unsupported() {
+    fn a_parked_folder_moved_out_mid_delete_keeps_everything_not_yet_removed() {
+        let (_root, root_path) = canonical_root();
+        let (_outside, outside) = canonical_root();
+        let root = Root::new(&root_path).unwrap();
+        std::fs::create_dir(root_path.join("victim")).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(root_path.join("victim").join(name), name).unwrap();
+        }
+        let dir = Dir::open(&root, &root_path, false).unwrap();
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let seen = std::rc::Rc::clone(&parked);
+        on_park(move |name| *seen.borrow_mut() = Some(name.to_os_string()));
+        let (base, away) = (root_path.clone(), outside.join("moved"));
+        let watched = std::rc::Rc::clone(&parked);
+        // Before the first removal, another process moves the parked folder out.
+        on_unlink(move |_| {
+            if let Some(name) = watched.borrow_mut().take() {
+                std::fs::rename(base.join(name), &away).unwrap();
+            }
+        });
+        let result = dir.remove_dir_all(OsStr::new("victim"));
+        clear_test_hooks();
+        assert!(matches!(result, Err(Removal::Partial { .. })), "{result:?}");
+        let mut left: Vec<_> = std::fs::read_dir(outside.join("moved"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["a", "b", "c"],
+            "nothing was removed once it left the root"
+        );
+    }
+
+    #[test]
+    fn a_folder_made_in_a_moved_parent_that_cannot_be_removed_says_so() {
+        let (_root, root_path) = canonical_root();
+        let (_outside, outside) = canonical_root();
+        let root = Root::new(&root_path).unwrap();
+        std::fs::create_dir(root_path.join("a")).unwrap();
+        let (from, to) = (root_path.join("a"), outside.join("a"));
+        // The parent moves out, and something lands in the folder just made, at once.
+        on_create(move |name| {
+            if name == "b" {
+                std::fs::rename(&from, &to).unwrap();
+                std::fs::write(to.join("b/theirs"), "x").unwrap();
+            }
+        });
+        let error = Dir::open(&root, &root_path.join("a/b/c"), true)
+            .err()
+            .expect("refused");
+        clear_test_hooks();
+        assert!(!is_escape(&error));
+        assert!(
+            error.to_string().contains("could not be removed"),
+            "{error}"
+        );
+        assert!(outside.join("a/b/theirs").exists());
+    }
+
+    #[test]
+    fn the_no_replace_rename_is_refused_where_the_flag_is_unsupported() {
         let (_root, root_path) = canonical_root();
         let root = Root::new(&root_path).unwrap();
         let dir = Dir::open(&root, &root_path, false).unwrap();
         std::fs::write(root_path.join("a"), "a").unwrap();
-        std::fs::write(root_path.join("taken"), "taken").unwrap();
         std::fs::create_dir(root_path.join("folder")).unwrap();
-        force_link_fallback(true);
-        let moved = dir.rename(OsStr::new("a"), &dir, OsStr::new("b"), Replace::Never);
-        let refused = dir.rename(OsStr::new("b"), &dir, OsStr::new("taken"), Replace::Never);
+        force_no_replace_unsupported(true);
+        let file = dir.rename(OsStr::new("a"), &dir, OsStr::new("b"), Replace::Never);
         let folder = dir.rename(
             OsStr::new("folder"),
             &dir,
@@ -1257,17 +1326,13 @@ mod tests {
             Replace::Never,
         );
         clear_test_hooks();
-        moved.unwrap();
-        assert!(!root_path.join("a").exists());
-        assert_eq!(std::fs::read_to_string(root_path.join("b")).unwrap(), "a");
-        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            std::fs::read_to_string(root_path.join("taken")).unwrap(),
-            "taken"
-        );
-        let folder = folder.unwrap_err();
-        assert_eq!(folder.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(folder.to_string(), imp::NO_REPLACE_UNSUPPORTED);
+        // Files and folders alike: refused, typed, and nothing moved.
+        for refused in [file.unwrap_err(), folder.unwrap_err()] {
+            assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(refused.to_string(), imp::NO_REPLACE_UNSUPPORTED);
+        }
+        assert_eq!(std::fs::read_to_string(root_path.join("a")).unwrap(), "a");
+        assert!(!root_path.join("b").exists());
         assert!(root_path.join("folder").exists());
     }
 

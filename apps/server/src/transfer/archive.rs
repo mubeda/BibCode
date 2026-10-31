@@ -62,44 +62,16 @@ pub async fn plan_archive_with_limits(
     let root = root.to_path_buf();
     let root_for_join_error = root.clone();
     tokio::task::spawn_blocking(move || {
-        let mut plan = ArchivePlan {
-            entries: 0,
-            bytes: 0,
-        };
-        let mut stack = vec![root.clone()];
-        while let Some(directory) = stack.pop() {
-            let read = std::fs::read_dir(&directory)
-                .map_err(|error| TransferError::operation("read-dir", &directory, error))?;
-            for entry in read {
-                let entry = entry.map_err(|error| {
-                    TransferError::operation("read-dir-entry", &directory, error)
-                })?;
-                let path = entry.path();
-                let metadata = std::fs::symlink_metadata(&path)
-                    .map_err(|error| TransferError::operation("stat", &path, error))?;
-                let file_type = metadata.file_type();
-                if !file_type.is_file() && !file_type.is_dir() {
-                    // Skips symlinks (never followed) and any other non-regular entry
-                    // (sockets, FIFOs, device nodes, ...): opening those for reading can
-                    // block forever (FIFO) or fail unpredictably (socket), and none of
-                    // them belong in a folder download.
-                    continue;
-                }
-                plan.entries += 1;
-                if plan.entries > max_entries {
-                    return Err(TransferError::TooManyEntries { limit: max_entries });
-                }
-                if metadata.is_dir() {
-                    stack.push(path);
-                } else {
-                    plan.bytes = plan.bytes.saturating_add(metadata.len());
-                    if plan.bytes > max_bytes {
-                        return Err(TransferError::TooManyBytes { limit: max_bytes });
-                    }
-                }
-            }
-        }
-        Ok(plan)
+        let folder = Root::new(&root)
+            .and_then(|validated| Dir::open(&validated, &root, false))
+            .map_err(|error| TransferError::operation("read-dir", &root, error))?;
+        plan_dir(
+            &folder,
+            ArchiveLimits {
+                max_entries,
+                max_bytes,
+            },
+        )
     })
     .await
     .map_err(|error| {
@@ -109,6 +81,51 @@ pub async fn plan_archive_with_limits(
             io::Error::other(error),
         )
     })?
+}
+
+/// Sizes the archive of a folder held open, walking it through the same no-follow handles the
+/// stream reads it by (`write_archive`), and refuses a tree over `limits`. Blocking.
+pub(crate) fn plan_dir(root: &Dir, limits: ArchiveLimits) -> Result<ArchivePlan, TransferError> {
+    let failed = |error: io::Error| TransferError::operation("read-dir", Path::new(""), error);
+    let mut plan = ArchivePlan {
+        entries: 0,
+        bytes: 0,
+    };
+    let mut stack: Vec<Option<Dir>> = vec![None];
+    while let Some(folder) = stack.pop() {
+        let folder = folder.as_ref().unwrap_or(root);
+        for child in folder.names().map_err(failed)? {
+            let entry = folder.entry(&child).map_err(failed)?;
+            // Skips symlinks (never followed) and any other non-regular entry (sockets,
+            // FIFOs, device nodes, ...): opening those for reading can block forever (FIFO)
+            // or fail unpredictably (socket), and none of them belong in a folder download.
+            if !matches!(entry.kind, Kind::File | Kind::Directory) {
+                continue;
+            }
+            plan.entries += 1;
+            if plan.entries > limits.max_entries {
+                return Err(TransferError::TooManyEntries {
+                    limit: limits.max_entries,
+                });
+            }
+            if entry.kind == Kind::Directory {
+                match folder.open_dir(&child) {
+                    Ok(inner) => stack.push(Some(inner)),
+                    // Became a symlink since it was listed: never followed.
+                    Err(error) if is_escape(&error) => {}
+                    Err(error) => return Err(failed(error)),
+                }
+            } else {
+                plan.bytes = plan.bytes.saturating_add(entry.len);
+                if plan.bytes > limits.max_bytes {
+                    return Err(TransferError::TooManyBytes {
+                        limit: limits.max_bytes,
+                    });
+                }
+            }
+        }
+    }
+    Ok(plan)
 }
 
 /// Streams a zip of `root`'s contents. `plan` is a proof token: callers must have already
@@ -331,6 +348,32 @@ mod tests {
                 .await
                 .is_err(),
             "an archive producer failure must not be reported as a successful HTTP body"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_plan_sizes_the_held_folder_never_a_swapped_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("folder/sub")).unwrap();
+        std::fs::write(root.join("folder/sub/mine.txt"), b"mine").unwrap();
+        std::fs::write(outside.path().join("big.bin"), vec![0_u8; 4096]).unwrap();
+        let validated = Root::new(&root).unwrap();
+        let folder = Dir::open(&validated, &root.join("folder"), false).unwrap();
+        // After the route opened it, the folder and a folder inside it become outside links.
+        std::fs::rename(root.join("folder"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("folder")).unwrap();
+        std::fs::rename(root.join("moved/sub"), root.join("moved/sub.real")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("moved/sub")).unwrap();
+        let plan = plan_dir(&folder, ArchiveLimits::default()).unwrap();
+        assert_eq!(
+            plan,
+            ArchivePlan {
+                entries: 2,
+                bytes: 4
+            }
         );
     }
 
