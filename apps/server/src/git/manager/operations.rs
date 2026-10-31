@@ -4967,11 +4967,17 @@ mod tests {
     /// its entry waits for the trash) is never recovered; once that lock is released, as it is
     /// when the process dies, the entry is restored. Another open of the folder stands in for
     /// the other process: `flock` locks belong to each open file, not to the process.
+    ///
+    /// A lock can outlive the descriptor that took it for a moment: a child another test forks
+    /// keeps a copy of every descriptor, close-on-exec ones too, until it execs. So taking the
+    /// lock after the stranded discard is stopped, and the recovery after it is released,
+    /// retry for a bounded time, as production recovery retries on the next discard.
     #[cfg(unix)]
     #[tokio::test]
     async fn recovery_leaves_a_holder_another_process_still_holds() {
         use std::os::fd::AsRawFd;
 
+        const ATTEMPTS: usize = 500;
         let (fixture, root) = staging_fixture();
         strand(&fixture, "dir/victim.txt").await;
         let staging = root.join(".git/bibcode-discard");
@@ -4982,10 +4988,17 @@ mod tests {
             .expect("a holder")
             .path();
         let other_process = std::fs::File::open(&holder).unwrap();
-        // SAFETY: the descriptor is open for the duration of the call.
-        let locked =
-            unsafe { libc::flock(other_process.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(locked, 0, "the other process takes the holder's lock");
+        let mut locked = false;
+        for _ in 0..ATTEMPTS {
+            // SAFETY: the descriptor is open for the duration of the call.
+            if unsafe { libc::flock(other_process.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+            {
+                locked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(locked, "the other process takes the holder's lock");
         let trash_directory = tempfile::tempdir().expect("temporary trash");
         let discard_other = || async {
             std::fs::write(root.join("other.txt"), "other\n").unwrap();
@@ -5014,7 +5027,13 @@ mod tests {
         assert!(holder.join("victim.txt").exists());
 
         drop(other_process);
-        discard_other().await;
+        for _ in 0..ATTEMPTS {
+            discard_other().await;
+            if root.join("dir/victim.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
             "inside\n",
@@ -5107,16 +5126,25 @@ mod tests {
             permit_permanent: false,
         };
 
-        let outcome = discard_paths(
-            &GitRepository::default(),
-            trash.clone(),
-            discard("other.txt"),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("the discard runs");
-
-        assert_eq!(outcome.trashed, ["other.txt"]);
+        // Retried for a bounded time: a child another test forks can hold a copy of the stopped
+        // discard's locked descriptor until it execs (see
+        // `recovery_leaves_a_holder_another_process_still_holds`).
+        for _ in 0..500 {
+            std::fs::write(root.join("other.txt"), "other\n").unwrap();
+            let outcome = discard_paths(
+                &GitRepository::default(),
+                trash.clone(),
+                discard("other.txt"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the discard runs");
+            assert_eq!(outcome.trashed, ["other.txt"]);
+            if root.join("dir/victim.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
             "inside\n",
