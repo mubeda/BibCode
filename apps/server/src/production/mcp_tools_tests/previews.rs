@@ -545,6 +545,8 @@ mod devices {
             )
             .await;
         assert_eq!(error_tag(&refused), "DeviceBusyError");
+        // The image id is a safe catalog id, so an agent can act on it.
+        assert_eq!(refused["structuredContent"]["error"]["imageId"], "Pixel");
         assert_eq!(
             fixture.manager.catalog().borrow().devices[0].state,
             crate::device::catalog::DeviceState::Ready

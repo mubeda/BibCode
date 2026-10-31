@@ -22,7 +22,7 @@ use crate::{
     mcp::{
         control::{ClientPrincipal, McpControl, PROVIDER_SCOPES, PrincipalKind, authorize_call},
         protocol::{self, Incoming},
-        tools::previews::{snapshot_tool_result, tool_failure},
+        tools::previews::{keep_device_fields, snapshot_tool_result, tool_failure},
     },
     preview::{OpenRequestError, PreviewManager},
 };
