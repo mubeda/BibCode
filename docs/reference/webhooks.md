@@ -336,10 +336,15 @@ then carries:
 - `count` is the total over the batches not yet acknowledged; `fromCursor` and `toCursor`
   span the dropped feed events, and `sinceLastSeen` is the earliest dropped finding's
   `lastSeen`. Each range field is present only when a dropped event had one.
+  `fromCursor` is the position just before the first dropped event, so
+  `changes_since { cursor: fromCursor }` returns that event first (it can also return one
+  entry you already processed just before it; drop repeats by the event `id`). `toCursor` is
+  the last dropped event's own `cursor`.
 - A `2xx` to that request acknowledges exactly the batches it named. A drop recorded
   meanwhile is named on a later request, never repeated in it.
 - Catch up from `fromCursor` with `changes_since` and from `sinceLastSeen` with
-  `profiler_findings`, as below.
+  `profiler_findings`, as below. Resuming from the `cursor` of the last event you processed
+  works too, and needs no `dropped` field.
 
 ## Catching up
 
@@ -347,7 +352,8 @@ A receiver that was down, or saw a `dropped` field, recovers through an MCP conn
 the same environment ([MCP reference](./mcp.md)):
 
 - **Thread, approval and agent events.** Call `changes_since { cursor }` with the `cursor`
-  of the last event you processed (or `dropped.fromCursor`), then again with each result's
+  of the last event you processed (or `dropped.fromCursor`, which lies just before the first
+  dropped event), then again with each result's
   `cursor` while `more` is true. It returns every feed entry after that point, the ones whose
   webhook you missed included; map entries to events as in [Events](#events). Pass the same
   `threadId` filter each time if you use one.

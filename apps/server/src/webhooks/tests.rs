@@ -1457,7 +1457,7 @@ async fn deliveries_dropped_from_a_full_queue_are_logged_shown_and_announced_onc
     assert_eq!(first["cursor"], "v1.11.0");
     assert_eq!(
         first["dropped"],
-        json!({ "count": 2, "fromCursor": "v1.9.0", "toCursor": "v1.10.0" })
+        json!({ "count": 2, "fromCursor": "v1.8.0", "toCursor": "v1.10.0" })
     );
     // Announced once.
     assert!(received[1].json().get("dropped").is_none());
@@ -1620,12 +1620,12 @@ async fn a_drop_during_an_announcement_is_announced_next_without_repeating_the_f
     let received = harness.receiver.received();
     assert_eq!(
         received[0].json()["dropped"],
-        json!({ "count": 2, "fromCursor": "v1.1.0", "toCursor": "v1.2.0" })
+        json!({ "count": 2, "fromCursor": "v1.0.0", "toCursor": "v1.2.0" })
     );
     assert_eq!(received[1].json()["cursor"], "v1.7.0");
     assert_eq!(
         received[1].json()["dropped"],
-        json!({ "count": 4, "fromCursor": "v1.3.0", "toCursor": "v1.6.0" })
+        json!({ "count": 4, "fromCursor": "v1.2.0", "toCursor": "v1.6.0" })
     );
     eventually("the last delivery", async || {
         harness.receiver.received().len() == 3
@@ -1789,7 +1789,7 @@ async fn an_acknowledgement_paused_across_off_and_on_keeps_a_newer_drop() {
         .await
         .unwrap()
         .expect("the newer drop stays");
-    assert_eq!(pending.from_cursor.as_deref(), Some("v1.3.0"));
+    assert_eq!(pending.from_cursor.as_deref(), Some("v1.2.0"));
     harness.webhooks.shutdown().await;
 }
 
@@ -1893,5 +1893,63 @@ async fn endpoints_are_validated_and_limited_to_twenty() {
         .await
         .unwrap_err();
     assert_eq!(refused["reason"], "limit");
+    harness.webhooks.shutdown().await;
+}
+
+/// `dropped.fromCursor` is where to resume `changes_since`, which reads strictly after the
+/// cursor it is given, so it must come just before the first dropped event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changes_since_from_dropped_from_cursor_returns_the_first_dropped_event() {
+    let harness = Harness::new_timed(Timing {
+        poll: Duration::from_secs(60),
+        max_pending: 2,
+        ..Timing::default()
+    })
+    .await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let store = harness.webhooks.store();
+    let endpoint = store.endpoint(&id).await.unwrap().unwrap();
+    let start = crate::mcp::tools::feed::head(&harness.repositories)
+        .await
+        .unwrap();
+    harness.turn("thread-1", "turn-1").await;
+    harness.turn("thread-1", "turn-2").await;
+    let page = crate::mcp::tools::feed::page_after(&harness.repositories, &start, None, 100)
+        .await
+        .unwrap();
+    let transitions: Vec<&Value> = page
+        .entries
+        .iter()
+        .filter(|entry| events::from_feed_entry(entry, None).is_some())
+        .collect();
+    assert!(transitions.len() >= 4, "{transitions:?}");
+    let cursors: Vec<&str> = transitions
+        .iter()
+        .map(|entry| entry["cursor"].as_str().unwrap())
+        .collect();
+    store
+        .enqueue(queued(&endpoint, &cursors, "k"), Vec::new(), 0)
+        .await
+        .unwrap();
+    let (_, lost) = store
+        .dropped(&id)
+        .await
+        .unwrap()
+        .expect("some were dropped");
+    let dropped = cursors.len() - 2;
+    assert_eq!(lost.count as usize, dropped);
+    let from = lost.from_cursor.expect("a range");
+    let resumed = crate::mcp::tools::feed::page_after(&harness.repositories, &from, None, 100)
+        .await
+        .unwrap();
+    // The first dropped event is returned, then every later one: none is skipped.
+    let resumed_cursors: Vec<&str> = resumed
+        .entries
+        .iter()
+        .filter(|entry| events::from_feed_entry(entry, None).is_some())
+        .map(|entry| entry["cursor"].as_str().unwrap())
+        .collect();
+    assert_eq!(resumed_cursors, cursors);
     harness.webhooks.shutdown().await;
 }

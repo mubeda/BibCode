@@ -98,7 +98,9 @@ durable record of them to send from.
 - `dropped` appears on the first delivery after BiBCode had to drop deliveries for this
   endpoint because its queue was full: `{ "count", "fromCursor", "toCursor",
   "sinceLastSeen" }` (each range field only when a dropped event had one). Catch up from
-  `fromCursor` with `changes_since`, and from `sinceLastSeen` with `profiler_findings`. A
+  `fromCursor` (the position just before the first dropped event) with `changes_since`, or
+  from the `cursor` of the last event you processed, and from `sinceLastSeen` with
+  `profiler_findings`. A
   `2xx` to that delivery acknowledges what it named; a drop that happens meanwhile is named
   on a later delivery, never repeated in it.
 
