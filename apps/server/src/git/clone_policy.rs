@@ -30,7 +30,7 @@ use std::{
     ffi::OsString,
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     pin::Pin,
     sync::Arc,
@@ -53,6 +53,12 @@ pub(crate) const URL_REFUSED: &str = "clone_url_refused";
 pub(crate) const GIT_TOO_OLD: &str = "clone_git_too_old";
 /// The clone would not sit next to a registered project.
 pub(crate) const DESTINATION_REFUSED: &str = "clone_destination_refused";
+/// An agent asked for a clone that outlives its call.
+pub(crate) const DETACH_REFUSED: &str = "clone_detach_refused";
+pub(crate) const DETACHED: &str = "An agent's clone stops when its call ends, so detach is refused. Use the clone_repository tool to clone in the background.";
+/// An agent asked to cancel a clone it did not start.
+pub(crate) const NOT_OWNED: &str = "clone_not_owned";
+pub(crate) const OTHERS_CLONE: &str = "An agent can cancel only a clone it started.";
 pub(crate) const OUTSIDE_PROJECTS: &str = "An agent clones only next to a registered project: the parent folder must be the folder that holds one of BiBCode's projects.";
 
 /// The first Git with `http.curloptResolve` (RelNotes 2.37.0). An older Git ignores the
@@ -63,6 +69,8 @@ const CURLOPT_RESOLVE: GitVersion = GitVersion {
     patch: 0,
 };
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The null device, for an empty global configuration and an empty hooks folder.
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const OPERATION: &str = "GitVcsDriver.clone";
 
 const NOT_HTTPS: &str = "BiBCode clones for an agent over HTTPS only: give an https:// URL such as https://github.com/owner/repo. SSH, host:path, git://, file:// and other transports are refused; clone it in BiBCode yourself to use them.";
@@ -196,42 +204,80 @@ fn target(url: &str, allow_http: bool) -> Result<Target, CloneRefusal> {
     })
 }
 
-/// Whether an agent may reach `address`: not loopback, private, link-local, CGNAT
-/// (`100.64.0.0/10`), unique-local, multicast, unspecified, broadcast or reserved, IPv4-mapped
-/// and IPv4-compatible forms included.
+/// Whether an agent may reach `address`: a globally reachable unicast address. Every range the
+/// IANA IPv4 and IPv6 special-purpose address registries mark not globally reachable is
+/// refused (a few small anycast blocks inside them that are reachable are refused too), and so
+/// are multicast, IPv6 outside `2000::/3`, IPv4-compatible and IPv4-translated forms, and
+/// Teredo. A mapped, NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address is judged by the
+/// IPv4 address it embeds.
 pub(crate) fn is_public(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_v4(address),
-        IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                return is_public_v4(mapped);
-            }
-            let segments = address.segments();
-            // `::a.b.c.d` (deprecated IPv4-compatible), which also covers `::` and `::1`.
-            if segments[..6] == [0; 6] {
-                return is_public_v4(Ipv4Addr::from(
-                    (u32::from(segments[6]) << 16) | u32::from(segments[7]),
-                ));
-            }
-            !(address.is_multicast()
-                // fc00::/7 unique-local, fe80::/10 link-local, fec0::/10 site-local.
-                || segments[0] & 0xfe00 == 0xfc00
-                || segments[0] & 0xffc0 == 0xfe80
-                || segments[0] & 0xffc0 == 0xfec0)
-        }
+        IpAddr::V6(address) => is_public_v6(address),
     }
 }
 
+/// Whether `bits` lies in `network/length` (`length` at least 1).
+fn in_prefix<T>(bits: T, network: T, length: u32) -> bool
+where
+    T: std::ops::BitXor<Output = T> + std::ops::Shr<u32, Output = T> + PartialEq + From<u8>,
+{
+    let width = u32::try_from(std::mem::size_of::<T>() * 8).unwrap_or(128);
+    (bits ^ network) >> (width - length) == T::from(0)
+}
+
 fn is_public_v4(address: Ipv4Addr) -> bool {
-    let [first, second, ..] = address.octets();
-    !(address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || address.is_multicast()
-        || address.is_broadcast()
-        || first == 0
-        || (first == 100 && second & 0xc0 == 64)
-        || first >= 240)
+    const NOT_GLOBAL: [([u8; 4], u32); 15] = [
+        ([0, 0, 0, 0], 8),       // this network
+        ([10, 0, 0, 0], 8),      // private
+        ([100, 64, 0, 0], 10),   // shared address space (CGNAT)
+        ([127, 0, 0, 0], 8),     // loopback
+        ([169, 254, 0, 0], 16),  // link-local
+        ([172, 16, 0, 0], 12),   // private
+        ([192, 0, 0, 0], 24),    // IETF protocol assignments
+        ([192, 0, 2, 0], 24),    // TEST-NET-1
+        ([192, 88, 99, 0], 24),  // 6to4 relay anycast (deprecated)
+        ([192, 168, 0, 0], 16),  // private
+        ([198, 18, 0, 0], 15),   // benchmarking
+        ([198, 51, 100, 0], 24), // TEST-NET-2
+        ([203, 0, 113, 0], 24),  // TEST-NET-3
+        ([224, 0, 0, 0], 4),     // multicast
+        ([240, 0, 0, 0], 4),     // reserved, and the limited broadcast address
+    ];
+    let bits = u32::from(address);
+    !NOT_GLOBAL
+        .iter()
+        .any(|&(network, length)| in_prefix(bits, u32::from_be_bytes(network), length))
+}
+
+fn is_public_v6(address: Ipv6Addr) -> bool {
+    let bits = u128::from(address);
+    let embedded = |shift: u32| Ipv4Addr::from(((bits >> shift) & 0xffff_ffff) as u32);
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_v4(mapped);
+    }
+    let net = |segments: [u16; 8]| u128::from(Ipv6Addr::from(segments));
+    // NAT64's well-known prefix carries the IPv4 address in its last 32 bits, 6to4 in the 32
+    // after its first 16.
+    if in_prefix(bits, net([0x64, 0xff9b, 0, 0, 0, 0, 0, 0]), 96) {
+        return is_public_v4(embedded(0));
+    }
+    if in_prefix(bits, net([0x2002, 0, 0, 0, 0, 0, 0, 0]), 16) {
+        return is_public_v4(embedded(80));
+    }
+    let not_global = [
+        (net([0x2001, 0, 0, 0, 0, 0, 0, 0]), 23), // IETF protocol assignments, Teredo
+        (net([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0]), 32), // documentation
+        (net([0x3fff, 0, 0, 0, 0, 0, 0, 0]), 20), // documentation
+        (net([0x5f00, 0, 0, 0, 0, 0, 0, 0]), 16), // segment routing SIDs
+    ];
+    // Only 2000::/3 is global unicast; everything else (`::/8` with loopback, unspecified,
+    // IPv4-compatible and -translated forms, `64:ff9b:1::/48`, `100::/64`, `fc00::/7`,
+    // `fe80::/10`, `fec0::/10`, `ff00::/8`) is not.
+    in_prefix(bits, net([0x2000, 0, 0, 0, 0, 0, 0, 0]), 3)
+        && !not_global
+            .iter()
+            .any(|&(network, length)| in_prefix(bits, network, length))
 }
 
 /// The agent clone policy of one server.
@@ -242,8 +288,9 @@ pub(crate) struct ClonePolicy {
     fixture: Option<Arc<FixtureAllowance>>,
 }
 
-/// Test-only settings: extra environment (a test `GIT_CONFIG_GLOBAL`) for every Git command
-/// the policy runs, and, with `admit_local`, a local fixture's `http://` and loopback addresses.
+/// Test-only settings: environment the server's Git commands inherit (a test `HOME`, a proxy),
+/// which the isolation then overrides, and, with `admit_local`, a local fixture's `http://` and
+/// loopback addresses.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FixtureAllowance {
@@ -298,14 +345,34 @@ impl ClonePolicy {
             "https"
         };
         #[allow(unused_mut)]
-        let mut environment = vec![
-            ("GIT_LFS_SKIP_SMUDGE".into(), "1".into()),
-            ("GIT_ALLOW_PROTOCOL".into(), protocols.into()),
-        ];
+        let mut environment: Vec<(OsString, OsString)> = Vec::new();
+        // What a test's server inherited comes first, so the isolation below wins.
         #[cfg(test)]
         if let Some(fixture) = &self.fixture {
             environment.extend(fixture.environment.iter().cloned());
         }
+        // An isolated configuration: no global or system file (and so no rewrite, proxy,
+        // URL-specific setting, hook, fsmonitor or filter driver of the person's), no
+        // inherited `-c` parameters, and no proxy from the environment.
+        environment.extend(
+            [
+                ("GIT_CONFIG_GLOBAL", NULL_DEVICE),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_PARAMETERS", ""),
+                ("GIT_CONFIG_COUNT", "0"),
+                ("GIT_LFS_SKIP_SMUDGE", "1"),
+                ("GIT_ALLOW_PROTOCOL", protocols),
+                ("https_proxy", ""),
+                ("HTTPS_PROXY", ""),
+                ("http_proxy", ""),
+                ("HTTP_PROXY", ""),
+                ("all_proxy", ""),
+                ("ALL_PROXY", ""),
+                ("NO_PROXY", "*"),
+                ("no_proxy", "*"),
+            ]
+            .map(|(key, value)| (key.into(), value.into())),
+        );
         environment
     }
 
@@ -345,6 +412,7 @@ impl ClonePolicy {
         let expanded = target(&expanded, allow_http).map_err(refused)?;
 
         let fixture_protocol = allow_http.then_some("protocol.http.allow=always");
+        let hooks = format!("core.hooksPath={NULL_DEVICE}");
         let mut arguments: Vec<String> = ["protocol.allow=never", "protocol.https.allow=always"]
             .into_iter()
             .chain(fixture_protocol)
@@ -355,6 +423,11 @@ impl ClonePolicy {
                 "filter.lfs.required=false",
                 // Never into submodules, whose hosts this policy has not checked.
                 "submodule.recurse=false",
+                // Above the isolated configuration, for a repository's own: no proxy (an
+                // empty value also turns off the environment's), hook or fsmonitor.
+                "http.proxy=",
+                "core.fsmonitor=false",
+                &hooks,
             ])
             .flat_map(|setting| ["-c".to_owned(), setting.to_owned()])
             .collect();
@@ -548,43 +621,82 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn local_private_and_special_addresses_are_not_public() {
-        for address in [
-            "127.0.0.1",
-            "127.1.2.3",
-            "10.0.0.1",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.168.1.1",
-            "169.254.169.254",
-            "100.64.0.1",
-            "100.127.255.255",
-            "0.0.0.0",
-            "0.1.2.3",
-            "224.0.0.1",
-            "240.0.0.1",
-            "255.255.255.255",
-            "::",
-            "::1",
-            "::ffff:127.0.0.1",
-            "::ffff:10.0.0.1",
-            "::127.0.0.1",
-            "fc00::1",
-            "fd12:3456::1",
-            "fe80::1",
-            "fec0::1",
-            "ff02::1",
+    fn only_globally_reachable_addresses_are_public() {
+        // One address per non-global range of the IANA IPv4 and IPv6 special-purpose address
+        // registries (and multicast, and addresses outside 2000::/3), with the range named.
+        for (address, range) in [
+            ("0.0.0.0", "0.0.0.0/8 this network"),
+            ("0.1.2.3", "0.0.0.0/8 this network"),
+            ("10.0.0.1", "10.0.0.0/8 private"),
+            ("100.64.0.1", "100.64.0.0/10 shared address space"),
+            ("100.127.255.254", "100.64.0.0/10 shared address space"),
+            ("127.0.0.1", "127.0.0.0/8 loopback"),
+            ("127.1.2.3", "127.0.0.0/8 loopback"),
+            ("169.254.169.254", "169.254.0.0/16 link-local"),
+            ("172.16.0.1", "172.16.0.0/12 private"),
+            ("172.31.255.254", "172.16.0.0/12 private"),
+            ("192.0.0.1", "192.0.0.0/24 IETF protocol assignments"),
+            ("192.0.0.170", "192.0.0.0/24 IETF protocol assignments"),
+            ("192.0.2.1", "192.0.2.0/24 TEST-NET-1"),
+            ("192.88.99.1", "192.88.99.0/24 6to4 relay anycast"),
+            ("192.168.1.1", "192.168.0.0/16 private"),
+            ("198.18.0.1", "198.18.0.0/15 benchmarking"),
+            ("198.19.255.254", "198.18.0.0/15 benchmarking"),
+            ("198.51.100.1", "198.51.100.0/24 TEST-NET-2"),
+            ("203.0.113.1", "203.0.113.0/24 TEST-NET-3"),
+            ("224.0.0.1", "224.0.0.0/4 multicast"),
+            ("239.255.255.255", "224.0.0.0/4 multicast"),
+            ("240.0.0.1", "240.0.0.0/4 reserved"),
+            ("255.255.255.255", "255.255.255.255/32 broadcast"),
+            ("::", "::/128 unspecified"),
+            ("::1", "::1/128 loopback"),
+            ("::127.0.0.1", "::/96 IPv4-compatible (deprecated)"),
+            ("::8.8.8.8", "::/96 IPv4-compatible (deprecated)"),
+            ("::ffff:127.0.0.1", "::ffff:0:0/96 mapped loopback"),
+            ("::ffff:10.0.0.1", "::ffff:0:0/96 mapped private"),
+            ("::ffff:198.18.0.1", "::ffff:0:0/96 mapped benchmarking"),
+            ("::ffff:0:8.8.8.8", "::ffff:0:0:0/96 IPv4-translated"),
+            ("64:ff9b::a00:1", "64:ff9b::/96 NAT64 of 10.0.0.1"),
+            ("64:ff9b::7f00:1", "64:ff9b::/96 NAT64 of 127.0.0.1"),
+            ("64:ff9b:1::1", "64:ff9b:1::/48 local-use NAT64"),
+            ("100::1", "100::/64 discard-only"),
+            ("100:0:0:1::1", "100:0:0:1::/64 dummy prefix"),
+            ("2001::1", "2001::/32 Teredo"),
+            ("2001:0:4136:e378:8000:63bf:f5ff:fffe", "2001::/32 Teredo"),
+            ("2001:2::1", "2001:2::/48 benchmarking"),
+            ("2001:10::1", "2001:10::/28 ORCHID"),
+            ("2001:db8::1", "2001:db8::/32 documentation"),
+            ("2002:a00:1::1", "2002::/16 6to4 of 10.0.0.1"),
+            ("2002:7f00:1::1", "2002::/16 6to4 of 127.0.0.1"),
+            ("2002:c612:1::1", "2002::/16 6to4 of 198.18.0.1"),
+            ("3fff::1", "3fff::/20 documentation"),
+            ("5f00::1", "5f00::/16 segment routing SIDs"),
+            ("fc00::1", "fc00::/7 unique-local"),
+            ("fd12:3456::1", "fc00::/7 unique-local"),
+            ("fe80::1", "fe80::/10 link-local"),
+            ("fec0::1", "fec0::/10 site-local (deprecated)"),
+            ("ff02::1", "ff00::/8 multicast"),
+            ("4000::1", "outside 2000::/3 global unicast"),
         ] {
             let parsed: IpAddr = address.parse().expect(address);
-            assert!(!is_public(parsed), "{address}");
+            assert!(!is_public(parsed), "{address} is in {range}");
         }
         for address in [
+            "1.1.1.1",
+            "8.8.8.8",
             "140.82.112.3",
             "100.128.0.1",
             "172.32.0.1",
-            "8.8.8.8",
+            "192.0.3.1",
+            "198.20.0.1",
+            "198.51.101.1",
+            "203.0.114.1",
+            "223.255.255.254",
             "::ffff:140.82.112.3",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
             "2606:4700::1111",
+            "2a00:1450:4001::1",
         ] {
             let parsed: IpAddr = address.parse().expect(address);
             assert!(is_public(parsed), "{address}");
@@ -618,6 +730,9 @@ pub(crate) mod tests {
             "filter.lfs.required=false",
             "submodule.recurse=false",
             "http.curloptResolve=github.com:443:140.82.112.3",
+            "http.proxy=",
+            "core.fsmonitor=false",
+            &format!("core.hooksPath={NULL_DEVICE}"),
         ] {
             assert!(settings.contains(&expected), "{expected} in {settings:?}");
         }
@@ -629,6 +744,26 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert!(environment.contains(&("GIT_LFS_SKIP_SMUDGE", "1")));
         assert!(environment.contains(&("GIT_ALLOW_PROTOCOL", "https")));
+        // An isolated configuration: no global or system file, no inherited parameters, no
+        // proxy from the environment.
+        for expected in [
+            ("GIT_CONFIG_GLOBAL", NULL_DEVICE),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_PARAMETERS", ""),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("https_proxy", ""),
+            ("HTTPS_PROXY", ""),
+            ("http_proxy", ""),
+            ("all_proxy", ""),
+            ("ALL_PROXY", ""),
+            ("NO_PROXY", "*"),
+            ("no_proxy", "*"),
+        ] {
+            assert!(
+                environment.contains(&expected),
+                "{expected:?} in {environment:?}"
+            );
+        }
 
         let policy = ClonePolicy::new(resolver(&[("v6.example.com", "2606:4700::1111")]));
         let v6 = super::tests::plan(&policy, "https://v6.example.com/owner/repo.git")
