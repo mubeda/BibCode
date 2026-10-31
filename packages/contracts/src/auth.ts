@@ -262,6 +262,10 @@ export const AuthClientSession = Schema.Struct({
   connected: Schema.Boolean,
   current: Schema.Boolean,
   reach: Schema.optionalKey(RemotePairingReach),
+  /** An outside agent's access ceiling (`mcp-client` sessions only; #139, slice X1). */
+  mcpAccess: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Set while a person has taken the agent over: the level Hand back restores. */
+  mcpAccessHandBack: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 
@@ -360,8 +364,32 @@ export type AuthRevokePairingLinkInput = typeof AuthRevokePairingLinkInput.Type;
 
 export const AuthRevokeClientSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
+  /**
+   * **Stop** an outside agent (#139, slice X1): also interrupt each running turn whose latest
+   * user message it sent. A plain revocation interrupts nothing.
+   */
+  interruptTurns: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthRevokeClientSessionInput = typeof AuthRevokeClientSessionInput.Type;
+
+/** The MCP access levels, lowest first. */
+export const AuthMcpAccessLevel = Schema.Literals([
+  "read-only",
+  "approval-required",
+  "auto-accept-edits",
+  "full-access",
+]);
+export type AuthMcpAccessLevel = typeof AuthMcpAccessLevel.Type;
+
+/**
+ * **Take over** (`read-only`) and **Hand back** (the level Take over replaced, and nothing
+ * else) for an outside agent's session (#139, slice X1).
+ */
+export const AuthSetMcpAccessInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  access: AuthMcpAccessLevel,
+});
+export type AuthSetMcpAccessInput = typeof AuthSetMcpAccessInput.Type;
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),

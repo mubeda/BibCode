@@ -26,6 +26,7 @@ import {
   AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
+  AuthSetMcpAccessInput,
   AuthRevokePairingLinkInput,
   AuthSessionState,
   AuthStandardClientScopes,
@@ -34,6 +35,7 @@ import {
 } from "./auth.ts";
 import {
   AuthClientSessionRevokeResult,
+  AuthMcpAccessResult,
   AuthOtherClientSessionsRevokeResult,
   AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
@@ -149,6 +151,14 @@ const authRouteContract = [
     requestContentTypes: ["application/json"],
     successStatuses: [200],
     errorStatuses: [401, 403, 500],
+  },
+  {
+    name: "setMcpAccess",
+    method: "POST",
+    path: "/api/auth/clients/mcp-access",
+    requestContentTypes: ["application/json"],
+    successStatuses: [200],
+    errorStatuses: [400, 401, 403, 500],
   },
   {
     name: "revokeOtherClients",
@@ -330,6 +340,7 @@ const namedSchemas = {
   AuthClientSession,
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
+  AuthMcpAccessResult,
   AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
@@ -344,6 +355,7 @@ const namedSchemas = {
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
   AuthRevokeClientSessionInput,
+  AuthSetMcpAccessInput,
   AuthRevokePairingLinkInput,
   AuthSessionState,
   AuthTokenExchangeRequest,
@@ -413,6 +425,10 @@ const expectedSamples = {
     request: "requests/client-revoke.json",
     success: "responses/client-revoke.json",
   },
+  setMcpAccess: {
+    request: "requests/client-mcp-access.json",
+    success: "responses/client-mcp-access.json",
+  },
   revokeOtherClients: { success: "responses/client-revoke-others.json" },
 } as const;
 
@@ -423,6 +439,7 @@ const expectedFixtures = [
   "errors/request-invalid.json",
   "errors/scope-required.json",
   "requests/browser-session.json",
+  "requests/client-mcp-access.json",
   "requests/client-revoke.json",
   "requests/pairing-create.json",
   "requests/pairing-offer-cancel.json",
@@ -431,6 +448,7 @@ const expectedFixtures = [
   "requests/token-form.txt",
   "responses/browser-session.json",
   "responses/client-list.json",
+  "responses/client-mcp-access.json",
   "responses/client-revoke-others.json",
   "responses/client-revoke.json",
   "responses/pairing-create.json",
@@ -453,6 +471,14 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
   [
     "requests/client-revoke.json",
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthRevokeClientSessionInput)),
+  ],
+  [
+    "requests/client-mcp-access.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthSetMcpAccessInput)),
+  ],
+  [
+    "responses/client-mcp-access.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthMcpAccessResult)),
   ],
   [
     "requests/pairing-create.json",
@@ -557,7 +583,7 @@ describe("Rust auth HTTP fixture parity", () => {
     const manifest = JSON.parse(NodeFS.readFileSync(manifestPath, "utf8")) as Manifest;
     expect(manifest.formatVersion).toBe(1);
     expect(manifest.routes).toEqual(currentRoutes());
-    expect(manifest.routes).toHaveLength(13);
+    expect(manifest.routes).toHaveLength(14);
     expect(
       manifest.routes.map(({ name, method, path, requestContentTypes, successes, errors }) => ({
         name,

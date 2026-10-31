@@ -1,0 +1,54 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "type": "snapshot",
+      "rows": [],
+      "active": [
+        {
+          "clientId": "]RENHFApDn",
+          "label": null,
+          "lastCallAt": null,
+          "running": true
+        },
+        {
+          "clientId": "😀",
+          "label": "Bocy",
+          "lastCallAt": null,
+          "running": true
+        },
+        {
+          "clientId": "4294967295",
+          "label": null,
+          "lastCallAt": "",
+          "running": true
+        },
+        {
+          "clientId": "0",
+          "label": "prototype",
+          "lastCallAt": null,
+          "running": true
+        },
+        {
+          "clientId": "__proto__",
+          "label": "",
+          "lastCallAt": "\n",
+          "running": true
+        },
+        {
+          "clientId": "�",
+          "label": null,
+          "lastCallAt": "\"af7~",
+          "running": true
+        },
+        {
+          "clientId": "p^kKBJUuw1",
+          "label": "6Zv wC",
+          "lastCallAt": "�",
+          "running": true
+        }
+      ]
+    }
+  ]
+}

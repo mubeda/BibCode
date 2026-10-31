@@ -355,6 +355,28 @@ export type TurnDelivery = typeof TurnDelivery.Type;
 export const TurnDeliveryResolutionAction = Schema.Literals(["retry", "dismiss", "cancel"]);
 export type TurnDeliveryResolutionAction = typeof TurnDeliveryResolutionAction.Type;
 
+/**
+ * Who sent a command (#139, slice X1): an outside agent over MCP, stamped by the server from
+ * its authenticated session; no client sets it. `clientId` is the agent's session id and
+ * `label` its Authorized clients label when it acted (untrusted text, rendered as text).
+ */
+export const OrchestrationActor = Schema.Struct({
+  kind: Schema.Literal("mcp-client"),
+  clientId: TrimmedNonEmptyString,
+  label: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+});
+export type OrchestrationActor = typeof OrchestrationActor.Type;
+
+/** The agent behind a thread it created, and why (untrusted text, at most 200 characters). */
+export const OrchestrationThreadRequester = Schema.Struct({
+  actor: OrchestrationActor,
+  purpose: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+});
+export type OrchestrationThreadRequester = typeof OrchestrationThreadRequester.Type;
+
+/** The longest `purpose` a created thread may carry. */
+export const THREAD_PURPOSE_MAX_LENGTH = 200;
+
 export const OrchestrationMessage = Schema.Struct({
   id: MessageId,
   role: OrchestrationMessageRole,
@@ -368,6 +390,10 @@ export const OrchestrationMessage = Schema.Struct({
    * context limit, admitted once the conversation was compacted. Absent from older servers.
    */
   resendOf: Schema.optional(MessageId),
+  /** The outside agent that sent this user message; absent for a person's. */
+  actor: Schema.optional(OrchestrationActor),
+  /** The thread this message came from (a chat panel's provenance, slice X4). */
+  sourceThreadId: Schema.optional(ThreadId),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -542,6 +568,8 @@ export const OrchestrationThread = Schema.Struct({
   kind: Schema.optional(ThreadKind),
   /** Host thread of a `panel` thread; absent for other kinds and on older servers. */
   hostThreadId: Schema.optional(ThreadId),
+  /** The outside agent that created the thread and why; absent for a person's thread. */
+  requester: Schema.optional(OrchestrationThreadRequester),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
@@ -616,6 +644,8 @@ export const OrchestrationThreadShell = Schema.Struct({
   kind: Schema.optional(ThreadKind),
   /** Host thread of a `panel` thread; absent for other kinds and on older servers. */
   hostThreadId: Schema.optional(ThreadId),
+  /** The outside agent that created the thread and why; absent for a person's thread. */
+  requester: Schema.optional(OrchestrationThreadRequester),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
@@ -777,6 +807,8 @@ const ThreadCreateCommand = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
   kind: Schema.optional(ThreadKind),
+  /** Why an outside agent creates the thread; shown with its actor, never logged. */
+  purpose: Schema.optional(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
@@ -859,6 +891,10 @@ const ThreadTurnStartBootstrapCreateThread = Schema.Struct({
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
+  /** Why an outside agent creates the thread, as on `thread.create`. */
+  purpose: Schema.optional(
+    Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
+  ),
 });
 
 const ThreadTurnStartBootstrapPrepareWorktree = Schema.Struct({
@@ -909,6 +945,8 @@ export const ThreadTurnStartCommand = Schema.Struct({
     attachments: Schema.Array(ChatAttachment).check(
       Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS),
     ),
+    /** The live thread of the same project this message came from (slice X4). */
+    sourceThreadId: Schema.optional(ThreadId),
   }),
   modelSelection: Schema.optional(ModelSelection),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -1298,6 +1336,8 @@ export const ThreadCreatedPayload = Schema.Struct({
   ),
   kind: Schema.optional(ThreadKind),
   hostThreadId: Schema.optional(ThreadId),
+  /** Why an outside agent created the thread; its actor is in the event's metadata. */
+  purpose: Schema.optional(Schema.String),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
@@ -1352,6 +1392,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
   resendOf: Schema.optional(MessageId),
+  sourceThreadId: Schema.optional(ThreadId),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -1483,6 +1524,8 @@ export const OrchestrationEventMetadata = Schema.Struct({
   adapterKey: Schema.optional(TrimmedNonEmptyString),
   requestId: Schema.optional(ApprovalRequestId),
   ingestedAt: Schema.optional(IsoDateTime),
+  /** The outside agent whose command planned this event (slice X1); absent for a person's. */
+  actor: Schema.optional(OrchestrationActor),
 });
 export type OrchestrationEventMetadata = typeof OrchestrationEventMetadata.Type;
 
