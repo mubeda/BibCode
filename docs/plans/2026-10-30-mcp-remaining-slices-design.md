@@ -4741,6 +4741,63 @@ batch branch (`e2fec73382`, whose tree equals the batch's) so `feed::ERRORS` was
 - **Not mine, seen while testing:** `feed::tests::the_error_table_holds_every_tag_the_mcp_sources_return`
   fails on the batch tree for X6's `McpCloneNotFoundError` and `McpCloneRefusedError`.
 
+**Review round 3 (Codex, 2026-10-31).** The coordinator stated the threat model the earlier
+rounds lacked; it is in `rpc-and-orchestration.md` ("Files tools") and here:
+
+- (a) **Containment:** no operation touches anything outside the workspace or follows a
+  swapped link, whatever any concurrent process does.
+- (b) **BiBCode's own writers are serialized:** an agent's `files_*` call and a person's
+  Files-panel save or upload of the same path never race, because both go through this
+  server.
+- (c) **Not guaranteed:** atomicity against an external editor writing the same file. POSIX
+  has no compare-and-swap on file contents; this is a documented residual.
+
+Each fix has a test that failed first (a mutation run confirmed the mkdir and archive-limit
+tests; the hard-link and parked-folder tests fail against the earlier code by construction):
+
+- **Inode-replacing save reverted (P2 regression).** Round 2's sibling-and-rename broke hard
+  links, inode watchers and open editors, lost owner, ACLs and xattrs, failed without create
+  permission and could leave a `.part`. A version-checked write now opens the file with
+  `O_RDWR | O_NOFOLLOW` through the re-validated folder (`Open::Existing`), checks identity
+  and version through that descriptor, then truncates and writes. The sibling code and
+  `WRITE_PARTIAL_SUFFIX` are gone. `a_guarded_save_writes_the_same_file_in_place_and_leaves_no_sibling`.
+- **BiBCode's writers serialized (closes round-3 P1 #1 and #2 under (b)).** The workspace
+  service's `PathLocks`, keyed by canonical path, is shared with the upload route
+  (`WorkspaceRpc::path_locks`). A guarded or plain write holds it across check and write; an
+  upload holds it from its reservation to its install. A write to a path an upload holds is
+  refused at once (`WorkspaceError::PathBusy`, `path_busy`, `McpFileBusyError`, in
+  `feed::ERRORS`); a write waits at most 10 s for another write, then is refused the same
+  way; an upload that cannot get the path in 10 s answers 409 `TransferBusyError`. Tests:
+  `a_write_is_refused_while_an_upload_holds_its_path` and
+  `an_upload_holds_its_file_against_the_panel_and_the_agent_until_it_installs`; the existing
+  `guarded_write_holds_the_path_lock_from_its_check_to_its_write` covers two writes. Lock
+  scope is the guarded write, the plain write and the upload, as asked; create, rename,
+  delete and duplicate take no path lock (they are refused on conflict by `O_EXCL` and the
+  no-replace rename instead).
+- **Folder creation checked (P1).** `create_contained` checks the held parent before and
+  after each `mkdirat`, removing a folder made in a parent that moved out through the
+  parent's handle. `a_parent_moved_out_while_folders_are_created_keeps_nothing_there`.
+- **Permanent delete by descriptor (P1).** The parked folder is opened by handle and emptied
+  with `openat`/`unlinkat` (`empty_tree`), and its name removed (and on failure restored)
+  only while `fstatat` still finds that folder's identity there.
+  `a_folder_put_at_the_parked_name_survives_a_permanent_delete`. Depth is bounded at 4,096.
+- **No-replace fallback (P2).** `beneath::rename_no_replace` tries the kernel's flag, and on
+  `EINVAL`, `ENOSYS`, `ENOTSUP` or `EOPNOTSUPP` links and unlinks a file (no-replace by
+  construction) and refuses a folder (`ErrorKind::Unsupported`). Discard staging in
+  `git/manager/operations.rs` now calls it instead of its own three copies; a staged folder
+  on such a file system stays staged for recovery. A thread-local test switch forces the
+  fallback: `the_no_replace_rename_falls_back_to_a_link_where_the_flag_is_unsupported`.
+- **Archive limits while streaming (P2).** `write_archive` counts entries and bytes as the
+  plan does and fails the stream once either passes its limit; the route passes its limits
+  to `archive_body_from`. `a_folder_that_outgrows_its_limits_after_planning_fails_the_stream`.
+- **Not closed:** (c) by design. The containment windows left are each single system call
+  after its check (the `..` walk cannot be atomic with the call that follows it). Windows
+  still refuses the file-changing MCP tools.
+- **Flaky, not mine:** `recovery_leaves_a_holder_another_process_still_holds` (discard
+  staging) failed once in four runs of `manager::operations` under parallel tests and passes
+  alone; it asserts the holder's `flock` is free right after an aborted discard, before any
+  rename runs.
+
 ## X7 implementation notes (2026-10-31)
 
 X7 was implemented on `claude/v0131-139-x7`, from the batch tip `4d4287c818` (slice 1, the
@@ -5085,60 +5142,3 @@ first; each new test was seen failing against the round-one code:
 - **Contract.** `WebhookEndpoint.droppedDeliveries` and the `queued` reason; fixtures
   regenerated, counts unchanged. **UI.** The status line names dropped deliveries; the log
   names `queue_full` and `endpoint_changed`.
-
-**Review round 3 (Codex, 2026-10-31).** The coordinator stated the threat model the earlier
-rounds lacked; it is in `rpc-and-orchestration.md` ("Files tools") and here:
-
-- (a) **Containment:** no operation touches anything outside the workspace or follows a
-  swapped link, whatever any concurrent process does.
-- (b) **BiBCode's own writers are serialized:** an agent's `files_*` call and a person's
-  Files-panel save or upload of the same path never race, because both go through this
-  server.
-- (c) **Not guaranteed:** atomicity against an external editor writing the same file. POSIX
-  has no compare-and-swap on file contents; this is a documented residual.
-
-Each fix has a test that failed first (a mutation run confirmed the mkdir and archive-limit
-tests; the hard-link and parked-folder tests fail against the earlier code by construction):
-
-- **Inode-replacing save reverted (P2 regression).** Round 2's sibling-and-rename broke hard
-  links, inode watchers and open editors, lost owner, ACLs and xattrs, failed without create
-  permission and could leave a `.part`. A version-checked write now opens the file with
-  `O_RDWR | O_NOFOLLOW` through the re-validated folder (`Open::Existing`), checks identity
-  and version through that descriptor, then truncates and writes. The sibling code and
-  `WRITE_PARTIAL_SUFFIX` are gone. `a_guarded_save_writes_the_same_file_in_place_and_leaves_no_sibling`.
-- **BiBCode's writers serialized (closes round-3 P1 #1 and #2 under (b)).** The workspace
-  service's `PathLocks`, keyed by canonical path, is shared with the upload route
-  (`WorkspaceRpc::path_locks`). A guarded or plain write holds it across check and write; an
-  upload holds it from its reservation to its install. A write to a path an upload holds is
-  refused at once (`WorkspaceError::PathBusy`, `path_busy`, `McpFileBusyError`, in
-  `feed::ERRORS`); a write waits at most 10 s for another write, then is refused the same
-  way; an upload that cannot get the path in 10 s answers 409 `TransferBusyError`. Tests:
-  `a_write_is_refused_while_an_upload_holds_its_path` and
-  `an_upload_holds_its_file_against_the_panel_and_the_agent_until_it_installs`; the existing
-  `guarded_write_holds_the_path_lock_from_its_check_to_its_write` covers two writes. Lock
-  scope is the guarded write, the plain write and the upload, as asked; create, rename,
-  delete and duplicate take no path lock (they are refused on conflict by `O_EXCL` and the
-  no-replace rename instead).
-- **Folder creation checked (P1).** `create_contained` checks the held parent before and
-  after each `mkdirat`, removing a folder made in a parent that moved out through the
-  parent's handle. `a_parent_moved_out_while_folders_are_created_keeps_nothing_there`.
-- **Permanent delete by descriptor (P1).** The parked folder is opened by handle and emptied
-  with `openat`/`unlinkat` (`empty_tree`), and its name removed (and on failure restored)
-  only while `fstatat` still finds that folder's identity there.
-  `a_folder_put_at_the_parked_name_survives_a_permanent_delete`. Depth is bounded at 4,096.
-- **No-replace fallback (P2).** `beneath::rename_no_replace` tries the kernel's flag, and on
-  `EINVAL`, `ENOSYS`, `ENOTSUP` or `EOPNOTSUPP` links and unlinks a file (no-replace by
-  construction) and refuses a folder (`ErrorKind::Unsupported`). Discard staging in
-  `git/manager/operations.rs` now calls it instead of its own three copies; a staged folder
-  on such a file system stays staged for recovery. A thread-local test switch forces the
-  fallback: `the_no_replace_rename_falls_back_to_a_link_where_the_flag_is_unsupported`.
-- **Archive limits while streaming (P2).** `write_archive` counts entries and bytes as the
-  plan does and fails the stream once either passes its limit; the route passes its limits
-  to `archive_body_from`. `a_folder_that_outgrows_its_limits_after_planning_fails_the_stream`.
-- **Not closed:** (c) by design. The containment windows left are each single system call
-  after its check (the `..` walk cannot be atomic with the call that follows it). Windows
-  still refuses the file-changing MCP tools.
-- **Flaky, not mine:** `recovery_leaves_a_holder_another_process_still_holds` (discard
-  staging) failed once in four runs of `manager::operations` under parallel tests and passes
-  alone; it asserts the holder's `flock` is free right after an aborted discard, before any
-  rename runs.
