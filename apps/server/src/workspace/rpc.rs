@@ -1238,8 +1238,8 @@ impl WorkspaceRpc {
         let root = normalize_root(Path::new(&input.cwd), false)
             .await
             .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
-        let relative = if input.relative_directory.is_empty() {
-            String::new()
+        let (relative, directory) = if input.relative_directory.is_empty() {
+            (String::new(), root.clone())
         } else {
             let (target, relative) = paths::resolve_relative(&root, &input.relative_directory)
                 .map_err(|error| transfer_wire(&input.cwd, &input.relative_directory, &error))?;
@@ -1255,8 +1255,11 @@ impl WorkspaceRpc {
                     "message": "Upload target is not a folder.",
                 }));
             }
-            relative
+            (relative, canonical)
         };
+        // The file itself may not be Git's metadata either (a `.git` file is a `gitdir:` link).
+        paths::refuse_git_metadata(&root, &directory.join(&input.file_name))
+            .map_err(|error| transfer_wire(&input.cwd, &input.file_name, &error))?;
         let issued = access
             .issue_upload_bound(
                 &root,
@@ -1664,6 +1667,7 @@ fn transfer_failure(error: &WorkspaceError) -> &'static str {
             "outside_root"
         }
         WorkspaceError::NotFound { .. } | WorkspaceError::RootNotFound { .. } => "not_found",
+        WorkspaceError::GitMetadata { .. } => "git_metadata",
         WorkspaceError::Operation { source, .. }
             if source.kind() == std::io::ErrorKind::NotFound =>
         {

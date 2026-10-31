@@ -11717,11 +11717,7 @@ pub(crate) fn validate_pathspecs(
                 "File pathspec must be a non-empty repository-relative path without traversal.",
             ));
         }
-        if parsed
-            .components()
-            .next()
-            .is_some_and(|first| first.as_os_str().eq_ignore_ascii_case(".git"))
-        {
+        if names_git_metadata(parsed) {
             return Err(simple_error(
                 operation,
                 cwd,
@@ -11730,6 +11726,52 @@ pub(crate) fn validate_pathspecs(
         }
     }
     Ok(())
+}
+
+/// Whether `relative` (a path below a checkout) names Git's own metadata: any component that
+/// is `.git` in any letter case. The checkout's Git directory, a submodule's `.git` file and a
+/// nested repository's `.git` folder all count: changing one can make Git run a command as
+/// the server's user (`core.fsmonitor`, `core.hooksPath`, a hook, a `gitdir:` redirect).
+pub(crate) fn names_git_metadata(relative: &Path) -> bool {
+    relative
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case(".git"))
+}
+
+/// The Git directory and common directory of the checkout whose top level is `root`, read
+/// from the file system as Git finds them (no `git` process): a `.git` folder, or the folder
+/// a `.git` file's `gitdir:` line names, and the folder that directory's `commondir` file
+/// names. Each is canonical; one that cannot be resolved is left out, and a `root` with no
+/// `.git` entry answers none.
+pub(crate) fn checkout_git_dirs(root: &Path) -> Vec<PathBuf> {
+    let dot_git = root.join(".git");
+    let git_dir = match fs::symlink_metadata(&dot_git) {
+        Ok(metadata) if metadata.is_dir() => dot_git,
+        Ok(metadata) if metadata.is_file() => {
+            let Some(named) = fs::read_to_string(&dot_git).ok().and_then(|text| {
+                text.lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("gitdir:"))
+                    .map(|named| named.trim().to_owned())
+            }) else {
+                return Vec::new();
+            };
+            resolve_git_metadata_path(root, &named)
+        }
+        _ => return Vec::new(),
+    };
+    let Ok(git_dir) = fs::canonicalize(&git_dir) else {
+        return Vec::new();
+    };
+    let common_dir = fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .and_then(|text| {
+            let named = text.lines().next()?.trim().to_owned();
+            fs::canonicalize(resolve_git_metadata_path(&git_dir, &named)).ok()
+        });
+    let mut dirs = vec![git_dir];
+    dirs.extend(common_dir.filter(|common| !dirs.contains(common)));
+    dirs
 }
 
 fn parse_commit(line: &str) -> Option<VcsCommit> {
