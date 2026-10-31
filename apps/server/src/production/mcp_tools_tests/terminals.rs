@@ -47,11 +47,29 @@ struct EchoPty {
     writes: Mutex<Vec<String>>,
     output: broadcast::Sender<String>,
     exit: watch::Sender<Option<PtyExit>>,
+    /// While set, a write blocks, as a PTY write does when the child reads no input.
+    stuck: Mutex<bool>,
+    unstuck: std::sync::Condvar,
 }
 
 impl EchoPty {
     fn emit(&self, data: &str) {
         let _ = self.output.send(data.to_owned());
+    }
+
+    fn set_stuck(&self, stuck: bool) {
+        *self.stuck.lock().unwrap() = stuck;
+        self.unstuck.notify_all();
+    }
+}
+
+/// Lets a held write go when the test ends, so a failed test fails instead of waiting for
+/// the blocking thread.
+struct Unstick(Arc<EchoPty>);
+
+impl Drop for Unstick {
+    fn drop(&mut self) {
+        self.0.set_stuck(false);
     }
 }
 
@@ -65,6 +83,11 @@ impl PtyProcess for EchoPty {
     }
 
     fn write(&self, data: &str) -> Result<(), String> {
+        drop(
+            self.unstuck
+                .wait_while(self.stuck.lock().unwrap(), |stuck| *stuck)
+                .unwrap(),
+        );
         self.writes.lock().unwrap().push(data.to_owned());
         self.emit(data);
         Ok(())
@@ -134,6 +157,8 @@ impl PtyBackend for EchoBackend {
             writes: Mutex::new(Vec::new()),
             output,
             exit,
+            stuck: Mutex::new(false),
+            unstuck: std::sync::Condvar::new(),
         });
         self.processes.lock().unwrap().push(process.clone());
         Ok(process)
@@ -772,6 +797,163 @@ async fn raw_reads_keep_escapes_and_plain_reads_strip_them() {
         )
         .await;
     assert_eq!(error_tag(&both), "McpInvalidArgumentError");
+    fixture.shutdown().await;
+}
+
+/// A write the terminal does not take in time is an unknown outcome, never a success, and a
+/// keyed retry answers the same without writing again (#139 slice T review).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_the_terminal_does_not_take_is_an_unknown_outcome() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    let process = backend.latest();
+    process.set_stuck(true);
+    let _unstick = Unstick(process.clone());
+    let write = json!({
+        "threadId": THREAD, "terminalId": terminal_id, "data": "cat\n",
+        "clientRequestId": "stuck-1",
+    });
+    for _ in 0..2 {
+        let answered = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.call(&agent, "terminal_write", write.clone()),
+        )
+        .await
+        .expect("the write answers in bounded time");
+        assert_eq!(error_tag(&answered), "McpOutcomeUnknownError");
+        assert_eq!(
+            answered["structuredContent"]["error"]["reason"],
+            "no-answer"
+        );
+    }
+    process.set_stuck(false);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.writes().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held write lands");
+    assert_eq!(backend.writes(), ["cat\n"]);
+    fixture.shutdown().await;
+}
+
+/// A restart keeps the terminal id but starts a new history, so a cursor from before it
+/// reports dropped instead of skipping the new output.
+#[tokio::test]
+async fn a_cursor_from_before_a_restart_reports_dropped() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("before\n");
+    let before = fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "before")
+        .await;
+    let cursor = before["nextCursor"].as_str().unwrap().to_owned();
+    let cwd = structured(
+        &fixture
+            .call(&agent, "terminal_list", json!({ "threadId": THREAD }))
+            .await,
+    )["terminals"][0]["cwd"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fixture
+        .manager
+        .restart(crate::terminal::TerminalOpenInput::new(
+            THREAD,
+            &terminal_id,
+            std::path::PathBuf::from(cwd),
+            120,
+            30,
+        ))
+        .await
+        .expect("restart");
+    backend
+        .latest()
+        .emit("after the restart, longer than before\n");
+    fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "longer")
+        .await;
+    let page = fixture
+        .read(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": cursor }),
+        )
+        .await;
+    assert_eq!(page["dropped"], true, "{page}");
+    assert_eq!(page["text"], "after the restart, longer than before\n");
+    fixture.shutdown().await;
+}
+
+/// An escape sequence longer than a page is skipped whole: its continuation never shows as
+/// text on the next page.
+#[tokio::test]
+async fn an_escape_longer_than_a_page_is_skipped_whole() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("x\n");
+    let start = fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "x")
+        .await;
+    let cursor = start["nextCursor"].as_str().unwrap().to_owned();
+    backend
+        .latest()
+        .emit(&format!("\u{1b}]0;{}\u{7}after\n", "t".repeat(20_000)));
+    fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "after")
+        .await;
+    let first = fixture
+        .read(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": cursor }),
+        )
+        .await;
+    assert_eq!(first["text"], "");
+    assert_eq!(first["more"], true);
+    let second = fixture
+        .read(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": first["nextCursor"] }),
+        )
+        .await;
+    assert_eq!(second["text"], "after\n");
+    fixture.shutdown().await;
+}
+
+/// An escape sequence still arriving keeps the cursor before it, so the next read gets it
+/// whole and strips it.
+#[tokio::test]
+async fn an_escape_still_arriving_keeps_the_cursor_before_it() {
+    let (fixture, backend) = Fixture::echo().await;
+    let agent = fixture.agent().await;
+    let terminal_id = fixture.open(&agent).await;
+    backend.latest().emit("x\n");
+    let start = fixture
+        .read_until(&agent, json!({ "terminalId": terminal_id }), "x")
+        .await;
+    let cursor = start["nextCursor"].as_str().unwrap().to_owned();
+    backend.latest().emit("\u{1b}[3");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiting = fixture
+        .read(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": cursor }),
+        )
+        .await;
+    assert_eq!(waiting["text"], "");
+    assert_eq!(waiting["nextCursor"], cursor.as_str());
+    backend.latest().emit("1mred\n");
+    let done = fixture
+        .read_until(
+            &agent,
+            json!({ "terminalId": terminal_id, "cursor": waiting["nextCursor"] }),
+            "red",
+        )
+        .await;
+    assert_eq!(done["text"], "red\n");
     fixture.shutdown().await;
 }
 

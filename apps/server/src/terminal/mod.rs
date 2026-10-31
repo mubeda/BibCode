@@ -1,4 +1,5 @@
 mod history;
+pub(crate) use history::{HistoryCursor, HistoryWindow};
 mod input;
 mod manager;
 mod model;
