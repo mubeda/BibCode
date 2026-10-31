@@ -718,6 +718,15 @@ pub struct McpArgs {
     /// approval-required, auto-accept-edits or full-access.
     #[arg(long, value_name = "LEVEL", value_parser = crate::mcp::relay::parse_access)]
     pub access: Option<crate::mcp::control::McpAccess>,
+    #[command(subcommand)]
+    pub command: Option<McpSubcommand>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum McpSubcommand {
+    /// Approve or deny a remote AI tool's request to connect over HTTPS, or list the
+    /// requests waiting.
+    Authorize(crate::mcp::authorize_cli::AuthorizeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -879,6 +888,11 @@ pub enum CliAction {
     },
     /// Relays an agent's MCP to the data root's running server; never starts one.
     Mcp(crate::mcp::relay::RelayOptions),
+    /// Decides a remote AI tool's request to connect through the data root; starts nothing.
+    McpAuthorize {
+        options: crate::mcp::relay::RelayOptions,
+        args: crate::mcp::authorize_cli::AuthorizeArgs,
+    },
     /// Calls the data root's running server's MCP thread tools; never starts one.
     Thread {
         options: crate::mcp::relay::RelayOptions,
@@ -1023,7 +1037,9 @@ impl Cli {
             CliAction::OpenUrl { .. } => Err(ConfigError::OpenUrlCommandIsNotServer),
             CliAction::Profiler { .. } => Err(ConfigError::ProfilerCommandIsNotServer),
             CliAction::Diagnostics { .. } => Err(ConfigError::DiagnosticsCommandIsNotServer),
-            CliAction::Mcp(_) => Err(ConfigError::McpCommandIsNotServer),
+            CliAction::Mcp(_) | CliAction::McpAuthorize { .. } => {
+                Err(ConfigError::McpCommandIsNotServer)
+            }
             CliAction::Thread { .. } => Err(ConfigError::ThreadCommandIsNotServer),
         }
     }
@@ -1118,11 +1134,7 @@ impl Cli {
                 });
             }
             Some(CliCommand::Mcp(mcp)) => {
-                return Ok(CliAction::Mcp(relay_options(
-                    args.base_dir,
-                    args.dev_url,
-                    mcp,
-                )?));
+                return mcp_action(args.base_dir, args.dev_url, mcp);
             }
             // The same data root and connection as `mcp`, at the environment's own limit.
             Some(CliCommand::Thread(thread)) => {
@@ -1133,6 +1145,7 @@ impl Cli {
                         McpArgs {
                             url: None,
                             access: None,
+                            command: None,
                         },
                     )?,
                     args: thread,
@@ -1266,6 +1279,20 @@ pub(crate) fn profiler_state_dir(
 
 /// What `mcp` relays to, resolved as every command that reads a data root does: with no
 /// `--base-dir`, `BIBCODE_HOME` or `~/.bibcode`, which is also the desktop's root.
+/// `bibcode mcp`, or its `authorize` subcommand.
+pub(crate) fn mcp_action(
+    base_dir: Option<PathBuf>,
+    dev_url: Option<Url>,
+    mut mcp: McpArgs,
+) -> Result<CliAction, ConfigError> {
+    let command = mcp.command.take();
+    let options = relay_options(base_dir, dev_url, mcp)?;
+    Ok(match command {
+        Some(McpSubcommand::Authorize(args)) => CliAction::McpAuthorize { options, args },
+        None => CliAction::Mcp(options),
+    })
+}
+
 pub(crate) fn relay_options(
     base_dir: Option<PathBuf>,
     dev_url: Option<Url>,

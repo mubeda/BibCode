@@ -1,8 +1,12 @@
+mod consent_page;
 mod dpop;
 mod host_identity;
 mod http;
 pub(crate) mod limits;
 mod model;
+pub(crate) mod oauth;
+#[cfg(test)]
+mod oauth_flow_tests;
 pub mod pairing_code;
 mod pairing_offer;
 mod rpc;
@@ -17,7 +21,9 @@ pub(crate) use host_identity::{
     HOST_IDENTITY_SECRET_NAME, HostIdentity, HostIdentityError, NOISE_NK_PARAMS,
 };
 pub(crate) use http::{
-    add_routes, auth_error_response, authenticate_websocket, authorize_http_request,
+    AUTHORIZATION_SERVER_METADATA_PATH, PROTECTED_RESOURCE_METADATA_PATH,
+    PROTECTED_RESOURCE_ROOT_METADATA_PATH, add_routes, auth_error_response, authenticate_websocket,
+    authorize_http_request,
 };
 pub(crate) use model::ClientMetadata;
 pub(crate) use model::Principal;
@@ -39,4 +45,4 @@ pub(crate) use service::{
     diagnostics_scopes, issue_administrative_pairing_link, issue_mcp_pairing_link,
     issue_offline_share_pairing,
 };
-pub(crate) use service::{format_iso, now_ms};
+pub(crate) use service::{format_iso, is_loopback_host, now_ms};

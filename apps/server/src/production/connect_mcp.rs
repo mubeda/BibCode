@@ -292,6 +292,20 @@ impl ConnectMcpError {
         }
     }
 
+    /// The 401 `/mcp` answers a request without a credential it accepts. On an origin that
+    /// serves remote MCP's OAuth (slice R) it names the protected resource metadata, so a
+    /// client's discovery finds the authorization server; elsewhere it stays plain `Bearer`.
+    fn mcp_unauthorized(context: &RouteContext) -> Self {
+        let mut error = Self::invalid_mcp_credential();
+        if let Some(origin) = context.origin.eligible_origin() {
+            error.headers.insert(
+                header::WWW_AUTHENTICATE.as_str().to_owned(),
+                crate::auth::oauth::challenge(origin),
+            );
+        }
+        error
+    }
+
     fn invalid_open_url_credential() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -631,6 +645,7 @@ impl ConnectMcpService {
         match method {
             Method::POST => self.mcp_post(body, context).await,
             Method::DELETE => self.mcp_delete(context).await,
+            Method::GET => self.mcp_get(context).await,
             _ => Err(ConnectMcpError::mcp(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "Unsupported MCP transport method.",
@@ -995,29 +1010,14 @@ impl ConnectMcpService {
                 "MCP requests from a web page are not accepted.",
             ));
         }
-        let token = bearer_token(&context)?.to_owned();
+        let token = bearer_token(&context)
+            .map_err(|_| ConnectMcpError::mcp_unauthorized(&context))?
+            .to_owned();
         let token_hash = hash_token(&token);
         let now = (self.config.now_epoch_seconds)();
-        let provider_scope = {
-            let mut state = self.mcp.lock().await;
-            prune_mcp(&mut state, now);
-            state.credentials.get_mut(&token_hash).map(|credential| {
-                credential.last_used_at = now;
-                credential.scope.clone()
-            })
-        };
-        let principal = match provider_scope {
-            Some(scope) => McpPrincipal::Provider(scope),
-            None => match &self.control {
-                Some(control) => McpPrincipal::Client(
-                    control
-                        .authenticate(&token)
-                        .await
-                        .ok_or_else(ConnectMcpError::invalid_mcp_credential)?,
-                ),
-                None => return Err(ConnectMcpError::invalid_mcp_credential()),
-            },
-        };
+        let principal = self
+            .authenticate(&token, &token_hash, now, &context)
+            .await?;
         let request = match protocol::parse(&body) {
             Incoming::Ignore => {
                 return Ok(McpHttpResponse {
@@ -1160,9 +1160,91 @@ impl ConnectMcpService {
         )
     }
 
-    async fn mcp_delete(&self, context: RouteContext) -> Result<McpHttpResponse, ConnectMcpError> {
-        let token_hash = hash_token(bearer_token(&context)?);
+    /// The credential `/mcp` accepts from this request, checked against how the request
+    /// arrived (slice R): a provider's token, and a relay or CLI session, only on a direct
+    /// request; a remote OAuth session only on the origin its grant is bound to. Anything
+    /// else gets 401.
+    async fn authenticate(
+        &self,
+        token: &str,
+        token_hash: &str,
+        now: i64,
+        context: &RouteContext,
+    ) -> Result<McpPrincipal, ConnectMcpError> {
+        let provider_scope = {
+            let mut state = self.mcp.lock().await;
+            prune_mcp(&mut state, now);
+            match state.credentials.get_mut(token_hash) {
+                Some(credential) if context.origin.is_direct() => {
+                    credential.last_used_at = now;
+                    Some(Some(credential.scope.clone()))
+                }
+                Some(_) => Some(None),
+                None => None,
+            }
+        };
+        let refused = || {
+            tracing::warn!(
+                class = ?context.origin.class,
+                "an MCP credential was refused for how the request arrived"
+            );
+            ConnectMcpError::mcp_unauthorized(context)
+        };
+        match provider_scope {
+            Some(Some(scope)) => return Ok(McpPrincipal::Provider(scope)),
+            Some(None) => return Err(refused()),
+            None => {}
+        }
+        let Some(control) = &self.control else {
+            return Err(ConnectMcpError::mcp_unauthorized(context));
+        };
+        let principal = control
+            .authenticate(token)
+            .await
+            .ok_or_else(|| ConnectMcpError::mcp_unauthorized(context))?;
+        let audience = match principal.resource.as_deref() {
+            None => context.origin.is_direct(),
+            Some(resource) => context
+                .origin
+                .eligible_origin()
+                .is_some_and(|origin| crate::auth::oauth::resource_matches(resource, origin)),
+        };
+        if audience {
+            Ok(McpPrincipal::Client(principal))
+        } else {
+            Err(refused())
+        }
+    }
+
+    /// `GET /mcp` opens no stream: an authenticated GET gets 405, and any other gets the 401
+    /// challenge, which is where a client's discovery starts.
+    async fn mcp_get(&self, context: RouteContext) -> Result<McpHttpResponse, ConnectMcpError> {
+        let token = bearer_token(&context)
+            .map_err(|_| ConnectMcpError::mcp_unauthorized(&context))?
+            .to_owned();
         let now = (self.config.now_epoch_seconds)();
+        self.authenticate(&token, &hash_token(&token), now, &context)
+            .await?;
+        Err(ConnectMcpError::mcp(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "This MCP server opens no GET stream.",
+        ))
+    }
+
+    async fn mcp_delete(&self, context: RouteContext) -> Result<McpHttpResponse, ConnectMcpError> {
+        let token = bearer_token(&context)?.to_owned();
+        let token_hash = hash_token(&token);
+        let now = (self.config.now_epoch_seconds)();
+        // Outside agents are sessionless: there is nothing for them to delete.
+        if let McpPrincipal::Client(_) = self
+            .authenticate(&token, &token_hash, now, &context)
+            .await?
+        {
+            return Err(ConnectMcpError::mcp(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "This MCP client has no session to delete.",
+            ));
+        }
         let session_id = context
             .headers
             .get("mcp-session-id")

@@ -39,11 +39,12 @@ fn auth_access_stream(
     tokio::spawn(async move {
         let current_session_id = context.current_session_id().unwrap_or_default().to_owned();
         let mut events = auth.subscribe_access();
-        let (mut revision, pairings, clients) = auth.access_snapshot(&current_session_id).await;
+        let (mut revision, pairings, clients, pending) =
+            auth.access_snapshot(&current_session_id).await;
         if !send_value(
             &sender,
             &cancellation,
-            snapshot_value(revision, pairings, clients),
+            snapshot_value(revision, pairings, clients, pending),
         )
         .await
         {
@@ -56,6 +57,25 @@ fn auth_access_stream(
                 event = events.recv() => event,
             };
             match event {
+                // A change to the pending remote authorizations goes out as a snapshot that
+                // carries them, so a client that predates them still decodes the stream.
+                Ok(AuthAccessEvent {
+                    revision: event_revision,
+                    change: AuthAccessChange::PendingMcpAuthorizations,
+                }) if event_revision > revision => {
+                    let (snapshot_revision, pairings, clients, pending) =
+                        auth.access_snapshot(&current_session_id).await;
+                    revision = snapshot_revision.max(event_revision);
+                    if !send_value(
+                        &sender,
+                        &cancellation,
+                        snapshot_value(revision, pairings, clients, pending),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
                 Ok(event) if event.revision > revision => {
                     revision = event.revision;
                     if !send_value(
@@ -70,13 +90,13 @@ fn auth_access_stream(
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let (snapshot_revision, pairings, clients) =
+                    let (snapshot_revision, pairings, clients, pending) =
                         auth.access_snapshot(&current_session_id).await;
                     revision = snapshot_revision;
                     if !send_value(
                         &sender,
                         &cancellation,
-                        snapshot_value(revision, pairings, clients),
+                        snapshot_value(revision, pairings, clients, pending),
                     )
                     .await
                     {
@@ -105,6 +125,7 @@ fn snapshot_value(
     revision: u64,
     pairing_links: Vec<super::model::PairingLinkView>,
     client_sessions: Vec<super::model::ClientSessionView>,
+    pending: Vec<super::model::PendingMcpAuthorizationView>,
 ) -> Value {
     json!({
         "version": 1,
@@ -113,6 +134,7 @@ fn snapshot_value(
         "payload": {
             "pairingLinks": pairing_links,
             "clientSessions": client_sessions,
+            "pendingMcpAuthorizations": pending,
         },
     })
 }
@@ -147,5 +169,7 @@ fn access_event_value(event: AuthAccessEvent, current_session_id: &str) -> Value
             "type": "clientRemoved",
             "payload": { "sessionId": session_id },
         }),
+        // Sent as a snapshot by the stream; never reaches here.
+        AuthAccessChange::PendingMcpAuthorizations => Value::Null,
     }
 }

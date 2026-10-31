@@ -2036,6 +2036,7 @@ mod tests {
         RouteContext {
             headers: HeaderMap::new(),
             uri: Uri::from_static("/test"),
+            origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
             cancellation: CancellationToken::new(),
         }
     }

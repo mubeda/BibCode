@@ -55,7 +55,7 @@ pub struct RelayOptions {
 }
 
 impl RelayOptions {
-    fn paths(&self) -> crate::persistence::StatePaths {
+    pub(crate) fn paths(&self) -> crate::persistence::StatePaths {
         let mut config = crate::config::ServerConfig::new(&self.root.effective);
         config.dev_url = self.dev_url.clone();
         crate::persistence::StatePaths::from_config(&config)
@@ -126,7 +126,7 @@ pub async fn run(
     served
 }
 
-fn read_settings(path: &Path) -> Result<McpServerSettings, String> {
+pub(crate) fn read_settings(path: &Path) -> Result<McpServerSettings, String> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice::<Value>(&bytes)
             .map(|settings| mcp_server_settings(&settings))
@@ -708,7 +708,7 @@ fn record_client(state_dir: &Path, session_id: &str) {
     }
 }
 
-async fn open_store(
+pub(crate) async fn open_store(
     options: &RelayOptions,
 ) -> Result<
     (

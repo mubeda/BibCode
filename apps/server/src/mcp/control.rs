@@ -495,6 +495,9 @@ pub struct ClientPrincipal {
     pub principal: Principal,
     /// The ceiling bound to the credential; a session without one is read-only.
     pub ceiling: McpAccess,
+    /// The resource (`<origin>/mcp`) a remote OAuth grant is bound to (slice R); `None` for
+    /// the relay's and `bibcode thread`'s sessions, which reach this server directly.
+    pub resource: Option<String>,
 }
 
 /// Progress notifications for one `tools/call`, sent on its own response stream.
@@ -648,6 +651,16 @@ impl McpControl {
             }),
         };
         super::activity::watch_stops(&control);
+        // Remote MCP's OAuth routes (slice R) read the same live settings.
+        let settings = control.inner.settings.clone();
+        control.inner.auth.set_mcp_oauth_settings(Arc::new(move || {
+            let settings = *settings.borrow();
+            crate::auth::oauth::McpOAuthSettings {
+                enabled: settings.enabled,
+                access: settings.access.as_str().to_owned(),
+                terminals: settings.capabilities.terminals,
+            }
+        }));
         control
     }
 
@@ -665,12 +678,17 @@ impl McpControl {
 
     /// The outside agent behind `token`, or `None` for any other credential.
     pub async fn authenticate(&self, token: &str) -> Option<ClientPrincipal> {
-        let (principal, access) = self.inner.auth.authenticate_mcp_client(token).await.ok()?;
-        let ceiling = access
+        let credential = self.inner.auth.authenticate_mcp_client(token).await.ok()?;
+        let ceiling = credential
+            .access
             .as_deref()
             .and_then(McpAccess::parse)
             .unwrap_or(McpAccess::ReadOnly);
-        Some(ClientPrincipal { principal, ceiling })
+        Some(ClientPrincipal {
+            principal: credential.principal,
+            ceiling,
+            resource: credential.resource,
+        })
     }
 
     /// The lower of the credential's ceiling and the environment's setting.

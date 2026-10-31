@@ -445,7 +445,7 @@ impl McpControl {
         if !settings.enabled || !settings.capabilities.files {
             return false;
         }
-        let (_, _, sessions) = self.auth().access_snapshot("").await;
+        let (_, _, sessions, _) = self.auth().access_snapshot("").await;
         let Some(session) = sessions
             .into_iter()
             .find(|session| session.session_id == session_id)

@@ -70,7 +70,7 @@ pub use data_root::{
 pub use diagnostics::profiler::cli::{ProfilerArgs, run_profiler_cli};
 pub use http::{
     DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ENVIRONMENT_DESCRIPTOR_PATH,
-    ROUTE_INVENTORY, RouteMethod, RouteSpec,
+    ROUTE_INVENTORY, RequestClass, RequestOrigin, RouteMethod, RouteSpec,
 };
 pub use lifecycle::{ServerError, ServerHandle, ServerRuntime, StartupAccess};
 pub use maintenance::{
@@ -133,6 +133,12 @@ pub async fn run_cli() -> Result<(), RunError> {
             0 => Ok(()),
             code => std::process::exit(code),
         },
+        CliAction::McpAuthorize { options, args } => {
+            match mcp::authorize_cli::run_mcp_authorize(options, args).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         CliAction::Thread { options, args } => {
             match mcp::thread_cli::run_thread_cli(options, args).await {
                 0 => Ok(()),

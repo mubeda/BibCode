@@ -205,6 +205,24 @@ pub struct McpAccessRequest {
     pub access: String,
 }
 
+/// Approves a pending remote MCP authorization (#139, slice R): at `access`, with terminals
+/// only when asked for and allowed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveMcpAuthorizationRequest {
+    pub id: String,
+    pub access: String,
+    #[serde(default)]
+    pub terminals: bool,
+}
+
+/// Denies a pending remote MCP authorization.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DenyMcpAuthorizationRequest {
+    pub id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientMetadata {
@@ -257,12 +275,40 @@ pub struct ClientSessionView {
     pub mcp_access_hand_back: Option<String>,
 }
 
+/// A remote MCP authorization waiting for a person (#139, slice R), as the **Requests to
+/// connect** cards show it. `clientName` is the client's own, untrusted, text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMcpAuthorizationView {
+    pub id: String,
+    /// The code the consent page shows, `XXXX-XXXX`.
+    pub code: String,
+    pub client_name: String,
+    /// Where the authorization returns: host and port.
+    pub redirect_host: String,
+    /// It returns to `localhost` only, so the card warns about impersonation.
+    pub redirect_is_loopback: bool,
+    /// The origin the request used.
+    pub origin: String,
+    pub scopes: Vec<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(skip)]
+    pub expires_at_ms: i64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum AuthAccessChange {
     PairingLinkUpserted(PairingLinkView),
-    PairingLinkRemoved { id: String },
+    PairingLinkRemoved {
+        id: String,
+    },
     ClientUpserted(ClientSessionView),
-    ClientRemoved { session_id: String },
+    ClientRemoved {
+        session_id: String,
+    },
+    /// The pending remote MCP authorizations changed; the list is the new whole.
+    PendingMcpAuthorizations,
 }
 
 #[derive(Clone, Debug)]

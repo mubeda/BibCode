@@ -1,8 +1,12 @@
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, UNIX_EPOCH},
+};
 
 use axum::{
-    Form, Json, Router,
-    extract::State,
+    Extension, Form, Json, Router,
+    body::Bytes,
+    extract::{FromRequest, State},
     http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -11,24 +15,34 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
+    consent_page,
     model::{
-        ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, BrowserSessionRequest, BrowserSessionResult,
-        CancelPairingOfferRequest, ClientMetadata, CreatePairingOfferRequest, CreatePairingRequest,
+        ACCESS_TOKEN_TYPE, ApproveMcpAuthorizationRequest, BOOTSTRAP_TOKEN_TYPE,
+        BrowserSessionRequest, BrowserSessionResult, CancelPairingOfferRequest, ClientMetadata,
+        CreatePairingOfferRequest, CreatePairingRequest, DenyMcpAuthorizationRequest,
         McpAccessRequest, PairingOfferResult, RevokeClientRequest, RevokePairingRequest,
         SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest,
         WebSocketTicketResult,
     },
+    oauth,
     pairing_code::{
         REMOTE_PAIRING_CODE_VERSION, RemotePairingCodePayload, RemotePairingReach,
         encode_pairing_code,
     },
     pairing_offer::validate_pairing_offer_input,
     service::{
-        AuthError, AuthService, McpAccessChange, PairingOfferIssuance, PairingOfferReplay,
-        PairingOfferReservation, default_standard_scopes, format_iso, now_ms, parse_scopes,
+        AuthError, AuthService, McpAccessChange, McpOAuthMint, McpOAuthRefresh, McpOAuthTokens,
+        PairingOfferIssuance, PairingOfferReplay, PairingOfferReservation, default_standard_scopes,
+        format_iso, now_ms, parse_scopes,
     },
 };
-use crate::http::AppState;
+use crate::{
+    http::{AppState, RequestOrigin},
+    persistence::{
+        McpOAuthAdmission, McpOAuthClient, McpOAuthDecision, McpOAuthRefreshRotation,
+        NewMcpOAuthAuthorization,
+    },
+};
 
 const CREDENTIAL_HEADERS: [(&str, &str); 2] =
     [("cache-control", "no-store"), ("pragma", "no-cache")];
@@ -53,6 +67,29 @@ pub(crate) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/api/auth/clients/revoke-others",
             post(revoke_other_clients),
         )
+        .route(
+            "/api/auth/mcp-authorizations/approve",
+            post(approve_mcp_authorization),
+        )
+        .route(
+            "/api/auth/mcp-authorizations/deny",
+            post(deny_mcp_authorization),
+        )
+        .route(
+            PROTECTED_RESOURCE_METADATA_PATH,
+            get(protected_resource_metadata),
+        )
+        .route(
+            PROTECTED_RESOURCE_ROOT_METADATA_PATH,
+            get(protected_resource_metadata),
+        )
+        .route(
+            AUTHORIZATION_SERVER_METADATA_PATH,
+            get(authorization_server_metadata),
+        )
+        .route("/oauth/register", post(register_client))
+        .route("/oauth/authorize", get(authorize))
+        .route("/oauth/authorize/status", get(authorize_status))
 }
 
 async fn session(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
@@ -118,14 +155,15 @@ async fn browser_session(
     credential_response(response)
 }
 
-async fn token(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    Form(payload): Form<TokenExchangeRequest>,
+/// The RFC 8693 exchange, as `POST /oauth/token` has always served it.
+async fn exchange_token(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    payload: TokenExchangeRequest,
 ) -> Response {
     let uses_dpop = headers.contains_key("dpop");
-    let response = token_inner(&state.auth, &headers, &uri, payload)
+    let response = token_inner(&state.auth, headers, uri, payload)
         .await
         .unwrap_or_else(|error| {
             HttpAuthError::new(error, "access_token_issuance_failed").into_response()
@@ -676,6 +714,955 @@ async fn revoke_other_clients(
             Err(error) => auth_error_for_request(error, &headers, "client_session_revoke_failed"),
         },
         Err(error) => auth_error_for_request(error, &headers, "client_session_revoke_failed"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remote Streamable HTTP's authorization server (#139, slice R). Every route answers 404 on
+// an origin that is not eligible (see `RequestOrigin::eligible_origin`). Secrets (codes,
+// refresh tokens, the status cookie) never reach a log line, a URL other than the client's
+// own redirect, or the profiler.
+// ---------------------------------------------------------------------------------------------
+
+/// RFC 9728 metadata for `/mcp`, where the 401 challenge points.
+pub(crate) const PROTECTED_RESOURCE_METADATA_PATH: &str =
+    "/.well-known/oauth-protected-resource/mcp";
+/// The same metadata at the root, which clients try next.
+pub(crate) const PROTECTED_RESOURCE_ROOT_METADATA_PATH: &str =
+    "/.well-known/oauth-protected-resource";
+/// RFC 8414 metadata.
+pub(crate) const AUTHORIZATION_SERVER_METADATA_PATH: &str =
+    "/.well-known/oauth-authorization-server";
+const MAX_REGISTRATION_BYTES: usize = 16 * 1024;
+const MAX_TOKEN_FORM_BYTES: usize = 16 * 1024;
+const AUTHORIZATION_CODE_GRANT: &str = "authorization_code";
+const REFRESH_TOKEN_GRANT: &str = "refresh_token";
+
+fn not_found() -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// An OAuth error body (RFC 6749 §5.2), `no-store`.
+fn oauth_error(status: StatusCode, error: &'static str, description: &str) -> Response {
+    credential_response(
+        (
+            status,
+            Json(json!({ "error": error, "error_description": description })),
+        )
+            .into_response(),
+    )
+}
+
+async fn protected_resource_metadata(
+    State(state): State<AppState>,
+    Extension(origin): Extension<RequestOrigin>,
+) -> Response {
+    let Some(origin) = origin.eligible_origin() else {
+        return not_found();
+    };
+    if state.auth.oauth_repositories().is_none() {
+        return not_found();
+    }
+    let settings = state.auth.mcp_oauth_settings();
+    no_store(
+        Json(oauth::protected_resource_metadata(
+            origin,
+            &settings,
+            &state.config.environment_label,
+        ))
+        .into_response(),
+    )
+}
+
+async fn authorization_server_metadata(
+    State(state): State<AppState>,
+    Extension(origin): Extension<RequestOrigin>,
+) -> Response {
+    let Some(origin) = origin.eligible_origin() else {
+        return not_found();
+    };
+    if state.auth.oauth_repositories().is_none() {
+        return not_found();
+    }
+    let settings = state.auth.mcp_oauth_settings();
+    no_store(Json(oauth::authorization_server_metadata(origin, &settings)).into_response())
+}
+
+/// `POST /oauth/register` (RFC 7591): public clients only, under the per-source and global
+/// admission limits.
+async fn register_client(
+    State(state): State<AppState>,
+    Extension(origin): Extension<RequestOrigin>,
+    body: Bytes,
+) -> Response {
+    if origin.eligible_origin().is_none() {
+        return not_found();
+    }
+    let Some(repositories) = state.auth.oauth_repositories() else {
+        return not_found();
+    };
+    if body.len() > MAX_REGISTRATION_BYTES {
+        return oauth_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_client_metadata",
+            "The registration is too large.",
+        );
+    }
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "The registration must be JSON.",
+        );
+    };
+    let registration = match oauth::validate_registration(&metadata) {
+        Ok(registration) => registration,
+        Err(refusal) => {
+            tracing::warn!(
+                error = refusal.error,
+                "an MCP client registration was refused"
+            );
+            return oauth_error(StatusCode::BAD_REQUEST, refusal.error, refusal.description);
+        }
+    };
+    let Ok(secret) = oauth::random_secret() else {
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "BiBCode could not register this client.",
+        );
+    };
+    let client_id = format!("mcp-{}", &secret[..22]);
+    let now = now_ms();
+    let admission = repositories
+        .register_mcp_oauth_client(
+            McpOAuthClient {
+                client_id: client_id.clone(),
+                client_name: registration.client_name.clone(),
+                redirect_uris: registration.redirect_uris.clone(),
+                source_key: origin.source_key.clone(),
+                created_at_ms: now,
+                approved_at_ms: None,
+                last_used_at_ms: None,
+            },
+            now,
+            oauth::LIMITS,
+        )
+        .await;
+    match admission {
+        Ok(McpOAuthAdmission::Admitted) => {}
+        Ok(McpOAuthAdmission::Refused) => {
+            tracing::warn!(
+                class = ?origin.class,
+                "an MCP client registration was refused: too many from one source"
+            );
+            return oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "temporarily_unavailable",
+                "Too many clients registered from here in the last hour. Try again later.",
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "an MCP client registration failed");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "BiBCode could not register this client.",
+            );
+        }
+    }
+    credential_response(
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "client_id": client_id,
+                "client_id_issued_at": now / 1_000,
+                "client_name": registration.client_name,
+                "redirect_uris": registration.redirect_uris,
+                "token_endpoint_auth_method": "none",
+                "grant_types": [AUTHORIZATION_CODE_GRANT, REFRESH_TOKEN_GRANT],
+                "response_types": ["code"],
+            })),
+        )
+            .into_response(),
+    )
+}
+
+fn query_pairs(uri: &Uri) -> HashMap<String, String> {
+    let mut pairs = HashMap::new();
+    for (name, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        // A repeated parameter is ambiguous; the first one counts, as most servers do.
+        pairs
+            .entry(name.into_owned())
+            .or_insert_with(|| value.into_owned());
+    }
+    pairs
+}
+
+/// The cookie that binds one authorization's poll to the browser that opened it.
+fn status_cookie_name(id: &str) -> String {
+    format!("{}_{}", oauth::STATUS_COOKIE, id)
+}
+
+fn status_url(id: &str) -> String {
+    format!("/oauth/authorize/status?id={id}")
+}
+
+fn admitted_mutation(state: &AppState, route: &str) -> Option<crate::maintenance::RpcPermit> {
+    state
+        .admission_gate
+        .admit_named(
+            crate::maintenance::RpcMutability::Mutation,
+            format!("HTTP GET {route}"),
+        )
+        .ok()
+}
+
+/// `GET /oauth/authorize`: checks the client and its redirect URI before it would redirect
+/// anywhere, then the request, then records a pending authorization and shows the consent
+/// page.
+async fn authorize(
+    State(state): State<AppState>,
+    Extension(origin): Extension<RequestOrigin>,
+    uri: Uri,
+) -> Response {
+    let Some(origin_value) = origin.eligible_origin().map(str::to_owned) else {
+        return not_found();
+    };
+    let Some(repositories) = state.auth.oauth_repositories() else {
+        return not_found();
+    };
+    let start_again = "Start sign-in again from your AI tool.";
+    let params = query_pairs(&uri);
+    let client = match params.get("client_id") {
+        Some(client_id) => repositories.get_mcp_oauth_client(client_id.clone()).await,
+        None => Ok(None),
+    };
+    let client = match client {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            tracing::warn!("an MCP authorization named an unknown client");
+            return consent_page::message(
+                StatusCode::BAD_REQUEST,
+                "Unknown AI tool",
+                &format!("This sign-in link names an AI tool BiBCode does not know. {start_again}"),
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "an MCP authorization could not read its client");
+            return consent_page::message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sign-in failed",
+                &format!("BiBCode could not read this request. {start_again}"),
+            );
+        }
+    };
+    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|registered| oauth::redirect_uri_matches(registered, &redirect_uri))
+    {
+        tracing::warn!("an MCP authorization named a redirect URI its client did not register");
+        return consent_page::message(
+            StatusCode::BAD_REQUEST,
+            "Unknown return address",
+            &format!(
+                "This sign-in link returns to an address the AI tool did not register. {start_again}"
+            ),
+        );
+    }
+    // From here on a refusal goes back to the client, as RFC 6749 §4.1.2.1 asks.
+    let state_param = params.get("state").cloned();
+    let refuse = |error: &'static str, description: &str| -> Response {
+        tracing::warn!(error, "an MCP authorization was refused");
+        let mut response_params = vec![("error", error), ("error_description", description)];
+        if let Some(state_param) = state_param
+            .as_deref()
+            .filter(|value| oauth::state_is_valid(value))
+        {
+            response_params.push(("state", state_param));
+        }
+        response_params.push(("iss", origin_value.as_str()));
+        redirect(&redirect_uri, &response_params)
+    };
+    if params.get("response_type").map(String::as_str) != Some("code") {
+        return refuse(
+            "unsupported_response_type",
+            "Only response_type=code is supported.",
+        );
+    }
+    let challenge = params.get("code_challenge").cloned().unwrap_or_default();
+    if params.get("code_challenge_method").map(String::as_str) != Some("S256")
+        || !oauth::challenge_is_valid(&challenge)
+    {
+        return refuse(
+            "invalid_request",
+            "PKCE with code_challenge_method=S256 is required.",
+        );
+    }
+    if state_param
+        .as_deref()
+        .is_some_and(|value| !oauth::state_is_valid(value))
+    {
+        return refuse("invalid_request", "The state parameter is too long.");
+    }
+    if !params
+        .get("resource")
+        .is_some_and(|resource| oauth::resource_matches(resource, &origin_value))
+    {
+        return refuse(
+            "invalid_target",
+            "The resource must be this server's /mcp endpoint.",
+        );
+    }
+    let settings = state.auth.mcp_oauth_settings();
+    let Some(scopes) = oauth::requested_scopes(params.get("scope").map(String::as_str), &settings)
+    else {
+        return refuse("invalid_scope", "A requested scope is not supported.");
+    };
+    if !settings.enabled {
+        return consent_page::message(
+            StatusCode::FORBIDDEN,
+            "The MCP server is off",
+            &format!(
+                "The MCP server is off on {}. Turn on MCP server in BiBCode (Settings → Agents → Agent integrations), then start sign-in again from your AI tool.",
+                state.config.environment_label
+            ),
+        );
+    }
+    let Some(_permit) = admitted_mutation(&state, "/oauth/authorize") else {
+        return consent_page::message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BiBCode is updating",
+            &format!("BiBCode is protecting its data during an update. {start_again}"),
+        );
+    };
+    let (Ok(cookie), Ok(user_code)) = (oauth::random_secret(), oauth::random_user_code()) else {
+        return consent_page::message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Sign-in failed",
+            &format!("BiBCode could not start this request. {start_again}"),
+        );
+    };
+    let id = Uuid::new_v4().to_string();
+    let now = now_ms();
+    let created = repositories
+        .create_mcp_oauth_authorization(
+            NewMcpOAuthAuthorization {
+                id: id.clone(),
+                user_code: user_code.clone(),
+                client_id: client.client_id.clone(),
+                redirect_uri: redirect_uri.clone(),
+                code_challenge: challenge,
+                state: state_param.clone(),
+                resource: oauth::resource_for(&origin_value),
+                scopes: scopes.join(" "),
+                origin: origin_value.clone(),
+                source_key: origin.source_key.clone(),
+                status_cookie_hash: oauth::secret_hash(&cookie),
+                created_at_ms: now,
+                expires_at_ms: now + oauth::AUTHORIZATION_TTL_MS,
+            },
+            now,
+            oauth::LIMITS,
+        )
+        .await;
+    match created {
+        Ok(McpOAuthAdmission::Admitted) => {}
+        Ok(McpOAuthAdmission::Refused) => {
+            tracing::warn!(
+                class = ?origin.class,
+                "an MCP authorization was refused: too many waiting from one client or source"
+            );
+            return consent_page::message(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests waiting",
+                "Too many sign-in requests from here are waiting. Approve or deny them in BiBCode (Settings → Agents → Agent integrations), or wait 10 minutes, then start sign-in again from your AI tool.",
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "an MCP authorization could not be recorded");
+            return consent_page::message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sign-in failed",
+                &format!("BiBCode could not record this request. {start_again}"),
+            );
+        }
+    }
+    if let Err(error) = state.auth.reload_pending_mcp_authorizations().await {
+        tracing::warn!(
+            ?error,
+            "the pending MCP authorizations could not be announced"
+        );
+    }
+    let secure = if origin_value.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let set_cookie = format!(
+        "{}={cookie}; Path=/oauth/authorize; Max-Age={}; HttpOnly; SameSite=Strict{secure}",
+        status_cookie_name(&id),
+        oauth::AUTHORIZATION_TTL_MS / 1_000,
+    );
+    consent_page::consent(
+        &consent_page::Consent {
+            client_name: &client.client_name,
+            environment: &state.config.environment_label,
+            code: &oauth::display_user_code(&user_code),
+            redirect_host: &oauth::redirect_host(&redirect_uri),
+            status_url: &status_url(&id),
+        },
+        Some(set_cookie),
+    )
+}
+
+fn redirect(target: &str, params: &[(&str, &str)]) -> Response {
+    let Some(location) = oauth::redirect_with(target, params) else {
+        return consent_page::message(
+            StatusCode::BAD_REQUEST,
+            "Unknown return address",
+            "This sign-in link returns to an address BiBCode cannot use.",
+        );
+    };
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    if let Ok(location) = header::HeaderValue::from_str(&location) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    no_store(response)
+}
+
+/// `GET /oauth/authorize/status?id=…`: the consent page's own poll, read with the cookie
+/// that page set. Pending refreshes; approved redirects once with a new single-use code;
+/// denied redirects with `access_denied`; expired explains.
+async fn authorize_status(
+    State(state): State<AppState>,
+    Extension(origin): Extension<RequestOrigin>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let Some(origin_value) = origin.eligible_origin().map(str::to_owned) else {
+        return not_found();
+    };
+    let Some(repositories) = state.auth.oauth_repositories() else {
+        return not_found();
+    };
+    let start_again = "Start sign-in again from your AI tool.";
+    let gone = || {
+        consent_page::message(
+            StatusCode::NOT_FOUND,
+            "Request not found",
+            &format!("This sign-in request is gone. {start_again}"),
+        )
+    };
+    let Some(id) = query_pairs(&uri).remove("id") else {
+        return gone();
+    };
+    let authorization = match repositories.get_mcp_oauth_authorization(id.clone()).await {
+        Ok(Some(authorization)) => authorization,
+        Ok(None) => return gone(),
+        Err(error) => {
+            tracing::warn!(%error, "an MCP authorization's status could not be read");
+            return consent_page::message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sign-in failed",
+                &format!("BiBCode could not read this request. {start_again}"),
+            );
+        }
+    };
+    let presented = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| cookie_value(cookies, &status_cookie_name(&id)))
+        .map(oauth::secret_hash);
+    if !presented
+        .is_some_and(|hash| oauth::constant_time_equal(&hash, &authorization.status_cookie_hash))
+        || authorization.origin != origin_value
+    {
+        tracing::warn!("an MCP authorization's status was asked without its cookie");
+        return consent_page::message(
+            StatusCode::FORBIDDEN,
+            "Open the sign-in page again",
+            &format!("This page only works in the browser your AI tool opened. {start_again}"),
+        );
+    }
+    let now = now_ms();
+    let respond = |params: &[(&str, &str)]| -> Response {
+        let mut params = params.to_vec();
+        if let Some(state_param) = authorization.state.as_deref() {
+            params.push(("state", state_param));
+        }
+        params.push(("iss", origin_value.as_str()));
+        let mut response = redirect(&authorization.redirect_uri, &params);
+        if let Ok(expired) = header::HeaderValue::from_str(&format!(
+            "{}=; Path=/oauth/authorize; Max-Age=0; HttpOnly; SameSite=Strict",
+            status_cookie_name(&id)
+        )) {
+            response.headers_mut().insert(header::SET_COOKIE, expired);
+        }
+        response
+    };
+    match authorization.status.as_str() {
+        "pending" if authorization.expires_at_ms > now => consent_page::consent(
+            &consent_page::Consent {
+                client_name: &authorization.client_name,
+                environment: &state.config.environment_label,
+                code: &oauth::display_user_code(&authorization.user_code),
+                redirect_host: &oauth::redirect_host(&authorization.redirect_uri),
+                status_url: &status_url(&id),
+            },
+            None,
+        ),
+        "denied" => respond(&[
+            ("error", "access_denied"),
+            ("error_description", "The request was denied in BiBCode."),
+        ]),
+        "approved" if authorization.code_hash.is_none() && authorization.expires_at_ms > now => {
+            let Some(_permit) = admitted_mutation(&state, "/oauth/authorize/status") else {
+                return consent_page::message(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "BiBCode is updating",
+                    "BiBCode is protecting its data during an update. Reload this page in a moment.",
+                );
+            };
+            let Ok(code) = oauth::random_secret() else {
+                return consent_page::message(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Sign-in failed",
+                    &format!("BiBCode could not finish this request. {start_again}"),
+                );
+            };
+            match repositories
+                .attach_mcp_oauth_code(
+                    id.clone(),
+                    oauth::secret_hash(&code),
+                    now + oauth::CODE_TTL_MS,
+                    now,
+                )
+                .await
+            {
+                Ok(true) => respond(&[("code", code.as_str())]),
+                Ok(false) => finished(),
+                Err(error) => {
+                    tracing::warn!(%error, "an MCP authorization's code could not be stored");
+                    consent_page::message(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Sign-in failed",
+                        &format!("BiBCode could not finish this request. {start_again}"),
+                    )
+                }
+            }
+        }
+        "approved" if authorization.code_hash.is_some() => finished(),
+        "exchanged" => finished(),
+        _ => consent_page::message(
+            StatusCode::GONE,
+            "This request expired",
+            &format!("Nobody approved it in time. {start_again}"),
+        ),
+    }
+}
+
+fn finished() -> Response {
+    consent_page::message(
+        StatusCode::OK,
+        "Sign-in finished",
+        "This request was already completed. Return to your AI tool.",
+    )
+}
+
+/// `POST /oauth/token`: dispatches on `grant_type`. The RFC 8693 exchange is unchanged and
+/// served wherever it was; the authorization-code and refresh grants need an eligible
+/// origin.
+async fn token(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, MAX_TOKEN_FORM_BYTES).await else {
+        return oauth_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request",
+            "The request is too large.",
+        );
+    };
+    let form = url::form_urlencoded::parse(&body)
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let grant_type = form
+        .iter()
+        .find(|(name, _)| name == "grant_type")
+        .map(|(_, value)| value.as_str());
+    match grant_type {
+        Some(AUTHORIZATION_CODE_GRANT | REFRESH_TOKEN_GRANT) => {
+            let origin = parts
+                .extensions
+                .get::<RequestOrigin>()
+                .cloned()
+                .unwrap_or_default();
+            let mut fields = HashMap::new();
+            for (name, value) in form {
+                fields.entry(name).or_insert(value);
+            }
+            oauth_token(&state, &origin, &parts.headers, &fields).await
+        }
+        _ => {
+            let (headers, uri) = (parts.headers.clone(), parts.uri.clone());
+            let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
+            match Form::<TokenExchangeRequest>::from_request(request, &state).await {
+                Ok(Form(payload)) => exchange_token(&state, &headers, &uri, payload).await,
+                Err(rejection) => rejection.into_response(),
+            }
+        }
+    }
+}
+
+/// The authorization-code and refresh-token grants of a remote MCP client.
+async fn oauth_token(
+    state: &AppState,
+    origin: &RequestOrigin,
+    headers: &HeaderMap,
+    fields: &HashMap<String, String>,
+) -> Response {
+    let Some(origin_value) = origin.eligible_origin() else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Remote MCP sign-in needs an HTTPS address, or this computer's loopback address.",
+        );
+    };
+    let Some(repositories) = state.auth.oauth_repositories() else {
+        return not_found();
+    };
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let invalid_grant = |why: &'static str| {
+        tracing::warn!(why, "an MCP token request was refused");
+        oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "The grant is invalid, expired or revoked. Sign in again.",
+        )
+    };
+    let Some(client_id) = field("client_id") else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id is required.",
+        );
+    };
+    let resource = field("resource")
+        .map(str::to_owned)
+        .unwrap_or_else(|| oauth::resource_for(origin_value));
+    if !oauth::resource_matches(&resource, origin_value) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "The resource must be this server's /mcp endpoint.",
+        );
+    }
+    if field("grant_type") == Some(REFRESH_TOKEN_GRANT) {
+        let Some(refresh_token) = field("refresh_token") else {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "refresh_token is required.",
+            );
+        };
+        let scopes = field("scope").map(|scope| {
+            scope
+                .split_ascii_whitespace()
+                .filter(|scope| *scope != "offline_access")
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+        let scopes = scopes.filter(|scopes| !scopes.is_empty());
+        let Ok(successor) = oauth::random_secret() else {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "BiBCode could not refresh this grant.",
+            );
+        };
+        let now = now_ms();
+        let outcome = state
+            .auth
+            .rotate_mcp_oauth_refresh_token(McpOAuthRefreshRotation {
+                token_hash: oauth::secret_hash(refresh_token),
+                new_token_hash: oauth::secret_hash(&successor),
+                client_id: client_id.to_owned(),
+                resource: oauth::resource_for(origin_value),
+                scopes,
+                new_expires_at: format_iso(now + oauth::GRANT_TTL_MS),
+                now: format_iso(now),
+            })
+            .await;
+        return match outcome {
+            Ok(McpOAuthRefresh::Rotated(tokens)) => token_response(&tokens, &successor),
+            Ok(McpOAuthRefresh::Reused) => {
+                tracing::warn!("a reused MCP refresh token revoked its grant");
+                invalid_grant("reused")
+            }
+            Ok(McpOAuthRefresh::InvalidGrant) => invalid_grant("unknown-or-dead"),
+            Ok(McpOAuthRefresh::InvalidScope) => oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "A refresh can only narrow the scopes that were granted.",
+            ),
+            Err(error) => {
+                tracing::warn!(?error, "an MCP refresh failed");
+                oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "BiBCode could not refresh this grant.",
+                )
+            }
+        };
+    }
+    if !state.auth.mcp_oauth_settings().enabled {
+        tracing::warn!("an MCP code exchange was refused: the MCP server is off");
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "The MCP server is off in BiBCode. Turn it on, then sign in again.",
+        );
+    }
+    let (Some(code), Some(verifier), Some(redirect_uri)) =
+        (field("code"), field("code_verifier"), field("redirect_uri"))
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code, code_verifier and redirect_uri are required.",
+        );
+    };
+    let code_hash = oauth::secret_hash(code);
+    let authorization = match repositories
+        .get_mcp_oauth_authorization_by_code(code_hash.clone())
+        .await
+    {
+        Ok(Some(authorization)) => authorization,
+        Ok(None) => return invalid_grant("unknown-code"),
+        Err(error) => {
+            tracing::warn!(%error, "an MCP code exchange could not read its authorization");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "BiBCode could not complete sign-in.",
+            );
+        }
+    };
+    let now = now_ms();
+    if authorization.status == "approved"
+        && (authorization.client_id != client_id
+            || authorization.redirect_uri != redirect_uri
+            || authorization.origin != origin_value
+            || !oauth::resource_matches(&authorization.resource, origin_value)
+            || authorization
+                .code_expires_at_ms
+                .is_none_or(|expiry| expiry <= now)
+            || !oauth::pkce_verifies(verifier, &authorization.code_challenge))
+    {
+        return invalid_grant("mismatch-or-expired");
+    }
+    let Ok(refresh_token) = oauth::random_secret() else {
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "BiBCode could not complete sign-in.",
+        );
+    };
+    match state
+        .auth
+        .mint_mcp_oauth_grant(
+            &authorization,
+            code_hash,
+            oauth::secret_hash(&refresh_token),
+            client_metadata(headers, None),
+        )
+        .await
+    {
+        Ok(McpOAuthMint::Minted(tokens)) => {
+            tracing::info!("a remote MCP client signed in");
+            token_response(&tokens, &refresh_token)
+        }
+        Ok(McpOAuthMint::Replayed) => {
+            tracing::warn!("a replayed MCP authorization code revoked its grant");
+            invalid_grant("replayed-code")
+        }
+        Ok(McpOAuthMint::Refused) => invalid_grant("not-approved"),
+        Err(error) => {
+            tracing::warn!(?error, "an MCP code exchange failed");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "BiBCode could not complete sign-in.",
+            )
+        }
+    }
+}
+
+fn token_response(tokens: &McpOAuthTokens, refresh_token: &str) -> Response {
+    credential_response(
+        Json(json!({
+            "access_token": tokens.access_token,
+            "token_type": "Bearer",
+            "expires_in": tokens.expires_in,
+            "refresh_token": refresh_token,
+            "scope": tokens.scope,
+        }))
+        .into_response(),
+    )
+}
+
+fn invalid_mcp_authorization(why: &str) -> Response {
+    tracing::warn!(why, "an MCP authorization decision was refused");
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "EnvironmentRequestInvalidError",
+        json!({
+            "code": "invalid_request",
+            "reason": "invalid_mcp_authorization",
+            "traceId": Uuid::new_v4().to_string(),
+        }),
+    )
+}
+
+/// `POST /api/auth/mcp-authorizations/approve`: a person with `access:write` approves a
+/// pending remote authorization, at most at the environment's access, with terminals only
+/// when the client asked for them and slice T's conditions hold.
+async fn approve_mcp_authorization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(payload): Json<ApproveMcpAuthorizationRequest>,
+) -> Response {
+    if let Err(error) =
+        authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE).await
+    {
+        return auth_error_for_request(error, &headers, "mcp_authorization_decision_failed");
+    }
+    let Some(repositories) = state.auth.oauth_repositories() else {
+        return invalid_mcp_authorization("no-store");
+    };
+    let authorization = match repositories
+        .get_mcp_oauth_authorization(payload.id.clone())
+        .await
+    {
+        Ok(Some(authorization))
+            if authorization.status == "pending" && authorization.expires_at_ms > now_ms() =>
+        {
+            authorization
+        }
+        Ok(_) => return invalid_mcp_authorization("not-pending"),
+        Err(error) => {
+            return auth_error_for_request(
+                AuthError::Internal(error.to_string()),
+                &headers,
+                "mcp_authorization_decision_failed",
+            );
+        }
+    };
+    let settings = state.auth.mcp_oauth_settings();
+    if !oauth::access_within(&payload.access, &settings.access) {
+        return invalid_mcp_authorization("above-the-environment-access");
+    }
+    let requested = authorization
+        .scopes
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if payload.terminals
+        && (!requested
+            .iter()
+            .any(|scope| scope == super::SCOPE_TERMINAL_OPERATE)
+            || !oauth::terminals_allowed(&settings, &payload.access))
+    {
+        return invalid_mcp_authorization("terminals-not-allowed");
+    }
+    let scopes = oauth::approved_scopes(&requested, payload.terminals);
+    if scopes.is_empty() {
+        return invalid_mcp_authorization("no-scope-left");
+    }
+    decide_mcp_authorization(
+        &state,
+        &headers,
+        payload.id,
+        McpOAuthDecision::Approve {
+            access: payload.access,
+            scopes: scopes.join(" "),
+        },
+        "approved",
+    )
+    .await
+}
+
+/// `POST /api/auth/mcp-authorizations/deny`.
+async fn deny_mcp_authorization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(payload): Json<DenyMcpAuthorizationRequest>,
+) -> Response {
+    if let Err(error) =
+        authenticated_with_scope(&state.auth, &headers, &uri, SCOPE_ACCESS_WRITE).await
+    {
+        return auth_error_for_request(error, &headers, "mcp_authorization_decision_failed");
+    }
+    decide_mcp_authorization(
+        &state,
+        &headers,
+        payload.id,
+        McpOAuthDecision::Deny,
+        "denied",
+    )
+    .await
+}
+
+async fn decide_mcp_authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: String,
+    decision: McpOAuthDecision,
+    status: &'static str,
+) -> Response {
+    let Some(repositories) = state.auth.oauth_repositories() else {
+        return invalid_mcp_authorization("no-store");
+    };
+    match repositories
+        .decide_mcp_oauth_authorization(id.clone(), decision, now_ms())
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(status, "a remote MCP authorization was decided");
+            if let Err(error) = state.auth.reload_pending_mcp_authorizations().await {
+                tracing::warn!(
+                    ?error,
+                    "the pending MCP authorizations could not be announced"
+                );
+            }
+            Json(json!({ "id": id, "status": status })).into_response()
+        }
+        Ok(false) => invalid_mcp_authorization("not-pending"),
+        Err(error) => auth_error_for_request(
+            AuthError::Internal(error.to_string()),
+            headers,
+            "mcp_authorization_decision_failed",
+        ),
     }
 }
 
