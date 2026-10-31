@@ -153,6 +153,7 @@ vi.mock("~/state/vcs", () => ({ vcsEnvironment: { listRefs: () => ({ kind: "list
 vi.mock("~/state/mcpActivity", () => ({
   usePrimaryMcpActivity: () => ({ rows: [], active: [], canManage: false, environmentId: null }),
   usePrimaryMcpClients: () => [],
+  usePrimaryAgentAccess: () => ({ environmentId: null, canRead: false, canManage: false }),
   takenOverLevel: () => null,
 }));
 // …and its header summarizes the webhook endpoints.

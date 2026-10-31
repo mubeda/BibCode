@@ -73,7 +73,10 @@ vi.mock("../../state/entities", () => ({
   useProjects: () => [{ id: "p1", title: "App", environmentId: "local" }],
 }));
 
-vi.mock("../../state/mcpActivity", () => ({ usePrimaryMcpClients: () => [] }));
+vi.mock("../../state/mcpActivity", () => ({
+  usePrimaryMcpClients: () => [],
+  usePrimaryAgentAccess: () => ({ environmentId: "local", canRead: true, canManage: true }),
+}));
 
 vi.mock("../ui/switch", () => ({
   Switch: (props: AnyProps) => (
@@ -317,5 +320,29 @@ describe("WebhooksTab", () => {
     expect(h.calls).toEqual([
       { command: "redeliver", request: { environmentId: "local", input: { deliveryId: "d1" } } },
     ]);
+  });
+
+  it("does not redeliver a delivery that is still queued", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint()];
+    h.deliveries = [
+      {
+        deliveryId: "d2",
+        eventId: "ev_2",
+        eventType: "approval.requested",
+        state: "pending",
+        attempts: 1,
+        lastStatus: 503,
+        lastError: "status",
+        latencyMs: 40,
+        nextAttemptAt: "2026-10-31T00:01:00Z",
+        createdAt: "2026-10-31T00:00:00Z",
+        updatedAt: "2026-10-31T00:00:30Z",
+      },
+    ];
+    const container = await render();
+    await act(async () => button(container, "Recent deliveries").click());
+    expect(container.textContent).toContain("Retrying (HTTP 503)");
+    expect(button(container, "Redeliver").disabled).toBe(true);
   });
 });

@@ -49,6 +49,7 @@ vi.mock("../../state/webhooks", () => ({
 vi.mock("../../state/mcpActivity", () => ({
   usePrimaryMcpActivity: () => ({ rows: [], active: [], canManage: false, environmentId: null }),
   usePrimaryMcpClients: () => h.clients,
+  usePrimaryAgentAccess: () => ({ environmentId: "local", canRead: true, canManage: true }),
   takenOverLevel: () => null,
 }));
 
@@ -382,6 +383,19 @@ describe("AgentIntegrationsSection", () => {
       container.querySelector('[data-testid="webhooks-tab"]')?.getAttribute("data-environment"),
     ).toBe("local");
     expect(container.querySelector('[aria-label="MCP server"]')).toBeNull();
+  });
+
+  it("names webhook endpoints a revoked agent's pairing turned off in the MCP tab", async () => {
+    h.webhooks = {
+      endpoints: [
+        { name: "CI", enabled: false, consecutiveFailures: 0, disabledReason: "client-revoked" },
+        { name: "Pager", enabled: true, consecutiveFailures: 0, disabledReason: null },
+      ],
+    };
+    const container = await render();
+    expect(container.textContent).toContain(
+      "Revoking their paired MCP client turned off CI. Re-enable them in the Webhooks tab.",
+    );
   });
 
   it("quotes for the server host's own shell", () => {

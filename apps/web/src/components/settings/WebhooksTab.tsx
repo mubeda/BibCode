@@ -17,7 +17,7 @@ import { useId, useMemo, useState } from "react";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hooks/useSettings";
 import { useProjects } from "../../state/entities";
-import { usePrimaryMcpClients } from "../../state/mcpActivity";
+import { usePrimaryAgentAccess, usePrimaryMcpClients } from "../../state/mcpActivity";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { isFailingEndpoint, useWebhookList, webhooksEnvironment } from "../../state/webhooks";
@@ -127,6 +127,7 @@ const ERROR_LABELS: Readonly<Record<string, string>> = {
   unresolved: "host not found",
   address_refused: "the host is a private address",
   url_refused: "not an https URL",
+  secret_missing: "its secret is missing: rotate it",
   redirect: "redirects are not followed",
   cancelled: "cancelled",
   queue_full: "the queue was full",
@@ -186,7 +187,11 @@ function EndpointsRow({
   readonly enabled: boolean;
   readonly isPrimary: boolean;
 }) {
-  const list = useWebhookList(environmentId);
+  const access = usePrimaryAgentAccess();
+  // The primary environment's session says whether it may read webhooks; elsewhere the
+  // server answers.
+  const allowed = !isPrimary || access.canRead;
+  const list = useWebhookList(allowed ? environmentId : null);
   const [adding, setAdding] = useState(false);
   const [secret, setSecret] = useState<{ readonly name: string; readonly value: string } | null>(
     null,
@@ -215,6 +220,9 @@ function EndpointsRow({
       }
     >
       <div className="space-y-3 pt-3 pb-3.5">
+        {allowed ? null : (
+          <ReasonLine text="Webhooks need an administrator session on this environment." />
+        )}
         {list.error !== null && list.data === null ? (
           <ErrorLine
             text={`Could not load the webhooks. ${list.error} Webhooks need an administrator session on this environment.`}
@@ -578,7 +586,12 @@ function DeliveriesList({
                 <Button
                   size="xs"
                   variant="ghost"
-                  disabled={!canRedeliver || busy !== null}
+                  disabled={
+                    !canRedeliver ||
+                    busy !== null ||
+                    delivery.state === "pending" ||
+                    delivery.state === "sending"
+                  }
                   aria-describedby={canRedeliver ? undefined : reasonId}
                   onClick={async () => {
                     setBusy(delivery.deliveryId);
