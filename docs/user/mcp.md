@@ -325,6 +325,9 @@ These two belong to no set: they are always listed and work at read-only.
   Agent activity is kept for 7 days or 5,000 rows: an older cursor sets `activityDropped`.
 - **Not in the feed:** Git operations a person ran in the app, worktree and file changes, and
   profiler findings, which `profiler_findings` pages with its own cursor.
+- **Webhooks.** Each [webhook](./webhooks.md) made from this feed carries its entry's
+  `cursor`, so a receiver that missed deliveries calls `changes_since` from the last one it
+  processed.
 
 ### Chat panels and UI suggestions
 

@@ -4789,3 +4789,137 @@ CLI, F0 and waves 1 to 3 with their review fixes). It adds five tools to the `gi
   runs both sides together.
 - **Not changed:** `git_log` with both `ref` and `cursor` follows the cursor's tip and only
   echoes `ref`; its description does not say so.
+
+## X8 implementation notes (2026-10-31)
+
+X8 was implemented on `claude/v0131-139-x8`, from the batch tip `4d4287c818` (slice 1, the
+CLI, F0, waves 1 to 3 with their review fixes). Migration 61 is `Webhooks`. It adds
+`apps/server/src/webhooks/` (`mod.rs` service and dispatcher, `store.rs`, `delivery.rs`,
+`signing.rs`, `events.rs`, `rpc.rs`, `tests.rs`), `packages/contracts/src/webhooks.ts`, the
+client-runtime `state/webhooks.ts`, `WebhooksTab.tsx` and `docs/user/webhooks.md`. X2's
+Revision-4 findings cursor was already done, so X8's Revision-4 row needed nothing more.
+
+**Security requirements of this wave (stricter than the section):**
+
+- **No loopback `http` opt-in.** The section allowed "loopback `http` with a per-endpoint
+  opt-in"; the wave's brief requires HTTPS and global addresses only, so neither exists.
+  `upsert` refuses any URL that is not `https://` with a host and no user name, password or
+  fragment.
+- **Address classification is X6's.** `delivery.rs` imports `git::clone_policy::is_public`
+  and the `HostResolver` trait, and `SystemResolver` became `pub(crate)` (one word in X6's
+  file). **Dependency:** the X6 writer is widening `is_public` to the full IANA non-global
+  registries this wave; webhooks pick that up with no change. Every resolved address must
+  pass, not only the first.
+- **Pinned connection.** One resolution per attempt (`HostResolver`, 10 s), then a fresh
+  reqwest client with `resolve_to_addrs(host, checked)` and a `dns_resolver` that refuses
+  every name, so no lookup happens after the check. `no_proxy()` ignores system and
+  environment proxies; `redirect::Policy::none()` makes a 3xx a failure (`redirect`). 5 s to
+  connect, 10 s in all, `pool_max_idle_per_host(0)`, and the response body is never read
+  (only the status), which bounds the response to the headers hyper accepts.
+
+**Drift and choices the section left open:**
+
+- **Event sources map onto X3's entries.** `events::from_feed_entry` reads the entries
+  `mcp::tools::feed::page_after` returns, a function extracted from `changes_since` (a
+  small change to X3's file: the tool now calls it, its output unchanged) so the dispatcher
+  and the tool share the entry kinds and cursors. Mapping: `turn.started`, `turn.completed`,
+  `turn.interrupted`, `turn.failed` and `session.status` are `thread.status_changed` with
+  the entry's `kind` and `status`; `panel.created`; `approval.requested`; `approval.resolved`
+  (`status` resolved or expired); `agent.call` rows are `clone.completed`
+  (`clone_repository`), `transfer.completed`/`failed` (`files_upload`/`files_download` rows
+  with no thread: the transfer route's, not the mint call's), and `scm.operation_completed`
+  (any tool whose `ToolSpec.capability` is Source control, by `tool_spec`, not a name list).
+  `thread.created`, `thread.archived`, `turn.requested` and `input.*` have no catalog event
+  and are not sent.
+- **Payload fields.** Beyond `{ id, type, occurredAt, environmentId, threadId?, actor?,
+  cursor?, finding? }`, an event carries the entry's `kind`, `status`, `requestId`, `tool`
+  and `target` (X3's notes: "the webhook's natural event fields"). `worktreeId` is never
+  set: no durable source names a worktree id, and `target.worktreeKey` belongs to the
+  `create_worktree` call row, which is not an event (it would duplicate `worktree.created`).
+  `id` is `ev_` and 24 hex of SHA-256 over the type and the cursor (or the finding's id and
+  count), so a redelivery keeps it. The actor's `label` goes through `redact_sensitive_text`.
+- **`worktree.created`** is a `thread.created` entry whose thread has a worktree, read from
+  `projection_threads.worktree_path IS NOT NULL` (a boolean) when the entry is mapped,
+  beside the thread's `project_id` for the project filter. A second non-panel thread created
+  in an existing worktree would also send it; BiBCode creates one host thread per worktree.
+- **`clone.completed` follows the call.** X6 records the `clone_repository` row when the call
+  answers, so a clone still running then is sent with `status: success` and its
+  `target.cloneId`; its final outcome is `clone_status`. The user guide says so; X6's
+  follow-up (a row per settled clone) would make it the clone's end.
+- **Findings position.** `Reader::follow_findings` is synchronous and in-memory, so the
+  dispatcher reads the book (`Reader::findings`, on a blocking thread) when its file changes
+  (`Reader::findings_version`, a new length-and-mtime accessor in `reader.rs`) and keeps a
+  durable position `{ lastSeen, marks: { id: count } }` for the newest second, since
+  `lastSeen` has whole seconds. New is a later second, or the same second with a mark that
+  differs. While MCP or its Diagnostics set is off the position moves but nothing is queued,
+  so turning it on does not replay. The first read only marks what is there.
+- **Positions.** `webhook_state` keeps two values: `feed` (X3's cursor, which holds the event
+  sequence and the activity id, the section's first two positions) and `findings`.
+  Webhooks off clears them; turning webhooks on starts from the heads, so nothing that
+  happened while off is sent ("off is immediate" read with "abandoned").
+- **Retries.** The section lists five delays for "5 attempts"; implemented as the first send
+  plus five retries (`RETRY_DELAYS`, six sends over about 32 minutes). An unresolved host
+  retries like a connection error. A delivery fails when its retries run out or on any other
+  answer; ten failed deliveries in a row (`consecutive_failures`, reset by a success) disable
+  the endpoint with `disabledReason: failures`; Re-enable clears the count.
+- **Ordering.** One request in flight per endpoint, always its oldest pending delivery, so a
+  retrying delivery holds that endpoint's later ones (order over throughput); at most eight
+  endpoints at once.
+- **`sendTest` and `redeliver`** send inline as a `sending` row (outside the queue) and
+  answer the first attempt's result, so they truly wait on the network (`is_long_running`).
+  A test is never retried and never counts toward health; a redelivery is a new delivery of
+  the same event (same `id`, new `X-BibCode-Delivery`), retried and counted like any other.
+  A `sending` row a stop cut off is failed as `interrupted` at the next start, never resent.
+  A test may go to a disabled endpoint, never while webhooks are off; a redelivery needs both
+  on.
+- **Pairing reads `auth_sessions`.** `subscribe_access` is a lossy broadcast, so the
+  dispatcher checks paired sessions in `auth_sessions` (gone or revoked) on each pass and
+  uses Authorized-clients notices only to wake (`Webhooks::wake_on`). `upsert` refuses a
+  pairing with anything but a live `mcp-client` session. The Settings form offers pairing
+  for the primary environment only, whose agents the app lists.
+- **Store, not `repositories.rs`.** As F0 and X1 kept their rows in their modules, the
+  webhook SQL lives in `webhooks/store.rs`; `persistence/repositories.rs` is unchanged.
+- **Files touched beyond X8's rows:** `production/control.rs` (`enableWebhooks`: validation,
+  default `false`, `webhooks_enabled_signal`, and its test; F0's file),
+  `mcp/tools/feed.rs` (the extraction above), `git/clone_policy.rs` (`SystemResolver`
+  visibility), `diagnostics/profiler/reader.rs` (`findings_version`),
+  `auth/secret_store.rs` (`set` lost its `expect(dead_code)`: rotation uses it), `lib.rs`
+  (the module), `docs/architecture/overview.md` (an "Outbound webhooks" section and a
+  profiler bullet), `docs/skills/bibcode-profiler/references/findings.md` (the two methods
+  in the `rpc.slow` exemptions), `CreateWorktreeDialog.settings.dom.test.tsx` (mocks
+  `~/state/webhooks`, as X1 mocked `~/state/mcpActivity`), and the client-runtime package
+  export. `docs/README.md` (Z's) does not link the new user guide yet.
+- **Counts.** Methods 180 → 187, typed failures 373 → 387, fixtures 499 → 513, schema
+  fingerprints 463 → 477; streams and stream shapes unchanged.
+- **No new `Mcp…Error` tag.** The RPC errors are `WebhookError { reason }`, so `feed::ERRORS`
+  is unchanged. `the_error_table_holds_every_tag_the_mcp_sources_return` fails on this tip
+  for `McpCloneNotFoundError`, `McpCloneRefusedError` (X6, being added) and also
+  `McpFileTooLargeError` and `McpTransferUnavailableError` (X5); none is X8's.
+
+**UI.** The section keeps its environment picker; under it a tab list (**MCP**,
+**Webhooks**). The MCP tab holds the existing rows and the Agents panel (R adds its mount
+line there). The header's status line reads "MCP on · 1 agent connected · 2 webhooks active,
+1 failing" (agents only for the primary environment). The Webhooks tab: the **Webhooks**
+switch (off by default, with a reset), then **Endpoints** with **Add endpoint**; each endpoint
+shows its name, URL and state, an on switch, **Send test event** (disabled with "Turn on
+Webhooks first."), **Recent deliveries** (time, event, status, attempts, latency,
+**Redeliver**), **Edit**, **Rotate secret** and **Delete**, which alone asks first. A secret is
+shown once in a notice with **Copy** and **Done**. A failing or auto-disabled endpoint shows a
+warning, and **Re-enable** when off. Webhooks need `access:*`; on an environment where the
+session lacks them, the list shows the server's error and says an administrator session is
+needed.
+
+**Tests (written with or before the code):** `webhooks::tests` against a local HTTPS receiver
+behind the test authority with injected resolvers: a signed delivery verifying over its
+timestamp with no prompt or message text and X3's cursors; retries on 500 and none on 400;
+ten failures disabling; the queue and feed position resuming after a restart; private,
+mixed, IP-literal and unresolvable hosts refused with no system lookup and plain `http`
+never sent; one lookup per attempt and no redirect followed; disabling an endpoint
+cancelling its request in flight and its queue; webhooks off abandoning and starting from
+now; revoking a paired client; a receiver dropping every second delivery catching up through
+`page_after` and `profiler_findings { since }`, including two findings in one second and a
+recurrence; Diagnostics off sending no finding; test, redeliver, rotate and delete;
+validation and the 20-endpoint limit. Also `webhooks::{signing,delivery,events}::tests`,
+`migration_061_adds_the_webhook_tables`, `webhooks_signal_follows_committed_setting`, the
+scope and latency tests, the contract settings test, `WebhooksTab.test.tsx` and two
+`AgentIntegrationsSection` tests (status line, tabs).
