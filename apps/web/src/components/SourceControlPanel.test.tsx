@@ -476,6 +476,11 @@ vi.mock("~/components/ui/textarea", () => ({
   },
 }));
 
+// Its own test covers the agent's commit message suggestion.
+vi.mock("./SourceControlAgentSuggestion", () => ({
+  SourceControlAgentSuggestion: () => null,
+}));
+
 vi.mock("./SourceControlCommits", () => ({
   SourceControlCommits: (props: { reloadToken: number; nowMs: number; gitCwd: string | null }) => {
     captured.commits.push(props);

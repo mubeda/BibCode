@@ -40,6 +40,49 @@ pub enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the system trash could not take {path}; it was left in place", path = .path.display())]
+    TrashUnavailable { path: PathBuf },
+    #[error("another BiBCode write or an upload of {path} is in progress; try again when it ends", path = .path.display())]
+    PathBusy { path: PathBuf },
+    #[error("{path} has more than one hard link; writing it would change its other names too", path = .path.display())]
+    HardLinked { path: PathBuf },
+    #[error(
+        "writing {path} failed after it was emptied ({reason}); {outcome}",
+        path = .path.display(),
+        outcome = if *.restored { "its old content was put back" } else { "its old content could NOT be put back" }
+    )]
+    WriteFailed {
+        path: PathBuf,
+        reason: String,
+        restored: bool,
+    },
+    #[error(
+        "the trash could not take {path}, and it could not be put back because its name is in use again: it is in BiBCode's staging folder at {staged}. Move it back by hand, or BiBCode moves it back on its next trash or discard once the name is free",
+        path = .path.display(),
+        staged = .staged.display()
+    )]
+    KeptInStaging {
+        path: PathBuf,
+        /// Where it is now.
+        staged: PathBuf,
+        /// The same, relative to the folder that holds `bibcode-discard`.
+        staged_at: String,
+        /// Whether that folder is the workspace's Git directory (else the server's state
+        /// directory).
+        in_git_dir: bool,
+    },
+    #[error(
+        "deleting {path} stopped part-way ({reason}); what is left is at {left_at}",
+        path = .path.display(),
+        left_at = .left_at.display()
+    )]
+    PartiallyRemoved {
+        path: PathBuf,
+        /// Where what is left now is: the entry's own path when it could be put back, else
+        /// the hidden name it was parked under.
+        left_at: PathBuf,
+        reason: String,
+    },
     #[error("workspace operation was cancelled")]
     Cancelled,
     #[error("invalid request: {0}")]
@@ -69,8 +112,21 @@ impl WorkspaceError {
             Self::BinaryFile { .. } => "binary_file",
             Self::AlreadyExists { .. } => "entry_already_exists",
             Self::NotFound { .. } | Self::RootNotFound { .. } => "path_not_found",
+            // Resolving a path that is not there (a read, a version check) fails in the file
+            // system call, not in an existence check, but it is the same answer.
+            Self::Operation {
+                operation: "realpath-target",
+                source,
+                ..
+            } if source.kind() == std::io::ErrorKind::NotFound => "path_not_found",
             Self::FileChangedOnDisk { .. } => "file_changed_on_disk",
             Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
+            Self::TrashUnavailable { .. } => "trash_unavailable",
+            Self::PathBusy { .. } => "path_busy",
+            Self::HardLinked { .. } => "hard_linked",
+            Self::WriteFailed { .. } => "write_failed",
+            Self::KeptInStaging { .. } => "kept_in_staging",
+            Self::PartiallyRemoved { .. } => "partially_removed",
             _ => "operation_failed",
         }
     }
@@ -103,8 +159,35 @@ impl WorkspaceError {
             | Self::AlreadyExists { path }
             | Self::NotFound { path }
             | Self::FileChangedOnDisk { path }
-            | Self::FileMissingOnDisk { path } => {
+            | Self::FileMissingOnDisk { path }
+            | Self::TrashUnavailable { path }
+            | Self::PathBusy { path }
+            | Self::HardLinked { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+            }
+            Self::KeptInStaging {
+                path,
+                staged_at,
+                in_git_dir,
+                ..
+            } => {
+                object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+                object.insert("stagedAt".to_owned(), json!(staged_at));
+                object.insert(
+                    "stagedIn".to_owned(),
+                    json!(if *in_git_dir { "git-dir" } else { "state-dir" }),
+                );
+            }
+            Self::WriteFailed { path, restored, .. } => {
+                object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+                object.insert("restored".to_owned(), json!(restored));
+            }
+            Self::PartiallyRemoved { path, left_at, .. } => {
+                object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+                // The name, in the entry's own folder, under which what is left now sits.
+                if let Some(name) = left_at.file_name() {
+                    object.insert("leftAt".to_owned(), json!(name.to_string_lossy()));
+                }
             }
             Self::Operation {
                 operation, path, ..

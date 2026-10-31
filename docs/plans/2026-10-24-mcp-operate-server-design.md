@@ -3,6 +3,15 @@
 Status: Approved 2026-10-24 with every recommended answer. Issue #139. Implemented last in
 the batch after v0.11.0.
 
+> **Superseded 2026-10-30 (historical).** Slice 1 shipped as designed here, and its
+> decisions are kept as they were. The remaining slices
+> ([2026-10-30-mcp-remaining-slices-design.md](./2026-10-30-mcp-remaining-slices-design.md))
+> replaced its non-goals and its answer on approvals: outside agents now answer approvals,
+> revert threads, remove worktrees, write Git and pull requests, use terminals, previews,
+> files, clone and diagnostics, and remote Streamable HTTP with OAuth is being added. For
+> current behavior read the [MCP reference](../reference/mcp.md) and
+> [Outside agents over MCP](../user/mcp.md), not this document.
+
 ## Goal
 
 Let an agent harness that BiBCode did not start, such as Claude Code or Codex
@@ -153,6 +162,12 @@ Goals:
 - Living docs, and a skill built test-first.
 
 Non-goals for slice 1:
+
+> **Superseded 2026-10-30.** Every non-goal below except the standalone `GET /mcp` stream,
+> the Tasks extension, resources, settings, credentials, the updater, pairing, the relay
+> and CLI session import was
+> delivered by the remaining slices; see the
+> [MCP reference](../reference/mcp.md#safety-model).
 
 - Remote Streamable HTTP for outside agents, which needs MCP OAuth (see
   Answers to the open questions).
@@ -332,13 +347,14 @@ tokens are route-bound. The audience rule needs no new column, because
 ### Discovery and launch
 
 - **Endpoint record.** The server writes `server-runtime.json` (mode 0600)
-  after `bind_listener`, under the `StoreRuntimeGuard` owner, and removes it at
-  shutdown. It holds `{ version, pid, dialHost, port, bootId, startedAt,
+  after `bind_listener` and removes it at shutdown. It holds `{ version, pid, dialHost, port, bootId, startedAt,
   proofKey }`, and is written in the `userdata` or `dev` state directory the
   server uses. `dialHost` is a loopback address that reaches the listener:
   `127.0.0.1` or `::1` for a wildcard or loopback bind, and `null` when the
   server listens only on other interfaces. The desktop's in-process server
-  writes it the same way.
+  writes it the same way. The first live owner keeps it: a starting server
+  leaves a record in place whose pid is alive and whose listener answers the
+  recorded proof (see Review fixes).
 - **Relay start.** `bibcode mcp [--base-dir] [--dev-url] [--url] [--access]`
   resolves the data root and state directory as `pairing issue` does. Then,
   within Codex's 10 s default startup timeout, it:
@@ -444,7 +460,8 @@ lets the existing command admission replay them:
   reservation released, is tried again. The message is enqueued either way,
   so the worst case is the same fallback to queued.
 - **Scope.** Rows belong to one client session, which is one running MCP
-  server in the agent. Rows older than 24 h are deleted on insert, and a
+  server in the agent (the credentials of `bibcode thread` share one scope; see
+  the CLI implementation notes). Rows older than 24 h are deleted on insert, and a
   reused key after that is a new request whose ids differ. The
   `clientRequestId` description says this.
 
@@ -618,7 +635,10 @@ Default on adds no capability. A same-user process can already run
   mints, revokes on exit, and sweeps orphans. Nothing is stored. A stored
   token would be one more live bearer at rest, and per-launch sessions keep
   Authorized clients showing one row per running agent.
-- **Approvals?** Keep the upstream stance in slice 1. A later
+- **Approvals?** _Superseded 2026-10-30: `answer_approval` shipped without
+  `anthropic/requiresUserInteraction` and without a separate opt-in; it is a destructive
+  tool available at every level above read-only (remaining-slices design, Revision 2,
+  questions 1 and 2)._ Keep the upstream stance in slice 1. A later
   `respond_to_approval` would need `_meta["anthropic/requiresUserInteraction"]: true`
   and an explicit per-environment opt-in that defaults off. Claude Code
   prompts on every such call, even in bypass modes, but other harnesses do not
@@ -940,7 +960,9 @@ Setting:
 Discovery:
 
 - the record is written after bind, is mode 0600, is removed on shutdown, and
-  is not overwritten by a second server that fails the guard;
+  is not overwritten by a second server that fails the guard, nor by one that
+  starts on another port while the first still runs; a record whose owner is
+  gone is replaced;
 - a stale record whose pid is gone makes the relay exit 1 before minting;
 - a replacement listener on the recorded port, which cannot answer the proof,
   makes the relay exit 1, and the listener receives no `/oauth/token` body
@@ -1131,3 +1153,256 @@ application service. It reuses the existing command admission: the new table
 only keeps a retry byte-identical and holds no replay logic. Pages are read
 directly, waits are short and tied to one turn, and the thread CLI remains a
 follow-up.
+
+## Implementation notes (2026-10-30)
+
+Slice 1 was implemented on `claude/v0131-139-mcp`, based on v0.13.0 (`a0ea849ef9`).
+Before any code, every "Current behavior" claim and every file in "Files to change" was
+re-checked against that commit. The design was verified at `4e023ac5ff`, before v0.12.0
+and v0.13.0. Nothing below changes a settled decision (transport, credential model, trust
+boundary or persisted shape). The changes are a renumbered migration, moved line
+references, one reused file-writing pattern, and the Settings placement that the issue
+updated on 2026-10-27.
+
+**Drift found:**
+
+- **Migration number.** `MIGRATIONS` now ends at 57 (`ProjectionThreadAgentStatus`), and
+  55 is `ProjectionThreadReasoning`. `McpClientAccessAndRequests` is therefore
+  **migration 58**, with a `(58, "mcp_tool_requests")` row in `CORE_TABLES`. The design's
+  shape (nullable `mcp_access` on `auth_pairing_links` and `auth_sessions`, plus
+  `mcp_tool_requests`) is unchanged.
+- **Desktop dispatch.** `desktop_dispatch` (`diagnostics/profiler/cli.rs:144-160`) now
+  also dispatches `diagnostics` (#201), on a `current_thread` Tokio runtime. `mcp` follows
+  that template. It attaches the parent console only when stdin and stdout are terminals,
+  because stdout must carry only JSON-RPC.
+- **Endpoint record precedent.** `server-runtime.json` is still declared but unused
+  (`persistence/state_files.rs:82`). v0.13.0 added `diagnostics-relay.json`, written by
+  `RelayEndpointFile` (`production/diagnostic_logs_relay.rs:1145-1196`): it is written
+  through a temporary file and a rename with mode 0600, after `bind_listener` under the
+  `StoreRuntimeGuard` owner (`lifecycle.rs:440-452`), and removed on drop only while it
+  is still ours. `relay_cli.rs:124` reads it, loopback-only. The MCP endpoint record uses
+  the same write, drop and read discipline. The design's per-boot `proofKey` and the
+  endpoint proof stay as designed: the diagnostics relay trusts the recorded URL without
+  a proof, which is weaker than what this design settled.
+- **Scopes.** v0.13.0 added `diagnostics:read`, and `orchestration:read` now satisfies it
+  one way (`auth/model.rs:30-39`). An `mcp-client` session therefore also satisfies
+  `diagnostics:read`. The audience rule already keeps that session off every RPC and HTTP
+  route except `/mcp`, so nothing changes.
+- **Auth.** `consume_grant` (`auth/service.rs:2202`) still checks no policy, so a
+  data-root pairing link is still accepted by a desktop's in-process server.
+  `issue_offline_share_pairing` (`auth/service.rs:2794`) is the template for the new
+  issuer (custom scopes, subject and label written straight into the data root).
+  `authenticate_token` (`:882`) is the single bearer check that every HTTP, cookie and
+  ticket path goes through. It now refuses the `mcp-client` subject by default, and only
+  a separate MCP-surface authenticate accepts it. That fails closed for any caller added
+  later.
+- **`/mcp`.** The `initialize` echo is now at `connect_mcp.rs:1018` and still falls back
+  to `2025-06-18`; `call_tool` is at `:1072`, and the "valid credential is the operate
+  grant" invariant is at `:1079`. The route is at `http_routes.rs:347` and its handler at
+  `:802`. It still skips `state.authorize`, like the documented precedents
+  `preview_open_url` and `diagnostic_logs_relay`.
+- **RPC registry.** `RpcRegistry::get` is private at `rpc/session.rs:650`. The timing
+  wrapper is `:571-604`, `admit_request` is `:1186`, and
+  `RpcSessionContext::authenticated` is `:332`.
+- **Shutdown.** `quiesce_for_update` is `production/runtime.rs:878`, `begin_stopping`
+  is `:886`, `orchestration.shutdown()` is `:928`, and `end_session` is `:931`. The HTTP
+  dispatch refusal of `thread.turn.start` is now `:786`.
+- **Engine.** `subscribe_events` is `orchestration/engine.rs:2979`. Turn rows still record
+  `pending_message_id` and `assistant_message_id`, and queued deliveries are
+  `provider_turn_outbox` rows. Migrations 54 (`host_thread_id`) and 57 (agent status) add
+  thread fields that the shell builder now emits. `list_projects_and_threads` passes the
+  shell builder's thread fields through instead of re-deriving them.
+- **Profiler.** `is_long_running` is `diagnostics/profiler/latency.rs:106`, and v0.13.0
+  added the diagnostics relay methods there. The profiler stdio MCP
+  (`diagnostics/profiler/mcp.rs`) is unchanged since `4e023ac5ff`.
+- **Existing module.** `apps/server/src/mcp/` already exists and holds
+  `preview_automation.rs`. The new files are added beside it.
+
+**Design adjustments:**
+
+- **Settings placement.** The issue's 2026-10-27 edit moves the MCP row into the **MCP**
+  tab of a **Settings → Agent integrations** section. This slice adds that section with
+  the MCP content only, on the existing Settings → Agents page (a section, not a new
+  route). Webhooks belong to the extended scope, so the tab bar arrives with the second
+  tab. The relay's off message names "Settings → Agents → Agent integrations → MCP
+  server".
+- **`rmcp`.** The issue's 2026-10-27 note says to reevaluate the official Rust SDK before
+  writing a third MCP framing. This slice writes none: `mcp/protocol.rs` replaces the
+  profiler's framing and the `/mcp` one, which leaves one copy. No dependency is added.
+- **Origin smoke test.** The design gates the `Origin` 403 on a launch smoke test of every
+  provider. That test needs real provider CLIs and was not run here. The check is
+  implemented and tested (no `Origin`, or this server's own origin, passes), and the
+  untested provider launch is reported as a residual risk.
+
+**Choices made while implementing** (none changes a settled decision):
+
+- **`list_providers_and_models` maps to `server.getConfig`.** `server.getProviderCapabilities`
+  returns slash commands, skills and agents, not models; the models and the session
+  defaults are in the server config. That read is not long-running, so
+  `mcp.list_providers_and_models` is not either; the profiler rule "long-running when it
+  waits or any method it dispatches to is" is unchanged.
+- **Provider tools are long-running.** `mcp.preview_*` and `mcp.device_*` wait on a
+  page or an emulator (`device.open` already is), so they never raise `rpc.slow`.
+- **`read_thread` pages backwards.** Without a cursor it returns the newest page, and
+  `nextCursor` reads older messages, keyed on the same `(created_at, message_id)` index.
+- **The relay mints on its first request**, not at start, so the label can name the agent
+  from `clientInfo` (`MCP · <name>`). Every check before minting (setting, record, proof)
+  still runs at start.
+- **Malformed `/mcp` bodies get 400** with the JSON-RPC error, and a message without an
+  id is a notification (202), as the Streamable HTTP transport says; the old endpoint
+  answered both differently.
+- **A wait without `messageId`** also counts an admitted turn that has not started
+  (`turn_id IS NULL`, `running`) as work in progress, so it does not report a just-started
+  thread as idle.
+- **Launch command wrappers.** `@bibcode/shared/launchCommand` builds the SSH and WSL
+  wrappers, but the Settings row does not yet look up an SSH or WSL environment's target
+  through the desktop bridge. For an environment other than the primary one it shows the
+  server's own command and says to run it on that host or after `ssh <host> --`.
+- **Retries after a crash and after a rejection** rest on the existing command-admission
+  replay, which the tools reach unchanged with the stored payloads; the review round below
+  added tests for both.
+
+**Review fixes (2026-10-30):**
+
+- **The endpoint proof binds the listener's address.** The proof signed only the nonce and
+  port, and `--url` could name another loopback address, so a listener on `[::1]:P` that
+  forwarded to BiBCode on `127.0.0.1:P` passed it and would have received the pairing link.
+  The proof is now `HMAC(proofKey, "bibcode-mcp-endpoint-v2" ‖ nonce ‖ local address ‖ port)`
+  over the address the connection reached (an IPv4-mapped address counts as IPv4), and
+  `RECORD_VERSION` is 2. The relay dials the record's `dialHost` and `port` as an address,
+  never a name, and a `--url` must name that listener (`localhost` on its port is allowed).
+  `dialHost` is now the bind address itself for a loopback bind, not always `127.0.0.1`.
+- **A page cut to fit sets its cursor afterwards.** `read_thread` set `nextCursor` from the
+  page it read and `tool_result` then dropped the oldest messages to meet the 80,000-character
+  cap, so following the cursor skipped them (and a page that fit its `limit` had no cursor at
+  all). `list_projects_and_threads` had the same gap at the back of its thread page.
+  `protocol::fit_list` now cuts a paged list first (keeping at least one entry) and the tool
+  sets its cursor from the entries left. `read_thread` lets queued messages, still counted in
+  `queuedCount`, give way before history.
+- **A retry resolves its `clientRequestId` first.** `start_thread`, `send_message` and
+  `answer_question` checked the ceiling, the thread, the project or the open question before
+  looking up the stored request, so a retry whose first answer was lost could fail before it
+  replayed (the question it answered is no longer open; the setting was lowered). The stored
+  request is now read first. Stored commands the engine has not accepted (no receipt, or a
+  `reserved` or `prepared` one) still meet the current ceiling, for the command's own
+  `runtimeMode` and the thread's; accepted and rejected ones go to the engine's replay, which
+  answers as it did the first time.
+- **Every read of a wait is bounded.** `wait_for_thread` awaited the thread lookup, its first
+  read and each re-read outside the select on the deadline, so a stalled store held a call
+  past its 50 s cap, its cancellation and the off switch. The deadline is now set before the
+  lookup, and one stop future (cancellation, shutdown, the setting off, the deadline) races
+  every read. A deadline that passes before the first read answers is `McpStorageError`
+  ("the work goes on. Wait again."); a later one returns the last state read, `timedOut: true`.
+- **Tests the first round left out** now exist: a retry after a crash between reservation and
+  enqueue (a `reserved` receipt is resumed and answered once admitted), a retry of a rejected
+  command (the original error), the relay's `MCP-Protocol-Version` on legacy calls with no
+  `Mcp-Session-Id`, the server's receiver released after a stdio `notifications/cancelled`,
+  steer, and, through the relay against a real server with every provider unable to run,
+  `list_providers_and_models`, `start_thread` with the Default Agent's model, and
+  `git_status`.
+- **The first live owner keeps the endpoint record.** "Not overwritten by a second server that
+  fails the guard" assumed an exclusive guard, but `StoreRuntimeGuard` takes a shared lock
+  (`persistence/backup.rs`), so a second server for the same data root on another port
+  started and its record replaced the first's. When that second server stopped, it removed
+  the record, and relays reported no server although the first still ran. The guard and the
+  record's shape are unchanged. Instead, a starting server writes the record through
+  `EndpointRecordFile::claim`: when a record exists, its pid is alive (`sysinfo`, the relay's
+  own check) and its listener answers a fresh nonce with the recorded `proofKey` (the
+  relay's `endpoint::prove`), the record stays, the server logs a content-free warning that
+  MCP discovery stays with the running server, and it runs normally without being reachable
+  by `bibcode mcp`. A dead pid, an older record version, a refused connection, a missing
+  route or a wrong proof (a recycled pid, or another program on the port) means the owner
+  is gone, and the record is replaced as before. Removal is unchanged: only while the record
+  is still ours. The probe runs once, at startup, with a 2 s connect and request timeout.
+  **A probe that times out counts as live.** It can only time out when the pid is alive and
+  something accepts on the recorded listener without answering, which is almost always the
+  owner itself, stalled or suspended. Wrongly counting it live costs only the second server's
+  discoverability, which stopping the first and restarting the second recovers. Wrongly counting it dead
+  reproduces this bug: the record moves to the second server and disappears when it stops,
+  while the first still runs. Startup waits at most the timeout. Two servers that start at
+  the same instant can still both see no record, and the later rename wins (the same race as
+  before). `diagnostics-relay.json` keeps the old last-writer-wins behavior; it has no proof
+  to check liveness with. Tests: a second server on another port leaves the first's record
+  byte for byte, and a relay reaches the first after the second stops (`relay/tests.rs`); a
+  dead pid's record, a live pid without its listener, and a silent listener that keeps the
+  record within the bound (`endpoint.rs`). The same-port case is still covered.
+
+**CLI front end (2026-10-30):** implemented on `claude/v0131-139-cli`, on top of slice 1, as
+designed in "CLI front end (next slice)". No new route, RPC method, table or persisted
+shape; the review round (below) widened the retry scope of `bibcode thread` credentials and
+added project paging to `list_projects_and_threads`.
+
+- **One connection.** `relay.rs` now holds a `Connection` (setting and `--access` checks,
+  `--url` check, record, endpoint proof, orphan sweep, credential minted on first use,
+  revocation, the rediscover-and-retry-once post). The relay and `mcp::thread_cli` both use
+  it, so discovery, mint, revoke and sweep exist once. `Connection::call_tool` sends a
+  modern-era `tools/call` (`_meta` protocol version, so `post` adds the three headers) and
+  returns the tool's `result`. A 401 says to run the command again, not to restart an MCP
+  server.
+- **Two tool outputs grew, for the CLI's needs.** `list_projects_and_threads` returns each
+  project's `workspaceRoot`, because `start .` is matched client-side from `list` and the
+  projection had dropped the folder. `read_thread` returns the thread's `status` (the same
+  `derive_status` as the list, with the latest turn's state read in the page's SQLite job),
+  so `show` needs no second call.
+- **Matching `.`** canonicalizes the current directory and each root, takes the deepest root
+  that holds it by path components, and refuses a tie (two projects on one folder) or no
+  match, naming `bibcode thread list`.
+- **Output and exit codes.** `--json` prints `{ threadId, messageId, status, reply, error }`
+  for `start` and `send`, with `null` for what is unknown, also on failure; `list` and
+  `show` print the tool's structured content, or `{ error }`. Without `--wait`, `status` is
+  `started`, or `queued` for a queued send. `reply` is the whole text: a reply the wait cut
+  at 16,000 characters is completed with `read_thread` slices. Exit 0 on `completed` or a
+  call that succeeded, 2 on `awaiting_approval` or `awaiting_input`, 1 otherwise. The
+  desktop executable maps clap's usage-error code 2 to 1, so 2 keeps one meaning; the
+  `bibcode` binary already exits 1 on a usage error.
+- **Waiting.** `--wait` calls `wait_for_thread` with the start's or send's `messageId` and
+  `timeoutMs: 30000` until `timedOut` is false. A `McpStorageError` is retried a second
+  later, at most 3 times in a row. Ctrl-C (or SIGTERM/SIGHUP, a console close) stops the
+  wait, revokes the credential and exits 1 with the ids; it never calls `interrupt_turn`.
+- **Idempotency.** Each `start` and `send` sends a `clientRequestId`: the `--request-id` the
+  person gave (1 to 256 characters, validated at parse), else a fresh UUID v4 made up once
+  per run. The id is reported as `requestId` in `--json` output, success or failure. A run
+  that is interrupted while its `start_thread` or `send_message` is in flight, or whose call
+  fails without an answer (not a tool's refusal), may have been accepted, so it prints the
+  id and "Run the same command with --request-id <id> to finish it without repeating it."
+  The retry must send identical arguments, because the stored row's digest covers all of
+  them; `.` resolves to the same project from the same directory.
+- **Retry scope (changed after review).** The Retries section keys `mcp_tool_requests` by
+  the client session, and the CLI mints a session per run, so a re-run with the same id
+  found no row and started a second thread (the test for it failed that way). Alternatives:
+  (a) key every `mcp-client` credential together, which would make two agents that number
+  their requests `1, 2, ...` collide for 24 hours; (b) keep one CLI credential across runs,
+  which the revoke-on-exit rule forbids and which leaves a long-lived secret; (c) key the
+  rows of credentials labelled `CLI · bibcode thread` together and every other credential by
+  its session. (c) is implemented, inside the one SQLite job that stores or reads the row
+  (`stored_request`), with no schema change. The trade-off: every `bibcode thread` run on a
+  data root shares one retry namespace, which is the same operator and the same trust
+  level; a ceiling is still checked for work the engine has not accepted. An agent that
+  calls itself `bibcode thread` gets the same scope, which exposes nothing beyond the
+  operator's own requests. Pending approval of this decision.
+- **Pages.** `list_projects_and_threads` cut a long project list at the back and gave no way
+  to read the rest, because `nextCursor` pages threads only; `start .` then matched against
+  an incomplete list. The tool now also pages projects: `nextProjectCursor` (`p:<n>`), taken
+  as `projectCursor`, and `projectCount` beside `threadCount`. A call that continues only one
+  list returns only that list. The projects fit first, then the threads, so neither
+  starves. `list` follows both cursors, and `start .` the project cursor with `limit: 1`,
+  at most 50 pages, with a clear error beyond. `list --json` is one merged page: nothing
+  cut, no `truncated`, both cursors null.
+- **Credential label** is `CLI · bibcode thread`. The access ceiling is the environment's
+  `mcpServerAccess`; the CLI has no `--access` or `--url`.
+- **Desktop.** `desktop_dispatch` takes `thread` next to `mcp` and `diagnostics`, after
+  `crash::attach()`, and always attaches the parent console, because its output is for a
+  person or a pipe, not JSON-RPC.
+- **Tests** (`mcp/thread_cli/tests.rs`): parsing of every subcommand and flag (and the
+  desktop's in `profiler/cli.rs`), `.` resolution, the JSON shape on success and failure,
+  exit codes 0/1/2, 30 s slicing with no `interrupt_turn`, a stopped wait, a long reply,
+  standard input, `--request-id` (parse, validation, the id in the JSON, the hint after an
+  unknown outcome or an interruption, none after a refusal), merging project and thread
+  pages and the 50-page bound, the setting off; and against a real server, a project list
+  cut across pages with the nested project on the second (`start .` and `list`), a `start`
+  and a `send` run again with their request id (same ids, one thread, a changed message
+  refused), and `mcp_tools_tests` for the shared CLI scope against separate agent sessions;
+  and against a real server, a delivery that fails
+  (exit 1, every run's credential revoked), and, with a fake Codex app-server script
+  (Unix only), `start . --wait` and `send --wait` (exit 0 with the reply), an approval
+  (exit 2), `show` and `list`.

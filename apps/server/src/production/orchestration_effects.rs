@@ -1269,6 +1269,8 @@ struct RevertPlan {
     rolled_back_turns: i64,
     /// The provider rewind's idempotency key, fixed when the revert is planned.
     rewind_key: String,
+    /// The request's command id, which the outcome's command id names.
+    request: Option<String>,
 }
 
 /// Checks the revert under its thread's reservation, then lets the provider prepare its rewind
@@ -1375,6 +1377,7 @@ async fn plan_revert(
         target_ref,
         rolled_back_turns,
         rewind_key,
+        request: event.event.command_id.clone(),
     })
 }
 
@@ -1400,6 +1403,7 @@ async fn finish_revert(
         target_ref,
         rolled_back_turns,
         rewind_key,
+        request,
     } = plan;
     let thread_id = thread_id.as_str();
     let missing_checkpoint = || missing_checkpoint(turn_count);
@@ -1429,7 +1433,7 @@ async fn finish_revert(
         let created_at = now_iso();
         return engine
             .dispatch(OrchestrationCommand::ThreadActivityAppend {
-                command_id: server_id("checkpoint-revert-files-only"),
+                command_id: outcome_id("checkpoint-revert-files-only", request.as_deref()),
                 thread_id: thread_id.to_owned(),
                 activity: ActivityInput {
                     id: Uuid::new_v4().to_string(),
@@ -1496,9 +1500,16 @@ async fn finish_revert(
         .await?;
     }
     let created_at = now_iso();
+    // A revert whose files were not restored records its completion under a tag of its own, so
+    // a client waiting on it knows a failure follows instead of reading success.
+    let tag = if restored.is_ok() {
+        "checkpoint-revert-complete"
+    } else {
+        UNRESTORED_REVERT_TAG
+    };
     engine
         .dispatch(OrchestrationCommand::ThreadRevertComplete {
-            command_id: server_id("checkpoint-revert-complete"),
+            command_id: outcome_id(tag, request.as_deref()),
             thread_id: thread_id.to_owned(),
             turn_count,
             created_at,
@@ -1565,7 +1576,10 @@ async fn append_failure_activity(
     let created_at = now_iso();
     let _ = engine
         .dispatch(OrchestrationCommand::ThreadActivityAppend {
-            command_id: server_id("checkpoint-effect-failure"),
+            command_id: outcome_id(
+                "checkpoint-effect-failure",
+                event.event.command_id.as_deref(),
+            ),
             thread_id: thread_id.to_owned(),
             activity: ActivityInput {
                 id: Uuid::new_v4().to_string(),
@@ -1963,6 +1977,20 @@ fn now_iso() -> String {
 
 fn server_id(tag: &str) -> String {
     format!("server:{tag}:{}", Uuid::new_v4())
+}
+
+/// The tag of a `thread.reverted` whose provider rewound but whose files were not restored; a
+/// `checkpoint.revert.failed` activity follows it.
+pub(crate) const UNRESTORED_REVERT_TAG: &str = "checkpoint-revert-unrestored";
+
+/// The command id of an outcome the worker records for request `request`: it contains
+/// `:{request}:`, so a client waiting on one revert is not answered by another revert of the
+/// same thread.
+fn outcome_id(tag: &str, request: Option<&str>) -> String {
+    match request {
+        Some(request) => format!("server:{tag}:{request}:{}", Uuid::new_v4()),
+        None => server_id(tag),
+    }
 }
 
 #[cfg(test)]

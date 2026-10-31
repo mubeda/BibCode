@@ -24,7 +24,8 @@ use super::{
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
         ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView,
-        PairingOfferResult, Principal, STANDARD_SCOPES, ShareExposureState,
+        PairingOfferResult, PendingMcpAuthorizationView, Principal, STANDARD_SCOPES,
+        ShareExposureState,
     },
     secret_store::SecretStore,
     token::{SessionClaims, TokenError, TokenSigner, WebSocketClaims},
@@ -34,7 +35,9 @@ use crate::persistence::{
     AuthAuthoritySnapshot as PersistedAuthAuthoritySnapshot,
     AuthPairingLink as PersistedPairingLink, AuthPairingOffer as PersistedPairingOffer,
     AuthSession as PersistedAuthSession, AuthSessionClient as PersistedAuthSessionClient,
-    AuthSessionDeliveryState, NewAuthPairingOffer, NewAuthSession, PersistenceError, Repositories,
+    AuthSessionDeliveryState, McpOAuthAuthorization, McpOAuthCodeExchange, McpOAuthExchangeOutcome,
+    McpOAuthRefreshOutcome, McpOAuthRefreshRotation, NewAuthPairingOffer, NewAuthSession,
+    PersistenceError, Repositories,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -51,6 +54,12 @@ const DESKTOP_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Subject of every session minted from the desktop bootstrap credential: the desktop app's
 /// own WebView.
 pub(crate) const DESKTOP_BOOTSTRAP_SUBJECT: &str = "desktop-bootstrap";
+/// The subject of an outside agent's MCP credential (#139). Such a session authenticates
+/// `/mcp` only, through [`AuthService::authenticate_mcp_client`]; every other bearer, cookie,
+/// ticket and E2EE path refuses it, so the tools it is given are all it can reach.
+pub(crate) const MCP_CLIENT_SUBJECT: &str = "mcp-client";
+/// How long the relay's MCP pairing link lives: it exchanges it at once.
+const MCP_PAIRING_TTL_MS: i64 = 60 * 1_000;
 const PAIRING_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_LENGTH: usize = 12;
 const PAIRING_REJECTION_LIMIT: u8 =
@@ -94,6 +103,11 @@ pub struct AuthService {
     pairing_offer_issuance: Arc<Mutex<()>>,
     repositories: Option<Repositories>,
     access_events: Arc<broadcast::Sender<AuthAccessEvent>>,
+    /// How Stop (#139, slice X1) has the MCP service interrupt a stopped agent's turns: a
+    /// revocation with `interruptTurns`. A plain revocation is not a stop.
+    mcp_stop_handler: Arc<std::sync::Mutex<Option<McpStopHandler>>>,
+    /// The environment's MCP settings, as remote MCP's OAuth routes read them (slice R).
+    mcp_oauth_settings: Arc<std::sync::Mutex<Option<McpOAuthSettingsSource>>>,
     access_revision: Arc<AtomicU64>,
     authority_watcher_running: Arc<AtomicBool>,
     /// Redeemed single-use websocket ticket ids, pruned by expiry.
@@ -205,6 +219,8 @@ struct AuthState {
     live_connections: HashMap<String, HashMap<u64, CancellationToken>>,
     next_connection_id: u64,
     authority_generation: u64,
+    /// Remote MCP authorizations waiting for a person (slice R), oldest first.
+    pending_mcp: Vec<PendingMcpAuthorizationView>,
 }
 
 impl AuthState {
@@ -273,6 +289,8 @@ struct AuthGrantMetadata {
     proof_key_thumbprint: Option<String>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
 }
 
 struct AuthSessionIssuanceMetadata {
@@ -285,6 +303,56 @@ pub(crate) enum PairingOfferReplay {
     Cancelled,
     Conflict,
     Fresh,
+}
+
+/// The MCP access levels, lowest first (the same names as `McpAccess`).
+const MCP_ACCESS_LEVELS: [&str; 4] = [
+    "read-only",
+    "approval-required",
+    "auto-accept-edits",
+    "full-access",
+];
+
+/// How long Stop waits for its interrupts before it answers; they go on after it.
+pub(crate) const MCP_STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// What interrupting a stopped agent's turns did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpStopOutcome {
+    pub(crate) interrupted: usize,
+    pub(crate) failed: usize,
+}
+
+/// Interrupts the turns a stopped agent (its session id) started.
+pub(crate) type McpStopHandler = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = McpStopOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What [`AuthService::stop_client`] did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct McpStopResult {
+    /// The agent is revoked, now or earlier, and its turns were interrupted.
+    pub revoked: bool,
+    pub interrupted: usize,
+    pub failed: usize,
+    /// The interrupts were still running when Stop answered.
+    pub timed_out: bool,
+}
+
+/// What [`AuthService::set_mcp_access`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpAccessChange {
+    Changed,
+    /// No live session has this id.
+    NotFound,
+    /// The session is not an outside agent's.
+    NotAnAgent,
+    /// The level is not an MCP access level.
+    InvalidAccess,
+    /// Only `read-only`, or the level Take over replaced, may be set.
+    NotTheHandBack,
 }
 
 pub(crate) enum PairingOfferIssuance {
@@ -328,6 +396,13 @@ struct SessionRecord {
     transport: SessionTransport,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
+    /// The access a person's Take over replaced, which Hand back restores (#139, slice X1).
+    mcp_access_hand_back: Option<String>,
+    /// The resource (`<origin>/mcp`) a remote OAuth grant is bound to (slice R); `None` for
+    /// every other session.
+    mcp_resource: Option<String>,
     delivery_state: AuthSessionDeliveryState,
 }
 
@@ -345,6 +420,8 @@ struct PairingRecord {
     revoked_at_ms: Option<i64>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
 }
 
 struct Grant {
@@ -353,6 +430,8 @@ struct Grant {
     label: Option<String>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
     /// The reusable desktop bootstrap credential of this backend process. The
     /// host's own WebView exchanges it on every load and after every backend
     /// restart, so a new exchange supersedes the sessions it minted before.
@@ -362,6 +441,43 @@ struct Grant {
 pub struct IssuedSession {
     pub token: String,
     pub principal: Principal,
+}
+
+/// Where the OAuth routes read the environment's MCP settings from.
+pub(crate) type McpOAuthSettingsSource =
+    Arc<dyn Fn() -> super::oauth::McpOAuthSettings + Send + Sync>;
+
+/// An outside agent's authenticated MCP credential: its session, its access ceiling (`None`
+/// is read-only), and, for a remote OAuth grant, the resource it is bound to.
+#[derive(Clone, Debug)]
+pub(crate) struct McpClientCredential {
+    pub(crate) principal: Principal,
+    pub(crate) access: Option<String>,
+    pub(crate) resource: Option<String>,
+}
+
+/// The tokens of a remote MCP grant, as the token endpoint returns them.
+#[derive(Clone, Debug)]
+pub(crate) struct McpOAuthTokens {
+    pub(crate) access_token: String,
+    pub(crate) expires_in: i64,
+    pub(crate) scope: String,
+}
+
+pub(crate) enum McpOAuthMint {
+    Minted(McpOAuthTokens),
+    /// The code was exchanged before; the session it minted is now revoked.
+    Replayed,
+    /// The code is unknown, expired, or not approved.
+    Refused,
+}
+
+pub(crate) enum McpOAuthRefresh {
+    Rotated(McpOAuthTokens),
+    /// The refresh token was used before; the grant is now revoked.
+    Reused,
+    InvalidGrant,
+    InvalidScope,
 }
 
 impl AuthService {
@@ -521,6 +637,8 @@ impl AuthService {
             pairing_offer_issuance: Arc::new(Mutex::new(())),
             repositories,
             access_events: Arc::new(access_events),
+            mcp_stop_handler: Arc::new(std::sync::Mutex::new(None)),
+            mcp_oauth_settings: Arc::new(std::sync::Mutex::new(None)),
             access_revision: Arc::new(AtomicU64::new(1)),
             authority_watcher_running: Arc::new(AtomicBool::new(false)),
             redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -564,6 +682,11 @@ impl AuthService {
             .map(|session| (session.session_id.clone(), session))
             .collect();
         state.pairing_offer_idempotency = pairing_offers;
+        state.pending_mcp = snapshot
+            .pending_mcp_authorizations
+            .iter()
+            .map(pending_mcp_view)
+            .collect();
         Ok(())
     }
 
@@ -597,7 +720,12 @@ impl AuthService {
     pub(crate) async fn access_snapshot(
         &self,
         current_session_id: &str,
-    ) -> (u64, Vec<PairingLinkView>, Vec<ClientSessionView>) {
+    ) -> (
+        u64,
+        Vec<PairingLinkView>,
+        Vec<ClientSessionView>,
+        Vec<PendingMcpAuthorizationView>,
+    ) {
         let now = now_ms();
         let state = self.state.lock().await;
         let mut pairings = state
@@ -618,8 +746,14 @@ impl AuthService {
             .map(|session| session.view(session.session_id == current_session_id))
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session| !session.current);
+        let pending = state
+            .pending_mcp
+            .iter()
+            .filter(|pending| pending.expires_at_ms > now)
+            .cloned()
+            .collect();
         let revision = self.access_revision.load(Ordering::Acquire);
-        (revision, pairings, sessions)
+        (revision, pairings, sessions, pending)
     }
 
     fn emit_access_change(&self, change: AuthAccessChange) {
@@ -872,6 +1006,7 @@ impl AuthService {
                     proof_key_thumbprint,
                     reach: grant.reach,
                     off_host: grant.off_host,
+                    mcp_access: grant.mcp_access,
                 },
                 delivery_state,
             },
@@ -884,6 +1019,50 @@ impl AuthService {
         token: &str,
         surface: SessionTransport,
     ) -> Result<Principal, AuthError> {
+        let (principal, _) = self.authenticate_session_token(token, surface).await?;
+        // Audience binding: an outside agent's credential reaches `/mcp` and nothing else.
+        if principal.subject == MCP_CLIENT_SUBJECT {
+            return Err(AuthError::InvalidCredential);
+        }
+        Ok(principal)
+    }
+
+    /// Authenticates an outside agent's MCP credential (subject `mcp-client`) and returns its
+    /// access ceiling, `None` when the session has none (callers treat that as read-only).
+    /// Every other session token is refused.
+    pub(crate) async fn authenticate_mcp_client(
+        &self,
+        token: &str,
+    ) -> Result<McpClientCredential, AuthError> {
+        let (principal, access, resource) = self
+            .authenticate_session_token_with_resource(token, SessionTransport::Plain)
+            .await?;
+        if principal.subject != MCP_CLIENT_SUBJECT {
+            return Err(AuthError::InvalidCredential);
+        }
+        Ok(McpClientCredential {
+            principal,
+            access,
+            resource,
+        })
+    }
+
+    async fn authenticate_session_token(
+        &self,
+        token: &str,
+        surface: SessionTransport,
+    ) -> Result<(Principal, Option<String>), AuthError> {
+        let (principal, access, _) = self
+            .authenticate_session_token_with_resource(token, surface)
+            .await?;
+        Ok((principal, access))
+    }
+
+    async fn authenticate_session_token_with_resource(
+        &self,
+        token: &str,
+        surface: SessionTransport,
+    ) -> Result<(Principal, Option<String>, Option<String>), AuthError> {
         let claims: SessionClaims = self
             .signer
             .verify(token)
@@ -905,9 +1084,17 @@ impl AuthService {
             .sessions
             .get(&claims.sid)
             .ok_or(AuthError::InvalidCredential)?;
+        // A remote OAuth grant (slice R) outlives its one-hour access tokens: the grant's
+        // expiry and the token's are checked separately, and a token never outlives its
+        // grant. Every other session's token carries the session's own expiry.
+        let token_expiry_mismatch = if record.mcp_resource.is_some() {
+            claims.exp > record.expires_at_ms
+        } else {
+            record.expires_at_ms != claims.exp
+        };
         if record.revoked_at_ms.is_some()
             || record.expires_at_ms <= observed_at
-            || record.expires_at_ms != claims.exp
+            || token_expiry_mismatch
             || record.subject != claims.sub
             || record.method != claims.method
             || record.scopes != claims.scopes
@@ -916,14 +1103,20 @@ impl AuthService {
         {
             return Err(AuthError::InvalidCredential);
         }
-        Ok(Principal {
-            session_id: claims.sid,
-            subject: claims.sub,
-            method: claims.method,
-            scopes: claims.scopes,
-            proof_key_thumbprint: claims.jkt,
-            expires_at_ms: claims.exp,
-        })
+        let access = record.mcp_access.clone();
+        let resource = record.mcp_resource.clone();
+        Ok((
+            Principal {
+                session_id: claims.sid,
+                subject: claims.sub,
+                method: claims.method,
+                scopes: claims.scopes,
+                proof_key_thumbprint: claims.jkt,
+                expires_at_ms: claims.exp,
+            },
+            access,
+            resource,
+        ))
     }
 
     pub async fn verify_dpop(
@@ -991,7 +1184,7 @@ impl AuthService {
         // Defense in depth for the no-downgrade invariant: tickets are only
         // accepted by the plain `/ws` route, so only plain-transport sessions
         // may redeem them.
-        if record.transport != SessionTransport::Plain {
+        if record.transport != SessionTransport::Plain || record.subject == MCP_CLIENT_SUBJECT {
             return Err(AuthError::InvalidCredential);
         }
         let principal = record.principal();
@@ -1272,6 +1465,7 @@ impl AuthService {
             proof_key_thumbprint,
             reach,
             off_host,
+            mcp_access,
         } = metadata;
         let _issuance = self.issuance.lock().await;
         if scopes.is_empty()
@@ -1335,6 +1529,7 @@ impl AuthService {
             revoked_at_ms: None,
             reach,
             off_host,
+            mcp_access,
         };
         let view = record.view();
         if let Some(repositories) = &self.repositories {
@@ -1771,6 +1966,379 @@ impl AuthService {
         self.revoke_session(target_session_id).await
     }
 
+    /// **Stop** (#139, slice X1): revokes an outside agent, which ends its calls and owned
+    /// mutations, then has the MCP service interrupt the turns it started, also for an agent
+    /// revoked earlier, and answers with how that went: the turns interrupted, those whose
+    /// interrupt failed, and whether the interrupts were still running after
+    /// [`MCP_STOP_WAIT`] (they go on). `revoked: false` for an unknown session, or one revoked
+    /// earlier that was not an outside agent's. Only Stop interrupts, so a plain revocation
+    /// (the `bibcode thread` CLI revokes its own credential on the way out) never does.
+    pub async fn stop_client(
+        &self,
+        current_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<McpStopResult, AuthError> {
+        let revoked = self
+            .revoke_client(current_session_id, target_session_id)
+            .await?;
+        // An agent revoked earlier (Revoke, then Stop) may still be running turns; Stop
+        // interrupts them too. Only a session that was an outside agent's is stopped.
+        let stopped = revoked || self.was_revoked_mcp_client(target_session_id).await?;
+        let mut result = McpStopResult {
+            revoked: stopped,
+            ..McpStopResult::default()
+        };
+        let handler = self
+            .mcp_stop_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let (true, Some(handler)) = (stopped, handler) {
+            let interrupting = tokio::spawn(handler(target_session_id.to_owned()));
+            match tokio::time::timeout(MCP_STOP_WAIT, interrupting).await {
+                Ok(Ok(outcome)) => {
+                    result.interrupted = outcome.interrupted;
+                    result.failed = outcome.failed;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "MCP Stop's interrupts ended abnormally");
+                    result.failed = 1;
+                }
+                Err(_) => result.timed_out = true,
+            }
+        }
+        Ok(result)
+    }
+
+    /// Lets the MCP service interrupt a stopped agent's turns; the last registration wins.
+    /// Lets the OAuth routes read the environment's MCP settings live (slice R). The MCP
+    /// service attaches its settings when it starts; until then remote MCP is off.
+    pub(crate) fn set_mcp_oauth_settings(&self, source: McpOAuthSettingsSource) {
+        *self
+            .mcp_oauth_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    pub(crate) fn mcp_oauth_settings(&self) -> super::oauth::McpOAuthSettings {
+        let source = self
+            .mcp_oauth_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source.map_or_else(super::oauth::McpOAuthSettings::off, |source| source())
+    }
+
+    /// The store behind the OAuth routes; `None` for a server without persistence, which
+    /// serves no remote MCP.
+    pub(crate) fn oauth_repositories(&self) -> Option<&Repositories> {
+        self.repositories.as_ref()
+    }
+
+    /// Mints the grant an approved authorization's code is exchanged for: an `mcp-client`
+    /// session bound to the authorization's resource, its first refresh token, and a
+    /// one-hour access token. The authorization's single use is decided in the same
+    /// transaction that writes the session.
+    pub(crate) async fn mint_mcp_oauth_grant(
+        &self,
+        authorization: &McpOAuthAuthorization,
+        code_hash: String,
+        refresh_token_hash: String,
+        client: ClientMetadata,
+    ) -> Result<McpOAuthMint, AuthError> {
+        let repositories = self
+            .repositories
+            .as_ref()
+            .ok_or_else(|| AuthError::Internal("remote MCP needs a data store".to_owned()))?;
+        let scopes = authorization
+            .approved_scopes
+            .as_deref()
+            .map(parse_scopes)
+            .transpose()?
+            .ok_or(AuthError::InvalidCredential)?;
+        let access = authorization
+            .approved_access
+            .clone()
+            .ok_or(AuthError::InvalidCredential)?;
+        let _issuance = self.issuance.lock().await;
+        let issued_at = now_ms();
+        {
+            let mut state = self.state.lock().await;
+            state.sessions.retain(|_, session| {
+                session.revoked_at_ms.is_none() && session.expires_at_ms > issued_at
+            });
+            if state.sessions.len() >= MAX_ACTIVE_SESSIONS {
+                return Err(AuthError::Internal(
+                    "active session capacity exceeded".to_owned(),
+                ));
+            }
+        }
+        let record = SessionRecord {
+            session_id: Uuid::new_v4().to_string(),
+            subject: MCP_CLIENT_SUBJECT.to_owned(),
+            scopes,
+            method: "bearer-access-token".to_owned(),
+            client: ClientMetadata {
+                label: Some(super::oauth::session_label(&authorization.client_name)),
+                ..client
+            },
+            issued_at_ms: issued_at,
+            expires_at_ms: issued_at.saturating_add(super::oauth::GRANT_TTL_MS),
+            revoked_at_ms: None,
+            last_connected_at_ms: None,
+            connected_count: 0,
+            proof_key_thumbprint: None,
+            transport: SessionTransport::Plain,
+            reach: None,
+            off_host: None,
+            mcp_access: Some(access),
+            mcp_access_hand_back: None,
+            mcp_resource: Some(authorization.resource.clone()),
+            delivery_state: AuthSessionDeliveryState::Active,
+        };
+        let outcome = repositories
+            .exchange_mcp_oauth_code(
+                McpOAuthCodeExchange {
+                    authorization_id: authorization.id.clone(),
+                    code_hash,
+                    client_id: authorization.client_id.clone(),
+                    resource: authorization.resource.clone(),
+                    session: persisted_auth_session(&record),
+                    refresh_token_hash,
+                    revoked_at: format_iso(issued_at),
+                },
+                issued_at,
+            )
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        match outcome {
+            McpOAuthExchangeOutcome::Exchanged => {}
+            McpOAuthExchangeOutcome::Replayed { session_id } => {
+                self.forget_revoked_session(&session_id).await;
+                return Ok(McpOAuthMint::Replayed);
+            }
+            McpOAuthExchangeOutcome::Refused => return Ok(McpOAuthMint::Refused),
+        }
+        let (access_token, expires_in) = self.sign_mcp_oauth_access_token(&record, issued_at)?;
+        let scope = record.scopes.join(" ");
+        let view = record.view(false);
+        let mut state = self.state.lock().await;
+        state.sessions.insert(record.session_id.clone(), record);
+        state.bump_authority_generation();
+        drop(state);
+        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        self.ensure_authority_watcher();
+        Ok(McpOAuthMint::Minted(McpOAuthTokens {
+            access_token,
+            expires_in,
+            scope,
+        }))
+    }
+
+    /// Rotates a remote grant's refresh token and signs a new access token. A token used
+    /// before revokes the grant; the session leaves this service at once.
+    pub(crate) async fn rotate_mcp_oauth_refresh_token(
+        &self,
+        rotation: McpOAuthRefreshRotation,
+    ) -> Result<McpOAuthRefresh, AuthError> {
+        let repositories = self
+            .repositories
+            .as_ref()
+            .ok_or_else(|| AuthError::Internal("remote MCP needs a data store".to_owned()))?;
+        let now = now_ms();
+        let outcome = repositories
+            .rotate_mcp_oauth_refresh_token(rotation, now)
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        let session = match outcome {
+            McpOAuthRefreshOutcome::Rotated(session) => session,
+            McpOAuthRefreshOutcome::Reused { session_id, .. } => {
+                self.forget_revoked_session(&session_id).await;
+                return Ok(McpOAuthRefresh::Reused);
+            }
+            McpOAuthRefreshOutcome::InvalidGrant => return Ok(McpOAuthRefresh::InvalidGrant),
+            McpOAuthRefreshOutcome::InvalidScope => return Ok(McpOAuthRefresh::InvalidScope),
+        };
+        let session_id = session.session_id.clone();
+        let record = session_record_from_persisted(*session)?;
+        let (access_token, expires_in) = self.sign_mcp_oauth_access_token(&record, now)?;
+        let scope = record.scopes.join(" ");
+        // The moved expiry (and any narrowed scopes) reach the cache before the new token is
+        // handed out, so its first use matches.
+        self.refresh_session_from_repository(&session_id, now)
+            .await?;
+        Ok(McpOAuthRefresh::Rotated(McpOAuthTokens {
+            access_token,
+            expires_in,
+            scope,
+        }))
+    }
+
+    /// An access token for a remote grant: the session's claims with `exp` one hour out, or
+    /// the grant's own expiry when that is sooner.
+    fn sign_mcp_oauth_access_token(
+        &self,
+        record: &SessionRecord,
+        issued_at: i64,
+    ) -> Result<(String, i64), AuthError> {
+        let expires_at = issued_at
+            .saturating_add(super::oauth::ACCESS_TOKEN_TTL_MS)
+            .min(record.expires_at_ms);
+        let claims = SessionClaims {
+            v: 1,
+            kind: "session".to_owned(),
+            sid: record.session_id.clone(),
+            sub: record.subject.clone(),
+            scopes: record.scopes.clone(),
+            method: record.method.clone(),
+            jkt: None,
+            tr: SessionTransport::Plain.claim().to_owned(),
+            iat: issued_at,
+            exp: expires_at,
+        };
+        let token = self
+            .signer
+            .issue(&claims)
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        Ok((token, ((expires_at - issued_at) / 1_000).max(0)))
+    }
+
+    /// Drops a session another path revoked in the store: its connections end and every
+    /// client sees it go.
+    async fn forget_revoked_session(&self, session_id: &str) {
+        self.remove_cached_session(session_id).await;
+    }
+
+    /// Rereads the pending remote authorizations after this service changed them, so every
+    /// BiBCode client's cards follow at once.
+    pub(crate) async fn reload_pending_mcp_authorizations(&self) -> Result<(), AuthError> {
+        let Some(repositories) = &self.repositories else {
+            return Ok(());
+        };
+        let rows = repositories
+            .list_pending_mcp_oauth_authorizations(now_ms())
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        let pending = rows.iter().map(pending_mcp_view).collect::<Vec<_>>();
+        let mut state = self.state.lock().await;
+        if state.pending_mcp == pending {
+            return Ok(());
+        }
+        state.pending_mcp = pending;
+        state.bump_authority_generation();
+        drop(state);
+        self.emit_access_change(AuthAccessChange::PendingMcpAuthorizations);
+        self.ensure_authority_watcher();
+        Ok(())
+    }
+
+    pub(crate) fn set_mcp_stop_handler(&self, handler: McpStopHandler) {
+        *self
+            .mcp_stop_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
+    }
+
+    /// Whether `session_id` is an outside agent's session that has been revoked.
+    async fn was_revoked_mcp_client(&self, session_id: &str) -> Result<bool, AuthError> {
+        let Some(repositories) = &self.repositories else {
+            return Ok(false);
+        };
+        let session = repositories
+            .get_auth_session(session_id.to_owned())
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        Ok(session.is_some_and(|session| {
+            session.subject == MCP_CLIENT_SUBJECT && session.revoked_at.is_some()
+        }))
+    }
+
+    /// The Authorized clients label of a live session.
+    pub(crate) async fn client_label(&self, session_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.client.label.clone())
+    }
+
+    /// **Take over** and **Hand back** (#139, slice X1). `read-only` remembers the level it
+    /// replaces; any other level must be that remembered level, so this never raises an agent
+    /// above what it was paired with. A change cancels the session's live work, so its owned
+    /// mutations stop (C4), and its next mutating call is refused.
+    pub(crate) async fn set_mcp_access(
+        &self,
+        target_session_id: &str,
+        access: &str,
+    ) -> Result<McpAccessChange, AuthError> {
+        if !MCP_ACCESS_LEVELS.contains(&access) {
+            return Ok(McpAccessChange::InvalidAccess);
+        }
+        let (next, hand_back) =
+            {
+                let state = self.state.lock().await;
+                let now = now_ms();
+                let Some(session) = state.sessions.get(target_session_id).filter(|session| {
+                    session.revoked_at_ms.is_none() && session.expires_at_ms > now
+                }) else {
+                    return Ok(McpAccessChange::NotFound);
+                };
+                if session.subject != MCP_CLIENT_SUBJECT {
+                    return Ok(McpAccessChange::NotAnAgent);
+                }
+                let current = session
+                    .mcp_access
+                    .clone()
+                    .unwrap_or_else(|| "read-only".to_owned());
+                if access == "read-only" {
+                    // Taking over twice keeps the first level.
+                    let hand_back = session
+                        .mcp_access_hand_back
+                        .clone()
+                        .or_else(|| (current != "read-only").then_some(current));
+                    ("read-only".to_owned(), hand_back)
+                } else if session.mcp_access_hand_back.as_deref() == Some(access) {
+                    (access.to_owned(), None)
+                } else {
+                    return Ok(McpAccessChange::NotTheHandBack);
+                }
+            };
+        if let Some(repositories) = &self.repositories {
+            let updated = repositories
+                .set_auth_session_mcp_access(
+                    target_session_id.to_owned(),
+                    next.clone(),
+                    hand_back.clone(),
+                )
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            if !updated {
+                return Ok(McpAccessChange::NotFound);
+            }
+        }
+        let mut state = self.state.lock().await;
+        let Some(session) = state.sessions.get_mut(target_session_id) else {
+            return Ok(McpAccessChange::NotFound);
+        };
+        session.mcp_access = Some(next);
+        session.mcp_access_hand_back = hand_back;
+        let view = session.view(false);
+        // The session stays, so its connection guards still count themselves out.
+        for shutdown in state
+            .live_connections
+            .get(target_session_id)
+            .into_iter()
+            .flat_map(HashMap::values)
+        {
+            shutdown.cancel();
+        }
+        state.bump_authority_generation();
+        drop(state);
+        self.emit_access_change(AuthAccessChange::ClientUpserted(view));
+        Ok(McpAccessChange::Changed)
+    }
+
     pub(crate) async fn revoke_failed_pairing_session(
         &self,
         session_id: &str,
@@ -2094,6 +2662,7 @@ impl AuthService {
                     proof_key_thumbprint,
                     reach,
                     off_host,
+                    mcp_access,
                 },
             delivery_state,
         } = metadata;
@@ -2137,6 +2706,9 @@ impl AuthService {
             transport,
             reach,
             off_host,
+            mcp_access,
+            mcp_access_hand_back: None,
+            mcp_resource: None,
             delivery_state,
         };
         {
@@ -2215,6 +2787,7 @@ impl AuthService {
                     label: None,
                     reach: None,
                     off_host: None,
+                    mcp_access: None,
                     desktop_bootstrap: true,
                 })
             } else {
@@ -2247,6 +2820,7 @@ impl AuthService {
                 label: pairing.label,
                 reach: pairing.reach,
                 off_host: pairing.off_host,
+                mcp_access: pairing.mcp_access,
                 desktop_bootstrap: false,
             });
         }
@@ -2275,6 +2849,7 @@ impl AuthService {
             label: pairing.label.clone(),
             reach: pairing.reach.clone(),
             off_host: pairing.off_host,
+            mcp_access: pairing.mcp_access.clone(),
             desktop_bootstrap: false,
         };
         drop(state);
@@ -2308,6 +2883,9 @@ impl SessionRecord {
             connected: self.connected_count > 0,
             current,
             reach: self.reach.clone(),
+            // An outside agent's access, and what Take over replaced (#139, slice X1).
+            mcp_access: self.mcp_access.clone(),
+            mcp_access_hand_back: self.mcp_access_hand_back.clone(),
         }
     }
 }
@@ -2352,6 +2930,7 @@ async fn authority_has_consumers(
     !state.pairings.is_empty()
         || !state.sessions.is_empty()
         || !state.live_connections.is_empty()
+        || !state.pending_mcp.is_empty()
         || access_events.receiver_count() > 0
 }
 
@@ -2377,6 +2956,11 @@ async fn reconcile_authority_snapshot(
         .into_iter()
         .map(stored_pairing_offer_from_persisted)
         .collect::<Result<HashMap<_, _>, _>>()?;
+    let pending_mcp = snapshot
+        .pending_mcp_authorizations
+        .iter()
+        .map(pending_mcp_view)
+        .collect::<Vec<_>>();
     let mut state = state.lock().await;
     if state.authority_generation != expected_generation {
         return Ok(None);
@@ -2427,10 +3011,35 @@ async fn reconcile_authority_snapshot(
         changes.push(AuthAccessChange::ClientRemoved { session_id });
     }
 
+    if state.pending_mcp != pending_mcp {
+        changes.push(AuthAccessChange::PendingMcpAuthorizations);
+    }
     state.pairings = next_pairings;
     state.sessions = next_sessions;
     state.pairing_offer_idempotency = offers;
+    state.pending_mcp = pending_mcp;
     Ok(Some(changes))
+}
+
+/// A pending remote authorization as BiBCode clients show it: who asks, where it returns,
+/// the origin it used, the scopes and the code to compare. No secret is in it.
+fn pending_mcp_view(row: &McpOAuthAuthorization) -> PendingMcpAuthorizationView {
+    PendingMcpAuthorizationView {
+        id: row.id.clone(),
+        code: super::oauth::display_user_code(&row.user_code),
+        client_name: row.client_name.clone(),
+        redirect_host: super::oauth::redirect_host(&row.redirect_uri),
+        redirect_is_loopback: super::oauth::redirect_is_loopback(&row.redirect_uri),
+        origin: row.origin.clone(),
+        scopes: row
+            .scopes
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        created_at: format_iso(row.created_at_ms),
+        expires_at: format_iso(row.expires_at_ms),
+        expires_at_ms: row.expires_at_ms,
+    }
 }
 
 fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
@@ -2448,6 +3057,7 @@ fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
         revoked_at: record.revoked_at_ms.map(format_iso),
         reach: record.reach.clone(),
         off_host: record.off_host,
+        mcp_access: record.mcp_access.clone(),
     }
 }
 
@@ -2469,6 +3079,7 @@ fn persisted_auth_session(record: &SessionRecord) -> NewAuthSession {
         expires_at: format_iso(record.expires_at_ms),
         reach: record.reach.clone(),
         off_host: record.off_host,
+        mcp_access: record.mcp_access.clone(),
         delivery_state: record.delivery_state,
     }
 }
@@ -2496,6 +3107,7 @@ fn pairing_record_from_persisted(row: PersistedPairingLink) -> Result<PairingRec
             .transpose()?,
         reach: row.reach,
         off_host: row.off_host,
+        mcp_access: row.mcp_access,
     })
 }
 
@@ -2580,6 +3192,9 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
         transport: SessionTransport::Plain,
         reach: row.reach,
         off_host: row.off_host,
+        mcp_access: row.mcp_access,
+        mcp_access_hand_back: row.mcp_access_hand_back,
+        mcp_resource: row.mcp_resource,
         delivery_state: row.delivery_state,
     })
 }
@@ -2771,6 +3386,7 @@ pub(crate) async fn issue_administrative_pairing_link(
         revoked_at_ms: None,
         reach: None,
         off_host: None,
+        mcp_access: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -2827,6 +3443,7 @@ pub(crate) async fn issue_offline_share_pairing(
         revoked_at_ms: None,
         reach: Some(reach),
         off_host: Some(off_host),
+        mcp_access: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -2836,6 +3453,72 @@ pub(crate) async fn issue_offline_share_pairing(
         id: record.id,
         credential: record.credential,
         label,
+        expires_at: format_iso(record.expires_at_ms),
+    })
+}
+
+/// Issues the one-time pairing link an MCP relay (`bibcode mcp`) exchanges for its credential,
+/// directly against a data root's repositories, like `issue_administrative_pairing_link`. It
+/// never holds more than `orchestration:read orchestration:operate`, so a stolen link cannot be
+/// widened at exchange; its subject is `mcp-client`, which binds the session to `/mcp`; and it
+/// carries the access ceiling `access` into the session. It lives 60 s. `extra_scopes` may
+/// add `terminal:operate` and nothing else: the relay asks for it when terminals are on for MCP
+/// agents and the ceiling is full access.
+pub(crate) async fn issue_mcp_pairing_link(
+    repositories: &Repositories,
+    label: String,
+    access: &str,
+    extra_scopes: &[&str],
+) -> Result<PairingCredentialResult, AuthError> {
+    if let Some(scope) = extra_scopes
+        .iter()
+        .find(|scope| **scope != super::model::SCOPE_TERMINAL_OPERATE)
+    {
+        return Err(AuthError::Internal(format!(
+            "an MCP credential cannot carry {scope}"
+        )));
+    }
+    let mut scopes = owned_scopes(super::model::MCP_CLIENT_SCOPES);
+    scopes.extend(
+        extra_scopes
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .filter(|scope| !scopes.contains(scope))
+            .collect::<Vec<_>>(),
+    );
+    let now = now_ms();
+    let active = repositories
+        .list_active_auth_pairing_links(format_iso(now))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    if active.len() >= MAX_ACTIVE_PAIRINGS {
+        return Err(AuthError::Internal(
+            "active pairing capacity exceeded".to_owned(),
+        ));
+    }
+    let record = PairingRecord {
+        id: Uuid::new_v4().to_string(),
+        credential: generate_pairing_credential()?,
+        scopes,
+        subject: MCP_CLIENT_SUBJECT.to_owned(),
+        label: Some(label.clone()),
+        proof_key_thumbprint: None,
+        created_at_ms: now,
+        expires_at_ms: now.saturating_add(MCP_PAIRING_TTL_MS),
+        consumed_at_ms: None,
+        revoked_at_ms: None,
+        reach: None,
+        off_host: None,
+        mcp_access: Some(access.to_owned()),
+    };
+    repositories
+        .create_auth_pairing_link(persisted_pairing_link(&record))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    Ok(PairingCredentialResult {
+        id: record.id,
+        credential: record.credential,
+        label: Some(label),
         expires_at: format_iso(record.expires_at_ms),
     })
 }
@@ -2974,6 +3657,516 @@ mod tests {
         ));
     }
 
+    async fn mcp_test_service() -> (AuthService, Repositories, tempfile::TempDir) {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("service hydrates");
+        (service, repositories, secrets)
+    }
+
+    #[tokio::test]
+    async fn the_mcp_issuer_adds_only_the_terminal_scope() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let issued = issue_mcp_pairing_link(
+            &repositories,
+            "MCP · terminals".into(),
+            "full-access",
+            &["terminal:operate"],
+        )
+        .await
+        .expect("link issues");
+        let session = service
+            .exchange_bootstrap(
+                &issued.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("exchange");
+        assert_eq!(
+            session.principal.scopes,
+            owned_scopes(&[
+                "orchestration:read",
+                "orchestration:operate",
+                "terminal:operate"
+            ])
+        );
+        for scope in ["access:write", "relay:write", "orchestration:operate"] {
+            assert!(
+                issue_mcp_pairing_link(&repositories, "MCP".into(), "full-access", &[scope])
+                    .await
+                    .is_err(),
+                "{scope}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mcp_issuer_mints_two_scopes_bound_to_mcp_with_its_ceiling() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let issued = issue_mcp_pairing_link(
+            &repositories,
+            "MCP · Claude Code".into(),
+            "approval-required",
+            &[],
+        )
+        .await
+        .expect("link issues");
+        let link = repositories
+            .get_auth_pairing_link_by_credential(issued.credential.clone())
+            .await
+            .expect("read")
+            .expect("link exists");
+        assert_eq!(link.subject, MCP_CLIENT_SUBJECT);
+        assert_eq!(link.mcp_access.as_deref(), Some("approval-required"));
+        let lifetime = parse_timestamp_ms(&link.expires_at).unwrap()
+            - parse_timestamp_ms(&link.created_at).unwrap();
+        assert_eq!(lifetime, 60_000);
+
+        // Exchange cannot widen the grant.
+        let widened = service
+            .exchange_bootstrap(
+                &issued.credential,
+                Some(owned_scopes(&["orchestration:read", "terminal:operate"])),
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await;
+        assert!(matches!(widened, Err(AuthError::ScopeNotGranted)));
+
+        let issued =
+            issue_mcp_pairing_link(&repositories, "MCP · Claude Code".into(), "read-only", &[])
+                .await
+                .expect("link issues");
+        let session = service
+            .exchange_bootstrap(
+                &issued.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("exchange");
+        assert_eq!(
+            session.principal.scopes,
+            owned_scopes(&["orchestration:read", "orchestration:operate"])
+        );
+        let stored = repositories
+            .get_auth_session(session.principal.session_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.mcp_access.as_deref(), Some("read-only"));
+        assert_eq!(stored.client.label.as_deref(), Some("MCP · Claude Code"));
+
+        // Audience: only the MCP surface accepts it.
+        assert!(matches!(
+            service
+                .authenticate_token(&session.token, SessionTransport::Plain)
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
+        let super::McpClientCredential {
+            principal, access, ..
+        } = service
+            .authenticate_mcp_client(&session.token)
+            .await
+            .expect("the MCP surface accepts it");
+        assert_eq!(principal.session_id, session.principal.session_id);
+        assert_eq!(access.as_deref(), Some("read-only"));
+        let ticket = service
+            .issue_websocket_ticket(&principal)
+            .expect("ticket signs")
+            .0;
+        assert!(service.verify_websocket_ticket(&ticket).await.is_err());
+
+        // Revoking the row through the data root ends it on the next request.
+        repositories
+            .revoke_auth_session(principal.session_id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .authenticate_mcp_client(&session.token)
+                .await
+                .is_err()
+        );
+    }
+
+    /// An approved remote authorization with an attached code, as the consent page's poll
+    /// leaves it (slice R).
+    async fn approved_remote_authorization(
+        repositories: &Repositories,
+        code: &str,
+    ) -> McpOAuthAuthorization {
+        let now = now_ms();
+        let client_id = Uuid::new_v4().to_string();
+        repositories
+            .register_mcp_oauth_client(
+                crate::persistence::McpOAuthClient {
+                    client_id: client_id.clone(),
+                    client_name: "Codex".to_owned(),
+                    redirect_uris: vec!["http://127.0.0.1:53682/callback".to_owned()],
+                    source_key: "loopback".to_owned(),
+                    created_at_ms: now,
+                    approved_at_ms: None,
+                    last_used_at_ms: None,
+                },
+                now,
+                super::super::oauth::LIMITS,
+            )
+            .await
+            .unwrap();
+        let id = Uuid::new_v4().to_string();
+        repositories
+            .create_mcp_oauth_authorization(
+                crate::persistence::NewMcpOAuthAuthorization {
+                    id: id.clone(),
+                    user_code: super::super::oauth::random_user_code().unwrap(),
+                    client_id,
+                    redirect_uri: "http://127.0.0.1:61000/callback".to_owned(),
+                    code_challenge: super::super::oauth::s256(&"v".repeat(43)),
+                    state: Some("s".to_owned()),
+                    resource: "http://127.0.0.1:3773/mcp".to_owned(),
+                    scopes: "orchestration:read orchestration:operate".to_owned(),
+                    origin: "http://127.0.0.1:3773".to_owned(),
+                    source_key: "loopback".to_owned(),
+                    status_cookie_hash: super::super::oauth::secret_hash("cookie"),
+                    created_at_ms: now,
+                    expires_at_ms: now + super::super::oauth::AUTHORIZATION_TTL_MS,
+                },
+                now,
+                super::super::oauth::LIMITS,
+            )
+            .await
+            .unwrap();
+        assert!(
+            repositories
+                .decide_mcp_oauth_authorization(
+                    id.clone(),
+                    crate::persistence::McpOAuthDecision::Approve {
+                        access: "approval-required".to_owned(),
+                        scopes: "orchestration:read orchestration:operate".to_owned(),
+                    },
+                    now,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            repositories
+                .attach_mcp_oauth_code(
+                    id.clone(),
+                    super::super::oauth::secret_hash(code),
+                    now + super::super::oauth::CODE_TTL_MS,
+                    now,
+                )
+                .await
+                .unwrap()
+        );
+        repositories
+            .get_mcp_oauth_authorization(id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn minted_remote_grant(
+        service: &AuthService,
+        repositories: &Repositories,
+        refresh_token: &str,
+    ) -> McpOAuthTokens {
+        let authorization = approved_remote_authorization(repositories, "code").await;
+        match service
+            .mint_mcp_oauth_grant(
+                &authorization,
+                super::super::oauth::secret_hash("code"),
+                super::super::oauth::secret_hash(refresh_token),
+                ClientMetadata::default(),
+            )
+            .await
+            .unwrap()
+        {
+            McpOAuthMint::Minted(tokens) => tokens,
+            _ => panic!("the approved code mints a grant"),
+        }
+    }
+
+    fn rotation(token: &str, successor: &str) -> McpOAuthRefreshRotation {
+        let now = now_ms();
+        McpOAuthRefreshRotation {
+            token_hash: super::super::oauth::secret_hash(token),
+            new_token_hash: super::super::oauth::secret_hash(successor),
+            client_id: String::new(),
+            resource: "http://127.0.0.1:3773/mcp".to_owned(),
+            scopes: None,
+            new_expires_at: format_iso(now + super::super::oauth::GRANT_TTL_MS),
+            now: format_iso(now),
+        }
+    }
+
+    /// Revision 4 (P1): a one-hour access token on a 30-day grant authenticates at once, and
+    /// again after a refresh. The token's expiry and the grant's are checked separately.
+    #[tokio::test]
+    async fn a_remote_grant_s_hour_long_access_token_works_on_its_thirty_day_grant() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let tokens = minted_remote_grant(&service, &repositories, "refresh-1").await;
+        assert_eq!(tokens.expires_in, 3_600);
+        let credential = service
+            .authenticate_mcp_client(&tokens.access_token)
+            .await
+            .expect("an access token works right after the code exchange");
+        assert_eq!(
+            credential.resource.as_deref(),
+            Some("http://127.0.0.1:3773/mcp")
+        );
+        assert_eq!(credential.access.as_deref(), Some("approval-required"));
+        assert!(credential.principal.expires_at_ms < now_ms() + 3_601_000);
+        let grant_expiry = service
+            .active_session_expiry(&credential.principal.session_id)
+            .await
+            .unwrap();
+        assert!(grant_expiry > now_ms() + 29 * 24 * 60 * 60 * 1_000);
+
+        let client_id = repositories
+            .get_mcp_oauth_authorization_by_code(super::super::oauth::secret_hash("code"))
+            .await
+            .unwrap()
+            .unwrap()
+            .client_id;
+        let refreshed = match service
+            .rotate_mcp_oauth_refresh_token(McpOAuthRefreshRotation {
+                client_id: client_id.clone(),
+                ..rotation("refresh-1", "refresh-2")
+            })
+            .await
+            .unwrap()
+        {
+            McpOAuthRefresh::Rotated(tokens) => tokens,
+            _ => panic!("an unused refresh token rotates"),
+        };
+        service
+            .authenticate_mcp_client(&refreshed.access_token)
+            .await
+            .expect("an access token works right after a refresh");
+        service
+            .authenticate_mcp_client(&tokens.access_token)
+            .await
+            .expect("the earlier access token lives until its own expiry");
+
+        // Reuse (Revision 3): the old refresh token again revokes the whole grant.
+        assert!(matches!(
+            service
+                .rotate_mcp_oauth_refresh_token(McpOAuthRefreshRotation {
+                    client_id: client_id.clone(),
+                    ..rotation("refresh-1", "refresh-3")
+                })
+                .await
+                .unwrap(),
+            McpOAuthRefresh::Reused
+        ));
+        assert!(
+            service
+                .authenticate_mcp_client(&refreshed.access_token)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            service
+                .rotate_mcp_oauth_refresh_token(McpOAuthRefreshRotation {
+                    client_id,
+                    ..rotation("refresh-2", "refresh-4")
+                })
+                .await
+                .unwrap(),
+            McpOAuthRefresh::InvalidGrant
+        ));
+    }
+
+    /// The grant's expiry and the token's are separate: a token past its own `exp` fails on
+    /// a live grant, and a token never outlives its grant.
+    #[tokio::test]
+    async fn a_remote_access_token_fails_past_its_own_expiry_or_its_grant_s() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let tokens = minted_remote_grant(&service, &repositories, "refresh-1").await;
+        let credential = service
+            .authenticate_mcp_client(&tokens.access_token)
+            .await
+            .unwrap();
+        let session_id = credential.principal.session_id.clone();
+        let mut claims: SessionClaims = service.signer.verify(&tokens.access_token).unwrap();
+        claims.exp = now_ms() - 1;
+        let expired = service.signer.issue(&claims).unwrap();
+        assert!(service.authenticate_mcp_client(&expired).await.is_err());
+        let grant_expiry = service.active_session_expiry(&session_id).await.unwrap();
+        claims.exp = grant_expiry + 1;
+        let beyond_grant = service.signer.issue(&claims).unwrap();
+        assert!(
+            service
+                .authenticate_mcp_client(&beyond_grant)
+                .await
+                .is_err()
+        );
+        // A grant past its own expiry refuses even an access token that has not expired.
+        let past = format_iso(now_ms() - 1);
+        repositories
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE auth_sessions SET expires_at = ? WHERE session_id = ?",
+                    rusqlite::params![past, session_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            service
+                .authenticate_mcp_client(&tokens.access_token)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Review round 2: refresh-token history stays bounded per grant, and the reuse of a
+    /// recent old token is still detected.
+    #[tokio::test]
+    async fn a_thousand_refreshes_keep_the_token_history_bounded() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let _tokens = minted_remote_grant(&service, &repositories, "refresh-0").await;
+        let client_id = repositories
+            .get_mcp_oauth_authorization_by_code(super::super::oauth::secret_hash("code"))
+            .await
+            .unwrap()
+            .unwrap()
+            .client_id;
+        for index in 0..1_000 {
+            let outcome = repositories
+                .rotate_mcp_oauth_refresh_token(
+                    McpOAuthRefreshRotation {
+                        client_id: client_id.clone(),
+                        ..rotation(
+                            &format!("refresh-{index}"),
+                            &format!("refresh-{}", index + 1),
+                        )
+                    },
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, McpOAuthRefreshOutcome::Rotated(_)),
+                "rotation {index}"
+            );
+        }
+        let rows: i64 = repositories
+            .database()
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_refresh_tokens",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(rows <= 33, "{rows} refresh-token rows kept");
+        // A token used a few rotations ago is still recognized, and revokes the grant.
+        assert!(matches!(
+            repositories
+                .rotate_mcp_oauth_refresh_token(
+                    McpOAuthRefreshRotation {
+                        client_id,
+                        ..rotation("refresh-995", "refresh-x")
+                    },
+                    now_ms(),
+                )
+                .await
+                .unwrap(),
+            McpOAuthRefreshOutcome::Reused { .. }
+        ));
+    }
+
+    /// A code works once; its second use revokes the session it minted.
+    #[tokio::test]
+    async fn a_replayed_code_revokes_the_grant_it_minted() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let tokens = minted_remote_grant(&service, &repositories, "refresh-1").await;
+        let authorization = repositories
+            .get_mcp_oauth_authorization_by_code(super::super::oauth::secret_hash("code"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            service
+                .mint_mcp_oauth_grant(
+                    &authorization,
+                    super::super::oauth::secret_hash("code"),
+                    super::super::oauth::secret_hash("refresh-other"),
+                    ClientMetadata::default(),
+                )
+                .await
+                .unwrap(),
+            McpOAuthMint::Replayed
+        ));
+        assert!(
+            service
+                .authenticate_mcp_client(&tokens.access_token)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mcp_surface_refuses_every_other_session() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let issued = issue_administrative_pairing_link(&repositories, None)
+            .await
+            .expect("link");
+        let session = service
+            .exchange_bootstrap(
+                &issued.credential,
+                Some(owned_scopes(&[
+                    "orchestration:read",
+                    "orchestration:operate",
+                ])),
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("exchange");
+        assert!(matches!(
+            service.authenticate_mcp_client(&session.token).await,
+            Err(AuthError::InvalidCredential)
+        ));
+    }
+
     #[tokio::test]
     async fn authorization_context_rechecks_a_revoked_session() {
         let service = service();
@@ -3053,7 +4246,7 @@ mod tests {
         let mut events = service.subscribe_access();
         let third_load = exchange_desktop_bootstrap(&service).await;
 
-        let (_, _, clients) = service
+        let (_, _, clients, _) = service
             .access_snapshot(&third_load.principal.session_id)
             .await;
         assert_eq!(
@@ -3113,7 +4306,7 @@ mod tests {
             shutdown.is_cancelled(),
             "the superseded session's connection is closed"
         );
-        let (_, _, clients) = service.access_snapshot(&second.principal.session_id).await;
+        let (_, _, clients, _) = service.access_snapshot(&second.principal.session_id).await;
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].session_id, second.principal.session_id);
         assert!(!clients[0].connected);
@@ -3141,7 +4334,7 @@ mod tests {
             .await
             .expect("browser session re-issues");
 
-        let (_, _, clients) = service
+        let (_, _, clients, _) = service
             .access_snapshot(&bearer_again.principal.session_id)
             .await;
         let mut remaining = clients
@@ -3180,7 +4373,7 @@ mod tests {
             paired.push(paired_session(&service, label).await.principal.session_id);
         }
 
-        let (_, _, clients) = service.access_snapshot(&desktop.principal.session_id).await;
+        let (_, _, clients, _) = service.access_snapshot(&desktop.principal.session_id).await;
         let mut session_ids = clients
             .iter()
             .map(|client| client.session_id.clone())
@@ -3253,7 +4446,7 @@ mod tests {
             tokio::time::advance(AUTHORITY_CONVERGENCE_INTERVAL).await;
             tokio::task::yield_now().await;
         }
-        let (_, _, clients) = service.access_snapshot(&second.principal.session_id).await;
+        let (_, _, clients, _) = service.access_snapshot(&second.principal.session_id).await;
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].session_id, second.principal.session_id);
     }
@@ -3993,6 +5186,7 @@ mod tests {
                 expires_at: format_iso(now + SESSION_TTL_MS),
                 reach: Some(PAIRING_REACH_ANOTHER_DEVICE.to_owned()),
                 off_host: Some(true),
+                mcp_access: None,
                 delivery_state: AuthSessionDeliveryState::PendingPairing,
             })
             .await
@@ -4532,7 +5726,7 @@ mod tests {
         assert_eq!(clients.len(), 3);
         assert!(clients[0].current);
         assert!(clients[0].connected);
-        let (revision, pairings, snapshot_clients) =
+        let (revision, pairings, snapshot_clients, _) =
             service.access_snapshot(&current.principal.session_id).await;
         assert!(revision > 1);
         assert!(pairings.is_empty());
@@ -4892,6 +6086,7 @@ mod tests {
                         revoked_at_ms: None,
                         reach: None,
                         off_host: None,
+                        mcp_access: None,
                     },
                 );
             }
@@ -4940,6 +6135,9 @@ mod tests {
                         transport: SessionTransport::Plain,
                         reach: None,
                         off_host: None,
+                        mcp_access: None,
+                        mcp_access_hand_back: None,
+                        mcp_resource: None,
                         delivery_state: AuthSessionDeliveryState::Active,
                     },
                 );
@@ -4976,6 +6174,7 @@ mod tests {
                 revoked_at_ms: None,
                 reach: Some("another-device".to_owned()),
                 off_host: Some(true),
+                mcp_access: None,
             },
         );
     }
@@ -5659,6 +6858,7 @@ mod tests {
                 revoked_at: None,
                 reach: Some("another-device".to_owned()),
                 off_host: Some(true),
+                mcp_access: None,
             })
             .await
             .expect("expiring authority row");

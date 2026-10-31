@@ -126,6 +126,7 @@ import {
   getAnchoredTurnMetrics,
   getSentRowLandingDelta,
   bindTimelineTakeoverListeners,
+  type TimelineTakeoverInput,
   getTimelinePageScrollOffset,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
@@ -422,12 +423,47 @@ const TIMELINE_END_FOLLOW_RECHECKS = 6;
 const SENT_ROW_LANDING_MAX_MS = 2_000;
 const SENT_ROW_LANDING_ATTEMPTS = 20;
 const SENT_ROW_LANDING_ATTEMPT_MS = 1_000;
+/**
+ * The sent row's glide eases toward the row's offset: each frame covers the share of the remaining
+ * distance that time constant gives the time since the last frame, and at least the minimum step.
+ * It settles where it is after the longest glide, as the native glide did on its 750 ms timer,
+ * however few frames a busy webview paints, or after the most frames when frames come at once.
+ */
+const SENT_ROW_GLIDE_TIME_CONSTANT_MS = 90;
+const SENT_ROW_GLIDE_MIN_STEP = 0.2;
+const SENT_ROW_GLIDE_MAX_MS = 500;
+const SENT_ROW_GLIDE_MAX_FRAMES = 60;
+/**
+ * How long after a scroll key LegendList keeps no content position, so its own scrolls do not
+ * cancel the key's native scroll: WebKit started that scroll up to 816 ms after the keydown on
+ * the macOS x64 runners (#207).
+ */
+const TIMELINE_NATIVE_SCROLL_PENDING_MS = 1_200;
 
 /** The patched LegendList method that withdraws its scroll requests (see the patch). */
 interface CancellableTimelineList {
   readonly cancelScrollRequests?: () => void;
 }
 
+/**
+ * How far the timeline must scroll for the sent row to rest at its offset: measured on screen once
+ * the row is mounted, and from LegendList's position for its row until then.
+ */
+function measureSentRowGlide(
+  list: LegendListRef,
+  scrollNode: HTMLElement,
+  messageId: MessageId,
+  anchorIndex: number,
+): number | null {
+  const measured = measureSentRowLanding(scrollNode, messageId);
+  if (measured !== undefined) {
+    return measured ?? 0;
+  }
+  const top = list.getState().positionAtIndex(anchorIndex);
+  return typeof top === "number" && Number.isFinite(top)
+    ? top - CHAT_LIST_ANCHOR_OFFSET - scrollNode.scrollTop
+    : null;
+}
 /**
  * How far the timeline must scroll for the sent row `messageId` to rest at its offset, measured
  * on screen: null within a pixel of it, undefined when the row is not mounted.
@@ -3508,17 +3544,21 @@ function ChatViewContent(props: ChatViewProps) {
     readonly userScrollGeneration: number;
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
+  const timelineGlideFrameRef = useRef<number | null>(null);
   const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
   // Whether the timeline follows its end, as state so LegendList stops keeping the list at its
   // end once the reader scrolls away: otherwise a change in the bottom region's height (the
   // composer growing, the Activity card opening) moves a list near its end, or a thread
   // shorter than the view, back to the end and takes the reader's line away.
   const [timelineFollowsEnd, setTimelineFollowsEnd] = useState(true);
+  // Whether a scroll key's native scroll may still be about to start (#207).
+  const [timelineNativeScrollPending, setTimelineNativeScrollPending] = useState(false);
+  const timelineNativeScrollTimerRef = useRef<number | null>(null);
   // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
   // anchored end space changes size, as each delivery does, and positioning it then would take
   // the reader's place away, so it stays released until the next send or thread (#190).
   const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
-  const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
+  const cancelTimelineLiveFollowForUserNavigation = useCallback((input?: TimelineTakeoverInput) => {
     // A send names its row pending before the previous one stops being positioned, so the
     // newest send is the one released.
     releasedTimelineAnchorRef.current =
@@ -3541,6 +3581,32 @@ function ChatViewContent(props: ChatViewProps) {
     if (anchorScrollRestoreFrameRef.current !== null) {
       cancelAnimationFrame(anchorScrollRestoreFrameRef.current);
       anchorScrollRestoreFrameRef.current = null;
+    }
+    // The glide stops where it is, and nothing scrolls the timeline after the reader's own input.
+    if (timelineGlideFrameRef.current !== null) {
+      cancelAnimationFrame(timelineGlideFrameRef.current);
+      timelineGlideFrameRef.current = null;
+    }
+    // The browser scrolls for a key only after the keydown, and a scroll LegendList makes before
+    // then, such as holding the row below a streamed reply in place as it grows, cancels the
+    // key's scroll. The wheel and touch scroll at once, and end a key's hold: held, the list
+    // keeps no content position, so growth above the view would move their line. A press scrolls
+    // nothing, so a key's scroll may still be about to start, and the hold goes on.
+    if (input === "press") {
+      return;
+    }
+    if (timelineNativeScrollTimerRef.current !== null) {
+      window.clearTimeout(timelineNativeScrollTimerRef.current);
+      timelineNativeScrollTimerRef.current = null;
+    }
+    if (input === "keyboard") {
+      setTimelineNativeScrollPending(true);
+      timelineNativeScrollTimerRef.current = window.setTimeout(() => {
+        timelineNativeScrollTimerRef.current = null;
+        setTimelineNativeScrollPending(false);
+      }, TIMELINE_NATIVE_SCROLL_PENDING_MS);
+    } else {
+      setTimelineNativeScrollPending(false);
     }
   }, []);
   const cancelTimelineLiveFollowForUserNavigationRef = useRef(
@@ -3641,7 +3707,7 @@ function ChatViewContent(props: ChatViewProps) {
     timelineTakeoverCleanupRef.current = bindTimelineTakeoverListeners(
       scrollNode,
       scrollNode.ownerDocument ?? document,
-      () => cancelTimelineLiveFollowForUserNavigationRef.current(),
+      (input) => cancelTimelineLiveFollowForUserNavigationRef.current(input),
     );
   }, []);
 
@@ -3754,28 +3820,48 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return;
         }
+        // The glide is ChatView's own, one instant scroll per frame toward the row's offset,
+        // measured again each frame. A browser's smooth scroll runs off the page's thread, where
+        // a scroll key's takeover cannot stop it: WebKit finished it over the stop, and on macOS
+        // arm64 that also cancelled the key's own scroll. LegendList also held the growth of a
+        // row above as an offset for an animated scroll, which a later scroll left behind (#214).
+        // A scroll the list still holds, such as an earlier row's landing waiting for rows to
+        // settle, would otherwise run over the glide.
+        (list as CancellableTimelineList).cancelScrollRequests?.();
         const scrollNode = list.getScrollableNode();
-        let finished = false;
-        const finishAnimatedPositioning = () => {
-          if (finished) {
+        const animates = timelineScrollAnimates();
+        const startedAt = performance.now();
+        let lastFrameAt = startedAt;
+        const glide = (frame: number) => {
+          timelineGlideFrameRef.current = null;
+          if (positionedTimelineAnchorRef.current !== messageId || legendListRef.current !== list) {
             return;
           }
-          finished = true;
-          window.clearTimeout(fallbackTimer);
-          scrollNode.removeEventListener("scrollend", finishAnimatedPositioning);
-          if (positionedTimelineAnchorRef.current !== messageId) {
+          const delta = measureSentRowGlide(list, scrollNode, messageId, anchorIndex);
+          const now = performance.now();
+          const step = animates
+            ? Math.max(
+                SENT_ROW_GLIDE_MIN_STEP,
+                1 - Math.exp(-(now - lastFrameAt) / SENT_ROW_GLIDE_TIME_CONSTANT_MS),
+              )
+            : 1;
+          lastFrameAt = now;
+          if (
+            delta !== null &&
+            Math.abs(delta) > 1 &&
+            frame < SENT_ROW_GLIDE_MAX_FRAMES &&
+            now - startedAt < SENT_ROW_GLIDE_MAX_MS
+          ) {
+            // Content the scroll cannot reach yet, such as end space the list has still to lay
+            // out, clamps it; the next frame tries again from where it got to.
+            const move = Math.abs(delta * step) < 1 ? delta : delta * step;
+            scrollNode.scrollTop = Math.max(0, Math.round(scrollNode.scrollTop + move));
+            timelineGlideFrameRef.current = requestAnimationFrame(() => glide(frame + 1));
             return;
           }
           settleSentTimelineRowRef.current(messageId);
         };
-        const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
-        scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
-        void list.scrollToIndex({
-          index: anchorIndex,
-          animated: true,
-          viewPosition: 0,
-          viewOffset: CHAT_LIST_ANCHOR_OFFSET,
-        });
+        glide(0);
       });
     };
     requestAnimationFrame(() => positionAnchor(12));
@@ -4020,6 +4106,16 @@ function ChatViewContent(props: ChatViewProps) {
     };
   }, [activeThread?.id, timelineEntries, followTimelineLiveEnd, composerOverlayHeight]);
 
+  // A turn that settles changes its rows with no new entry: its "Worked for" row arrives above
+  // the answer and the rows below it go. The list then keeps no row in place, since the rows it
+  // held were the ones that went, and the answer's end can drop out of view (#208). Follow as a
+  // new entry does, once the list has laid the new rows out.
+  const onTimelineTurnSettled = useCallback(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => followTimelineLiveEndRef.current());
+    });
+  }, []);
+
   // A row that grows without a new entry, such as a diagram drawing in a reply taller than the
   // timeline, changes layout the effect above never sees. That includes rows above the anchored
   // turn, such as an earlier reply whose diagrams draw again as it remounts: the list holds the
@@ -4080,6 +4176,7 @@ function ChatViewContent(props: ChatViewProps) {
     setPullRequestDialogState(null);
     setScrollPillThreadId(null);
     setTimelineFollowsEnd(true);
+    setTimelineNativeScrollPending(false);
     setIsRevertingCheckpoint(false);
   }
 
@@ -7034,6 +7131,7 @@ function ChatViewContent(props: ChatViewProps) {
                       listRef={legendListRef}
                       onListMount={onTimelineListMount}
                       followsEnd={timelineFollowsEnd}
+                      nativeScrollPending={timelineNativeScrollPending}
                       timelineEntries={timelineEntries}
                       queuedMessages={queuedMessages}
                       queuedStatuses={queuedStatuses}
@@ -7073,6 +7171,7 @@ function ChatViewContent(props: ChatViewProps) {
                       onAnchorReady={onTimelineAnchorReady}
                       onAnchorSizeChanged={onTimelineAnchorSizeChanged}
                       onRowSizeChanged={onTimelineRowSizeChanged}
+                      onTurnSettled={onTimelineTurnSettled}
                       contentInsetEndAdjustment={composerOverlayHeight}
                       onIsAtEndChange={onIsAtEndChange}
                       onManualNavigation={cancelTimelineLiveFollowForUserNavigation}

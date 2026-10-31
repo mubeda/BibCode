@@ -460,7 +460,12 @@ impl PortablePtyBackend {
         // does not depend on the client's slower round-trip reply.
         let osc_responder = {
             let colors = colors_from_env(&input.env);
-            (!colors.is_empty()).then(|| (OscColorResponder::new(colors), Arc::clone(&writer)))
+            (!colors.is_empty()).then(|| {
+                (
+                    OscColorResponder::new(colors),
+                    osc_replies(pid, Arc::clone(&writer)),
+                )
+            })
         };
         let osc_color_responder_active = osc_responder.is_some();
 
@@ -912,7 +917,7 @@ fn decode_pty_output(pending: &mut Vec<u8>, bytes: &[u8], end_of_stream: bool) -
 fn read_output(
     reader: &mut dyn Read,
     sender: &broadcast::Sender<String>,
-    mut osc_responder: Option<(OscColorResponder, SharedPtyWriter)>,
+    mut osc_responder: Option<(OscColorResponder, OscReplies)>,
 ) {
     let mut buffer = [0u8; 8 * 1024];
     let mut pending = Vec::with_capacity(4);
@@ -936,24 +941,44 @@ fn read_output(
     }
 }
 
-/// Feeds raw output bytes to the OSC responder and writes any reply back to the
-/// PTY input. Runs on the raw byte stream so split queries are tracked before
-/// UTF-8 decoding; write failures are ignored because a lost reply only leaves
-/// the provider on its default theme.
-fn answer_osc_color_queries(
-    responder: Option<&mut (OscColorResponder, SharedPtyWriter)>,
-    bytes: &[u8],
-) {
-    let Some((responder, writer)) = responder else {
+/// OSC color replies waiting for the PTY input. Bounded: a reply that does not fit is
+/// dropped, which only leaves the provider on its default theme.
+type OscReplies = mpsc::SyncSender<Vec<u8>>;
+const MOST_QUEUED_OSC_REPLIES: usize = 16;
+
+/// Starts the thread that writes OSC color replies to the PTY input, so the output reader
+/// never waits for the PTY writer, which an input write the child does not read can hold
+/// (#139). The thread ends when the reader drops its sender, at the end of the output.
+fn osc_replies(pid: u32, writer: SharedPtyWriter) -> OscReplies {
+    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(MOST_QUEUED_OSC_REPLIES);
+    if let Err(error) = thread::Builder::new()
+        .name(format!("bibcode-pty-osc-{pid}"))
+        .spawn(move || {
+            for reply in receiver {
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = writer.write_all(&reply);
+                    let _ = writer.flush();
+                }
+            }
+        })
+    {
+        // Replies are then dropped as they come: the provider keeps its default theme.
+        tracing::warn!(%error, "terminal OSC color replies are unavailable");
+    }
+    sender
+}
+
+/// Feeds raw output bytes to the OSC responder and queues any reply for the PTY input.
+/// Runs on the raw byte stream so split queries are tracked before UTF-8 decoding. Never
+/// waits: a reply that cannot be queued is dropped, because a lost reply only leaves the
+/// provider on its default theme.
+fn answer_osc_color_queries(responder: Option<&mut (OscColorResponder, OscReplies)>, bytes: &[u8]) {
+    let Some((responder, replies)) = responder else {
         return;
     };
     let reply = responder.process(bytes);
-    if reply.is_empty() {
-        return;
-    }
-    if let Ok(mut writer) = writer.lock() {
-        let _ = writer.write_all(&reply);
-        let _ = writer.flush();
+    if !reply.is_empty() {
+        let _ = replies.try_send(reply);
     }
 }
 
@@ -1288,6 +1313,63 @@ mod tests {
 
         let output: String = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
         assert_eq!(output, expected);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedInput(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedInput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A write the child never reads holds the PTY writer. An OSC color query in the output
+    /// then must not stop the reader from publishing what follows; the reply goes in once the
+    /// writer is free (#139 slice T review, round 4).
+    #[test]
+    fn an_osc_color_query_never_waits_for_a_held_pty_writer() {
+        let input = CapturedInput::default();
+        let writer: SharedPtyWriter = Arc::new(Mutex::new(Box::new(input.clone())));
+        let held = writer.lock().unwrap();
+        let colors = colors_from_env(&BTreeMap::from([(
+            OSC_BACKGROUND_ENV.to_owned(),
+            "16,32,48".to_owned(),
+        )]));
+        let responder = (
+            OscColorResponder::new(colors),
+            osc_replies(0, Arc::clone(&writer)),
+        );
+        let (sender, mut receiver) = broadcast::channel(16);
+        let reader = thread::spawn(move || {
+            let mut bytes = std::io::Cursor::new(b"\x1b]11;?\x1b\\after the query\n".to_vec());
+            read_output(&mut bytes, &sender, Some(responder));
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut published = String::new();
+        while !published.contains("after the query") && std::time::Instant::now() < deadline {
+            match receiver.try_recv() {
+                Ok(text) => published.push_str(&text),
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        drop(held);
+        assert!(
+            published.contains("after the query"),
+            "the reader waited for the PTY writer: {published:?}"
+        );
+        reader.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while input.0.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let reply = String::from_utf8(input.0.lock().unwrap().clone()).unwrap();
+        assert!(reply.starts_with("\u{1b}]11;rgb:"), "{reply:?}");
     }
 
     #[test]

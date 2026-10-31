@@ -262,12 +262,36 @@ export const AuthClientSession = Schema.Struct({
   connected: Schema.Boolean,
   current: Schema.Boolean,
   reach: Schema.optionalKey(RemotePairingReach),
+  /** An outside agent's access ceiling (`mcp-client` sessions only; #139, slice X1). */
+  mcpAccess: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Set while a person has taken the agent over: the level Hand back restores. */
+  mcpAccessHandBack: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
+
+/**
+ * A remote AI tool's request to connect over HTTPS, waiting for a person (#139, slice R).
+ * `clientName` is the tool's own, untrusted, text; `code` is what its sign-in page shows.
+ */
+export const AuthPendingMcpAuthorization = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  code: TrimmedNonEmptyString,
+  clientName: Schema.String,
+  redirectHost: Schema.String,
+  /** It returns to this computer only, so approving it is safe only if you just started it. */
+  redirectIsLoopback: Schema.Boolean,
+  origin: TrimmedNonEmptyString,
+  scopes: AuthEnvironmentScopes,
+  createdAt: Schema.DateTimeUtc,
+  expiresAt: Schema.DateTimeUtc,
+});
+export type AuthPendingMcpAuthorization = typeof AuthPendingMcpAuthorization.Type;
 
 export const AuthAccessSnapshot = Schema.Struct({
   pairingLinks: Schema.Array(AuthPairingLink),
   clientSessions: Schema.Array(AuthClientSession),
+  /** Remote MCP requests to connect (slice R). Absent from servers that predate them. */
+  pendingMcpAuthorizations: Schema.optionalKey(Schema.Array(AuthPendingMcpAuthorization)),
 });
 export type AuthAccessSnapshot = typeof AuthAccessSnapshot.Type;
 
@@ -360,8 +384,49 @@ export type AuthRevokePairingLinkInput = typeof AuthRevokePairingLinkInput.Type;
 
 export const AuthRevokeClientSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
+  /**
+   * **Stop** an outside agent (#139, slice X1): also interrupt each running turn whose latest
+   * user message it sent. A plain revocation interrupts nothing.
+   */
+  interruptTurns: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthRevokeClientSessionInput = typeof AuthRevokeClientSessionInput.Type;
+
+/** The MCP access levels, lowest first. */
+export const AuthMcpAccessLevel = Schema.Literals([
+  "read-only",
+  "approval-required",
+  "auto-accept-edits",
+  "full-access",
+]);
+export type AuthMcpAccessLevel = typeof AuthMcpAccessLevel.Type;
+
+/**
+ * **Take over** (`read-only`) and **Hand back** (the level Take over replaced, and nothing
+ * else) for an outside agent's session (#139, slice X1).
+ */
+export const AuthSetMcpAccessInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  access: AuthMcpAccessLevel,
+});
+export type AuthSetMcpAccessInput = typeof AuthSetMcpAccessInput.Type;
+
+/**
+ * **Approve** a remote AI tool's request to connect (#139, slice R): at `access`, at most the
+ * environment's Agents may, with terminals only when it asked for them and they are allowed.
+ */
+export const AuthApproveMcpAuthorizationInput = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  access: AuthMcpAccessLevel,
+  terminals: Schema.optionalKey(Schema.Boolean),
+});
+export type AuthApproveMcpAuthorizationInput = typeof AuthApproveMcpAuthorizationInput.Type;
+
+/** **Deny** a remote AI tool's request to connect (#139, slice R). */
+export const AuthDenyMcpAuthorizationInput = Schema.Struct({
+  id: TrimmedNonEmptyString,
+});
+export type AuthDenyMcpAuthorizationInput = typeof AuthDenyMcpAuthorizationInput.Type;
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),

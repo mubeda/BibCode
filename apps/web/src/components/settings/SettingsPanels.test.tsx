@@ -291,6 +291,11 @@ vi.mock("./WorktreeWorkspaceSetting", () => ({
   WorktreeWorkspaceSetting: () => <div data-testid="worktree-workspace-setting">Workspace</div>,
 }));
 
+// Its own test covers it; the Agents panel only places it.
+vi.mock("./AgentIntegrationsSection", () => ({
+  AgentIntegrationsSection: () => <div data-testid="agent-integrations-section" />,
+}));
+
 vi.mock("../ProjectFavicon", () => ({
   ProjectFavicon: () => <span data-testid="project-favicon" />,
 }));

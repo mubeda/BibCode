@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        CloneLeaf, CloneReservation, GitCommandError, GitRepository, host_path_platform,
-        normalize_worktree_path_key,
+        CloneLeaf, CloneReservation, GitCommandError, GitRepository, clone_policy::ClonePlan,
+        host_path_platform, normalize_worktree_path_key,
     },
     maintenance::RpcPermit,
 };
@@ -94,6 +94,15 @@ pub(crate) struct CloneRequest {
     pub(crate) attach: bool,
     /// The caller leaving does not cancel a clone it started.
     pub(crate) detach: bool,
+    /// What Git runs with when an outside agent starts this clone (`git::clone_policy`):
+    /// HTTPS only, the checked addresses pinned, redirects and LFS smudge off. `None` for a
+    /// person's clone. A request that joins a running clone shares the starter's Git, so an
+    /// agent that joins a person's clone of the same URL (after its own check passed) waits on
+    /// that unpinned clone.
+    pub(crate) plan: Option<Arc<ClonePlan>>,
+    /// The outside agent's session when one starts this clone, so only that agent may cancel
+    /// it through `vcs.cancelClone`. A request that joins keeps the starter's owner.
+    pub(crate) owner: Option<String>,
 }
 
 impl CloneRequest {
@@ -122,6 +131,8 @@ enum ClonePhase {
 struct CloneEntry {
     id: u64,
     url: String,
+    /// The outside agent's session that started it; `None` for a person's clone.
+    owner: Option<String>,
     root: CancellationToken,
     phase: watch::Sender<ClonePhase>,
     /// When a retained outcome expires; `None` while the clone is live.
@@ -303,6 +314,32 @@ impl CloneRuntime {
     /// had already succeeded; a finished clone is never touched. A caller that leaves drops
     /// this future, and the RPC layer reports that as an interrupt. The clone stays cancelled.
     pub(crate) async fn cancel(&self, url: &str, parent_dir: &Path, leaf: &CloneLeaf) -> bool {
+        self.cancel_owned_by(url, parent_dir, leaf, None)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// [`Self::cancel`] for the outside agent with session `agent`: it may cancel only a clone
+    /// it started. `None` when the live clone of that URL is another's (a person's, or another
+    /// agent's), which is left running.
+    pub(crate) async fn cancel_as_agent(
+        &self,
+        url: &str,
+        parent_dir: &Path,
+        leaf: &CloneLeaf,
+        agent: &str,
+    ) -> Option<bool> {
+        self.cancel_owned_by(url, parent_dir, leaf, Some(agent))
+            .await
+    }
+
+    async fn cancel_owned_by(
+        &self,
+        url: &str,
+        parent_dir: &Path,
+        leaf: &CloneLeaf,
+        agent: Option<&str>,
+    ) -> Option<bool> {
         let destination = parent_dir.join(leaf.as_str());
         let receiver = {
             let mut state = self.lock();
@@ -312,15 +349,18 @@ impl CloneRuntime {
                 .get(&destination_key(&destination))
                 .filter(|entry| entry.is_live() && entry.url == url)
             else {
-                return false;
+                return Some(false);
             };
+            if agent.is_some_and(|agent| entry.owner.as_deref() != Some(agent)) {
+                return None;
+            }
             entry.root.cancel();
             entry.phase.subscribe()
         };
-        !matches!(
+        Some(!matches!(
             wait_finished(receiver, &destination).await,
             CloneOutcome::Succeeded(_)
-        )
+        ))
     }
 
     /// Shutdown: refuse new clones, cancel every live one, and wait until each has published
@@ -394,6 +434,7 @@ impl CloneRuntime {
             CloneEntry {
                 id,
                 url: request.url.clone(),
+                owner: request.owner.clone(),
                 root: root.clone(),
                 phase,
                 expires_at: None,
@@ -465,7 +506,8 @@ impl CloneRuntime {
         let transfer = {
             let reserved = Arc::clone(&reserved);
             let root = root.clone();
-            tokio::spawn(async move { reserved.transfer(&root).await })
+            let plan = request.plan.clone();
+            tokio::spawn(async move { reserved.transfer(plan.as_deref(), &root).await })
         };
         let transferred = transfer.await;
         #[cfg(test)]
@@ -914,6 +956,8 @@ mod tests {
             leaf: leaf(name),
             attach: false,
             detach: true,
+            plan: None,
+            owner: None,
         }
     }
 

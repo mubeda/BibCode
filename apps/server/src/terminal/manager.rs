@@ -20,7 +20,8 @@ use super::{
     PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
     TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput,
     TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
-    TerminalStatus, TerminalSummary, history::TerminalHistory,
+    TerminalStatus, TerminalSummary,
+    history::{HistoryCursor, HistoryWindow, TerminalHistory},
 };
 use super::{TerminalAgentStatus, TerminalAgentStatusState};
 use crate::{
@@ -236,6 +237,16 @@ struct SizeOwner {
     attachment: uuid::Uuid,
 }
 
+/// A bounded read of one session's output, and the state of its process.
+#[derive(Debug)]
+pub(crate) struct TerminalHistoryRead {
+    pub(crate) window: HistoryWindow,
+    /// The offset just past everything the session has written.
+    pub(crate) total: u64,
+    pub(crate) status: TerminalStatus,
+    pub(crate) exit_code: Option<i32>,
+}
+
 struct Session {
     generation: Arc<SessionGeneration>,
     thread_id: String,
@@ -350,12 +361,16 @@ impl TerminalSessionIdentity {
         self.generation.cancellation.clone()
     }
 
-    pub(super) async fn write_input(
+    /// Queues one ordered input frame for the process, under the publication lock and
+    /// without waiting for the write. The queueing happens in the same poll that returns, so
+    /// a caller that drops this future before it is ready has queued nothing; the returned
+    /// write is dropped with its handle unless the writer has started it.
+    pub(super) async fn enqueue_input(
         &self,
         data: &str,
         cancelled: &CancellationToken,
         connection_closed: &CancellationToken,
-    ) -> Result<(), TerminalError> {
+    ) -> Result<super::writer::PendingWrite, TerminalError> {
         let _publication = tokio::select! {
             biased;
             () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
@@ -384,7 +399,7 @@ impl TerminalSessionIdentity {
             });
         }
         drop(session);
-        self.process.write(data).map_err(TerminalError::Io)
+        self.generation.writer.enqueue(&self.process, data, true)
     }
 }
 
@@ -1167,6 +1182,9 @@ struct SessionGeneration {
     cancellation: CancellationToken,
     publication: Mutex<()>,
     startup: Arc<Mutex<()>>,
+    /// The process's input queue: unary and ordered writes are enqueued under `publication`
+    /// and written by the writer's own thread, outside it.
+    writer: super::writer::TerminalWriter,
     output_started: std::sync::atomic::AtomicBool,
     output_stop: CancellationToken,
     output_completed: CancellationToken,
@@ -1190,6 +1208,7 @@ impl SessionGeneration {
             cancellation: CancellationToken::new(),
             publication: Mutex::new(()),
             startup: Arc::new(Mutex::new(())),
+            writer: super::writer::TerminalWriter::default(),
             output_started: std::sync::atomic::AtomicBool::new(false),
             output_stop: CancellationToken::new(),
             output_completed: CancellationToken::new(),
@@ -1205,6 +1224,9 @@ impl SessionGeneration {
         self.invalidated
             .store(true, std::sync::atomic::Ordering::Release);
         self.cancellation.cancel();
+        // Close, exit, restart and shutdown all end here: the input writer's thread and its
+        // hold on the process go now, not after its idle timeout.
+        self.writer.stop();
     }
 
     fn is_invalidated(&self) -> bool {
@@ -3338,27 +3360,37 @@ impl TerminalManager {
         terminal_id: &str,
         data: &str,
     ) -> Result<(), TerminalError> {
+        let not_running = || TerminalError::NotRunning {
+            thread_id: thread_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+        };
         let session = self.require_session(thread_id, terminal_id).await?;
         let generation = session.lock().await.generation.clone();
-        let _publication = generation.publication.lock().await;
-        if generation.is_invalidated() {
-            return Err(TerminalError::NotFound {
-                thread_id: thread_id.to_owned(),
-                terminal_id: terminal_id.to_owned(),
-            });
-        }
-        let (process, status) = {
-            let session = session.lock().await;
-            (session.process.clone(), session.status)
+        let mut pending = {
+            let _publication = generation.publication.lock().await;
+            let (process, status) = {
+                let session = session.lock().await;
+                (session.process.clone(), session.status)
+            };
+            // An exit invalidates the generation and then marks the session exited, both under
+            // this lock, so a session that is still listed but whose process ended is refused
+            // here, never reported as written.
+            if matches!(status, TerminalStatus::Exited | TerminalStatus::Error) {
+                return Err(not_running());
+            }
+            if generation.is_invalidated() {
+                return Err(TerminalError::NotFound {
+                    thread_id: thread_id.to_owned(),
+                    terminal_id: terminal_id.to_owned(),
+                });
+            }
+            // Queued without waiting; the writer's thread writes it outside this lock, after
+            // any input queued before it. Dropping this future leaves the write queued.
+            generation
+                .writer
+                .enqueue(&process.ok_or_else(not_running)?, data, false)?
         };
-        if status == TerminalStatus::Exited {
-            return Ok(());
-        }
-        let process = process.ok_or_else(|| TerminalError::NotRunning {
-            thread_id: thread_id.to_string(),
-            terminal_id: terminal_id.to_string(),
-        })?;
-        process.write(data).map_err(TerminalError::Io)
+        pending.wait().await
     }
 
     pub async fn resize(
@@ -3801,6 +3833,42 @@ impl TerminalManager {
                 reason,
             });
         }
+    }
+
+    /// The summaries of one thread's sessions, by terminal id.
+    pub(crate) async fn thread_sessions(&self, thread_id: &str) -> Vec<TerminalSummary> {
+        let sessions = self.inner.sessions.read().await;
+        let mut listed = Vec::new();
+        for ((thread, _), session) in sessions.iter() {
+            if thread == thread_id {
+                listed.push(session.lock().await.summary());
+            }
+        }
+        listed.sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
+        listed
+    }
+
+    /// A bounded window of one session's retained output, from memory: from byte offset
+    /// `from`, or its last `max_chars` characters when `from` is `None`.
+    pub(crate) async fn read_history(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        from: Option<HistoryCursor>,
+        max_chars: usize,
+    ) -> Result<TerminalHistoryRead, TerminalError> {
+        let session = self.require_session(thread_id, terminal_id).await?;
+        let session = session.lock().await;
+        let window = match from {
+            Some(from) => session.history.read_window(from, max_chars),
+            None => session.history.tail(max_chars),
+        };
+        Ok(TerminalHistoryRead {
+            window,
+            total: session.history.total_bytes_written(),
+            status: session.status,
+            exit_code: session.exit_code,
+        })
     }
 
     /// Terminal sessions whose process is starting or running.
@@ -4798,9 +4866,69 @@ mod tests {
         kill_error: std::sync::Mutex<Option<String>>,
         write_error: std::sync::Mutex<Option<String>>,
         writes: std::sync::Mutex<Vec<String>>,
+        /// When set, a write blocks until the gate opens, as a PTY write does while the child
+        /// reads no input.
+        write_gate: std::sync::Mutex<Option<Arc<WriteGate>>>,
         resize_error: std::sync::Mutex<Option<String>>,
         resizes: std::sync::Mutex<Vec<(u16, u16)>>,
         output_on_resize: std::sync::Mutex<Option<String>>,
+    }
+
+    /// Holds PTY writes until opened. Opening it on drop keeps a failed test from hanging in
+    /// the runtime's wait for its blocking threads.
+    #[derive(Debug, Default)]
+    struct WriteGate {
+        open: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+        entered: std::sync::atomic::AtomicBool,
+    }
+
+    impl WriteGate {
+        fn pass(&self) {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            let open = self.open.lock().expect("gate");
+            drop(
+                self.changed
+                    .wait_while(open, |open| !*open)
+                    .expect("gate wait"),
+            );
+        }
+
+        fn open(&self) {
+            *self.open.lock().expect("gate") = true;
+            self.changed.notify_all();
+        }
+
+        /// Waits on this thread, never a runtime worker, until a write is held.
+        fn wait_entered(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !self.entered.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no write reached the PTY"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    struct OpenOnDrop(Arc<WriteGate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// Whether the runtime still runs a newly spawned task within two seconds, observed from
+    /// the test thread.
+    fn runtime_responds() -> bool {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(());
+        });
+        receiver.recv_timeout(Duration::from_secs(2)).is_ok()
     }
 
     impl HistoryTestPty {
@@ -4822,6 +4950,7 @@ mod tests {
                 kill_error: std::sync::Mutex::new(None),
                 write_error: std::sync::Mutex::new(None),
                 writes: std::sync::Mutex::new(Vec::new()),
+                write_gate: std::sync::Mutex::new(None),
                 resize_error: std::sync::Mutex::new(None),
                 resizes: std::sync::Mutex::new(Vec::new()),
                 output_on_resize: std::sync::Mutex::new(None),
@@ -4910,6 +5039,10 @@ mod tests {
         }
 
         fn write(&self, data: &str) -> Result<(), String> {
+            let gate = self.write_gate.lock().expect("write gate").clone();
+            if let Some(gate) = gate {
+                gate.pass();
+            }
             self.writes
                 .lock()
                 .expect("writes lock")
@@ -8286,6 +8419,438 @@ mod tests {
         assert_eq!(backend.processes.lock().expect("processes lock").len(), 2);
 
         manager.shutdown().await;
+    }
+
+    /// The outside-agent terminal tools list one thread's sessions and read bounded windows
+    /// of their history from memory (#139 slice T).
+    #[tokio::test]
+    async fn a_threads_sessions_list_and_read_bounded_history_windows() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for (thread, terminal) in [
+            ("thread-a", "term-2"),
+            ("thread-a", "term-1"),
+            ("thread-b", "term-1"),
+        ] {
+            manager
+                .open(TerminalOpenInput::new(
+                    thread,
+                    terminal,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let listed: Vec<String> = manager
+            .thread_sessions("thread-a")
+            .await
+            .into_iter()
+            .map(|summary| summary.terminal_id)
+            .collect();
+        assert_eq!(listed, ["term-1", "term-2"]);
+
+        let mut events = manager.subscribe_events();
+        backend.latest().emit("only thread-b\n");
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("output timeout")
+            .expect("output event");
+        let tail = manager
+            .read_history("thread-b", "term-1", None, 4)
+            .await
+            .unwrap();
+        assert_eq!((tail.window.text.as_str(), tail.window.end), ("d-b\n", 14));
+        assert_eq!(tail.status, TerminalStatus::Running);
+        let from = manager
+            .read_history(
+                "thread-b",
+                "term-1",
+                Some(super::super::HistoryCursor {
+                    epoch: tail.window.epoch,
+                    offset: 5,
+                }),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(from.window.text, "thread-b\n");
+        assert!(matches!(
+            manager.read_history("thread-a", "term-9", None, 10).await,
+            Err(TerminalError::NotFound { .. })
+        ));
+        manager.shutdown().await;
+    }
+
+    async fn gated_terminal() -> (
+        tempfile::TempDir,
+        Arc<HistoryTestBackend>,
+        TerminalManager,
+        Arc<WriteGate>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        (root, backend, manager, gate)
+    }
+
+    /// A PTY write blocks while the child reads no input. The unary write runs it on a
+    /// blocking thread, outside the publication lock, so neither the runtime nor the
+    /// terminal's output waits for it (#139 slice T review).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_unary_write_holds_neither_a_runtime_worker_nor_the_publication_lock() {
+        let (_root, backend, manager, gate) = gated_terminal().await;
+        let _open = OpenOnDrop(gate.clone());
+        let writing = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write("thread", "term", "stuck").await }
+        });
+        gate.wait_entered();
+        assert!(
+            runtime_responds(),
+            "the blocked write holds the only worker"
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                let _ = sender.send(manager.clear("thread", "term").await.is_ok());
+            }
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "the blocked write holds the publication lock"
+        );
+        gate.open();
+        writing.await.unwrap().unwrap();
+        assert_eq!(backend.latest().writes(), ["stuck"]);
+        manager.shutdown().await;
+    }
+
+    /// The ordered input path keeps its write inside the poll, so a frame is never written
+    /// twice, but hands the worker's other tasks to another thread while it blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_ordered_write_does_not_hold_a_runtime_worker() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        let writing = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                ordered_write(
+                    &manager, connection, "thread", "term", &input_id, 0, "typed",
+                )
+                .await
+            }
+        });
+        gate.wait_entered();
+        assert!(
+            runtime_responds(),
+            "the blocked write holds the only worker"
+        );
+        gate.open();
+        writing.await.unwrap().unwrap();
+        assert_eq!(backend.latest().writes(), ["typed"]);
+        manager.shutdown().await;
+    }
+
+    /// A unary write after the process ended is refused, never reported as written.
+    #[tokio::test]
+    async fn a_unary_write_after_the_process_exits_is_not_running() {
+        let (_root, backend, manager, gate) = gated_terminal().await;
+        gate.open();
+        backend.latest().exit(0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager
+                .read_history("thread", "term", None, 0)
+                .await
+                .unwrap()
+                .status
+                != TerminalStatus::Exited
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the process exits");
+        assert!(matches!(
+            manager.write("thread", "term", "late").await,
+            Err(TerminalError::NotRunning { .. })
+        ));
+        assert!(backend.latest().writes().is_empty());
+        manager.shutdown().await;
+    }
+
+    /// Runs `future` on the runtime and tells, from the test thread, whether it finished
+    /// within `seconds`.
+    fn finishes_within<F>(seconds: u64, future: F) -> bool
+    where
+        F: std::future::Future + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            future.await;
+            let _ = sender.send(());
+        });
+        receiver.recv_timeout(Duration::from_secs(seconds)).is_ok()
+    }
+
+    /// A unary (MCP) write the child never reads holds the terminal's input; typing in the
+    /// same terminal queues behind it, while output publication and close go on (#139 slice
+    /// T review, round 3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_unary_write_never_blocks_typing_publication_or_close() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write("thread", "term", "stuck").await }
+        });
+        gate.wait_entered();
+        tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                ordered_write(
+                    &manager, connection, "thread", "term", &input_id, 0, "typed",
+                )
+                .await
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let clearing = manager.clone();
+        assert!(
+            finishes_within(2, async move { clearing.clear("thread", "term").await }),
+            "typing behind a stuck write holds the publication lock"
+        );
+        let closing = manager.clone();
+        assert!(
+            finishes_within(
+                5,
+                async move { closing.close("thread", Some("term")).await }
+            ),
+            "a stuck write blocks close"
+        );
+        gate.open();
+        manager.shutdown().await;
+    }
+
+    /// Typing queued behind a stuck write is dropped when the input session loses its
+    /// admission, so it never reaches the program later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_typing_is_dropped_when_its_admission_is_lost() {
+        let (_root, backend, manager, connection, closed, _input_id) =
+            ordered_input_fixture().await;
+        let lost = CancellationToken::new();
+        let lease = manager
+            .begin_input(
+                connection,
+                closed,
+                "thread",
+                "term",
+                1,
+                Some(super::super::input::TerminalInputAdmission::new(
+                    lost.clone(),
+                    (),
+                    None,
+                )),
+            )
+            .await
+            .expect("admitted lease");
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write("thread", "term", "stuck").await }
+        });
+        gate.wait_entered();
+        let typing = tokio::spawn({
+            let manager = manager.clone();
+            let input_id = lease.input_id.clone();
+            async move {
+                ordered_write(
+                    &manager, connection, "thread", "term", &input_id, 0, "typed",
+                )
+                .await
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        lost.cancel();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(typing.await.unwrap().is_err());
+        });
+        // The frame fails at once, without waiting for the stuck write to drain.
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)), Ok(true));
+        gate.open();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(backend.latest().writes(), ["stuck"]);
+        manager.shutdown().await;
+    }
+
+    /// PTY writes run on terminal writer threads, never Tokio's blocking pool, so stuck
+    /// terminals cannot use it up.
+    #[test]
+    fn stuck_terminal_writes_never_take_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut gates = Vec::new();
+        let (_root, manager) = runtime.block_on(async {
+            let (root, backend, manager, gate) = gated_terminal().await;
+            gates.push(OpenOnDrop(gate.clone()));
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread",
+                    "other",
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+            let other = Arc::new(WriteGate::default());
+            *backend.latest().write_gate.lock().unwrap() = Some(other.clone());
+            gates.push(OpenOnDrop(other));
+            for terminal in ["term", "other"] {
+                let manager = manager.clone();
+                tokio::spawn(async move { manager.write("thread", terminal, "stuck").await });
+            }
+            (root, manager)
+        });
+        for gate in &gates {
+            gate.0.wait_entered();
+        }
+        let free = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(|| ())).await
+        });
+        assert!(free.is_ok(), "stuck terminal writes hold the blocking pool");
+        drop(gates);
+        runtime.block_on(manager.shutdown());
+    }
+
+    /// Close and shutdown stop a terminal's input writer at once, so its thread and its hold
+    /// on the process go with the terminal instead of after the idle timeout (#139 slice T
+    /// review, round 4).
+    #[tokio::test]
+    async fn close_and_shutdown_stop_the_input_writer_at_once() {
+        let (root, _backend, manager, gate) = gated_terminal().await;
+        gate.open();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "other",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let mut generations = Vec::new();
+        for terminal in ["term", "other"] {
+            manager.write("thread", terminal, "ls\n").await.unwrap();
+            let generation = manager
+                .require_session("thread", terminal)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .generation
+                .clone();
+            assert!(generation.writer.thread_alive(), "{terminal}");
+            generations.push(generation);
+        }
+        let stopped = |generation: Arc<SessionGeneration>| async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while generation.writer.thread_alive() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+        manager.close("thread", Some("term")).await.unwrap();
+        assert!(
+            stopped(generations[0].clone()).await,
+            "close kept the writer"
+        );
+        manager.shutdown().await;
+        assert!(
+            stopped(generations[1].clone()).await,
+            "shutdown kept the writer"
+        );
+    }
+
+    /// A terminal whose program reads no input refuses input past its queue's bound instead
+    /// of holding it without limit.
+    #[tokio::test]
+    async fn a_terminal_refuses_input_past_its_queue_bound() {
+        let process = Arc::new(HistoryTestPty::with_identity(7));
+        let gate = Arc::new(WriteGate::default());
+        *process.write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        let process: Arc<dyn PtyProcess> = process;
+        let writer = super::super::writer::TerminalWriter::default();
+        let chunk = "z".repeat(64 * 1024);
+        let mut pending = Vec::new();
+        for _ in 0..super::super::writer::MOST_QUEUED_INPUT_BYTES / chunk.len() {
+            pending.push(
+                writer
+                    .enqueue(&process, &chunk, false)
+                    .expect("within the bound"),
+            );
+        }
+        // A full queue is an input refusal with its own code, not an I/O fault: the terminal
+        // RPC must not report it as a failed working-directory stat.
+        assert!(matches!(
+            writer.enqueue(&process, &chunk, false),
+            Err(TerminalError::Input(error)) if error.code == "capacity"
+        ));
+        gate.open();
+        for mut write in pending {
+            write.wait().await.expect("written once the program reads");
+        }
+        writer
+            .enqueue(&process, "after", false)
+            .expect("room again")
+            .wait()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

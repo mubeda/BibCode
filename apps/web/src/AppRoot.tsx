@@ -21,6 +21,8 @@ import { useShareExposureReconciler } from "./state/shareExposureReconciler";
 import { RemoteUpdateConfirmationCoordinator } from "./components/settings/UpdateServerDialog";
 import { RemoteUpdateRequestNotifier } from "./components/RemoteUpdateRequestNotifier";
 import { ServerReloadPrompt } from "./components/ServerReloadPrompt";
+import { McpAuthorizationNotifier } from "./components/McpAuthorizationNotifier";
+import { UiIntentNotifier } from "./components/UiIntentNotifier";
 import { isDesktopHost } from "./env";
 
 export function ShareExposureReconciler() {
@@ -175,6 +177,8 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
       <PreviewAutomationHosts />
       <PreviewNewWindowRouter />
       <OpenRequestRouter router={router} />
+      <UiIntentNotifier router={router} />
+      <McpAuthorizationNotifier router={router} />
       {isDesktopHost ? <DiagnosticLogsRelayHost /> : null}
     </AppAtomRegistryProvider>
   );

@@ -8,8 +8,9 @@
         "_tag": "Fail",
         "error": {
           "_tag": "ProjectWriteFileError",
-          "message": "=%=)XkB9x~",
-          "cause": null
+          "resolvedWorkspaceRoot": "0",
+          "restored": true,
+          "message": "😀"
         }
       }
     ]

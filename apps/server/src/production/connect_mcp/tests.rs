@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::mcp::tools::previews::{TOOL_OPERATIONS, operation_wire_name};
 
 type PreviewCall = (PreviewScope, String, Value, Option<String>);
 
@@ -205,6 +206,7 @@ fn context(headers: HeaderMap) -> RouteContext {
     RouteContext {
         headers,
         uri: Uri::from_static("http://127.0.0.1:43123/mcp"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     }
 }
@@ -215,6 +217,7 @@ fn cancelled_context(headers: HeaderMap) -> RouteContext {
     RouteContext {
         headers,
         uri: Uri::from_static("http://127.0.0.1:43123/mcp"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation,
     }
 }
@@ -398,6 +401,7 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
     let ipv6 = RouteContext {
         headers: HeaderMap::new(),
         uri: "http://[::1]:43123/mcp".parse().unwrap(),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     };
     assert!(allowed_origin(Some(&valid), &ipv6));
@@ -417,6 +421,7 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
     let origin_form = |headers| RouteContext {
         headers,
         uri: Uri::from_static("/api/connect/link-proof"),
+        origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     };
     let loopback = json!({"localHttpHost":"127.0.0.1","localHttpPort":43123});
@@ -720,6 +725,7 @@ async fn connect_routes_validate_payload_origin_and_runtime_failures() {
             RouteContext {
                 headers: HeaderMap::new(),
                 uri: Uri::from_static("https://remote.example/mcp"),
+                origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
                 cancellation: CancellationToken::new(),
             },
         ),
@@ -1035,16 +1041,15 @@ async fn cloud_health_and_mint_fail_closed_at_each_dependency() {
 #[tokio::test]
 async fn mcp_transport_enforces_auth_capacity_expiry_and_session_ownership() {
     let harness = harness(2, 1).await;
-    assert_eq!(
-        error(
-            harness
-                .service
-                .mcp(Method::GET, Vec::new(), context(HeaderMap::new()))
-                .await
-        )
-        .status,
-        StatusCode::METHOD_NOT_ALLOWED
+    // An unauthenticated GET is a discovery probe (slice R): 401, naming the metadata.
+    let probe = error(
+        harness
+            .service
+            .mcp(Method::GET, Vec::new(), context(HeaderMap::new()))
+            .await,
     );
+    assert_eq!(probe.status, StatusCode::UNAUTHORIZED);
+    assert!(probe.headers["www-authenticate"].contains("resource_metadata="));
 
     let first = harness
         .service
@@ -1195,20 +1200,19 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
         .unwrap();
     let auth = authorization(&issued);
 
-    for body in [
-        b"not-json".to_vec(),
-        serde_json::to_vec(&json!({"id":1})).unwrap(),
+    // A malformed message gets 400 with its JSON-RPC error in the body.
+    for (body, code) in [
+        (b"not-json".to_vec(), -32700),
+        (serde_json::to_vec(&json!({"id":1})).unwrap(), -32600),
     ] {
-        assert_eq!(
-            error(
-                harness
-                    .service
-                    .mcp(Method::POST, body, context(auth.clone()))
-                    .await
-            )
-            .status,
-            StatusCode::BAD_REQUEST
-        );
+        let response = harness
+            .service
+            .mcp(Method::POST, body, context(auth.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], code);
     }
     assert_eq!(
         error(
@@ -1240,19 +1244,19 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
         .status,
         StatusCode::NOT_FOUND
     );
+    // A message without an id is a notification: accepted, never answered.
     assert_eq!(
-        error(
-            harness
-                .service
-                .mcp(
-                    Method::POST,
-                    serde_json::to_vec(&json!({"method":"initialize"})).unwrap(),
-                    context(auth.clone()),
-                )
-                .await
-        )
-        .status,
-        StatusCode::BAD_REQUEST
+        harness
+            .service
+            .mcp(
+                Method::POST,
+                serde_json::to_vec(&json!({"method":"initialize"})).unwrap(),
+                context(auth.clone()),
+            )
+            .await
+            .unwrap()
+            .status,
+        202
     );
 
     let headers = initialize(&harness.service, &issued).await;
@@ -1271,10 +1275,10 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
     let unknown = rpc(
         &harness.service,
         headers.clone(),
-        json!({"method":"unknown"}),
+        json!({"id":9,"method":"unknown"}),
     )
     .await;
-    assert_eq!(unknown["id"], Value::Null);
+    assert_eq!(unknown["id"], 9);
     assert_eq!(unknown["error"]["code"], -32601);
 
     let listed = rpc(
@@ -1791,21 +1795,16 @@ async fn sqlite_failures_map_to_route_specific_errors_without_partial_responses(
 
 #[test]
 fn json_rpc_helpers_preserve_ids_headers_and_errors() {
-    let response = json_rpc_result(Some(json!(7)), json!({"ok":true}), None).unwrap();
+    let message = json!({"jsonrpc":"2.0","id":7,"result":{"ok":true}});
+    let response = mcp_json(StatusCode::OK, &message, None).unwrap();
     assert_eq!(response.headers.len(), 1);
     assert_eq!(
         serde_json::from_slice::<Value>(&response.body).unwrap()["id"],
         7
     );
-    assert_eq!(
-        error(json_rpc_result(None, Value::Null, None)).status,
-        StatusCode::BAD_REQUEST
-    );
-    let response = json_rpc_error(None, -32601, "missing", Some("session".into())).unwrap();
+    let response = mcp_json(StatusCode::NOT_FOUND, &message, Some("session".into())).unwrap();
+    assert_eq!(response.status, 404);
     assert_eq!(response.headers["mcp-session-id"], "session");
-    let body: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body["id"], Value::Null);
-    assert_eq!(body["error"]["message"], "missing");
 
     let error = ConnectMcpError::invalid_mcp_credential();
     assert_eq!(error.headers[header::WWW_AUTHENTICATE.as_str()], "Bearer");
@@ -2098,6 +2097,30 @@ fn device_screenshot_describes_both_image_formats() {
         description.contains("a full-size JPEG for a view-only iOS simulator"),
         "{description}"
     );
+}
+
+#[test]
+fn every_listed_provider_tool_is_registered_with_a_client_twin_of_its_own() {
+    use crate::mcp::control::{PrincipalKind, tool_spec, tool_specs};
+    let listed: Vec<String> = tool_descriptors(true)
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    let registered: Vec<&str> = tool_specs(PrincipalKind::Provider)
+        .map(|spec| spec.name)
+        .collect();
+    assert_eq!(listed, registered);
+    for name in &listed {
+        let spec = tool_spec(PrincipalKind::Provider, name).unwrap();
+        // They wait on a page or an emulator, so `mcp.<name>` is long-running.
+        assert!(spec.long_running, "{name}");
+        assert_eq!(spec.kind, PrincipalKind::Provider, "{name}");
+        assert!(spec.capability.is_none(), "{name}");
+        // Outside agents' twin (slice D) is a spec of its own, in the Workspace set.
+        let twin = tool_spec(PrincipalKind::Client, name).unwrap();
+        assert_eq!(twin.kind, PrincipalKind::Client, "{name}");
+        assert!(twin.long_running && !twin.holds_wait_slot, "{name}");
+    }
 }
 
 #[test]
@@ -2708,4 +2731,530 @@ mod device_tools {
                 .is_empty()
         );
     }
+}
+
+fn bearer(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+async fn post(service: &ConnectMcpService, headers: HeaderMap, request: Value) -> McpHttpResponse {
+    service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&request).unwrap(),
+            context(headers),
+        )
+        .await
+        .expect("MCP response")
+}
+
+fn body(response: &McpHttpResponse) -> Value {
+    serde_json::from_slice(&response.body).expect("JSON body")
+}
+
+fn names(listed: &Value) -> Vec<String> {
+    listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (_agent, token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("thread", "thread", "provider")
+        .await
+        .unwrap();
+
+    // A web page's Origin is refused; this server's own origin is not.
+    let mut from_page = bearer(&token);
+    from_page.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://evil.example"),
+    );
+    let refused = service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"ping"})).unwrap(),
+            context(from_page),
+        )
+        .await;
+    assert_eq!(error(refused).status, StatusCode::FORBIDDEN);
+    let mut own = bearer(&token);
+    own.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:3773"),
+    );
+    own.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3773"));
+    assert_eq!(
+        post(
+            &service,
+            own,
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"})
+        )
+        .await
+        .status,
+        200
+    );
+
+    // A legacy outside agent: no HTTP session, and an unknown version answers 2025-11-25.
+    let initialized = post(
+        &service,
+        bearer(&token),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}),
+    )
+    .await;
+    assert!(!initialized.headers.contains_key("mcp-session-id"));
+    assert_eq!(
+        body(&initialized)["result"]["protocolVersion"],
+        "2025-11-25"
+    );
+    let mut later = bearer(&token);
+    later.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2025-11-25"),
+    );
+    let listed = body(
+        &post(
+            &service,
+            later,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await,
+    );
+    let client_tools = names(&listed);
+    assert!(client_tools.contains(&"start_thread".to_owned()));
+    // Outside agents list their own twin of each preview tool, which names its thread.
+    let twin = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "preview_status")
+        .expect("the client twin is listed");
+    assert_eq!(twin["inputSchema"]["required"], json!(["threadId"]));
+    assert_eq!(listed["result"]["cacheScope"], "private");
+
+    // A provider lists no thread tools, and a provider's legacy initialize also negotiates.
+    let provider = initialize(&service, &issued).await;
+    let provider_tools = names(
+        &rpc(
+            &service,
+            provider.clone(),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert!(
+        provider_tools
+            .iter()
+            .all(|name| name.starts_with("preview_") || name.starts_with("device_"))
+    );
+
+    // Each kind's call to the other's tool is a scope refusal.
+    let crossed = rpc(
+        &service,
+        provider,
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"start_thread","arguments":{}}}),
+    )
+    .await;
+    assert_eq!(
+        crossed["result"]["structuredContent"]["error"]["_tag"],
+        "McpScopeError"
+    );
+
+    // A provider still reaches its own preview tool, for the thread its credential names.
+    let own = rpc(
+        &service,
+        initialize(&service, &issued).await,
+        json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"preview_status","arguments":{}}}),
+    )
+    .await;
+    assert_eq!(own["result"]["isError"], false, "{own}");
+    {
+        let calls = connect.controls.preview_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.provider_session_id, issued.provider_session_id);
+        assert_eq!(calls[0].0.thread_id, "thread");
+    }
+    // An outside agent's call of that name is its twin's, never the provider's: it needs a
+    // thread of this environment, not a provider's credential.
+    let twin_call = |id: u64, arguments: Value| {
+        post(
+            &service,
+            bearer(&token),
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"preview_status","arguments":arguments}}),
+        )
+    };
+    let missing = body(&twin_call(6, json!({})).await);
+    assert_eq!(
+        missing["result"]["structuredContent"]["error"]["_tag"],
+        "McpInvalidArgumentError"
+    );
+    let unknown = body(&twin_call(7, json!({ "threadId": "thread" })).await);
+    assert_eq!(
+        unknown["result"]["structuredContent"]["error"]["_tag"],
+        "McpThreadNotFoundError"
+    );
+    assert_eq!(connect.controls.preview_calls.lock().await.len(), 1);
+
+    // A modern request whose headers disagree with its body is refused.
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let mut mismatched = bearer(&token);
+    mismatched.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2026-07-28"),
+    );
+    mismatched.insert("mcp-method", HeaderValue::from_static("tools/call"));
+    mismatched.insert("mcp-name", HeaderValue::from_static("read_thread"));
+    let response = post(
+        &service,
+        mismatched.clone(),
+        json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_projects_and_threads","arguments":{},"_meta":meta}}),
+    )
+    .await;
+    assert_eq!(response.status, 400);
+    assert_eq!(body(&response)["error"]["code"], -32020);
+    mismatched.insert(
+        "mcp-name",
+        HeaderValue::from_static("list_projects_and_threads"),
+    );
+    let response = post(
+        &service,
+        mismatched,
+        json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_projects_and_threads","arguments":{},"_meta":meta}}),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(body(&response)["result"]["resultType"], "complete");
+
+    // Any other session token is not an MCP credential.
+    let link = crate::auth::issue_administrative_pairing_link(&tools.repositories, None)
+        .await
+        .unwrap();
+    let standard = tools
+        .auth
+        .exchange_bootstrap(
+            &link.credential,
+            Some(vec![
+                "orchestration:read".into(),
+                "orchestration:operate".into(),
+            ]),
+            crate::auth::ClientMetadata::default(),
+            None,
+            crate::auth::SessionTransport::Plain,
+        )
+        .await
+        .unwrap();
+    let refused = service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":8,"method":"tools/list"})).unwrap(),
+            context(bearer(&standard.token)),
+        )
+        .await;
+    assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED);
+
+    // Off: a typed refusal for outside agents, while provider tools keep working.
+    tools
+        .settings
+        .send_replace(crate::mcp::control::McpServerSettings {
+            enabled: false,
+            access: crate::mcp::control::McpAccess::FullAccess,
+            ..Default::default()
+        });
+    let off = body(
+        &post(
+            &service,
+            bearer(&token),
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert_eq!(off["error"]["data"]["_tag"], "McpServerDisabledError");
+    let provider = initialize(&service, &issued).await;
+    let status = rpc(
+        &service,
+        provider,
+        json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"preview_status","arguments":{}}}),
+    )
+    .await;
+    assert_ne!(
+        status["result"]["structuredContent"]["error"]["_tag"],
+        "McpServerDisabledError"
+    );
+    assert_ne!(
+        status["result"]["structuredContent"]["error"]["_tag"],
+        "McpScopeError"
+    );
+    // On again: the same token works with no new initialize.
+    tools
+        .settings
+        .send_replace(crate::mcp::control::McpServerSettings {
+            enabled: true,
+            access: crate::mcp::control::McpAccess::FullAccess,
+            ..Default::default()
+        });
+    let mut again = bearer(&token);
+    again.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2025-11-25"),
+    );
+    let listed = body(
+        &post(
+            &service,
+            again,
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert!(names(&listed).contains(&"read_thread".to_owned()));
+    tools.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wait_with_a_progress_token_streams_progress_then_its_result() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (agent, token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let started = tools
+        .control
+        .call(
+            &agent,
+            "start_thread",
+            &serde_json::from_value(json!({"projectId":"p1","prompt":"hi","providerInstanceId":"codex","model":"gpt-5"})).unwrap(),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let thread_id = started["structuredContent"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let mut response = post(
+        &service,
+        bearer(&token),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait_for_thread","arguments":{"threadId":thread_id,"timeoutMs":300},"_meta":{"progressToken":"p-1"}}}),
+    )
+    .await;
+    assert_eq!(response.headers["content-type"], "text/event-stream");
+    let mut stream = response.stream.take().expect("a streamed body");
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.recv().await {
+        frames.push(String::from_utf8(frame).unwrap());
+    }
+    let messages: Vec<Value> = frames
+        .iter()
+        .map(|frame| {
+            serde_json::from_str(frame.trim().strip_prefix("event: message\ndata: ").unwrap())
+                .unwrap()
+        })
+        .collect();
+    assert!(messages.len() >= 2, "{frames:?}");
+    assert_eq!(messages[0]["method"], "notifications/progress");
+    assert_eq!(messages[0]["params"]["progressToken"], "p-1");
+    let last = messages.last().unwrap();
+    assert_eq!(last["id"], 1);
+    assert_eq!(last["result"]["structuredContent"]["timedOut"], true);
+    tools.shutdown().await;
+}
+
+/// A request as it arrives through the managed tunnel at `origin`, or through a local proxy.
+fn arriving(headers: HeaderMap, class: crate::RequestClass, origin: &str) -> RouteContext {
+    RouteContext {
+        headers,
+        uri: Uri::from_static("/mcp"),
+        origin: crate::RequestOrigin {
+            class,
+            origin: Some(origin.to_owned()),
+            source_key: "tunnel".to_owned(),
+        },
+        cancellation: CancellationToken::new(),
+    }
+}
+
+fn ping() -> Vec<u8> {
+    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"ping"})).unwrap()
+}
+
+/// Slice R: each bearer kind is accepted only where it belongs. A provider's token and a
+/// relay session work on a direct request and get 401 through the tunnel or a proxy; a
+/// remote OAuth session works only at the origin its grant is bound to.
+#[tokio::test]
+async fn each_bearer_is_accepted_only_where_it_belongs() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (_agent, relay_token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let provider = service
+        .issue_mcp_credential("thread", "thread", "provider")
+        .await
+        .unwrap();
+    let provider_token = provider
+        .authorization_header
+        .strip_prefix("Bearer ")
+        .unwrap()
+        .to_owned();
+    let tunnel = "https://env-1.connect.example";
+    let (oauth_token, _) = crate::auth::oauth::test_remote_grant(
+        &tools.auth,
+        tunnel,
+        "approval-required",
+        "orchestration:read orchestration:operate",
+    )
+    .await;
+
+    for token in [&relay_token, &provider_token] {
+        let modern = |token: &str| {
+            let mut headers = bearer(token);
+            headers.insert(
+                "mcp-protocol-version",
+                HeaderValue::from_static("2025-11-25"),
+            );
+            headers
+        };
+        let direct = service
+            .mcp(Method::POST, ping(), context(modern(token)))
+            .await;
+        // A provider's legacy ping needs its session (400); neither is refused as a credential.
+        assert!(
+            direct
+                .as_ref()
+                .map_or_else(|error| error.status != StatusCode::UNAUTHORIZED, |_| true),
+            "a direct request is authenticated"
+        );
+        for (class, origin) in [
+            (crate::RequestClass::ManagedTunnel, tunnel),
+            (crate::RequestClass::LocalProxy, "https://proxy.example"),
+        ] {
+            let refused = error(
+                service
+                    .mcp(Method::POST, ping(), arriving(modern(token), class, origin))
+                    .await,
+            );
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{class:?}");
+        }
+    }
+
+    // The OAuth grant works at its own origin only.
+    let through_tunnel = service
+        .mcp(
+            Method::POST,
+            ping(),
+            arriving(
+                bearer(&oauth_token),
+                crate::RequestClass::ManagedTunnel,
+                tunnel,
+            ),
+        )
+        .await;
+    assert!(through_tunnel.is_ok());
+    for refused in [
+        context(bearer(&oauth_token)),
+        arriving(
+            bearer(&oauth_token),
+            crate::RequestClass::LocalProxy,
+            "https://other.example",
+        ),
+    ] {
+        assert_eq!(
+            error(service.mcp(Method::POST, ping(), refused).await).status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    tools.shutdown().await;
+}
+
+/// The 401 names the protected resource metadata on an eligible origin, for POST and GET
+/// alike; an authenticated GET is 405, and an outside agent has no session to DELETE.
+#[tokio::test]
+async fn the_challenge_names_the_metadata_on_an_eligible_origin_only() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (_agent, token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    for method in [Method::POST, Method::GET] {
+        let challenged = error(
+            service
+                .mcp(method.clone(), ping(), context(HeaderMap::new()))
+                .await,
+        );
+        assert_eq!(challenged.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenged.headers["www-authenticate"],
+            "Bearer resource_metadata=\"http://127.0.0.1:43123/.well-known/oauth-protected-resource/mcp\", scope=\"orchestration:read orchestration:operate\""
+        );
+        let tunnel = error(
+            service
+                .mcp(
+                    method.clone(),
+                    ping(),
+                    arriving(
+                        HeaderMap::new(),
+                        crate::RequestClass::ManagedTunnel,
+                        "https://env-1.connect.example",
+                    ),
+                )
+                .await,
+        );
+        assert!(
+            tunnel.headers["www-authenticate"]
+                .contains("https://env-1.connect.example/.well-known/oauth-protected-resource/mcp")
+        );
+        // A plain-HTTP LAN origin, or any other, serves no OAuth: a plain challenge.
+        let lan = error(
+            service
+                .mcp(
+                    method.clone(),
+                    ping(),
+                    arriving(
+                        HeaderMap::new(),
+                        crate::RequestClass::Direct,
+                        "http://192.168.1.5:3773",
+                    ),
+                )
+                .await,
+        );
+        assert_eq!(lan.headers["www-authenticate"], "Bearer");
+    }
+    assert_eq!(
+        error(
+            service
+                .mcp(Method::GET, Vec::new(), context(bearer(&token)))
+                .await
+        )
+        .status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let mut delete = bearer(&token);
+    delete.insert("mcp-session-id", HeaderValue::from_static("anything"));
+    assert_eq!(
+        error(
+            service
+                .mcp(Method::DELETE, Vec::new(), context(delete))
+                .await
+        )
+        .status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    tools.shutdown().await;
 }

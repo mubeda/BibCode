@@ -1720,6 +1720,98 @@ packaged application:
 
 Do not run destructive worktree scenarios against a user repository.
 
+## Outside-agent MCP smoke
+
+Run on each desktop (macOS, Windows, Linux) and on a server, against a disposable
+project. The focused gates are `cargo test -p bibcode-server --lib -- mcp::
+mcp_tools_tests connect_mcp auth::service::tests::the_mcp` (`mcp::` includes the
+`bibcode thread` tests in `mcp::thread_cli`) and
+`vp test run --project unit src/components/settings/AgentIntegrationsSection.test.tsx`
+from `apps/web`.
+
+1. In **Settings → Agents → Agent integrations**, check that **MCP server** is on,
+   **Agents may** reads Supervised, and the launch command names this install's
+   executable and data root (`--dev-url` for a development build).
+2. Use **Copy for Claude Code**, run it, restart Claude Code, and ask it to start a
+   thread in the project, wait for it, and show the diff. Expect one
+   **MCP · claude-code** row in **Authorized clients** while it runs, and none after
+   the agent exits.
+3. Run Codex with its default timeouts and ask for a `wait_for_thread` at
+   `timeoutMs: 50000`: it returns before Codex's 60 s tool timeout.
+4. Turn **MCP server** off during a wait: the wait ends with "turned off", a new
+   `bibcode mcp` exits naming the setting, and a provider's browser preview still
+   works. Turn it on: the agent's next call works without restarting it.
+5. Revoke the agent's row: its next call says to restart the MCP server.
+6. On Windows, run the desktop executable's `mcp` from an agent and check that
+   stdout carries only JSON-RPC (no console output mixed in). A Windows update
+   ends it with the app.
+7. From a terminal in the project's folder, run `bibcode thread start . "Say hello"
+   --wait` (the desktop executable's `thread` on a desktop): it prints the reply and
+   exits 0, and **CLI · bibcode thread** shows in **Authorized clients** only while
+   it runs. `bibcode thread list --json` lists the thread. With a Supervised thread
+   stopped at an approval, `send <thread> <message> --wait` exits 2. With **MCP
+   server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
+   that the desktop executable's output reaches the terminal and a pipe.
+8. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
+9. **A destructive tool.** At Supervised, make a change in the disposable project and ask
+   the agent to discard it. Claude Code asks before `git_discard` runs (it is marked
+   destructive); after you allow it, the file is in the system trash, the server log has
+   one `MCP destructive tool` line with the tool, thread and outcome and no path, and
+   **Agent activity** lists the call with a file count.
+10. **A terminal.** Turn **Terminals** on under **What agents can use** (it is disabled until
+    **Agents may** is Full access), restart the agent's MCP server, and ask it to open a
+    terminal and run `echo $((40+2))`. The terminal appears as a tab in the thread's center
+    panel and the agent reads back `42`. Turn **Terminals** off: the agent's next terminal
+    call is refused naming the set, and the tab stays open.
+11. **The off switch mid-push.** Give the disposable project a remote whose `pre-receive`
+    hook sleeps 30 seconds. Ask the agent to push with a `clientRequestId`, and turn **MCP
+    server** off while the push waits. The agent gets `McpOutcomeUnknownError` with
+    `reason: "mcp-disabled"`; after you turn it on again, a retry with the same id answers
+    the same, and `git_status` shows whether the push landed.
+12. **Stop and Take over.** While a turn the agent started runs, press **Stop** on the
+    status bar's **Agent active** indicator: the turn is interrupted, a turn you started in
+    another thread keeps running, and the agent's next call says its access ended. Restart
+    its MCP server, press **Take over**: reads still work and its next change is refused as
+    read-only. **Hand back** restores the level it had, and its next change works.
+13. **A webhook delivery.** In the **Webhooks** tab turn **Webhooks** on, add an endpoint at
+    a disposable public HTTPS receiver with `thread.status_changed`, copy the secret, and
+    **Send test event**: the receiver gets `webhook.test`, and its `X-BibCode-Signature`
+    verifies with the secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
+    shows. Start a thread: the receiver gets `thread.status_changed` events, and
+    `changes_since` from the first event's `cursor` returns the entries after it.
+14. **A remote OAuth connect**, once with Claude Code and once with Codex, on another
+    computer, through BiBCode Connect's managed tunnel and through an HTTPS reverse proxy
+    that follows the [Remote access](../user/remote-access.md#remote-ai-tools-over-https)
+    recipe (see the [MCP reference](../reference/mcp.md#remote-http-with-oauth) for the
+    flow):
+    1. **Connect.** Copy the command from **MCP → Remote agents**
+       (`claude mcp add --transport http bibcode https://<host>/mcp`, or
+       `codex mcp add bibcode --url https://<host>/mcp`) and run it. The tool opens a sign-in
+       page showing a code.
+    2. **Consent.** **Requests to connect** (and its toast) shows the same code and the tool's
+       name. Approve it at Supervised. The page returns to the tool, and **Authorized
+       clients** lists `MCP · <tool> (remote)`. Repeat once approving with
+       `bibcode mcp authorize <code>` on the host, and once with **Deny**: the tool reports
+       the sign-in was refused.
+    3. **A call.** Ask the tool to list projects and start a thread: it works at once after
+       sign-in. The same access token sent to the host's loopback address is refused (401).
+       A plain-HTTP LAN address answers no sign-in (404 on the metadata).
+    4. **A refresh after an hour.** Leave the tool idle for more than an hour, then ask for
+       `server_capabilities`: it answers without a new sign-in, and the grant's row stays
+       one row.
+    5. **Revocation.** **Revoke** the row: the next call fails, Codex says to run
+       `codex mcp login bibcode` and Claude Code shows **Re-authenticate**. Signing in again
+       makes a new row.
+    6. **Terminal re-authorization.** Turn **Terminals** on at Full access. The connected tool
+       still has no terminal tools, and a terminal call answers `McpScopeError` naming
+       `terminal:operate`. Sign in again asking for it (Codex:
+       `codex mcp login bibcode --scopes orchestration:read,orchestration:operate,terminal:operate`;
+       Claude Code: the server's `oauth.scopes`, then **Re-authenticate**), allow terminals
+       when approving, and open a terminal.
+
+Record the agent versions, the protocol version each negotiated and every
+message shown in the execution report.
+
 ## Remote-server update scenario
 
 Exercise the controlled second host from both Settings and the sidebar in both

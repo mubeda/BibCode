@@ -454,6 +454,7 @@ async fn assets_and_mcp_use_native_handlers_with_protocol_headers() {
                 status: if method == Method::POST { 200 } else { 204 },
                 headers: BTreeMap::from([("mcp-session-id".to_owned(), "session-1".to_owned())]),
                 body: Vec::new(),
+                stream: None,
             })
         })
     });

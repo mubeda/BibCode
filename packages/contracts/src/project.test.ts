@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ProjectCreateEntryError,
   ProjectDeleteEntryError,
+  ProjectDeleteEntryInput,
   ProjectDuplicateEntryError,
   ProjectFileVersion,
   ProjectListEntriesInput,
@@ -23,6 +24,7 @@ const decodeListError = Schema.decodeUnknownSync(ProjectListEntriesError);
 const decodeCreateError = Schema.decodeUnknownSync(ProjectCreateEntryError);
 const decodeRenameError = Schema.decodeUnknownSync(ProjectRenameEntryError);
 const decodeDeleteError = Schema.decodeUnknownSync(ProjectDeleteEntryError);
+const decodeDeleteInput = Schema.decodeUnknownSync(ProjectDeleteEntryInput);
 const decodeDuplicateError = Schema.decodeUnknownSync(ProjectDuplicateEntryError);
 const decodeSearchError = Schema.decodeUnknownSync(ProjectSearchEntriesError);
 const decodeWriteError = Schema.decodeUnknownSync(ProjectWriteFileError);
@@ -117,6 +119,102 @@ describe("project RPC inputs", () => {
 
   it.each(["true", 1, null])("rejects the invalid refresh value %s", (refresh) => {
     expect(() => decodeListEntriesInput({ cwd: "/workspace", refresh })).toThrow();
+  });
+
+  it("deletes permanently unless a delete asks for the trash", () => {
+    expect(decodeDeleteInput({ cwd: "/workspace", relativePath: "a.txt" })).not.toHaveProperty(
+      "toTrash",
+    );
+    expect(
+      decodeDeleteInput({ cwd: "/workspace", relativePath: "a.txt", toTrash: true }).toTrash,
+    ).toBe(true);
+    expect(() =>
+      decodeDeleteInput({ cwd: "/workspace", relativePath: "a.txt", toTrash: "yes" }),
+    ).toThrow();
+  });
+
+  it("names a trash that could not take an entry", () => {
+    expect(
+      decodeDeleteError({
+        _tag: "ProjectDeleteEntryError",
+        cwd: "/workspace",
+        relativePath: "a.txt",
+        failure: "trash_unavailable",
+        message: "The system trash could not take it; it was left in place.",
+      }).failure,
+    ).toBe("trash_unavailable");
+  });
+
+  it("lets a guarded write ask for a single-link file and names the failures it can meet", () => {
+    expect(
+      decodeGuardedWrite({
+        cwd: "/workspace",
+        relativePath: "a.txt",
+        contents: "x",
+        precondition: { _tag: "missing" },
+        singleLinkOnly: true,
+      }).singleLinkOnly,
+    ).toBe(true);
+    for (const failure of ["hard_linked", "write_failed"] as const) {
+      expect(
+        decodeWriteError({
+          _tag: "ProjectWriteFileError",
+          cwd: "/workspace",
+          relativePath: "a.txt",
+          failure,
+          restored: true,
+          message: "Writing a.txt failed.",
+        }).failure,
+      ).toBe(failure);
+    }
+  });
+
+  it("names a write refused while another BiBCode writer holds the file", () => {
+    expect(
+      decodeWriteError({
+        _tag: "ProjectWriteFileError",
+        cwd: "/workspace",
+        relativePath: "up.txt",
+        failure: "path_busy",
+        message: "Another BiBCode write or upload of up.txt is in progress.",
+      }).failure,
+    ).toBe("path_busy");
+  });
+
+  it("says where a folder delete that stopped part-way left what remains", () => {
+    const decoded = decodeDeleteError({
+      _tag: "ProjectDeleteEntryError",
+      cwd: "/workspace",
+      relativePath: "build",
+      failure: "partially_removed",
+      leftAt: ".bibcode-delete-0f3a",
+      message: "Deleting build stopped part-way; what is left is at .bibcode-delete-0f3a.",
+    });
+    expect(decoded.failure).toBe("partially_removed");
+    expect(decoded.leftAt).toBe(".bibcode-delete-0f3a");
+  });
+
+  it("says where a trashed entry that could not go back is kept", () => {
+    const decoded = decodeDeleteError({
+      _tag: "ProjectDeleteEntryError",
+      cwd: "/workspace",
+      relativePath: "a.txt",
+      failure: "kept_in_staging",
+      stagedAt: "bibcode-discard/0f3a/a.txt",
+      stagedIn: "git-dir",
+      message: "The trash could not take a.txt, and it could not be put back.",
+    });
+    expect(decoded.failure).toBe("kept_in_staging");
+    expect(decoded.stagedAt).toBe("bibcode-discard/0f3a/a.txt");
+    expect(decoded.stagedIn).toBe("git-dir");
+    expect(() =>
+      decodeDeleteError({
+        _tag: "ProjectDeleteEntryError",
+        failure: "kept_in_staging",
+        stagedIn: "elsewhere",
+        message: "x",
+      }),
+    ).toThrow();
   });
 });
 

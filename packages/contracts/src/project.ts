@@ -194,6 +194,19 @@ export const ProjectFileFailure = Schema.Literals([
   "operation_failed",
   "file_changed_on_disk",
   "file_missing_on_disk",
+  // A delete asked for the system trash, which could not take the entry; it was left in place.
+  "trash_unavailable",
+  // A folder delete stopped part-way; `leftAt` names where what is left now is.
+  "partially_removed",
+  // Another BiBCode writer (an upload, or a write that did not finish in time) holds the file.
+  "path_busy",
+  // The file has more than one hard link, and the write asked for a single-link file only.
+  "hard_linked",
+  // A write failed after emptying the file; `restored` says whether its old content came back.
+  "write_failed",
+  // The trash refused an entry and its name was taken meanwhile, so it could not go back: it is
+  // in BiBCode's staging folder, at `stagedAt` under the folder `stagedIn` names.
+  "kept_in_staging",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
@@ -213,6 +226,11 @@ export const ProjectFileOperation = Schema.Literals([
 ]);
 export type ProjectFileOperation = typeof ProjectFileOperation.Type;
 
+// Where an entry kept in BiBCode's staging folder is: the workspace's Git directory, or the
+// server's state directory (for a folder that is no Git repository).
+export const ProjectTrashStagingFolder = Schema.Literals(["git-dir", "state-dir"]);
+export type ProjectTrashStagingFolder = typeof ProjectTrashStagingFolder.Type;
+
 type ProjectFileFailureContext = {
   readonly cwd: string;
   readonly relativePath: string;
@@ -221,6 +239,10 @@ type ProjectFileFailureContext = {
   readonly resolvedWorkspaceRoot?: string;
   readonly operation?: ProjectFileOperation;
   readonly operationPath?: string;
+  readonly leftAt?: string;
+  readonly restored?: boolean;
+  readonly stagedAt?: string;
+  readonly stagedIn?: ProjectTrashStagingFolder;
   readonly cause?: unknown;
 };
 
@@ -271,6 +293,9 @@ export type ProjectWritePrecondition = typeof ProjectWritePrecondition.Type;
 export const ProjectWriteFileIfUnchangedInput = Schema.Struct({
   ...ProjectWriteFileInput.fields,
   precondition: ProjectWritePrecondition,
+  // Refuse a file with more than one hard link (`hard_linked`). Outside agents' writes set it; a
+  // person may save their own hard-linked file, so the Files panel does not.
+  singleLinkOnly: Schema.optional(Schema.Boolean),
 });
 export type ProjectWriteFileIfUnchangedInput = typeof ProjectWriteFileIfUnchangedInput.Type;
 
@@ -291,6 +316,8 @@ export class ProjectWriteFileError extends Schema.TaggedError<ProjectWriteFileEr
     resolvedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
     operation: Schema.optional(ProjectFileOperation),
     operationPath: Schema.optional(TrimmedNonEmptyString),
+    // With `write_failed`: whether the file's old content was put back after the write failed.
+    restored: Schema.optional(Schema.Boolean),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },
@@ -383,6 +410,10 @@ export class ProjectRenameEntryError extends Schema.TaggedError<ProjectRenameEnt
 export const ProjectDeleteEntryInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_ENTRY_PATH_MAX_LENGTH)),
+  // Move the entry to the system trash instead of deleting it. Off unless set; a trash that cannot
+  // take it fails with `trash_unavailable` and leaves it in place, or with `kept_in_staging` when
+  // its name was taken meanwhile and it stays in BiBCode's staging folder.
+  toTrash: Schema.optional(Schema.Boolean),
 });
 export type ProjectDeleteEntryInput = typeof ProjectDeleteEntryInput.Type;
 
@@ -401,6 +432,11 @@ export class ProjectDeleteEntryError extends Schema.TaggedError<ProjectDeleteEnt
     resolvedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
     operation: Schema.optional(ProjectFileOperation),
     operationPath: Schema.optional(TrimmedNonEmptyString),
+    // With `partially_removed`: the name, in the entry's own folder, where what is left now is.
+    leftAt: Schema.optional(TrimmedNonEmptyString),
+    // With `kept_in_staging`: where the entry is, relative to the folder `stagedIn` names.
+    stagedAt: Schema.optional(TrimmedNonEmptyString),
+    stagedIn: Schema.optional(ProjectTrashStagingFolder),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },

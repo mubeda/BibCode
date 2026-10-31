@@ -23,6 +23,10 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_DIAGNOSTICS_READ,
 ];
 
+/// The scopes of an outside agent's MCP credential (#139): never `terminal:operate`,
+/// `access:*` or `relay:*`.
+pub const MCP_CLIENT_SCOPES: &[&str] = &[SCOPE_ORCHESTRATION_READ, SCOPE_ORCHESTRATION_OPERATE];
+
 /// The one scope a diagnostics-only pairing offer grants.
 pub const DIAGNOSTICS_SCOPES: &[&str] = &[SCOPE_DIAGNOSTICS_READ];
 
@@ -186,6 +190,37 @@ pub struct RevokePairingRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RevokeClientRequest {
     pub session_id: String,
+    /// **Stop** for an outside agent (#139, slice X1): also interrupt each running turn whose
+    /// latest user message it sent. A plain revocation interrupts nothing.
+    #[serde(default)]
+    pub interrupt_turns: bool,
+}
+
+/// `POST /api/auth/clients/mcp-access`: **Take over** sets `read-only`; **Hand back** restores
+/// the level Take over replaced, and nothing else.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAccessRequest {
+    pub session_id: String,
+    pub access: String,
+}
+
+/// Approves a pending remote MCP authorization (#139, slice R): at `access`, with terminals
+/// only when asked for and allowed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveMcpAuthorizationRequest {
+    pub id: String,
+    pub access: String,
+    #[serde(default)]
+    pub terminals: bool,
+}
+
+/// Denies a pending remote MCP authorization.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DenyMcpAuthorizationRequest {
+    pub id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -232,14 +267,48 @@ pub struct ClientSessionView {
     pub current: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reach: Option<String>,
+    /// An outside agent's access ceiling (`mcp-client` sessions only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_access: Option<String>,
+    /// The access a person's Take over replaced; set while the agent is taken over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_access_hand_back: Option<String>,
+}
+
+/// A remote MCP authorization waiting for a person (#139, slice R), as the **Requests to
+/// connect** cards show it. `clientName` is the client's own, untrusted, text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMcpAuthorizationView {
+    pub id: String,
+    /// The code the consent page shows, `XXXX-XXXX`.
+    pub code: String,
+    pub client_name: String,
+    /// Where the authorization returns: host and port.
+    pub redirect_host: String,
+    /// It returns to `localhost` only, so the card warns about impersonation.
+    pub redirect_is_loopback: bool,
+    /// The origin the request used.
+    pub origin: String,
+    pub scopes: Vec<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(skip)]
+    pub expires_at_ms: i64,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum AuthAccessChange {
     PairingLinkUpserted(PairingLinkView),
-    PairingLinkRemoved { id: String },
+    PairingLinkRemoved {
+        id: String,
+    },
     ClientUpserted(ClientSessionView),
-    ClientRemoved { session_id: String },
+    ClientRemoved {
+        session_id: String,
+    },
+    /// The pending remote MCP authorizations changed; the list is the new whole.
+    PendingMcpAuthorizations,
 }
 
 #[derive(Clone, Debug)]

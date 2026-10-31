@@ -1,0 +1,5 @@
+{
+  "id": "fixture-mcp-authorization",
+  "access": "approval-required",
+  "terminals": false
+}

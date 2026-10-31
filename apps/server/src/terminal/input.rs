@@ -37,6 +37,14 @@ impl TerminalInputError {
         }
     }
 
+    /// A terminal whose program is not reading has as much input queued as it may hold.
+    pub(crate) fn queue_full() -> Self {
+        Self::new(
+            "capacity",
+            "The terminal's program is not reading its input, and its input queue is full.",
+        )
+    }
+
     fn closed() -> Self {
         Self::new(
             "closed",
@@ -471,15 +479,18 @@ impl PreparedTerminalInput<'_> {
         let data = self.data;
         lease.wait_turn(sequence).await?;
         // Loss of the current admission stops the write at once, without waiting for the
-        // cleanup task; a replaced admission's loss does not.
-        let written = loop {
+        // cleanup task; a replaced admission's loss does not. The frame is queued once: a
+        // replacement before it is queued tries again, and after it only changes whose loss
+        // is watched while the terminal's writer gets to it.
+        let queued = loop {
             let replaced = lease.admission_changed.notified();
             tokio::pin!(replaced);
             replaced.as_mut().enable();
             let lost = lease.admission_lost();
-            let write = lease
-                .identity
-                .write_input(data, &lease.closed, &lease.connection_closed);
+            let enqueue =
+                lease
+                    .identity
+                    .enqueue_input(data, &lease.closed, &lease.connection_closed);
             tokio::select! {
                 biased;
                 () = async { if let Some(lost) = &lost { lost.cancelled().await } else { std::future::pending().await } } => {
@@ -489,8 +500,30 @@ impl PreparedTerminalInput<'_> {
                 }
                 // Watch the replacement's loss instead; nothing was published yet.
                 () = &mut replaced => {}
-                written = write => break written,
+                queued = enqueue => break queued,
             }
+        };
+        let written = match queued {
+            Err(error) => Err(error),
+            Ok(mut pending) => loop {
+                let replaced = lease.admission_changed.notified();
+                tokio::pin!(replaced);
+                replaced.as_mut().enable();
+                let lost = lease.admission_lost();
+                tokio::select! {
+                    biased;
+                    written = pending.wait() => break written,
+                    () = async { if let Some(lost) = &lost { lost.cancelled().await } else { std::future::pending().await } } => {
+                        if lease.seal_on_current_admission_loss() {
+                            // Dropped unless the writer already started it; either way the
+                            // sealed session answers a failure.
+                            pending.cancel();
+                            break Err(TerminalError::PublicationCancelled);
+                        }
+                    }
+                    () = &mut replaced => {}
+                }
+            },
         };
         if let Err(error) = written {
             let failure = TerminalInputError::new(

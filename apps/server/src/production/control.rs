@@ -293,6 +293,8 @@ pub struct NativeServerControl {
     automatic_git_fetch_interval: watch::Sender<Duration>,
     profiler_enabled: watch::Sender<bool>,
     device_previews_enabled: watch::Sender<bool>,
+    webhooks_enabled: watch::Sender<bool>,
+    mcp_server: watch::Sender<crate::mcp::control::McpServerSettings>,
     settings_update_lock: Arc<Mutex<()>>,
     settings_generation: Arc<AtomicU64>,
     agent_activity_handler: AgentActivityHandlerSlot,
@@ -389,6 +391,8 @@ impl NativeServerControl {
             watch::channel(automatic_git_fetch_interval(&settings));
         let (profiler_enabled, _) = watch::channel(enabled_setting(&settings));
         let (device_previews_enabled, _) = watch::channel(device_previews_setting(&settings));
+        let (webhooks_enabled, _) = watch::channel(webhooks_setting(&settings));
+        let (mcp_server, _) = watch::channel(crate::mcp::control::mcp_server_settings(&settings));
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
         let provider_maintenance = ProviderMaintenance::new();
@@ -408,6 +412,8 @@ impl NativeServerControl {
             automatic_git_fetch_interval,
             profiler_enabled,
             device_previews_enabled,
+            webhooks_enabled,
+            mcp_server,
             settings_update_lock: Arc::new(Mutex::new(())),
             settings_generation: Arc::new(AtomicU64::new(0)),
             agent_activity_handler: AgentActivityHandlerSlot::default(),
@@ -481,6 +487,7 @@ impl NativeServerControl {
             "availableEditors": available_editors(),
             "observability": observability_snapshot(&self.state_directory),
             "settings": settings,
+            "mcpLaunch": mcp_launch(&self.config),
         })
     }
 
@@ -496,6 +503,18 @@ impl NativeServerControl {
     /// The committed `enableDevicePreviews`; changes as soon as a settings update commits.
     pub fn device_previews_enabled_signal(&self) -> watch::Receiver<bool> {
         self.device_previews_enabled.subscribe()
+    }
+
+    /// The committed `enableWebhooks` (#139 slice X8); changes as soon as a settings update
+    /// commits, so turning webhooks off stops deliveries at once.
+    pub fn webhooks_enabled_signal(&self) -> watch::Receiver<bool> {
+        self.webhooks_enabled.subscribe()
+    }
+
+    /// The committed `enableMcpServer` and `mcpServerAccess`; changes as soon as a settings
+    /// update commits, so connected MCP agents see it on their next call.
+    pub fn mcp_server_signal(&self) -> watch::Receiver<crate::mcp::control::McpServerSettings> {
+        self.mcp_server.subscribe()
     }
 
     /// The provider inventory this control publishes, for a launch to read a model's capabilities.
@@ -648,6 +667,26 @@ impl NativeServerControl {
                     *current = next_device_previews;
                     changed
                 });
+            let next_webhooks = webhooks_setting(&next);
+            commit_control.webhooks_enabled.send_if_modified(|current| {
+                let changed = *current != next_webhooks;
+                *current = next_webhooks;
+                changed
+            });
+            let next_mcp_server = crate::mcp::control::mcp_server_settings(&next);
+            commit_control.mcp_server.send_if_modified(|current| {
+                if *current == next_mcp_server {
+                    return false;
+                }
+                tracing::info!(
+                    enabled = next_mcp_server.enabled,
+                    access = next_mcp_server.access.as_str(),
+                    capabilities = ?next_mcp_server.capabilities,
+                    "MCP server setting changed"
+                );
+                *current = next_mcp_server;
+                true
+            });
             commit_control.publish(json!({
                 "version": 1,
                 "type": "settingsUpdated",
@@ -1997,6 +2036,27 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
     validate_optional_bool(object, "enableTerminalAgentActivity")?;
     validate_optional_bool(object, "enableProfiler")?;
     validate_optional_bool(object, "enableDevicePreviews")?;
+    validate_optional_bool(object, "enableMcpServer")?;
+    validate_optional_bool(object, "enableWebhooks")?;
+    if let Some(access) = object.get("mcpServerAccess")
+        && access
+            .as_str()
+            .and_then(crate::mcp::control::McpAccess::parse)
+            .is_none()
+    {
+        return Err(
+            "mcpServerAccess must be read-only, approval-required, auto-accept-edits or full-access"
+                .to_owned(),
+        );
+    }
+    if let Some(capabilities) = object.get("mcpCapabilities") {
+        let capabilities = capabilities
+            .as_object()
+            .ok_or_else(|| "mcpCapabilities must be an object".to_owned())?;
+        for capability in crate::mcp::control::McpCapability::ALL {
+            validate_optional_bool(capabilities, capability.key())?;
+        }
+    }
     validate_optional_bool(object, "newWorktreesStartFromOrigin")?;
     validate_optional_string(object, "worktreeBaseDirectory")?;
     validate_optional_string(object, "addProjectBaseDirectory")?;
@@ -2033,6 +2093,30 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
         validate_optional_bool(terminal, "webglEnabled")?;
     }
     Ok(())
+}
+
+/// The command an MCP agent on this host runs to reach this server (#139): this executable,
+/// `mcp`, this data root and, for the `dev` state, its dev URL. The UI wraps it for WSL or SSH
+/// and quotes it, so it never guesses a path, a root or a state. `null` when the executable is
+/// unknown.
+fn mcp_launch(config: &ServerConfig) -> Value {
+    let Ok(executable) = std::env::current_exe() else {
+        return Value::Null;
+    };
+    let mut argv = vec![
+        executable.to_string_lossy().into_owned(),
+        "mcp".to_owned(),
+        "--base-dir".to_owned(),
+        config.base_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(dev_url) = &config.dev_url {
+        argv.extend(["--dev-url".to_owned(), dev_url.to_string()]);
+    }
+    json!({ "argv": argv })
+}
+
+fn webhooks_setting(settings: &Value) -> bool {
+    settings.get("enableWebhooks").and_then(Value::as_bool) == Some(true)
 }
 
 fn device_previews_setting(settings: &Value) -> bool {
@@ -2389,6 +2473,16 @@ fn apply_settings_defaults(settings: &mut Value) {
             "enableProviderUpdateChecks": true,
             "enableChatAgentActivity": true,
             "enableTerminalAgentActivity": false,
+            "enableMcpServer": true,
+            "enableWebhooks": false,
+            "mcpServerAccess": "approval-required",
+            "mcpCapabilities": {
+                "workspace": true,
+                "sourceControl": true,
+                "files": true,
+                "diagnostics": true,
+                "terminals": false,
+            },
             "automaticGitFetchInterval": 180_000,
             "defaultThreadEnvMode": "local",
             "newWorktreesStartFromOrigin": false,
@@ -4957,9 +5051,88 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_launch_command_names_this_root_and_the_dev_state() {
+        let root = std::path::PathBuf::from("/tmp/a root with spaces");
+        let launch = mcp_launch(&ServerConfig::new(&root));
+        let argv: Vec<&str> = launch["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part.as_str().unwrap())
+            .collect();
+        assert_eq!(&argv[1..], ["mcp", "--base-dir", "/tmp/a root with spaces"]);
+        let dev = mcp_launch(
+            &ServerConfig::new(&root).with_dev_url("http://localhost:5733".parse().unwrap()),
+        );
+        let argv = dev["argv"].as_array().unwrap();
+        assert_eq!(argv[argv.len() - 2], "--dev-url");
+        assert_eq!(argv[argv.len() - 1], "http://localhost:5733/");
+    }
+
+    #[test]
     fn validates_enable_device_previews_as_bool() {
         assert!(validate_settings_document(&json!({"enableDevicePreviews": true})).is_ok());
         assert!(validate_settings_document(&json!({"enableDevicePreviews": "yes"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_server_signal_follows_committed_setting() {
+        let temp = tempfile::tempdir().expect("state");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let mut signal = control.mcp_server_signal();
+        assert!(signal.borrow().enabled, "on by default");
+        assert!(validate_settings_document(&json!({"mcpServerAccess": "everything"})).is_err());
+        control
+            .update_settings(
+                json!({"patch":{"enableMcpServer":false,"mcpServerAccess":"read-only"}}),
+            )
+            .await
+            .expect("update");
+        signal.changed().await.expect("changed");
+        let committed = *signal.borrow();
+        assert!(!committed.enabled);
+        assert_eq!(committed.access, crate::mcp::control::McpAccess::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn mcp_capabilities_default_validate_and_patch_one_set_at_a_time() {
+        let temp = tempfile::tempdir().expect("state");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let mut signal = control.mcp_server_signal();
+        assert_eq!(
+            signal.borrow().capabilities,
+            crate::mcp::control::McpCapabilities::default()
+        );
+        for invalid in [
+            json!({"mcpCapabilities": true}),
+            json!({"mcpCapabilities": {"terminals": "yes"}}),
+        ] {
+            assert!(validate_settings_document(&invalid).is_err(), "{invalid}");
+        }
+        let updated = control
+            .update_settings(json!({"patch":{"mcpCapabilities":{"terminals":true}}}))
+            .await
+            .expect("update");
+        assert_eq!(
+            updated["mcpCapabilities"],
+            json!({
+                "workspace": true, "sourceControl": true, "files": true,
+                "diagnostics": true, "terminals": true,
+            })
+        );
+        signal.changed().await.expect("changed");
+        assert!(signal.borrow().capabilities.terminals);
+        control
+            .update_settings(json!({"patch":{"mcpCapabilities":{"files":false}}}))
+            .await
+            .expect("update");
+        signal.changed().await.expect("changed");
+        let committed = signal.borrow().capabilities;
+        assert!(committed.terminals && !committed.files && committed.workspace);
     }
 
     #[tokio::test]
@@ -4976,6 +5149,28 @@ mod tests {
             .expect("enable device previews");
         signal.changed().await.expect("signal changes");
         assert!(*signal.borrow());
+    }
+
+    #[tokio::test]
+    async fn webhooks_signal_follows_committed_setting() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let mut signal = control.webhooks_enabled_signal();
+        assert!(!*signal.borrow(), "webhooks start off");
+        control
+            .update_settings(json!({"patch":{"enableWebhooks":true}}))
+            .await
+            .expect("enable webhooks");
+        signal.changed().await.expect("signal changes");
+        assert!(*signal.borrow());
+        assert!(
+            control
+                .update_settings(json!({"patch":{"enableWebhooks":"yes"}}))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

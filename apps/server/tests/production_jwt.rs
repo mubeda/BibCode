@@ -87,6 +87,7 @@ fn route_context() -> RouteContext {
     RouteContext {
         headers: HeaderMap::new(),
         uri: Uri::from_static("http://127.0.0.1:43123/connect"),
+        origin: bibcode_server::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
     }
 }

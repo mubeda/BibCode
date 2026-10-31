@@ -1004,16 +1004,16 @@ Pinned profiles allow one pre-auth HTTP request: the unauthenticated
 `/.well-known/bibcode/environment` descriptor, which is only a routing hint and
 is re-verified over RPC. The production call-site audit is:
 
-| Call site or surface                                                                                                                      | Host-key verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `environment/descriptor.ts`, `authorization/service.ts`, and `connection/pairingAdd.ts` descriptor fetches                                | Allowed unauthenticated descriptor request. Pairing and reconnect both re-verify identity inside E2EE.                                                                                                                                                                                                                                                                                                                                                                                            |
-| `/oauth/token`, `/api/auth/session`, and `/api/auth/websocket-ticket` helpers in `authorization/remote.ts` and `authorization/service.ts` | Not reachable for a profile with `hostKey`; those helpers serve legacy bearer, primary, relay, and SSH flows.                                                                                                                                                                                                                                                                                                                                                                                     |
-| `PreparedConnection.httpAuthorization`                                                                                                    | Explicitly `null` whenever `PreparedConnection.e2ee` is non-null. Pinned bearer credentials exist only in the E2EE auth form.                                                                                                                                                                                                                                                                                                                                                                     |
-| `assets.createUrl` and `apps/web/src/assets/assetUrls.ts`                                                                                 | URL issuance is authenticated RPC over E2EE. The resulting `/api/assets/<signed capability>/<path>` GET is a documented exception: it carries a bounded, expiring, resource-scoped HMAC capability and no bearer authorization.                                                                                                                                                                                                                                                                   |
-| `projects.createDownloadUrl`, `projects.createUploadUrl`, and `apps/web/src/components/files/fileTransfers.ts`                            | Same documented exception as `assets.createUrl`. URL issuance is authenticated RPC over E2EE; the resulting `GET`/`POST /api/transfers/<token>` carries a bounded, five-minute, resource-scoped HMAC capability and no bearer authorization. A download token names one entry and an upload token one file name in one directory, so a leaked URL reaches nothing else. The browser upload sends `credentials: "omit"`; desktop mode reaches the route from the Rust host instead of the WebView. |
-| `device.createMediaTicket` and `packages/client-runtime/src/device/mediaSocket.ts`                                                        | Ticket issuance is authenticated RPC over E2EE, and the ticket is redeemable only on the E2EE route. `GET /api/device-media-e2ee` carries no credential in the URL: it runs Noise_NK with the pinned key under the prologue `bibcode-device-media/1`, then reads the single-use ticket inside the encrypted records. See [Device media sockets](#device-media-sockets).                                                                                                                           |
-| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Its direct authenticated HTTP request (`POST /api/diagnostics/logs.zip`) is primary-environment-only and never targets a saved bearer profile; an E2EE bearer must not be added to it. Another environment's bundle is environment-scoped RPC: `server.downloadDiagnosticLogs` over that environment's own connection, so on a pinned profile the archive stays inside Noise. It is sent only to a server advertising `capabilities.diagnosticLogs`.                                              |
-| `rpc/http.ts` HTTP API client and primary/cloud-link callers                                                                              | The module is a transport constructor, not an independent request. Its host-key callers are limited to the descriptor row above; primary and Connect control-plane calls are not saved host-key targets.                                                                                                                                                                                                                                                                                          |
+| Call site or surface                                                                                                                      | Host-key verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `environment/descriptor.ts`, `authorization/service.ts`, and `connection/pairingAdd.ts` descriptor fetches                                | Allowed unauthenticated descriptor request. Pairing and reconnect both re-verify identity inside E2EE.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `/oauth/token`, `/api/auth/session`, and `/api/auth/websocket-ticket` helpers in `authorization/remote.ts` and `authorization/service.ts` | Not reachable for a profile with `hostKey`; those helpers serve legacy bearer, primary, relay, and SSH flows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `PreparedConnection.httpAuthorization`                                                                                                    | Explicitly `null` whenever `PreparedConnection.e2ee` is non-null. Pinned bearer credentials exist only in the E2EE auth form.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `assets.createUrl` and `apps/web/src/assets/assetUrls.ts`                                                                                 | URL issuance is authenticated RPC over E2EE. The resulting `/api/assets/<signed capability>/<path>` GET is a documented exception: it carries a bounded, expiring, resource-scoped HMAC capability and no bearer authorization.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `projects.createDownloadUrl`, `projects.createUploadUrl`, and `apps/web/src/components/files/fileTransfers.ts`                            | Same documented exception as `assets.createUrl`. URL issuance is authenticated RPC over E2EE; the resulting `GET`/`POST /api/transfers/<token>` carries a bounded, five-minute, resource-scoped HMAC capability and no bearer authorization. A download token names one entry and an upload token one file name in one directory, so a leaked URL reaches nothing else. A URL an outside agent minted over MCP also names its session and stops working, mid-transfer included, when that agent's access ends. The browser upload sends `credentials: "omit"`; desktop mode reaches the route from the Rust host instead of the WebView. |
+| `device.createMediaTicket` and `packages/client-runtime/src/device/mediaSocket.ts`                                                        | Ticket issuance is authenticated RPC over E2EE, and the ticket is redeemable only on the E2EE route. `GET /api/device-media-e2ee` carries no credential in the URL: it runs Noise_NK with the pinned key under the prologue `bibcode-device-media/1`, then reads the single-use ticket inside the encrypted records. See [Device media sockets](#device-media-sockets).                                                                                                                                                                                                                                                                  |
+| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Its direct authenticated HTTP request (`POST /api/diagnostics/logs.zip`) is primary-environment-only and never targets a saved bearer profile; an E2EE bearer must not be added to it. Another environment's bundle is environment-scoped RPC: `server.downloadDiagnosticLogs` over that environment's own connection, so on a pinned profile the archive stays inside Noise. It is sent only to a server advertising `capabilities.diagnosticLogs`.                                                                                                                                                                                     |
+| `rpc/http.ts` HTTP API client and primary/cloud-link callers                                                                              | The module is a transport constructor, not an independent request. Its host-key callers are limited to the descriptor row above; primary and Connect control-plane calls are not saved host-key targets.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ### BiBCode Connect
 
@@ -1748,14 +1748,34 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   Bearer, DPoP, and `wsTicket` authentication do not check `Origin`. The
   desktop app's `bibcode://app` origin gets no exception: it sends a bearer
   token with `credentials: "omit"` and never uses the cookie.
-- `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only from a loopback
-  socket peer, the same trust as `X-Forwarded-For`. From such a peer the first
+- `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only when the socket
+  peer is loopback **and** the raw `Host` is a loopback name or the address the
+  connection was accepted on (#139, slice R). From such a peer the first
   `X-Forwarded-Host` entry replaces `Host` before any handler runs, so the
   Origin rule, DPoP request URLs, and the preview gateway see the address the
-  browser used. Every other peer has both headers removed. A reverse proxy
-  must therefore run on the server's host and send `X-Forwarded-Host`. With
-  nginx's default `proxy_set_header Host $proxy_host`, a proxy that omits it
-  gets `403` on every cookie mutation and WebSocket.
+  browser used. Otherwise both headers are removed and `Host` is kept: a client
+  of the managed tunnel, whose `Host` is the public hostname, cannot turn it
+  into a loopback name with its own `X-Forwarded-Host`. A reverse proxy must
+  therefore run on the server's host, keep nginx's default
+  `proxy_set_header Host $proxy_host` (the loopback upstream), and overwrite
+  both forwarded headers. A proxy that omits `X-Forwarded-Host` gets `403` on
+  every cookie mutation and WebSocket; one that sends the public `Host` itself
+  loses `X-Forwarded-Proto`, so it serves no remote MCP sign-in.
+- The same layer classes each request once, before any route runs
+  (`RequestOrigin` in `http.rs`): **direct** (a loopback `Host` from a loopback
+  peer, or the accepted address, with no forwarded header; origin
+  `http://<Host>`), **managed tunnel** (a loopback socket and the managed
+  hostname in `Host`; origin `https://<managed hostname>`, fixed by the server),
+  **local proxy** (loopback peer and `Host` with `X-Forwarded-Host`; origin
+  `<X-Forwarded-Proto or http>://<X-Forwarded-Host>`), or **other** (anything
+  else, preview gateway hostnames included). The class also carries the
+  admission source key, `<class>:<network>`: the peer's /24 or /64 network, or
+  for a local proxy the last `X-Forwarded-For` entry's (`X-Forwarded-For` is
+  read for no other class), or `tunnel:`. The documented recipe overwrites
+  `X-Forwarded-For` with the client's address, but the server cannot prove it
+  did, so the `proxy` class is unproven: it shares a class cap and never evicts
+  another request (see
+  [Environment authentication](../cloud/environment-auth.md#remote-mcp-oauth)).
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently
@@ -1774,11 +1794,59 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   Noise. A read-scope session can watch a device but cannot start, stop, or
   drive it: `device.open`, `device.close`, `device.input`, and `device.rotate`
   need `orchestration:operate`.
-- The `device_*` MCP tools, like `preview_*`, perform no per-call scope check:
-  a valid provider MCP credential is issued only when the server launches a
-  thread's provider, so holding it is the operate grant. Issuing MCP
-  credentials to a lower-privileged principal would require a scope check in
-  both tool families first.
+- `/mcp` serves two kinds of principal (#139). A **provider credential** is the
+  random bearer the server issues when it launches a thread's provider; it holds
+  `orchestration:read orchestration:operate` implicitly and reaches only the
+  `preview_*` and `device_*` tools. An **outside agent** presents an `mcp-client`
+  session (see [Environment authentication](../cloud/environment-auth.md#outside-agents-over-mcp))
+  and reaches only the thread tools. Every other bearer gets 401.
+- `/mcp` checks each bearer's audience against the request's class (slice R):
+  a provider credential, and a relay or `bibcode thread` session (no
+  `mcp_resource`), only on a **direct** request; a remote OAuth session only
+  when the request's eligible origin plus `/mcp` is the resource its grant is
+  bound to. A token minted through one hostname therefore does not work through
+  another, and a tunnel hostname change needs a new sign-in (RFC 8707). A
+  request without an accepted credential gets 401; on an eligible origin it
+  carries `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp", scope="orchestration:read orchestration:operate"`,
+  for GET as for POST. An authenticated GET gets 405, and outside agents, which
+  are sessionless, get 405 on `DELETE`. A tool whose scope the credential lacks
+  is hidden from `tools/list` and refused with `McpScopeError` naming the scope. Each tool is
+  registered in `mcp::control` with its principal kind and the required scope of
+  the RPC method it maps to, and every call checks both before the handler runs;
+  a call to the other kind's tool is a scope refusal.
+- `/mcp` refuses a request whose `Origin` is not this server's own (403). A
+  modern (2026-07-28) request must repeat its version, method and tool name in
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` (400, `-32020`, on a
+  mismatch); an unknown modern method gets 404. Providers keep the legacy
+  `initialize` and `Mcp-Session-Id`; outside agents get no HTTP session, so a
+  restart or an off/on cycle loses nothing.
+- Outside agents reach `/mcp` from the same host only: `bibcode mcp` relays stdio
+  to loopback, and `bibcode thread` calls the same tools, after proving the listener with `POST /mcp/endpoint-proof`, an
+  unauthenticated, loopback-only route that signs a caller's nonce and the local
+  address and port the connection reached with the per-boot key in the
+  owner-only `server-runtime.json`. The relay dials exactly the record's
+  `dialHost` and `port` (a `--url` must name that listener), so another
+  listener on the same port of the other loopback family, or one that
+  forwards to the real server, cannot pass the proof. The first live owner
+  keeps the record: a second server for the same data root on another port
+  (the runtime guard is shared) leaves a record whose pid is alive and whose
+  listener answers the proof, or does not answer within 2 s, and runs without
+  MCP discovery; a record whose owner is gone is replaced. A remote
+  agent uses `ssh <host> bibcode mcp`, or remote Streamable HTTP with MCP OAuth.
+- **Remote Streamable HTTP with MCP OAuth** (slice R). BiBCode is the
+  authorization server for its own `/mcp` on an **eligible origin**: the managed
+  tunnel's, a local proxy's `https` one, or a direct loopback `http` one. Every
+  OAuth route answers 404 elsewhere, so a plain-HTTP LAN address keeps
+  `ssh <host> bibcode mcp`. The flow, the routes and the token lifetimes are in
+  [Environment authentication](../cloud/environment-auth.md#remote-mcp-oauth).
+  BiBCode Connect's managed tunnel gives an environment an HTTPS hostname, and
+  the Connect relay's own tokens never reach `/mcp`. A grant is approved in
+  BiBCode by a person with `access:write`, or on the host with
+  `bibcode mcp authorize`; the unauthenticated routes only create bounded,
+  expiring rows under per-client, per-source and global caps. Through the
+  managed tunnel the source key cannot be proven unforgeable, so a flood
+  through the tunnel can delay other tunnel sign-ins; it cannot grant access or
+  block direct, SSH or proxy requests, and turning MCP off ends it.
 - Emulator, adb, and scrcpy sockets listen on loopback only; BiBCode never
   passes `adb -a`.
 

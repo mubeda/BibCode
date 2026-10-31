@@ -107,6 +107,7 @@ import {
   SettingsSection,
   useRelativeTimeTick,
 } from "./settingsLayout";
+import { AgentIntegrationsSection } from "./AgentIntegrationsSection";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { StatusBarSettingsSection } from "./StatusBarSettingsSection";
@@ -1222,6 +1223,7 @@ export function AgentsSettingsPanel() {
           }
         />
       </SettingsSection>
+      <AgentIntegrationsSection />
     </SettingsPageContainer>
   );
 }

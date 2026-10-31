@@ -104,6 +104,18 @@ pub fn judge(ms: f64, p95: Option<f64>, samples: u64, interactive: bool) -> Tier
 /// duration says little about the server. These methods still emit `rpc.timing`, but never
 /// raise `rpc.slow` or count toward `rpc.saturation`, and their hang budget is 300 s.
 pub fn is_long_running(method: &str) -> bool {
+    // An MCP tool call (#139) is long-running when its spec says so (waits, network,
+    // devices) or any RPC method it dispatches to is. A client tool and a provider tool may
+    // share a name, so both kinds are asked.
+    if let Some(tool) = method.strip_prefix("mcp.") {
+        use crate::mcp::control::{PrincipalKind, tool_spec};
+        return [PrincipalKind::Client, PrincipalKind::Provider]
+            .into_iter()
+            .filter_map(|kind| tool_spec(kind, tool))
+            .any(|spec| {
+                spec.long_running || spec.methods.iter().any(|method| is_long_running(method))
+            });
+    }
     matches!(
         method,
         "vcs.clone"
@@ -181,6 +193,10 @@ pub fn is_long_running(method: &str) -> bool {
             // 1 s on an external program.
             | "review.listDiffTools"
             | "review.openDiffTool"
+            // Wait on a person's webhook endpoint: a lookup and a request of up to 10 s
+            // (#139 slice X8).
+            | "webhooks.sendTest"
+            | "webhooks.redeliver"
     )
 }
 
@@ -1144,6 +1160,25 @@ mod tests {
     }
 
     #[test]
+    fn an_mcp_tool_is_long_running_when_it_waits_or_dispatches_to_a_long_running_method() {
+        assert!(is_long_running("mcp.wait_for_thread"));
+        assert!(is_long_running("mcp.preview_wait_for"));
+        assert!(is_long_running("mcp.device_open"));
+        assert!(!is_long_running("mcp.read_thread"));
+        assert!(!is_long_running("mcp.no_such_tool"));
+        for spec in crate::mcp::control::tool_specs(crate::mcp::control::PrincipalKind::Client) {
+            let expected =
+                spec.long_running || spec.methods.iter().any(|method| is_long_running(method));
+            assert_eq!(
+                is_long_running(&crate::mcp::control::timing_name(spec.name)),
+                expected,
+                "{}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
     fn long_running_methods_raise_no_slow_or_saturation_findings() {
         let book = LatencyBook::default();
         book.observe("vcs.clone", "success", 12_000.0, 0.0, None);
@@ -1198,6 +1233,19 @@ mod tests {
         // Preparing an AI Terminal runs its provider's probe, a shim's manager and codesign.
         assert!(is_long_running("terminal.open"));
         assert!(!is_long_running("terminal.writeInput"));
+        // A test event or a redelivery waits on the person's endpoint (up to 10 s); the rest
+        // of the webhook methods read and write the store only.
+        assert!(is_long_running("webhooks.sendTest"));
+        assert!(is_long_running("webhooks.redeliver"));
+        for method in [
+            "webhooks.list",
+            "webhooks.listDeliveries",
+            "webhooks.upsert",
+            "webhooks.delete",
+            "webhooks.rotateSecret",
+        ] {
+            assert!(!is_long_running(method), "{method}");
+        }
     }
 
     #[test]

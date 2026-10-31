@@ -80,13 +80,16 @@ Serve setup flags.
 
 Run the reverse proxy on the same machine as the BiBCode server and have it send
 the browser's host in `X-Forwarded-Host`. BiBCode trusts `X-Forwarded-Host` and
-`X-Forwarded-Proto` only from a proxy on the same machine. For nginx:
+`X-Forwarded-Proto` only from a proxy on the same machine **whose own `Host` is
+the loopback address** it proxies to, so keep nginx's default
+`Host: $proxy_host` and overwrite both headers. For nginx:
 
 ```nginx
 location / {
   proxy_pass http://127.0.0.1:3773;
   proxy_set_header X-Forwarded-Host $http_host;
   proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-For $remote_addr;
   proxy_http_version 1.1;
   proxy_set_header Upgrade $http_upgrade;
   proxy_set_header Connection "upgrade";
@@ -95,7 +98,47 @@ location / {
 
 Without `X-Forwarded-Host`, nginx sends `Host: 127.0.0.1:3773`, and a browser
 signed in with its session cookie gets `403` on every change and on the live
-connection. Clients that use a bearer token are not affected.
+connection. Clients that use a bearer token are not affected. Set
+`X-Forwarded-For` to the client's own address, as above, rather than appending
+to what the client sent: BiBCode counts remote sign-in requests per client
+address, and an appended value would let a client pick its own. A proxy that sends
+the public host in `Host` itself loses `X-Forwarded-Proto`: browsers still work,
+but remote AI tools cannot sign in through it.
+
+### Remote AI tools over HTTPS
+
+An AI tool on another computer (Claude Code, Codex) can operate BiBCode over
+HTTPS with MCP OAuth, through BiBCode Connect's managed tunnel or a reverse proxy
+that follows the recipe above. Plain HTTP on a LAN address is refused; use
+`ssh <host> bibcode mcp` there instead.
+
+1. In **Settings → Agents → Agent integrations → MCP**, the **Remote agents** row
+   shows the MCP URL (`https://<host>/mcp`) with **Copy for Claude Code**
+   (`claude mcp add --transport http bibcode <url>`) and **Copy for Codex**
+   (`codex mcp add bibcode --url <url>`).
+2. Run the copied command on the other computer. The tool registers itself and
+   opens a sign-in page in its browser that shows a code such as `ABCD-2345`.
+3. Approve the request where this environment's access is managed: under
+   **Requests to connect** in the BiBCode app that manages it (the host's own
+   desktop app or web UI), after checking that the code matches, or on the host
+   with `bibcode mcp authorize ABCD-2345` (`bibcode mcp authorize` alone lists
+   the requests waiting; add `--access <level>`, `--terminals` or `--deny`).
+   Choose what the tool may do, at most the environment's **Agents may**.
+4. The sign-in page returns to the tool, which then stays signed in: its access
+   token lasts an hour and it refreshes it by itself.
+
+- A tool asks for terminals only when you sign it in again asking for
+  `terminal:operate` (Codex:
+  `codex mcp login bibcode --scopes orchestration:read,orchestration:operate,terminal:operate`;
+  Claude Code: set the server's `oauth.scopes`, then **Re-authenticate** in
+  `/mcp`), and you allow terminals when you approve.
+- Revoking the tool in **Authorized clients** ends it at once. Codex then says to
+  run `codex mcp login bibcode`, and Claude Code shows **Re-authenticate**.
+- A sign-in is bound to the address it used. If the tunnel's hostname changes,
+  sign in again.
+- With Tailscale Serve, use the MagicDNS name, never a `100.x` address (Codex
+  refuses those). Serve works only if it presents as the nginx recipe does (a
+  loopback `Host` and both forwarded headers); otherwise put nginx in front.
 
 Previews of a dev server that listens on the server's loopback are not available
 through a reverse proxy, through Tailscale Serve, or on a public address. Their
@@ -168,9 +211,11 @@ To keep the server running across reboots, install it as a per-user service
 with `bibcode service install --host <address>`; see
 [Standalone server installation](./server-installation.md#run-as-a-per-user-service).
 
-The CLI does not print a QR code and has no `project` subcommand. Pairing
-credentials come from `bibcode pairing offer` (encrypted offers for the desktop
-app) and `bibcode pairing issue` (the desktop SSH bootstrap). Use
+The CLI does not print a QR code and has no `project` or `thread` subcommand.
+Pairing credentials come from `bibcode pairing offer` (encrypted offers for the
+desktop app) and `bibcode pairing issue` (the desktop SSH bootstrap). An AI agent
+operates threads through `bibcode mcp`, including on a remote host as
+`ssh <host> bibcode mcp`; see [Outside agents over MCP](./mcp.md). Use
 `bibcode serve --help` for the implemented options.
 
 `--static-dir` explicitly overrides packaged web discovery and must contain

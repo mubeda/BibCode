@@ -85,6 +85,20 @@ vi.mock("~/state/server", () => ({
 vi.mock("~/state/environments", () => ({
   usePrimaryEnvironment: () => ({ environmentId: "local" }),
   usePrimaryEnvironmentId: () => "local",
+  // Agent integrations' Remote agents row reads the environment's address (#139, slice R).
+  useEnvironmentHttpBaseUrl: () => null,
+  // Settings → Agents also mounts Agent integrations, which picks among connected environments.
+  useEnvironments: () => ({
+    environments: [
+      {
+        environmentId: "local",
+        label: "local",
+        connection: { phase: "connected" },
+        serverConfig: null,
+      },
+    ],
+    isReady: true,
+  }),
   useEnvironment: (environmentId: string | null) =>
     environmentId === null ? null : { label: environmentId, connection: { phase: "connected" } },
 }));
@@ -137,6 +151,19 @@ vi.mock("~/state/query", () => ({
   }),
 }));
 vi.mock("~/state/vcs", () => ({ vcsEnvironment: { listRefs: () => ({ kind: "listRefs" }) } }));
+// Settings → Agents also shows the Agents panel; it reads the agent activity.
+vi.mock("~/state/mcpActivity", () => ({
+  usePrimaryMcpActivity: () => ({ rows: [], active: [], canManage: false, environmentId: null }),
+  usePrimaryMcpClients: () => [],
+  usePrimaryAgentAccess: () => ({ environmentId: null, canRead: false, canManage: false }),
+  takenOverLevel: () => null,
+}));
+// …and its header summarizes the webhook endpoints.
+vi.mock("~/state/webhooks", () => ({
+  useWebhookList: () => ({ data: null, error: null, refresh: vi.fn() }),
+  isFailingEndpoint: () => false,
+  webhooksEnvironment: {},
+}));
 vi.mock("~/state/worktrees", () => ({ worktreeEnvironment: { createManaged: h.createManaged } }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
 vi.mock("~/centerPanelStore", () => ({

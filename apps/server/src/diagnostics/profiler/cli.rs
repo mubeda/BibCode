@@ -143,9 +143,24 @@ pub fn run_profiler_cli(args: ProfilerArgs, state_dir: PathBuf) -> i32 {
 /// in-process server uses.
 pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
     let command = std::env::args_os().nth(1);
+    if command.as_deref() == Some(OsStr::new("mcp")) {
+        // Stdout carries only JSON-RPC: an agent's pipes are not a console, and attaching the
+        // parent's would mix its output in. `mcp authorize` (slice R) is a person's command,
+        // so it always uses the console.
+        use std::io::IsTerminal as _;
+        let authorize = std::env::args_os().nth(2).as_deref() == Some(OsStr::new("authorize"));
+        if authorize || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
+            attach_console();
+        }
+        return Some(desktop_mcp_dispatch());
+    }
     if command.as_deref() == Some(OsStr::new("diagnostics")) {
         attach_console();
         return Some(desktop_diagnostics_dispatch());
+    }
+    if command.as_deref() == Some(OsStr::new("thread")) {
+        attach_console();
+        return Some(desktop_thread_dispatch());
     }
     if command.as_deref() != Some(OsStr::new("profiler")) {
         return None;
@@ -196,6 +211,114 @@ fn desktop_diagnostics_dispatch() -> i32 {
             1
         }
     }
+}
+
+/// `<desktop exe> mcp …` (#139): the relay to this desktop's own running server, which it
+/// finds through the endpoint record in the desktop's data root.
+fn desktop_mcp_dispatch() -> i32 {
+    let cli = match DesktopMcpCli::try_parse_from(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return error.exit_code();
+        }
+    };
+    let action = match crate::config::mcp_action(cli.base_dir, cli.dev_url, cli.args) {
+        Ok(action) => action,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            return 1;
+        }
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async move {
+            match action {
+                crate::config::CliAction::McpAuthorize { options, args } => {
+                    crate::mcp::authorize_cli::run_mcp_authorize(options, args).await
+                }
+                crate::config::CliAction::Mcp(options) => {
+                    crate::mcp::relay::run_mcp_cli(options).await
+                }
+                _ => 1,
+            }
+        }),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            1
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "mcp",
+    about = "Serve MCP on stdin and stdout so an AI agent on this computer can operate this BiBCode app's threads."
+)]
+struct DesktopMcpCli {
+    /// The data root; BIBCODE_HOME or ~/.bibcode by default, as the desktop app uses.
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
+    /// The dev state's URL, as a development build's server uses.
+    #[arg(long)]
+    dev_url: Option<url::Url>,
+    #[command(flatten)]
+    args: crate::config::McpArgs,
+}
+
+/// `<desktop exe> thread …` (#139): `bibcode thread` against this desktop's own running
+/// server. A usage error exits 1, not clap's 2, which means a person must answer in BiBCode.
+fn desktop_thread_dispatch() -> i32 {
+    let cli = match DesktopThreadCli::try_parse_from(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return i32::from(error.exit_code() != 0);
+        }
+    };
+    let options = match crate::config::relay_options(
+        cli.base_dir,
+        cli.dev_url,
+        crate::config::McpArgs {
+            url: None,
+            access: None,
+            command: None,
+        },
+    ) {
+        Ok(options) => options,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            return 1;
+        }
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(crate::mcp::thread_cli::run_thread_cli(options, cli.args)),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            1
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "thread",
+    about = "List, start, message and show this BiBCode app's threads."
+)]
+struct DesktopThreadCli {
+    /// The data root; BIBCODE_HOME or ~/.bibcode by default, as the desktop app uses.
+    #[arg(long, global = true)]
+    base_dir: Option<PathBuf>,
+    /// The dev state's URL, as a development build's server uses.
+    #[arg(long, global = true)]
+    dev_url: Option<url::Url>,
+    #[command(flatten)]
+    args: crate::mcp::thread_cli::ThreadArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -311,7 +434,7 @@ fn write_followed(
 }
 
 /// `value` as compact JSON and a newline: what `--json` prints.
-pub(super) fn write_json(out: &mut impl Write, value: &Value) -> io::Result<()> {
+pub(crate) fn write_json(out: &mut impl Write, value: &Value) -> io::Result<()> {
     value.serialize(&mut serde_json::Serializer::with_formatter(
         &mut *out,
         EscapeControls,
@@ -320,7 +443,7 @@ pub(super) fn write_json(out: &mut impl Write, value: &Value) -> io::Result<()> 
 }
 
 /// `value` as the same compact JSON as [`write_json`], without the newline.
-pub(super) fn to_json(value: &Value) -> String {
+pub(crate) fn to_json(value: &Value) -> String {
     let mut text = Vec::new();
     write_json(&mut text, value).expect("writing to a Vec cannot fail");
     text.pop();
@@ -504,7 +627,7 @@ fn text(value: &Value, key: &str, missing: &str) -> String {
         .map_or_else(|| missing.to_owned(), plain)
 }
 
-pub(super) fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control() || is_hidden_format(c) {
@@ -631,6 +754,66 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_desktop_executable_parses_the_mcp_launch_command() {
+        let cli = DesktopMcpCli::try_parse_from([
+            "mcp",
+            "--base-dir",
+            "/data root",
+            "--dev-url",
+            "http://localhost:5733",
+            "--access",
+            "read-only",
+        ])
+        .expect("the copied launch command parses");
+        assert_eq!(
+            cli.base_dir.as_deref(),
+            Some(std::path::Path::new("/data root"))
+        );
+        assert_eq!(
+            cli.args.access,
+            Some(crate::mcp::control::McpAccess::ReadOnly)
+        );
+        assert!(DesktopMcpCli::try_parse_from(["mcp", "--access", "everything"]).is_err());
+    }
+
+    #[test]
+    fn the_desktop_executable_parses_a_thread_command() {
+        let cli = DesktopThreadCli::try_parse_from([
+            "thread",
+            "send",
+            "thread-1",
+            "-",
+            "--wait",
+            "--request-id",
+            "req-1",
+            "--json",
+            "--base-dir",
+            "/data root",
+        ])
+        .expect("a thread command parses");
+        assert_eq!(
+            cli.base_dir.as_deref(),
+            Some(std::path::Path::new("/data root"))
+        );
+        assert!(cli.args.json);
+        let crate::mcp::thread_cli::ThreadCommand::Send {
+            thread,
+            message,
+            wait,
+            request_id,
+        } = cli.args.command
+        else {
+            panic!("a send");
+        };
+        assert_eq!(
+            (thread.as_str(), message.as_str(), wait),
+            ("thread-1", "-", true)
+        );
+        assert_eq!(request_id.as_deref(), Some("req-1"));
+        assert!(DesktopThreadCli::try_parse_from(["thread", "send", "thread-1"]).is_err());
+    }
 
     fn parse(args: &[&str]) -> Result<ProfilerSubcommand, clap::Error> {
         DesktopCli::try_parse_from(std::iter::once("profiler").chain(args.iter().copied()))

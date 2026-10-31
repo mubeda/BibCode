@@ -1,4 +1,5 @@
 mod broadcaster;
+pub(crate) mod clone_policy;
 mod fetch_owner;
 pub mod manager;
 mod model;
@@ -17,9 +18,13 @@ pub use manager::graph::{
     COMMIT_PAGE_SIZE, GitManagerCommitEntry, GitManagerCommitPage, GitManagerGraphError,
     MAX_DIFF_BUFFER_SIZE, MAX_DIFF_LINE_CHARACTERS, MAX_PINNED_TIPS, MAX_REASONABLE_DIFF_SIZE,
 };
+#[cfg(unix)]
+pub(crate) use manager::operations::Moved;
+#[cfg(unix)]
+pub(crate) use manager::operations::trash_by_staging;
 pub use manager::operations::{
     CoAuthor, CommitRequest, DiscardError, DiscardOutcome, DiscardRequest, FileTrash,
-    FileTrashFuture, NativeFileTrash, TrashUnavailable, UndoCommitDraft,
+    FileTrashFuture, NativeFileTrash, TrashUnavailable, UndoCommitDraft, without_verbatim_prefix,
 };
 pub use manager::refs::{
     GitManagerBlockedReason, GitManagerInProgressKind, GitManagerInProgressOperation,

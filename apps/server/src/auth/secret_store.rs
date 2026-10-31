@@ -220,13 +220,7 @@ impl SecretStore {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "provider secret rotation uses atomic replacement in Task 11"
-        )
-    )]
+    /// Replaces a secret atomically (a webhook endpoint's rotation, #139 slice X8).
     pub async fn set(&self, name: &str, value: &[u8]) -> Result<()> {
         let path = self.secret_path(name)?;
         let temporary_path = self.write_temporary(name, value).await?;

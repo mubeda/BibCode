@@ -47,6 +47,7 @@ pub mod terminal;
 pub mod text_generation;
 pub mod transfer;
 pub mod vcs;
+pub(crate) mod webhooks;
 pub mod workspace;
 pub mod worktree_catalog;
 
@@ -69,7 +70,7 @@ pub use data_root::{
 pub use diagnostics::profiler::cli::{ProfilerArgs, run_profiler_cli};
 pub use http::{
     DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ENVIRONMENT_DESCRIPTOR_PATH,
-    ROUTE_INVENTORY, RouteMethod, RouteSpec,
+    ROUTE_INVENTORY, RequestClass, RequestOrigin, RouteMethod, RouteSpec,
 };
 pub use lifecycle::{ServerError, ServerHandle, ServerRuntime, StartupAccess};
 pub use maintenance::{
@@ -127,6 +128,23 @@ pub async fn run_cli() -> Result<(), RunError> {
             0 => Ok(()),
             code => std::process::exit(code),
         },
+        // Stdout carries only JSON-RPC, so nothing here logs to it.
+        CliAction::Mcp(options) => match mcp::relay::run_mcp_cli(options).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        },
+        CliAction::McpAuthorize { options, args } => {
+            match mcp::authorize_cli::run_mcp_authorize(options, args).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        CliAction::Thread { options, args } => {
+            match mcp::thread_cli::run_thread_cli(options, args).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         CliAction::Diagnostics { args, state_dir } => {
             match diagnostics::relay_cli::run_diagnostics_cli(args, state_dir).await {
                 0 => Ok(()),

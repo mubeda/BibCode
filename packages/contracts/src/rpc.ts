@@ -85,6 +85,27 @@ import {
   EnvironmentAuthorizationError,
   EnvironmentRpcError,
 } from "./auth.ts";
+import { McpActivityError, McpActivityStreamEvent } from "./mcpActivity.ts";
+import {
+  UiIntentError,
+  UiIntentStreamEvent,
+  UiPublishIntentInput,
+  UiPublishIntentResult,
+} from "./uiIntents.ts";
+import {
+  WebhookError,
+  WebhooksDeleteResult,
+  WebhooksEndpointInput,
+  WebhooksListDeliveriesInput,
+  WebhooksListDeliveriesResult,
+  WebhooksListInput,
+  WebhooksListResult,
+  WebhooksRedeliverInput,
+  WebhooksRotateSecretResult,
+  WebhooksSendResult,
+  WebhooksUpsertInput,
+  WebhooksUpsertResult,
+} from "./webhooks.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -199,6 +220,7 @@ import {
   OrchestrationRpcSchemas,
   ProviderInteractionMode,
   RuntimeMode,
+  THREAD_PURPOSE_MAX_LENGTH,
 } from "./orchestration.ts";
 import {
   CommandId,
@@ -411,6 +433,10 @@ export const WorktreeCreateManagedInput = Schema.Struct({
   newRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   baseRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   threadDefaults: WorktreeThreadDefaults,
+  /** Why an outside agent creates it (#139, slice X1); shown with the agent's label. */
+  purpose: Schema.optional(
+    Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
+  ),
 });
 export type WorktreeCreateManagedInput = typeof WorktreeCreateManagedInput.Type;
 
@@ -420,6 +446,10 @@ export const WorktreeCreatePanelInput = Schema.Struct({
   threadId: ThreadId,
   title: TrimmedNonEmptyString,
   threadDefaults: WorktreeThreadDefaults,
+  /** Why an outside agent opens it (#139, slices X1 and X4). */
+  purpose: Schema.optional(
+    Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
+  ),
 });
 export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
 
@@ -654,6 +684,18 @@ export const WS_METHODS = {
   serverRefreshProviderUsage: "server.refreshProviderUsage",
   serverConsumeCodexRateLimitReset: "server.consumeCodexRateLimitReset",
 
+  // An outside agent's UI suggestions (#139, slice X4)
+  uiPublishIntent: "ui.publishIntent",
+
+  // Outbound webhooks (#139, slice X8)
+  webhooksList: "webhooks.list",
+  webhooksListDeliveries: "webhooks.listDeliveries",
+  webhooksUpsert: "webhooks.upsert",
+  webhooksDelete: "webhooks.delete",
+  webhooksRotateSecret: "webhooks.rotateSecret",
+  webhooksSendTest: "webhooks.sendTest",
+  webhooksRedeliver: "webhooks.redeliver",
+
   // Remote updater methods
   updaterActiveWork: "updater.activeWork",
   updaterStatus: "updater.status",
@@ -679,6 +721,8 @@ export const WS_METHODS = {
   subscribeServerConfig: "subscribeServerConfig",
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
+  subscribeMcpActivity: "subscribeMcpActivity",
+  subscribeUiIntents: "subscribeUiIntents",
   subscribeActivity: "subscribeActivity",
   subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
   subscribeGitManagerSignal: "subscribeGitManagerSignal",
@@ -2022,6 +2066,81 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
   stream: true,
 });
 
+/** The agent activity log and who is active (#139, slice X1); needs `access:read`. */
+export const WsSubscribeMcpActivityRpc = Rpc.make(WS_METHODS.subscribeMcpActivity, {
+  payload: Schema.Struct({}),
+  success: McpActivityStreamEvent,
+  error: Schema.Union([McpActivityError, EnvironmentRpcError]),
+  stream: true,
+});
+
+/**
+ * Publishes an outside agent's UI suggestion (#139, slice X4). Only an `mcp-client` session
+ * may publish; clients only raise a notice, and nothing moves until a person clicks Show.
+ */
+export const WsUiPublishIntentRpc = Rpc.make(WS_METHODS.uiPublishIntent, {
+  payload: UiPublishIntentInput,
+  success: UiPublishIntentResult,
+  error: Schema.Union([UiIntentError, EnvironmentRpcError]),
+});
+
+/** The pending UI suggestions, then each new one (#139, slice X4). */
+export const WsSubscribeUiIntentsRpc = Rpc.make(WS_METHODS.subscribeUiIntents, {
+  payload: Schema.Struct({}),
+  success: UiIntentStreamEvent,
+  error: EnvironmentRpcError,
+  stream: true,
+});
+
+/** The webhook endpoints and whether webhooks are on (#139, slice X8). `access:read`. */
+export const WsWebhooksListRpc = Rpc.make(WS_METHODS.webhooksList, {
+  payload: WebhooksListInput,
+  success: WebhooksListResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
+/** One endpoint's recent deliveries, newest first. `access:read`. */
+export const WsWebhooksListDeliveriesRpc = Rpc.make(WS_METHODS.webhooksListDeliveries, {
+  payload: WebhooksListDeliveriesInput,
+  success: WebhooksListDeliveriesResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
+/** Adds or edits an endpoint; a new one's secret is returned once. `access:write`. */
+export const WsWebhooksUpsertRpc = Rpc.make(WS_METHODS.webhooksUpsert, {
+  payload: WebhooksUpsertInput,
+  success: WebhooksUpsertResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
+/** Deletes an endpoint with its delivery log and secret. `access:write`. */
+export const WsWebhooksDeleteRpc = Rpc.make(WS_METHODS.webhooksDelete, {
+  payload: WebhooksEndpointInput,
+  success: WebhooksDeleteResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
+/** Replaces an endpoint's secret and returns the new one once. `access:write`. */
+export const WsWebhooksRotateSecretRpc = Rpc.make(WS_METHODS.webhooksRotateSecret, {
+  payload: WebhooksEndpointInput,
+  success: WebhooksRotateSecretResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
+/** Sends `webhook.test` now and answers with the result. `access:write`. */
+export const WsWebhooksSendTestRpc = Rpc.make(WS_METHODS.webhooksSendTest, {
+  payload: WebhooksEndpointInput,
+  success: WebhooksSendResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
+/** Sends a logged delivery's event again now. `access:write`. */
+export const WsWebhooksRedeliverRpc = Rpc.make(WS_METHODS.webhooksRedeliver, {
+  payload: WebhooksRedeliverInput,
+  success: WebhooksSendResult,
+  error: Schema.Union([WebhookError, EnvironmentRpcError]),
+});
+
 export const WsActivityGetSnapshotRpc = Rpc.make(WS_METHODS.activityGetSnapshot, {
   payload: ActivityGetSnapshotInput,
   success: ActivitySnapshot,
@@ -2253,6 +2372,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
+  WsSubscribeMcpActivityRpc,
+  WsUiPublishIntentRpc,
+  WsSubscribeUiIntentsRpc,
+  WsWebhooksListRpc,
+  WsWebhooksListDeliveriesRpc,
+  WsWebhooksUpsertRpc,
+  WsWebhooksDeleteRpc,
+  WsWebhooksRotateSecretRpc,
+  WsWebhooksSendTestRpc,
+  WsWebhooksRedeliverRpc,
   WsActivityGetSnapshotRpc,
   WsActivityListRosterRpc,
   WsActivityListDetailRpc,

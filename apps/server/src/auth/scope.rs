@@ -79,6 +79,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "subscribeProjectEntries"
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
+        // An outside agent's UI suggestions (#139, slice X4).
+        | "subscribeUiIntents"
         | "subscribeVcsStatus"
         | "subscribeVcsStatusSummary"
         | "subscribeWorktreeCatalog"
@@ -163,7 +165,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.pull"
         | "vcs.stageFiles"
         | "vcs.switchRef"
-        | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
+        | "vcs.unstageFiles"
+        // Only an outside agent's session may publish; the handler checks it (slice X4).
+        | "ui.publishIntent" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "worktree.adopt"
         | "worktree.createManaged"
         | "worktree.createPanel"
@@ -191,7 +195,15 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // Crash dumps additionally need `orchestration:operate`, checked by the handler.
         "server.downloadDiagnosticLogs" => Some(SCOPE_DIAGNOSTICS_READ),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
-        "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
+        "subscribeAuthAccess" | "subscribeMcpActivity" => Some(SCOPE_ACCESS_READ),
+        // Outbound webhooks (#139 slice X8): settings an outside agent's `mcp-client` session,
+        // which never holds `access:*`, cannot read or change.
+        "webhooks.list" | "webhooks.listDeliveries" => Some(SCOPE_ACCESS_READ),
+        "webhooks.upsert"
+        | "webhooks.delete"
+        | "webhooks.rotateSecret"
+        | "webhooks.sendTest"
+        | "webhooks.redeliver" => Some(SCOPE_ACCESS_WRITE),
         // Two-tier policy: a pending-pairing session confirms its OWN
         // delivery through the session capability gate (which bypasses this
         // scope, since standard device grants do not carry access scopes);
@@ -292,6 +304,33 @@ mod tests {
             required_scope("auth.confirmPairing"),
             Some(SCOPE_ACCESS_WRITE)
         );
+        // Webhooks are access settings: an outside agent's credential reaches none of them.
+        for method in ["webhooks.list", "webhooks.listDeliveries"] {
+            assert_eq!(required_scope(method), Some(SCOPE_ACCESS_READ), "{method}");
+        }
+        for method in [
+            "webhooks.upsert",
+            "webhooks.delete",
+            "webhooks.rotateSecret",
+            "webhooks.sendTest",
+            "webhooks.redeliver",
+        ] {
+            assert_eq!(required_scope(method), Some(SCOPE_ACCESS_WRITE), "{method}");
+        }
+        for method in ACTIVE_RPC_METHODS
+            .iter()
+            .filter(|method| method.name.starts_with("webhooks."))
+        {
+            let scope = required_scope(method.name).expect("a scope");
+            assert!(
+                !super::super::model::scope_satisfies(
+                    super::super::model::MCP_CLIENT_SCOPES,
+                    scope
+                ),
+                "{}",
+                method.name
+            );
+        }
         assert_eq!(
             required_scope("updater.status"),
             Some(SCOPE_ORCHESTRATION_READ)

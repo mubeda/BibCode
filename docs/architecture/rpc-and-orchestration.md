@@ -638,6 +638,63 @@ application surface. Its unary methods are:
 | `gitManager.commit`, `gitManager.undoCommit`, `gitManager.discard`                                            | `orchestration:operate` | Commit or amend selected paths, undo the latest eligible local commit, or discard whole-file changes.                                                                                                                   |
 | `gitManager.stagePartial`, `gitManager.unstagePartial`, `gitManager.discardPartial`                           | `orchestration:operate` | Apply a generation-checked patch to the index or working tree.                                                                                                                                                          |
 
+**Whole-file discard** (`gitManager.discard`, for the Changes view and MCP's
+`git_discard`) restores tracked paths from Git and sends untracked ones to the
+server's trash. These refuse the whole call before anything moves:
+
+- a path whose folder resolves outside the checkout;
+- a path that starts with `.git` in any case. `validate_pathspecs` refuses this for
+  stage, unstage, stash and discard alike;
+- a path that resolves into, or holds, the Git directory or common directory.
+
+On macOS and Linux the trash takes a path and resolves it later, so each entry is
+first staged by folder handle:
+
+1. The canonical checkout is opened, and each folder of the path below it, with
+   `O_DIRECTORY|O_NOFOLLOW`, so a folder that is, or turns into, a link is never
+   entered.
+2. The entry is `renameat`ed by that handle into a new `0700` folder
+   `<git_dir>/bibcode-discard/<uuid>/`, created and opened the same way. That
+   folder sits on the repository's file system; Git never writes there, and no
+   checkout operation can reach it. `bibcode-discard` must be owned by the
+   server's user and writable by no group or other user. Otherwise it is not
+   used: the entry counts as a trash refusal. Before the rename, an origin record
+   `<uuid>.origin` is written beside the holder. It holds only the entry's path
+   below the worktree root Git reports for this Git directory; the root itself is
+   never stored. Right before the rename, the entry's held folder must still be
+   under the checkout (its `..` chain reaches the checkout's device and inode): a
+   folder another process moved out after it was opened stages nothing, and the
+   entry is kept where that folder went.
+3. Before the trash runs, the staged path, resolved by string, must name the
+   folders (from the Git directory down) and the entry BiBCode holds, by device and
+   inode. After a trash that answered success, the entry must be gone from the held
+   folder. If either check fails, the entry goes back and is kept.
+4. A refused entry is renamed back, never over a file created meanwhile
+   (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). The holder and its
+   record are removed once the entry is trashed or back. An entry whose name was taken
+   meanwhile stays in its holder: a discard lists it in `trashUnavailable`, and a Files
+   delete answers `kept_in_staging` with where it is (below).
+5. Each discard first recovers what a crash left behind. A discard holds an
+   exclusive `flock` on its holder folder from just after creating it until it is
+   done, so recovery, which takes that lock without waiting, never touches a holder a
+   live discard in any server process owns. The OS drops a dead process's lock. A
+   record whose holder recovery can lock, and that still holds its entry, has the
+   entry moved back the same way, from the worktree root down, when its place is free. Otherwise
+   the entry stays and a warning is logged. A record whose holder is empty is removed.
+   Records are not trusted. One whose path has anything but plain parts (a root, `.`
+   or `..`), a NUL, or starts with `.git` is ignored. Its path is opened without
+   following a link, so it can only restore into the checkout.
+
+A folder that is a link keeps its entry in `trashUnavailable`, also under
+`permitPermanent`. Any other staging failure, such as a Git directory on another
+file system or a missing entry, counts as a trash refusal, so `permitPermanent`
+still removes the entry through `git clean`. Because the trash took the staged
+path, **Put Back** does not return a file to the checkout; the Changes view says
+so on a macOS or Linux server. On Windows the move re-checks the canonical path and
+refuses a folder that is a reparse point, leaving the PowerShell call's own path
+resolution as the remaining window. After a permanent discard, the Changes view
+names any path still kept (an ignored file, or one in a linked folder).
+
 `subscribeGitManagerSignal` is the read-scoped generation/health stream described in
 the VCS section above. `gitManager.runOperation` is the one operate-scoped
 streaming command for branch lifecycle, fetch/pull/push, stash, merge, history
@@ -2095,7 +2152,8 @@ every live clone, and drains beside the worktree-removal tasks, so Git stops
 and each partial folder is removed before providers and terminals shut down.
 Clients send `attach` and `detach` only when the server advertises
 `vcsCloneReattach`: `CloneInput` accepts unknown fields, so an older server
-would run an `attach` as a new clone.
+would run an `attach` as a new clone. An outside agent's clone also meets the
+agent clone policy first (see [Clone tools](#clone-tools)).
 
 With that claim held, an already-accepted retry is replayed first. Every new
 removal must then acquire one finite runtime-cleanup lifetime slot before receipt
@@ -3267,6 +3325,590 @@ interrupting it, and a restore that fails is still recorded: the work log
 then says the conversation was rewound but the files were not restored. Every
 failure is a `checkpoint.revert.failed` activity.
 
+## Outside-agent thread tools
+
+The tools an outside agent calls on `/mcp` (#139) run inside the server. They live
+in families under `mcp::tools` (`threads`, `previews`, and one per later slice), each
+registered by one line in `mcp::control::FAMILIES`; a tool's `ToolSpec` names its
+principal kind, scope, RPC methods, capability set and hints, and lookup is by kind
+and name, so a client tool may share a provider tool's name. They reach the same
+handlers the UI uses through `RpcRegistry::invoke_local`, which checks the method's
+declared scope on the caller's session, takes its maintenance admission and runs the
+registered handler with its timing; `thread.turn.start` therefore goes through the
+durable ingress, workspace admission and receipt replay exactly as a WebSocket
+request does. Stream-only methods (`gitManager.runOperation`,
+`git.runStackedAction`) go through `RpcRegistry::invoke_local_stream`, which runs
+the same checks and drains the stream to its schema's terminal event: `finished` or
+`action_finished` is success, `failed`, `action_failed` or an error chunk is a typed
+failure, and a stream that closes first (or is cancelled, or passes its budget) is
+`McpStreamEndedError`.
+
+| Tool                        | Maps to                                                                               | Scope   |
+| --------------------------- | ------------------------------------------------------------------------------------- | ------- |
+| `list_projects_and_threads` | the `subscribeShell` builder, threads and projects each paged by offset               | read    |
+| `list_providers_and_models` | `server.getConfig` providers and session defaults                                     | read    |
+| `start_thread`              | `thread.turn.start` with `bootstrap.createThread`; attachments staged first           | operate |
+| `send_message`              | `thread.turn.start` with `queued: true`, then `thread.turn.steer` for `mode: "steer"` | operate |
+| `wait_for_thread`           | engine events and one targeted read                                                   | read    |
+| `read_thread`               | one keyset page of `projection_thread_messages` with `LIMIT`, texts cut in SQL        | read    |
+| `list_pending_requests`     | open questions and pending approvals, read directly                                   | read    |
+| `answer_question`           | `thread.user-input.respond`; an approval id is refused (`McpRequestKindError`)        | operate |
+| `answer_approval`           | `thread.approval.respond`; a question id is refused (`McpRequestKindError`)           | operate |
+| `revert_thread_to_turn`     | `thread.checkpoint.revert`, then the effects worker's outcome event                   | operate |
+| `interrupt_turn`            | `thread.turn.interrupt` for the running turn; nothing when no turn runs               | operate |
+| `get_turn_diff`             | `orchestration.getTurnDiff`, paged by file and offset                                 | read    |
+| `git_status`                | `vcs.refreshStatus` on the thread's folder                                            | read    |
+
+- **Retries.** With a `clientRequestId`, the first call stores the commands it built
+  in `mcp_tool_requests` (`INSERT OR IGNORE`, keyed by session and id, with the
+  argument digest). Every call with that key dispatches the stored payloads, so
+  command admission replays them by receipt state; other arguments under the same
+  key get `idempotency_conflict`. Rows older than 24 h are pruned on insert. The
+  credentials labelled `CLI · bibcode thread` share one scope instead of a session
+  each, because every CLI run mints its own; the scope is resolved from
+  `auth_sessions.client_label` in the same SQLite job.
+- **Recorded outcomes.** A tool whose RPC has no command receipt (Git and pull
+  request writes) runs it through `ToolCall::recorded` (`mcp::outcome`). With a
+  `clientRequestId` it is an owned mutation: its `mcp_tool_requests` row goes
+  `running`, then `done`, `failed` or `unknown` with the tool result (migration 59;
+  slice-1 rows read `commands`), it runs as a task `McpControl` owns, and a retry
+  returns the stored outcome without running anything. A `running` row no process
+  owns answers `McpOutcomeUnknownError`. Owned and unkeyed work alike runs under one
+  token that the off switch, read-only, revoking the session (through
+  `mark_connected_guard`) and `McpControl::shutdown` cancel; work they interrupt is
+  `unknown`, never success.
+- **Pages.** `list_projects_and_threads` pages threads with `cursor`/`nextCursor`
+  (`t:<n>`) and projects with `projectCursor`/`nextProjectCursor` (`p:<n>`), each
+  cursor continuing after the last entry its page returns. A call that continues
+  only one list returns only that list.
+- **Ceiling.** A start runs at most at the lower of the session's `mcp_access` and
+  `mcpServerAccess`; a send, an answer, an accepted approval or a revert on a thread
+  above it is refused, and `read-only` hides and refuses every operate tool. Declining
+  or cancelling an approval stops work, so it passes no thread to `ToolCall::commands`
+  and a retry is judged as its first call was.
+- **Attachments.** `start_thread` and `send_message` take at most 8 attachments, 3 MiB
+  decoded per call, as base64. A new request stages each through `uploads.begin` and
+  `uploads.append` under the MCP session, which owns the uploads and whose quota bounds
+  them, and stores commands that name the `uploadId`s, never the bytes; turn admission
+  consumes them. A failure cancels the uploads the call began. A staged upload lives
+  10 minutes idle and is lost on restart, so a retry whose stored turn was never
+  admitted after that gets `McpAttachmentExpiredError`, never a turn without its
+  attachments.
+- **Checkpoint revert.** `revert_thread_to_turn` refuses a running turn
+  (`McpTurnRunningError`, as the UI does) and a `turnCount` past the latest checkpoint,
+  then subscribes to engine events, dispatches, and waits up to 30 s for the first
+  outcome after its dispatch sequence in `orchestration_events`: `thread.reverted`,
+  `checkpoint.revert.files-only` (files restored, conversation kept), or
+  `checkpoint.revert.failed` (`McpCheckpointRevertError` with the worker's detail).
+  Reading the log rather than the live stream also answers a receipt replay.
+- **Waiting.** `wait_for_thread` subscribes to `subscribe_events()` before its first
+  read, keeps only the thread's events, re-reads at most once per 100 ms burst, and
+  returns when the selected turn settles (or, without `messageId`, the thread is
+  idle with nothing waiting to start), needs a person, fails, or 50 s pass. The
+  reply is the selected turn's own `assistant_message_id`. A `progressToken` turns
+  the answer into `text/event-stream` with status-only `notifications/progress`.
+  Every way out drops the receiver.
+- **Bounds.** At most 8 calls and 4 waits per session and 32 waits per
+  environment; only a tool that idles on the engine (`wait_for_thread`) holds a wait
+  slot. Owned mutations take 2 slots per session and 8 per environment, held until
+  their outcome is written. `enableMcpServer` off refuses calls with
+  `McpServerDisabledError` and ends waits; shutdown ends them right after the
+  profiler starts stopping.
+- **Capability sets.** `mcpCapabilities` turns tool sets on or off per environment
+  (`workspace`, `sourceControl`, `files`, `diagnostics` on; `terminals` off). A set
+  that is off hides its tools and refuses them with `McpCapabilityDisabledError`,
+  live.
+- **Clients.** `bibcode mcp` relays an agent's messages unchanged. `bibcode thread`
+  (`mcp::thread_cli`) calls the same tools itself in the modern era, over the
+  relay's `Connection` (setting check, endpoint proof, credential minted on first
+  call and revoked on exit, orphan sweep). It resolves `start .` from
+  `list_projects_and_threads`'s `workspaceRoot` over every project page, sends a
+  `clientRequestId` with each start and send (`--request-id`, else made up, and
+  reported as `requestId`), and loops `wait_for_thread` in 30 s slices for
+  `--wait`.
+
+### Worktree tools
+
+The `worktrees` family (`mcp::tools::worktrees`) reaches the worktree catalog's
+handlers, so creation and removal keep their command claims, generation checks,
+`operation_runtime` and profiler coverage.
+
+| Tool                        | Maps to                                                                                                                                           | Scope   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `list_worktrees`            | `vcs.refreshWorktreeCatalog`: descriptors joined with `adoptedWorkspaces` by `worktreeKey`, paged by offset                                       | read    |
+| `create_worktree`           | `worktree.createManaged`, thread defaults capped by the ceiling                                                                                   | operate |
+| `get_worktree_removal_plan` | `worktree.getRemovalPlan` for the host thread's project                                                                                           | read    |
+| `remove_worktree`           | `worktree.remove` (`delete-git-worktree` or `cleanup-stale-registration`, `forceDirty = discardChanges`) or `worktree.removeFromBibCode` (detach) | operate |
+
+- **Host threads only.** A thread with no worktree path, or one that is not the
+  worktree's `workspace` thread, is refused with `McpNotAWorktreeError` before any
+  RPC.
+- **Retries.** Both mutations store their RPC payload (with its `commandId`) through
+  `ToolCall::commands`, so a retry replays it by the catalog's receipt: a removal
+  replay records no second `worktree.removal` profiler event. The stored row carries
+  the host thread's `runtimeMode` beside the payload, so an unaccepted creation still
+  meets the current ceiling. The thread is resolved only for a new request, since a
+  completed removal deletes it.
+- **Removal plan.** `remove_worktree` sends `planToken` and `expectedGeneration`
+  as the agent passed them and never fetches a plan itself. The tool's `planToken`
+  is opaque: the catalog's token and whether `pruneImpact` fit in the result
+  (`pruneImpactCount` gives the total), signed under a per-process key
+  (`signed_token`, purpose `mcp-worktree-removal-plan`). A new removal opens it and
+  sends the catalog's token on; one the server did not sign is refused, and so is
+  `confirmRepositoryWidePrune` with a plan that did not fit
+  (`McpPruneImpactTooLongError`), since the prune would remove registrations the
+  agent never saw. A keyed replay sends the stored catalog token.
+- **Handoff.** The removal RPC runs in a task of its own under `McpControl`'s
+  shutdown token, not the call's, so a call cancelled or dropped after the catalog
+  took the removal over does not stop it. `McpControl::call` writes the
+  `MCP destructive tool` line when the call is still waiting. Otherwise the task
+  writes the line when the removal ends; a close-then-`try_recv` on the waiting side
+  makes that exactly one line.
+
+### Source Control reads and the commit message suggestion
+
+`mcp::tools::git` (slice X7, beside slice G's write tools) resolves the thread's folder
+when the call runs and calls the Source Control panel's reads. Every tool is in the
+`sourceControl` set; the three reads are read-only and idempotent, so they work at the
+read-only ceiling.
+
+| Tool                          | Maps to                                                                                   | Scope   |
+| ----------------------------- | ----------------------------------------------------------------------------------------- | ------- |
+| `git_diff`                    | `gitManager.getDiff` `working-tree` for one C5-checked path, paged at 16,000 characters   | read    |
+| `git_log`                     | `gitManager.getRefs` to resolve the ref, then `gitManager.getCommits` with one pinned tip | read    |
+| `git_refs`                    | `gitManager.getRefs` and `gitManager.getStashes`, projected without the guard reasons     | read    |
+| `git_generate_commit_message` | `vcs.generateCommitMessage` (deterministic "Update <paths>")                              | operate |
+| `git_set_commit_message`      | `ui.publishIntent` with `kind: "commitMessage"` and the folder the tool resolved          | operate |
+
+- **Diff.** `path` is required: the handler diffs one path and refuses `.`. The tool
+  drops Git's `--patch-with-raw -z` header (everything before the first `diff --git`
+  that starts a line) and pages the rest with `get_turn_diff`'s `diff_page`. A
+  `large-text` or `unrenderable` diff returns its kind and `byteLength` only, and an
+  image's bytes are never returned.
+- **Log.** `ref` is HEAD unless set; a branch, remote branch, tag (peeled) or full sha
+  resolves to one commit, which is the only pinned tip. The cursor is `sha:offset`, so
+  pages follow the first page's tip after the branch moves. Each subject is cut at
+  1,000 characters, each body at 2,000 (with `bodyChars`), and each file list at 50 (with
+  `changedFileCount`); the page is fitted to the result cap before its cursor is set.
+- **Generate** needs `orchestration:operate` because its method is registered as a
+  mutation, though it changes nothing; it carries `idempotentHint`.
+- **Suggest.** See the UI intents bullet below. The message must hold text, at most
+  8,000 characters, with no control character but tabs and line breaks
+  (`McpInvalidArgumentError` from the tool, `UiIntentError` `invalid` from the handler).
+
+### Pull request tools
+
+`mcp::tools::pull_requests` resolves the thread's folder and calls the handlers the
+Pull Requests and Source Control panels use. Every tool is in the `sourceControl`
+set and marked open-world (and so long-running); none holds a wait slot.
+
+| Tool                  | Maps to                                                                          | Scope   |
+| --------------------- | -------------------------------------------------------------------------------- | ------- |
+| `list_pull_requests`  | `pullRequests.list` (newest first, no filters, the host's opaque cursor)         | read    |
+| `view_pull_request`   | `pullRequests.get` and `pullRequests.getChecks`, together; body cut at 16,000    | read    |
+| `pull_request_checks` | `pullRequests.getChecks`                                                         | read    |
+| `create_pull_request` | `git.runStackedAction` with `action: "create_pr"`, through `invoke_local_stream` | operate |
+| `update_pull_request` | `pullRequests.runAction` `editPullRequest`, then `setDraft`                      | operate |
+| `merge_pull_request`  | `pullRequests.runAction` `merge` with `bypass: false` and the agent's `headSha`  | operate |
+
+The three writes run through `ToolCall::recorded`. A create's `action_failed` is a
+typed `GitActionFailedError` (with its `phase`) recorded as `failed`; a stream that
+closes before `action_finished` is `unknown`. When the edit lands and the draft
+change does not, `update_pull_request` records `McpPartialOutcomeError` naming what
+changed. The merge is destructive, so it writes the `MCP destructive tool` line.
+
+### Terminal tools
+
+`mcp::tools::terminals` is the `terminals` set. Every tool needs `terminal:operate`
+(minted only while the set is on at Full access), the set on, and an effective ceiling
+of Full access, which the family checks on every call, the reads included. The runtime
+attaches the `TerminalManager` to `McpControl` (`attach_terminals`).
+
+| Tool              | Maps to                                                                                                              | Hints       |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `terminal_list`   | `TerminalManager::thread_sessions` (memory)                                                                          | read-only   |
+| `terminal_open`   | `terminal.open` with a server-minted `mcp-<uuid>` id, the thread's `cwd`, `centerPanel: true`, no `command` or `env` | —           |
+| `terminal_write`  | `terminal.write`, after a status check (an exited terminal is `McpTerminalExitedError`)                              | destructive |
+| `terminal_read`   | `TerminalManager::read_history`: `TerminalHistory::read_window` or `tail` (memory)                                   | read-only   |
+| `terminal_resize` | `terminal.resize` without a size claim                                                                               | idempotent  |
+| `terminal_close`  | `terminal.close` for one terminal                                                                                    | destructive |
+
+- **Cursor.** `TerminalHistory` counts every byte ever pushed (`total_bytes_written`,
+  kept across `clear`) and an epoch from a counter that starts at a random 64-bit value
+  in each server lifetime. A cursor is
+  `<epoch>:<offset>`; one of another history (a restart or a reopened id), older than
+  the retained 1 MiB, or past the end reads from the oldest retained byte with
+  `dropped: true`. Without `raw`, CSI, OSC and other escape sequences are removed after
+  the raw window is read. An escape cut at the page's end moves `nextCursor` back to
+  its start; a page that is one unfinished escape skips it whole when the retained
+  output holds its end, else keeps `nextCursor` at its start.
+- **Writes.** `terminal.write` is the unordered unary path: MCP has no WebSocket
+  connection to scope the ordered input lease to. Every PTY write, unary or ordered,
+  goes through the process's `terminal::writer::TerminalWriter`: the caller checks the
+  session and enqueues under the publication lock without waiting (an ended process is
+  `TerminalNotRunningError`), and one `terminal-input` thread of the writer's own, not
+  Tokio's blocking pool, writes the queue in order outside that lock. The queue holds at
+  most 1 MiB queued or in flight per process. The thread retires after 30 s idle, and
+  close, exit, restart and shutdown stop it at once (`SessionGeneration::invalidate`)
+  without waiting for a write stuck in the kernel. OSC color replies go to a PTY-level
+  reply thread, so the output reader never waits on the PTY writer.
+  An ordered frame is queued once, in the poll that returns, so a replaced admission
+  never queues it twice; loss of its admission, or dropping the call, drops it unless
+  the writer started it. Writes to one terminal also take a per-terminal lock in the
+  tool layer, and one the terminal does not take within 10 s is
+  `McpOutcomeUnknownError` (`no-answer`). Keyed `terminal_open` and
+  `terminal_write` run through `ToolCall::recorded`; a write's stored payload keeps its
+  length, not its data.
+- **Lifetime.** A terminal an agent opened is the thread's terminal. It is a center-panel
+  terminal of the owner thread (a chat panel's host, else the thread itself), the kind
+  every client adopts through `subscribeTerminalMetadata`, and it outlives the MCP
+  session. Every terminal tool works on that owner thread.
+- **Content.** Terminal input and output never reach a log line or a profiler record.
+
+### Diagnostics tools
+
+`mcp::tools::diagnostics` serves the `diagnostics` set. Every result is an allowlisted
+projection built from named fields, never the RPC's own reply.
+
+| Tool                   | Maps to                                                                                                               | Scope   |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ------- |
+| `profiler_status`      | the stdio `profiler_status` handler over the server's own profiler directory, in `spawn_blocking`; findings projected | read    |
+| `profiler_findings`    | the same for `profiler_findings`, with its cursor; each finding keeps its kind's documented evidence                  | read    |
+| `profiler_events`      | the same for `profiler_events`; each event keeps its envelope and its kind's documented fields                        | read    |
+| `profiler_crash`       | the same for `profiler_crash` (local symbols only); the record, its events and its frames' files projected            | read    |
+| `diagnose_environment` | `server.getConfig`, `server.discoverSourceControl` (never `recordHosts`) and `server.getProfilerStatus`               | read    |
+| `refresh_providers`    | `server.refreshProviders` with no `instanceId`                                                                        | operate |
+| `process_diagnostics`  | `server.getProcessDiagnostics` and `server.getProcessResourceHistory`, without commands, labels or messages           | read    |
+| `trace_diagnostics`    | `server.getTraceDiagnostics`, without paths, causes or log entries                                                    | read    |
+
+The profiler tools take no RPC admission: they read files in process, as the stdio
+server does. A section of `diagnose_environment` that fails carries its error's tag
+instead of failing the call.
+
+### Feed tools
+
+`mcp::tools::feed` holds the two tools of no capability set (slice X3). Both need
+`orchestration:read`, call no RPC, and are listed at every ceiling.
+
+- **`server_capabilities`** returns `CARGO_PKG_VERSION` (as `serverInfo` does), the MCP
+  `protocol::VERSIONS`, the remote protocol window, `toolsVersion` (the first 8 bytes of
+  the SHA-256 of `McpControl::tools(principal)`, hex), the effective ceiling, the
+  `mcpCapabilities` sets, the credential's scopes, and `feed::ERRORS`, the table of every
+  tag the MCP layer returns with its meaning and fix. A unit test scans `mcp/**` and
+  `rpc/session.rs` and fails on an `Mcp…Error` literal the table lacks.
+- **`changes_since`** reads `Repositories::read_change_feed` in one SQLite transaction: at
+  most 5,000 events after the cursor's sequence (a thread's through its stream index),
+  stopped before the event whose transition-type payload, and for a session update the
+  previous session update its mapping reads, would bring the bytes SQLite parses past 4 MiB
+  (`octet_length` reads each size from the record header; the first event is always kept and
+  charged), of which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
+  `thread.session-set` and the approval and input `thread.activity-appended` events come
+  back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`
+  (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`);
+  and the `mcp_activity` rows after the cursor's activity id. A session update reads the
+  status and turn of the thread's previous session update (both that lookup and its cost
+  seek the partial index `idx_orch_events_thread_session_updates`, migration 60), so it maps
+  to `turn.started`,
+  `turn.completed`, `turn.interrupted`, `turn.failed` or `session.status`, or to nothing.
+  The cursor is `v1.<sequence>.<activityId>`; a page lists event entries first, then
+  activity entries, each with the cursor just after it, so cursors increase strictly and
+  nothing written in the same second is skipped. `activityDropped` compares the cursor
+  with the oldest activity row, or with `sqlite_sequence` once every row is pruned.
+- **The stdio relay** answers a `tools/call` whose credential is refused with
+  `McpCredentialRefusedError`, one it cannot deliver with `McpServerUnreachableError`, and
+  one it cannot sign in for with `McpSignInError`, each a typed tool result; other requests
+  keep their JSON-RPC errors.
+
+### Clone tools
+
+`mcp::tools::clone` is in the `workspace` set.
+
+| Tool               | Maps to                                                                              | Scope   |
+| ------------------ | ------------------------------------------------------------------------------------ | ------- |
+| `clone_repository` | one owned mutation: `vcs.clone` (no `detach`), then `project.create` with frozen ids | operate |
+| `clone_status`     | the clone's `mcp_tool_requests` row, read by replaying its key through `recorded`    | read    |
+| `cancel_clone`     | fires the clone task's stop token, then waits up to 15 s for the row to settle       | operate |
+
+- **Always owned.** `clone_repository` runs through `ToolCall::recorded` with the agent's
+  `clientRequestId` or a minted `clone-<uuid>`; that key is the `cloneId`, returned at the
+  top of every result so the activity row records it. The stored payload holds the
+  arguments, the URL, the destination and the frozen `projectId` and `commandId`. The call
+  waits 50 s, then answers `{ state: "running", cloneId }` and the task goes on, holding its
+  owned slot. `clone_status` replays the stored arguments with an already-cancelled wait:
+  a held claim answers `running`, a settled row its outcome, and a `running` row no process
+  owns `McpOutcomeUnknownError` (`restarted`).
+- **Stopping.** The task races its `vcs.clone` call against a stop token, the child of the
+  live controls' token, that `cancel_clone` also fires (a process-wide map by session and
+  `cloneId`). Dropping the call is what stops Git: without `detach`, the clone runtime's drop
+  guard cancels a clone this task started and removes its folder, and a clone it joined
+  goes on. Either way the work answers `McpOutcomeUnknownError`, recorded `unknown`; a live
+  control replaces it with its own reason, `cancel_clone`'s keeps `cancelled`.
+- **Registration.** After Git finishes, `project.create` runs with a fresh cancellation
+  token, under the agent's credential, so its events carry the agent's actor. The engine
+  answers a workspace root that is already registered with that project's id
+  (`process_envelope`'s existing-root check), so a retry never creates a second project.
+
+`vcs.clone` and `sourceControl.cloneRepository` read the principal from their context.
+For an `mcp-client` principal, before the runtime admits or joins anything, the parent
+folder must be the folder that holds a registered project (`clone_destination_refused`),
+and `git::clone_policy` checks the URL and returns the `ClonePlan` that
+`ReservedClone::transfer` runs Git with:
+
+- the URL is `https://`, written as the URL parser would write it, without user
+  information, and the folder name does not start with `-` (`clone_url_refused`);
+- Git is 2.37 or later, for `http.curloptResolve` (`clone_git_too_old`);
+- every Git command of the clone runs with an isolated configuration:
+  `GIT_CONFIG_GLOBAL` is the null device, `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_PARAMETERS` empty, `GIT_CONFIG_COUNT=0`, every proxy variable empty and
+  `NO_PROXY=*`, so none of the person's rewrites, credentials, proxies, URL-specific
+  `http.<url>.*` settings, hooks, fsmonitor or filter drivers apply; the commands inherit
+  nothing from the server (`env_clear`) but an allowlist (`PATH`, `TMPDIR`, `TEMP`, `TMP`,
+  `LANG`, `LC_*`, `TZ`, and the Windows system variables), with `HOME` the null device, and
+  the clone gets `--template=` so no hooks are copied;
+- `git ls-remote --get-url -- <url>` gives the URL after any `insteadOf` left (the clone
+  folder's enclosing repository), which must pass the same checks;
+- every address of the original and the rewritten host is globally reachable: no range the
+  IANA special-purpose registries mark otherwise, no multicast, no IPv6 outside `2000::/3`,
+  and mapped, NAT64 and 6to4 addresses judged by the IPv4 address they embed
+  (`clone_host_refused`, or `clone_host_unresolved`);
+- Git runs with `protocol.allow=never`, `protocol.https.allow=always`,
+  `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false`, one
+  `http.curloptResolve=<host>:<port>:<first address>` per named host, `http.proxy=`,
+  `core.hooksPath` and `core.fsmonitor` off, an empty and optional `filter.lfs` smudge and
+  process, `GIT_LFS_SKIP_SMUDGE=1` and `submodule.recurse=false`.
+
+For an agent principal `vcs.clone` also refuses `detach: true` (`clone_detach_refused`): a
+long clone goes through `clone_repository`, which owns it. A clone records the agent session
+that started it, and `vcs.cancelClone` from an agent cancels only such a clone
+(`clone_not_owned` otherwise); a person's `vcs.cancelClone` is unchanged.
+
+A refusal is a `GitCommandError` with a `reason` (`vcs.clone`), or a
+`SourceControlRepositoryError` with one (`sourceControl.cloneRepository`). A person's clone
+gets no plan and is unchanged. A request that joins a running clone shares the starter's
+Git, so an agent that joins a person's clone of the same URL, after its own check passed,
+waits on that unpinned clone.
+
+### Files tools
+
+`mcp::tools::files` serves the `files` set over the Files panel's own handlers.
+
+| Tool             | Maps to                                                                      | Scope   |
+| ---------------- | ---------------------------------------------------------------------------- | ------- |
+| `files_list`     | `projects.listEntries`, at most 200 entries                                  | read    |
+| `files_search`   | `projects.searchEntries`                                                     | read    |
+| `files_read`     | `projects.readFile`, paged to 16,000 characters (halved until the page fits) | read    |
+| `files_write`    | `projects.writeFileIfUnchanged` with a `version` or `missing` precondition   | operate |
+| `files_create`   | `projects.createEntry`                                                       | operate |
+| `files_rename`   | `projects.renameEntry`                                                       | operate |
+| `files_delete`   | `projects.deleteEntry` with `toTrash` unless `permanent`, recorded (C4)      | operate |
+| `files_download` | `projects.createDownloadUrl`, on the transfer base                           | read    |
+| `files_upload`   | `projects.createUploadUrl` with `overwrite` bound, on the transfer base      | operate |
+
+**Threat model.** Other processes work in the same folder, the provider's own agent among
+them, and can move, swap or write anything there at any moment.
+
+- (a) **Containment.** BiBCode never follows a link and never resolves a swapped path
+  component outside the workspace: every operation walks through no-follow handles, and every
+  held folder is re-checked right before each mutation. **Residual:** a concurrent process
+  moving an already-opened folder out of the workspace in the instant between that check and
+  the system call. BiBCode detects it afterwards where it can (a rename is undone, a folder it
+  just created is removed, a delete stops) and refuses further work, but cannot prevent it
+  without kernel support (`openat2` with `RESOLVE_BENEATH` is Linux-only).
+- (b) **BiBCode's own writers are serialized.** An agent's `files_*` call and a person's
+  Files-panel save, upload, rename or delete of the same path never race: all go through this
+  server and take the same per-path lock.
+- (c) **Not guaranteed:** atomicity against an editor outside BiBCode writing the same file.
+  POSIX has no compare-and-swap on file contents, so a write between a guarded write's check
+  and its write lands and is then overwritten. This is a documented residual.
+
+- **Containment.** Paths pass `validate_paths` (C5) first. The workspace service then
+  resolves the target's folder canonically and opens it from the canonical root one
+  component at a time with `O_DIRECTORY | O_NOFOLLOW`, acting on the entry by name through
+  that handle (`openat`, `unlinkat`, `renameat`, `mkdirat`; `workspace::beneath`). A symlink
+  met on the walk means the tree changed since the check and is `resolved_path_outside_root`.
+  Every caller, the Files panel included, gets this. The root is opened with
+  `O_DIRECTORY | O_NOFOLLOW` and must have the device and inode recorded when it was
+  validated (`beneath::Root`). Before each mutating call a held folder must still be under
+  the root (`Dir::contained`: `..` walked by handle to the root's identity), and a rename is
+  checked again after and undone if either folder left. Each folder a walk creates is made
+  only while its parent is under the root, checked before and after `mkdirat`, and removed
+  through the parent's handle if the parent moved out (one that something was already put in
+  stays, and the error says so). A folder's permanent removal renames it through the handle
+  to a fresh name, opens that name by handle, and empties it with `openat` and `unlinkat`,
+  re-checking that it is under the root before each removal, the parked name's own included,
+  and stopping at the first failed check; it removes the name only while it is still that
+  folder, so a folder put at the
+  parked name survives. If it stops, what is left goes back with a no-replace rename and the
+  caller learns where (`partially_removed`, `leftAt`). Folder downloads plan and stream
+  through the same no-follow handles (`plan_dir`, `archive_body_from`) and enforce the entry
+  and size limits while the zip streams.
+- **Trash by staging.** `projects.deleteEntry { toTrash }` reuses Source Control's discard
+  staging (`git::trash_by_staging`): the entry is renamed by handle into a private
+  `bibcode-discard` holder (in the workspace's Git directory, else under the server's state
+  directory, `workspace-trash/<hash of the root>`), each folder on the staged path is checked
+  against what BiBCode holds, and only that path goes to the native trash. No workspace path
+  is handed to it. A holder on another file system, or one without the no-replace rename,
+  stages nothing: `trash_unavailable`. An entry the trash refused that cannot go back,
+  because something took its name meanwhile, stays in its holder and the delete answers
+  `kept_in_staging` (`McpTrashStagedError` for agents) with `stagedAt`, its path below the
+  folder `stagedIn` names (`git-dir` or `state-dir`); the panel's message gives the full
+  path. The next trash or discard there moves it back once the name is free.
+- **One writer per path.** `PathLocks` (in the workspace service, shared with the upload
+  route), keyed by canonical path, serializes a guarded or plain write, an upload, a delete
+  or trash, and a rename (both its paths, in key order). An upload holds it from its
+  reservation to its install; a write arriving meanwhile is refused at once (`path_busy`,
+  `McpFileBusyError` for agents), and other writers wait at most 10 seconds.
+- **Writes in place.** `projects.writeFileIfUnchanged` with `missing` creates with `O_EXCL`;
+  with a `version` it opens the file `O_RDWR | O_NOFOLLOW` through the re-validated folder,
+  checks its identity and content through that descriptor, then truncates and writes it, so
+  the file keeps its inode, links, owner, permissions, ACLs and extended attributes. The old
+  content (up to 16 MiB) is kept and written back if the write fails after the truncation;
+  `write_failed` says whether it came back. With `singleLinkOnly` (set by `files_write`, not
+  by the Files panel) a file with more than one hard link is refused (`hard_linked`,
+  `McpHardLinkedFileError`): writing it in place would change its other names, which can be
+  outside the workspace. A person may save their own hard-linked file.
+- **No replacement by surprise.** `projects.renameEntry`, an upload without `overwrite` and a
+  delete's restore use one no-replace rename (`beneath::rename_no_replace`, shared with
+  Source Control's discard staging): `renameat2(RENAME_NOREPLACE)` or
+  `renameatx_np(RENAME_EXCL)`. A file system without the flag is refused
+  (`ErrorKind::Unsupported`), for files and folders alike. An upload replaces or removes its
+  name only while it is still its own empty reservation (`Dir::remove_own`).
+- **Windows.** `std` has no `*at` calls there, so every operation re-checks its folder and
+  works by path, as the Files panel did before; the MCP tools that change files answer
+  `McpPlatformUnsupportedError` instead of running with that race.
+- **Trash.** `projects.deleteEntry { toTrash }` uses the same `FileTrash` as Source
+  Control's discard and fails `trash_unavailable` rather than deleting.
+- **Errors.** A workspace error's `failure` is kept on the tool failure, and the message is
+  rewritten to name the path the agent gave, never the host's absolute path.
+- **Transfers.** `McpControl::attach_transfer_base` holds the bound address
+  (`local_http_base`, set after bind); the URL is that base plus the minted relative URL, and
+  `transferId` (`transfer::transfer_id`, a hash of the token) ties the mint's activity row to
+  the route's.
+
+### Actor attribution and agent activity
+
+Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
+
+- **Actor.** `principal_actor(context)` is `{ kind: "mcp-client", clientId, label }` for an
+  `mcp-client` principal (its session id and its Authorized clients label at dispatch time)
+  and `None` for any other. `orchestration.dispatchCommand`, `worktree.createManaged` and
+  `worktree.createPanel` attribute their `CommandAdmissionClaim` to it
+  (`attribute_to`), and `process_envelope` stamps `metadata.actor` on every event the command
+  plans. The actor never comes from the command, so a client cannot claim one: a public
+  command's `actor` or `metadata` is ignored. `infer_actor_kind` stores `actor_kind =
+  'mcp-client'` for such events, and `wire_event` already carries the metadata.
+- **Projections (migration 60).** `projection_thread_messages.actor_json` holds the actor of
+  a `role = 'user'` message, `projection_thread_messages.source_thread_id` a message's
+  `sourceThreadId` (another thread of the target's worktree, set only by X4's panel
+  messages; see below), and
+  `projection_threads.requester_json` `{ actor, purpose }` for a thread an agent created
+  (a `thread.create` or `bootstrap.createThread` `purpose`, at most 200 characters, an
+  engine invariant). The thread stream's messages carry `actor` and `sourceThreadId`, the
+  shell's threads carry `requester`, and `read_thread` returns both.
+- **Activity rows.** `McpControl::call_in` records one `mcp_activity` row per call of a
+  non-read-only tool that reached its handler: time, session, label, tool, thread, outcome
+  (`success` or the error tag) and a target of ids and counts only (`sha`, `revertedSha`,
+  `pullRequest`, `worktreeKey`, `fileCount`, `cloneId`, `transferId`). A keyed call whose
+  `clientRequestId` already has a live `mcp_tool_requests` row is a retry and records
+  nothing; a keyed call cancelled while its owned mutation goes on is recorded once that
+  row settles. Rows are pruned past 7 days or 5,000 after each insert and past 7 days at
+  startup; reads only filter by that cutoff and never write, so an `access:read` subscriber
+  deletes nothing. A write failure is a `tracing::warn!` and never fails the call.
+- **Attributed turns.** A running turn belongs to the actor of the command that started
+  it: the user message it was started for (`projection_turns.pending_message_id`) carries
+  that actor. A turn started by no message, such as a compaction, belongs to no agent. The
+  lookup walks the partial index `idx_projection_turns_running` (migration 60), so it reads
+  running turns only.
+- **`subscribeMcpActivity`** (`access:read`, read stream) sends a snapshot of the newest
+  200 rows and the active agents, then each new row and each change of who is active. An
+  agent is active with a call in flight or in the last 2 minutes, an owned mutation
+  running, or a running turn it started (`runningTurns`, revoked or not, so Stop stays in
+  reach). One task refreshes the running turns for every subscriber every 15 s while any
+  subscribes, and each refresh is also every stream's re-check that drops a quiet agent.
+- **Stop.** `POST /api/auth/clients/revoke` with `interruptTurns: true` revokes the session
+  (cancelling its calls and owned mutations), then waits up to 10 s while `McpControl`
+  dispatches `thread.turn.interrupt` (`server:mcp-stop:…`, through the dispatch RPC, so the
+  provider is told) for each running turn the agent started, and answers with
+  `interrupted`, `failed` and `timedOut` (the interrupts go on after that). An `mcp-client`
+  session revoked earlier is stopped too; `revoked: false` means an unknown session or a
+  revoked one that was not an agent's. The web reports `revoked: false`, any failure and a
+  timeout as a failed Stop. A plain revocation, such as the `bibcode thread` CLI revoking
+  its own credential, interrupts nothing.
+- **Take over.** `POST /api/auth/clients/mcp-access { sessionId, access }` (`access:write`)
+  sets an `mcp-client` session's `mcp_access` to `read-only` and remembers the level it
+  replaced in `auth_sessions.mcp_access_hand_back`; any other level must be exactly that
+  level (Hand back), so the route never raises an agent above its pairing. Either change
+  cancels the session's live tokens, so owned mutations stop (they record `revoked`), and
+  emits a `clientUpserted` access event; the client list carries `mcpAccess` and
+  `mcpAccessHandBack`. Every refusal is a 400 `invalid_mcp_access`.
+
+### Chat panel and UI intent tools
+
+Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
+
+| Tool                 | Maps to                                                                                                    | Scope   |
+| -------------------- | ---------------------------------------------------------------------------------------------------------- | ------- |
+| `create_chat_panel`  | `worktree.createPanel`, its `commandId` and `threadId` stored with the request so a retry replays by claim | operate |
+| `list_chat_panels`   | the `subscribeShell` builder: threads of kind `panel` whose `hostThreadId` is the host                     | read    |
+| `send_panel_message` | `thread.turn.start` (`queued: true`) with `message.sourceThreadId`, then `thread.turn.steer` for `steer`   | operate |
+| `focus_ui`           | `ui.publishIntent`, after the C5 check of `path` against the thread's folder                               | operate |
+
+- **Who may name a source thread.** `message.sourceThreadId` on `thread.turn.start` is
+  provenance a person reads ("From <panel>"), so the engine accepts it only when the
+  command's admission claim carries an `mcp-client` actor and the source is another live
+  thread of the target's worktree (the same host thread, or one hosts the other). A
+  person's client and an agent naming an unrelated thread are both refused as an invariant,
+  with nothing projected. MCP clients reach dispatch only through tools, and only
+  `send_panel_message` sets the field, after its own `McpNotSameWorktreeError` check and a
+  check that the calling agent owns the source: it is the thread's `requester`, or its
+  actor sent the thread's latest user message (`McpSourceThreadNotOwnedError` otherwise);
+  `send_message` refuses an unknown argument.
+- **`includeLastReply`** appends the source's latest assistant message as a Markdown quote,
+  at most 16,000 characters with a note of where it was cut. Message and quote together stay
+  within the 120,000-character turn limit.
+- **UI intents** (`production::ui_intents_rpc`). `ui.publishIntent` (`orchestration:operate`,
+  unary) accepts only an `mcp-client` principal and stamps its actor; it repeats the shape
+  checks (`surface`, a relative literal `path` for `files` and `diff`). An intent
+  `{ kind: "focus", intentId, threadId, surface, path, actor, createdAt, expiresAt }` lives
+  in memory for 60 seconds, at most 16 pending per thread and 64 per agent credential
+  (`UiIntentError`, `reason: "limit"`), and at most 256 in all, past which the oldest are
+  dropped; the result reports how many streams were subscribed.
+  `subscribeUiIntents` (`orchestration:read`, read stream) sends the newest 64 pending
+  intents (one server is one environment) and then each new one (a lagging stream gets a
+  fresh snapshot).
+- **Commit message suggestions** (slice X7). `ui.publishIntent` takes `kind`, `focus`
+  unless set; `kind: "commitMessage"` takes `{ threadId, cwd, message }` and publishes
+  `{ kind: "commitMessage", intentId, bootId, sequence, threadId, cwd, message, actor,
+  createdAt, expiresAt, expiresInMs }`. These live apart from the `focus` intents: the last
+  one per `cwd` for 24 hours, at most 64 folders (the oldest dropped first), outside the
+  per-thread and per-agent limits, and every snapshot carries all of them after the newest 64
+  `focus` intents. `sequence` rises with every publish of one server process, whose random
+  `bootId` each message names; it is taken, the folder updated and the intent broadcast under
+  one lock. Every intent of either kind carries `expiresInMs`, the time it had left when sent
+  (recomputed per snapshot). The handler trusts the `cwd` the tool resolved from the thread;
+  it has no projection to check it against, and the suggestion is advice a panel labels. The
+  client runtime gives each intent a deadline on its own clock (arrival, read through
+  Effect's `Clock`, plus `expiresInMs`), drops intents past it, caps each kind separately,
+  and keeps a folder's newest message: the higher `sequence` within one boot, and a message
+  from another boot over anything it holds (one server serves one environment).
+- **Clients.** `UiIntentNotifier` (one per environment, outside the router) raises a
+  non-modal toast per intent, **Agent <label> wants to show <surface>** with **Show**, and
+  moves nothing until it is clicked; a hidden window raises it when shown again if it has
+  not expired. **Show** routes to the thread (a panel's host, with the panel's tab active)
+  and opens the surface there. A chat panel tab an agent opened carries an **Agent** badge,
+  with the agent and purpose in its tooltip. `UiIntentNotifier` skips `commitMessage`
+  intents; `SourceControlAgentSuggestion`, under the Source Control message box, follows
+  only its folder's newest one. The draft store (`sourceControlPanelStore`) fills an empty
+  draft (**Message from Agent <label>**), or offers it beside text (**Use it**, **Dismiss**,
+  then **Undo**), and remembers each intent id per folder in local storage, so a pending
+  suggestion never refills the box after a commit cleared it. Applying a suggestion first
+  promotes the thread's draft from before folder drafts. It fills only when this tab's draft
+  and the saved one are both empty, and that fill writes only its folder's draft and record
+  into the saved state; otherwise the suggestion is offered and nothing is written (an
+  unhandled suggestion reads as offered). The panel applies each suggestion once while it is
+  mounted, never applies one past its local deadline, and hides a shown one when that
+  passes.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop
@@ -4144,7 +4786,19 @@ H.264 video does not travel over RPC. The ticket from
   `overwrite=1`, never replacing directories, and removing the partial and any
   reservation this server created on failure. The upload handler
   invalidates the entries index for that root and notifies the Git status
-  broadcaster.
+  broadcaster. Every step of an upload, and a file download, goes through a
+  handle on its folder opened without following symlinks below the root
+  (`workspace::beneath`). A token an outside agent minted (both mints run with
+  the caller's credential) also names the agent's session inside its claims, and
+  an upload token can bind `overwrite` (bound `false` refuses `?overwrite=1`
+  with 400). The route serves such a token only while that session is live, the
+  MCP server and the Files set are on, and for an upload the session's ceiling
+  is above read-only; it then runs the transfer under the session's live
+  controls (`McpControl::transfer_controls`): a download's body breaks off with
+  an error when access ends, and an upload stops while streaming and is checked
+  once more before its final rename, removing its partial. An ended access
+  answers 404 like an expired token. Such a transfer writes one `mcp_activity`
+  row (`files_download` or `files_upload`, with its `transferId`) when it ends.
 - Cancellation flows from client interrupt or socket closure until the
   operation's documented handoff. After a durable engine handoff, the
   server-owned lifecycle continues to a terminal receipt while only the caller

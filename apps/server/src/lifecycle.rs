@@ -300,6 +300,7 @@ impl ServerRuntime {
             None
         };
         let mut relay_token = None;
+        let mut mcp_proof_key = None;
         let (rpc_registry, http_routes, production_runtime) = match custom_registry {
             Some(mut registry) => {
                 crate::auth::register_rpc_handlers(&mut registry, auth.clone());
@@ -321,6 +322,10 @@ impl ServerRuntime {
                 );
                 // A port-0 start learns its port only here.
                 runtime.preview_tunnels().set_own_port(local_addr.port());
+                // The MCP Files tools' transfer URLs (#139 X5) point here.
+                runtime
+                    .mcp_control()
+                    .attach_transfer_base(local_http_base(local_addr));
                 let jwt = PersistentJwtCodec::open(state_directory.join("environment-jwt.json"))
                     .await
                     .map_err(|error| ServerError::ProductionInitialize(error.to_string()))?;
@@ -397,7 +402,8 @@ impl ServerRuntime {
                         )),
                     )
                     .await
-                    .map_err(|error| ServerError::ProductionInitialize(format!("{error:?}")))?,
+                    .map_err(|error| ServerError::ProductionInitialize(format!("{error:?}")))?
+                    .with_control(runtime.mcp_control()),
                 );
                 runtime.attach_connect_mcp(connect.clone()).await;
                 // The tunnel starts only on a link; a restart brings it back from the stored one.
@@ -435,6 +441,14 @@ impl ServerRuntime {
                         tracing::warn!(%error, "could not create the diagnostics relay token");
                     }
                 }
+                // `bibcode mcp` proves this listener with the per-boot key in the record.
+                match crate::mcp::endpoint::new_proof_key() {
+                    Ok(key) => {
+                        routes.mcp_proof_key = Some(key.clone());
+                        mcp_proof_key = Some(key);
+                    }
+                    Err(error) => tracing::warn!(%error, "could not create the MCP proof key"),
+                }
                 (runtime.registry.clone(), routes, Some(runtime))
             }
         };
@@ -451,6 +465,22 @@ impl ServerRuntime {
             })
             .ok()
         });
+        // `bibcode mcp` finds and proves this server through this record (#139). Written after
+        // bind unless another server for this data root still runs and holds it (the runtime
+        // guard is shared); removed when the server task ends, only while it is ours.
+        let mcp_endpoint_record = match mcp_proof_key {
+            Some(key) => crate::mcp::endpoint::EndpointRecordFile::claim(
+                &state_directory,
+                local_addr,
+                &config.boot_id.unwrap_or_default().to_string(),
+                &key,
+            )
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "could not write the MCP endpoint record"))
+            .ok()
+            .flatten(),
+            None => None,
+        };
         let shutdown = CancellationToken::new();
         let admission_gate = rpc_registry.admission_gate();
         let update_maintenance_owner = if update_maintenance_owner_enabled(&config) {
@@ -509,6 +539,7 @@ impl ServerRuntime {
         let task = tokio::spawn(async move {
             let _log_sink = task_log_sink;
             let _relay_endpoint_file = relay_endpoint_file;
+            let _mcp_endpoint_record = mcp_endpoint_record;
             let result = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<http::ConnectionAddrs>(),
@@ -794,6 +825,25 @@ impl ServerHandle {
         self._production_runtime
             .as_ref()
             .map(|runtime| runtime.profiler_enabled_signal())
+    }
+
+    /// How many receivers the production runtime's orchestration event stream has.
+    #[cfg(test)]
+    pub(crate) fn event_subscriber_count_for_test(&self) -> Option<usize> {
+        self._production_runtime
+            .as_ref()
+            .map(|runtime| runtime.orchestration.event_subscriber_count_for_test())
+    }
+
+    /// The production runtime's orchestration engine, so a test can dispatch what a provider
+    /// runtime would.
+    #[cfg(test)]
+    pub(crate) fn orchestration_for_test(
+        &self,
+    ) -> Option<crate::orchestration::OrchestrationEngine> {
+        self._production_runtime
+            .as_ref()
+            .map(|runtime| runtime.orchestration.clone())
     }
 
     pub fn shutdown(&self) {

@@ -29,6 +29,7 @@ import { serverEnvironment } from "../../state/server";
 import { useKnownTerminalSessions } from "../../state/terminalSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { ProviderUsageControl } from "./ProviderUsageControl";
+import { McpAgentIndicator } from "./McpAgentIndicator";
 import { ProfilerRecordingSegment } from "./ProfilerRecordingSegment";
 import { ResourceUsageSegment } from "./ResourceUsageSegment";
 import { SlowRequestsIndicator } from "./SlowRequestsIndicator";
@@ -374,6 +375,7 @@ export function AppStatusBarView({
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <SlowRequestsIndicator />
+        <McpAgentIndicator />
         <ProfilerRecordingSegment />
         {showResourceUsage ? (
           <ResourceUsageSegment

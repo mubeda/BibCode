@@ -310,6 +310,13 @@ pub enum GitManagerOperationRequest {
         force: bool,
         delete_remote: bool,
     },
+    /// Deletes `branch` on `remote` only, leaving any local branch alone.
+    RemoteBranchDelete {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+        branch: String,
+    },
     Fetch {
         cwd: PathBuf,
         project_id: String,
@@ -467,6 +474,7 @@ impl GitManagerOperationRequest {
             Self::BranchCheckout { .. } => "branch-checkout",
             Self::BranchRename { .. } => "branch-rename",
             Self::BranchDelete { .. } => "branch-delete",
+            Self::RemoteBranchDelete { .. } => "remote-branch-delete",
             Self::Fetch { .. } => "fetch",
             Self::Pull { .. } => "pull",
             Self::Push { .. } => "push",
@@ -501,6 +509,7 @@ impl GitManagerOperationRequest {
             | Self::BranchCheckout { cwd, .. }
             | Self::BranchRename { cwd, .. }
             | Self::BranchDelete { cwd, .. }
+            | Self::RemoteBranchDelete { cwd, .. }
             | Self::Fetch { cwd, .. }
             | Self::Pull { cwd, .. }
             | Self::Push { cwd, .. }
@@ -531,11 +540,13 @@ impl GitManagerOperationRequest {
     #[must_use]
     /// Operations that can move a worktree's HEAD or change the branch set.
     /// The worktree catalog must rescan after them instead of waiting for its
-    /// poller; fetch, push, and stash operations leave every HEAD in place.
+    /// poller; fetch, push, remote branch deletion and stash operations leave every
+    /// HEAD in place.
     fn changes_worktree_heads(&self) -> bool {
         !matches!(
             self,
-            Self::Fetch { .. }
+            Self::RemoteBranchDelete { .. }
+                | Self::Fetch { .. }
                 | Self::Push { .. }
                 | Self::PublishBranch { .. }
                 | Self::ForcePush { .. }
@@ -552,6 +563,7 @@ impl GitManagerOperationRequest {
             | Self::BranchCheckout { project_id, .. }
             | Self::BranchRename { project_id, .. }
             | Self::BranchDelete { project_id, .. }
+            | Self::RemoteBranchDelete { project_id, .. }
             | Self::Fetch { project_id, .. }
             | Self::Pull { project_id, .. }
             | Self::Push { project_id, .. }
@@ -590,6 +602,7 @@ impl GitManagerOperationRequest {
                 }
                 | Self::BranchRename { .. }
                 | Self::BranchDelete { .. }
+                | Self::RemoteBranchDelete { .. }
                 | Self::Fetch { .. }
                 | Self::Pull { .. }
                 | Self::Push { .. }
@@ -1122,6 +1135,51 @@ fn blocked_reason_for_operation(
         .cloned()
 }
 
+/// Refuses a remote or branch a sync command would read as an option: `git fetch`, `pull` and
+/// `push` take them as operands with no `--` (`git pull` passes its remote on to `git fetch`
+/// without one), and Git accepts a configured remote such as `--all` (#139 slice G).
+fn refuse_option_like_operands(
+    operation: &str,
+    request: &GitManagerOperationRequest,
+) -> Result<(), GitManagerOperationError> {
+    let operands = match request {
+        GitManagerOperationRequest::Fetch { remote, .. }
+        | GitManagerOperationRequest::Pull { remote, .. }
+        | GitManagerOperationRequest::RemoteBranchDelete { remote, .. } => vec![remote.as_str()],
+        GitManagerOperationRequest::Push {
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        }
+        | GitManagerOperationRequest::PublishBranch {
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        }
+        | GitManagerOperationRequest::ForcePush {
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        } => [Some(remote), Some(local_branch), remote_branch.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if operands.iter().any(|operand| operand.starts_with('-')) {
+        return Err(operation_error(
+            operation,
+            "invalid-request",
+            "A remote or branch name may not start with '-'.",
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_branch_or_sync_operation(
     repository: &GitRepository,
     snapshot: &GitManagerRefsSnapshot,
@@ -1129,6 +1187,7 @@ async fn execute_branch_or_sync_operation(
     cancellation: &CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
+    refuse_option_like_operands(operation, request)?;
     let outputs = match request {
         GitManagerOperationRequest::BranchCreate {
             cwd,
@@ -1259,6 +1318,33 @@ async fn execute_branch_or_sync_operation(
                 outputs = require_last_success(operation, outputs)?;
             }
             outputs
+        }
+        GitManagerOperationRequest::RemoteBranchDelete {
+            cwd,
+            remote,
+            branch,
+            ..
+        } => {
+            if !snapshot.remotes.iter().any(|known| known == remote) {
+                return Err(operation_error(
+                    operation,
+                    "invalid-request",
+                    "The remote is not one of this checkout's remotes.",
+                ));
+            }
+            if !is_branch_name(branch) {
+                return Err(operation_error(
+                    operation,
+                    "invalid-request",
+                    "The remote branch name is not a valid branch name.",
+                ));
+            }
+            one_output(
+                operation,
+                repository
+                    .git_manager_delete_remote_branch(cwd, remote, branch, cancellation)
+                    .await,
+            )?
         }
         GitManagerOperationRequest::Fetch { cwd, remote, .. } => one_output(
             operation,
@@ -1713,6 +1799,30 @@ fn validate_revision(operation: &str, revision: &str) -> Result<(), GitManagerOp
         ));
     }
     Ok(())
+}
+
+/// Whether `name` is a branch name `git check-ref-format --branch` would accept, kept strict so
+/// a name can never be read as an option or a refspec: no leading `-` or `+`, no `:`, no whitespace,
+/// control or wildcard characters, no `..`, `@{`, `//`, and no part that starts with `.` or
+/// ends with `.lock`.
+#[must_use]
+pub(crate) fn is_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "@"
+        && !name.starts_with(['-', '+', '/'])
+        && !name.ends_with(['/', '.'])
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && name
+            .split('/')
+            .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
 }
 
 fn validate_revisions(
@@ -2273,9 +2383,30 @@ pub async fn discard_paths(
     cancellation: &CancellationToken,
 ) -> Result<DiscardOutcome, DiscardError> {
     validate_pathspecs("GitManager.discard", &request.cwd, &request.paths)?;
+    // Git's metadata is never discarded, also through a path that resolves into it; on unix,
+    // entries are staged in the Git directory on their way to the trash (see `move_to_trash`).
+    let roots = repository
+        .resolve_watch_roots(&request.cwd, cancellation)
+        .await?;
+    let root = contain_discard_paths(
+        &request.cwd,
+        &request.paths,
+        &[&roots.git_dir, &roots.common_dir],
+    )
+    .await?;
     let tracked = repository
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
+    #[cfg(unix)]
+    let (git_dir, worktree_root) = (roots.git_dir, roots.worktree_root);
+    #[cfg(unix)]
+    {
+        let (staging_dir, recovery_root) = (git_dir.clone(), worktree_root.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            discard_staging::recover(&staging_dir, &recovery_root);
+        })
+        .await;
+    }
     let mut outcome = DiscardOutcome::default();
     let mut restore_only = Vec::new();
     for path in &request.paths {
@@ -2292,12 +2423,27 @@ pub async fn discard_paths(
             restore_only.push(path.clone());
             continue;
         }
-        match trash.trash(absolute_path, cancellation).await {
-            Ok(()) => outcome.trashed.push(path.clone()),
-            Err(_) if request.permit_permanent => {
+        #[cfg(unix)]
+        let moved = move_to_trash(
+            trash.as_ref(),
+            &root,
+            (&git_dir, &worktree_root),
+            path,
+            cancellation,
+        )
+        .await;
+        #[cfg(not(unix))]
+        let moved = move_to_trash(trash.as_ref(), &root, &request.cwd, path, cancellation).await;
+        match moved {
+            Moved::Trashed => outcome.trashed.push(path.clone()),
+            Moved::NotTaken if request.permit_permanent => {
                 outcome.permanently_discarded.push(path.clone());
             }
-            Err(_) => outcome.trash_unavailable.push(path.clone()),
+            // A stranded entry is listed with those the trash did not take; it is in the
+            // staging folder, which the next discard's recovery empties.
+            Moved::NotTaken | Moved::Kept | Moved::Stranded(_) => {
+                outcome.trash_unavailable.push(path.clone());
+            }
         }
     }
 
@@ -2308,12 +2454,13 @@ pub async fn discard_paths(
         return Ok(outcome);
     }
     let tracked_to_unstage = tracked
-        .into_iter()
+        .iter()
         .filter(|tracked_path| {
             discarded_paths
                 .iter()
                 .any(|path| path_matches(path, tracked_path))
         })
+        .cloned()
         .collect::<Vec<_>>();
     repository
         .unstage_files(&request.cwd, &tracked_to_unstage, cancellation)
@@ -2328,8 +2475,843 @@ pub async fn discard_paths(
         repository
             .discard_files(&request.cwd, &outcome.permanently_discarded, cancellation)
             .await?;
+        // `git clean` (without `-x`) leaves ignored files. An untracked path still there was
+        // kept, so it is reported so; a tracked one is there again because it was restored.
+        let mut kept = Vec::new();
+        for path in &outcome.permanently_discarded {
+            if !tracked
+                .iter()
+                .any(|candidate| path_matches(path, candidate))
+                && tokio::fs::symlink_metadata(request.cwd.join(path))
+                    .await
+                    .is_ok()
+            {
+                kept.push(path.clone());
+            }
+        }
+        outcome
+            .permanently_discarded
+            .retain(|path| !kept.contains(path));
+        outcome.trash_unavailable.extend(kept);
     }
     Ok(outcome)
+}
+
+/// Refuses every path whose folder resolves outside the checkout, before anything is trashed or
+/// restored (#139 slice G, C5): a symlinked folder inside the checkout that points elsewhere
+/// cannot route a discard outside it. A path that resolves into, or holds, one of
+/// `metadata` (the Git directory and common directory) is refused too (review round 4).
+/// Returns the checkout's canonical path.
+async fn contain_discard_paths(
+    cwd: &Path,
+    paths: &[String],
+    metadata: &[&Path],
+) -> Result<PathBuf, DiscardError> {
+    let refused = |detail: &str| {
+        DiscardError::Git(GitCommandError {
+            tag: "GitCommandError",
+            operation: "GitManager.discard".into(),
+            command: "git".into(),
+            cwd: cwd.to_string_lossy().into(),
+            diagnostics: None,
+            detail: detail.into(),
+        })
+    };
+    const ESCAPES: &str = "A discard path leaves the checkout through a symlinked folder.";
+    let root = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|_| refused(ESCAPES))?;
+    let metadata = metadata
+        .iter()
+        .map(|folder| without_verbatim_prefix(folder.to_path_buf()))
+        .collect::<Vec<_>>();
+    for path in paths {
+        let Some(resolved) = contained_path(&root, cwd, path).await else {
+            return Err(refused(ESCAPES));
+        };
+        if metadata
+            .iter()
+            .any(|folder| resolved.starts_with(folder) || folder.starts_with(&resolved))
+        {
+            return Err(refused("A discard path names Git's own metadata."));
+        }
+    }
+    Ok(root)
+}
+
+/// `path` (relative to `cwd`) below the canonical form of its deepest existing folder, or `None`
+/// when that folder resolves outside `root`, the canonical checkout. The deepest folder that
+/// exists is the one resolved, so a deleted tracked file in a deleted folder still passes. A
+/// path that is itself a symlink is allowed: the link is what is discarded.
+async fn contained_path(root: &Path, cwd: &Path, path: &str) -> Option<PathBuf> {
+    let absolute = cwd.join(path);
+    let mut folder = absolute.parent()?.to_path_buf();
+    while tokio::fs::metadata(&folder).await.is_err() {
+        match folder.parent() {
+            Some(up) if up.starts_with(cwd) && up != folder => folder = up.to_path_buf(),
+            _ => return None,
+        }
+    }
+    let resolved = tokio::fs::canonicalize(&folder).await.ok()?;
+    if !resolved.starts_with(root) {
+        return None;
+    }
+    Some(without_verbatim_prefix(
+        resolved.join(absolute.strip_prefix(&folder).ok()?),
+    ))
+}
+
+/// What became of one entry a discard sent to the trash.
+pub(crate) enum Moved {
+    Trashed,
+    /// The trash could not take it, and it is where it was: a permanent discard may remove it.
+    NotTaken,
+    /// It is kept where it was, whatever the request permits: its folder is, or became, a link
+    /// (or not a folder), or left the checkout.
+    Kept,
+    /// It is no longer where it was: it is in BiBCode's staging folder, at this path, because
+    /// it could not be put back (its name was taken again). A later discard or trash moves it
+    /// back once its name is free.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix move stages entries")
+    )]
+    Stranded(PathBuf),
+}
+
+/// Moves the entry at `path` (relative to `root`, the canonical checkout) to the trash, closing
+/// the window between checking its folder and the trash resolving a path (#139 slice G).
+///
+/// The entry's folder is opened from `root` one component at a time without following a link
+/// (`O_NOFOLLOW`), so a folder that is, or becomes, a symlink is never entered. The entry is
+/// then renamed by that handle into a new folder of BiBCode's own under
+/// `<git_dir>/bibcode-discard/`, on the same file system as the repository, and only that
+/// staged path, which nothing the checkout holds can redirect, goes to the trash. The trash
+/// resolves that path by string, so first each folder on it, from the Git directory down, and
+/// the entry must be the very ones BiBCode holds by handle; and after a trash that answered
+/// success, the entry must be gone from the folder BiBCode holds. Either check failing puts the
+/// entry back, kept. When the trash refuses it, it is renamed back, never over something created
+/// there meanwhile. A
+/// folder that is a link is `Kept`; a rename that fails (another file system, a missing entry)
+/// is `NotTaken`, so a permanent discard still removes it through Git.
+#[cfg(unix)]
+async fn move_to_trash(
+    trash: &dyn FileTrash,
+    root: &Path,
+    (git_dir, worktree_root): (&Path, &Path),
+    path: &str,
+    cancellation: &CancellationToken,
+) -> Moved {
+    let (root, git_dir, relative) = (root.to_path_buf(), git_dir.to_path_buf(), path.to_owned());
+    let worktree_root = worktree_root.to_path_buf();
+    let staged = match tokio::task::spawn_blocking(move || {
+        discard_staging::stage(&root, (&git_dir, &worktree_root), &relative)
+    })
+    .await
+    {
+        Ok(Ok(staged)) => staged,
+        Ok(Err(discard_staging::Unstaged::Failed)) => return Moved::NotTaken,
+        Ok(Err(discard_staging::Unstaged::Stranded(staged))) => return Moved::Stranded(staged),
+        Ok(Err(discard_staging::Unstaged::Escapes)) | Err(_) => return Moved::Kept,
+    };
+    let trashed = trash
+        .trash(staged.path().to_path_buf(), cancellation)
+        .await
+        .is_ok();
+    tokio::task::spawn_blocking(move || {
+        if trashed {
+            match staged.finish() {
+                Ok(()) => Moved::Trashed,
+                Err(None) => {
+                    tracing::warn!("the trash answered success but left BiBCode's staged entry");
+                    Moved::Kept
+                }
+                Err(Some(staged)) => Moved::Stranded(staged),
+            }
+        } else {
+            match staged.put_back() {
+                Ok(()) => Moved::NotTaken,
+                Err(staged) => {
+                    tracing::warn!(
+                        "a discarded entry the trash refused stayed in BiBCode's staging folder"
+                    );
+                    Moved::Stranded(staged)
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(Moved::Kept)
+}
+
+/// The Files tools' and Files panel's trash (#139 X5), by the same staging as a discard: the
+/// entry at `path` (relative to `root`, the canonical workspace) is renamed by handle into a
+/// holder under `<holder_parent>/bibcode-discard/` (the Git directory, or a private folder
+/// under the server's state directory for a folder that is no repository), checked, and only
+/// that staged path goes to the trash. Entries a crash left staged there are first moved back
+/// below `root`. Another file system, or one without the no-replace rename, stages nothing:
+/// `NotTaken`.
+#[cfg(unix)]
+pub(crate) async fn trash_by_staging(
+    trash: &dyn FileTrash,
+    root: &Path,
+    holder_parent: &Path,
+    path: &str,
+    cancellation: &CancellationToken,
+) -> Moved {
+    let (staging_dir, recovery_root) = (holder_parent.to_path_buf(), root.to_path_buf());
+    let _ = tokio::task::spawn_blocking(move || {
+        discard_staging::recover(&staging_dir, &recovery_root);
+    })
+    .await;
+    move_to_trash(trash, root, (holder_parent, root), path, cancellation).await
+}
+
+/// Moves the entry at `path` to the trash by the checked folder's canonical path. The trash
+/// resolves that path later, so a folder that turns into a link in between could still route
+/// it; a folder that is a reparse point (a symlink or junction) when the move starts is refused,
+/// which leaves only that short window (#139 slice G).
+#[cfg(not(unix))]
+async fn move_to_trash(
+    trash: &dyn FileTrash,
+    root: &Path,
+    cwd: &Path,
+    path: &str,
+    cancellation: &CancellationToken,
+) -> Moved {
+    let Some(checked_path) = contained_path(root, cwd, path).await else {
+        return Moved::Kept;
+    };
+    #[cfg(windows)]
+    if crosses_reparse_point(root, path).await {
+        return Moved::Kept;
+    }
+    match trash.trash(checked_path, cancellation).await {
+        Ok(()) => Moved::Trashed,
+        Err(_) => Moved::NotTaken,
+    }
+}
+
+/// Whether a folder between `root` and the entry at `path` is a reparse point.
+#[cfg(windows)]
+async fn crosses_reparse_point(root: &Path, path: &str) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let mut folder = root.to_path_buf();
+    let Some(parents) = Path::new(path).parent() else {
+        return false;
+    };
+    for component in parents.components() {
+        folder.push(component);
+        match tokio::fs::symlink_metadata(&folder).await {
+            Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+                return true;
+            }
+            Ok(_) => {}
+            // A missing folder holds nothing to trash.
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Staging a discarded entry into BiBCode's own folder by directory handles (see
+/// `move_to_trash`).
+#[cfg(unix)]
+mod discard_staging {
+    use std::{
+        ffi::{CStr, CString, OsStr},
+        io::{self, Read, Write},
+        os::{
+            fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+            unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        },
+        path::{Component, Path, PathBuf},
+    };
+
+    /// The folder in the Git directory that holds entries on their way to the trash.
+    const FOLDER: &CStr = c"bibcode-discard";
+    /// Ends the name of a holder's origin record, `<uuid>.origin`, beside the holder.
+    const RECORD: &str = ".origin";
+
+    /// Takes the exclusive advisory lock on open holder folder `holder` without waiting. A
+    /// discard holds it from just after creating the holder (before its origin record exists)
+    /// until it is done with the holder, so recovery, which needs the same lock, never touches
+    /// a holder a live discard owns, in this process (a lock belongs to each open file) or
+    /// another. The operating system releases it when a process dies, so an abandoned holder
+    /// becomes recoverable.
+    fn lock(holder: &OwnedFd) -> bool {
+        // SAFETY: `holder` is an open descriptor.
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    /// Why an entry was not staged.
+    pub(super) enum Unstaged {
+        /// A folder on its way is a link or not a folder: the entry is never moved.
+        Escapes,
+        /// Staging failed otherwise (another file system, a missing entry); nothing moved.
+        Failed,
+        /// It moved in, failed a check, and could not go back: it stays at this staged path.
+        Stranded(PathBuf),
+    }
+
+    /// An entry renamed into `<git_dir>/bibcode-discard/<uuid>/`, with the handles that move
+    /// it back.
+    pub(super) struct Staged {
+        parent: OwnedFd,
+        staging: OwnedFd,
+        holder: OwnedFd,
+        holder_name: CString,
+        record_name: CString,
+        name: CString,
+        path: PathBuf,
+    }
+
+    impl Staged {
+        /// The staged entry's path: the one the trash takes.
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// After the trash answered success: removes the holder folder when the entry is gone
+        /// from it, and returns whether it is. If the entry is still there, the trash took
+        /// another path, or nothing, so the entry goes back (see [`Staged::put_back`]).
+        pub(super) fn finish(self) -> Result<(), Option<PathBuf>> {
+            if identity_at(&self.holder, &self.name).is_some() {
+                return match self.put_back() {
+                    Ok(()) => Err(None),
+                    Err(staged) => {
+                        tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
+                        Err(Some(staged))
+                    }
+                };
+            }
+            self.release();
+            Ok(())
+        }
+
+        /// Renames the entry back into the folder it came from, never over an entry created
+        /// there since. If it cannot go back, it stays staged with its origin record, for a
+        /// later discard's [`recover`] to try again, and the error is where it stays.
+        pub(super) fn put_back(self) -> Result<(), PathBuf> {
+            if rename_no_replace(&self.holder, &self.name, &self.parent, &self.name).is_ok() {
+                self.release();
+                Ok(())
+            } else {
+                Err(self.path)
+            }
+        }
+
+        /// Removes the emptied holder and its origin record.
+        fn release(&self) {
+            remove_folder(&self.staging, &self.holder_name);
+            remove_file(&self.staging, &self.record_name);
+        }
+    }
+
+    /// Whether a staging folder with owner `uid` and `mode` is private to the user `ours`: owned
+    /// by it and writable by no group or other user, so nobody else can rename a holder in it.
+    pub(super) fn is_private(uid: u32, mode: u32, ours: u32) -> bool {
+        uid == ours && mode & 0o022 == 0
+    }
+
+    /// Whether open folder `folder` is private to this process's user (see [`is_private`]).
+    fn private(folder: &OwnedFd) -> bool {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `folder` is an open descriptor and `status` is writable.
+        if unsafe { libc::fstat(folder.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: `fstat` succeeded and filled `status`.
+        let status = unsafe { status.assume_init() };
+        // SAFETY: `geteuid` has no preconditions.
+        let ours = unsafe { libc::geteuid() };
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "the field types differ between platforms"
+        )]
+        is_private(status.st_uid as u32, status.st_mode as u32, ours as u32)
+    }
+
+    /// Opens the folder that holds `relative` (below `root`) from `root` one part at a time,
+    /// never following a link, and returns it with the entry's name.
+    fn open_parent<'a>(root: &Path, relative: &'a Path) -> Result<(OwnedFd, &'a OsStr), Unstaged> {
+        let name = relative.file_name().ok_or(Unstaged::Escapes)?;
+        let mut parent = open_folder(root).map_err(|_| Unstaged::Failed)?;
+        for component in relative.parent().into_iter().flat_map(Path::components) {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(folder) => {
+                    parent = open_child(&parent, &c_name(folder)?).map_err(|error| match error
+                        .raw_os_error()
+                    {
+                        Some(libc::ELOOP | libc::ENOTDIR) => Unstaged::Escapes,
+                        _ => Unstaged::Failed,
+                    })?;
+                }
+                _ => return Err(Unstaged::Escapes),
+            }
+        }
+        Ok((parent, name))
+    }
+
+    /// Opens `<git_dir>/bibcode-discard`, creating it, when it is private to this user.
+    fn open_staging(git: &OwnedFd) -> Result<OwnedFd, Unstaged> {
+        match make_folder(git, FOLDER) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(Unstaged::Failed),
+        }
+        let staging = open_child(git, FOLDER).map_err(|_| Unstaged::Failed)?;
+        if !private(&staging) {
+            tracing::warn!(
+                "BiBCode's discard staging folder is not private to this user; not used"
+            );
+            return Err(Unstaged::Failed);
+        }
+        Ok(staging)
+    }
+
+    /// Moves back entries a crash left in `<git_dir>/bibcode-discard` (staged, with an origin
+    /// record, and a holder whose lock no live discard in any process holds), each into the
+    /// folder it came from
+    /// below `worktree_root` (the checkout this Git directory belongs to) when that place is
+    /// free; otherwise it stays, and is logged. Holders whose entry is gone (the trash took it
+    /// before the record was removed) are removed with their record. A record is not trusted:
+    /// one naming anything but a plain path below the checkout, outside Git's metadata, is
+    /// ignored, and the path is opened without following a link.
+    pub(super) fn recover(git_dir: &Path, worktree_root: &Path) {
+        let Ok(git) = open_folder(git_dir) else {
+            return;
+        };
+        let Ok(staging) = open_child(&git, FOLDER) else {
+            return;
+        };
+        if !private(&staging) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(git_dir.join(OsStr::from_bytes(FOLDER.to_bytes())))
+        else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(holder) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(RECORD))
+            else {
+                continue;
+            };
+            if !restore(&staging, holder, worktree_root) {
+                tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
+            }
+        }
+    }
+
+    /// Restores the entry of `holder` from its origin record; returns false when it stays.
+    fn restore(staging: &OwnedFd, holder: &str, worktree_root: &Path) -> bool {
+        let (Ok(holder_name), Ok(record_name)) = (
+            CString::new(holder),
+            CString::new(format!("{holder}{RECORD}")),
+        ) else {
+            return false;
+        };
+        let Some(relative) = read_record(staging, &record_name) else {
+            return false;
+        };
+        let holder_fd = match open_child(staging, &holder_name) {
+            Ok(holder) => holder,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                remove_file(staging, &record_name);
+                return true;
+            }
+            Err(_) => return false,
+        };
+        // A live discard, here or in another server process, still owns it.
+        if !lock(&holder_fd) {
+            return true;
+        }
+        let Some(name) = relative.file_name().and_then(|name| c_name(name).ok()) else {
+            return false;
+        };
+        if identity_at(&holder_fd, &name).is_none() {
+            remove_folder(staging, &holder_name);
+            remove_file(staging, &record_name);
+            return true;
+        }
+        let Ok((parent, _)) = open_parent(worktree_root, &relative) else {
+            return false;
+        };
+        if rename_no_replace(&holder_fd, &name, &parent, &name).is_err() {
+            return false;
+        }
+        remove_folder(staging, &holder_name);
+        remove_file(staging, &record_name);
+        true
+    }
+
+    /// Writes `<uuid>.origin`: the entry's path below the checkout's root, the folder Git
+    /// reports for this Git directory, so the root is never read from the record.
+    fn write_record(staging: &OwnedFd, record_name: &CStr, relative: &Path) -> io::Result<()> {
+        // SAFETY: `staging` is an open descriptor and `record_name` is NUL-terminated; the
+        // file is new (`O_EXCL`) and never a link.
+        let descriptor = unsafe {
+            libc::openat(
+                staging.as_raw_fd(),
+                record_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new descriptor that nothing else owns.
+        let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        file.write_all(relative.as_os_str().as_bytes())?;
+        file.sync_all()
+    }
+
+    /// The entry path a record names, when it is one BiBCode could have written (see
+    /// [`is_record_path`]).
+    fn read_record(staging: &OwnedFd, record_name: &CStr) -> Option<PathBuf> {
+        // SAFETY: `staging` is an open descriptor and `record_name` is NUL-terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                staging.as_raw_fd(),
+                record_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return None;
+        }
+        // SAFETY: `openat` returned a new descriptor that nothing else owns.
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut record = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut record).ok()?;
+        let relative = PathBuf::from(OsStr::from_bytes(&record));
+        is_record_path(&record, &relative).then_some(relative)
+    }
+
+    /// Whether `relative` (`bytes`) is a plain path below a checkout: no NUL, only plain parts
+    /// (no root, `.` or `..`), and not under `.git` in any case, as `validate_pathspecs`
+    /// requires of every discard path.
+    fn is_record_path(bytes: &[u8], relative: &Path) -> bool {
+        !bytes.is_empty()
+            && !bytes.contains(&0)
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            && relative
+                .components()
+                .next()
+                .is_some_and(|first| !first.as_os_str().eq_ignore_ascii_case(".git"))
+    }
+
+    /// Stages the entry at `relative` below `root` into a new holder folder under `git_dir`.
+    pub(super) fn stage(
+        root: &Path,
+        (git_dir, worktree_root): (&Path, &Path),
+        relative: &str,
+    ) -> Result<Staged, Unstaged> {
+        let relative = Path::new(relative);
+        // The checkout's identity, taken first, that the entry's folder must stay under.
+        let root_identity = open_folder(root).ok().and_then(|root| identity(&root));
+        let (parent, name) = open_parent(root, relative)?;
+        let name_c = c_name(name)?;
+        let git = open_folder(git_dir).map_err(|_| Unstaged::Failed)?;
+        let staging = open_staging(&git)?;
+        let holder_text = uuid::Uuid::new_v4().to_string();
+        let holder_name = CString::new(holder_text.clone()).map_err(|_| Unstaged::Failed)?;
+        let record_name =
+            CString::new(format!("{holder_text}{RECORD}")).map_err(|_| Unstaged::Failed)?;
+        make_folder(&staging, &holder_name).map_err(|_| Unstaged::Failed)?;
+        let holder = match open_child(&staging, &holder_name) {
+            Ok(holder) if lock(&holder) => holder,
+            _ => {
+                remove_folder(&staging, &holder_name);
+                return Err(Unstaged::Failed);
+            }
+        };
+        // An entry staged here can only come back without replacing anything if this file
+        // system has the no-replace rename: without it the trash is unavailable, and nothing
+        // moves. Renaming the holder onto itself answers which.
+        if matches!(
+            rename_no_replace(&staging, &holder_name, &staging, &holder_name),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported
+        ) {
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        }
+        // Where the entry came from, written before it moves, so a crash before the trash
+        // takes it leaves a record a later discard restores it from.
+        let Ok(below_root) = root.strip_prefix(worktree_root) else {
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        };
+        if write_record(&staging, &record_name, &below_root.join(relative)).is_err() {
+            remove_file(&staging, &record_name);
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        }
+        #[cfg(test)]
+        super::discard_hooks::run(
+            super::discard_hooks::Point::BeforeMove,
+            &root.join(relative),
+        );
+        // The entry's folder must still be under the checkout right before it moves: a folder
+        // another process moved out after it was opened is never emptied into the staging
+        // folder. The window left is the rename itself.
+        let beneath = root_identity.is_some_and(|root| {
+            crate::workspace::beneath::folder_beneath(parent.as_fd(), root).is_ok()
+        });
+        if !beneath {
+            remove_file(&staging, &record_name);
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Escapes);
+        }
+        // SAFETY: both descriptors are open folders and both names are NUL-terminated; the
+        // rename acts on the entries those handles hold and follows no link.
+        let renamed = unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                name_c.as_ptr(),
+                holder.as_raw_fd(),
+                name_c.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            remove_file(&staging, &record_name);
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Failed);
+        }
+        #[cfg(test)]
+        super::discard_hooks::run(super::discard_hooks::Point::Staged, &root.join(relative));
+        let staged = Staged {
+            parent,
+            staging,
+            holder,
+            holder_name,
+            record_name,
+            name: name_c,
+            path: git_dir
+                .join(OsStr::from_bytes(FOLDER.to_bytes()))
+                .join(holder_text)
+                .join(name),
+        };
+        // The trash takes a path and resolves it itself, so the path must name exactly what
+        // BiBCode holds: each folder from the Git directory down, and the entry. One swapped
+        // since it was opened sends the entry back, kept.
+        let folders = [
+            (git_dir.to_path_buf(), identity(&git)),
+            (
+                git_dir.join(OsStr::from_bytes(FOLDER.to_bytes())),
+                identity(&staged.staging),
+            ),
+            (
+                staged
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default(),
+                identity(&staged.holder),
+            ),
+            (
+                staged.path.clone(),
+                identity_at(&staged.holder, &staged.name),
+            ),
+        ];
+        if !folders
+            .iter()
+            .all(|(path, held)| held.is_some() && path_identity(path) == *held)
+        {
+            return Err(match staged.put_back() {
+                Ok(()) => Unstaged::Escapes,
+                Err(stranded) => {
+                    tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
+                    Unstaged::Stranded(stranded)
+                }
+            });
+        }
+        Ok(staged)
+    }
+
+    /// The device and inode of an open folder.
+    fn identity(folder: &OwnedFd) -> Option<(u64, u64)> {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `folder` is an open descriptor and `status` is writable.
+        if unsafe { libc::fstat(folder.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `fstat` succeeded and filled `status`.
+        let status = unsafe { status.assume_init() };
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "the field types differ between platforms"
+        )]
+        Some((status.st_dev as u64, status.st_ino as u64))
+    }
+
+    /// The device and inode of entry `name` in `folder`, not following a link.
+    fn identity_at(folder: &OwnedFd, name: &CStr) -> Option<(u64, u64)> {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `folder` is an open descriptor, `name` is NUL-terminated and `status` is
+        // writable.
+        if unsafe {
+            libc::fstatat(
+                folder.as_raw_fd(),
+                name.as_ptr(),
+                status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return None;
+        }
+        // SAFETY: `fstatat` succeeded and filled `status`.
+        let status = unsafe { status.assume_init() };
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "the field types differ between platforms"
+        )]
+        Some((status.st_dev as u64, status.st_ino as u64))
+    }
+
+    /// The device and inode `path` names, resolved by string as the trash will, without
+    /// following a link at its end.
+    fn path_identity(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    fn c_name(name: &OsStr) -> Result<CString, Unstaged> {
+        CString::new(name.as_bytes()).map_err(|_| Unstaged::Escapes)
+    }
+
+    fn open_folder(path: &Path) -> io::Result<OwnedFd> {
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?
+            .into())
+    }
+
+    fn open_child(folder: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
+        // SAFETY: `folder` is an open descriptor and `name` is NUL-terminated; `O_NOFOLLOW`
+        // refuses a link in place of the folder.
+        let descriptor = unsafe {
+            libc::openat(
+                folder.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new descriptor that nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+
+    fn make_folder(folder: &OwnedFd, name: &CStr) -> io::Result<()> {
+        // SAFETY: `folder` is an open descriptor and `name` is NUL-terminated.
+        if unsafe { libc::mkdirat(folder.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Removes file `name` in `folder`, if it is there.
+    fn remove_file(folder: &OwnedFd, name: &CStr) {
+        // SAFETY: `folder` is an open descriptor and `name` is NUL-terminated.
+        unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) };
+    }
+
+    /// Removes empty folder `name` in `folder`; a folder that is not empty stays.
+    fn remove_folder(folder: &OwnedFd, name: &CStr) {
+        // SAFETY: `folder` is an open descriptor and `name` is NUL-terminated.
+        unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    }
+
+    /// Renames `from_name` in `from` to `to_name` in `to`, never over an existing entry: the
+    /// workspace's shared no-replace rename, refused (`Unsupported`) where the file system lacks
+    /// the kernel's flag; [`stage`] then stages nothing, so the trash is unavailable.
+    fn rename_no_replace(
+        from: &OwnedFd,
+        from_name: &CStr,
+        to: &OwnedFd,
+        to_name: &CStr,
+    ) -> io::Result<()> {
+        crate::workspace::beneath::rename_no_replace(from.as_fd(), from_name, to.as_fd(), to_name)
+    }
+}
+
+/// A canonical Windows path without its `\\?\` prefix, which the Recycle Bin refuses.
+#[cfg(windows)]
+pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let stripped = {
+        let text = path.to_string_lossy();
+        match text.strip_prefix(r"\\?\UNC\") {
+            Some(share) => Some(format!(r"\\{share}")),
+            None => text.strip_prefix(r"\\?\").map(str::to_owned),
+        }
+    };
+    stripped.map_or(path, PathBuf::from)
+}
+
+#[cfg(not(windows))]
+pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
+}
+
+/// Test hooks that run inside a discard's move window, so a test can change the file system
+/// between the containment check and the move. Unix only: only the unix move has a window a
+/// test can enter (between opening the folder and the rename).
+#[cfg(all(test, unix))]
+pub(crate) mod discard_hooks {
+    use std::{
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// Where in the move a hook runs.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Point {
+        /// After the entry's folder is open, before the rename into the staging folder.
+        BeforeMove,
+        /// After the rename, before the staged path is checked and handed to the trash.
+        Staged,
+    }
+
+    static HOOKS: Mutex<Vec<(PathBuf, Point, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` once at `point` of the discard of `entry` (the canonical checkout joined with
+    /// the discarded path). Keyed by path, so tests running at once never share one.
+    pub(crate) fn on(point: Point, entry: PathBuf, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .expect("discard hooks")
+            .push((entry, point, Box::new(hook)));
+    }
+
+    pub(super) fn run(point: Point, entry: &Path) {
+        let hook = {
+            let mut hooks = HOOKS.lock().expect("discard hooks");
+            hooks
+                .iter()
+                .position(|(key, at, _)| key == entry && *at == point)
+                .map(|index| hooks.remove(index).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 fn path_matches(requested: &str, candidate: &str) -> bool {
@@ -3443,6 +4425,55 @@ mod tests {
         assert!(!fixture.path().join("untracked.txt").exists());
     }
 
+    /// The permanent fallback (`git clean` without `-x`) leaves an ignored file in place, so it
+    /// is reported as kept, never as permanently discarded.
+    #[tokio::test]
+    async fn a_permanent_discard_never_reports_an_ignored_file_it_left_in_place() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
+        std::fs::write(fixture.path().join(".gitignore"), "*.log\n").expect("ignore file");
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", ".gitignore", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "changed\n").expect("change");
+        std::fs::write(fixture.path().join("untracked.txt"), "untracked\n").expect("untracked");
+        std::fs::write(fixture.path().join("ignored.log"), "ignored\n").expect("ignored");
+        std::fs::create_dir(fixture.path().join("logs")).expect("ignored folder");
+        std::fs::write(fixture.path().join("logs/only.log"), "ignored\n").expect("ignored");
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(UnavailableTrash),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec![
+                    "ignored.log".into(),
+                    "untracked.txt".into(),
+                    "tracked.txt".into(),
+                    "logs".into(),
+                ],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(
+            outcome.permanently_discarded,
+            ["untracked.txt", "tracked.txt"]
+        );
+        assert_eq!(outcome.trash_unavailable, ["ignored.log", "logs"]);
+        assert!(fixture.path().join("ignored.log").exists());
+        assert!(fixture.path().join("logs/only.log").exists());
+        assert!(!fixture.path().join("untracked.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            "base\n"
+        );
+    }
+
     #[tokio::test]
     async fn discard_restores_an_absent_tracked_file_without_trash_confirmation() {
         fn git(cwd: &Path, args: &[&str]) {
@@ -3501,5 +4532,958 @@ mod tests {
                 "base\n"
             );
         }
+    }
+
+    /// Moves each file into `destination`; while trashing the first, it swaps folder `swap.0`
+    /// for a symlink to `swap.1`, as another process could between the check and the move.
+    #[cfg(unix)]
+    struct SwappingTrash {
+        destination: PathBuf,
+        swap: (PathBuf, PathBuf),
+        trashed: Mutex<Vec<PathBuf>>,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for SwappingTrash {
+        fn trash<'a>(
+            &'a self,
+            path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            Box::pin(async move {
+                let mut trashed = self.trashed.lock().expect("swapping trash mutex");
+                if trashed.is_empty() {
+                    let (folder, outside) = &self.swap;
+                    std::fs::rename(folder, self.destination.join("swapped-away"))
+                        .expect("folder moves away");
+                    std::os::unix::fs::symlink(outside, folder).expect("symlink replaces it");
+                }
+                let destination = self.destination.join(trashed.len().to_string());
+                std::fs::rename(&path, destination).map_err(|_| TrashUnavailable)?;
+                trashed.push(path);
+                Ok(())
+            })
+        }
+    }
+
+    /// The containment check is repeated right before each move, and the move is given the
+    /// checked folder's canonical path: a folder swapped for a symlink to somewhere outside
+    /// after the first check cannot route the trash there (#139 slice G).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_swapped_for_an_outside_symlink_mid_discard_is_never_followed() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::tempdir().expect("outside folder");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("a.txt"), "a\n").expect("first file");
+        std::fs::create_dir(fixture.path().join("dir")).expect("folder");
+        std::fs::write(fixture.path().join("dir/victim.txt"), "inside\n").expect("inside file");
+        std::fs::write(outside.path().join("victim.txt"), "keep\n").expect("outside file");
+        let trash = Arc::new(SwappingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            swap: (fixture.path().join("dir"), outside.path().to_path_buf()),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["a.txt".into(), "dir/victim.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(outcome.trashed, ["a.txt"]);
+        assert!(outcome.permanently_discarded.is_empty());
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert_eq!(trash.trashed.lock().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    /// Answers that it took every path, and takes none.
+    #[cfg(unix)]
+    struct LyingTrash;
+
+    #[cfg(unix)]
+    impl FileTrash for LyingTrash {
+        fn trash<'a>(
+            &'a self,
+            _path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A repository with `dir/victim.txt` untracked, and its canonical path.
+    #[cfg(unix)]
+    fn staging_fixture() -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::create_dir(fixture.path().join("dir")).expect("folder");
+        std::fs::write(fixture.path().join("dir/victim.txt"), "inside\n").expect("inside file");
+        let root = fixture.path().canonicalize().expect("canonical checkout");
+        (fixture, root)
+    }
+
+    /// The trash resolves the staged path by string. A staging folder swapped, after the rename,
+    /// for a link to a place holding an entry of the same staged name is caught before the
+    /// trash is called: the staged path must resolve to the very folders and entry BiBCode holds
+    /// by handle. The entry goes back and is kept, even under `permanent`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_staging_folder_swapped_before_the_trash_resolves_it_is_never_followed() {
+        let (fixture, root) = staging_fixture();
+        let outside = tempfile::tempdir().expect("outside folder");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let (git_dir, target) = (root.join(".git"), outside.path().to_path_buf());
+        discard_hooks::on(
+            discard_hooks::Point::Staged,
+            root.join("dir/victim.txt"),
+            move || {
+                let staging = git_dir.join("bibcode-discard");
+                let holder = std::fs::read_dir(&staging)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .file_name();
+                std::fs::create_dir(target.join(&holder)).unwrap();
+                std::fs::write(target.join(&holder).join("victim.txt"), "keep\n").unwrap();
+                std::fs::rename(&staging, git_dir.join("staging-away")).unwrap();
+                std::os::unix::fs::symlink(&target, &staging).unwrap();
+            },
+        );
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(
+            trash.trashed.lock().unwrap().is_empty(),
+            "the trash was never called"
+        );
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert!(outcome.trashed.is_empty() && outcome.permanently_discarded.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "inside\n",
+            "the entry went back"
+        );
+        let planted = std::fs::read_dir(outside.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(planted.path().join("victim.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    /// A trash that answers success but leaves BiBCode's staged entry where it was took
+    /// something else, or nothing: the entry goes back and is kept, never reported trashed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_trash_that_did_not_take_the_staged_entry_is_never_reported_as_trashed() {
+        let (fixture, root) = staging_fixture();
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(LyingTrash),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.trashed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "inside\n"
+        );
+        let staging = std::fs::read_dir(root.join(".git/bibcode-discard")).unwrap();
+        assert_eq!(staging.count(), 0, "the staging folder is emptied");
+    }
+
+    /// Writes a new file where the staged entry came from, then refuses it.
+    #[cfg(unix)]
+    struct RefusingTrash {
+        recreate: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for RefusingTrash {
+        fn trash<'a>(
+            &'a self,
+            _path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            Box::pin(async move {
+                std::fs::write(&self.recreate, "new\n").expect("a new file appears");
+                Err(TrashUnavailable)
+            })
+        }
+    }
+
+    /// Git's own metadata is never a discard target, for any caller: `.git` as the first part of
+    /// a path (in any case), and any path that resolves into the Git directory, are refused
+    /// before anything moves. Staging shares the validator and refuses them too (review
+    /// round 4).
+    #[tokio::test]
+    async fn git_metadata_is_never_a_discard_target() {
+        let (fixture, root) = metadata_fixture();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join(".git"), root.join("meta")).expect("link");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+        let mut refused_paths = vec![
+            ".git/objects",
+            ".git",
+            "./.git/HEAD",
+            ".GIT/config",
+            ".git/",
+        ];
+        if cfg!(unix) {
+            refused_paths.push("meta/objects");
+        }
+        for path in refused_paths {
+            let refused = discard_paths(
+                &GitRepository::default(),
+                trash.clone(),
+                DiscardRequest {
+                    cwd: fixture.path().to_path_buf(),
+                    paths: vec!["untracked.txt".into(), path.into()],
+                    permit_permanent: true,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(refused.is_err(), "{path} was accepted");
+        }
+        assert!(trash.trashed.lock().unwrap().is_empty());
+        assert!(root.join(".git/objects").is_dir() && root.join(".git/HEAD").is_file());
+        assert!(
+            root.join("untracked.txt").exists(),
+            "a refused call moves nothing"
+        );
+        let staged = GitRepository::default()
+            .stage_files(
+                fixture.path(),
+                &[".git/config".to_owned()],
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(staged.is_err(), "staging takes the same validator");
+
+        // A linked worktree's `.git` is a file that points at its Git directory.
+        let linked = root.parent().unwrap().join(format!(
+            "{}-linked",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let refused = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: linked.clone(),
+                paths: vec![".git".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a linked worktree's .git file was accepted"
+        );
+        assert!(linked.join(".git").is_file());
+        std::fs::remove_dir_all(&linked).ok();
+    }
+
+    /// A repository with one commit and `untracked.txt`, and its canonical path.
+    fn metadata_fixture() -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("untracked.txt"), "untracked\n").expect("untracked");
+        let root = fixture.path().canonicalize().expect("canonical checkout");
+        (fixture, root)
+    }
+
+    /// A staging folder BiBCode does not keep private (another owner, or writable by group or
+    /// others) is never used: such a user could rename the holder after the identity check. The
+    /// entry stays where it was, the trash is never called, and `permanent` still works
+    /// through Git.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_staging_folder_others_can_write_is_never_used() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, root) = staging_fixture();
+        let staging = root.join(".git/bibcode-discard");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert!(trash.trashed.lock().unwrap().is_empty());
+        assert!(root.join("dir/victim.txt").exists());
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// The ownership rule itself, for an owner a test cannot create.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_staging_folder_of_ours_without_group_or_other_write_is_private() {
+        assert!(discard_staging::is_private(501, 0o40700, 501));
+        assert!(discard_staging::is_private(501, 0o40755, 501));
+        assert!(
+            !discard_staging::is_private(0, 0o40700, 501),
+            "another owner"
+        );
+        assert!(
+            !discard_staging::is_private(501, 0o40770, 501),
+            "group write"
+        );
+        assert!(
+            !discard_staging::is_private(501, 0o40702, 501),
+            "other write"
+        );
+    }
+
+    /// Never answers.
+    #[cfg(unix)]
+    struct StuckTrash {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for StuckTrash {
+        fn trash<'a>(
+            &'a self,
+            _path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Stops a discard while its entry waits for the trash, as a crash would, and returns once
+    /// the entry is staged.
+    #[cfg(unix)]
+    async fn strand(fixture: &tempfile::TempDir, path: &str) {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trash = Arc::new(StuckTrash {
+            called: called.clone(),
+        });
+        let (cwd, path) = (fixture.path().to_path_buf(), path.to_owned());
+        let discard = tokio::spawn(async move {
+            discard_paths(
+                &GitRepository::default(),
+                trash,
+                DiscardRequest {
+                    cwd,
+                    paths: vec![path],
+                    permit_permanent: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        while !called.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        discard.abort();
+        assert!(discard.await.is_err(), "the discard was stopped");
+    }
+
+    /// A holder another server process is still using (it holds the holder folder's lock while
+    /// its entry waits for the trash) is never recovered; once that lock is released, as it is
+    /// when the process dies, the entry is restored. Another open of the folder stands in for
+    /// the other process: `flock` locks belong to each open file, not to the process.
+    ///
+    /// A lock can outlive the descriptor that took it for a moment: a child another test forks
+    /// keeps a copy of every descriptor, close-on-exec ones too, until it execs. So taking the
+    /// lock after the stranded discard is stopped, and the recovery after it is released,
+    /// retry for a bounded time, as production recovery retries on the next discard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_leaves_a_holder_another_process_still_holds() {
+        use std::os::fd::AsRawFd;
+
+        const ATTEMPTS: usize = 500;
+        let (fixture, root) = staging_fixture();
+        strand(&fixture, "dir/victim.txt").await;
+        let staging = root.join(".git/bibcode-discard");
+        let holder = std::fs::read_dir(&staging)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.path().is_dir())
+            .expect("a holder")
+            .path();
+        let other_process = std::fs::File::open(&holder).unwrap();
+        let mut locked = false;
+        for _ in 0..ATTEMPTS {
+            // SAFETY: the descriptor is open for the duration of the call.
+            if unsafe { libc::flock(other_process.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+            {
+                locked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(locked, "the other process takes the holder's lock");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let discard_other = || async {
+            std::fs::write(root.join("other.txt"), "other\n").unwrap();
+            discard_paths(
+                &GitRepository::default(),
+                Arc::new(RecordingTrash {
+                    destination: trash_directory.path().to_path_buf(),
+                    trashed: Mutex::new(Vec::new()),
+                }),
+                DiscardRequest {
+                    cwd: fixture.path().to_path_buf(),
+                    paths: vec!["other.txt".into()],
+                    permit_permanent: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the discard runs");
+        };
+
+        discard_other().await;
+        assert!(
+            !root.join("dir/victim.txt").exists(),
+            "a held holder is left alone"
+        );
+        assert!(holder.join("victim.txt").exists());
+
+        drop(other_process);
+        for _ in 0..ATTEMPTS {
+            discard_other().await;
+            if root.join("dir/victim.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "inside\n",
+            "an abandoned holder is restored"
+        );
+    }
+
+    /// A record BiBCode did not write cannot move a staged entry anywhere but its place in this
+    /// checkout: a record naming another root, a `..`, an absolute path, Git's metadata, or a
+    /// path through a symlinked folder is ignored, and its entry stays staged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_origin_record_never_moves_an_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, root) = staging_fixture();
+        let outside = tempfile::tempdir().expect("outside folder");
+        let outside_path = outside.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside_path, root.join("link")).expect("link");
+        let staging = root.join(".git/bibcode-discard");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut root_elsewhere = outside_path.as_os_str().as_encoded_bytes().to_vec();
+        root_elsewhere.extend_from_slice(b"\0x.txt");
+        let records: Vec<Vec<u8>> = vec![
+            root_elsewhere,
+            b"../outside/x.txt".to_vec(),
+            format!("{}/x.txt", outside_path.display()).into_bytes(),
+            b"link/x.txt".to_vec(),
+            b".git/x.txt".to_vec(),
+            b"./x.txt".to_vec(),
+        ];
+        let mut holders = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            let holder = format!("forged-{index}");
+            std::fs::create_dir(staging.join(&holder)).unwrap();
+            std::fs::write(staging.join(&holder).join("x.txt"), "staged\n").unwrap();
+            std::fs::write(staging.join(format!("{holder}.origin")), record).unwrap();
+            holders.push(holder);
+        }
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+
+        discard_paths(
+            &GitRepository::default(),
+            Arc::new(RecordingTrash {
+                destination: trash_directory.path().to_path_buf(),
+                trashed: Mutex::new(Vec::new()),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["other.txt".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        for holder in &holders {
+            assert!(
+                staging.join(holder).join("x.txt").exists(),
+                "{holder}'s entry was moved"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&outside_path).unwrap().count(), 0);
+        assert!(!root.join("x.txt").exists() && !root.join(".git/x.txt").exists());
+    }
+
+    /// An entry a crash left in the staging folder is moved back to where it came from by the
+    /// next discard in that repository; one whose place is taken again stays staged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_discard_restores_entries_a_crash_left_in_staging() {
+        let (fixture, root) = staging_fixture();
+        strand(&fixture, "dir/victim.txt").await;
+        assert!(
+            !root.join("dir/victim.txt").exists(),
+            "the entry is stranded"
+        );
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+        let discard = |path: &str| DiscardRequest {
+            cwd: fixture.path().to_path_buf(),
+            paths: vec![path.into()],
+            permit_permanent: false,
+        };
+
+        // Retried for a bounded time: a child another test forks can hold a copy of the stopped
+        // discard's locked descriptor until it execs (see
+        // `recovery_leaves_a_holder_another_process_still_holds`).
+        for _ in 0..500 {
+            std::fs::write(root.join("other.txt"), "other\n").unwrap();
+            let outcome = discard_paths(
+                &GitRepository::default(),
+                trash.clone(),
+                discard("other.txt"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the discard runs");
+            assert_eq!(outcome.trashed, ["other.txt"]);
+            if root.join("dir/victim.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "inside\n",
+            "the stranded entry went back"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".git/bibcode-discard"))
+                .unwrap()
+                .count(),
+            0,
+            "its holder and record are gone"
+        );
+
+        // Stranded again, and its place taken meanwhile: it stays staged.
+        strand(&fixture, "dir/victim.txt").await;
+        std::fs::write(root.join("dir/victim.txt"), "new\n").unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        discard_paths(
+            &GitRepository::default(),
+            trash,
+            discard("other.txt"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dir/victim.txt")).unwrap(),
+            "new\n"
+        );
+        assert_ne!(
+            std::fs::read_dir(root.join(".git/bibcode-discard"))
+                .unwrap()
+                .count(),
+            0,
+            "the stranded entry is kept, not dropped"
+        );
+    }
+
+    /// An entry the trash refuses goes back where it was, but never over a file created there
+    /// while it was staged: that file is kept and the entry stays staged, reported as kept, not
+    /// as permanently discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_entry_never_goes_back_over_a_file_created_meanwhile() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("untracked.txt"), "old\n").expect("untracked file");
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingTrash {
+                recreate: fixture.path().join("untracked.txt"),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["untracked.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(outcome.trash_unavailable, ["untracked.txt"]);
+        assert!(outcome.permanently_discarded.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("untracked.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    /// A folder swapped for a symlink to somewhere outside inside the move window itself, after
+    /// every check, is never followed: the entry is moved from the folder that was checked, by
+    /// handle, into BiBCode's own staging folder in the Git directory, and only that staged path
+    /// reaches the trash (#139 slice G, review round 3).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_swapped_for_an_outside_symlink_inside_the_move_window_is_never_followed() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::tempdir().expect("outside folder");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::create_dir(fixture.path().join("dir")).expect("folder");
+        std::fs::write(fixture.path().join("dir/victim.txt"), "inside\n").expect("inside file");
+        std::fs::write(outside.path().join("victim.txt"), "keep\n").expect("outside file");
+        let root = fixture.path().canonicalize().expect("canonical checkout");
+        let (folder, away, target) = (
+            root.join("dir"),
+            root.join("dir-away"),
+            outside.path().to_path_buf(),
+        );
+        discard_hooks::on(
+            discard_hooks::Point::BeforeMove,
+            root.join("dir/victim.txt"),
+            move || {
+                std::fs::rename(&folder, away).expect("folder moves away");
+                std::os::unix::fs::symlink(target, &folder).expect("symlink replaces it");
+            },
+        );
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep\n",
+            "the outside file was never touched"
+        );
+        assert_eq!(outcome.trashed, ["dir/victim.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(trash_directory.path().join("victim.txt")).unwrap(),
+            "inside\n",
+            "the trash took the file from the folder that was checked"
+        );
+        let trashed = trash.trashed.lock().unwrap();
+        assert!(
+            trashed[0].starts_with(root.join(".git/bibcode-discard")),
+            "the trash got BiBCode's staged path, not one that resolves through the checkout: {trashed:?}"
+        );
+        let staging = std::fs::read_dir(root.join(".git/bibcode-discard")).unwrap();
+        assert_eq!(staging.count(), 0, "the staging folder is emptied");
+    }
+
+    /// A folder another process moves out of the checkout after BiBCode opened it, before its
+    /// entry is staged, is never emptied into the staging folder: the entry stays where the
+    /// folder went, the trash is never called, and the discard reports it kept (#139 X5
+    /// round 5).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_moved_out_of_the_checkout_before_staging_is_never_staged() {
+        let (fixture, root) = staging_fixture();
+        let outside = tempfile::tempdir_in(root.parent().expect("a parent")).expect("outside");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let (folder, away) = (root.join("dir"), outside.path().join("dir"));
+        let moved_to = away.clone();
+        discard_hooks::on(
+            discard_hooks::Point::BeforeMove,
+            root.join("dir/victim.txt"),
+            move || std::fs::rename(&folder, &moved_to).expect("the folder moves out"),
+        );
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(
+            trash.trashed.lock().unwrap().is_empty(),
+            "the trash was never called"
+        );
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert!(outcome.trashed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(away.join("victim.txt")).unwrap(),
+            "inside\n",
+            "the entry stayed in the folder that left"
+        );
+        let staging = std::fs::read_dir(root.join(".git/bibcode-discard")).unwrap();
+        assert_eq!(staging.count(), 0, "nothing is left staged");
+    }
+
+    /// A symlinked folder inside the checkout that points elsewhere cannot route a discard
+    /// outside it (#139 slice G, C5): nothing is trashed or restored, for any path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discard_refuses_a_path_whose_folder_leaves_the_checkout() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::tempdir().expect("outside folder");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "changed\n").expect("change");
+        std::fs::write(outside.path().join("victim.txt"), "keep\n").expect("outside file");
+        std::os::unix::fs::symlink(outside.path(), fixture.path().join("link")).expect("link");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+        for paths in [
+            vec!["link/victim.txt".to_owned()],
+            vec!["tracked.txt".to_owned(), "link/victim.txt".to_owned()],
+            vec!["link/missing/deeper.txt".to_owned()],
+        ] {
+            let refused = discard_paths(
+                &GitRepository::default(),
+                trash.clone(),
+                DiscardRequest {
+                    cwd: fixture.path().to_path_buf(),
+                    paths: paths.clone(),
+                    permit_permanent: true,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(refused.is_err(), "{paths:?} was discarded");
+        }
+        assert!(trash.trashed.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            "changed\n",
+            "a refused call restores nothing"
+        );
+    }
+
+    #[test]
+    fn branch_names_can_never_be_options_or_refspecs() {
+        for name in [
+            "feature",
+            "feature/x-1",
+            "refs/heads/main",
+            "release/v1.2",
+            "a@b",
+        ] {
+            assert!(is_branch_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "-x",
+            "--receive-pack=evil",
+            "a:b",
+            "+main",
+            "a b",
+            "a\tb",
+            "a..b",
+            "a@{1}",
+            "@",
+            "/a",
+            "a/",
+            "a.",
+            "a//b",
+            "a/.b",
+            "a.lock",
+            "a/b.lock/c",
+            "a~1",
+            "a^",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+            "a\u{7f}",
+        ] {
+            assert!(!is_branch_name(name), "{name:?}");
+        }
+    }
+
+    /// `remote-branch-delete` deletes only the remote branch (#139 slice G), and refuses a
+    /// remote the checkout does not have or a branch name that is not one.
+    #[tokio::test]
+    async fn remote_branch_delete_removes_only_the_remote_branch() {
+        let remote = tempfile::tempdir().expect("bare remote");
+        let fixture = tempfile::tempdir().expect("clone");
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(
+            fixture.path(),
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        std::fs::write(fixture.path().join("a.txt"), "a\n").expect("file");
+        git(fixture.path(), &["add", "a.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        git(fixture.path(), &["branch", "feature"]);
+        git(fixture.path(), &["push", "-q", "origin", "main", "feature"]);
+        let request: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "remote-branch-delete", "cwd": fixture.path(), "projectId": "p",
+            "remote": "origin", "branch": "feature",
+        }))
+        .expect("the request decodes");
+        assert_eq!(request.operation(), "remote-branch-delete");
+        assert!(request.is_implemented_through_phase_16());
+        let mut snapshot = operation_snapshot(fixture.path());
+        snapshot.remotes = vec!["origin".into()];
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        for (remote_name, branch) in [("upstream", "feature"), ("origin", "-x"), ("origin", "a:b")]
+        {
+            let refused = execute_branch_or_sync_operation(
+                &repository,
+                &snapshot,
+                &GitManagerOperationRequest::RemoteBranchDelete {
+                    cwd: fixture.path().to_path_buf(),
+                    project_id: "p".into(),
+                    remote: remote_name.into(),
+                    branch: branch.into(),
+                },
+                &token,
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(refused.code, "invalid-request", "{remote_name} {branch}");
+        }
+        execute_branch_or_sync_operation(&repository, &snapshot, &request, &token)
+            .await
+            .expect("the remote branch is deleted");
+        assert_eq!(
+            git(remote.path(), &["branch", "--format=%(refname:short)"]),
+            "main"
+        );
+        assert_eq!(
+            git(fixture.path(), &["branch", "--format=%(refname:short)"]),
+            "feature\nmain",
+            "the local branch stays"
+        );
     }
 }

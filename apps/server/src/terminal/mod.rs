@@ -1,9 +1,11 @@
 mod history;
+pub(crate) use history::{HistoryCursor, HistoryWindow};
 mod input;
 mod manager;
 mod model;
 mod osc;
 mod pty;
+mod writer;
 
 pub use input::TerminalInputError;
 pub(crate) use input::{InputReadmissionScope, TerminalInputAdmission};

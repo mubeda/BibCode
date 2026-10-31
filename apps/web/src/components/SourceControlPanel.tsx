@@ -86,6 +86,7 @@ import {
   resolveQuickAction,
   stackedActionFailureTitle,
 } from "./GitActionsControl.logic";
+import { SourceControlAgentSuggestion } from "./SourceControlAgentSuggestion";
 import { SourceControlChangesList } from "./SourceControlChangesList";
 import { SourceControlCommits } from "./SourceControlCommits";
 import {
@@ -1062,6 +1063,12 @@ export default function SourceControlPanel({
             )}
           </button>
         </div>
+        <SourceControlAgentSuggestion
+          environmentId={environmentId}
+          cwd={gitCwd}
+          legacyThreadKey={scopedThreadKey(threadRef)}
+          draftMessage={draft.message}
+        />
 
         <div className="flex items-center gap-1">
           {activeSelectionMode ? (

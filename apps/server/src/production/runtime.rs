@@ -110,6 +110,10 @@ use crate::{
 
 pub struct ProductionRuntime {
     pub registry: RpcRegistry,
+    /// The outside-agent tools on `/mcp` (#139).
+    mcp_control: crate::mcp::control::McpControl,
+    /// Outbound webhooks and their dispatcher (#139 slice X8).
+    webhooks: crate::webhooks::Webhooks,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -161,6 +165,12 @@ impl ProductionRuntime {
         self.provider_runtime.attach_connect_mcp(service).await;
     }
 
+    /// The outside-agent MCP tools, for the `/mcp` endpoint.
+    #[must_use]
+    pub fn mcp_control(&self) -> crate::mcp::control::McpControl {
+        self.mcp_control.clone()
+    }
+
     /// The committed `enableProfiler`, which drives a desktop host's crash monitor.
     #[must_use]
     pub fn profiler_enabled_signal(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -193,10 +203,14 @@ impl ProductionRuntime {
         &self.preview_tunnels
     }
 
-    /// The handler that serves signed download URLs.
+    /// The handler that serves signed download URLs. A URL an outside agent minted is served
+    /// only while its access lasts (#139 X5).
     #[must_use]
     pub fn transfer_download_handler(&self) -> TransferDownloadHandler {
-        transfer_routes::download_handler(self.transfer_access.clone())
+        transfer_routes::download_handler_with_mcp(
+            self.transfer_access.clone(),
+            self.mcp_control.clone(),
+        )
     }
 
     /// The handler that accepts signed uploads.
@@ -209,7 +223,7 @@ impl ProductionRuntime {
     pub fn transfer_upload_handler(&self) -> TransferUploadHandler {
         let workspace = self.workspace.clone();
         let status_broadcaster = self.status_broadcaster.clone();
-        transfer_routes::upload_handler(
+        transfer_routes::upload_handler_with_mcp(
             self.transfer_access.clone(),
             Arc::new(move |root| {
                 let workspace = workspace.clone();
@@ -219,6 +233,8 @@ impl ProductionRuntime {
                     status_broadcaster.notify_local_change(&root).await;
                 })
             }),
+            self.mcp_control.clone(),
+            self.workspace.path_locks(),
         )
     }
 
@@ -533,8 +549,12 @@ impl ProductionRuntime {
                 status_broadcaster.notify_local_change(&cwd).await;
             })
         }));
+        // One system trash for Source Control's discard and the Files tools' delete (#139 X5).
+        let file_trash: Arc<dyn crate::git::FileTrash> =
+            Arc::new(crate::git::NativeFileTrash::default());
         let workspace = WorkspaceRpc::with_dependencies(
-            WorkspaceService::default(),
+            WorkspaceService::default()
+                .with_trash(file_trash.clone(), state_paths.state_dir.clone()),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
                 transfer_access: Some(transfer_access.clone()),
@@ -590,6 +610,7 @@ impl ProductionRuntime {
         ));
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
+        let mcp_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
@@ -641,7 +662,7 @@ impl ProductionRuntime {
         ));
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
-        crate::auth::register_rpc_handlers(&mut registry, auth);
+        crate::auth::register_rpc_handlers(&mut registry, auth.clone());
         register_activity_rpc(
             &mut registry,
             activity_projections.clone(),
@@ -686,7 +707,7 @@ impl ProductionRuntime {
             worktree_catalog.clone(),
             repositories.clone(),
             workspace_availability.clone(),
-            Arc::new(crate::git::NativeFileTrash::default()),
+            file_trash,
         );
         register_git_vcs_rpc(&mut registry, git_vcs);
         register_git_manager_rpc(&mut registry, git_manager);
@@ -719,9 +740,43 @@ impl ProductionRuntime {
                 terminal_services.clone(),
             ),
         );
+        let mcp_activity = crate::mcp::activity::McpActivity::new(repositories.database().clone());
+        // Startup maintenance: the 7-day retention, which readers only filter by.
+        mcp_activity.prune_expired().await;
+        crate::mcp::activity::register_mcp_activity_rpc(&mut registry, mcp_activity.clone());
+        crate::production::ui_intents_rpc::register_ui_intents_rpc(
+            &mut registry,
+            crate::production::ui_intents_rpc::UiIntents::new(),
+        );
+        // The secret store `lifecycle.rs` opens for auth: endpoint secrets live beside the host
+        // identity secret, as `webhook-<id>`.
+        let webhook_secrets = crate::auth::SecretStore::new(config.state_dir().join("secrets"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let webhooks =
+            crate::webhooks::Webhooks::start(crate::webhooks::WebhooksConfig::production(
+                repositories.database().clone(),
+                repositories.clone(),
+                webhook_secrets,
+                config.environment_id.clone(),
+                control.webhooks_enabled_signal(),
+                control.mcp_server_signal(),
+            ));
+        webhooks.wake_on(auth.subscribe_access());
+        crate::webhooks::register_webhooks_rpc(&mut registry, webhooks.clone());
         finalize_rpc_registry(&registry, &control)?;
+        let mcp_control = crate::mcp::control::McpControl::new_with_activity(
+            registry.clone(),
+            auth.clone(),
+            orchestration.clone(),
+            control.mcp_server_signal(),
+            mcp_activity,
+        );
+        mcp_control.attach_terminals(mcp_terminals);
 
         Ok(Self {
+            mcp_control,
+            webhooks,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -884,6 +939,12 @@ impl ProductionRuntime {
         // as an incomplete shutdown on the next start, not as a crash.
         let profiler = self.profiler.clone();
         let _ = tokio::task::spawn_blocking(move || profiler.begin_stopping()).await;
+        // Outside agents' MCP calls: refused from here on, and every wait in flight ends, long
+        // before the orchestration engine shuts down.
+        self.mcp_control.shutdown();
+        // Outbound webhooks: requests in flight end and stay queued for the next start, before
+        // the profiler's teardown.
+        self.webhooks.shutdown().await;
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         self.server_control.shutdown_capability_discovery().await;
@@ -1975,6 +2036,7 @@ mod tests {
         RouteContext {
             headers: HeaderMap::new(),
             uri: Uri::from_static("/test"),
+            origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
             cancellation: CancellationToken::new(),
         }
     }

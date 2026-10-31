@@ -379,8 +379,13 @@ impl WorkspaceRpc {
             }
             "projects.writeFileIfUnchanged" => {
                 let input: WriteIfUnchangedInput = decode(payload)?;
-                self.handle_write_file(input.write, Some(input.precondition), cancellation)
-                    .await
+                let single_link_only = input.single_link_only.unwrap_or(false);
+                self.handle_write_file(
+                    input.write,
+                    Some((input.precondition, single_link_only)),
+                    cancellation,
+                )
+                .await
             }
             "projects.createEntry" => {
                 let input: CreateInput = decode(payload)?;
@@ -465,7 +470,7 @@ impl WorkspaceRpc {
                 .await
             }
             "projects.deleteEntry" => {
-                let input: PathInput = decode(payload)?;
+                let input: DeleteInput = decode(payload)?;
                 let admission = self.acquire_path(&input.cwd).await?;
                 let finalization = Self::begin_mutation(admission.as_ref())?;
                 let rpc = self.clone();
@@ -475,11 +480,16 @@ impl WorkspaceRpc {
                     &input.cwd,
                     &input.relative_path,
                 );
+                let trash_cancellation = cancellation.clone();
                 let operation = async move {
-                    let result = rpc
-                        .service
-                        .delete_entry(Path::new(&input.cwd), &input.relative_path)
-                        .await;
+                    let root = Path::new(&input.cwd);
+                    let result = if input.to_trash == Some(true) {
+                        rpc.service
+                            .trash_entry(root, &input.relative_path, &trash_cancellation)
+                            .await
+                    } else {
+                        rpc.service.delete_entry(root, &input.relative_path).await
+                    };
                     rpc.invalidate_index(&input.cwd).await;
                     result
                         .map(|relative_path| json!({ "relativePath": relative_path }))
@@ -595,13 +605,8 @@ impl WorkspaceRpc {
                 let input: AssetCreateUrlInput = decode(payload)?;
                 self.handle_asset_create_url(input).await
             }
-            "projects.createDownloadUrl" => {
-                let input: ProjectCreateDownloadUrlInput = decode(payload)?;
-                self.handle_create_download_url(input).await
-            }
-            "projects.createUploadUrl" => {
-                let input: ProjectCreateUploadUrlInput = decode(payload)?;
-                self.handle_create_upload_url(input).await
+            "projects.createDownloadUrl" | "projects.createUploadUrl" => {
+                self.handle_transfer_mint(method, payload, None).await
             }
             "review.getDiffPreview" => {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
@@ -652,6 +657,12 @@ impl WorkspaceRpc {
                 "message": WorkspaceError::UnsupportedMethod(method.to_owned()).to_string(),
             })),
         }
+    }
+
+    /// The per-path locks the service's writes take; the upload route takes the same ones, so
+    /// a save and an upload of one file never run together.
+    pub(crate) fn path_locks(&self) -> super::PathLocks {
+        self.service.path_locks()
     }
 
     /// How many full workspace scans have run.
@@ -1125,6 +1136,25 @@ impl WorkspaceRpc {
         self.indexes.lock().await.invalidate(&canonical);
     }
 
+    /// `projects.createDownloadUrl` and `projects.createUploadUrl`. `mcp_session_id` is the
+    /// outside agent's session when one minted it (#139 X5), taken from the authenticated
+    /// principal by the registration, never from the payload: the token then names it, and
+    /// the route serves it only while that session's access lasts.
+    pub(crate) async fn handle_transfer_mint(
+        &self,
+        method: &str,
+        payload: Value,
+        mcp_session_id: Option<String>,
+    ) -> Result<Value, Value> {
+        if method == "projects.createDownloadUrl" {
+            let input: ProjectCreateDownloadUrlInput = decode(payload)?;
+            self.handle_create_download_url(input, mcp_session_id).await
+        } else {
+            let input: ProjectCreateUploadUrlInput = decode(payload)?;
+            self.handle_create_upload_url(input, mcp_session_id).await
+        }
+    }
+
     /// Mints a short-lived signed URL for downloading a file, or a folder as a zip archive.
     ///
     /// The token binds the canonical workspace root and the relative path, so the HTTP route
@@ -1132,6 +1162,7 @@ impl WorkspaceRpc {
     async fn handle_create_download_url(
         &self,
         input: ProjectCreateDownloadUrlInput,
+        mcp_session_id: Option<String>,
     ) -> Result<Value, Value> {
         let access = self.transfer_access(&input.cwd, &input.relative_path)?;
         let _admission = self.acquire_path(&input.cwd).await?;
@@ -1166,7 +1197,14 @@ impl WorkspaceRpc {
         };
         let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
         let issued = access
-            .issue_download(&root, &relative)
+            .issue_download_bound(
+                &root,
+                &relative,
+                &transfer::TransferBinding {
+                    mcp_session_id,
+                    overwrite: None,
+                },
+            )
             .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_path, &error))?;
         Ok(json!({
             "relativeUrl": issued.relative_url,
@@ -1183,6 +1221,7 @@ impl WorkspaceRpc {
     async fn handle_create_upload_url(
         &self,
         input: ProjectCreateUploadUrlInput,
+        mcp_session_id: Option<String>,
     ) -> Result<Value, Value> {
         let access = self.transfer_access(&input.cwd, &input.relative_directory)?;
         // Checked before the path lease: an unusable name costs nothing to refuse.
@@ -1219,7 +1258,16 @@ impl WorkspaceRpc {
             relative
         };
         let issued = access
-            .issue_upload(&root, &relative, &input.file_name)
+            .issue_upload_bound(
+                &root,
+                &relative,
+                &input.file_name,
+                crate::transfer::MAX_UPLOAD_BYTES,
+                &transfer::TransferBinding {
+                    mcp_session_id,
+                    overwrite: input.overwrite,
+                },
+            )
             .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_directory, &error))?;
         Ok(json!({
             "relativeUrl": issued.relative_url,
@@ -1306,7 +1354,7 @@ impl WorkspaceRpc {
     async fn handle_write_file(
         &self,
         input: WriteInput,
-        precondition: Option<WritePrecondition>,
+        precondition: Option<(WritePrecondition, bool)>,
         cancellation: CancellationToken,
     ) -> Result<Value, Value> {
         let admission = self.acquire_path(&input.cwd).await?;
@@ -1326,13 +1374,14 @@ impl WorkspaceRpc {
                         .write_file(root, &input.relative_path, &input.contents)
                         .await
                 }
-                Some(precondition) => {
+                Some((precondition, single_link_only)) => {
                     rpc.service
-                        .write_file_if_unchanged(
+                        .write_file_if_unchanged_with(
                             root,
                             &input.relative_path,
                             &input.contents,
                             precondition,
+                            *single_link_only,
                         )
                         .await
                 }
@@ -1704,6 +1753,16 @@ struct PathInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DeleteInput {
+    cwd: String,
+    relative_path: String,
+    /// Move the entry to the system trash instead of deleting it (#139 X5). Off unless set,
+    /// so the Files panel's delete is unchanged.
+    to_trash: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WriteInput {
     cwd: String,
     relative_path: String,
@@ -1716,6 +1775,9 @@ struct WriteIfUnchangedInput {
     #[serde(flatten)]
     write: WriteInput,
     precondition: WritePrecondition,
+    /// Refuse a file with more than one hard link (#139 X5): `files_write` sets it; the Files
+    /// panel does not, since a person may edit their own hard-linked file.
+    single_link_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1769,6 +1831,9 @@ struct ProjectCreateUploadUrlInput {
     cwd: String,
     relative_directory: String,
     file_name: String,
+    /// Binds whether the upload may replace an existing file (#139 X5). Absent, the route
+    /// decides by its `?overwrite=1`, as before.
+    overwrite: Option<bool>,
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::diagnostics::redact_sensitive_text;
 use crate::source_control::{self, ProviderHosts};
 
+use super::clone_policy::ClonePlan;
 use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
 use super::manager::in_progress::detect_in_progress_operation;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
@@ -76,6 +77,9 @@ struct GitExecutionOptions {
 struct GitExecutionInput {
     environment: Vec<(OsString, OsString)>,
     stdin: Option<Vec<u8>>,
+    /// Inherit nothing: the child gets `environment` only (an agent clone's commands, which
+    /// put back an allowlist of the server's variables).
+    cleared: bool,
 }
 
 struct RewriteTempFiles {
@@ -103,6 +107,17 @@ pub(crate) trait GitProcessRunner: Send + Sync {
         request: ProcessRequest,
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a>;
+
+    /// [`Self::run`] inheriting nothing: the child gets `request.env` only (an agent clone's
+    /// commands, `clone_policy`). A runner that starts no process inherits nothing anyway,
+    /// so the default runs it as [`Self::run`].
+    fn run_cleared<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        self.run(request, cancellation)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +140,14 @@ impl GitProcessRunner for ProcessRunner {
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a> {
         Box::pin(ProcessRunner::run(self, request, cancellation))
+    }
+
+    fn run_cleared<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner::run_cleared(self, request, cancellation))
     }
 }
 
@@ -489,6 +512,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment: git_environment(),
                 stdin: Some(stdin),
+                cleared: false,
             },
             cancellation,
         )
@@ -535,6 +559,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment,
                 stdin: None,
+                cleared: false,
             },
             cancellation,
         )
@@ -557,25 +582,25 @@ impl GitRepository {
             .chain(args.iter().map(OsString::from))
             .collect::<Vec<_>>();
         let argument_count = args.len();
-        self.runner
-            .run(
-                ProcessRequest {
-                    operation: operation.to_owned(),
-                    command: PathBuf::from("git"),
-                    args,
-                    cwd: cwd.to_path_buf(),
-                    env: input.environment,
-                    stdin: input.stdin,
-                    timeout: self.command_timeout,
-                    max_output_bytes: options.max_output_bytes,
-                    output_policy: options.output_policy,
-                    append_truncation_marker: false,
-                    allow_non_zero_exit: options.allow_non_zero_exit,
-                },
-                cancellation,
-            )
-            .await
-            .map_err(|error| git_error(operation, cwd, argument_count, error))
+        let request = ProcessRequest {
+            operation: operation.to_owned(),
+            command: PathBuf::from("git"),
+            args,
+            cwd: cwd.to_path_buf(),
+            env: input.environment,
+            stdin: input.stdin,
+            timeout: self.command_timeout,
+            max_output_bytes: options.max_output_bytes,
+            output_policy: options.output_policy,
+            append_truncation_marker: false,
+            allow_non_zero_exit: options.allow_non_zero_exit,
+        };
+        let output = if input.cleared {
+            self.runner.run_cleared(request, cancellation).await
+        } else {
+            self.runner.run(request, cancellation).await
+        };
+        output.map_err(|error| git_error(operation, cwd, argument_count, error))
     }
 
     pub(crate) async fn git_manager_resolve_tips(
@@ -628,6 +653,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment: git_read_environment(),
                 stdin: Some(stdin),
+                cleared: false,
             },
             cancellation,
         )
@@ -2766,7 +2792,7 @@ impl GitRepository {
             return Ok(());
         }
         validate_pathspecs("GitVcsDriver.stageFiles", cwd, paths)?;
-        let mut args = strings(&["add", "--"]);
+        let mut args = strings(&[LITERAL_PATHSPECS, "add", "--"]);
         args.extend(paths.iter().cloned());
         self.run("GitVcsDriver.stageFiles", cwd, &args, cancellation)
             .await?;
@@ -2793,9 +2819,16 @@ impl GitRepository {
             )
             .await?;
         let mut args = if head.exit_code == 0 {
-            strings(&["restore", "--staged", "--"])
+            strings(&[LITERAL_PATHSPECS, "restore", "--staged", "--"])
         } else {
-            strings(&["rm", "--cached", "-r", "--ignore-unmatch", "--"])
+            strings(&[
+                LITERAL_PATHSPECS,
+                "rm",
+                "--cached",
+                "-r",
+                "--ignore-unmatch",
+                "--",
+            ])
         };
         args.extend(paths.iter().cloned());
         self.run("GitVcsDriver.unstageFiles", cwd, &args, cancellation)
@@ -2813,7 +2846,14 @@ impl GitRepository {
             return Ok(());
         }
         validate_pathspecs("GitVcsDriver.discardFiles", cwd, paths)?;
-        let mut list_args = strings(&["-c", "core.quotePath=false", "ls-files", "-z", "--"]);
+        let mut list_args = strings(&[
+            LITERAL_PATHSPECS,
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-z",
+            "--",
+        ]);
         list_args.extend(paths.iter().cloned());
         let tracked = self
             .run(
@@ -2830,7 +2870,7 @@ impl GitRepository {
             .map(str::to_owned)
             .collect();
         if !tracked_paths.is_empty() {
-            let mut restore_args = strings(&["restore", "--worktree", "--"]);
+            let mut restore_args = strings(&[LITERAL_PATHSPECS, "restore", "--worktree", "--"]);
             restore_args.extend(tracked_paths);
             self.run(
                 "GitVcsDriver.discardFiles.restore",
@@ -2859,7 +2899,7 @@ impl GitRepository {
             .cloned()
             .collect();
         if !requested_untracked.is_empty() {
-            let mut clean_args = strings(&["clean", "-fd", "--"]);
+            let mut clean_args = strings(&[LITERAL_PATHSPECS, "clean", "-fd", "--"]);
             clean_args.extend(requested_untracked);
             self.run(
                 "GitVcsDriver.discardFiles.clean",
@@ -2882,7 +2922,14 @@ impl GitRepository {
             return Ok(Vec::new());
         }
         validate_pathspecs("GitManager.discard", cwd, paths)?;
-        let mut args = strings(&["-c", "core.quotePath=false", "ls-files", "-z", "--"]);
+        let mut args = strings(&[
+            LITERAL_PATHSPECS,
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-z",
+            "--",
+        ]);
         args.extend(paths.iter().cloned());
         let tracked = self
             .run_read("GitManager.discard.tracked", cwd, &args, cancellation)
@@ -2905,7 +2952,7 @@ impl GitRepository {
             return Ok(());
         }
         validate_pathspecs("GitManager.discard", cwd, paths)?;
-        let mut args = strings(&["checkout", "HEAD", "--"]);
+        let mut args = strings(&[LITERAL_PATHSPECS, "checkout", "HEAD", "--"]);
         args.extend(paths.iter().cloned());
         self.run("GitManager.discard.restore", cwd, &args, cancellation)
             .await?;
@@ -5194,6 +5241,83 @@ impl GitRepository {
         }
     }
 
+    /// The URL `git clone <url>` run in `cwd` would contact, after the configuration's
+    /// `url.<base>.insteadOf` rewrites: `git ls-remote --get-url`, which contacts nothing.
+    /// Like every command of an agent clone, it inherits only the allowlist and `environment`.
+    pub(crate) async fn clone_remote_url(
+        &self,
+        cwd: &Path,
+        url: &str,
+        environment: &[(OsString, OsString)],
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitCommandError> {
+        let output = self
+            .agent_clone_read(
+                "GitVcsDriver.cloneRemoteUrl",
+                cwd,
+                &[
+                    "ls-remote".into(),
+                    "--get-url".into(),
+                    "--".into(),
+                    url.into(),
+                ],
+                environment,
+                cancellation,
+            )
+            .await?;
+        Ok(output.stdout.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    /// `git --version` for an agent clone, inheriting only the allowlist and `environment`;
+    /// `None` when unparseable.
+    pub(crate) async fn clone_git_version(
+        &self,
+        cwd: &Path,
+        environment: &[(OsString, OsString)],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::git::GitVersion>, GitCommandError> {
+        let output = self
+            .agent_clone_read(
+                "GitVcsDriver.cloneGitVersion",
+                cwd,
+                &["--version".into()],
+                environment,
+                cancellation,
+            )
+            .await?;
+        Ok(crate::git::GitVersion::parse(&output.stdout))
+    }
+
+    async fn agent_clone_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        environment: &[(OsString, OsString)],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut command_environment = super::clone_policy::inherited_environment();
+        command_environment.extend(git_read_environment());
+        command_environment.extend(environment.iter().cloned());
+        self.execute_with_environment_and_stdin(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: 64 * 1024,
+                output_policy: OutputPolicy::Error,
+            },
+            GitExecutionInput {
+                environment: command_environment,
+                stdin: None,
+                cleared: true,
+            },
+            cancellation,
+        )
+        .await
+    }
+
     /// The reuse check without reserving: `Ok(None)` when nothing exists at the destination,
     /// the finished clone's path, or the error that names why the folder cannot be reused.
     pub(crate) async fn inspect_clone_destination(
@@ -7373,23 +7497,61 @@ pub(crate) struct ReservedClone {
 impl ReservedClone {
     /// Runs `git clone` into the reserved folder and nothing else. When it fails, the runner
     /// has already stopped and reaped Git's process group; removing the folder is the caller's.
+    /// An agent's clone runs with its `plan` (`clone_policy`): the `-c` pairs before `clone`
+    /// and the environment beside Git's own. A person's clone has none.
     pub(crate) async fn transfer(
         &self,
+        plan: Option<&ClonePlan>,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
+        let mut args = plan.map_or_else(Vec::new, |plan| plan.arguments().to_vec());
+        args.push("clone".into());
+        if plan.is_some() {
+            // An empty template: no hooks are copied into the clone, whatever the
+            // environment or configuration names.
+            args.push("--template=".into());
+        }
+        args.extend(["--".into(), self.url.clone(), self.leaf.as_str().to_owned()]);
+        // An agent's clone inherits only the allowlist; a person's keeps the server's
+        // environment.
+        let mut environment = if plan.is_some() {
+            super::clone_policy::inherited_environment()
+        } else {
+            Vec::new()
+        };
+        environment.extend(git_environment());
+        if let Some(plan) = plan {
+            environment.extend(plan.environment().iter().cloned());
+        }
         self.repository
-            .run(
+            .execute_with_environment_and_stdin(
                 CLONE_OPERATION,
                 &self.parent_dir,
-                &[
-                    "clone".into(),
-                    "--".into(),
-                    self.url.clone(),
-                    self.leaf.as_str().to_owned(),
-                ],
+                &args,
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Truncate,
+                },
+                GitExecutionInput {
+                    environment,
+                    stdin: None,
+                    cleared: plan.is_some(),
+                },
                 cancellation,
             )
-            .await?;
+            .await
+            .map_err(|mut error| {
+                // `http.followRedirects=false` leaves curl's 3xx for Git to report.
+                if plan.is_some() && error.detail.contains("returned error: 30") {
+                    error.detail = format!(
+                        "{}\nThe repository redirects to another address, and BiBCode does not follow redirects for an agent. Clone the address it moved to.",
+                        error.detail
+                    )
+                    .into();
+                }
+                error
+            })?;
         Ok(self.destination.path().to_path_buf())
     }
 
@@ -7418,7 +7580,7 @@ impl ReservedClone {
         self,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
-        match self.transfer(cancellation).await {
+        match self.transfer(None, cancellation).await {
             Ok(path) => Ok(path),
             Err(error) => match self.remove_destination().await {
                 Ok(()) => Err(error),
@@ -10058,6 +10220,7 @@ mod tests {
         assert_eq!(
             runner.requests()[0].args,
             [
+                "--literal-pathspecs",
                 "-c",
                 "core.quotePath=false",
                 "ls-files",
@@ -11525,6 +11688,16 @@ fn parse_git_manager_head_commit(
     })
 }
 
+/// The global option every command that takes a caller's file paths runs with (#139 slice G,
+/// C5): each path is a literal file or folder name, so `:(glob)**`, `*.rs` or `:/` names a
+/// file that matches nothing, never pathspec magic or a wildcard over the tree. A folder still
+/// names every file under it. `validate_pathspecs` refuses absolute, `.`, `..` and `.git` paths.
+const LITERAL_PATHSPECS: &str = "--literal-pathspecs";
+
+/// Refuses a caller's file pathspec that is empty, absolute, holds anything but plain parts
+/// (`.`, `..`), or starts with `.git` in any case: Git's own metadata (a main checkout's Git
+/// directory, a linked worktree's `.git` file) is never staged, unstaged, stashed or discarded
+/// (#139 review round 4). Discard also refuses a path that resolves into the Git directory.
 pub(crate) fn validate_pathspecs(
     operation: &str,
     cwd: &Path,
@@ -11542,6 +11715,17 @@ pub(crate) fn validate_pathspecs(
                 operation,
                 cwd,
                 "File pathspec must be a non-empty repository-relative path without traversal.",
+            ));
+        }
+        if parsed
+            .components()
+            .next()
+            .is_some_and(|first| first.as_os_str().eq_ignore_ascii_case(".git"))
+        {
+            return Err(simple_error(
+                operation,
+                cwd,
+                "File pathspec must not name Git's own metadata (.git).",
             ));
         }
     }
@@ -13503,6 +13687,137 @@ mod clone_tests {
         assert!(
             !parent.join("b").exists(),
             "nothing is cloned where the path leads"
+        );
+    }
+}
+
+/// Pathspecs a caller passes are literal file paths (#139 slice G, C5): `:(glob)**` names a
+/// file that matches nothing, never the whole tree, while a folder still names its files.
+#[cfg(test)]
+mod literal_pathspec_tests {
+    use std::{fs, path::Path, process::Command};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::GitRepository;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "BiBCode Test")
+            .env("GIT_AUTHOR_EMAIL", "bibcode@example.invalid")
+            .env("GIT_COMMITTER_NAME", "BiBCode Test")
+            .env("GIT_COMMITTER_EMAIL", "bibcode@example.invalid")
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository with one commit of `a.txt` and `src/b.txt`, both since changed, and an
+    /// untracked `src/new.txt`.
+    fn repository() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().expect("repository");
+        let root = folder.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "core.autocrlf", "false"]);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        fs::write(root.join("src/b.txt"), "b\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "base"]);
+        fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        fs::write(root.join("src/b.txt"), "b changed\n").unwrap();
+        fs::write(root.join("src/new.txt"), "new\n").unwrap();
+        folder
+    }
+
+    fn staged(root: &Path) -> String {
+        git(root, &["diff", "--cached", "--name-only"])
+    }
+
+    #[tokio::test]
+    async fn staging_takes_paths_literally_and_a_folder_still_stages_its_files() {
+        let folder = repository();
+        let root = folder.path();
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        for magic in [":(glob)**", "*.txt", ":/"] {
+            // Git refuses a literal path that matches nothing; either way nothing is staged.
+            let _ = repository.stage_files(root, &[magic.into()], &token).await;
+            assert_eq!(staged(root), "", "{magic} staged something");
+        }
+        repository
+            .stage_files(root, &["src".into()], &token)
+            .await
+            .expect("a folder stages");
+        assert_eq!(staged(root), "src/b.txt\nsrc/new.txt");
+    }
+
+    #[tokio::test]
+    async fn unstaging_takes_paths_literally() {
+        let folder = repository();
+        let root = folder.path();
+        git(root, &["add", "."]);
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        let _ = repository
+            .unstage_files(root, &[":(glob)**".into()], &token)
+            .await;
+        assert_eq!(staged(root), "a.txt\nsrc/b.txt\nsrc/new.txt");
+        repository
+            .unstage_files(root, &["src".into()], &token)
+            .await
+            .expect("a folder unstages");
+        assert_eq!(staged(root), "a.txt");
+    }
+
+    #[tokio::test]
+    async fn discarding_and_its_tracked_listing_take_paths_literally() {
+        let folder = repository();
+        let root = folder.path();
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        assert_eq!(
+            repository
+                .git_manager_tracked_paths(root, &[":(glob)**".into()], &token)
+                .await
+                .expect("listing"),
+            Vec::<String>::new()
+        );
+        let _ = repository
+            .git_manager_restore_tracked_paths(root, &[":(glob)**".into()], &token)
+            .await;
+        let _ = repository
+            .discard_files(root, &[":(glob)**".into()], &token)
+            .await;
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a changed\n"
+        );
+        assert!(root.join("src/new.txt").exists());
+        assert_eq!(
+            repository
+                .git_manager_tracked_paths(root, &["src".into()], &token)
+                .await
+                .expect("listing"),
+            ["src/b.txt"]
+        );
+        repository
+            .discard_files(root, &["src".into()], &token)
+            .await
+            .expect("a folder discards");
+        assert_eq!(fs::read_to_string(root.join("src/b.txt")).unwrap(), "b\n");
+        assert!(!root.join("src/new.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a changed\n"
         );
     }
 }
