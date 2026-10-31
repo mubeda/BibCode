@@ -3548,18 +3548,24 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   `pullRequest`, `worktreeKey`, `fileCount`, `cloneId`, `transferId`). A keyed call whose
   `clientRequestId` already has a live `mcp_tool_requests` row is a retry and records
   nothing; a keyed call cancelled while its owned mutation goes on is recorded once that
-  row settles. Rows are pruned past 7 days or 5,000 on insert. A write failure is a
-  `tracing::warn!` and never fails the call.
+  row settles. Rows are pruned past 7 days or 5,000 on insert, and past 7 days on every
+  read, which also filters by that cutoff, so retention holds while nothing is written. A
+  write failure is a `tracing::warn!` and never fails the call.
 - **`subscribeMcpActivity`** (`access:read`, read stream) sends a snapshot of the newest
   200 rows and the active agents, then each new row and each change of who is active. An
-  agent is active with a call in flight or in the last 2 minutes, or an owned mutation
-  running; streams re-check every 15 s so a quiet agent drops off.
+  agent is active with a call in flight or in the last 2 minutes, an owned mutation
+  running, or a running turn whose latest sent user message carries its actor
+  (`runningTurns`, revoked or not, so Stop stays in reach). Streams read the running turns on
+  the snapshot and every 15 s re-check, which also drops a quiet agent.
 - **Stop.** `POST /api/auth/clients/revoke` with `interruptTurns: true` revokes the session
   (cancelling its calls and owned mutations) and announces it on a channel of its own;
   `McpControl` then dispatches `thread.turn.interrupt` (`server:mcp-stop:…`, through the
   dispatch RPC, so the provider is told) for each running turn whose latest sent user
-  message carries that actor. A plain revocation, such as the `bibcode thread` CLI revoking
-  its own credential, interrupts nothing.
+  message carries that actor. An `mcp-client` session revoked earlier is announced too, so
+  Stop after Revoke still interrupts; Stop answers `revoked: false` only for an unknown
+  session or a revoked one that was not an agent's, and the web reports that as a failure.
+  A plain revocation, such as the `bibcode thread` CLI revoking its own credential,
+  interrupts nothing.
 - **Take over.** `POST /api/auth/clients/mcp-access { sessionId, access }` (`access:write`)
   sets an `mcp-client` session's `mcp_access` to `read-only` and remembers the level it
   replaced in `auth_sessions.mcp_access_hand_back`; any other level must be exactly that
