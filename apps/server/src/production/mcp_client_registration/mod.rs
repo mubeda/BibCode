@@ -77,6 +77,9 @@ pub(crate) struct Host {
     home: PathBuf,
     /// `$XDG_CONFIG_HOME`, else `~/.config`: where OpenCode keeps `opencode/opencode.json`.
     config_home: PathBuf,
+    /// `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`: Claude Code's user-scope MCP
+    /// servers, read (never written) for an entry's exact arguments.
+    claude_json: PathBuf,
 }
 
 impl Host {
@@ -85,11 +88,20 @@ impl Host {
         let home = dirs::home_dir()
             .filter(|home| home.is_dir())
             .unwrap_or_else(|| fallback.to_path_buf());
-        let config_home = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".config"));
-        Self { home, config_home }
+        let absolute = |name: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        };
+        let config_home = absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        let claude_json = absolute("CLAUDE_CONFIG_DIR")
+            .unwrap_or_else(|| home.clone())
+            .join(".claude.json");
+        Self {
+            home,
+            config_home,
+            claude_json,
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -97,6 +109,7 @@ impl Host {
         Self {
             home: home.to_path_buf(),
             config_home: home.join(".config"),
+            claude_json: home.join(".claude.json"),
         }
     }
 }
@@ -164,7 +177,7 @@ impl Target {
 
     async fn add(&self, launch: &[String], host: &Host) -> Result<(), Value> {
         match self {
-            Self::Cli(cli) => cli.add(launch, &host.home).await,
+            Self::Cli(cli) => cli.add(launch, &host.home, &host.claude_json).await,
             Self::File(file) => file.add(launch).await,
         }
     }

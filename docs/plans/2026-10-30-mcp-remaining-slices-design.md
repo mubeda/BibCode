@@ -5746,3 +5746,33 @@ five P2s, each now covered by a test that fails without its fix:
   BiBCode again. Codex's `mcp add` overwrites (`codex-rs/cli/src/mcp_cmd.rs` inserts by
   name), so Codex never removes. Tests: `a_failed_claude_replacement_puts_the_previous_entry_back`,
   `a_replacement_that_cannot_restore_says_what_was_removed_and_how_to_add_it`.
+
+### Connect an agent: review round 3 (2026-10-31)
+
+Codex closed the dual-file OpenCode handling and the symlink confinement and found no hang
+paths. Three P2s, each with a test that failed before its fix:
+
+- **A Claude Code restore could put back different arguments.** `claude mcp get` joins the
+  arguments with spaces, and splitting that line at ` --` turned `--base-dir "/work --archive"`
+  into two arguments while the message said the old entry was put back. The exact old
+  command now comes from Claude Code's own config, read only: `mcpServers.bibcode` (`command`,
+  `args`) in `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json` (checked on this Mac with
+  Claude Code 2.1.314: user-scope servers live there with `type`, `command` and `args`). It is
+  trusted only when it joins to the line `claude mcp get` printed. Without it, nothing is put
+  back and the message names the removed command and how to add BiBCode again; the printed
+  line is never split into a guess. Tests:
+  `a_failed_claude_replacement_puts_back_the_exact_previous_arguments`,
+  `without_the_exact_previous_arguments_nothing_is_claimed_restored`.
+- **A disabled OpenCode entry read as up to date.** An OpenCode entry is up to date only when
+  it is `"type": "local"`, not `"enabled": false` (left out, OpenCode turns it on), and runs
+  the launch command; Update writes `enabled: true`. Cursor's `mcp.json` has no such flag
+  (cursor.com/docs/context/mcp: servers are turned off in Cursor's own settings), so there is
+  nothing to compare there. Test: `a_disabled_opencode_entry_is_out_of_date_and_update_enables_it`.
+- **A save between the last check and the rename.** BiBCode shares no lock with Cursor or
+  OpenCode, so a save at that instant can only be made unlikely, not prevented. The check
+  stays immediately before the rename; after the rename the file is read back, and if it no
+  longer holds exactly what BiBCode wrote, the result is "Another app changed … at the same
+  time as BiBCode. Check the file, then try again." instead of success. BiBCode's own writers
+  stay serialized. Residual, as for the Files tools: another app's save in that instant can
+  replace BiBCode's change (reported) or be replaced by it (not detectable from BiBCode's
+  side). Test: `a_save_that_lands_with_the_rename_is_reported_not_claimed_as_success`.

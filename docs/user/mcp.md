@@ -31,13 +31,18 @@ uses the tool's own command where there is one (`claude mcp add --scope user`,
 holds the entry), keeping everything else in the file. A config file that is not plain JSON
 (for example one with comments) is left unchanged, and the line says so; so is a config file
 that is a link to somewhere outside the tool's own folder. If another app saves the file
-while BiBCode is changing it, BiBCode reads it again rather than overwriting that save. A
-tool BiBCode cannot find on that host shows its button disabled with the reason.
+while BiBCode is changing it, BiBCode reads it again rather than overwriting that save. BiBCode
+cannot lock the file against Cursor or OpenCode, so a save in the very instant BiBCode
+replaces it can still collide: BiBCode then says "Another app changed … at the same time";
+check the file and add again. A tool BiBCode cannot find on that host shows its button
+disabled with the reason.
 
 When an entry runs another command, for example after the app moved or its data folder
-changed, the line reads "Added to … (out of date)" with **Update**, which replaces the entry
-with the current command. If replacing a Claude Code entry fails, BiBCode puts the previous
-one back, or tells you what it removed and how to add it again.
+changed, or an OpenCode entry is turned off (`"enabled": false`), the line reads "Added to …
+(out of date)" with **Update**, which replaces the entry with the current command, turned on.
+If replacing a Claude Code entry fails, BiBCode puts the previous one back exactly as it was
+(read from Claude Code's own `~/.claude.json`), or, when it cannot, tells you what it removed
+and how to add it again.
 
 **Other MCP clients** (collapsed) holds the command and the standard `mcpServers` JSON for
 any other tool, with **Copy command** and **Copy MCP config**. They name the right
