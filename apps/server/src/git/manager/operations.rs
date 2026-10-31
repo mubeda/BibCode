@@ -2439,7 +2439,11 @@ pub async fn discard_paths(
             Moved::NotTaken if request.permit_permanent => {
                 outcome.permanently_discarded.push(path.clone());
             }
-            Moved::NotTaken | Moved::Kept => outcome.trash_unavailable.push(path.clone()),
+            // A stranded entry is listed with those the trash did not take; it is in the
+            // staging folder, which the next discard's recovery empties.
+            Moved::NotTaken | Moved::Kept | Moved::Stranded(_) => {
+                outcome.trash_unavailable.push(path.clone());
+            }
         }
     }
 
@@ -2562,9 +2566,17 @@ pub(crate) enum Moved {
     Trashed,
     /// The trash could not take it, and it is where it was: a permanent discard may remove it.
     NotTaken,
-    /// It is kept whatever the request permits: its folder is, or became, a link (or not a
-    /// folder), or it could not be put back from BiBCode's staging folder.
+    /// It is kept where it was, whatever the request permits: its folder is, or became, a link
+    /// (or not a folder), or left the checkout.
     Kept,
+    /// It is no longer where it was: it is in BiBCode's staging folder, at this path, because
+    /// it could not be put back (its name was taken again). A later discard or trash moves it
+    /// back once its name is free.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix move stages entries")
+    )]
+    Stranded(PathBuf),
 }
 
 /// Moves the entry at `path` (relative to `root`, the canonical checkout) to the trash, closing
@@ -2599,6 +2611,7 @@ async fn move_to_trash(
     {
         Ok(Ok(staged)) => staged,
         Ok(Err(discard_staging::Unstaged::Failed)) => return Moved::NotTaken,
+        Ok(Err(discard_staging::Unstaged::Stranded(staged))) => return Moved::Stranded(staged),
         Ok(Err(discard_staging::Unstaged::Escapes)) | Err(_) => return Moved::Kept,
     };
     let trashed = trash
@@ -2607,19 +2620,24 @@ async fn move_to_trash(
         .is_ok();
     tokio::task::spawn_blocking(move || {
         if trashed {
-            if staged.finish() {
-                Moved::Trashed
-            } else {
-                tracing::warn!("the trash answered success but left BiBCode's staged entry");
-                Moved::Kept
+            match staged.finish() {
+                Ok(()) => Moved::Trashed,
+                Err(None) => {
+                    tracing::warn!("the trash answered success but left BiBCode's staged entry");
+                    Moved::Kept
+                }
+                Err(Some(staged)) => Moved::Stranded(staged),
             }
-        } else if staged.put_back() {
-            Moved::NotTaken
         } else {
-            tracing::warn!(
-                "a discarded entry the trash refused stayed in BiBCode's staging folder"
-            );
-            Moved::Kept
+            match staged.put_back() {
+                Ok(()) => Moved::NotTaken,
+                Err(staged) => {
+                    tracing::warn!(
+                        "a discarded entry the trash refused stayed in BiBCode's staging folder"
+                    );
+                    Moved::Stranded(staged)
+                }
+            }
         }
     })
     .await
@@ -2734,6 +2752,8 @@ mod discard_staging {
         Escapes,
         /// Staging failed otherwise (another file system, a missing entry); nothing moved.
         Failed,
+        /// It moved in, failed a check, and could not go back: it stays at this staged path.
+        Stranded(PathBuf),
     }
 
     /// An entry renamed into `<git_dir>/bibcode-discard/<uuid>/`, with the handles that move
@@ -2757,27 +2777,30 @@ mod discard_staging {
         /// After the trash answered success: removes the holder folder when the entry is gone
         /// from it, and returns whether it is. If the entry is still there, the trash took
         /// another path, or nothing, so the entry goes back (see [`Staged::put_back`]).
-        pub(super) fn finish(self) -> bool {
+        pub(super) fn finish(self) -> Result<(), Option<PathBuf>> {
             if identity_at(&self.holder, &self.name).is_some() {
-                if !self.put_back() {
-                    tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
-                }
-                return false;
+                return match self.put_back() {
+                    Ok(()) => Err(None),
+                    Err(staged) => {
+                        tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
+                        Err(Some(staged))
+                    }
+                };
             }
             self.release();
-            true
+            Ok(())
         }
 
         /// Renames the entry back into the folder it came from, never over an entry created
-        /// there since. Returns whether it went back; if not, it stays staged with its origin
-        /// record, for a later discard's [`recover`] to try again.
-        pub(super) fn put_back(self) -> bool {
-            let back =
-                rename_no_replace(&self.holder, &self.name, &self.parent, &self.name).is_ok();
-            if back {
+        /// there since. If it cannot go back, it stays staged with its origin record, for a
+        /// later discard's [`recover`] to try again, and the error is where it stays.
+        pub(super) fn put_back(self) -> Result<(), PathBuf> {
+            if rename_no_replace(&self.holder, &self.name, &self.parent, &self.name).is_ok() {
                 self.release();
+                Ok(())
+            } else {
+                Err(self.path)
             }
-            back
         }
 
         /// Removes the emptied holder and its origin record.
@@ -2994,6 +3017,8 @@ mod discard_staging {
         relative: &str,
     ) -> Result<Staged, Unstaged> {
         let relative = Path::new(relative);
+        // The checkout's identity, taken first, that the entry's folder must stay under.
+        let root_identity = open_folder(root).ok().and_then(|root| identity(&root));
         let (parent, name) = open_parent(root, relative)?;
         let name_c = c_name(name)?;
         let git = open_folder(git_dir).map_err(|_| Unstaged::Failed)?;
@@ -3036,6 +3061,17 @@ mod discard_staging {
             super::discard_hooks::Point::BeforeMove,
             &root.join(relative),
         );
+        // The entry's folder must still be under the checkout right before it moves: a folder
+        // another process moved out after it was opened is never emptied into the staging
+        // folder. The window left is the rename itself.
+        let beneath = root_identity.is_some_and(|root| {
+            crate::workspace::beneath::folder_beneath(parent.as_fd(), root).is_ok()
+        });
+        if !beneath {
+            remove_file(&staging, &record_name);
+            remove_folder(&staging, &holder_name);
+            return Err(Unstaged::Escapes);
+        }
         // SAFETY: both descriptors are open folders and both names are NUL-terminated; the
         // rename acts on the entries those handles hold and follows no link.
         let renamed = unsafe {
@@ -3091,10 +3127,13 @@ mod discard_staging {
             .iter()
             .all(|(path, held)| held.is_some() && path_identity(path) == *held)
         {
-            if !staged.put_back() {
-                tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
-            }
-            return Err(Unstaged::Escapes);
+            return Err(match staged.put_back() {
+                Ok(()) => Unstaged::Escapes,
+                Err(stranded) => {
+                    tracing::warn!("a discarded entry stayed in BiBCode's staging folder");
+                    Unstaged::Stranded(stranded)
+                }
+            });
         }
         Ok(staged)
     }
@@ -5247,6 +5286,56 @@ mod tests {
         );
         let staging = std::fs::read_dir(root.join(".git/bibcode-discard")).unwrap();
         assert_eq!(staging.count(), 0, "the staging folder is emptied");
+    }
+
+    /// A folder another process moves out of the checkout after BiBCode opened it, before its
+    /// entry is staged, is never emptied into the staging folder: the entry stays where the
+    /// folder went, the trash is never called, and the discard reports it kept (#139 X5
+    /// round 5).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_moved_out_of_the_checkout_before_staging_is_never_staged() {
+        let (fixture, root) = staging_fixture();
+        let outside = tempfile::tempdir_in(root.parent().expect("a parent")).expect("outside");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        let (folder, away) = (root.join("dir"), outside.path().join("dir"));
+        let moved_to = away.clone();
+        discard_hooks::on(
+            discard_hooks::Point::BeforeMove,
+            root.join("dir/victim.txt"),
+            move || std::fs::rename(&folder, &moved_to).expect("the folder moves out"),
+        );
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["dir/victim.txt".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(
+            trash.trashed.lock().unwrap().is_empty(),
+            "the trash was never called"
+        );
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert!(outcome.trashed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(away.join("victim.txt")).unwrap(),
+            "inside\n",
+            "the entry stayed in the folder that left"
+        );
+        let staging = std::fs::read_dir(root.join(".git/bibcode-discard")).unwrap();
+        assert_eq!(staging.count(), 0, "nothing is left staged");
     }
 
     /// A symlinked folder inside the checkout that points elsewhere cannot route a discard

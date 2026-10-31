@@ -57,6 +57,21 @@ pub enum WorkspaceError {
         restored: bool,
     },
     #[error(
+        "the trash could not take {path}, and it could not be put back because its name is in use again: it is in BiBCode's staging folder at {staged}. Move it back by hand, or BiBCode moves it back on its next trash or discard once the name is free",
+        path = .path.display(),
+        staged = .staged.display()
+    )]
+    KeptInStaging {
+        path: PathBuf,
+        /// Where it is now.
+        staged: PathBuf,
+        /// The same, relative to the folder that holds `bibcode-discard`.
+        staged_at: String,
+        /// Whether that folder is the workspace's Git directory (else the server's state
+        /// directory).
+        in_git_dir: bool,
+    },
+    #[error(
         "deleting {path} stopped part-way ({reason}); what is left is at {left_at}",
         path = .path.display(),
         left_at = .left_at.display()
@@ -103,6 +118,7 @@ impl WorkspaceError {
             Self::PathBusy { .. } => "path_busy",
             Self::HardLinked { .. } => "hard_linked",
             Self::WriteFailed { .. } => "write_failed",
+            Self::KeptInStaging { .. } => "kept_in_staging",
             Self::PartiallyRemoved { .. } => "partially_removed",
             _ => "operation_failed",
         }
@@ -141,6 +157,19 @@ impl WorkspaceError {
             | Self::PathBusy { path }
             | Self::HardLinked { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+            }
+            Self::KeptInStaging {
+                path,
+                staged_at,
+                in_git_dir,
+                ..
+            } => {
+                object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+                object.insert("stagedAt".to_owned(), json!(staged_at));
+                object.insert(
+                    "stagedIn".to_owned(),
+                    json!(if *in_git_dir { "git-dir" } else { "state-dir" }),
+                );
             }
             Self::WriteFailed { path, restored, .. } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));

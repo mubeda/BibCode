@@ -1039,6 +1039,19 @@ impl WorkspaceService {
         {
             crate::git::Moved::Trashed => Ok(()),
             crate::git::Moved::NotTaken | crate::git::Moved::Kept => Err(unavailable()),
+            // Not where it was any more: say where it is.
+            crate::git::Moved::Stranded(staged) => Err(WorkspaceError::KeptInStaging {
+                path: target.clone(),
+                staged_at: staged
+                    .strip_prefix(&holder_parent)
+                    .map(super::paths::to_posix)
+                    .unwrap_or_default(),
+                in_git_dir: self
+                    .trash_state
+                    .as_ref()
+                    .is_none_or(|state| !holder_parent.starts_with(state)),
+                staged,
+            }),
         }
     }
 
@@ -1891,6 +1904,89 @@ mod tests {
             std::fs::read_to_string(parent.with_extension("moved").join("victim.txt")).unwrap(),
             "inside"
         );
+    }
+
+    /// Refuses every entry, after something else has taken the entry's original name.
+    #[cfg(unix)]
+    struct RefusingTrashAfterTheNameIsTaken {
+        original: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl crate::git::FileTrash for RefusingTrashAfterTheNameIsTaken {
+        fn trash<'a>(
+            &'a self,
+            _: PathBuf,
+            _: &'a tokio_util::sync::CancellationToken,
+        ) -> crate::git::FileTrashFuture<'a> {
+            Box::pin(async move {
+                std::fs::write(&self.original, "new").unwrap();
+                Err(crate::git::TrashUnavailable)
+            })
+        }
+    }
+
+    /// A trash that refuses an entry whose name was taken again meanwhile cannot put it back:
+    /// the entry stays in the staging folder, and the error says where, never that it was left
+    /// in place (#139 X5 round 5).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_trash_that_cannot_put_the_entry_back_says_where_it_is() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::write(canonical.join("victim.txt"), "old").unwrap();
+        let service = WorkspaceService::default().with_trash(
+            Arc::new(RefusingTrashAfterTheNameIsTaken {
+                original: canonical.join("victim.txt"),
+            }),
+            state.path().to_path_buf(),
+        );
+
+        let refused = service
+            .trash_entry(
+                root.path(),
+                "victim.txt",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+
+        let Err(error) = refused else {
+            panic!("expected kept_in_staging, got {refused:?}");
+        };
+        let WorkspaceError::KeptInStaging {
+            staged,
+            staged_at,
+            in_git_dir,
+            ..
+        } = &error
+        else {
+            panic!("expected kept_in_staging, got {error:?}");
+        };
+        let in_git_dir = *in_git_dir;
+        assert_eq!(std::fs::read_to_string(staged).unwrap(), "old");
+        assert!(
+            !in_git_dir,
+            "a folder that is no repository stages in the state directory"
+        );
+        assert!(
+            staged_at.starts_with("bibcode-discard/") && staged_at.ends_with("/victim.txt"),
+            "{staged_at}"
+        );
+        assert!(staged.ends_with(staged_at), "{staged:?} {staged_at}");
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("victim.txt")).unwrap(),
+            "new",
+            "the file that took the name is untouched"
+        );
+        assert!(
+            error.to_string().contains(&staged.display().to_string()),
+            "{error}"
+        );
+        let wire = error.to_project_wire("ProjectDeleteEntryError", "/w", "victim.txt");
+        assert_eq!(wire["failure"], "kept_in_staging");
+        assert_eq!(wire["stagedAt"], staged_at.as_str());
+        assert_eq!(wire["stagedIn"], "state-dir");
     }
 
     #[tokio::test]

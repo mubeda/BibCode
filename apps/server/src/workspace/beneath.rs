@@ -506,6 +506,20 @@ mod imp {
 
     /// Whether the folder `held` is still under the root whose identity is `root`: `..` is
     /// walked by handle until the root's identity is met, or the file system's own root.
+    /// Whether the folder `held` is still under the folder whose device and inode are `root`
+    /// (Source Control's discard staging checks the entry's folder with it before moving it).
+    pub(crate) fn folder_beneath(held: BorrowedFd<'_>, root: (u64, u64)) -> io::Result<()> {
+        // SAFETY: `held` is open.
+        let copy = owned(unsafe { libc::fcntl(held.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
+        contained_fd(
+            &copy,
+            Some(Identity {
+                dev: root.0,
+                ino: root.1,
+            }),
+        )
+    }
+
     fn contained_fd(held: &OwnedFd, root: Option<Identity>) -> io::Result<()> {
         let root = root.ok_or_else(escape)?;
         let mut current = identity(held)?;
@@ -743,13 +757,17 @@ mod imp {
         let emptied = empty_tree(&fd, dir.root.id, 0);
         drop(fd);
         match emptied {
-            Ok(()) if still_ours() => match remove_empty(&dir.fd, &parked) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(Removal::Partial {
-                    error,
-                    left_at: parked,
-                }),
-            },
+            // The held parent must still be under the root right before the parked name goes.
+            Ok(()) if still_ours() => {
+                #[cfg(test)]
+                hooks::before_unlink(&parked);
+                dir.contained()
+                    .and_then(|()| remove_empty(&dir.fd, &parked))
+                    .map_err(|error| Removal::Partial {
+                        error,
+                        left_at: parked,
+                    })
+            }
             Ok(()) => Err(Removal::Partial {
                 error: io::Error::other("the folder moved while it was deleted"),
                 left_at: parked,
@@ -878,7 +896,7 @@ pub(crate) use hooks::{
     clear as clear_test_hooks, force_no_replace_unsupported, on_create, on_park, on_unlink,
 };
 #[cfg(unix)]
-pub(crate) use imp::rename_no_replace;
+pub(crate) use imp::{folder_beneath, rename_no_replace};
 
 /// Without `*at` calls, every operation re-checks the folder and then works by path. The
 /// outside-agent tools that change files are refused on these platforms.
@@ -1281,6 +1299,33 @@ mod tests {
             left,
             ["a", "b", "c"],
             "nothing was removed once it left the root"
+        );
+    }
+
+    /// The held parent moved out of the root after the folder was emptied, before its parked
+    /// name goes: the final removal is refused, so nothing is removed outside the root (#139
+    /// X5 round 5).
+    #[test]
+    fn a_parent_moved_out_before_the_final_removal_keeps_the_parked_folder() {
+        let (_root, root_path) = canonical_root();
+        let (_outside, outside) = canonical_root();
+        let root = Root::new(&root_path).unwrap();
+        std::fs::create_dir_all(root_path.join("sub/victim")).unwrap();
+        let dir = Dir::open(&root, &root_path.join("sub"), false).unwrap();
+        let (held, away) = (root_path.join("sub"), outside.join("sub"));
+        let moved_to = away.clone();
+        // The folder is empty, so the only removal left is its parked name.
+        on_unlink(move |_| std::fs::rename(&held, &moved_to).unwrap());
+        let result = dir.remove_dir_all(OsStr::new("victim"));
+        clear_test_hooks();
+        assert!(matches!(result, Err(Removal::Partial { .. })), "{result:?}");
+        let left: Vec<_> = std::fs::read_dir(&away)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.len() == 1 && left[0].starts_with(".bibcode-delete-"),
+            "the parked folder stays in the parent that left: {left:?}"
         );
     }
 
