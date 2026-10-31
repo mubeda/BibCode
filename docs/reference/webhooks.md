@@ -198,7 +198,9 @@ Examples:
 ```
 
 A `webhook.test` body has only `id` (`ev_` and 32 hex characters, new each time), `type`,
-`occurredAt` and `environmentId`.
+`occurredAt` and `environmentId`, plus [`dropped`](#dropped-deliveries) when the endpoint has
+drop batches it was not told about: a test event is sent the same way as any other, and a
+`2xx` to it acknowledges those batches.
 
 ## Headers and signature
 
