@@ -2672,11 +2672,14 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md))
   endpoint whose send lock is free (a test event or redelivery holding it wakes the
   loop when done); with every slot taken the loop waits for a completion, otherwise
   until the earliest due head of an endpoint that is free, or the poll. A new URL,
-  project or event list abandons the endpoint's queue (`endpoint_changed`) in its
-  transaction; the enqueue drops a delivery chosen under other settings (a fence on
-  the URL, project and event list, checked in the enqueue's transaction), and the
-  dispatcher re-reads a picked row under the endpoint's lock and token before sending.
-  A redelivery of a queued delivery is refused.
+  project or event list, and turning it off or on, bumps the endpoint's `revision`
+  and abandons its queue (`endpoint_changed`) in one transaction. Each queued row is
+  stamped with the revision it was chosen under; the enqueue drops a row whose
+  revision moved (checked in its own transaction), and the dispatcher re-reads a picked
+  row under the endpoint's lock and token and drops it when stale. A test event or
+  redelivery re-reads the endpoint after its lock and token and is refused
+  (`endpoint_changed`) when the revision moved. Drop batch numbers come from a counter
+  that is never reset. A redelivery of a queued delivery is refused.
 - **Outbound trust boundary.** HTTPS only; every resolved address must be public by
   `git::clone_policy::is_public` (shared with agent clones); the client connects to
   the checked addresses only (reqwest's resolve override, every other name refused),
