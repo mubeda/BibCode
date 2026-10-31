@@ -35,7 +35,8 @@ pub(crate) use secret_store::{SecretStore, SecretStoreError};
 pub(crate) use service::McpAccessChange;
 pub(crate) use service::{
     AuthError, AuthService, AuthenticatedConnectionGuard, DESKTOP_BOOTSTRAP_SUBJECT,
-    MCP_CLIENT_SUBJECT, SessionTransport, default_standard_scopes, diagnostics_scopes,
-    issue_administrative_pairing_link, issue_mcp_pairing_link, issue_offline_share_pairing,
+    MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome, SessionTransport, default_standard_scopes,
+    diagnostics_scopes, issue_administrative_pairing_link, issue_mcp_pairing_link,
+    issue_offline_share_pairing,
 };
 pub(crate) use service::{format_iso, now_ms};

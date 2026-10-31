@@ -331,17 +331,20 @@ async fn stop_revokes_the_agent_interrupts_its_running_turn_and_cancels_its_owne
                 > 0
         })
         .await;
-        assert!(
-            harness
-                .auth
-                .stop_client("person", &session_id)
-                .await
-                .unwrap()
-        );
+        let stopped = harness
+            .auth
+            .stop_client("person", &session_id)
+            .await
+            .unwrap();
+        assert!(stopped.revoked);
+        // Stop answers once the interrupt was tried: one turn, which this harness's
+        // provider (no live session) refuses, so it counts as failed.
+        assert_eq!((stopped.interrupted, stopped.failed), (0, 1), "{stopped:?}");
+        assert!(!stopped.timed_out);
     });
     assert_eq!(unknown_reason(&outcome), "revoked");
     assert!(harness.control.authenticate(&token).await.is_none());
-    until_async(|| async { stop_interrupts(&harness, &theirs).await == 1 }).await;
+    assert_eq!(stop_interrupts(&harness, &theirs).await, 1);
     assert_eq!(
         stop_interrupts(&harness, &mine).await,
         0,
@@ -384,17 +387,92 @@ async fn stop_after_revoke_still_interrupts_the_agents_running_turn() {
     assert_eq!(stop_interrupts(&harness, &theirs).await, 0, "Revoke alone");
 
     // Stop on the already revoked agent still interrupts what it is running.
-    assert!(
-        harness
-            .auth
-            .stop_client("person", &session_id)
-            .await
-            .unwrap()
-    );
-    until_async(|| async { stop_interrupts(&harness, &theirs).await == 1 }).await;
+    let stopped = harness
+        .auth
+        .stop_client("person", &session_id)
+        .await
+        .unwrap();
+    assert!(stopped.revoked);
+    assert_eq!(stopped.interrupted + stopped.failed, 1);
+    assert_eq!(stop_interrupts(&harness, &theirs).await, 1);
 
     // A session that was never an agent's, or never existed, is not stopped.
-    assert!(!harness.auth.stop_client("person", "missing").await.unwrap());
+    let missing = harness.auth.stop_client("person", "missing").await.unwrap();
+    assert!(!missing.revoked);
+    assert_eq!(missing.interrupted + missing.failed, 0);
+    harness.shutdown().await;
+}
+
+/// Review round 3: an interrupt that cannot be dispatched is reported, not hidden.
+#[tokio::test]
+async fn stop_reports_an_interrupt_it_could_not_dispatch() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &agent, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-agent").await;
+    // Update maintenance holds RPC admission closed: the interrupt's dispatch is refused.
+    let gate = harness.control.registry().admission_gate();
+    gate.close_and_drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("drained");
+    let stopped = harness
+        .auth
+        .stop_client("person", &agent.principal.session_id)
+        .await
+        .unwrap();
+    gate.release().unwrap();
+    assert!(stopped.revoked);
+    assert_eq!((stopped.interrupted, stopped.failed), (0, 1), "{stopped:?}");
+    assert_eq!(
+        stop_interrupts(&harness, &theirs).await,
+        0,
+        "nothing reached the engine"
+    );
+    harness.shutdown().await;
+}
+
+/// Review round 3: a person's compaction after an agent's message is not the agent's turn.
+#[tokio::test]
+async fn a_compaction_after_an_agents_message_is_not_the_agents_turn() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &agent, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-agent").await;
+    harness.provider_turn(&theirs, "turn-agent", "", true).await;
+    // A compaction runs as a turn of its own, started by no user message.
+    let thread = theirs.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE projection_turns SET state = 'completed' WHERE thread_id = ?1",
+                [&thread],
+            )?;
+            connection.execute(
+                "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, state, requested_at, checkpoint_files_json) VALUES (?1, 'turn-compaction', NULL, 'running', '2026-10-30T00:00:00.000Z', '[]')",
+                [&thread],
+            )?;
+            connection.execute(
+                "UPDATE projection_threads SET latest_turn_id = 'turn-compaction' WHERE thread_id = ?1",
+                [&thread],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let activity = crate::mcp::activity::McpActivity::new(harness.repositories.database().clone());
+    assert!(
+        activity.active_now().await.is_empty(),
+        "the compaction keeps no agent active"
+    );
+    let stopped = harness
+        .auth
+        .stop_client("person", &agent.principal.session_id)
+        .await
+        .unwrap();
+    assert_eq!(stopped.interrupted + stopped.failed, 0, "{stopped:?}");
+    assert_eq!(stop_interrupts(&harness, &theirs).await, 0);
     harness.shutdown().await;
 }
 

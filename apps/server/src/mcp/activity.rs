@@ -19,7 +19,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -32,7 +35,7 @@ use super::control::{
     Inner, McpControl, REQUEST_ROW_TTL_SECONDS, ToolCall, ToolSpec, invalid_argument, now_iso,
 };
 use crate::{
-    auth::MCP_CLIENT_SUBJECT,
+    auth::{MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome},
     orchestration::engine::MAX_THREAD_PURPOSE_CHARS,
     persistence::Database,
     rpc::{RpcRegistry, RpcSessionContext, RpcStreamChunk},
@@ -111,6 +114,12 @@ struct Shared {
     rows: broadcast::Sender<Value>,
     presence: Mutex<HashMap<String, Presence>>,
     presence_changed: watch::Sender<u64>,
+    /// The running attributed turns, refreshed by one task for every subscriber while any
+    /// subscribes, with a version that counts refreshes (0: not read yet).
+    turns: watch::Sender<(u64, Arc<Vec<RunningTurn>>)>,
+    turn_refresh: Duration,
+    refreshing: AtomicBool,
+    turn_queries: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -149,13 +158,85 @@ impl Drop for CallPresence {
 impl McpActivity {
     #[must_use]
     pub fn new(database: Database) -> Self {
+        Self::with_turn_refresh(database, ACTIVE_RECHECK)
+    }
+
+    /// [`Self::new`] refreshing the running turns every `turn_refresh`.
+    #[must_use]
+    pub(crate) fn with_turn_refresh(database: Database, turn_refresh: Duration) -> Self {
         Self {
             shared: Arc::new(Shared {
                 database,
                 rows: broadcast::channel(ROW_CAPACITY).0,
                 presence: Mutex::new(HashMap::new()),
                 presence_changed: watch::channel(0).0,
+                turns: watch::channel((0, Arc::new(Vec::new()))).0,
+                turn_refresh,
+                refreshing: AtomicBool::new(false),
+                turn_queries: AtomicUsize::new(0),
             }),
+        }
+    }
+
+    /// How many times the running turns were read.
+    #[cfg(test)]
+    pub(crate) fn turn_queries(&self) -> usize {
+        self.shared.turn_queries.load(Ordering::Acquire)
+    }
+
+    /// Starts the one task that refreshes the running turns for every subscriber, unless it
+    /// runs. It stops once no subscriber is left after a refresh.
+    fn ensure_turn_refresh(&self) {
+        if self
+            .shared
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let activity = self.clone();
+        tokio::spawn(async move {
+            let mut version = activity.shared.turns.borrow().0;
+            loop {
+                let turns = activity.running_turns().await;
+                version += 1;
+                activity
+                    .shared
+                    .turns
+                    .send_replace((version, Arc::new(turns)));
+                tokio::time::sleep(activity.shared.turn_refresh).await;
+                if activity.shared.turns.receiver_count() == 0 {
+                    activity.shared.refreshing.store(false, Ordering::Release);
+                    // A subscriber that arrived meanwhile restarts it unless it already did.
+                    if activity.shared.turns.receiver_count() == 0
+                        || activity
+                            .shared
+                            .refreshing
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Prunes rows past the 7-day retention: the server's own maintenance, run
+    /// at startup (and the write path prunes after each insert). Readers only filter.
+    pub(crate) async fn prune_expired(&self) {
+        let cutoff = retention_cutoff();
+        if let Err(error) = self
+            .shared
+            .database
+            .call(move |connection| {
+                connection.execute("DELETE FROM mcp_activity WHERE occurred_at < ?", [&cutoff])?;
+                Ok(())
+            })
+            .await
+        {
+            tracing::warn!(%error, "MCP activity could not prune old rows");
         }
     }
 
@@ -293,17 +374,13 @@ impl McpActivity {
         }
     }
 
-    /// The newest rows of the last 7 days, newest first. Reading prunes older rows, so the
-    /// retention holds while no row is written.
+    /// The newest rows of the last 7 days, newest first. It only reads: older rows are left to
+    /// the write path and to [`Self::prune_expired`], and are never returned.
     pub(crate) async fn recent(&self) -> crate::persistence::Result<Vec<Value>> {
         let cutoff = retention_cutoff();
         self.shared
             .database
             .call(move |connection| {
-                connection.execute(
-                    "DELETE FROM mcp_activity WHERE occurred_at < ?",
-                    [&cutoff],
-                )?;
                 let mut statement = connection.prepare_cached(
                     "SELECT activity_id, occurred_at, session_id, label, tool, thread_id, outcome, target_json FROM mcp_activity WHERE occurred_at >= ? ORDER BY activity_id DESC LIMIT ?",
                 )?;
@@ -336,6 +413,7 @@ impl McpActivity {
 
     /// The running turns attributed to outside agents; none when the store cannot be read.
     async fn running_turns(&self) -> Vec<RunningTurn> {
+        self.shared.turn_queries.fetch_add(1, Ordering::AcqRel);
         self.shared
             .database
             .call(|connection| attributed_running_turns(connection, None))
@@ -390,15 +468,22 @@ fn activity_stream(
                 return;
             }
         };
-        // Running turns are read on the snapshot and every recheck; a presence change reuses
-        // the last read, so a burst of calls costs no store reads.
-        let mut turns = activity.running_turns().await;
+        // One shared task reads the running turns for every subscriber, every 15 s; each of
+        // its refreshes is also this stream's re-check of who is still active. A presence
+        // change reuses the last refresh, so neither calls nor subscribers add store reads.
+        let mut shared_turns = activity.shared.turns.subscribe();
+        activity.ensure_turn_refresh();
+        let first = match shared_turns.wait_for(|(version, _)| *version > 0).await {
+            Ok(first) => Some(Arc::clone(&first.1)),
+            Err(_) => None,
+        };
+        let Some(mut turns) = first else {
+            return;
+        };
         let mut active = merge_active(activity.active(), &turns);
         if !send(activity.snapshot_value(snapshot, active.clone())).await {
             return;
         }
-        let mut recheck = tokio::time::interval(ACTIVE_RECHECK);
-        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let next = tokio::select! {
                 () = cancellation.cancelled() => break,
@@ -406,7 +491,6 @@ fn activity_stream(
                     Ok(row) => json!({ "type": "row", "row": row }),
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let Ok(recent) = activity.recent().await else { break };
-                        turns = activity.running_turns().await;
                         active = merge_active(activity.active(), &turns);
                         activity.snapshot_value(recent, active.clone())
                     }
@@ -423,8 +507,11 @@ fn activity_stream(
                     active = now;
                     json!({ "type": "active", "active": active })
                 }
-                _ = recheck.tick() => {
-                    turns = activity.running_turns().await;
+                changed = shared_turns.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    turns = Arc::clone(&shared_turns.borrow_and_update().1);
                     let now = merge_active(activity.active(), &turns);
                     if now == active {
                         continue;
@@ -622,35 +709,31 @@ fn hex_id(value: &Value) -> Option<&str> {
         .filter(|sha| (4..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Interrupts the running turns of each agent a person stops, until `McpControl` shuts down.
-/// The listener holds the service weakly, so it never keeps a dropped one alive.
+/// Lets Stop interrupt the turns of the agent a person stops and wait for the outcome. The
+/// handler holds the service weakly, so it never keeps a dropped one alive; after shutdown it
+/// interrupts nothing.
 pub(crate) fn watch_stops(control: &McpControl) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let mut stops = control.auth().subscribe_mcp_stops();
     let inner: Weak<Inner> = Arc::downgrade(&control.inner);
-    let shutdown = control.shutdown_token();
-    runtime.spawn(async move {
-        loop {
-            let session_id = tokio::select! {
-                () = shutdown.cancelled() => break,
-                stopped = stops.recv() => match stopped {
-                    Ok(session_id) => session_id,
-                    Err(broadcast::error::RecvError::Lagged(missed)) => {
-                        tracing::warn!(missed, "MCP Stop requests were missed");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-            };
-            let Some(inner) = inner.upgrade() else {
-                break;
-            };
-            let control = McpControl { inner };
-            interrupt_turns_of(&control, &session_id).await;
-        }
+    let handler: McpStopHandler = Arc::new(move |session_id: String| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            match inner.upgrade() {
+                Some(inner) if !inner_shutdown(&inner) => {
+                    interrupt_turns_of(&McpControl { inner }, &session_id).await
+                }
+                _ => McpStopOutcome::default(),
+            }
+        })
     });
+    control.auth().set_mcp_stop_handler(handler);
+}
+
+fn inner_shutdown(inner: &Arc<Inner>) -> bool {
+    McpControl {
+        inner: Arc::clone(inner),
+    }
+    .shutdown_token()
+    .is_cancelled()
 }
 
 /// A running turn attributed to an outside agent: its thread's latest sent user message is
@@ -663,25 +746,28 @@ pub(crate) struct RunningTurn {
 }
 
 /// The running turns attributed to an outside agent, to `client_id`'s only when given.
+/// A running turn belongs to the actor of the command that started it: the user message the
+/// turn was started for (`pending_message_id`) carries that command's actor. A turn started by
+/// no message (a compaction) belongs to no one, whoever wrote the thread's latest message.
+/// Only running turns are read, through `idx_projection_turns_running`; `CROSS JOIN` keeps
+/// them the outer loop, so each thread and message is a primary-key lookup.
+const RUNNING_TURNS_SQL: &str = "SELECT turn.thread_id, turn.turn_id,
+       json_extract(message.actor_json, '$.clientId'), json_extract(message.actor_json, '$.label')
+  FROM projection_turns AS turn
+  CROSS JOIN projection_threads AS thread
+  CROSS JOIN projection_thread_messages AS message
+ WHERE turn.state = 'running' AND turn.turn_id IS NOT NULL
+   AND thread.thread_id = turn.thread_id AND thread.latest_turn_id = turn.turn_id
+   AND thread.deleted_at IS NULL
+   AND message.message_id = turn.pending_message_id
+   AND message.role = 'user' AND message.actor_json IS NOT NULL
+   AND (?1 IS NULL OR json_extract(message.actor_json, '$.clientId') = ?1)";
+
 fn attributed_running_turns(
     connection: &rusqlite::Connection,
     client_id: Option<&str>,
 ) -> crate::persistence::Result<Vec<RunningTurn>> {
-    let mut statement = connection.prepare_cached(
-        "SELECT thread_id, turn_id, json_extract(actor, '$.clientId'), json_extract(actor, '$.label') FROM (
-           SELECT thread.thread_id AS thread_id, thread.latest_turn_id AS turn_id, (
-             SELECT message.actor_json FROM projection_thread_messages AS message
-              WHERE message.thread_id = thread.thread_id AND message.role = 'user'
-                AND COALESCE(message.delivery_state, '') <> 'queued'
-              ORDER BY message.created_at DESC, message.message_id DESC LIMIT 1
-           ) AS actor
-             FROM projection_threads AS thread
-             JOIN projection_turns AS turn
-               ON turn.thread_id = thread.thread_id AND turn.turn_id = thread.latest_turn_id
-            WHERE turn.state = 'running' AND thread.deleted_at IS NULL
-         )
-         WHERE actor IS NOT NULL AND (?1 IS NULL OR json_extract(actor, '$.clientId') = ?1)",
-    )?;
+    let mut statement = connection.prepare_cached(RUNNING_TURNS_SQL)?;
     let rows = statement
         .query_map([client_id], |row| {
             Ok(RunningTurn {
@@ -736,8 +822,10 @@ fn merge_active(presence: Vec<Value>, turns: &[RunningTurn]) -> Vec<Value> {
     active
 }
 
-/// Interrupts each running turn whose latest sent user message `session_id`'s agent sent.
-pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -> usize {
+/// Interrupts each running turn `session_id`'s agent started, and counts the turns
+/// interrupted and those whose interrupt failed. Running turns that cannot be read count as
+/// one failure, since Stop cannot say they stopped.
+pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -> McpStopOutcome {
     let client_id = session_id.to_owned();
     let running = control
         .repositories()
@@ -748,10 +836,13 @@ pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -
         Ok(running) => running,
         Err(error) => {
             tracing::warn!(%error, "MCP Stop could not read the agent's running turns");
-            return 0;
+            return McpStopOutcome {
+                interrupted: 0,
+                failed: 1,
+            };
         }
     };
-    let mut interrupted = 0;
+    let mut outcome = McpStopOutcome::default();
     for RunningTurn {
         thread_id, turn_id, ..
     } in running
@@ -775,14 +866,15 @@ pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -
             )
             .await
         {
-            Ok(_) => interrupted += 1,
+            Ok(_) => outcome.interrupted += 1,
             Err(error) => {
+                outcome.failed += 1;
                 let tag = error["_tag"].as_str().unwrap_or("unknown");
                 tracing::warn!(tag, "MCP Stop could not interrupt a turn");
             }
         }
     }
-    interrupted
+    outcome
 }
 
 #[cfg(test)]
@@ -914,9 +1006,23 @@ mod tests {
         assert_eq!(activity.recent().await.unwrap().len(), 200);
     }
 
-    /// Review round 2: retention holds while no row is written.
+    async fn old_rows(database: &Database) -> i64 {
+        database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_activity WHERE tool = 'old'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Review rounds 2 and 3: retention holds while no row is written, a read-scoped
+    /// subscriber never writes, and the server's own maintenance prunes.
     #[tokio::test]
-    async fn rows_past_seven_days_are_hidden_and_pruned_without_a_new_row() {
+    async fn rows_past_seven_days_are_hidden_from_readers_who_never_delete_them() {
         let database = migrated().await;
         let activity = McpActivity::new(database.clone());
         activity.record(new_row("git_commit")).await;
@@ -930,20 +1036,97 @@ mod tests {
             })
             .await
             .unwrap();
+        let changes_before = total_changes(&database).await;
         let recent = activity.recent().await.unwrap();
         assert_eq!(recent.len(), 1, "{recent:?}");
         assert_eq!(recent[0]["tool"], "git_commit");
-        let old = database
+        let cancellation = CancellationToken::new();
+        let mut stream = activity_stream(activity.clone(), cancellation.clone());
+        let snapshot = next(&mut stream).await;
+        assert_eq!(snapshot["rows"].as_array().unwrap().len(), 1);
+        cancellation.cancel();
+        assert_eq!(old_rows(&database).await, 1, "a reader deletes nothing");
+        assert_eq!(
+            total_changes(&database).await,
+            changes_before,
+            "nor writes anything"
+        );
+
+        // Startup maintenance (the server's, not a reader's) prunes it.
+        activity.prune_expired().await;
+        assert_eq!(old_rows(&database).await, 0);
+    }
+
+    async fn total_changes(database: &Database) -> i64 {
+        database
             .call(|connection| {
-                Ok(connection.query_row(
-                    "SELECT COUNT(*) FROM mcp_activity WHERE tool = 'old'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?)
+                Ok(connection.query_row("SELECT total_changes()", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Review round 3: the running-turn lookup reads running turns through their index.
+    #[tokio::test]
+    async fn the_running_turn_lookup_uses_the_running_state_index() {
+        let plan = migrated()
+            .await
+            .call(|connection| {
+                let mut statement =
+                    connection.prepare(&format!("EXPLAIN QUERY PLAN {RUNNING_TURNS_SQL}"))?;
+                let details = statement
+                    .query_map([Option::<String>::None], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(details)
             })
             .await
             .unwrap();
-        assert_eq!(old, 0, "reading prunes it");
+        // The partial index holds running turns only, so walking it reads those and nothing
+        // else; every other table is a primary-key lookup.
+        assert_eq!(
+            plan.first().map(String::as_str),
+            Some("SCAN turn USING INDEX idx_projection_turns_running"),
+            "{plan:?}"
+        );
+        assert!(
+            plan[1..].iter().all(|detail| detail.starts_with("SEARCH")),
+            "{plan:?}"
+        );
+    }
+
+    /// Review round 3: one shared refresh of the running turns, however many subscribers.
+    #[tokio::test]
+    async fn subscribers_share_one_running_turn_query_per_tick() {
+        let activity = McpActivity::with_turn_refresh(migrated().await, Duration::from_millis(100));
+        assert_eq!(
+            activity.turn_queries(),
+            0,
+            "nothing runs without a subscriber"
+        );
+        let cancellation = CancellationToken::new();
+        let mut streams: Vec<_> = (0..5)
+            .map(|_| activity_stream(activity.clone(), cancellation.clone()))
+            .collect();
+        for stream in &mut streams {
+            assert_eq!(next(stream).await["type"], "snapshot");
+        }
+        let started = activity.turn_queries();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let ticks = activity.turn_queries() - started;
+        assert!(
+            (3..=7).contains(&ticks),
+            "five subscribers, about five ticks, one query each: {ticks}"
+        );
+        cancellation.cancel();
+        drop(streams);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopped = activity.turn_queries();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            activity.turn_queries(),
+            stopped,
+            "the refresh stops with its subscribers"
+        );
     }
 
     #[tokio::test]

@@ -2762,6 +2762,14 @@ fn migration_060(transaction: &Transaction<'_>) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_mcp_activity_occurred_at
            ON mcp_activity(occurred_at);",
     )?;
+    // The running turns an agent started, which keep it active and which Stop interrupts:
+    // only running turns are indexed, so the lookup reads those and nothing else.
+    if table_exists(transaction, "projection_turns")? {
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_projection_turns_running
+               ON projection_turns(thread_id, turn_id) WHERE state = 'running';",
+        )?;
+    }
     Ok(())
 }
 
