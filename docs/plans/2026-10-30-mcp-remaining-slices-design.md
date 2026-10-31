@@ -4798,6 +4798,66 @@ tests; the hard-link and parked-folder tests fail against the earlier code by co
   alone; it asserts the holder's `flock` is free right after an aborted discard, before any
   rename runs.
 
+**Review round 4 (Codex, 2026-10-31).** Claim (a) was stronger than POSIX can deliver
+("whatever any concurrent process does"), so the coordinator narrowed it. The restated model,
+also in `rpc-and-orchestration.md` ("Files tools"):
+
+- (a) **Containment.** BiBCode never follows a link and never resolves a swapped path
+  component outside the workspace: every operation walks through no-follow handles, and every
+  held folder is re-checked right before each mutation. **Residual:** a concurrent process
+  moving an already-opened folder out of the workspace in the instant between that check and
+  the system call. BiBCode detects it afterwards where it can and refuses further work;
+  preventing it needs kernel support (`openat2 RESOLVE_BENEATH`, Linux-only).
+- (b) **BiBCode's own writers are serialized.** Unchanged.
+- (c) **External-editor atomicity is not guaranteed.** Unchanged.
+
+Fixes, each with a test that failed first (a mutation run confirmed the delete-lock,
+restore, single-link and empty-tree tests):
+
+- **Hard links (P1).** `files_write` sends `singleLinkOnly`; an in-place write to a file whose
+  `st_nlink > 1` is then refused (`hard_linked`, `McpHardLinkedFileError` in
+  `feed::ERRORS`), checked on the open descriptor before truncating. The Files panel does not
+  send it: a person editing their own hard-linked file is legitimate, a recorded choice.
+  `an_agent_may_not_write_a_hard_linked_file_and_a_person_may`,
+  `only_a_single_link_write_refuses_a_hard_linked_file`.
+- **Truncate then fail (P1).** The version check's read keeps the content (up to 16 MiB,
+  `KEPT_FOR_RESTORE_BYTES`; agents write only files within 1 MiB). A write error after the
+  truncation writes it back through the same descriptor; `WorkspaceError::WriteFailed`
+  (`write_failed`, with `restored`) says whether it came back. A test hook injects the
+  failure: `a_write_that_fails_after_emptying_the_file_puts_the_old_content_back`.
+- **Trash by staging (P1).** `trash_entry` calls `git::trash_by_staging`, a wrapper around G's
+  `move_to_trash` (which recovers a crash's leftovers first): the entry is renamed by handle
+  into `bibcode-discard` under the workspace's Git directory (a `.git` folder, or the folder a
+  `.git` file names), else under `<state>/workspace-trash/<hash of the root>`, and only that
+  staged path, checked folder by folder, goes to the trash. Another file system stages
+  nothing (`trash_unavailable`). `WorkspaceService::with_trash` now takes the state
+  directory. `the_trash_takes_a_staged_copy_never_a_swapped_workspace_path`. On non-Unix the
+  trash still takes the re-checked path (the agent tools that change files are refused there).
+- **Permanent delete and `mkdirat` (P1s).** `empty_tree` re-checks the folder before each
+  `unlinkat` and stops at the first failed check, leaving the rest:
+  `a_parked_folder_moved_out_mid_delete_keeps_everything_not_yet_removed`. A folder made in a
+  moved parent that cannot be removed (something was put in it) is reported as such:
+  `a_folder_made_in_a_moved_parent_that_cannot_be_removed_says_so`. Both are the residual of
+  (a); each window is one call. The per-removal check walks `..` to the root each time, so a
+  very large tree deletes more slowly.
+- **Locks (P2).** Delete, trash and rename take the per-path lock (rename both paths, in key
+  order; one lock when both are one file). `a_delete_waits_for_a_save_of_the_same_file`.
+- **Link fallback removed (P2).** Without the kernel's flag the no-replace rename is refused
+  with `ErrorKind::Unsupported` for files and folders. Discard staging probes for it (a
+  no-replace rename of the new holder onto itself) and stages nothing where it is missing, so
+  the trash is unavailable there. `the_no_replace_rename_is_refused_where_the_flag_is_unsupported`.
+  On the wire the refusal is `operation_failed` with that message.
+- **ZIP planning (P2).** `plan_dir` sizes the held folder through the same no-follow handles
+  the stream uses; the route opens the folder once and plans and streams from it, and
+  `plan_archive_with_limits` (the mint's sizing) opens the folder by handle too.
+  `the_plan_sizes_the_held_folder_never_a_swapped_link`.
+- **Windows dead-code gate (CI on PR #213).** `Entry::MISSING` and `Root`'s identity are
+  `cfg(unix)`; `Identity` and `WorkspaceService::trash_state` allow dead code off Unix. A
+  Windows build still cannot run here.
+- **Contracts:** `singleLinkOnly` on the guarded write input, `hard_linked` and
+  `write_failed` failures, and `restored` on the write error.
+- **Not closed:** the residual of (a) and (c), by the model.
+
 ## X7 implementation notes (2026-10-31)
 
 X7 was implemented on `claude/v0131-139-x7`, from the batch tip `4d4287c818` (slice 1, the

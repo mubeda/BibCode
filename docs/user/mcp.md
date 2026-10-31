@@ -420,14 +420,21 @@ read and download tools work at read-only.
   absolute path, a glob or pathspec character, and a symlinked folder that leads outside are
   refused. Each operation reaches the file through a folder handle opened without following
   symlinks, and checks just before it changes anything that the folder is still inside, so a
-  folder another program swaps for a symlink, or moves out, after the check is refused too.
+  folder another program swaps for a symlink is never followed. One case is beyond what the
+  operating system lets BiBCode prevent: another program moving a folder BiBCode already
+  opened out of the thread's folder in the instant between that check and the change. BiBCode
+  notices afterwards where it can and stops.
 - **No lost edits.** `files_write` needs the `version` `files_read` returned, or `createOnly`
   for a new file. A file changed since is refused (`file_changed_on_disk`); read it again.
   `createOnly` never replaces a file. A write is made in place, so the file keeps its links,
-  owner and permissions. BiBCode lets one writer of a file in at a time: your saves in the
-  Files panel, uploads and an agent's writes never interleave, and while an upload of a file
-  runs, saving or writing it is refused (`McpFileBusyError` for an agent). An editor outside
-  BiBCode saving the same file at the same moment can still be overwritten. Pages after the
+  owner and permissions; if it fails part-way, the old content is put back
+  (`write_failed` says whether it was). An agent may not write a file that has more than one
+  hard link (`McpHardLinkedFileError`), since its other names can be outside the folder; you
+  can still save it in the Files panel. BiBCode lets one writer of a file in at a time: your
+  saves, renames and deletes in the Files panel, uploads and an agent's changes never
+  interleave, and while an upload of a file runs, saving or writing it is refused
+  (`McpFileBusyError` for an agent). An editor outside BiBCode saving the same file at the
+  same moment can still be overwritten. Pages after the
   first need the `version` the first page returned; a file changed between pages is refused
   (`McpFileChangedError`). A file over 1 MiB, or a binary one, cannot be read or written
   here: download it.
