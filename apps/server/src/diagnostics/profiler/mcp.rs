@@ -13,7 +13,7 @@ use std::{
 };
 
 use serde_json::{Map, Value, json};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{
     cli::parse_since,
@@ -21,8 +21,8 @@ use super::{
     symbolicate::{Target, symbolicate},
 };
 use crate::mcp::protocol::{
-    self, Cut, INTERNAL_ERROR, Incoming, METHOD_NOT_FOUND, invalid, rpc_error, tool_descriptor,
-    tool_failure, tool_result,
+    self, Cut, INTERNAL_ERROR, Incoming, METHOD_NOT_FOUND, fit_list, invalid, rpc_error,
+    tool_descriptor, tool_failure, tool_result,
 };
 #[cfg(test)]
 use crate::mcp::protocol::{MAX_MESSAGE_CHARS, MAX_RESULT_CHARS};
@@ -86,29 +86,60 @@ fn server_info() -> Value {
     json!({ "name": "bibcode-profiler", "version": env!("CARGO_PKG_VERSION") })
 }
 
-fn tools() -> Value {
-    let query = |most: u64| {
-        json!({
-            "type": "object",
-            "properties": {
-                "since": {
-                    "type": "string",
-                    "description": "Only records from this long ago (30s, 10m, 1h, 2d) or after this RFC3339 timestamp.",
-                },
-                "kind": {
-                    "type": "string",
-                    "description": "Only this kind; a trailing * matches a prefix (rpc.*).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": most,
-                    "description": format!("The most records to return; at most {most}."),
-                },
+pub(crate) const FINDINGS_DESCRIPTION: &str = "Profiler findings (slow requests, memory growth, crashes, failures) with their evidence. Without since or cursor: the newest, newest first. With since (inclusive) or cursor: oldest first by lastSeen, with nextCursor to read the next page until it is null; a finding that recurs later comes again at its new lastSeen.";
+pub(crate) const EVENTS_DESCRIPTION: &str = "Recorded profiler events, newest last. A panic event's frames can be named with profiler_symbolicate, as panicSeq <sid>:<seq>.";
+pub(crate) const STATUS_DESCRIPTION: &str = "BiBCode profiler overview: whether recording is on, disk use, capture capabilities, the newest findings and the newest crash record ids.";
+pub(crate) const CRASH_DESCRIPTION: &str = "One native crash record: when and where it happened, the events before it, and the crashing thread's stack, named from symbols fetched before. dump says whether its minidump was read, is missing, or could not be read.";
+
+/// The input schema of a findings or events call that returns at most `most` records.
+fn query_schema(most: u64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "Only records from this long ago (30s, 10m, 1h, 2d) or after this RFC3339 timestamp.",
             },
-            "additionalProperties": false,
-        })
-    };
+            "kind": {
+                "type": "string",
+                "description": "Only this kind; a trailing * matches a prefix (rpc.*).",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": most,
+                "description": format!("The most records to return; at most {most}."),
+            },
+        },
+        "additionalProperties": false,
+    })
+}
+
+pub(crate) fn findings_schema() -> Value {
+    let mut schema = query_schema(FINDINGS_LIMIT.1);
+    schema["properties"]["cursor"] = json!({
+        "type": "string",
+        "description": "nextCursor of the previous page: reads the findings after it, oldest first.",
+    });
+    schema
+}
+
+pub(crate) fn events_schema() -> Value {
+    query_schema(EVENTS_LIMIT.1)
+}
+
+pub(crate) fn crash_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "A crash id, as profiler_status lists them." },
+        },
+        "required": ["id"],
+        "additionalProperties": false,
+    })
+}
+
+fn tools() -> Value {
     let tool = |name: &str, description: &str, input: Value, open_world: bool| {
         tool_descriptor(
             name,
@@ -120,35 +151,23 @@ fn tools() -> Value {
     json!([
         tool(
             "profiler_status",
-            "BiBCode profiler overview: whether recording is on, disk use, capture capabilities, the newest findings and the newest crash record ids.",
+            STATUS_DESCRIPTION,
             json!({ "type": "object", "additionalProperties": false }),
             false,
         ),
         tool(
             "profiler_findings",
-            "Profiler findings (slow requests, memory growth, crashes, failures), newest first, with their evidence.",
-            query(FINDINGS_LIMIT.1),
+            FINDINGS_DESCRIPTION,
+            findings_schema(),
             false,
         ),
         tool(
             "profiler_events",
-            "Recorded profiler events, newest last. A panic event's frames can be named with profiler_symbolicate, as panicSeq <sid>:<seq>.",
-            query(EVENTS_LIMIT.1),
+            EVENTS_DESCRIPTION,
+            events_schema(),
             false,
         ),
-        tool(
-            "profiler_crash",
-            "One native crash record: when and where it happened, the events before it, and the crashing thread's stack, named from symbols fetched before. dump says whether its minidump was read, is missing, or could not be read.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "A crash id, as profiler_status lists them." },
-                },
-                "required": ["id"],
-                "additionalProperties": false,
-            }),
-            false,
-        ),
+        tool("profiler_crash", CRASH_DESCRIPTION, crash_schema(), false),
         tool(
             "profiler_symbolicate",
             "Names the functions and source lines in a crash's stack (crashId) or a panic event's frames (panicSeq, as <sid>:<seq>), from Breakpad symbols in symbolsDir and symbols fetched before. With download: true and no local match, first downloads that release's symbols from GitHub: a first download can take minutes and use a lot of memory.",
@@ -180,18 +199,69 @@ fn call(reader: &Reader, params: Option<&Value>) -> Result<Value, Value> {
         Some(Value::Object(args)) => args,
         Some(_) => return Err(invalid("arguments must be an object")),
     };
-    let tool: fn(&Reader, &Map<String, Value>) -> Result<Value, String> = match name {
-        "profiler_status" => status_tool,
-        "profiler_findings" => findings_tool,
-        "profiler_events" => events_tool,
-        "profiler_crash" => crash_tool,
-        "profiler_symbolicate" => symbolicate_tool,
+    let content: Producer = match name {
+        "profiler_status" => status_content,
+        "profiler_findings" => findings_content,
+        "profiler_events" => events_content,
+        "profiler_crash" => crash_content,
+        "profiler_symbolicate" => {
+            return Ok(
+                symbolicate_tool(reader, args).unwrap_or_else(|message| tool_failure(&message))
+            );
+        }
         _ => return Err(invalid(&format!("Unknown tool: {name}"))),
     };
-    Ok(tool(reader, args).unwrap_or_else(|message| tool_failure(&message)))
+    Ok(match content(reader, args) {
+        Ok((content, cuts)) => tool_result(content, cuts),
+        Err(refusal) => tool_failure(refusal.message()),
+    })
 }
 
-fn status_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value, String> {
+/// The lists of a tool's content that give way, in order, when its result is too long.
+pub(crate) type Cuts = &'static [(&'static str, Cut)];
+/// A tool's content before it becomes a result. The `/mcp` twins (#139 slice X2) run the same
+/// producers over the server's own profiler directory and project their content first.
+pub(crate) type Producer = fn(&Reader, &Map<String, Value>) -> Result<(Value, Cuts), Refusal>;
+
+/// Why a profiler tool could not answer: an argument it refuses, or a crash record that is not
+/// there. Each says what to send instead.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    Invalid(String),
+    Missing(String),
+}
+
+impl Refusal {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Invalid(message) | Self::Missing(message) => message,
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
+/// A reader over the running server's own profiler directory, which it writes beside this, or
+/// `None` without a profiler runtime (or with one that could not lock its directory). The
+/// directory is read whether recording is on or off, as the stdio server reads it.
+pub(crate) fn server_reader() -> Option<Reader> {
+    super::global().map(|handle| Reader::new(handle.dir.clone()))
+}
+
+pub(crate) fn status_content(
+    reader: &Reader,
+    args: &Map<String, Value>,
+) -> Result<(Value, Cuts), Refusal> {
     only(args, &[])?;
     let mut status = reader.status_without_counts();
     status["crashes"] = reader
@@ -205,35 +275,87 @@ fn status_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value, Stri
             })
         })
         .collect();
-    Ok(tool_result(
-        status,
-        &[("/findings", Cut::Back), ("/crashes", Cut::Back)],
-    ))
+    Ok((status, &[("/findings", Cut::Back), ("/crashes", Cut::Back)]))
 }
 
-fn findings_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value, String> {
-    let (since, kind, limit) = query(args, FINDINGS_LIMIT)?;
-    Ok(tool_result(
-        json!({ "findings": reader.findings(since, kind, limit) }),
-        &[("/findings", Cut::Back)],
-    ))
+/// Without `since` or `cursor`, the newest `limit` findings, newest first. With either, the
+/// findings seen at or after `since` and after `cursor`, oldest first by `lastSeen` and then
+/// id, and `nextCursor` while more remain (#139, Revision 4). A finding that recurs after it
+/// was read moves to its new `lastSeen`, so a reader that follows the cursor sees it again.
+/// At most the book's 1,000 findings are ever held.
+pub(crate) fn findings_content(
+    reader: &Reader,
+    args: &Map<String, Value>,
+) -> Result<(Value, Cuts), Refusal> {
+    let (since, kind, limit) = query(args, FINDINGS_LIMIT, &["since", "kind", "limit", "cursor"])?;
+    let cursor = string(args, "cursor")?.map(parse_cursor).transpose()?;
+    if since.is_none() && cursor.is_none() {
+        return Ok((
+            json!({ "findings": reader.findings(None, kind, limit) }),
+            &[("/findings", Cut::Back)],
+        ));
+    }
+    let mut after: Vec<((OffsetDateTime, String), Value)> = reader
+        .findings(since, kind, usize::MAX)
+        .into_iter()
+        .filter_map(|finding| Some((finding_key(&finding)?, finding)))
+        .filter(|(key, _)| cursor.as_ref().is_none_or(|cursor| key > cursor))
+        .collect();
+    after.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let more = after.len() > limit;
+    after.truncate(limit);
+    let (keys, findings): (Vec<_>, Vec<_>) = after.into_iter().unzip();
+    let mut content = json!({ "findings": findings });
+    // Fitted before the cursor is set, so following it skips nothing that was cut.
+    let kept = keys.len() - fit_list(&mut content, "/findings", Cut::Back, 1);
+    content["nextCursor"] = match keys.get(kept.wrapping_sub(1)) {
+        Some((at, id)) if more || kept < keys.len() => cursor_text(*at, id).into(),
+        _ => Value::Null,
+    };
+    Ok((content, &[]))
 }
 
-fn events_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value, String> {
-    let (since, kind, limit) = query(args, EVENTS_LIMIT)?;
-    Ok(tool_result(
+/// A finding's place in cursor order: its `lastSeen`, then its id.
+fn finding_key(finding: &Value) -> Option<(OffsetDateTime, String)> {
+    let at = OffsetDateTime::parse(finding.get("lastSeen")?.as_str()?, &Rfc3339).ok()?;
+    Some((at, finding.get("id")?.as_str()?.to_owned()))
+}
+
+fn cursor_text(at: OffsetDateTime, id: &str) -> String {
+    format!("{}|{id}", at.format(&Rfc3339).unwrap_or_default())
+}
+
+fn parse_cursor(cursor: &str) -> Result<(OffsetDateTime, String), Refusal> {
+    cursor
+        .split_once('|')
+        .filter(|(_, id)| !id.is_empty() && cursor.len() <= 512)
+        .and_then(|(at, id)| Some((OffsetDateTime::parse(at, &Rfc3339).ok()?, id.to_owned())))
+        .ok_or_else(|| "cursor must be the nextCursor of an earlier profiler_findings call".into())
+}
+
+pub(crate) fn events_content(
+    reader: &Reader,
+    args: &Map<String, Value>,
+) -> Result<(Value, Cuts), Refusal> {
+    let (since, kind, limit) = query(args, EVENTS_LIMIT, &["since", "kind", "limit"])?;
+    Ok((
         json!({ "events": reader.events(since, kind, limit) }),
         &[("/events", Cut::Front)],
     ))
 }
 
-fn crash_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value, String> {
+pub(crate) fn crash_content(
+    reader: &Reader,
+    args: &Map<String, Value>,
+) -> Result<(Value, Cuts), Refusal> {
     only(args, &["id"])?;
     let id =
         string(args, "id")?.ok_or("id is required: a crash id, as profiler_status lists them")?;
-    let (crash, dump) = reader
-        .crash(id)
-        .ok_or_else(|| format!("No crash record {id}; profiler_status lists the newest."))?;
+    let (crash, dump) = reader.crash(id).ok_or_else(|| {
+        Refusal::Missing(format!(
+            "No crash record {id}; profiler_status lists the newest."
+        ))
+    })?;
     // Only symbols already here: no download.
     let (dump, stack, stack_error) = match dump {
         None => ("missing", None, None),
@@ -242,7 +364,7 @@ fn crash_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value, Strin
             Err(error) => ("unreadable", None, Some(error.to_string())),
         },
     };
-    Ok(tool_result(
+    Ok((
         json!({ "crash": crash, "dump": dump, "stack": stack, "stackError": stack_error }),
         &[
             ("/crash/lastEvents", Cut::Front),
@@ -292,12 +414,14 @@ fn symbolicate_tool(reader: &Reader, args: &Map<String, Value>) -> Result<Value,
     ))
 }
 
-/// `since`, `kind` and `limit` of a findings or events call, `limit` clamped to `1..=most`.
-fn query(
-    args: &Map<String, Value>,
+/// `since`, `kind` and `limit` of a findings or events call, `limit` clamped to `1..=most`;
+/// `known` are the arguments the tool takes.
+fn query<'a>(
+    args: &'a Map<String, Value>,
     (default, most): (u64, u64),
-) -> Result<(Option<OffsetDateTime>, Option<&str>, usize), String> {
-    only(args, &["since", "kind", "limit"])?;
+    known: &[&str],
+) -> Result<(Option<OffsetDateTime>, Option<&'a str>, usize), String> {
+    only(args, known)?;
     let since = string(args, "since")?.map(parse_since).transpose()?;
     let limit = match args.get("limit") {
         None | Some(Value::Null) => default,
@@ -518,6 +642,84 @@ mod tests {
         assert_eq!(list_len(&responses[3], "findings"), 50);
     }
 
+    /// A gap of more than 100 findings is caught up by paging (#139, Revision 4): with `since`
+    /// findings come oldest first, each exactly once, and `nextCursor` reads the next page until
+    /// it is null. Two findings share each `lastSeen`, written in reverse id order, so the id
+    /// breaks ties and file order does not.
+    #[test]
+    fn a_cursor_catches_up_more_than_100_findings_oldest_first() {
+        let (_state, dir) = seeded(0, 0);
+        let findings: String = (0..250)
+            .map(|index| {
+                let second = index / 2;
+                let finding = json!({
+                    "id": format!("rpc.slow-{:012}", 249 - index), "fingerprint": format!("{index:012}"),
+                    "kind": "rpc.slow", "severity": "warn", "firstSeen": "2026-10-09T10:00:00Z",
+                    "lastSeen": format!("2026-10-09T11:{:02}:{:02}Z", second / 60, second % 60),
+                    "count": 1, "source": "server", "title": "Slow request", "summary": "s",
+                    "state": "open", "evidence": {},
+                });
+                format!("{finding}\n")
+            })
+            .collect();
+        fs::write(dir.join("findings.ndjson"), findings).unwrap();
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut arguments = json!({ "since": "2026-10-09T11:00:00Z", "limit": 100 });
+            if let Some(cursor) = &cursor {
+                arguments["cursor"] = cursor.clone().into();
+            }
+            let responses = exchange(&dir, &[call_tool(1, "profiler_findings", arguments)]);
+            let content = &responses[0]["result"]["structuredContent"];
+            for finding in content["findings"].as_array().expect("findings") {
+                seen.push((
+                    finding["lastSeen"].as_str().unwrap().to_owned(),
+                    finding["id"].as_str().unwrap().to_owned(),
+                ));
+            }
+            pages += 1;
+            assert!(pages <= 3, "{content}");
+            match content["nextCursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+
+        assert_eq!(pages, 3);
+        let mut expected = seen.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(seen.len(), 250);
+        assert_eq!(seen, expected, "oldest first, each once");
+        // Without since or cursor, the newest come first, as before.
+        let responses = exchange(&dir, &[call_tool(1, "profiler_findings", json!({}))]);
+        let newest = &responses[0]["result"]["structuredContent"];
+        assert_eq!(newest["findings"].as_array().unwrap().len(), 50);
+        assert_eq!(newest["findings"][0]["lastSeen"], "2026-10-09T11:02:04Z");
+        assert!(newest.get("nextCursor").is_none(), "{newest}");
+        // A cursor that is not one is refused, saying what to send.
+        let responses = exchange(
+            &dir,
+            &[call_tool(
+                1,
+                "profiler_findings",
+                json!({ "cursor": "nope" }),
+            )],
+        );
+        assert_eq!(responses[0]["result"]["isError"], true);
+        assert!(
+            responses[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("nextCursor"),
+            "{}",
+            responses[0]
+        );
+    }
+
     #[test]
     fn errors_follow_json_rpc_and_the_server_keeps_reading() {
         let (_state, dir) = seeded(1, 0);
@@ -593,7 +795,7 @@ mod tests {
         );
         assert!(hint(4).contains("30s, 10m, 1h or 2d"), "{}", hint(4));
         assert!(
-            hint(5).contains("unknown argument limt; this tool takes since, kind, limit"),
+            hint(5).contains("unknown argument limt; this tool takes since, kind, limit, cursor"),
             "{}",
             hint(5)
         );
