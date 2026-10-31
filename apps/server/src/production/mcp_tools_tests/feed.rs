@@ -526,6 +526,83 @@ async fn one_call_parses_a_bounded_number_of_payload_bytes() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_previous_session_update_the_read_consults_counts_toward_the_budget() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let session = |thread: &str, status: &str, turn: Option<&str>, error: Option<&str>| {
+        json!({
+            "threadId": thread,
+            "session": {
+                "threadId": thread, "status": status, "providerName": "opencode",
+                "runtimeMode": "full-access", "activeTurnId": turn, "lastError": error,
+                "updatedAt": CREATED_AT,
+            },
+        })
+        .to_string()
+    };
+    let database = harness.repositories.database().clone();
+    let insert = |rows: Vec<(String, String, i64, String)>| {
+        let database = database.clone();
+        async move {
+            database
+            .call(move |connection| {
+                for (id, thread, version, payload) in rows {
+                    connection.execute(
+                        "INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES (?, 'thread', ?, ?, 'thread.session-set', ?, NULL, NULL, NULL, 'provider', ?, '{}')",
+                        rusqlite::params![id, thread, version, CREATED_AT, payload],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+    };
+    // Before the cursor: two threads whose running session update holds a 20 MiB provider
+    // error. After it: each settles with a small update, whose mapping reads the large one.
+    let error = "e".repeat(20 * 1024 * 1024);
+    insert(
+        ["a", "b"]
+            .into_iter()
+            .map(|thread| {
+                (
+                    format!("run-{thread}"),
+                    thread.to_owned(),
+                    0,
+                    session(thread, "running", Some("turn-1"), Some(&error)),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let cursor = head(&harness, &agent).await;
+    insert(
+        ["a", "b"]
+            .into_iter()
+            .map(|thread| {
+                (
+                    format!("ready-{thread}"),
+                    thread.to_owned(),
+                    1,
+                    session(thread, "ready", None, None),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    // One large lookup per call, and each still maps to the turn it ended.
+    let first = feed(&harness, &agent, json!({ "cursor": cursor })).await;
+    assert_eq!(kinds(&first), ["turn.completed"], "{first}");
+    assert_eq!(first["entries"][0]["threadId"], "a");
+    assert_eq!(first["more"], true);
+    let second = feed(&harness, &agent, json!({ "cursor": first["cursor"] })).await;
+    assert_eq!(kinds(&second), ["turn.completed"], "{second}");
+    assert_eq!(second["entries"][0]["threadId"], "b");
+    assert_eq!(second["more"], false);
+    harness.shutdown().await;
+}
+
 /// The worst case of one page, measured: 5,000 approval-shaped candidates of 100 KiB each
 /// in a file database. Run with `--ignored --nocapture`.
 #[tokio::test]

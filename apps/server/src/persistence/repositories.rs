@@ -2975,9 +2975,12 @@ const TRANSITION_COLUMNS: &str = "e.sequence, e.event_type, e.stream_id, e.occur
     CASE WHEN e.event_type = 'thread.activity-appended' THEN COALESCE(json_extract(e.payload_json, '$.activity.payload.requestId'), json_extract(e.metadata_json, '$.requestId')) END, \
     json_extract(e.metadata_json, '$.actor')";
 
-/// The bytes of an event's payload the transition read may parse: a transition type's whole
-/// payload (an approval's kind is inside it), nothing for any other event.
-const PARSE_COST: &str = "CASE WHEN aggregate_kind = 'thread' AND event_type IN ('thread.created', 'thread.archived', 'thread.turn-start-requested', 'thread.session-set', 'thread.activity-appended') THEN octet_length(payload_json) ELSE 0 END";
+/// The bytes of payload the transition read may parse for event `o`: a transition type's whole
+/// payload (an approval's kind is inside it), plus, for a session update, the payload of the
+/// thread's previous session update its mapping reads (a provider error there is uncapped);
+/// nothing for any other event. Sizes come from `octet_length`, through the stream index.
+const PARSE_COST: &str = "CASE WHEN o.aggregate_kind = 'thread' AND o.event_type IN ('thread.created', 'thread.archived', 'thread.turn-start-requested', 'thread.session-set', 'thread.activity-appended') THEN octet_length(o.payload_json) ELSE 0 END \
+    + CASE WHEN o.aggregate_kind = 'thread' AND o.event_type = 'thread.session-set' THEN COALESCE((SELECT octet_length(p.payload_json) FROM orchestration_events AS p WHERE p.aggregate_kind = 'thread' AND p.stream_id = o.stream_id AND p.sequence < o.sequence AND p.event_type = 'thread.session-set' ORDER BY p.sequence DESC LIMIT 1), 0) ELSE 0 END";
 
 fn change_feed_heads(connection: &Connection) -> Result<(i64, i64)> {
     Ok(connection.query_row(
@@ -2995,11 +2998,12 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
     let thread = query.thread_id.as_deref();
     let parse_budget = i64::try_from(query.parse_budget).unwrap_or(i64::MAX);
     // The scanned window: at most `scan_limit` events after the cursor (a thread's through its
-    // stream index), cut before the event whose transition-type payload would bring the bytes
-    // to be parsed past `parse_budget`. `octet_length` reads a payload's size from the record
-    // header, never its text. The first event is always kept, so a call progresses.
+    // stream index), cut before the event whose payloads to parse (its own, and the previous
+    // session update a session update consults) would bring the bytes past `parse_budget`.
+    // `octet_length` reads a payload's size from the record header, never its text. The first
+    // event is always kept, and charged, so a call progresses.
     let stream = if thread.is_some() {
-        "aggregate_kind = 'thread' AND stream_id = ?4 AND"
+        "o.aggregate_kind = 'thread' AND o.stream_id = ?4 AND"
     } else {
         "?4 IS NULL AND"
     };
@@ -3008,8 +3012,8 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
             "SELECT COUNT(*), COALESCE(SUM(kept), 0), MAX(CASE WHEN kept THEN sequence END) FROM ( \
                SELECT sequence, (n = 1 OR spent <= ?3) AS kept FROM ( \
                  SELECT sequence, ROW_NUMBER() OVER w AS n, SUM(cost) OVER w AS spent FROM ( \
-                   SELECT sequence, {PARSE_COST} AS cost FROM orchestration_events \
-                   WHERE {stream} sequence > ?1 ORDER BY sequence LIMIT ?2) \
+                   SELECT o.sequence AS sequence, {PARSE_COST} AS cost FROM orchestration_events AS o \
+                   WHERE {stream} o.sequence > ?1 ORDER BY o.sequence LIMIT ?2) \
                  WINDOW w AS (ORDER BY sequence ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)))"
         ),
         params![query.after_sequence, scan_limit, parse_budget, thread],
