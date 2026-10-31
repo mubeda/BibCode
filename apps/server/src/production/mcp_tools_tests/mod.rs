@@ -5,6 +5,7 @@
 
 mod attribution;
 mod diagnostics;
+mod feed;
 mod foundation;
 mod git;
 mod previews;
