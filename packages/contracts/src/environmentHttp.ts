@@ -22,6 +22,8 @@ import {
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthSetMcpAccessInput,
+  AuthApproveMcpAuthorizationInput,
+  AuthDenyMcpAuthorizationInput,
   AuthMcpAccessLevel,
   AuthRevokePairingLinkInput,
   AuthEnvironmentScope,
@@ -379,6 +381,13 @@ export const AuthMcpAccessResult = Schema.Struct({
 });
 export type AuthMcpAccessResult = typeof AuthMcpAccessResult.Type;
 
+/** A remote MCP request to connect, once decided (#139, slice R). */
+export const AuthMcpAuthorizationDecisionResult = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  status: Schema.Literals(["approved", "denied"]),
+});
+export type AuthMcpAuthorizationDecisionResult = typeof AuthMcpAuthorizationDecisionResult.Type;
+
 export const AuthOtherClientSessionsRevokeResult = Schema.Struct({
   revokedCount: Schema.Finite,
 });
@@ -486,6 +495,22 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       headers: OptionalBearerHeaders,
       payload: AuthSetMcpAccessInput,
       success: AuthMcpAccessResult,
+      error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("approveMcpAuthorization", "/api/auth/mcp-authorizations/approve", {
+      headers: OptionalBearerHeaders,
+      payload: AuthApproveMcpAuthorizationInput,
+      success: AuthMcpAuthorizationDecisionResult,
+      error: EnvironmentPairingCredentialErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("denyMcpAuthorization", "/api/auth/mcp-authorizations/deny", {
+      headers: OptionalBearerHeaders,
+      payload: AuthDenyMcpAuthorizationInput,
+      success: AuthMcpAuthorizationDecisionResult,
       error: EnvironmentPairingCredentialErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )

@@ -269,9 +269,29 @@ export const AuthClientSession = Schema.Struct({
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 
+/**
+ * A remote AI tool's request to connect over HTTPS, waiting for a person (#139, slice R).
+ * `clientName` is the tool's own, untrusted, text; `code` is what its sign-in page shows.
+ */
+export const AuthPendingMcpAuthorization = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  code: TrimmedNonEmptyString,
+  clientName: Schema.String,
+  redirectHost: Schema.String,
+  /** It returns to this computer only, so approving it is safe only if you just started it. */
+  redirectIsLoopback: Schema.Boolean,
+  origin: TrimmedNonEmptyString,
+  scopes: AuthEnvironmentScopes,
+  createdAt: Schema.DateTimeUtc,
+  expiresAt: Schema.DateTimeUtc,
+});
+export type AuthPendingMcpAuthorization = typeof AuthPendingMcpAuthorization.Type;
+
 export const AuthAccessSnapshot = Schema.Struct({
   pairingLinks: Schema.Array(AuthPairingLink),
   clientSessions: Schema.Array(AuthClientSession),
+  /** Remote MCP requests to connect (slice R). Absent from servers that predate them. */
+  pendingMcpAuthorizations: Schema.optionalKey(Schema.Array(AuthPendingMcpAuthorization)),
 });
 export type AuthAccessSnapshot = typeof AuthAccessSnapshot.Type;
 
@@ -390,6 +410,23 @@ export const AuthSetMcpAccessInput = Schema.Struct({
   access: AuthMcpAccessLevel,
 });
 export type AuthSetMcpAccessInput = typeof AuthSetMcpAccessInput.Type;
+
+/**
+ * **Approve** a remote AI tool's request to connect (#139, slice R): at `access`, at most the
+ * environment's Agents may, with terminals only when it asked for them and they are allowed.
+ */
+export const AuthApproveMcpAuthorizationInput = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  access: AuthMcpAccessLevel,
+  terminals: Schema.optionalKey(Schema.Boolean),
+});
+export type AuthApproveMcpAuthorizationInput = typeof AuthApproveMcpAuthorizationInput.Type;
+
+/** **Deny** a remote AI tool's request to connect (#139, slice R). */
+export const AuthDenyMcpAuthorizationInput = Schema.Struct({
+  id: TrimmedNonEmptyString,
+});
+export type AuthDenyMcpAuthorizationInput = typeof AuthDenyMcpAuthorizationInput.Type;
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),
