@@ -75,6 +75,27 @@ describe("sourceControlPanelStore", () => {
       });
     });
 
+    // Only text the store put in from the suggestion is the agent's to take back: the person
+    // may have typed the very same words themselves.
+    it("clears a committed suggestion's draft only when it was filled or used from it", () => {
+      store().setCwdMessage(CWD, "Fix the parser");
+      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
+      expect(outcome("intent-1")).toBe("offered");
+      store().retireCommittedAgentSuggestion(CWD, "intent-1", "Fix the parser");
+      expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser");
+
+      store().setCwdMessage(OTHER, "");
+      store().receiveAgentCommitSuggestion(OTHER, "intent-2", "Fix the lexer");
+      store().retireCommittedAgentSuggestion(OTHER, "intent-2", "Fix the lexer");
+      expect(store().byCwdKey[OTHER]).toBeUndefined();
+
+      store().setCwdMessage(CWD, "Mine");
+      store().receiveAgentCommitSuggestion(CWD, "intent-3", "Fix the tests");
+      store().acceptAgentCommitSuggestion(CWD, "intent-3", "Fix the tests");
+      store().retireCommittedAgentSuggestion(CWD, "intent-3", "Fix the tests");
+      expect(store().byCwdKey[CWD]).toBeUndefined();
+    });
+
     it("fills an empty draft once, and never again after the draft is cleared", () => {
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
       expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser");
