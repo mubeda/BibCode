@@ -166,22 +166,33 @@ routes serve only an eligible origin (see
   (port included), the resource and the approved scopes. Its exchange writes the
   grant's `mcp-client` session (label `MCP · <client> (remote)`,
   `mcp_resource` set, 30 days after its last refresh) in the same transaction
-  that marks it used. A second use revokes that session.
+  that marks it used. A second use revokes that session, but only when it
+  carries the original binding (client, redirect URI, resource) and a verifier
+  that proves the stored challenge; a code without them is `invalid_grant` and
+  revokes nothing, so a code seen in a callback URL cannot end the grant.
 - **Tokens.** The response is `{ access_token, token_type: "Bearer",
   expires_in: 3600, refresh_token, scope }`. The access token is the session's
   signed claims with `exp` one hour out (never past the grant); the verifier
   checks the grant's expiry and the token's separately. Refresh tokens are
   single use: a refresh rotates both tokens and moves the grant's expiry 30
   days out, and any second use of a refresh token is `invalid_grant` and revokes
-  the whole grant. A refresh's `scope` may only narrow the grant, which then
-  stays narrowed. Refresh works while `enableMcpServer` is off; the code grant
+  the whole grant. A grant keeps its current refresh token and its 32 most
+  recently used ones for that check; an older one is simply unknown
+  (`invalid_grant`, no revocation), and a revoked or expired grant's tokens are
+  deleted. A refresh's `scope` may only narrow the grant, which then stays
+  narrowed. Refresh works while `enableMcpServer` is off; the code grant
   does not.
-- **Admission.** Per client 2 pending authorizations; per source 8
-  registrations an hour and 4 pending authorizations (429 past either); global
-  64 never-approved clients and 64 pending authorizations, of which 16 are kept
-  for sources with none pending, evicting the oldest entry of the source with
-  the most. Never-approved clients go after a day, approved ones after 90 days
-  unused.
+- **Admission.** A source is `<class>:<network>` (`direct`, `proxy`,
+  `tunnel`, `other`). Per client 2 pending authorizations; per source 8
+  registrations an hour and 4 pending authorizations; the unproven `proxy`
+  class, whose network comes from `X-Forwarded-For`, 16 registrations an hour
+  and 16 pending authorizations in all (429 past any of these). Global: 64
+  never-approved clients and 64 pending authorizations, of which 16 are kept
+  for sources with none pending. At the global cap a request evicts the oldest
+  entry of the source holding the most _within its own class_; an unproven
+  class, or a class with nothing of its own to evict, is refused instead, so no
+  request can evict another class's. Never-approved clients go after a day,
+  approved ones after 90 days unused.
 - **Secrets.** Codes, refresh tokens and the status cookie are stored only as
   SHA-256 hashes, compared in constant time, and never logged or recorded by the
   profiler.
