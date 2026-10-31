@@ -1991,9 +1991,26 @@ pub struct OrchestrationEngine {
     thread_turns: ThreadTurnFence,
     compaction_waiters: CompactionWaiters,
     ask_recovery_holds: AskRecoveryHolds,
+    checkpoint_holds: CheckpointHolds,
     #[cfg(test)]
     test_hooks: TestHooks,
 }
+
+/// How long a queued follow-up waits for its thread's turn checkpoint before it goes anyway:
+/// longer than a capture takes in a large checkout, short enough that a worker that never
+/// answers does not hold the queue for good.
+const CHECKPOINT_HOLD_LIMIT: Duration = Duration::from_secs(120);
+
+/// Ended turns the effects worker has yet to checkpoint, by thread and turn, each with the id of
+/// the hold that owns it. Holds are taken only while the effects worker runs (`enabled`).
+#[derive(Clone, Default)]
+struct CheckpointHolds {
+    enabled: Arc<AtomicBool>,
+    turns: Arc<StdMutex<HeldTurns>>,
+}
+
+/// The last hold id given out, and each held `(thread, turn)` with its hold's id.
+type HeldTurns = (u64, HashMap<(String, String), u64>);
 
 /// Threads whose resumed session has not yet read the asks its provider kept (#187), each with
 /// the id of the hold that owns it.
@@ -2071,6 +2088,7 @@ impl OrchestrationEngine {
             thread_turns: ThreadTurnFence::default(),
             compaction_waiters: CompactionWaiters::default(),
             ask_recovery_holds: AskRecoveryHolds::default(),
+            checkpoint_holds: CheckpointHolds::default(),
             #[cfg(test)]
             test_hooks: options.test_hooks,
         })
@@ -2764,6 +2782,93 @@ impl OrchestrationEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .1
             .contains_key(thread_id)
+    }
+
+    /// Lets turn checkpoints hold queue promotion (the effects worker that records them runs), or
+    /// stops them, releasing every hold.
+    pub(crate) fn set_checkpoint_holds_enabled(&self, enabled: bool) {
+        self.checkpoint_holds
+            .enabled
+            .store(enabled, Ordering::Release);
+        if !enabled {
+            self.release_checkpoint_holds(|_| true);
+        }
+    }
+
+    /// Holds the thread's automatic queue promotion until the effects worker has recorded the
+    /// checkpoint of `turn_id`, which just ended, so a queued follow-up cannot edit the checkout
+    /// before it is captured. Taken before the turn's session settles; released by the worker
+    /// for that turn only, or after [`CHECKPOINT_HOLD_LIMIT`]. Nothing is held while the worker
+    /// does not run.
+    pub(crate) fn hold_promotion_for_checkpoint(&self, thread_id: &str, turn_id: &str) {
+        if !self.checkpoint_holds.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let id = {
+            let mut holds = self
+                .checkpoint_holds
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            holds.0 = holds.0.wrapping_add(1);
+            let id = holds.0;
+            holds.1.insert(key.clone(), id);
+            id
+        };
+        let engine = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CHECKPOINT_HOLD_LIMIT).await;
+            if engine.release_checkpoint_holds(|(held, held_id)| *held == key && *held_id == id) {
+                tracing::warn!(
+                    thread_id = %key.0,
+                    "a queued follow-up stopped waiting for its thread's turn checkpoint"
+                );
+            }
+        });
+    }
+
+    /// The effects worker is done with the checkpoint of `turn_id`: once no other ended turn of
+    /// the thread waits for one, its queued messages may be promoted again.
+    pub(crate) fn release_checkpoint_hold(&self, thread_id: &str, turn_id: &str) {
+        self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
+    }
+
+    /// Releases every checkpoint hold of a deleted thread.
+    pub(crate) fn release_thread_checkpoint_holds(&self, thread_id: &str) {
+        self.release_checkpoint_holds(|((thread, _), _)| thread == thread_id);
+    }
+
+    /// Releases the holds `matches` picks, waking delivery. Returns whether any was released.
+    fn release_checkpoint_holds(
+        &self,
+        matches: impl Fn((&(String, String), &u64)) -> bool,
+    ) -> bool {
+        let released = {
+            let mut holds = self
+                .checkpoint_holds
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = holds.1.len();
+            holds.1.retain(|key, id| !matches((key, id)));
+            holds.1.len() != before
+        };
+        if released {
+            self.wake_turn_delivery();
+        }
+        released
+    }
+
+    /// Whether the thread's automatic queue promotion waits for an ended turn's checkpoint.
+    pub(crate) fn promotion_held_for_checkpoint(&self, thread_id: &str) -> bool {
+        self.checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .keys()
+            .any(|(thread, _)| thread == thread_id)
     }
 
     /// Where the event pump reports a compaction's tagged turn to the compaction effect.
@@ -7896,7 +8001,9 @@ fn apply_turns_projector_tx(
             let checkpoint_turn_count = required_i64(payload, "checkpointTurnCount")?;
             transaction.execute("UPDATE projection_turns SET checkpoint_turn_count = NULL, checkpoint_ref = NULL, checkpoint_status = NULL, checkpoint_files_json = '[]' WHERE thread_id = ? AND turn_id <> ? AND checkpoint_turn_count = ?", params![thread_id, turn_id, checkpoint_turn_count])?;
             let files = json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?;
-            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = ?, state = ?, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
+            // A turn its session ended interrupted or failed keeps that state, and an event that
+            // names no answer keeps the one the turn already has.
+            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
             if updated == 0 {
                 transaction.execute(
                     TURN_UPSERT_SQL,

@@ -5781,3 +5781,215 @@ paths. Three P2s, each with a test that failed before its fix:
   stay serialized. Residual, as for the Files tools: another app's save in that instant can
   replace BiBCode's change (reported) or be replaced by it (not detectable from BiBCode's
   side). Test: `a_save_that_lands_with_the_rename_is_reported_not_claimed_as_success`.
+
+## Turn checkpoints (2026-10-31)
+
+### Problem
+
+No turn ever records a checkpoint, for any thread. The only production code that records
+one (`thread.turn.diff.complete`, status `ready`) is `capture_missing_checkpoint` in
+`apps/server/src/production/orchestration_effects.rs`, and it runs only for a
+`thread.turn-diff-completed` event with status `missing`. Nothing produced that event: the
+Rust migration commit `bfbecf5956` ported the effect arm, the projector and the client
+reducer, but not the TypeScript server's turn-completion trigger (its `CheckpointReactor`
+"captures git checkpoints on turn start/complete", per the architecture text removed in
+`8960d136fe`; its runtime ingestion recorded the `missing` placeholder). `git log -S` finds no
+later producer or removal: the trigger never existed in Rust. Only the turn-start baseline
+(ref 0) was ever written. So `get_turn_diff` answered `McpNoTurnDiffError`,
+`revert_thread_to_turn` and the app's revert had no target past 0, and the Diff panel had no
+turns. The user's store has 21 turns and 0 recorded checkpoints.
+
+Red tests (all three timed out waiting for turn 1's checkpoint before the fix), in
+`apps/server/tests/production_provider_runtime.rs`, driving a fake provider through the real
+ingestion, effects worker, RPC and Git:
+`a_completed_turn_records_its_checkpoint_and_turn_diff`,
+`an_interrupted_or_failed_turn_records_its_checkpoint_and_keeps_its_state`,
+`reverting_to_a_recorded_turn_restores_its_files`.
+
+### What the rest of the system already expects
+
+- Ref scheme: `checkpoint_ref(thread, n)` is the checkout after turn `n` (ref 0 is before
+  the first turn). Turn `n`'s diff is `ref(n-1)..ref(n)` (`orchestration.getTurnDiff`, MCP
+  `get_turn_diff`, the Diff panel via `thread.checkpoints`). Refs live under
+  `refs/bibcode/checkpoints/<base64 thread id>/turn/<n>` in the repository's common
+  directory, so a worktree and its main checkout share them.
+- `ensure_baseline` (turn start) captures `ref(max recorded count)` only when it is missing.
+- Revert restores `ref(n)`, deletes later refs and rewinds the provider by
+  `current count - n`, both read from `projection_turns.checkpoint_turn_count`. A gap in the
+  counts misaligns the provider rewind with the files.
+
+### Decision (revised after Codex review round 1)
+
+Provider ingestion records a turn's end; the effects worker captures it.
+
+1. In `provider_runtime::project_provider_event`'s `turn.completed` branch, **before** the
+   session settles (`dispatch_tagged_session_state`), `orchestration_effects::record_turn_end`
+   records the turn's checkpoint number with status `missing`. It skips a compaction's own
+   turn, an event of another thread, an event without a turn id, and a turn that already has
+   a number, whatever its status: a repeated end never asks for a second capture, which could
+   store a later checkout as this turn's. The number is `max + 1`, so it is durable and dense
+   whether or not the capture ever happens. A record that cannot be written fails the
+   `turn.completed` projection before the session settles, as a failed session write would,
+   so a turn is never settled without its number.
+2. Before dispatching that record it takes a **checkpoint hold** for that turn
+   (`OrchestrationEngine::hold_promotion_for_checkpoint(thread, turn)`, beside
+   `AskRecoveryHold`). `promote_settled_threads` holds a thread's queue while any of its ended
+   turns is held, so a queued follow-up is not promoted until the effects worker has captured
+   the checkout as each turn left it. Holds are taken only while `OrchestrationEffects` runs
+   (it enables them at start and disables them, releasing every hold, at shutdown), a deleted
+   thread's holds are released, and each expires after 120 s with a warning, so a worker that
+   never answers cannot hold a queue for good. Expiry wakes delivery.
+3. The effects worker handles the `missing` event in the existing arm
+   (`capture_missing_checkpoint` → `record_checkpoint`): captures `ref(n)` unless it already
+   exists, diffs it against `ref(n-1)`, records `ready` with the files and the turn's own
+   assistant message id (the record carries none; the projector keeps the turn's), and
+   releases that turn's hold on every exit (a drop guard), including no workspace, not a Git
+   checkout, already recorded and failure. A failed capture stays `missing`, with the
+   existing `checkpoint.capture.failed` activity; the next turn's `ensure_baseline` then sees
+   number `n` and writes `ref(n)` at that turn's start, so turn `n`'s diff (read by explicit
+   number) holds its changes and anything changed before the next turn started.
+4. Startup reconciliation (`reconcile_abandoned_provider_session`) records a turn a restart
+   cut off the same way, as `TurnEnd::CutOff`: number only, no hold (the worker is not
+   running yet), and only when the thread already has a recorded checkpoint. Before any, the
+   next turn's baseline starts the thread's checkpoints after it (see Existing threads).
+
+Committing the record before the session settles orders it before anything the settled
+session causes; the hold keeps the queued follow-up's `thread.turn-start-requested` (and the
+follow-up's edits) after the capture. The `missing` arm never overwrites an existing ref, so a
+retry cannot replace a turn's end state with a later checkout.
+
+Alternative considered: an effects-only trigger that learns the running turn from
+`thread.session-set` events and captures when the session settles. It needs no change to
+ingestion and also covers turns driven by orchestration commands alone (the MCP test harness
+drives turns with `thread.session.set`). Rejected after review: a settling session-set
+carries no turn id, so a stale or duplicated completion would checkpoint whichever turn is
+remembered; the hold must exist before the settling event commits, which a subscriber cannot
+arrange; and only ingestion and reconciliation know the turn a restart cut off. The MCP
+harness therefore seeds checkpoints with the `missing` record, which is now a stated property.
+
+### Projector and client
+
+- The `thread.turn-diff-completed` projector keeps a turn's `interrupted` or `error` state
+  (the `thread.message-sent` projector's precedent) instead of setting `completed`, and keeps
+  the turn's `assistant_message_id` when the event carries none (`COALESCE`).
+- `threadReducer.ts` keeps `latestTurn.state` `interrupted`/`error` and the answer id for the
+  same turn when a checkpoint lands.
+- MCP `get_turn_diff` without `turnCount` reads the latest `ready` checkpoint, so a turn not
+  captured (`missing`) does not hide the turns before it, and a thread with none answers
+  `McpNoTurnDiffError`. Between a turn's end and its capture the latest captured turn is the
+  one before it.
+
+### Threads without a worktree
+
+A project-folder thread shares the checkout with sibling threads and with the person. Refs are
+per thread, but each capture snapshots the whole checkout (temporary index, `add -A`, honouring
+`.gitignore`). A turn's diff therefore contains whatever changed in the checkout while it ran,
+whoever changed it, and a revert restores the whole checkout (the existing shared-checkout
+revert model, ordered by request). Edits made between turns land in the next turn's diff,
+because `ensure_baseline` reuses `ref(n)` when it exists rather than recapturing at the next
+turn's start. Recapturing would need a second ref and a second capture per turn; not done.
+
+### Concurrency and bounding
+
+The capture runs on the sequential effects worker, through `run_git` → `ProcessRunner` →
+`run_supervised`, each Git call bounded by `GIT_TIMEOUT` (30 s) and the 8 MiB output cap,
+cancelled at shutdown. Staying on the worker orders it before the thread's next baseline and
+before any revert of the same checkout. Git is a child process, so no event loop is blocked;
+the worker is: a slow capture in a large checkout delays other threads' effects, as the
+turn-start baseline already does. With the hold, it delays only the same thread's queued
+follow-up, and at most until the hold expires. A per-checkout worker with a total capture
+deadline would let independent checkouts proceed; deferred, as it changes revert ordering
+across the worker.
+
+Residual: a message the person sends directly (not queued) is not held. They type it after
+seeing the turn end, so the capture has normally finished; if the worker is behind, that
+turn's early edits can land in the previous turn's checkpoint, the window the turn-start
+baseline already has.
+
+### Restart and idempotency
+
+- The effects producer never replays history below its startup floor, and reconciliation runs
+  before the effects worker starts, so a cut-off turn's record (step 4) stays `missing`. The
+  next turn's baseline writes `ref(n)`, so turn `n`'s diff (by explicit number) holds the
+  cut-off turn's changes and anything changed before the next turn started, the next turn's
+  diff does not, and a revert across it rewinds the provider by every turn.
+- A provider stream that ends while a turn runs synthesizes a failed `turn.completed` for the
+  active turn, so that turn is recorded and captured like any other.
+- Duplicate or replayed completions are no-ops: a turn with a number is left alone. A stale
+  completion of an earlier turn arriving after the next turn started records nothing new for
+  the same reason; ingestion still settles the session on it, a pre-existing behaviour this
+  change does not alter. Number allocation (`max + 1`) is not atomic, but one thread's
+  completions are projected one at a time by its event pump, and reconciliation runs before
+  any pump starts.
+
+### Existing threads (no backfill)
+
+Turns completed before this fix get no checkpoint; nothing is backfilled (the checkout no
+longer holds their end states). A thread with completed turns and no recorded checkpoint
+keeps an old ref 0 from its first turn's baseline; using it would make the first recorded
+turn's diff "everything since the thread began" and a revert to 0 restore that old tree while
+rewinding one provider turn. So on `thread.turn-start-requested` (never on the queue-time
+`message-sent`), when the thread has no recorded checkpoint, has settled turns, and no turn
+runs other than the one this event starts (its turn row carries the event's `messageId`), the
+worker recaptures ref 0. The first recorded turn of such a thread is that turn alone, and
+revert to 0 means "undo the recorded turns". If the worker reaches the event only after the
+new turn is running, it still recaptures, with the window any first turn's baseline has (the
+new turn's earliest edits can land in ref 0), never the old ref 0.
+
+### Cleanup
+
+Revert deletes the refs past its target (unchanged). Refs of a deleted thread stay until a
+manual `git for-each-ref`/`update-ref -d` and `git gc`; deleting them on `thread.deleted` needs
+the deleted thread's checkout, which the read model may no longer resolve. Deferred. Each ref
+is one commit and tree; objects are shared with the checkout, except untracked, unignored
+files, which each capture stores as blobs (as the baseline already does).
+
+### Codex review round 1 (2026-10-31)
+
+Reviewed the first draft (effects-only trigger on `thread.session-set`). Dispositions:
+
+- **P1, wrong turn on a late completion.** A settling session-set carries no turn id.
+  Fixed by moving the trigger to ingestion's `turn.completed`, which names the turn.
+- **P1, the next turn edits before the capture.** Fixed with the checkpoint hold on queue
+  promotion, taken before the session settles. A direct send is not held (residual above).
+- **P1, a restart leaves the rewind count wrong.** Fixed: reconciliation records the cut-off
+  turn's number (step 4).
+- **P2, legacy ref 0 refresh reads the session later.** First kept the session check; replaced
+  in round 2 (below).
+- **P2, large checkouts stall every thread's effects.** Bounded and deferred (above); the hold
+  limits the user-visible effect to the thread's own queued follow-up.
+
+### Codex review round 2 (2026-10-31)
+
+Reviewed the revised decision with its implementation. Dispositions:
+
+- **P1, an earlier turn releases a later turn's hold.** Fixed: holds are per turn, the worker
+  releases only the turn its `missing` event names, and the queue waits while any of the
+  thread's turns is held. Test: `each_ended_turn_holds_the_queue_until_its_own_checkpoint`.
+- **P1, a delayed legacy baseline keeps the old ref 0.** Fixed: the refresh no longer reads
+  the session. It skips only when a turn other than the starting one runs, so a lagging
+  worker recaptures with the ordinary first-baseline window instead of keeping the old era.
+  Capturing every baseline under turn admission, before the provider starts, would close
+  that window for all threads; it changes turn delivery and is left as a follow-up.
+- **P1, a failed end record loses a number while the session settles.** Fixed: the record's
+  error fails the `turn.completed` projection before the session write (step 1), and
+  reconciliation's error leaves the session for its retry.
+- **P2, the cut-off diff residual was wrong.** Corrected (Restart): the cut-off turn's own
+  diff holds its changes once the next baseline writes its ref.
+- **P2, replaying a `missing` end could capture a later checkout.** Fixed: a turn with a
+  number is never recorded again (step 1).
+- Note: the stream-end residual was overstated; a stream end synthesizes `turn.completed`.
+  Corrected.
+
+### Tests
+
+- Red first, then green: the three integration tests above; `threadReducer` keeps an
+  interrupted/failed turn's state and answer; `get_turn_diff_reads_only_captured_turns`
+  (MCP, answered `OrchestrationGetTurnDiffError` before); with the hold disabled,
+  `a_queued_follow_up_waits_for_the_ended_turns_checkpoint` fails (the follow-up starts before
+  the checkpoint is recorded); with the refresh disabled,
+  `a_thread_with_turns_before_checkpoints_starts_them_from_its_next_turn` times out.
+- Also: `a_cut_off_turn_is_numbered_only_after_a_recorded_turn`,
+  `restart_reconciliation_numbers_the_cut_off_turn_after_the_recorded_ones`, and the existing
+  `production_orchestration_effects` checkpoint and revert tests, `mcp_tools_tests`
+  thread_actions revert tests, and the provider-runtime checkpoint RPC tests.

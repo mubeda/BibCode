@@ -2785,6 +2785,18 @@ async fn reconcile_abandoned_provider_session(
             && projected.updated_at == settled_at
     });
     if let Some(turn_id) = abandoned_turn_id {
+        // The turn the restart cut off keeps its checkpoint number, `missing`: the checkout
+        // after a restart is not where it ended. The next turn's baseline captures its ref, and
+        // a revert across it still rewinds the provider by every turn.
+        super::orchestration_effects::record_turn_end(
+            engine,
+            &session.thread_id,
+            &turn_id,
+            &settled_at,
+            super::orchestration_effects::TurnEnd::CutOff,
+        )
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
         settle_streaming_assistant_messages(
             engine,
             &session.thread_id,
@@ -11206,6 +11218,23 @@ async fn project_provider_event(
             compactable: event.payload.get("compactable").and_then(Value::as_bool),
         });
         let status = if failed { "error" } else { "ready" };
+        // Its checkpoint number is recorded before the session settles: a settled session
+        // promotes queued messages, which wait until the checkout is captured. A turn whose
+        // number cannot be recorded is not settled either.
+        if compaction_id.is_none()
+            && event.thread_id == launch.thread_id
+            && let Some(turn_id) = &event.turn_id
+        {
+            super::orchestration_effects::record_turn_end(
+                engine,
+                &launch.thread_id,
+                turn_id,
+                &created_at,
+                super::orchestration_effects::TurnEnd::Live,
+            )
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        }
         persist_runtime(
             &engine.repositories(),
             launch,
@@ -29143,11 +29172,15 @@ done
             message_id: &str,
         ) -> crate::orchestration::engine::AdmissionCommitPause {
             // The hooks are unfiltered and take-once. No other command producer
-            // may run until both pauses have caught the completion's commands.
+            // may run until the pauses have caught the completion's commands.
             self.stream(turn_id, message_id).await;
             let hooks = self.engine.test_hooks();
-            let ready = hooks.pause_before_next_command_persist();
+            // The turn's checkpoint number is recorded before its session settles.
+            let checkpoint = hooks.pause_before_next_command_persist();
             self.emit("turn.completed", turn_id, message_id).await;
+            checkpoint.wait_until_entered().await;
+            let ready = hooks.pause_before_next_command_persist();
+            checkpoint.release();
             ready.wait_until_entered().await;
             let settlement = hooks.pause_before_next_command_persist();
             ready.release();

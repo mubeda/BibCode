@@ -738,6 +738,65 @@ async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff()
     engine.shutdown().await;
 }
 
+/// A thread whose turns predate turn checkpoints keeps the ref 0 of its very first turn. The
+/// first turn it starts afterwards captures ref 0 again, so that turn's diff, and a revert to
+/// 0, cover that turn alone rather than everything since the thread began.
+#[tokio::test]
+async fn a_thread_with_turns_before_checkpoints_starts_them_from_its_next_turn() {
+    let repository = initialize_repository().await;
+    let engine = engine(repository.path()).await;
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 0)
+        .await
+        .unwrap();
+    let baseline_ref = orchestration_effects::checkpoint_ref("t1", 0);
+    let session = |status: &str, active: Option<&str>| {
+        json!({
+            "type":"thread.session.set", "commandId":format!("session-{status}"), "threadId":"t1",
+            "session":{
+                "threadId":"t1", "status":status, "providerName":"codex",
+                "providerInstanceId":"codex", "runtimeMode":"full-access",
+                "activeTurnId":active, "lastError":null, "updatedAt":NOW
+            },
+            "createdAt":NOW
+        })
+    };
+    // A turn that ran before this version: settled, with no checkpoint.
+    dispatch(&engine, session("running", Some("old-turn"))).await;
+    dispatch(&engine, session("ready", None)).await;
+    std::fs::write(repository.path().join("tracked.txt"), "changed since\n").unwrap();
+    let callbacks = Arc::new(CallbackState::default());
+    *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
+    let effects = OrchestrationEffects::start(
+        engine.clone(),
+        Arc::new(GitRepository::default()),
+        callbacks,
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.turn.start", "commandId":"turn-start", "threadId":"t1",
+            "message":{"messageId":"m1","role":"user","text":"change it","attachments":[]},
+            "createdAt":NOW
+        }),
+    )
+    .await;
+    let baseline_file = format!("{baseline_ref}:tracked.txt");
+    tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, async {
+        while git(repository.path(), &["show", &baseline_file]) != "changed since" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("ref 0 is captured again when the next turn starts");
+
+    effects.shutdown().await;
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn reverts_workspace_provider_history_and_stale_checkpoint_refs() {
     let repository = initialize_repository().await;

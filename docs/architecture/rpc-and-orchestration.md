@@ -840,6 +840,52 @@ range from `review.getDiffPreview`, and a turn or the whole thread from
 - **Review sources on failure.** `getDiffPreview` still returns an empty
   source when Git fails (for example, a base ref that does not exist).
 
+### Turn checkpoints
+
+A checkpoint is a commit of the whole checkout, written by the orchestration
+effects worker (`orchestration_effects.rs`) through a temporary index, so the
+person's own index and branches are untouched. `refs/bibcode/checkpoints/<base64
+thread id>/turn/<n>` is the checkout after turn `n`; ref 0 is the checkout
+before the thread's first recorded turn. Turn `n`'s patch is ref `n - 1` to ref
+`n`, and the read model's `projection_turns.checkpoint_*` columns hold each
+turn's number, ref, status and changed files.
+
+1. **Turn start.** `thread.turn-start-requested` (and a non-imported user
+   `thread.message-sent`) captures ref `n` (the thread's latest number) if it
+   is missing. A thread with settled turns but no recorded checkpoint, whose
+   turns predate turn checkpoints, captures ref 0 again on
+   `thread.turn-start-requested` unless another turn runs, so its first
+   recorded turn does not reach back to the thread's first turn.
+2. **Turn end.** Provider ingestion's `turn.completed` (not a compaction's own
+   turn) records the turn's number, the latest plus one, with status `missing`
+   before the session settles (`record_turn_end`). A turn that already has a
+   number is left alone, and a record that cannot be written fails the
+   projection before the session settles. It also takes a checkpoint hold for
+   the turn: the thread's queue promotion waits while any of its ended turns
+   is held, so a queued follow-up cannot edit the checkout before the capture.
+   Holds exist only while the effects worker runs, a deleted thread's holds
+   are released, and each expires after 120 seconds.
+3. **Capture.** The worker handles the `missing` record: it captures ref `n`
+   (never overwriting one that exists), diffs it against ref `n - 1`, records
+   `ready` with the changed files and the turn's own answer id, appends a
+   `checkpoint.captured` activity, and releases that turn's hold however it
+   ends. A failed capture stays `missing` with a `checkpoint.capture.failed`
+   activity; the next turn start then writes ref `n`.
+4. **Restart.** Startup reconciliation records a turn the restart cut off as
+   `missing`, without a capture, when the thread already has a recorded
+   checkpoint, so the numbers stay dense and a revert's provider rewind
+   (current number minus target) still counts every turn.
+
+A provider stream that ends mid-turn synthesizes a failed `turn.completed`, so
+that turn is recorded too. The turn-diff projector keeps a turn's `interrupted` or `error` state and its answer
+id when a checkpoint lands. A thread without its own worktree shares its
+project's checkout, so its turn's patch holds every change made in the checkout
+while the turn ran, and edits made between turns land in the next turn's patch.
+Git runs through the supervised process runner, 30 seconds per call, on the
+sequential worker, which also orders captures before the thread's next baseline
+and any revert of the same checkout. Turns that ended before checkpoints were
+recorded have none, and a deleted thread's refs are not removed.
+
 ### Turn patches
 
 Turn and full-thread patches are computed live from the checkpoint refs at

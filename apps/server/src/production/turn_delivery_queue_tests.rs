@@ -1214,6 +1214,82 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks
     }
 }
 
+/// A turn's end holds its thread's queued follow-up until the effects worker has captured the
+/// checkout as that turn left it, so the follow-up's edits never land in its checkpoint. With
+/// no effects worker, nothing is held.
+#[tokio::test]
+async fn a_queued_follow_up_waits_for_the_ended_turns_checkpoint() {
+    use crate::production::orchestration_effects::{TurnEnd, record_turn_end};
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    session(&engine, "running", "running-third").await;
+    enqueue(&engine, "queued", true).await;
+    let (service, mut routes) = service(&engine);
+    quiet(&mut routes).await;
+    std::fs::write(fixture.rewind.cwd.join("tracked.txt"), "three\n").unwrap();
+    record_turn_end(&engine, "t", "turn-3", TIME, TurnEnd::Live)
+        .await
+        .unwrap();
+    session(&engine, "ready", "ready-third").await;
+    received(&mut routes, "queued").await;
+    service.shutdown().await;
+
+    let events = engine.read_events(0).await.unwrap();
+    let position = |matches: &dyn Fn(&crate::persistence::OrchestrationEvent) -> bool| {
+        events
+            .iter()
+            .find(|event| matches(event))
+            .map(|event| event.sequence)
+    };
+    let recorded = position(&|event| {
+        event.event.event_type == "thread.turn-diff-completed"
+            && event.event.payload["turnId"] == "turn-3"
+            && event.event.payload["status"] == "ready"
+    })
+    .expect("the ended turn's checkpoint is recorded");
+    let promoted = position(&|event| {
+        event.event.event_type == "thread.turn-start-requested"
+            && event.event.payload["messageId"] == "queued"
+    })
+    .expect("the follow-up starts");
+    assert!(recorded < promoted, "{recorded} >= {promoted}");
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 3)
+        .await
+        .unwrap()
+        .expect("checkpoint 3");
+    assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
+
+    fixture.shutdown().await;
+    engine.hold_promotion_for_checkpoint("t", "turn-4");
+    assert!(!engine.promotion_held_for_checkpoint("t"));
+}
+
+/// Each ended turn holds the queue for itself: when two turns end before the effects worker
+/// catches up, capturing the first does not release the second's hold. Deleting the thread
+/// releases them all.
+#[tokio::test]
+async fn each_ended_turn_holds_the_queue_until_its_own_checkpoint() {
+    let engine = engine().await;
+    engine.set_checkpoint_holds_enabled(true);
+    engine.hold_promotion_for_checkpoint("t", "turn-1");
+    engine.hold_promotion_for_checkpoint("t", "turn-2");
+    engine.release_checkpoint_hold("t", "turn-1");
+    assert!(engine.promotion_held_for_checkpoint("t"));
+    engine.release_checkpoint_hold("t", "turn-2");
+    assert!(!engine.promotion_held_for_checkpoint("t"));
+
+    engine.hold_promotion_for_checkpoint("t", "turn-3");
+    engine.hold_promotion_for_checkpoint("other", "turn-1");
+    engine.release_thread_checkpoint_holds("t");
+    assert!(!engine.promotion_held_for_checkpoint("t"));
+    assert!(engine.promotion_held_for_checkpoint("other"));
+    engine.set_checkpoint_holds_enabled(false);
+    assert!(!engine.promotion_held_for_checkpoint("other"));
+    engine.shutdown().await;
+}
+
 /// Five chats sharing one checkout revert, one more than are prepared at once, while every
 /// provider reopen is slow. They still restore in the order they were asked for, and a message
 /// sent to the fifth chat after its revert is delivered only once that revert is done.

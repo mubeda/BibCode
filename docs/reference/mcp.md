@@ -1525,7 +1525,7 @@ Answers a thread's pending approval, as `list_pending_requests` lists it. `accep
 
 #### `revert_thread_to_turn`
 
-Reverts a thread to its checkpoint after turn `turnCount` (0 means before its first turn). The files go back to that point, discarding the later turns' changes and anything changed since, and the provider forgets the later turns where it can. It waits up to 30 seconds for the result. It is refused while a turn runs. Use `get_turn_diff` first to see what a turn changed.
+Reverts a thread to its checkpoint after turn `turnCount` (0 means before its first recorded turn). The files go back to that point, discarding the later turns' changes and anything changed since, and the provider forgets the later turns where it can. Turns are numbered from the first one BiBCode recorded a checkpoint for, so in a thread older than checkpoints, 0 is the start of its first turn since then. It waits up to 30 seconds for the result. It is refused while a turn runs. Use `get_turn_diff` first to see what a turn changed.
 
 - **Set / scope:** Workspace · `orchestration:operate`
 - **Access:** operate (hidden at read-only)
@@ -1579,7 +1579,7 @@ Stops a thread's running turn: the one `turnId` names, else the thread's latest 
 
 #### `get_turn_diff`
 
-Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch.
+Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only. Turns that ended before BiBCode recorded checkpoints have none, and neither does a turn whose capture failed or that a restart cut off (its changes show in the next turn's patch). In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
 
 - **Set / scope:** Workspace · `orchestration:read`
 - **Access:** any level
@@ -1589,7 +1589,7 @@ Returns the file changes one turn made, as a patch: the changed files first, the
 | Argument    | Type    | Required | Limits and default                                                           | Meaning                                                                                                              |
 | ----------- | ------- | -------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `threadId`  | string  | yes      | a live thread                                                                | The thread.                                                                                                          |
-| `turnCount` | integer | no       | 1 or more; default is the thread's latest turn with a checkpoint             | The turn's number; the patch is the change from turn `turnCount - 1` to `turnCount`. 0 is `McpInvalidArgumentError`. |
+| `turnCount` | integer | no       | 1 or more; default is the thread's latest turn with a captured checkpoint    | The turn's number; the patch is the change from turn `turnCount - 1` to `turnCount`. 0 is `McpInvalidArgumentError`. |
 | `cursor`    | string  | no       | the `nextCursor` of the previous page (form `<fileIndex>:<characterOffset>`) | Where to continue. Treat as opaque; a malformed one is `McpInvalidArgumentError`.                                    |
 
 **Result** (`structuredContent`):
@@ -1603,7 +1603,7 @@ Returns the file changes one turn made, as a patch: the changed files first, the
 
 **Errors:**
 
-- `McpNoTurnDiffError`: no `turnCount` was given and the thread has no turn with recorded changes yet.
+- `McpNoTurnDiffError`: no `turnCount` was given and the thread has no turn with a captured checkpoint yet: none has ended since BiBCode recorded checkpoints, the project is not a Git checkout, or its only turn is still being captured.
 - `McpInvalidArgumentError`: `turnCount` is 0, or the cursor is malformed.
 - `OrchestrationGetTurnDiffError`: the checkpoint for a turn is no longer in the repository, or the workspace could not be resolved.
 - `WorkspaceUnavailableError`: the thread's workspace is being removed or is gone.
