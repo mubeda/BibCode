@@ -379,8 +379,13 @@ impl WorkspaceRpc {
             }
             "projects.writeFileIfUnchanged" => {
                 let input: WriteIfUnchangedInput = decode(payload)?;
-                self.handle_write_file(input.write, Some(input.precondition), cancellation)
-                    .await
+                let single_link_only = input.single_link_only.unwrap_or(false);
+                self.handle_write_file(
+                    input.write,
+                    Some((input.precondition, single_link_only)),
+                    cancellation,
+                )
+                .await
             }
             "projects.createEntry" => {
                 let input: CreateInput = decode(payload)?;
@@ -1349,7 +1354,7 @@ impl WorkspaceRpc {
     async fn handle_write_file(
         &self,
         input: WriteInput,
-        precondition: Option<WritePrecondition>,
+        precondition: Option<(WritePrecondition, bool)>,
         cancellation: CancellationToken,
     ) -> Result<Value, Value> {
         let admission = self.acquire_path(&input.cwd).await?;
@@ -1369,13 +1374,14 @@ impl WorkspaceRpc {
                         .write_file(root, &input.relative_path, &input.contents)
                         .await
                 }
-                Some(precondition) => {
+                Some((precondition, single_link_only)) => {
                     rpc.service
-                        .write_file_if_unchanged(
+                        .write_file_if_unchanged_with(
                             root,
                             &input.relative_path,
                             &input.contents,
                             precondition,
+                            *single_link_only,
                         )
                         .await
                 }
@@ -1769,6 +1775,9 @@ struct WriteIfUnchangedInput {
     #[serde(flatten)]
     write: WriteInput,
     precondition: WritePrecondition,
+    /// Refuse a file with more than one hard link (#139 X5): `files_write` sets it; the Files
+    /// panel does not, since a person may edit their own hard-linked file.
+    single_link_only: Option<bool>,
 }
 
 #[derive(Deserialize)]

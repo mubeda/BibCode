@@ -20,6 +20,10 @@ use super::paths::{
 use super::{EntryKind, WorkspaceError};
 
 const READ_LIMIT_BYTES: usize = 1024 * 1024;
+/// How much of a file's old content an in-place write keeps to put back if the write fails
+/// after truncating it. Agents write only files within the read limit; a larger file (a
+/// person's save) is written without that safety net and the failure says so.
+const KEPT_FOR_RESTORE_BYTES: usize = 16 * 1024 * 1024;
 const VERSION_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLICATE_LIMIT: usize = 1000;
 const DEFAULT_MAX_CONCURRENT_OPERATIONS: usize = 32;
@@ -35,6 +39,10 @@ enum WriteMode {
     Unchanged {
         version: String,
         id: Option<Identity>,
+        /// Refuse a file with more than one hard link (an outside agent's write).
+        single_link_only: bool,
+        /// A test's injected write failure right after the truncation.
+        fail_after_truncate: bool,
     },
 }
 
@@ -55,6 +63,11 @@ pub(crate) trait WorkspaceWriteHook: Send + Sync {
     /// the file system: the window a folder swapped for a symlink would exploit.
     fn after_containment_check<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Whether an in-place write fails right after it truncated the file.
+    fn fail_after_truncate(&self) -> bool {
+        false
     }
 }
 
@@ -264,10 +277,32 @@ fn hash_open(
     file: &mut std::fs::File,
     place: &Place,
 ) -> Result<(String, u64, bool), WorkspaceError> {
+    hash_with(file, place, 0).map(|(version, length, binary, _)| (version, length, binary))
+}
+
+/// The version of an open file and, when it is at most `keep` bytes, its whole content.
+fn hash_keeping(
+    file: &mut std::fs::File,
+    place: &Place,
+    keep: usize,
+) -> Result<(String, Option<Vec<u8>>), WorkspaceError> {
+    hash_with(file, place, keep).map(|(version, _, _, kept)| (version, kept))
+}
+
+/// A file's version, length, binary flag and, when kept, its content.
+type Hashed = (String, u64, bool, Option<Vec<u8>>);
+
+/// [`hash_open`], also keeping the content read while it stays within `keep` bytes.
+fn hash_with(
+    file: &mut std::fs::File,
+    place: &Place,
+    keep: usize,
+) -> Result<Hashed, WorkspaceError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; VERSION_SCAN_CHUNK_BYTES];
     let mut byte_length = 0_u64;
     let mut binary = false;
+    let mut kept = (keep > 0).then(Vec::new);
     loop {
         let read = match file.read(&mut buffer) {
             Ok(0) => break,
@@ -282,8 +317,27 @@ fn hash_open(
         }
         hasher.update(chunk);
         byte_length += read as u64;
+        kept = kept
+            .filter(|kept| kept.len() + read <= keep)
+            .map(|mut kept| {
+                kept.extend_from_slice(chunk);
+                kept
+            });
     }
-    Ok((lowercase_hex(&hasher.finalize()), byte_length, binary))
+    Ok((lowercase_hex(&hasher.finalize()), byte_length, binary, kept))
+}
+
+/// How many hard links a file has; one where the platform reports none.
+fn link_count(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::nlink(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        1
+    }
 }
 
 async fn scan_file(place: Place) -> Result<ScannedFile, WorkspaceError> {
@@ -419,6 +473,13 @@ pub struct WorkspaceService {
     /// The system trash `projects.deleteEntry { toTrash }` uses: the one Source Control's
     /// discard uses. Without it a trash request answers `trash_unavailable`.
     trash: Option<Arc<dyn crate::git::FileTrash>>,
+    /// The server's state directory, under which a workspace that is no Git repository keeps
+    /// its trash holder.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix trash stages entries")
+    )]
+    trash_state: Option<PathBuf>,
     #[cfg(test)]
     write_hook: Option<Arc<dyn WorkspaceWriteHook>>,
 }
@@ -435,14 +496,16 @@ impl WorkspaceService {
             permits: Arc::new(Semaphore::new(max_concurrent_operations.max(1))),
             path_locks: PathLocks::default(),
             trash: None,
+            trash_state: None,
             #[cfg(test)]
             write_hook: None,
         }
     }
 
     #[must_use]
-    pub fn with_trash(mut self, trash: Arc<dyn crate::git::FileTrash>) -> Self {
+    pub fn with_trash(mut self, trash: Arc<dyn crate::git::FileTrash>, state: PathBuf) -> Self {
         self.trash = Some(trash);
+        self.trash_state = Some(state);
         self
     }
 
@@ -623,6 +686,22 @@ impl WorkspaceService {
         contents: &str,
         precondition: &WritePrecondition,
     ) -> Result<WriteFileOutcome, WorkspaceError> {
+        self.write_file_if_unchanged_with(root, relative_path, contents, precondition, false)
+            .await
+    }
+
+    /// [`Self::write_file_if_unchanged`]; with `single_link_only` (an outside agent's
+    /// `files_write`), a file with more than one hard link is refused (`hard_linked`): writing
+    /// it in place would change every other name it has, which can be outside the workspace. A
+    /// person's save of their own hard-linked file stays allowed.
+    pub async fn write_file_if_unchanged_with(
+        &self,
+        root: &Path,
+        relative_path: &str,
+        contents: &str,
+        precondition: &WritePrecondition,
+        single_link_only: bool,
+    ) -> Result<WriteFileOutcome, WorkspaceError> {
         let _permit = self.permit().await?;
         let (place, normalized) = self.mutation_place(root, relative_path).await?;
         let _path_lock = self
@@ -652,6 +731,8 @@ impl WorkspaceService {
                 WriteMode::Unchanged {
                     version: version.clone(),
                     id,
+                    single_link_only,
+                    fail_after_truncate: self.fails_after_truncate(),
                 }
             }
         };
@@ -660,6 +741,15 @@ impl WorkspaceService {
             hook.after_precondition_check(&target).await?;
         }
         self.write_target(place, normalized, contents, mode).await
+    }
+
+    /// Whether a test asked the next in-place write to fail right after truncating.
+    fn fails_after_truncate(&self) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = &self.write_hook {
+            return hook.fail_after_truncate();
+        }
+        false
     }
 
     /// Writes through the folder's handle, creating missing folders. The target is canonical,
@@ -707,7 +797,12 @@ impl WorkspaceService {
                     file.write_all(&bytes)
                         .map_err(|error| place.fault("write-file", error))?;
                 }
-                WriteMode::Unchanged { version, id } => {
+                WriteMode::Unchanged {
+                    version,
+                    id,
+                    single_link_only,
+                    fail_after_truncate,
+                } => {
                     // Opened without creating or truncating; checked through this descriptor,
                     // then truncated and written through it. Other BiBCode writers of the path
                     // wait on its lock; an outside editor writing between the check and the
@@ -729,15 +824,40 @@ impl WorkspaceService {
                             path: place.target.clone(),
                         });
                     }
+                    if single_link_only && link_count(&metadata) > 1 {
+                        return Err(WorkspaceError::HardLinked {
+                            path: place.target.clone(),
+                        });
+                    }
                     let now_id = Identity::of(&file).map_err(|error| place.fault("stat", error))?;
-                    let (now, _, _) = hash_open(&mut file, &place)?;
+                    // The old content is kept (up to a cap) so a write that fails after the
+                    // truncation can put it back.
+                    let (now, old) = hash_keeping(&mut file, &place, KEPT_FOR_RESTORE_BYTES)?;
                     if now_id != id || now != version {
                         return Err(changed());
                     }
                     file.set_len(0)
-                        .and_then(|()| file.seek(std::io::SeekFrom::Start(0)).map(drop))
-                        .and_then(|()| file.write_all(&bytes))
                         .map_err(|error| place.fault("write-file", error))?;
+                    let written = if fail_after_truncate {
+                        Err(std::io::Error::other("an injected write failure"))
+                    } else {
+                        file.seek(std::io::SeekFrom::Start(0))
+                            .map(drop)
+                            .and_then(|()| file.write_all(&bytes))
+                    };
+                    if let Err(error) = written {
+                        let restored = old.is_some_and(|old| {
+                            file.set_len(0)
+                                .and_then(|()| file.seek(std::io::SeekFrom::Start(0)).map(drop))
+                                .and_then(|()| file.write_all(&old))
+                                .is_ok()
+                        });
+                        return Err(WorkspaceError::WriteFailed {
+                            path: place.target.clone(),
+                            reason: error.to_string(),
+                            restored,
+                        });
+                    }
                 }
             }
             Ok((target_existed, parent_existed))
@@ -798,6 +918,8 @@ impl WorkspaceService {
         let _permit = self.permit().await?;
         let from = self.entry_place(root, from_relative_path).await?;
         let (to, normalized) = self.mutation_place(root, to_relative_path).await?;
+        // Both paths, always in the same order, so two renames never wait on each other.
+        let _path_locks = self.lock_paths(&from.target, &to.target).await?;
         self.containment_checked(&to.target).await?;
         let target = from.target.clone();
         blocking(&target, move || {
@@ -831,6 +953,7 @@ impl WorkspaceService {
         let _permit = self.permit().await?;
         let (_, normalized) = resolve_relative(root, relative_path)?;
         let place = self.entry_place(root, relative_path).await?;
+        let _path_lock = self.lock_path(&place.target).await?;
         self.containment_checked(&place.target).await?;
         let target = place.target.clone();
         blocking(&target, move || {
@@ -874,10 +997,60 @@ impl WorkspaceService {
         let _permit = self.permit().await?;
         let (_, normalized) = resolve_relative(root, relative_path)?;
         let place = self.entry_place(root, relative_path).await?;
+        let _path_lock = self.lock_path(&place.target).await?;
         let Some(trash) = self.trash.clone() else {
             return Err(WorkspaceError::TrashUnavailable { path: place.target });
         };
         self.containment_checked(&place.target).await?;
+        self.move_to_trash(&*trash, place, cancellation).await?;
+        Ok(normalized)
+    }
+
+    /// The entry moves into a private holder by handle (Source Control's discard staging, the
+    /// Git directory's `bibcode-discard`, else a folder under the server's state directory)
+    /// and only that staged path goes to the trash, so no workspace path another process could
+    /// swap is ever handed to it. A holder on another file system stages nothing:
+    /// `trash_unavailable`.
+    #[cfg(unix)]
+    async fn move_to_trash(
+        &self,
+        trash: &dyn crate::git::FileTrash,
+        place: Place,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), WorkspaceError> {
+        let target = place.target.clone();
+        let unavailable = || WorkspaceError::TrashUnavailable {
+            path: target.clone(),
+        };
+        let root = place.root.path().to_path_buf();
+        let Some(holder_parent) = self.trash_holder(&root) else {
+            return Err(unavailable());
+        };
+        let relative = place
+            .folder
+            .join(&place.name)
+            .strip_prefix(&root)
+            .ok()
+            .and_then(|relative| relative.to_str())
+            .map(str::to_owned)
+            .ok_or_else(unavailable)?;
+        match crate::git::trash_by_staging(trash, &root, &holder_parent, &relative, cancellation)
+            .await
+        {
+            crate::git::Moved::Trashed => Ok(()),
+            crate::git::Moved::NotTaken | crate::git::Moved::Kept => Err(unavailable()),
+        }
+    }
+
+    /// Without `*at` calls the trash takes the folder's path after a re-check (the outside
+    /// agents' tools that change files are refused on these platforms).
+    #[cfg(not(unix))]
+    async fn move_to_trash(
+        &self,
+        trash: &dyn crate::git::FileTrash,
+        place: Place,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), WorkspaceError> {
         let target = place.target.clone();
         let checked = blocking(&target, move || {
             place
@@ -889,8 +1062,62 @@ impl WorkspaceService {
         trash
             .trash(checked, cancellation)
             .await
-            .map_err(|_| WorkspaceError::TrashUnavailable { path: target })?;
-        Ok(normalized)
+            .map_err(|_| WorkspaceError::TrashUnavailable { path: target })
+    }
+
+    /// The folder that holds `bibcode-discard` for a workspace: its Git directory (a `.git`
+    /// folder, or the folder a `.git` file names), else a folder of its own, named by a hash
+    /// of the root, under the server's state directory.
+    #[cfg(unix)]
+    fn trash_holder(&self, root: &Path) -> Option<PathBuf> {
+        let dot_git = root.join(".git");
+        match std::fs::symlink_metadata(&dot_git) {
+            Ok(metadata) if metadata.is_dir() => return Some(dot_git),
+            Ok(metadata) if metadata.is_file() => {
+                let text = std::fs::read_to_string(&dot_git).ok()?;
+                let named = text.strip_prefix("gitdir:")?.trim();
+                return std::fs::canonicalize(root.join(named)).ok();
+            }
+            _ => {}
+        }
+        let state = self.trash_state.as_ref()?;
+        let mut name = sha256_hex(root.as_os_str().as_encoded_bytes());
+        name.truncate(24);
+        let folder = state.join("workspace-trash").join(name);
+        std::fs::create_dir_all(&folder).ok()?;
+        Some(folder)
+    }
+
+    /// The locks of two paths (a rename's source and target), taken in the order of their
+    /// keys so two renames of the same pair never wait on each other; one lock when both
+    /// paths are one file.
+    async fn lock_paths(
+        &self,
+        first: &Path,
+        second: &Path,
+    ) -> Result<(PathGuard, Option<PathGuard>), WorkspaceError> {
+        let key = |path: &Path| path.to_string_lossy().to_lowercase();
+        if key(first) == key(second) {
+            return Ok((self.lock_path(first).await?, None));
+        }
+        let (low, high) = if key(first) < key(second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let low = self.lock_path(low).await?;
+        let high = self.lock_path(high).await?;
+        Ok((low, Some(high)))
+    }
+
+    /// The path's lock (see [`PathLocks`]), or `path_busy`.
+    async fn lock_path(&self, path: &Path) -> Result<PathGuard, WorkspaceError> {
+        self.path_locks
+            .lock(path)
+            .await
+            .map_err(|PathBusy| WorkspaceError::PathBusy {
+                path: path.to_path_buf(),
+            })
     }
 
     pub async fn duplicate_entry(
@@ -1468,6 +1695,202 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["linked.txt", "notes.txt"]);
+    }
+
+    /// Fails every in-place write right after it truncated the file.
+    struct FailAfterTruncate;
+
+    impl WorkspaceWriteHook for FailAfterTruncate {
+        fn after_write<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fail_after_truncate(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_after_emptying_the_file_puts_the_old_content_back() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("notes.txt"), "the old content").unwrap();
+        let failed = WorkspaceService::default()
+            .with_write_hook_for_test(Arc::new(FailAfterTruncate))
+            .write_file_if_unchanged(
+                root.path(),
+                "notes.txt",
+                "new",
+                &WritePrecondition::Version {
+                    version: sha256_hex(b"the old content"),
+                },
+            )
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(
+                failed,
+                Err(WorkspaceError::WriteFailed { restored: true, .. })
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "the old content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_single_link_write_refuses_a_hard_linked_file() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("a.txt"), "base").unwrap();
+        std::fs::hard_link(root.path().join("a.txt"), root.path().join("b.txt")).unwrap();
+        let base = WritePrecondition::Version {
+            version: sha256_hex(b"base"),
+        };
+        let service = WorkspaceService::default();
+        let refused = service
+            .write_file_if_unchanged_with(root.path(), "a.txt", "agent", &base, true)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(refused, Err(WorkspaceError::HardLinked { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+            "base"
+        );
+        // A person's save of their own hard-linked file goes through.
+        service
+            .write_file_if_unchanged(root.path(), "a.txt", "person", &base)
+            .await
+            .map(|_| ())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+            "person"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_waits_for_a_save_of_the_same_file() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("shared.txt"), "base").unwrap();
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let service = WorkspaceService::default().with_write_hook_for_test(Arc::new(
+            HoldAfterPreconditionCheck {
+                entered,
+                release: release.clone(),
+            },
+        ));
+        let save = {
+            let (service, root) = (service.clone(), root.path().to_path_buf());
+            tokio::spawn(async move {
+                service
+                    .write_file_if_unchanged(
+                        &root,
+                        "shared.txt",
+                        "saved",
+                        &WritePrecondition::Version {
+                            version: sha256_hex(b"base"),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        };
+        entered_rx.recv().await.expect("the save passed its check");
+        let delete = {
+            let (service, root) = (service.clone(), root.path().to_path_buf());
+            tokio::spawn(async move { service.delete_entry(&root, "shared.txt").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!delete.is_finished(), "the delete ran during the save");
+        assert!(root.path().join("shared.txt").exists());
+        release.add_permits(1);
+        save.await.unwrap().unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(!root.path().join("shared.txt").exists());
+    }
+
+    /// Moves a trashed entry into a folder of its own and counts the calls.
+    #[cfg(unix)]
+    struct FolderTrash {
+        folder: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl crate::git::FileTrash for FolderTrash {
+        fn trash<'a>(
+            &'a self,
+            path: PathBuf,
+            _: &'a tokio_util::sync::CancellationToken,
+        ) -> crate::git::FileTrashFuture<'a> {
+            Box::pin(async move {
+                let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::fs::rename(&path, self.folder.join(index.to_string()))
+                    .await
+                    .map_err(|_| crate::git::TrashUnavailable)
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_trash_takes_a_staged_copy_never_a_swapped_workspace_path() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let trashed = TempDir::new().unwrap();
+        let trash = Arc::new(FolderTrash {
+            folder: trashed.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let parent = root.path().join("sub");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("victim.txt"), "inside").unwrap();
+        std::fs::write(outside.path().join("victim.txt"), "outside").unwrap();
+
+        // A plain trash goes through the private holder.
+        std::fs::write(root.path().join("plain.txt"), "plain").unwrap();
+        WorkspaceService::default()
+            .with_trash(trash.clone(), state.path().to_path_buf())
+            .trash_entry(
+                root.path(),
+                "plain.txt",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!root.path().join("plain.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(trashed.path().join("0")).unwrap(),
+            "plain"
+        );
+
+        // The folder becomes an outside link after the check: nothing is trashed.
+        let swapping = SwapAfterContainmentCheck::service(parent.clone(), outside.path().into())
+            .with_trash(trash.clone(), state.path().to_path_buf());
+        let refused = swapping
+            .trash_entry(
+                root.path(),
+                "sub/victim.txt",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(trash.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "outside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.with_extension("moved").join("victim.txt")).unwrap(),
+            "inside"
+        );
     }
 
     #[tokio::test]
