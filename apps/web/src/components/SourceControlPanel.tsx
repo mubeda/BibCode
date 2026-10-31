@@ -1066,6 +1066,7 @@ export default function SourceControlPanel({
         <SourceControlAgentSuggestion
           environmentId={environmentId}
           cwd={gitCwd}
+          legacyThreadKey={scopedThreadKey(threadRef)}
           draftMessage={draft.message}
         />
 

@@ -3,22 +3,30 @@ import type { EnvironmentId, UiCommitMessageIntent, UiIntent } from "@bibcode/co
 import { AsyncResult } from "effect/reactivity";
 import { useContext, useEffect, useState } from "react";
 
+import { isUiIntentPending } from "@bibcode/client-runtime/state/uiIntents";
+
 import { sourceControlDraftKey } from "~/sourceControlDraft";
 import { useSourceControlPanelStore } from "~/sourceControlPanelStore";
 import { uiIntentsEnvironment } from "~/state/uiIntents";
 
 import { Button } from "./ui/button";
 
-/** The newest commit message an outside agent suggested for the folder `cwdKey` names. */
+/**
+ * The commit message an outside agent suggested for the folder `cwdKey` names with the highest
+ * sequence, among those still pending at `now`.
+ */
 export function latestCommitMessageSuggestion(
   intents: ReadonlyArray<UiIntent>,
   environmentId: EnvironmentId,
   cwdKey: string,
+  now: number = Date.now(),
 ): UiCommitMessageIntent | null {
   let latest: UiCommitMessageIntent | null = null;
   for (const intent of intents) {
     if (
       intent.kind === "commitMessage" &&
+      isUiIntentPending(intent, now) &&
+      (latest === null || intent.sequence > latest.sequence) &&
       sourceControlDraftKey({ environmentId, cwd: intent.cwd }) === cwdKey
     ) {
       latest = intent;
@@ -40,11 +48,13 @@ function capitalized(text: string): string {
 /**
  * Follows the environment's pending UI intents for one folder's commit message suggestion and
  * hands each new one to the draft store, which fills an empty draft and only offers it over
- * text. Only a new suggestion for this folder renders the caller again.
+ * text. Only a new suggestion for this folder renders the caller again. An expired suggestion
+ * is never applied, and one that expires while shown goes away then.
  */
 function useCommitMessageSuggestion(
   environmentId: EnvironmentId,
   cwdKey: string | null,
+  legacyThreadKey: string | undefined,
 ): UiCommitMessageIntent | null {
   const registry = useContext(RegistryContext);
   const [current, setCurrent] = useState<{
@@ -59,9 +69,10 @@ function useCommitMessageSuggestion(
         if (!AsyncResult.isSuccess(result)) return;
         const intent = latestCommitMessageSuggestion(result.value, environmentId, cwdKey);
         if (intent !== null) {
+          // The store promotes the thread's older draft before it applies the suggestion.
           useSourceControlPanelStore
             .getState()
-            .receiveAgentCommitSuggestion(cwdKey, intent.intentId, intent.message);
+            .receiveAgentCommitSuggestion(cwdKey, intent.intentId, intent.message, legacyThreadKey);
         }
         setCurrent((previous) =>
           previous?.cwdKey === cwdKey && previous.intent?.intentId === intent?.intentId
@@ -71,8 +82,20 @@ function useCommitMessageSuggestion(
       },
       { immediate: true },
     );
-  }, [cwdKey, environmentId, registry]);
-  return current !== null && current.cwdKey === cwdKey ? current.intent : null;
+  }, [cwdKey, environmentId, legacyThreadKey, registry]);
+  const intent = current !== null && current.cwdKey === cwdKey ? current.intent : null;
+  const intentId = intent?.intentId ?? null;
+  const expiresAt = intent?.expiresAt ?? null;
+  useEffect(() => {
+    if (intentId === null || expiresAt === null) return;
+    const expire = () =>
+      setCurrent((previous) =>
+        previous?.intent?.intentId === intentId ? { ...previous, intent: null } : previous,
+      );
+    const timer = setTimeout(expire, Math.max(0, Date.parse(expiresAt) - Date.now()));
+    return () => clearTimeout(timer);
+  }, [expiresAt, intentId]);
+  return intent;
 }
 
 /**
@@ -84,11 +107,13 @@ function useCommitMessageSuggestion(
 export function SourceControlAgentSuggestion(props: {
   readonly environmentId: EnvironmentId;
   readonly cwd: string | null;
+  /** The thread's draft key from before folder drafts, promoted before a suggestion applies. */
+  readonly legacyThreadKey?: string | undefined;
   readonly draftMessage: string;
 }) {
-  const { environmentId, cwd, draftMessage } = props;
+  const { environmentId, cwd, legacyThreadKey, draftMessage } = props;
   const cwdKey = cwd === null ? null : sourceControlDraftKey({ environmentId, cwd });
-  const suggestion = useCommitMessageSuggestion(environmentId, cwdKey);
+  const suggestion = useCommitMessageSuggestion(environmentId, cwdKey, legacyThreadKey);
   const handled = useSourceControlPanelStore((state) =>
     cwdKey === null ? undefined : state.agentSuggestionByCwdKey[cwdKey],
   );

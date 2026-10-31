@@ -1,6 +1,7 @@
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { createJSONStorage } from "zustand/middleware";
 
 import {
   selectThreadSourceControlDraft,
@@ -96,6 +97,52 @@ describe("sourceControlPanelStore", () => {
         intentId: "intent-2",
         outcome: "offered",
       });
+    });
+
+    it("never fills over words another tab saved, and keeps that tab's other folders", () => {
+      const persisted = new Map<string, string>();
+      useSourceControlPanelStore.persist.setOptions({
+        storage: createJSONStorage(() => ({
+          getItem: (name: string) => persisted.get(name) ?? null,
+          setItem: (name: string, value: string) => void persisted.set(name, value),
+          removeItem: (name: string) => void persisted.delete(name),
+        })),
+      });
+      const OTHER = "environment-1::/other";
+      const saved = () =>
+        JSON.parse(persisted.get("bibcode:source-control-panel-state:v1") ?? "{}").state;
+      // Tab A typed after this tab loaded: this tab still holds empty drafts.
+      const tabA = (byCwdKey: Record<string, { message: string }>) =>
+        persisted.set(
+          "bibcode:source-control-panel-state:v1",
+          JSON.stringify({
+            state: { byThreadKey: {}, byCwdKey, agentSuggestionByCwdKey: {} },
+            version: 2,
+          }),
+        );
+      tabA({ [CWD]: { message: "tab A words" }, [OTHER]: { message: "tab A other" } });
+
+      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
+      expect(store().byCwdKey[CWD]?.message).toBe("tab A words");
+      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("offered");
+      expect(saved().byCwdKey[CWD]).toEqual({ message: "tab A words" });
+      expect(saved().byCwdKey[OTHER]).toEqual({ message: "tab A other" });
+
+      // An empty folder is filled, and the fill changes only that folder.
+      useSourceControlPanelStore.setState({ byCwdKey: {}, agentSuggestionByCwdKey: {} });
+      tabA({ [OTHER]: { message: "tab A other" } });
+      store().receiveAgentCommitSuggestion(CWD, "intent-2", "Fix the parser");
+      expect(store().byCwdKey[CWD]?.message).toBe("Fix the parser");
+      expect(saved().byCwdKey[OTHER]).toEqual({ message: "tab A other" });
+      expect(saved().byCwdKey[CWD]).toEqual({ message: "Fix the parser" });
+    });
+
+    it("promotes a draft from before folder drafts before it applies a suggestion", () => {
+      useSourceControlPanelStore.setState({ byThreadKey: { "env:thread": { message: "half" } } });
+      store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser", "env:thread");
+      expect(store().byCwdKey[CWD]?.message).toBe("half");
+      expect(store().byThreadKey).toEqual({});
+      expect(store().agentSuggestionByCwdKey[CWD]?.outcome).toBe("offered");
     });
 
     it("remembers a bounded number of folders", () => {
