@@ -423,11 +423,14 @@ read and download tools work at read-only.
   folder another program swaps for a symlink, or moves out, after the check is refused too.
 - **No lost edits.** `files_write` needs the `version` `files_read` returned, or `createOnly`
   for a new file. A file changed since is refused (`file_changed_on_disk`); read it again.
-  Even a save that lands while the write runs is kept: `createOnly` never replaces a file,
-  and a versioned write replaces the file only while it is still the one that was read.
-  Pages after the first need the `version` the first page returned; a file changed between
-  pages is refused (`McpFileChangedError`). A file over 1 MiB, or a binary one, cannot be
-  read or written here: download it.
+  `createOnly` never replaces a file. A write is made in place, so the file keeps its links,
+  owner and permissions. BiBCode lets one writer of a file in at a time: your saves in the
+  Files panel, uploads and an agent's writes never interleave, and while an upload of a file
+  runs, saving or writing it is refused (`McpFileBusyError` for an agent). An editor outside
+  BiBCode saving the same file at the same moment can still be overwritten. Pages after the
+  first need the `version` the first page returned; a file changed between pages is refused
+  (`McpFileChangedError`). A file over 1 MiB, or a binary one, cannot be read or written
+  here: download it.
 - **Nothing replaced by surprise.** `files_rename` and an upload without `overwrite` never
   replace a file, even one created while they run.
 - **Delete goes to the trash.** If the trash cannot take an entry, it is left in place
