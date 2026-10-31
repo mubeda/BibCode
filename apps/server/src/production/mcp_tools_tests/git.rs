@@ -751,6 +751,50 @@ async fn a_dirty_switch_is_blocked_with_its_reason_and_stash_carries_the_changes
     fixture.harness.shutdown().await;
 }
 
+/// The thread's recorded branch, which the sidebar and the chat header show.
+async fn thread_branch(fixture: &Fixture) -> Option<String> {
+    fixture
+        .harness
+        .repositories
+        .get_thread(THREAD.to_owned())
+        .await
+        .unwrap()
+        .unwrap()
+        .branch
+}
+
+/// The thread's branch follows the checkout an agent makes, as it does after the Source
+/// Control panel's own switch, even while no client shows the thread.
+#[tokio::test]
+async fn the_thread_branch_follows_an_agents_checkout() {
+    let fixture = fixture().await;
+    structured(
+        &fixture
+            .call("git_create_branch", json!({ "name": "feature" }))
+            .await,
+    );
+    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("feature"));
+    structured(
+        &fixture
+            .call("git_switch_branch", json!({ "name": "main" }))
+            .await,
+    );
+    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("main"));
+    // A checkout made elsewhere is picked up when the agent deletes the branch it left.
+    fixture.git(&["checkout", "-q", "feature"]);
+    fixture.git(&["checkout", "-q", "-b", "next"]);
+    structured(
+        &fixture
+            .call(
+                "git_delete_branch",
+                json!({ "name": "feature", "force": true }),
+            )
+            .await,
+    );
+    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("next"));
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn paths_that_leave_the_folder_or_use_pathspec_magic_are_refused() {
     let fixture = fixture().await;
