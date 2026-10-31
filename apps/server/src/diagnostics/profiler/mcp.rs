@@ -295,13 +295,21 @@ pub(crate) fn findings_content(
             &[("/findings", Cut::Back)],
         ));
     }
-    let mut after: Vec<((OffsetDateTime, String), Value)> = reader
+    // `lastSeen` is whole seconds and the book keeps no position of its own, so a cursor names
+    // the second its page ended in and marks each finding it returned in that second by id and
+    // count. That second is read again: a finding written into it later, or one that recurred
+    // in it (a new count), is returned; one already read is not.
+    let mut after: Vec<(FindingKey, Value)> = reader
         .findings(since, kind, usize::MAX)
         .into_iter()
-        .filter_map(|finding| Some((finding_key(&finding)?, finding)))
-        .filter(|(key, _)| cursor.as_ref().is_none_or(|cursor| key > cursor))
+        .filter_map(|finding| Some((FindingKey::of(&finding)?, finding)))
+        .filter(|(key, _)| {
+            cursor.as_ref().is_none_or(|(second, read)| {
+                key.at > *second || (key.at == *second && !read.contains(&key.mark()))
+            })
+        })
         .collect();
-    after.sort_by(|(left, _), (right, _)| left.cmp(right));
+    after.sort_by(|(left, _), (right, _)| (left.at, &left.id).cmp(&(right.at, &right.id)));
     let more = after.len() > limit;
     after.truncate(limit);
     let (keys, findings): (Vec<_>, Vec<_>) = after.into_iter().unzip();
@@ -309,28 +317,77 @@ pub(crate) fn findings_content(
     // Fitted before the cursor is set, so following it skips nothing that was cut.
     let kept = keys.len() - fit_list(&mut content, "/findings", Cut::Back, 1);
     content["nextCursor"] = match keys.get(kept.wrapping_sub(1)) {
-        Some((at, id)) if more || kept < keys.len() => cursor_text(*at, id).into(),
+        Some(last) if more || kept < keys.len() => {
+            let mut read: Vec<String> = match &cursor {
+                Some((second, read)) if *second == last.at => read.clone(),
+                _ => Vec::new(),
+            };
+            read.extend(
+                keys[..kept]
+                    .iter()
+                    .filter(|key| key.at == last.at)
+                    .map(FindingKey::mark),
+            );
+            cursor_text(last.at, &read).into()
+        }
         _ => Value::Null,
     };
     Ok((content, &[]))
 }
 
-/// A finding's place in cursor order: its `lastSeen`, then its id.
-fn finding_key(finding: &Value) -> Option<(OffsetDateTime, String)> {
-    let at = OffsetDateTime::parse(finding.get("lastSeen")?.as_str()?, &Rfc3339).ok()?;
-    Some((at, finding.get("id")?.as_str()?.to_owned()))
+/// A finding's place in cursor order (`lastSeen`, then id) and its count.
+struct FindingKey {
+    at: OffsetDateTime,
+    id: String,
+    count: u64,
 }
 
-fn cursor_text(at: OffsetDateTime, id: &str) -> String {
-    format!("{}|{id}", at.format(&Rfc3339).unwrap_or_default())
+impl FindingKey {
+    fn of(finding: &Value) -> Option<Self> {
+        Some(Self {
+            at: OffsetDateTime::parse(finding.get("lastSeen")?.as_str()?, &Rfc3339).ok()?,
+            id: finding.get("id")?.as_str()?.to_owned(),
+            count: finding.get("count").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+
+    /// 12 hex characters of SHA-256 over the id and the count: a recurrence marks anew.
+    fn mark(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!("{}\0{}", self.id, self.count));
+        digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 }
 
-fn parse_cursor(cursor: &str) -> Result<(OffsetDateTime, String), Refusal> {
-    cursor
+/// The longest cursor: a mark for each of the book's 1,000 findings, all in one second.
+const MOST_CURSOR_CHARS: usize = 16_384;
+
+fn cursor_text(second: OffsetDateTime, read: &[String]) -> String {
+    format!(
+        "{}|{}",
+        second.format(&Rfc3339).unwrap_or_default(),
+        read.join(",")
+    )
+}
+
+fn parse_cursor(cursor: &str) -> Result<(OffsetDateTime, Vec<String>), Refusal> {
+    let refused = || "cursor must be the nextCursor of an earlier profiler_findings call";
+    let (second, read) = cursor
         .split_once('|')
-        .filter(|(_, id)| !id.is_empty() && cursor.len() <= 512)
-        .and_then(|(at, id)| Some((OffsetDateTime::parse(at, &Rfc3339).ok()?, id.to_owned())))
-        .ok_or_else(|| "cursor must be the nextCursor of an earlier profiler_findings call".into())
+        .filter(|_| cursor.len() <= MOST_CURSOR_CHARS)
+        .ok_or_else(refused)?;
+    let second = OffsetDateTime::parse(second, &Rfc3339).map_err(|_| refused())?;
+    let read: Vec<String> = read.split(',').map(str::to_owned).collect();
+    let marks = read
+        .iter()
+        .all(|mark| mark.len() == 12 && mark.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !marks {
+        return Err(refused().into());
+    }
+    Ok((second, read))
 }
 
 pub(crate) fn events_content(
@@ -718,6 +775,79 @@ mod tests {
             "{}",
             responses[0]
         );
+    }
+
+    /// `lastSeen` is whole seconds, so a cursor that ended inside a second replays that second:
+    /// a finding written into it afterwards, and a recurrence that changed only `count`, both
+    /// come on the next page, and nothing already read comes again (#139, review round 2).
+    #[test]
+    fn a_cursor_replays_its_last_second_and_returns_what_changed_in_it() {
+        let (_state, dir) = seeded(0, 0);
+        let finding = |id: &str, last_seen: &str, count: u64| {
+            json!({
+                "id": id, "fingerprint": id, "kind": "rpc.slow", "severity": "warn",
+                "firstSeen": "2026-10-09T09:00:00Z", "lastSeen": last_seen, "count": count,
+                "source": "server", "title": "Slow request", "summary": "s", "state": "open",
+                "evidence": {},
+            })
+        };
+        let write = |findings: &[Value]| {
+            let lines: String = findings.iter().map(|f| format!("{f}\n")).collect();
+            fs::write(dir.join("findings.ndjson"), lines).unwrap();
+        };
+        let page = |cursor: Option<&str>| {
+            let mut arguments = json!({ "since": "2026-10-09T09:00:00Z", "limit": 2 });
+            if let Some(cursor) = cursor {
+                arguments["cursor"] = cursor.into();
+            }
+            let responses = exchange(&dir, &[call_tool(1, "profiler_findings", arguments)]);
+            responses[0]["result"]["structuredContent"].clone()
+        };
+        let ids = |content: &Value| -> Vec<(String, u64)> {
+            content["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    (
+                        f["id"].as_str().unwrap().to_owned(),
+                        f["count"].as_u64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let second = "2026-10-09T10:00:00Z";
+        write(&[
+            finding("rpc.slow-b", second, 1),
+            finding("rpc.slow-c", second, 1),
+            finding("rpc.slow-z", "2026-10-09T10:00:05Z", 1),
+        ]);
+        let first = page(None);
+        assert_eq!(
+            ids(&first),
+            [("rpc.slow-b".into(), 1), ("rpc.slow-c".into(), 1)]
+        );
+        let cursor = first["nextCursor"]
+            .as_str()
+            .expect("more remain")
+            .to_owned();
+
+        // In the same second: a new finding that sorts before the page's last, and a recurrence
+        // of one already read.
+        write(&[
+            finding("rpc.slow-a", second, 1),
+            finding("rpc.slow-b", second, 2),
+            finding("rpc.slow-c", second, 1),
+            finding("rpc.slow-z", "2026-10-09T10:00:05Z", 1),
+        ]);
+        let next = page(Some(&cursor));
+        assert_eq!(
+            ids(&next),
+            [("rpc.slow-a".into(), 1), ("rpc.slow-b".into(), 2)]
+        );
+        let last = page(Some(next["nextCursor"].as_str().expect("z remains")));
+        assert_eq!(ids(&last), [("rpc.slow-z".into(), 1)]);
+        assert_eq!(last["nextCursor"], Value::Null);
     }
 
     #[test]
