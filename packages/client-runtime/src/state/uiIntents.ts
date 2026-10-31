@@ -1,5 +1,7 @@
 import type { UiIntent, UiIntentStreamEvent } from "@bibcode/contracts";
 import { WS_METHODS } from "@bibcode/contracts";
+import * as Clock from "effect/Clock";
+import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import { Atom } from "effect/reactivity";
 
@@ -21,47 +23,61 @@ export type UiIntentsState = ReadonlyArray<UiIntent>;
 
 export const EMPTY_UI_INTENTS: UiIntentsState = [];
 
+/** Whether `intent` is still pending at `now` (milliseconds since the epoch). */
+export function isUiIntentPending(intent: UiIntent, now: number): boolean {
+  return Date.parse(intent.expiresAt) > now;
+}
+
 /**
- * Caps each kind on its own, so a flood of `focus` intents never pushes out a folder's commit
- * message, and keeps only a folder's newest commit message.
+ * Drops expired intents and caps each kind on its own, so a flood of `focus` intents never
+ * pushes out a folder's commit message. A folder keeps only its commit message with the
+ * highest `sequence`, so a live event that arrives after a newer snapshot never wins.
  */
-function bound(intents: ReadonlyArray<UiIntent>): UiIntentsState {
-  const latestPerFolder = new Map<string, string>();
-  for (const intent of intents) {
-    if (intent.kind === "commitMessage") latestPerFolder.set(intent.cwd, intent.intentId);
+function bound(intents: ReadonlyArray<UiIntent>, now: number): UiIntentsState {
+  const pending = intents.filter((intent) => isUiIntentPending(intent, now));
+  const newestPerFolder = new Map<string, UiIntent & { kind: "commitMessage" }>();
+  for (const intent of pending) {
+    if (intent.kind !== "commitMessage") continue;
+    const kept = newestPerFolder.get(intent.cwd);
+    if (kept === undefined || intent.sequence > kept.sequence) {
+      newestPerFolder.set(intent.cwd, intent);
+    }
   }
-  const focus = intents.filter((intent) => intent.kind === "focus");
-  const messages = intents.filter(
-    (intent) =>
-      intent.kind === "commitMessage" && latestPerFolder.get(intent.cwd) === intent.intentId,
+  const focus = pending.filter((intent) => intent.kind === "focus");
+  const messages = [...newestPerFolder.values()].toSorted(
+    (left, right) => left.sequence - right.sequence,
   );
   const kept = new Set<UiIntent>([
     ...focus.slice(-MOST_UI_INTENTS),
     ...messages.slice(-MOST_UI_INTENTS),
   ]);
-  return intents.filter((intent) => kept.has(intent));
+  return pending.filter((intent) => kept.has(intent));
 }
 
-/** Folds one `subscribeUiIntents` event into the pending intents; an id is kept once. */
+/**
+ * Folds one `subscribeUiIntents` event into the pending intents at `now`; an id is kept once,
+ * and intents that expired are dropped.
+ */
 export function applyUiIntentEvent(
   current: UiIntentsState,
   event: UiIntentStreamEvent,
+  now: number,
 ): UiIntentsState {
   switch (event.type) {
     case "snapshot":
-      return bound(event.intents);
+      return bound(event.intents, now);
     case "intent":
       return current.some((intent) => intent.intentId === event.intent.intentId)
         ? current
-        : bound([...current, event.intent]);
+        : bound([...current, event.intent], now);
   }
 }
 
 function projectUiIntents(
   current: UiIntentsState,
-  event: UiIntentStreamEvent,
+  [event, now]: readonly [UiIntentStreamEvent, number],
 ): readonly [UiIntentsState, ReadonlyArray<UiIntentsState>] {
-  const next = applyUiIntentEvent(current, event);
+  const next = applyUiIntentEvent(current, event, now);
   return [next, [next]];
 }
 
@@ -73,6 +89,10 @@ export function createUiIntentsEnvironmentAtoms<R, E>(
       label: "environment-data:ui:intents",
       subscribe: (_input: null) =>
         subscribe(WS_METHODS.subscribeUiIntents, {}).pipe(
+          // Each event is folded at the time it arrived, so expired intents drop out.
+          Stream.mapEffect((event) =>
+            Effect.map(Clock.currentTimeMillis, (now) => [event, now] as const),
+          ),
           Stream.mapAccum(() => EMPTY_UI_INTENTS, projectUiIntents),
         ),
     }),
