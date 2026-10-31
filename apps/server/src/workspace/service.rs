@@ -1386,6 +1386,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_a_missing_path_fails_as_not_found() {
+        let root = TempDir::new().unwrap();
+        let service = WorkspaceService::new(0);
+        for path in ["missing.txt", "no/such/folder/file.txt"] {
+            let error = service.read_file(root.path(), path).await.unwrap_err();
+            assert_eq!(error.wire_failure(), "path_not_found", "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn service_covers_file_and_directory_lifecycle_edges() {
         let root = TempDir::new().unwrap();
         let service = WorkspaceService::new(0);

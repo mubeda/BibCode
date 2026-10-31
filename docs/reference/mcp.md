@@ -2630,7 +2630,7 @@ Reads a text file in pages of at most 16,000 characters. The first call uses `of
 - `McpInvalidArgumentError`: bad path; `offset` > 0 without `version` ("a page after the first needs version"); `offset` past the end of the file.
 - `McpFileTooLargeError`: the file is over 1 MiB (checked after the binary test, so a large file with a NUL in its first MiB is `binary_file` instead).
 - `McpFileChangedError`: `version` differs from the file's version now (it changed between pages, or you passed a wrong string). Read again from offset 0.
-- `ProjectReadFileError` with `failure`: `binary_file`, `path_not_file` (a directory or special file), `workspace_path_outside_root` / `resolved_path_outside_root` / `outside_root` (the path leaves the folder), `path_not_found` / `not_found`, or `operation_failed`. A path that does not exist is reported by this code as `operation_failed` with the reason `No such file or directory (os error 2)` (see GAPS).
+- `ProjectReadFileError` with `failure`: `binary_file`, `path_not_file` (a directory or special file), `workspace_path_outside_root` / `resolved_path_outside_root` / `outside_root` (the path leaves the folder), `path_not_found` / `not_found`, or `operation_failed`. A path that does not exist is `path_not_found` ("Nothing exists at <path>."), as for every other Files tool.
 
 #### `files_write`
 

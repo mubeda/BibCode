@@ -112,6 +112,13 @@ impl WorkspaceError {
             Self::BinaryFile { .. } => "binary_file",
             Self::AlreadyExists { .. } => "entry_already_exists",
             Self::NotFound { .. } | Self::RootNotFound { .. } => "path_not_found",
+            // Resolving a path that is not there (a read, a version check) fails in the file
+            // system call, not in an existence check, but it is the same answer.
+            Self::Operation {
+                operation: "realpath-target",
+                source,
+                ..
+            } if source.kind() == std::io::ErrorKind::NotFound => "path_not_found",
             Self::FileChangedOnDisk { .. } => "file_changed_on_disk",
             Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
             Self::TrashUnavailable { .. } => "trash_unavailable",
