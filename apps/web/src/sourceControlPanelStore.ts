@@ -11,9 +11,28 @@ export interface SourceControlDraft {
 
 const DEFAULT_DRAFT: SourceControlDraft = { message: "" };
 
+/**
+ * What became of an outside agent's commit message suggestion for one folder (#139, slice X7):
+ * it `filled` an empty draft, was `offered` beside a draft with text, or the person `used` or
+ * `dismissed` it. Remembered by intent id, so a suggestion the server still holds never fills
+ * the draft again after a commit cleared it.
+ */
+export type AgentCommitSuggestionOutcome = "filled" | "offered" | "used" | "dismissed";
+
+export interface AgentCommitSuggestion {
+  readonly intentId: string;
+  readonly outcome: AgentCommitSuggestionOutcome;
+  /** What **Use it** replaced, so **Undo** can put the person's words back. */
+  readonly replacedDraft?: string;
+}
+
+/** Folders whose last suggestion is remembered; the server keeps one per folder for a day. */
+const MOST_REMEMBERED_SUGGESTIONS = 128;
+
 interface SourceControlPanelStoreState {
   byThreadKey: Record<string, SourceControlDraft>;
   byCwdKey: Record<string, SourceControlDraft>;
+  agentSuggestionByCwdKey: Record<string, AgentCommitSuggestion>;
   /**
    * Changes view preference: pending files grouped under folder headers
    * (default) or one flat list. Panel-wide, not per section or per thread.
@@ -26,6 +45,54 @@ interface SourceControlPanelStoreState {
   setCwdMessage: (cwdKey: string, message: string) => void;
   clearCwdDraft: (cwdKey: string) => void;
   promoteThreadDraft: (threadKey: string, cwdKey: string) => void;
+  /** A suggestion arrived: fill an empty draft, else offer it. Each intent is handled once. */
+  receiveAgentCommitSuggestion: (cwdKey: string, intentId: string, message: string) => void;
+  /** The person chose **Use it**: the suggestion replaces the draft. */
+  acceptAgentCommitSuggestion: (cwdKey: string, intentId: string, message: string) => void;
+  /** The person chose **Undo** after **Use it**: the draft it replaced comes back. */
+  undoAgentCommitSuggestion: (cwdKey: string, intentId: string) => void;
+  dismissAgentCommitSuggestion: (cwdKey: string, intentId: string) => void;
+}
+
+/** `suggestions` with `cwdKey` set last, keeping the newest {@link MOST_REMEMBERED_SUGGESTIONS}. */
+function rememberSuggestion(
+  suggestions: Record<string, AgentCommitSuggestion>,
+  cwdKey: string,
+  suggestion: AgentCommitSuggestion,
+): Record<string, AgentCommitSuggestion> {
+  const { [cwdKey]: _previous, ...others } = suggestions;
+  const entries = Object.entries(others);
+  const kept = entries.slice(Math.max(0, entries.length - MOST_REMEMBERED_SUGGESTIONS + 1));
+  return { ...Object.fromEntries(kept), [cwdKey]: suggestion };
+}
+
+/**
+ * Applies an arriving suggestion. A draft with text, the person's or an earlier suggestion's,
+ * is never overwritten; the suggestion is offered beside it instead.
+ */
+function receiveSuggestion(
+  state: SourceControlPanelStoreState,
+  cwdKey: string,
+  intentId: string,
+  message: string,
+): Partial<SourceControlPanelStoreState> {
+  if (state.agentSuggestionByCwdKey[cwdKey]?.intentId === intentId) return state;
+  const draft = state.byCwdKey[cwdKey]?.message ?? "";
+  if (draft.trim().length > 0) {
+    return {
+      agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
+        intentId,
+        outcome: "offered",
+      }),
+    };
+  }
+  return {
+    byCwdKey: { ...state.byCwdKey, [cwdKey]: { message } },
+    agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
+      intentId,
+      outcome: "filled",
+    }),
+  };
 }
 
 function updateDraft(
@@ -43,6 +110,7 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
     (set) => ({
       byThreadKey: {},
       byCwdKey: {},
+      agentSuggestionByCwdKey: {},
       sourceControlGroupByFolder: true,
       setSourceControlGroupByFolder: (groupByFolder) =>
         set(() => ({ sourceControlGroupByFolder: groupByFolder })),
@@ -85,6 +153,42 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
             },
           };
         }),
+      receiveAgentCommitSuggestion: (cwdKey, intentId, message) =>
+        set((state) => receiveSuggestion(state, cwdKey, intentId, message)),
+      acceptAgentCommitSuggestion: (cwdKey, intentId, message) =>
+        set((state) => {
+          if (state.agentSuggestionByCwdKey[cwdKey]?.intentId !== intentId) return state;
+          return {
+            byCwdKey: { ...state.byCwdKey, [cwdKey]: { message } },
+            agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
+              intentId,
+              outcome: "used",
+              replacedDraft: state.byCwdKey[cwdKey]?.message ?? "",
+            }),
+          };
+        }),
+      undoAgentCommitSuggestion: (cwdKey, intentId) =>
+        set((state) => {
+          const suggestion = state.agentSuggestionByCwdKey[cwdKey];
+          if (suggestion?.intentId !== intentId || suggestion.outcome !== "used") return state;
+          return {
+            byCwdKey: { ...state.byCwdKey, [cwdKey]: { message: suggestion.replacedDraft ?? "" } },
+            agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
+              intentId,
+              outcome: "dismissed",
+            }),
+          };
+        }),
+      dismissAgentCommitSuggestion: (cwdKey, intentId) =>
+        set((state) => {
+          if (state.agentSuggestionByCwdKey[cwdKey]?.intentId !== intentId) return state;
+          return {
+            agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
+              intentId,
+              outcome: "dismissed",
+            }),
+          };
+        }),
     }),
     {
       name: "bibcode:source-control-panel-state:v1",
@@ -99,11 +203,13 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
         return {
           byThreadKey: state?.byThreadKey ?? {},
           byCwdKey: state?.byCwdKey ?? {},
+          agentSuggestionByCwdKey: state?.agentSuggestionByCwdKey ?? {},
         };
       },
       partialize: (state) => ({
         byThreadKey: state.byThreadKey,
         byCwdKey: state.byCwdKey,
+        agentSuggestionByCwdKey: state.agentSuggestionByCwdKey,
         sourceControlGroupByFolder: state.sourceControlGroupByFolder,
       }),
     },
