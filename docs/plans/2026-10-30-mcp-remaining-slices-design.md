@@ -3467,6 +3467,44 @@ write or a write to a missing terminal. The interleaving test passes without the
 since the manager already serializes a terminal's writes (its publication lock, and the PTY
 writer's lock); the lock keeps the guarantee in the tool layer, as the design asks.
 
+**Codex review fixes (round 2, 2026-10-31).** Each finding was checked in source and fixed
+test-first; these supersede the notes above where they differ.
+
+- **P1, a write could block a runtime worker (verified).** `TerminalManager::write` called the
+  PTY's synchronous `write_all` inside the publication lock. It now checks the session under
+  that lock, releases it, and runs the write with `spawn_blocking`, ordered by a per-generation
+  `unary_writes` lock that the blocking thread holds until the bytes are in, so a dropped call
+  never lets a later write overtake a stuck one. The ordered `write_input` path (the UI's
+  normal input) keeps its write inside the poll, because `PreparedTerminalInput::write` runs it
+  again when its admission is replaced and an abandoned handed-off write would send the frame
+  twice; it uses `block_in_place` on a multi-thread runtime (inline on a current-thread one)
+  and still holds the publication lock, which the output publisher only awaits. `terminal_write`
+  gives the write 10 s; past that it is `McpOutcomeUnknownError` (`reason: "no-answer"`),
+  recorded `unknown`, while the write goes on in the manager and later writes queue behind it.
+  At most one blocking thread per terminal generation waits on a stuck PTY.
+- **P2, success after the process exited (partly refuted).** The `Ok(())` branch for an exited
+  session was unreachable: both exit paths invalidate the generation before they mark the
+  session exited, under the publication lock, so a write after an exit already failed, as
+  `TerminalSessionLookupError`, not success. The manager now answers that case
+  `TerminalNotRunningError`, which `write_input` already did, and `terminal_write` maps it to
+  `McpTerminalExitedError`. An exit after the check and before the syscall is inherent; the
+  write then reaches a dead PTY.
+- **P3, a cursor from before a restart (verified).** A cursor is now `<epoch>:<offset>`: every
+  `TerminalHistory` takes an epoch unique in the process, so a restart or a reopened terminal
+  id answers an old cursor with `dropped: true` from the oldest byte. This replaces the
+  decimal `nextCursor` above.
+- **P4, an escape that fills the page (verified).** When the whole page is one unfinished
+  escape, the read looks at the retained output (at most 1 MiB, in memory): it moves
+  `nextCursor` past the sequence when its end is there, and keeps it at the sequence's start
+  while it is still arriving. A `tail` or `dropped` window that starts inside a sequence can
+  still show its continuation as text; that is not this finding and stays a known gap.
+- **Tests.** Manager: a blocked unary write leaves the runtime's only worker and the
+  publication lock free; a blocked ordered write leaves the worker free; a unary write after an
+  exit is `NotRunning`. History: a cursor of another history is dropped, and cursors round-trip.
+  Tools: a stuck write answers unknown within the timeout, twice with one key, and lands once;
+  a pre-restart cursor is dropped; an escape longer than a page is skipped whole; an escape
+  still arriving keeps the cursor.
+
 ## X2 (diagnostics tools) implementation notes (2026-10-30)
 
 X2 was implemented on `claude/v0131-139-x2`, from the batch tip `1d4eda69bd` (slice 1, the

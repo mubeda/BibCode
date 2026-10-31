@@ -3442,15 +3442,24 @@ attaches the `TerminalManager` to `McpControl` (`attach_terminals`).
 | `terminal_close`  | `terminal.close` for one terminal                                                                                    | destructive |
 
 - **Cursor.** `TerminalHistory` counts every byte ever pushed (`total_bytes_written`,
-  kept across `clear`). A cursor is a byte offset into that count; one older than the
-  retained 1 MiB, or past the end (a restarted session), reads from the oldest retained
-  byte with `dropped: true`. Without `raw`, CSI, OSC and other escape sequences are
-  removed after the raw window is read, and an escape cut at the page's end moves
-  `nextCursor` back so the next page reads it whole.
+  kept across `clear`) and has an epoch unique in the process. A cursor is
+  `<epoch>:<offset>`; one of another history (a restart or a reopened id), older than
+  the retained 1 MiB, or past the end reads from the oldest retained byte with
+  `dropped: true`. Without `raw`, CSI, OSC and other escape sequences are removed after
+  the raw window is read. An escape cut at the page's end moves `nextCursor` back to
+  its start; a page that is one unfinished escape skips it whole when the retained
+  output holds its end, else keeps `nextCursor` at its start.
 - **Writes.** `terminal.write` is the unordered unary path: MCP has no WebSocket
-  connection to scope the ordered input lease to. Writes to one terminal take a
-  per-terminal lock in the tool layer. Keyed `terminal_open` and `terminal_write` run
-  through `ToolCall::recorded`; a write's stored payload keeps its length, not its data.
+  connection to scope the ordered input lease to. `TerminalManager::write` checks the
+  session under the publication lock (an ended process is `TerminalNotRunningError`),
+  then runs the PTY write on a blocking thread outside that lock, ordered by a
+  per-generation write lock the blocking thread holds until the bytes are in. The
+  ordered `write_input` path keeps its write in the poll, since a replaced admission
+  re-runs it, and uses `block_in_place` on a multi-thread runtime. Writes to one terminal
+  also take a per-terminal lock in the tool layer, and one the terminal does not take
+  within 10 s is `McpOutcomeUnknownError` (`no-answer`). Keyed `terminal_open` and
+  `terminal_write` run through `ToolCall::recorded`; a write's stored payload keeps its
+  length, not its data.
 - **Lifetime.** A terminal an agent opened is the thread's terminal. It is a center-panel
   terminal of the owner thread (a chat panel's host, else the thread itself), the kind
   every client adopts through `subscribeTerminalMetadata`, and it outlives the MCP
