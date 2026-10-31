@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::diagnostics::redact_sensitive_text;
 use crate::source_control::{self, ProviderHosts};
 
+use super::clone_policy::ClonePlan;
 use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
 use super::manager::in_progress::detect_in_progress_operation;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
@@ -5215,6 +5216,39 @@ impl GitRepository {
         }
     }
 
+    /// The URL `git clone <url>` run in `cwd` would contact, after the configuration's
+    /// `url.<base>.insteadOf` rewrites: `git ls-remote --get-url`, which contacts nothing.
+    pub(crate) async fn clone_remote_url(
+        &self,
+        cwd: &Path,
+        url: &str,
+        environment: Vec<(OsString, OsString)>,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitCommandError> {
+        let mut command_environment = git_read_environment();
+        command_environment.extend(environment);
+        let output = self
+            .execute_with_environment(
+                "GitVcsDriver.cloneRemoteUrl",
+                cwd,
+                &[
+                    "ls-remote".into(),
+                    "--get-url".into(),
+                    "--".into(),
+                    url.into(),
+                ],
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: 64 * 1024,
+                    output_policy: OutputPolicy::Error,
+                },
+                command_environment,
+                cancellation,
+            )
+            .await?;
+        Ok(output.stdout.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
     /// The reuse check without reserving: `Ok(None)` when nothing exists at the destination,
     /// the finished clone's path, or the error that names why the folder cannot be reused.
     pub(crate) async fn inspect_clone_destination(
@@ -7394,23 +7428,49 @@ pub(crate) struct ReservedClone {
 impl ReservedClone {
     /// Runs `git clone` into the reserved folder and nothing else. When it fails, the runner
     /// has already stopped and reaped Git's process group; removing the folder is the caller's.
+    /// An agent's clone runs with its `plan` (`clone_policy`): the `-c` pairs before `clone`
+    /// and the environment beside Git's own. A person's clone has none.
     pub(crate) async fn transfer(
         &self,
+        plan: Option<&ClonePlan>,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
+        let mut args = plan.map_or_else(Vec::new, |plan| plan.arguments().to_vec());
+        args.extend([
+            "clone".into(),
+            "--".into(),
+            self.url.clone(),
+            self.leaf.as_str().to_owned(),
+        ]);
+        let mut environment = git_environment();
+        if let Some(plan) = plan {
+            environment.extend(plan.environment().iter().cloned());
+        }
         self.repository
-            .run(
+            .execute_with_environment(
                 CLONE_OPERATION,
                 &self.parent_dir,
-                &[
-                    "clone".into(),
-                    "--".into(),
-                    self.url.clone(),
-                    self.leaf.as_str().to_owned(),
-                ],
+                &args,
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Truncate,
+                },
+                environment,
                 cancellation,
             )
-            .await?;
+            .await
+            .map_err(|mut error| {
+                // `http.followRedirects=false` leaves curl's 3xx for Git to report.
+                if plan.is_some() && error.detail.contains("returned error: 30") {
+                    error.detail = format!(
+                        "{}\nThe repository redirects to another address, and BiBCode does not follow redirects for an agent. Clone the address it moved to.",
+                        error.detail
+                    )
+                    .into();
+                }
+                error
+            })?;
         Ok(self.destination.path().to_path_buf())
     }
 
@@ -7439,7 +7499,7 @@ impl ReservedClone {
         self,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
-        match self.transfer(cancellation).await {
+        match self.transfer(None, cancellation).await {
             Ok(path) => Ok(path),
             Err(error) => match self.remove_destination().await {
                 Ok(()) => Err(error),
