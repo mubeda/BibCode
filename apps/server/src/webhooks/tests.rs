@@ -39,6 +39,8 @@ enum Reply {
     Status(u16),
     /// Never answers: the request stays in flight until the client drops it.
     Hang,
+    /// Answers 200 after this many milliseconds.
+    Delay(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +69,9 @@ struct ReceiverState {
     /// The reply once the script is spent.
     default: Arc<Mutex<Option<Reply>>>,
     hung: Arc<AtomicUsize>,
+    /// Requests being answered now, and the most there ever were at once.
+    open: Arc<AtomicUsize>,
+    most_open: Arc<AtomicUsize>,
 }
 
 /// A local HTTPS receiver at `https://localhost:<port>/hook`.
@@ -77,6 +82,14 @@ struct Receiver {
 }
 
 async fn handle(State(state): State<ReceiverState>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let open = state.open.fetch_add(1, Ordering::SeqCst) + 1;
+    state.most_open.fetch_max(open, Ordering::SeqCst);
+    let status = answer(&state, headers, body).await;
+    state.open.fetch_sub(1, Ordering::SeqCst);
+    status
+}
+
+async fn answer(state: &ReceiverState, headers: HeaderMap, body: Bytes) -> StatusCode {
     state.received.lock().unwrap().push(Received {
         headers: headers
             .iter()
@@ -101,6 +114,11 @@ async fn handle(State(state): State<ReceiverState>, headers: HeaderMap, body: By
         Reply::Hang => {
             state.hung.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;
+            StatusCode::OK
+        }
+        Reply::Delay(ms) => {
+            state.hung.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
             StatusCode::OK
         }
     }
@@ -159,7 +177,26 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// The dispatcher's timing and queue size for one test.
+#[derive(Clone)]
+struct Timing {
+    retry_delays: Vec<Duration>,
+    poll: Duration,
+    max_pending: i64,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            retry_delays: FAST_RETRIES.to_vec(),
+            poll: Duration::from_millis(30),
+            max_pending: store::MAX_PENDING,
+        }
+    }
+}
+
 struct Harness {
+    timing: Timing,
     webhooks: Webhooks,
     database: Database,
     repositories: Repositories,
@@ -176,8 +213,16 @@ impl Harness {
         Self::new_with_findings(&[]).await
     }
 
-    /// A harness whose findings book already holds `findings` when the dispatcher starts.
     async fn new_with_findings(findings: &[(&str, u64, &str)]) -> Self {
+        Self::new_full(findings, Timing::default()).await
+    }
+
+    async fn new_timed(timing: Timing) -> Self {
+        Self::new_full(&[], timing).await
+    }
+
+    /// A harness whose findings book already holds `findings` when the dispatcher starts.
+    async fn new_full(findings: &[(&str, u64, &str)], timing: Timing) -> Self {
         let database = Database::open_in_memory().await.unwrap();
         database
             .call(|connection| {
@@ -201,6 +246,7 @@ impl Harness {
             resolver,
             tempfile::tempdir().unwrap(),
             profiler_dir,
+            timing,
         )
         .await
     }
@@ -211,6 +257,7 @@ impl Harness {
         resolver: Arc<dyn HostResolver>,
         secrets_dir: tempfile::TempDir,
         profiler_dir: tempfile::TempDir,
+        timing: Timing,
     ) -> Self {
         let repositories = Repositories::new(database.clone());
         let (enabled, enabled_rx) = watch::channel(true);
@@ -225,10 +272,12 @@ impl Harness {
             mcp: mcp_rx,
             findings: Arc::new(move || Some(Reader::new(directory.clone()))),
             net: receiver.policy(resolver.clone()),
-            retry_delays: FAST_RETRIES.to_vec(),
-            poll: Duration::from_millis(30),
+            retry_delays: timing.retry_delays.clone(),
+            poll: timing.poll,
+            max_pending: timing.max_pending,
         });
         Self {
+            timing,
             webhooks,
             database,
             repositories,
@@ -251,6 +300,7 @@ impl Harness {
             self.resolver,
             self.secrets_dir,
             self.profiler_dir,
+            self.timing,
         )
         .await;
         next.enabled.send_replace(enabled);
@@ -1206,6 +1256,259 @@ async fn a_missing_secret_is_never_sent_unsigned() {
     assert_eq!(sent["delivery"]["state"], "failed");
     assert_eq!(sent["delivery"]["lastError"], "secret_missing");
     assert!(harness.receiver.received().is_empty());
+    harness.webhooks.shutdown().await;
+}
+
+async fn wait_for_feed_position(harness: &Harness) -> String {
+    eventually("the feed position", async || {
+        harness
+            .webhooks
+            .store()
+            .position(store::FEED_POSITION)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    harness
+        .webhooks
+        .store()
+        .position(store::FEED_POSITION)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+const SLOW_RETRIES: [Duration; 5] = [Duration::from_secs(10); 5];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_an_endpoint_url_or_filter_abandons_what_it_queued() {
+    let harness = Harness::new_timed(Timing {
+        retry_delays: SLOW_RETRIES.to_vec(),
+        ..Timing::default()
+    })
+    .await;
+    harness.receiver.answer_by_default(Reply::Status(503));
+    let (endpoint, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    harness.turn("thread-1", "turn-1").await;
+    eventually("both events queued", async || {
+        harness.deliveries(&endpoint).await.len() == 2
+    })
+    .await;
+    let edit = |url: &str, name: &str, project: Value| json!({ "id": endpoint, "name": name, "url": url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED], "projectId": project });
+    // A new name changes nothing that was queued.
+    harness
+        .call(
+            "upsert",
+            edit(&harness.receiver.url, "Renamed", Value::Null),
+        )
+        .await
+        .unwrap();
+    assert!(
+        harness
+            .deliveries(&endpoint)
+            .await
+            .iter()
+            .all(|delivery| delivery["state"] == "pending")
+    );
+    // A new URL: what was queued for the old one is never sent to it.
+    let moved = format!("{}/moved", harness.receiver.url);
+    harness
+        .call("upsert", edit(&moved, "Renamed", Value::Null))
+        .await
+        .unwrap();
+    for delivery in harness.deliveries(&endpoint).await {
+        assert_eq!(delivery["state"], "abandoned", "{delivery}");
+        assert_eq!(delivery["lastError"], "endpoint_changed", "{delivery}");
+    }
+    // A new project filter does the same.
+    harness.receiver.answer_by_default(Reply::Status(503));
+    harness.turn("thread-1", "turn-2").await;
+    eventually("the new turn queued", async || {
+        harness
+            .deliveries(&endpoint)
+            .await
+            .iter()
+            .filter(|delivery| delivery["state"] == "pending")
+            .count()
+            == 2
+    })
+    .await;
+    harness
+        .call("upsert", edit(&moved, "Renamed", json!("project-1")))
+        .await
+        .unwrap();
+    assert!(
+        harness
+            .deliveries(&endpoint)
+            .await
+            .iter()
+            .all(|delivery| delivery["state"] == "abandoned")
+    );
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redelivery_waits_for_the_request_in_flight_and_a_queued_one_is_refused() {
+    let harness = Harness::new_timed(Timing {
+        retry_delays: SLOW_RETRIES.to_vec(),
+        ..Timing::default()
+    })
+    .await;
+    let (endpoint, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let test = harness
+        .call("sendTest", json!({ "id": endpoint }))
+        .await
+        .unwrap();
+    wait_for_feed_position(&harness).await;
+    harness.receiver.script(&[Reply::Delay(600)]);
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "idle", "activeTurnId": null } }),
+        )
+        .await;
+    eventually("the dispatcher's request in flight", async || {
+        harness.receiver.state.hung.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // Sent while the dispatcher's request is open: it waits for it, never overlapping.
+    let again = harness
+        .call(
+            "redeliver",
+            json!({ "deliveryId": test["delivery"]["deliveryId"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["delivery"]["state"], "delivered");
+    assert_eq!(harness.receiver.received().len(), 3);
+    assert_eq!(harness.receiver.state.most_open.load(Ordering::SeqCst), 1);
+
+    // A delivery still queued (here, waiting for its retry) cannot be sent a second time.
+    harness.receiver.answer_by_default(Reply::Status(503));
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "ready", "activeTurnId": null } }),
+        )
+        .await;
+    eventually("a delivery waiting to retry", async || {
+        harness
+            .deliveries(&endpoint)
+            .await
+            .iter()
+            .any(|delivery| delivery["state"] == "pending" && delivery["attempts"] == 1)
+    })
+    .await;
+    let queued = harness
+        .deliveries(&endpoint)
+        .await
+        .into_iter()
+        .find(|delivery| delivery["state"] == "pending")
+        .unwrap();
+    let refused = harness
+        .call("redeliver", json!({ "deliveryId": queued["deliveryId"] }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused["reason"], "queued");
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliveries_dropped_from_a_full_queue_are_logged_shown_and_announced_once() {
+    let harness = Harness::new_timed(Timing {
+        max_pending: 2,
+        ..Timing::default()
+    })
+    .await;
+    let (endpoint, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    // Four events queued at once (as one feed page would be): the queue keeps the newest two.
+    // Their cursors are out of order on purpose: the range is by position, not by text.
+    let queued: Vec<store::NewDelivery> = ["v1.9.0", "v1.10.0", "v1.11.0", "v1.12.0"]
+        .iter()
+        .enumerate()
+        .map(|(index, cursor)| store::NewDelivery {
+            delivery_id: format!("d{index}"),
+            endpoint_id: endpoint.clone(),
+            event_id: format!("ev_{index}"),
+            event_type: events::THREAD_STATUS_CHANGED.to_owned(),
+            body: json!({ "id": format!("ev_{index}"), "type": events::THREAD_STATUS_CHANGED, "cursor": cursor })
+                .to_string(),
+        })
+        .collect();
+    let abandoned = harness
+        .webhooks
+        .store()
+        .enqueue(queued, Vec::new(), 0)
+        .await
+        .unwrap();
+    assert_eq!(abandoned, 2);
+    eventually("the two kept deliveries", async || {
+        harness.receiver.received().len() == 2
+    })
+    .await;
+    let received = harness.receiver.received();
+    let first = received[0].json();
+    assert_eq!(first["cursor"], "v1.11.0");
+    assert_eq!(
+        first["dropped"],
+        json!({ "count": 2, "fromCursor": "v1.9.0", "toCursor": "v1.10.0" })
+    );
+    // Announced once.
+    assert!(received[1].json().get("dropped").is_none());
+    let deliveries = harness.deliveries(&endpoint).await;
+    assert_eq!(
+        deliveries
+            .iter()
+            .filter(|delivery| delivery["lastError"] == "queue_full")
+            .count(),
+        2
+    );
+    let listed = harness.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["endpoints"][0]["droppedDeliveries"], 2);
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_waiting_behind_its_delay_does_not_spin_the_dispatcher() {
+    let harness = Harness::new_timed(Timing {
+        poll: Duration::from_secs(1),
+        retry_delays: vec![Duration::from_secs(5); 5],
+        ..Timing::default()
+    })
+    .await;
+    harness.receiver.answer_by_default(Reply::Status(500));
+    let (endpoint, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "idle", "activeTurnId": null } }),
+        )
+        .await;
+    wait_for_requests(&harness.receiver, 1).await;
+    // Due now, but behind the first one, which waits 5 s for its retry.
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "ready", "activeTurnId": null } }),
+        )
+        .await;
+    eventually("the second delivery queued", async || {
+        harness.deliveries(&endpoint).await.len() == 2
+    })
+    .await;
+    let before = harness.webhooks.passes();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let passes = harness.webhooks.passes() - before;
+    assert!(passes <= 3, "{passes} passes in one second");
+    assert_eq!(harness.receiver.received().len(), 1);
     harness.webhooks.shutdown().await;
 }
 

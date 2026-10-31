@@ -28,6 +28,9 @@ pub(crate) const SENDING: &str = "sending";
 pub(crate) const DISABLED_FAILURES: &str = "failures";
 pub(crate) const DISABLED_CLIENT_REVOKED: &str = "client-revoked";
 
+/// Why a queued delivery was abandoned, as its log shows it.
+pub(crate) const ENDPOINT_CHANGED: &str = "endpoint_changed";
+
 /// The dispatcher's positions (`webhook_state` keys).
 pub(crate) const FEED_POSITION: &str = "feed";
 pub(crate) const FINDINGS_POSITION: &str = "findings";
@@ -155,11 +158,15 @@ fn decode_delivery(row: &Row<'_>) -> rusqlite::Result<Delivery> {
 #[derive(Clone)]
 pub(crate) struct Store {
     database: Database,
+    max_pending: i64,
 }
 
 impl Store {
-    pub(crate) fn new(database: Database) -> Self {
-        Self { database }
+    pub(crate) fn new(database: Database, max_pending: i64) -> Self {
+        Self {
+            database,
+            max_pending,
+        }
     }
 
     pub(crate) async fn endpoints(&self) -> Result<Vec<Endpoint>> {
@@ -239,16 +246,23 @@ impl Store {
         self.database
             .call(move |connection| {
                 let transaction = connection.transaction()?;
-                let was_enabled: Option<i64> = transaction
+                let before: Option<(i64, String, Option<String>, String)> = transaction
                     .query_row(
-                        "SELECT enabled FROM webhook_endpoints WHERE endpoint_id = ?1",
+                        "SELECT enabled, url, project_id, event_types_json FROM webhook_endpoints WHERE endpoint_id = ?1",
                         params![endpoint.id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?;
-                let Some(was_enabled) = was_enabled else {
+                let Some((was_enabled, url, project_id, event_types)) = before else {
                     return Ok(Err(StoreError::NotFound));
                 };
+                let event_types_json =
+                    serde_json::to_string(&endpoint.event_types).unwrap_or_else(|_| "[]".to_owned());
+                // Queued deliveries were addressed to the old URL and chosen by the old
+                // filters: none of them goes to the new destination.
+                let readdressed = url != endpoint.url
+                    || project_id != endpoint.project_id
+                    || event_types != event_types_json;
                 let turned_on = was_enabled == 0 && endpoint.enabled;
                 transaction.execute(
                     "UPDATE webhook_endpoints SET name = ?2, url = ?3, enabled = ?4, event_types_json = ?5, \
@@ -261,15 +275,18 @@ impl Store {
                         endpoint.name,
                         endpoint.url,
                         i64::from(endpoint.enabled),
-                        serde_json::to_string(&endpoint.event_types).unwrap_or_else(|_| "[]".to_owned()),
+                        event_types_json,
                         endpoint.project_id,
                         endpoint.paired_session_id,
                         turned_on,
                         now_iso(),
                     ],
                 )?;
+                if readdressed {
+                    abandon_pending(&transaction, Some(&endpoint.id), Some(ENDPOINT_CHANGED))?;
+                }
                 if !endpoint.enabled {
-                    abandon_pending(&transaction, Some(&endpoint.id))?;
+                    abandon_pending(&transaction, Some(&endpoint.id), None)?;
                 }
                 transaction.commit()?;
                 Ok(Ok(()))
@@ -345,6 +362,10 @@ impl Store {
                     "DELETE FROM webhook_deliveries WHERE endpoint_id = ?1",
                     params![id],
                 )?;
+                transaction.execute(
+                    "DELETE FROM webhook_state WHERE key = ?1",
+                    params![dropped_key(&id)],
+                )?;
                 let removed = transaction.execute(
                     "DELETE FROM webhook_endpoints WHERE endpoint_id = ?1",
                     params![id],
@@ -363,6 +384,7 @@ impl Store {
         positions: Vec<(&'static str, String)>,
         now_ms: i64,
     ) -> Result<usize> {
+        let max_pending = self.max_pending;
         self.database
             .call(move |connection| {
                 let transaction = connection.transaction()?;
@@ -387,14 +409,47 @@ impl Store {
                 for (key, value) in &positions {
                     set_state(&transaction, key, value)?;
                 }
-                let abandoned = transaction.execute(
-                    "UPDATE webhook_deliveries SET state = 'abandoned', last_error = 'queue_full', updated_at = ?2 \
-                     WHERE sequence IN (SELECT sequence FROM webhook_deliveries WHERE state = 'pending' \
-                       ORDER BY sequence DESC LIMIT -1 OFFSET ?1)",
-                    params![MAX_PENDING, now],
-                )?;
+                let dropped: Vec<(String, Option<String>, Option<String>)> = {
+                    let mut statement = transaction.prepare_cached(
+                        "UPDATE webhook_deliveries SET state = 'abandoned', last_error = 'queue_full', updated_at = ?2 \
+                         WHERE sequence IN (SELECT sequence FROM webhook_deliveries WHERE state = 'pending' \
+                           ORDER BY sequence DESC LIMIT -1 OFFSET ?1) \
+                         RETURNING endpoint_id, json_extract(body, '$.cursor'), json_extract(body, '$.finding.lastSeen')",
+                    )?;
+                    statement
+                        .query_map(params![max_pending, now], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                // Each endpoint's next delivery names what it lost (see `Dropped`).
+                let mut by_endpoint: HashMap<String, Dropped> = HashMap::new();
+                for (endpoint, cursor, last_seen) in &dropped {
+                    by_endpoint
+                        .entry(endpoint.clone())
+                        .or_default()
+                        .add(cursor.as_deref(), last_seen.as_deref());
+                }
+                for (endpoint, lost) in by_endpoint {
+                    let key = dropped_key(&endpoint);
+                    let mut merged: Dropped = transaction
+                        .query_row(
+                            "SELECT value FROM webhook_state WHERE key = ?1",
+                            params![key],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                        .unwrap_or_default();
+                    merged.merge(&lost);
+                    set_state(
+                        &transaction,
+                        &key,
+                        &serde_json::to_string(&merged).unwrap_or_default(),
+                    )?;
+                }
                 transaction.commit()?;
-                Ok(abandoned)
+                Ok(dropped.len())
             })
             .await
     }
@@ -428,16 +483,57 @@ impl Store {
     }
 
     /// When the next pending delivery of an enabled endpoint is due, if any.
-    pub(crate) async fn next_due_ms(&self) -> Result<Option<i64>> {
+    ///
+    /// Only each endpoint's oldest pending delivery counts, since `due` sends nothing behind
+    /// it, and an endpoint in `busy` (a request in flight, whose end wakes the loop) does not.
+    pub(crate) async fn next_due_ms(&self, busy: Vec<String>) -> Result<Option<i64>> {
         self.database
-            .call(|connection| {
-                Ok(connection.query_row(
-                    "SELECT MIN(d.next_attempt_ms) FROM webhook_deliveries AS d \
-                     JOIN webhook_endpoints AS w ON w.endpoint_id = d.endpoint_id AND w.enabled = 1 \
-                     WHERE d.state = 'pending'",
-                    [],
-                    |row| row.get(0),
-                )?)
+            .call(move |connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT endpoint_id, next_attempt_ms FROM webhook_deliveries WHERE sequence IN ( \
+                       SELECT MIN(d.sequence) FROM webhook_deliveries AS d \
+                       JOIN webhook_endpoints AS w ON w.endpoint_id = d.endpoint_id AND w.enabled = 1 \
+                       WHERE d.state = 'pending' GROUP BY d.endpoint_id)",
+                )?;
+                let heads = statement
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(heads
+                    .into_iter()
+                    .filter(|(endpoint, _)| !busy.contains(endpoint))
+                    .map(|(_, due)| due)
+                    .min())
+            })
+            .await
+    }
+
+    /// What an endpoint lost to a full queue and was not yet told (`Dropped`, as JSON).
+    pub(crate) async fn dropped(&self, endpoint_id: &str) -> Result<Option<String>> {
+        let key = dropped_key(endpoint_id);
+        self.database
+            .call(move |connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT value FROM webhook_state WHERE key = ?1",
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            })
+            .await
+    }
+
+    /// Forgets `announced` once a delivery carrying it arrived; a loss recorded meanwhile
+    /// changed the value and stays.
+    pub(crate) async fn clear_dropped(&self, endpoint_id: &str, announced: String) -> Result<()> {
+        let key = dropped_key(endpoint_id);
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM webhook_state WHERE key = ?1 AND value = ?2",
+                    params![key, announced],
+                )?;
+                Ok(())
             })
             .await
     }
@@ -585,7 +681,7 @@ impl Store {
         self.database
             .call(|connection| {
                 let transaction = connection.transaction()?;
-                let abandoned = abandon_pending(&transaction, None)?;
+                let abandoned = abandon_pending(&transaction, None, None)?;
                 transaction.commit()?;
                 Ok(abandoned)
             })
@@ -625,17 +721,22 @@ impl Store {
     }
 
     /// Per endpoint: how many deliveries are pending, and the last finished one's state.
-    pub(crate) async fn summaries(&self) -> Result<HashMap<String, (i64, Option<String>)>> {
+    /// Per endpoint: deliveries pending, the last finished one's state, and how many in the
+    /// log were dropped from a full queue.
+    pub(crate) async fn summaries(&self) -> Result<HashMap<String, (i64, Option<String>, i64)>> {
         self.database
             .call(|connection| {
                 let mut statement = connection.prepare_cached(
                     "SELECT w.endpoint_id, \
                        (SELECT COUNT(*) FROM webhook_deliveries AS d WHERE d.endpoint_id = w.endpoint_id AND d.state = 'pending'), \
-                       (SELECT d.state FROM webhook_deliveries AS d WHERE d.endpoint_id = w.endpoint_id AND d.state != 'pending' ORDER BY d.sequence DESC LIMIT 1) \
+                       (SELECT d.state FROM webhook_deliveries AS d WHERE d.endpoint_id = w.endpoint_id AND d.state != 'pending' ORDER BY d.sequence DESC LIMIT 1), \
+                       (SELECT COUNT(*) FROM webhook_deliveries AS d WHERE d.endpoint_id = w.endpoint_id AND d.last_error = 'queue_full') \
                      FROM webhook_endpoints AS w",
                 )?;
                 Ok(statement
-                    .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+                    })?
                     .collect::<rusqlite::Result<HashMap<_, _>>>()?)
             })
             .await
@@ -730,6 +831,68 @@ impl Store {
     }
 }
 
+fn dropped_key(endpoint_id: &str) -> String {
+    format!("dropped:{endpoint_id}")
+}
+
+/// Deliveries an endpoint lost to a full queue and has not been told about yet: their count,
+/// the range of change-feed cursors they carried, and the earliest finding `lastSeen`. The
+/// next delivery to the endpoint carries it as `dropped`, and it is cleared once one arrives.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Dropped {
+    pub(crate) count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) from_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) since_last_seen: Option<String>,
+}
+
+/// A feed cursor's position for ordering: `v1.<sequence>.<activity>`.
+fn cursor_order(cursor: &str) -> Option<(i64, i64)> {
+    let mut parts = cursor.split('.');
+    let (Some("v1"), Some(sequence), Some(activity), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    Some((sequence.parse().ok()?, activity.parse().ok()?))
+}
+
+impl Dropped {
+    fn add(&mut self, cursor: Option<&str>, last_seen: Option<&str>) {
+        self.merge(&Self {
+            count: 1,
+            from_cursor: cursor.map(str::to_owned),
+            to_cursor: cursor.map(str::to_owned),
+            since_last_seen: last_seen.map(str::to_owned),
+        });
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.count += other.count;
+        let pick = |mine: &mut Option<String>, theirs: &Option<String>, earlier: bool| {
+            if let Some(theirs) = theirs {
+                let replace = match mine.as_deref() {
+                    None => true,
+                    Some(current) => match (cursor_order(theirs), cursor_order(current)) {
+                        (Some(theirs), Some(current)) => (theirs < current) == earlier,
+                        _ => (theirs.as_str() < current) == earlier,
+                    },
+                };
+                if replace {
+                    *mine = Some(theirs.clone());
+                }
+            }
+        };
+        pick(&mut self.from_cursor, &other.from_cursor, true);
+        pick(&mut self.to_cursor, &other.to_cursor, false);
+        pick(&mut self.since_last_seen, &other.since_last_seen, true);
+    }
+}
+
 fn set_state(transaction: &Transaction<'_>, key: &str, value: &str) -> rusqlite::Result<()> {
     transaction.execute(
         "INSERT INTO webhook_state (key, value) VALUES (?1, ?2) \
@@ -739,14 +902,16 @@ fn set_state(transaction: &Transaction<'_>, key: &str, value: &str) -> rusqlite:
     Ok(())
 }
 
+/// Abandons pending deliveries (one endpoint's, or all), naming `reason` in their log.
 fn abandon_pending(
     transaction: &Transaction<'_>,
     endpoint: Option<&str>,
+    reason: Option<&str>,
 ) -> rusqlite::Result<usize> {
     transaction.execute(
-        "UPDATE webhook_deliveries SET state = 'abandoned', updated_at = ?2 \
+        "UPDATE webhook_deliveries SET state = 'abandoned', last_error = COALESCE(?3, last_error), updated_at = ?2 \
          WHERE state = 'pending' AND (?1 IS NULL OR endpoint_id = ?1)",
-        params![endpoint, now_iso()],
+        params![endpoint, now_iso(), reason],
     )
 }
 
@@ -756,6 +921,6 @@ fn disable(transaction: &Transaction<'_>, id: &str, reason: &str) -> rusqlite::R
          WHERE endpoint_id = ?1 AND enabled = 1",
         params![id, reason, now_iso()],
     )?;
-    abandon_pending(transaction, Some(id))?;
+    abandon_pending(transaction, Some(id), None)?;
     Ok(changed > 0)
 }

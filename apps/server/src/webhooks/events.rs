@@ -7,8 +7,8 @@
 //! missed deliveries calls `changes_since { cursor }` from the last one it processed;
 //! `profiler.finding` carries `finding: { id, count, lastSeen }` instead, and a receiver
 //! catches up with `profiler_findings { since: lastSeen }`. No prompt, message, reply,
-//! terminal output, file content, diff, token or secret is ever read into an event; the one
-//! free-text field, an agent's label, goes through `redact_sensitive_text`.
+//! terminal output, file content, diff, token or secret is ever read into an event, and no
+//! free text either: an agent is named by its kind and opaque client id, never its label.
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -152,15 +152,19 @@ fn agent_call_event(entry: &Value) -> Option<&'static str> {
     }
 }
 
-/// An actor with its label passed through `redact_sensitive_text`.
+/// An actor as its kind and opaque client id only. The label is text the client chose (it
+/// can be a path or a name), so it is never sent; a kind or id that is not id-shaped drops
+/// the actor.
 fn redacted_actor(actor: &Value) -> Option<Value> {
-    let kind = actor.get("kind")?.as_str()?;
-    let client_id = actor.get("clientId")?.as_str()?;
-    let label = actor
-        .get("label")
-        .and_then(Value::as_str)
-        .map(crate::diagnostics::redact_sensitive_text);
-    Some(json!({ "kind": kind, "clientId": client_id, "label": label }))
+    let is_id = |text: &str| {
+        (1..=128).contains(&text.len())
+            && text.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-')
+            })
+    };
+    let kind = actor.get("kind")?.as_str().filter(|kind| is_id(kind))?;
+    let client_id = actor.get("clientId")?.as_str().filter(|id| is_id(id))?;
+    Some(json!({ "kind": kind, "clientId": client_id }))
 }
 
 /// A profiler finding that appeared or recurred: `finding: { id, count, lastSeen }`.
@@ -265,7 +269,7 @@ mod tests {
     #[test]
     fn a_payload_holds_ids_and_states_only() {
         let event = from_feed_entry(
-            &json!({ "at": "2026-10-31T00:00:00Z", "kind": "approval.requested", "threadId": "t1", "cursor": "v1.9.0", "requestId": "req-1", "actor": { "kind": "mcp-client", "clientId": "s1", "label": "Agent token=hunter2" } }),
+            &json!({ "at": "2026-10-31T00:00:00Z", "kind": "approval.requested", "threadId": "t1", "cursor": "v1.9.0", "requestId": "req-1", "actor": { "kind": "mcp-client", "clientId": "s1", "label": "/Users/alice/private/customer token=hunter2" } }),
             Some(("p1".to_owned(), false)),
         )
         .expect("an event");
@@ -277,6 +281,20 @@ mod tests {
         assert_eq!(body["requestId"], "req-1");
         assert!(body.get("projectId").is_none());
         assert!(!body.to_string().contains("hunter2"), "{body}");
+        // A label is free text a client chose (it may be a path): only the kind and the
+        // opaque client id are sent.
+        assert!(!body.to_string().contains("/Users/alice"), "{body}");
+        assert_eq!(
+            body["actor"],
+            json!({ "kind": "mcp-client", "clientId": "s1" })
+        );
+        // A client id that is not id-shaped is left out, and the actor with it.
+        let odd = from_feed_entry(
+            &json!({ "kind": "approval.requested", "cursor": "v1.9.1", "actor": { "kind": "mcp-client", "clientId": "/Users/alice x" } }),
+            None,
+        )
+        .unwrap();
+        assert!(odd.fields.get("actor").is_none());
         // The same entry always makes the same event id.
         assert_eq!(
             event.id,

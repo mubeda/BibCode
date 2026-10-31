@@ -97,6 +97,8 @@ pub(crate) struct WebhooksConfig {
     pub(crate) net: NetPolicy,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) poll: Duration,
+    /// At most this many deliveries wait; past it the oldest are abandoned.
+    pub(crate) max_pending: i64,
 }
 
 impl WebhooksConfig {
@@ -120,6 +122,7 @@ impl WebhooksConfig {
             net: NetPolicy::system(),
             retry_delays: RETRY_DELAYS.to_vec(),
             poll: POLL,
+            max_pending: store::MAX_PENDING,
         }
     }
 }
@@ -146,9 +149,14 @@ struct Inner {
     /// One token per endpoint, a child of `shutdown`: cancelling it drops the endpoint's
     /// request in flight.
     endpoint_tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// One lock per endpoint, held for each request: the dispatcher's, a test event's and a
+    /// redelivery's all take it, so an endpoint never has two requests open.
+    send_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The findings file as last read, so an unchanged book is not parsed again.
     findings_version: Mutex<Option<(u64, Option<SystemTime>)>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Loop passes so far: a test counts them to catch a busy loop.
+    passes: std::sync::atomic::AtomicU64,
 }
 
 /// The dispatcher's position in the findings book: the newest `lastSeen` second it delivered
@@ -194,10 +202,11 @@ impl Webhooks {
             net,
             retry_delays,
             poll,
+            max_pending,
         } = config;
         let webhooks = Self {
             inner: Arc::new(Inner {
-                store: Store::new(database),
+                store: Store::new(database, max_pending),
                 repositories,
                 secrets,
                 environment_id,
@@ -210,8 +219,10 @@ impl Webhooks {
                 wake: Notify::new(),
                 shutdown: CancellationToken::new(),
                 endpoint_tokens: Mutex::new(HashMap::new()),
+                send_locks: Mutex::new(HashMap::new()),
                 findings_version: Mutex::new(None),
                 task: Mutex::new(None),
+                passes: std::sync::atomic::AtomicU64::new(0),
             }),
         };
         let task = tokio::spawn(run(webhooks.clone()));
@@ -230,6 +241,11 @@ impl Webhooks {
         {
             tracing::error!("the webhook dispatcher panicked");
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn passes(&self) -> u64 {
+        self.inner.passes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -308,8 +324,67 @@ impl Webhooks {
         }
     }
 
-    /// Sends one delivery once and returns what happened, without recording it.
+    fn send_lock(&self, endpoint_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .send_locks
+            .lock()
+            .expect("send lock map")
+            .entry(endpoint_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Sends one delivery once and returns what happened, without recording it. It waits
+    /// for the endpoint's request in flight, if any, and adds `dropped` to the body while the
+    /// endpoint has deliveries lost to a full queue that it was not told about.
     async fn attempt(
+        &self,
+        endpoint: &Endpoint,
+        delivery_id: &str,
+        event_type: &str,
+        body: &str,
+        cancel: &CancellationToken,
+    ) -> Attempt {
+        let lock = self.send_lock(&endpoint.id);
+        let _turn = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Attempt { status: None, failure: Some(Failure::Cancelled), latency_ms: 0 };
+            }
+            turn = lock.lock_owned() => turn,
+        };
+        let dropped = match self.inner.store.dropped(&endpoint.id).await {
+            Ok(dropped) => dropped,
+            Err(error) => {
+                tracing::warn!(%error, "could not read a webhook endpoint's dropped deliveries");
+                None
+            }
+        };
+        let announced = dropped.as_deref().and_then(|dropped| {
+            let mut payload: serde_json::Map<String, Value> = serde_json::from_str(body).ok()?;
+            payload.insert("dropped".to_owned(), serde_json::from_str(dropped).ok()?);
+            Some(Value::Object(payload).to_string())
+        });
+        let attempt = self
+            .send_signed(
+                endpoint,
+                delivery_id,
+                event_type,
+                announced.as_deref().unwrap_or(body),
+                cancel,
+            )
+            .await;
+        if attempt.failure.is_none()
+            && announced.is_some()
+            && let Some(dropped) = dropped
+            && let Err(error) = self.inner.store.clear_dropped(&endpoint.id, dropped).await
+        {
+            tracing::warn!(%error, "could not clear a webhook endpoint's dropped deliveries");
+        }
+        attempt
+    }
+
+    async fn send_signed(
         &self,
         endpoint: &Endpoint,
         delivery_id: &str,
@@ -745,6 +820,9 @@ async fn run(webhooks: Webhooks) {
         Err(error) => tracing::warn!(%error, "could not close interrupted webhook sends"),
     }
     loop {
+        inner
+            .passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if inner.shutdown.is_cancelled() {
             break;
         }
@@ -789,7 +867,11 @@ async fn run(webhooks: Webhooks) {
                     Err(error) => tracing::warn!(%error, "could not read due webhook deliveries"),
                 }
             }
-            if let Ok(Some(next)) = inner.store.next_due_ms().await {
+            if let Ok(Some(next)) = inner
+                .store
+                .next_due_ms(busy.iter().cloned().collect())
+                .await
+            {
                 let until = u64::try_from(next.saturating_sub(now_ms())).unwrap_or(0);
                 wait = wait.min(Duration::from_millis(until.max(50)));
             }
