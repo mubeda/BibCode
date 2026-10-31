@@ -9,7 +9,7 @@
         "error": {
           "_tag": "ProjectDeleteEntryError",
           "cwd": "toString",
-          "failure": "trash_unavailable",
+          "failure": "partially_removed",
           "resolvedPath": "bT-q?aU%H",
           "message": "^"
         }

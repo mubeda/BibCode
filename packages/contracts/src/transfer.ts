@@ -42,7 +42,14 @@ export class ProjectTransferError extends Schema.TaggedError<ProjectTransferErro
   {
     cwd: TrimmedNonEmptyString,
     relativePath: Schema.String,
-    failure: Schema.Literals(["not_found", "outside_root", "not_configured", "operation_failed"]),
+    // `git_metadata`: the path is, or resolves into, Git's own metadata.
+    failure: Schema.Literals([
+      "not_found",
+      "outside_root",
+      "not_configured",
+      "operation_failed",
+      "git_metadata",
+    ]),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },

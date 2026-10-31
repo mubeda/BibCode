@@ -16,6 +16,19 @@ const decodeUploadInput = Schema.decodeUnknownSync(ProjectCreateUploadUrlInput);
 const decodeUploadResult = Schema.decodeUnknownSync(ProjectCreateUploadUrlResult);
 
 describe("transfer contracts", () => {
+  it("names a transfer refused because it is Git's own metadata", () => {
+    const decode = Schema.decodeUnknownSync(ProjectTransferError);
+    expect(
+      decode({
+        _tag: "ProjectTransferError",
+        cwd: "/repo",
+        relativePath: ".git",
+        failure: "git_metadata",
+        message: ".git is Git's own metadata (.git).",
+      }).failure,
+    ).toBe("git_metadata");
+  });
+
   it("registers both methods", () => {
     expect(WS_METHODS.projectsCreateDownloadUrl).toBe("projects.createDownloadUrl");
     expect(WS_METHODS.projectsCreateUploadUrl).toBe("projects.createUploadUrl");

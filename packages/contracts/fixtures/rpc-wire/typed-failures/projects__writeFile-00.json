@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "ProjectWriteFileError",
-          "failure": "kept_in_staging",
+          "failure": "git_metadata",
           "resolvedWorkspaceRoot": "[",
           "operationPath": "\"",
           "message": "iQ~!B1CkYn",

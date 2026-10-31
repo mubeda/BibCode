@@ -194,6 +194,18 @@ describe("project RPC inputs", () => {
     expect(decoded.leftAt).toBe(".bibcode-delete-0f3a");
   });
 
+  it("names a path refused because it is Git's own metadata", () => {
+    expect(
+      decodeWriteError({
+        _tag: "ProjectWriteFileError",
+        cwd: "/workspace",
+        relativePath: ".git/config",
+        failure: "git_metadata",
+        message: ".git/config is Git's own metadata (.git).",
+      }).failure,
+    ).toBe("git_metadata");
+  });
+
   it("says where a trashed entry that could not go back is kept", () => {
     const decoded = decodeDeleteError({
       _tag: "ProjectDeleteEntryError",
