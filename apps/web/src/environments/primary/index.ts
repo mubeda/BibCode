@@ -31,6 +31,8 @@ export {
   resolveInitialServerAuthGateState,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
+  setServerMcpClientAccess,
+  stopServerMcpClient,
   revokeServerPairingLink,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,

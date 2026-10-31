@@ -1,4 +1,5 @@
 import { QueuedMessageTimelineRow } from "./QueuedMessageTimelineRow";
+import { AgentActorChip } from "./AgentActorChip";
 import { AttachmentUploadNotice, type PendingAttachmentUpload } from "./AttachmentUploadNotice";
 import { deliveryProviderLabel, waitsBehind, type QueuedCardStatus } from "../ChatView.logic";
 import {
@@ -1324,6 +1325,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
   return (
     <div className="group flex flex-col items-end gap-1">
+      {row.message.actor ? <AgentActorChip label={row.message.actor.label} /> : null}
       <div className="relative max-w-[80%] rounded-2xl border border-border bg-secondary p-3">
         {regularImages.length > 0 && (
           <div className="mb-2 grid max-w-[420px] grid-cols-2 gap-2">
