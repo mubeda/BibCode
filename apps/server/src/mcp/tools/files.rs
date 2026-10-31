@@ -130,12 +130,13 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "files_read" => (
-            "Reads a text file in pages of at most 16,000 characters from offset. nextOffset reads the next page; truncated says one remains. version is the whole file's, for files_write. A file over 1 MiB, or a binary one, cannot be read here: files_download it.",
+            "Reads a text file in pages of at most 16,000 characters from offset. nextOffset reads the next page, with version set to the version this page returned; truncated says one remains. A file changed between pages is refused (McpFileChangedError): read it again from offset 0. version is the whole file's, for files_write. A file over 1 MiB, or a binary one, cannot be read here: files_download it.",
             object(
                 json!({
                     "threadId": thread,
                     "path": path("The file."),
                     "offset": { "type": "integer", "minimum": 0, "description": "The character to start from; 0 unless set." },
+                    "version": { "type": "string", "description": "Required past offset 0: the version the earlier page returned." },
                 }),
                 &["threadId", "path"],
             ),
@@ -258,8 +259,45 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         Some("trash_unavailable") => format!(
             "The system trash could not take {path}; it was left in place. Delete it with permanent: true only if the person asked for that."
         ),
-        _ => return failure,
+        Some("partially_removed") => {
+            let left_at = error["leftAt"].as_str().map_or_else(
+                || path.to_owned(),
+                |name| match path.rsplit_once('/') {
+                    Some((folder, _)) => format!("{folder}/{name}"),
+                    None => name.to_owned(),
+                },
+            );
+            format!(
+                "Deleting {path} stopped part-way; what is left is at {left_at}. Tell the person rather than retrying."
+            )
+        }
+        // Not a workspace error, and naming no path: kept as the operation answered it.
+        None if !error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(['/', '\\'])) =>
+        {
+            return failure;
+        }
+        // Anything else (permission denied, a full disk): the operating system's reason
+        // without the host path it named.
+        _ => {
+            let reason = error["message"]
+                .as_str()
+                .and_then(|message| message.rsplit(": ").next())
+                .filter(|reason| !reason.contains(['/', '\\']))
+                .unwrap_or("the operation failed");
+            format!("BiBCode could not complete this on {path}: {reason}.")
+        }
     };
+    if let Some(error) = failure["structuredContent"]["error"].as_object_mut() {
+        // Only the tag, the failure and the message: nothing else that could name a host path.
+        error.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "_tag" | "failure" | "message" | "outcome" | "leftAt"
+            )
+        });
+    }
     failure["structuredContent"]["error"]["message"] = message.clone().into();
     failure["content"] = json!([{ "type": "text", "text": message }]);
     failure
@@ -311,9 +349,16 @@ async fn search(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn read(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "path", "offset"]).await?;
+    let place = place(call, &["threadId", "path", "offset", "version"]).await?;
     let path = checked_path(call, &place.cwd, "path").await?;
     let offset = usize::try_from(call.integer("offset")?.unwrap_or(0)).unwrap_or(usize::MAX);
+    // A continuation page names the version it continues, so pages of two versions never mix.
+    let continues = call.string("version")?.map(str::to_ascii_lowercase);
+    if offset > 0 && continues.is_none() {
+        return Err(invalid_argument(
+            "a page after the first needs version, the version the first page returned",
+        ));
+    }
     let file = call
         .invoke(
             "projects.readFile",
@@ -325,6 +370,14 @@ async fn read(call: &ToolCall<'_>) -> ToolResult {
         return Err(typed_tool_failure(
             "McpFileTooLargeError",
             &format!("{path} is larger than 1 MiB, too large to read here; files_download it."),
+        ));
+    }
+    if continues.is_some_and(|version| file["version"] != version.as_str()) {
+        return Err(typed_tool_failure(
+            "McpFileChangedError",
+            &format!(
+                "{path} changed since the page you continue was read. Read it again from offset 0."
+            ),
         ));
     }
     let contents = file["contents"].as_str().unwrap_or_default();
@@ -362,6 +415,7 @@ async fn read(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn write(call: &ToolCall<'_>) -> ToolResult {
+    changes_files_here()?;
     let place = place(
         call,
         &[
@@ -415,6 +469,7 @@ async fn write(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn create(call: &ToolCall<'_>) -> ToolResult {
+    changes_files_here()?;
     let place = place(call, &["threadId", "path", "kind"]).await?;
     let path = checked_path(call, &place.cwd, "path").await?;
     let kind = match call.required("kind")? {
@@ -434,6 +489,7 @@ async fn create(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn rename(call: &ToolCall<'_>) -> ToolResult {
+    changes_files_here()?;
     let place = place(call, &["threadId", "from", "to"]).await?;
     let from = checked_path(call, &place.cwd, "from").await?;
     let to = checked_path(call, &place.cwd, "to").await?;
@@ -457,6 +513,7 @@ async fn rename(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn delete(call: &ToolCall<'_>) -> ToolResult {
+    changes_files_here()?;
     let place = place(call, &["threadId", "path", "permanent", "clientRequestId"]).await?;
     let path = checked_path(call, &place.cwd, "path").await?;
     let permanent = call.boolean("permanent")?.unwrap_or(false);
@@ -475,6 +532,25 @@ async fn delete(call: &ToolCall<'_>) -> ToolResult {
     })
     .await
 }
+
+/// The tools that change files run only where every step is bound to a folder handle (Unix,
+/// `workspace::beneath`). Elsewhere a folder another process swaps for a symlink between the
+/// check and the call could still redirect them, so they are refused instead.
+fn changes_files_here() -> Result<(), Value> {
+    handle_bound(cfg!(unix))
+}
+
+fn handle_bound(supported: bool) -> Result<(), Value> {
+    if supported {
+        return Ok(());
+    }
+    Err(typed_tool_failure(
+        PLATFORM_UNSUPPORTED_TAG,
+        "Changing files over MCP is not available on this server's operating system yet. Reading, listing, searching and downloading work; ask the person to make the change in BiBCode.",
+    ))
+}
+
+pub(crate) const PLATFORM_UNSUPPORTED_TAG: &str = "McpPlatformUnsupportedError";
 
 /// The base a transfer URL is built on: the address this server is bound to, which the local
 /// relay and `bibcode thread` reach. Remote OAuth sessions (slice R) get their own origin here.
@@ -518,6 +594,7 @@ async fn download(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn upload(call: &ToolCall<'_>) -> ToolResult {
+    changes_files_here()?;
     let place = place(call, &["threadId", "directory", "fileName", "overwrite"]).await?;
     let directory = match call
         .string("directory")?
@@ -559,4 +636,20 @@ async fn upload(call: &ToolCall<'_>) -> ToolResult {
         }),
         &[],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_file_changing_tools_are_refused_where_operations_are_not_handle_bound() {
+        assert!(handle_bound(true).is_ok());
+        let refused = handle_bound(false).unwrap_err();
+        assert_eq!(
+            refused["structuredContent"]["error"]["_tag"],
+            PLATFORM_UNSUPPORTED_TAG
+        );
+        assert_eq!(changes_files_here().is_ok(), cfg!(unix));
+    }
 }

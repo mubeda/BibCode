@@ -322,7 +322,7 @@ async fn reads_come_in_pages_with_the_version_and_refuse_large_and_binary_files(
         let page = fixture
             .call(
                 "files_read",
-                json!({ "path": "src/big.txt", "offset": offset }),
+                json!({ "path": "src/big.txt", "offset": offset, "version": first["version"] }),
             )
             .await;
         let page = structured(&page);
@@ -885,5 +885,67 @@ async fn a_transfer_refused_after_admission_records_the_refusal_not_a_cancel() {
         .find(|row| row["tool"] == "files_download")
         .expect("a download row");
     assert_eq!(row["outcome"], "TransferNotFoundError");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_continuation_page_of_a_changed_file_is_refused() {
+    let fixture = fixture().await;
+    fixture.write("big.txt", "a".repeat(40_000));
+    let first = fixture
+        .call("files_read", json!({ "path": "big.txt" }))
+        .await;
+    let first = structured(&first).clone();
+    let next = first["nextOffset"].clone();
+    // The next page needs the version it continues.
+    let refused = fixture
+        .call("files_read", json!({ "path": "big.txt", "offset": next }))
+        .await;
+    assert_eq!(error_tag(&refused), "McpInvalidArgumentError");
+    let same = fixture
+        .call(
+            "files_read",
+            json!({ "path": "big.txt", "offset": next, "version": first["version"] }),
+        )
+        .await;
+    assert_eq!(structured(&same)["version"], first["version"]);
+    fixture.write("big.txt", "b".repeat(40_000));
+    let changed = fixture
+        .call(
+            "files_read",
+            json!({ "path": "big.txt", "offset": next, "version": first["version"] }),
+        )
+        .await;
+    assert_eq!(error_tag(&changed), "McpFileChangedError");
+    assert!(
+        crate::mcp::tools::feed::ERRORS
+            .iter()
+            .any(|(tag, _, _)| *tag == "McpFileChangedError")
+    );
+    fixture.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unexpected_failure_names_the_agents_path_never_the_hosts() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = fixture().await;
+    fixture.write("locked.txt", "x");
+    let locked = fixture.folder.join("locked.txt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let refused = fixture
+        .call("files_read", json!({ "path": "locked.txt" }))
+        .await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(refused["isError"], true, "{refused}");
+    let host = fixture.folder.to_string_lossy().into_owned();
+    assert!(!refused.to_string().contains(&host), "{refused}");
+    assert!(
+        refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("locked.txt"),
+        "{refused}"
+    );
     fixture.shutdown().await;
 }
