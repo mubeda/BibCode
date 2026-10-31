@@ -4721,3 +4721,11 @@ CLI, F0 and waves 1 to 3 with their review fixes). It adds five tools to the `gi
   `.git/config` is refused by the handler (`GitManagerOperationError`, `invalid-path`),
   since C5's `validate_paths` does not name Git's metadata. `SourceControlPanel.test.tsx`
   mocks the new component; its own happy-dom test covers it.
+- **The folder seam.** The suggestion matches a panel only when the server's `cwd` and the
+  panel's `gitCwd` are the same string. Both come from the same source and fallback: the
+  thread's non-empty `worktreePath`, else the project's `workspaceRoot`
+  (`mcp/target.rs::thread_target`, and `projectScriptCwd` in `ChatView.tsx`); the panel
+  compares them through `sourceControlDraftKey`, which drops a trailing separator. No test
+  runs both sides together.
+- **Not changed:** `git_log` with both `ref` and `cursor` follows the cursor's tip and only
+  echoes `ref`; its description does not say so.
