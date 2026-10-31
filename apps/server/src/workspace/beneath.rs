@@ -662,10 +662,10 @@ mod imp {
         };
         match native {
             Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::EOPNOTSUPP)
-                ) =>
+                // ENOTSUP and EOPNOTSUPP are the same number on Linux, so compare by value.
+                if error.raw_os_error().is_some_and(|code| {
+                    [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code)
+                }) =>
             {
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,

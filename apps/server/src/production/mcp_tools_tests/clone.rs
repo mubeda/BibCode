@@ -1087,11 +1087,15 @@ const INHERITED: &[&str] = &[
     "GIT_TRACE2",
     "GIT_TRACE_PACKFILE",
 ];
+#[cfg(unix)]
 const INHERITED_TEST: &str = "production::mcp_tools_tests::clone::an_inherited_server_environment_never_reaches_an_agent_clone";
+#[cfg(unix)]
 const INHERITED_PHASE: &str = "inherited-environment";
 /// The folder the inherited variables point into.
+#[cfg(unix)]
 const OUTSIDE: &str = "BIBCODE_X6_OUTSIDE";
 /// A variable outside the allowlist, which a person's commands keep inheriting.
+#[cfg(unix)]
 const KEPT: &str = "BIBCODE_X6_KEPT";
 
 /// Review round 2: an agent clone's commands inherit only an allowlist of the server's

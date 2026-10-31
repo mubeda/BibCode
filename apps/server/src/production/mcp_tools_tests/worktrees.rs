@@ -44,7 +44,9 @@ pub(super) struct Fixture {
     pub(super) harness: Harness,
     pub(super) services: WorktreeCatalogRpcServices,
     catalog: WorktreeCatalogService,
+    #[cfg_attr(not(unix), allow(dead_code))]
     git: IsolatedGitConfig,
+    #[cfg_attr(not(unix), allow(dead_code))]
     root: TempDir,
 }
 

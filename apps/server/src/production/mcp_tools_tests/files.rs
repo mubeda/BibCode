@@ -77,6 +77,7 @@ struct Fixture {
     /// The thread's folder.
     folder: PathBuf,
     /// A folder outside it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     outside: PathBuf,
     trash: Arc<TestTrash>,
     access: TransferAccess,
