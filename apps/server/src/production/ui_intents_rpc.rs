@@ -33,6 +33,12 @@ use crate::rpc::{RpcRegistry, RpcSessionContext, RpcStreamChunk};
 pub(crate) const FOCUS_TTL: Duration = Duration::from_secs(60);
 /// Pending `focus` intents one thread may hold.
 pub(crate) const MOST_PENDING_PER_THREAD: usize = 16;
+/// Pending intents one agent credential may hold across threads.
+pub(crate) const MOST_PENDING_PER_CLIENT: usize = 64;
+/// Pending intents the server holds; past it the oldest are dropped first.
+pub(crate) const MOST_PENDING: usize = 256;
+/// The newest pending intents a subscriber's snapshot carries (a client keeps 64).
+pub(crate) const SNAPSHOT_INTENTS: usize = 64;
 /// What a `focus` intent may ask to show.
 pub(crate) const SURFACES: &[&str] = &["thread", "files", "sourceControl", "diff"];
 /// The surfaces a `path` applies to.
@@ -55,6 +61,7 @@ struct Shared {
 
 struct Pending {
     thread_id: String,
+    client_id: String,
     expires: Instant,
     intent: Value,
 }
@@ -76,11 +83,23 @@ impl UiIntents {
         }
     }
 
-    /// The intents still pending, oldest first; expired ones are dropped.
-    pub(crate) fn pending(&self) -> Vec<Value> {
+    /// The newest [`SNAPSHOT_INTENTS`] intents still pending, oldest first; expired ones are
+    /// dropped. One server is one environment, so this is the subscriber's environment.
+    pub(crate) fn snapshot(&self) -> Vec<Value> {
         let mut pending = self.lock();
         prune(&mut pending);
-        pending.iter().map(|entry| entry.intent.clone()).collect()
+        let skip = pending.len().saturating_sub(SNAPSHOT_INTENTS);
+        pending[skip..]
+            .iter()
+            .map(|entry| entry.intent.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        let mut pending = self.lock();
+        prune(&mut pending);
+        pending.len()
     }
 
     /// Each intent published from now on; every receiver counts as a subscribed client.
@@ -93,7 +112,8 @@ impl UiIntents {
     /// # Errors
     ///
     /// A typed `UiIntentError` (`reason: "limit"`) when the thread already holds
-    /// [`MOST_PENDING_PER_THREAD`] pending intents.
+    /// [`MOST_PENDING_PER_THREAD`] pending intents, or the agent [`MOST_PENDING_PER_CLIENT`].
+    /// Past [`MOST_PENDING`] in all, the oldest pending intents are dropped.
     pub(crate) fn publish_focus(
         &self,
         thread_id: &str,
@@ -101,6 +121,7 @@ impl UiIntents {
         path: Option<&str>,
         actor: Value,
     ) -> Result<(Value, usize), Value> {
+        let client_id = actor["clientId"].as_str().unwrap_or_default().to_owned();
         let now = time::OffsetDateTime::now_utc();
         let intent = json!({
             "kind": "focus",
@@ -128,11 +149,27 @@ impl UiIntents {
                     ),
                 ));
             }
+            if pending
+                .iter()
+                .filter(|entry| entry.client_id == client_id)
+                .count()
+                >= MOST_PENDING_PER_CLIENT
+            {
+                return Err(refusal(
+                    "limit",
+                    &format!(
+                        "You already have {MOST_PENDING_PER_CLIENT} UI suggestions waiting for a person; each expires 60 seconds after it was sent."
+                    ),
+                ));
+            }
             pending.push(Pending {
                 thread_id: thread_id.to_owned(),
+                client_id,
                 expires: Instant::now() + FOCUS_TTL,
                 intent: intent.clone(),
             });
+            let excess = pending.len().saturating_sub(MOST_PENDING);
+            pending.drain(..excess);
         }
         // No subscriber is not an error: the result says nobody saw it.
         let _ = self.shared.published.send(intent.clone());
@@ -245,7 +282,7 @@ fn intents_stream(
     let mut published = intents.subscribe();
     tokio::spawn(async move {
         let snapshot =
-            |intents: &UiIntents| json!({ "type": "snapshot", "intents": intents.pending() });
+            |intents: &UiIntents| json!({ "type": "snapshot", "intents": intents.snapshot() });
         let mut next = snapshot(&intents);
         loop {
             let sent = tokio::select! {
@@ -285,11 +322,68 @@ mod tests {
         assert_eq!(subscribers, 0);
         assert_eq!(intent["kind"], "focus");
         assert_eq!(intent["actor"]["label"], "Claude Code");
-        assert_eq!(intents.pending().len(), 1);
+        assert_eq!(intents.len(), 1);
         tokio::time::advance(FOCUS_TTL - Duration::from_millis(1)).await;
-        assert_eq!(intents.pending().len(), 1);
+        assert_eq!(intents.len(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(intents.pending().is_empty());
+        assert_eq!(intents.len(), 0);
+    }
+
+    fn agent(n: usize) -> Value {
+        crate::mcp::activity::actor(&format!("session-{n}"), None)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_credential_holds_at_most_64_pending_intents_across_threads() {
+        let intents = UiIntents::new();
+        for thread in 0..MOST_PENDING_PER_CLIENT {
+            intents
+                .publish_focus(&format!("t{thread}"), "thread", None, agent(1))
+                .unwrap();
+        }
+        let refused = intents
+            .publish_focus("t-more", "thread", None, agent(1))
+            .unwrap_err();
+        assert_eq!(refused["reason"], "limit");
+        // Another credential has its own allowance.
+        intents
+            .publish_focus("t-more", "thread", None, agent(2))
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_server_holds_at_most_256_pending_intents_and_snapshots_the_newest_64() {
+        let intents = UiIntents::new();
+        let mut published = Vec::new();
+        for client in 0..5 {
+            for thread in 0..MOST_PENDING_PER_CLIENT {
+                let (intent, _) = intents
+                    .publish_focus(
+                        &format!("t{client}-{thread}"),
+                        "thread",
+                        None,
+                        agent(client),
+                    )
+                    .unwrap();
+                published.push(intent["intentId"].clone());
+            }
+        }
+        assert_eq!(published.len(), 320);
+        // The oldest are evicted first.
+        assert_eq!(intents.len(), MOST_PENDING);
+        let snapshot = intents.snapshot();
+        assert_eq!(snapshot.len(), SNAPSHOT_INTENTS);
+        let ids: Vec<&Value> = snapshot.iter().map(|intent| &intent["intentId"]).collect();
+        assert_eq!(
+            ids,
+            published[published.len() - SNAPSHOT_INTENTS..]
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        // An evicted intent freed its credential's allowance.
+        intents
+            .publish_focus("t0-new", "thread", None, agent(0))
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -345,7 +439,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(person["reason"], "actor");
-        assert!(intents.pending().is_empty());
+        assert_eq!(intents.len(), 0);
         for path in ["../outside", "/etc/passwd", "a/../../b", "a\\b"] {
             assert!(!is_relative_literal(path), "{path}");
         }
