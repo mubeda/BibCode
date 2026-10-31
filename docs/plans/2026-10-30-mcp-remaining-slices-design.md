@@ -3397,6 +3397,19 @@ that failed first:
   was rejected too: after a restart, records written before it would be ignored, and the
   crash recovery would never run.
 
+- **Codex re-review: recovery could interrupt another server's live discard.** It skipped
+  only holders in its own process's in-flight set, so a `bibcode` server's discard could move
+  back a file the desktop app had staged and was trashing. A discard now takes an exclusive
+  `flock` on the holder folder right after creating it, before its record exists, and holds
+  it until it is done. Recovery takes the same lock without waiting, and restores only a
+  holder it gets: an abandoned one, since the OS drops a dead process's lock. A `flock`
+  belongs to each open file, so it also covers this process, and the in-flight set is gone.
+  Unix only, like staging. Test: `recovery_leaves_a_holder_another_process_still_holds`
+  locks a stranded holder through a second open. Recovery leaves it while locked and restores
+  it once released; it failed first, restoring the held entry. The intermediate `root\0path`
+  record format existed only between two local commits and never shipped, so nothing reads
+  it.
+
 ## P (pull request tools) implementation notes (2026-10-30)
 
 Slice P was implemented on `claude/v0131-139-p`, from `claude/v0131-139-f0`. It adds
