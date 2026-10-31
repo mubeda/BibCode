@@ -29,6 +29,36 @@ const h = vi.hoisted(() => ({
   copied: [] as string[],
   environments: [] as FakeEnvironment[],
   updateResult: null as unknown,
+  webhooks: null as null | { endpoints: ReadonlyArray<Record<string, unknown>> },
+  clients: [] as Array<{ connected: boolean }>,
+}));
+
+vi.mock("../../state/webhooks", () => ({
+  useWebhookList: (environmentId: string | null) => ({
+    data: environmentId === null ? null : h.webhooks,
+    error: null,
+    refresh: () => undefined,
+  }),
+  isFailingEndpoint: (endpoint: {
+    disabledReason: unknown;
+    enabled: boolean;
+    consecutiveFailures: number;
+  }) => endpoint.disabledReason !== null || (endpoint.enabled && endpoint.consecutiveFailures > 0),
+}));
+
+vi.mock("../../state/mcpActivity", () => ({
+  usePrimaryMcpActivity: () => ({ rows: [], active: [], canManage: false, environmentId: null }),
+  usePrimaryMcpClients: () => h.clients,
+  takenOverLevel: () => null,
+}));
+
+// Covered by its own tests; here only its place in the MCP tab matters.
+vi.mock("./McpAgentsPanel", () => ({ McpAgentsPanel: () => <div data-testid="agents-panel" /> }));
+
+vi.mock("./WebhooksTab", () => ({
+  WebhooksTab: (props: AnyProps) => (
+    <div data-testid="webhooks-tab" data-environment={props.environmentId as string} />
+  ),
 }));
 
 vi.mock("./diagnosticsEnvironment", () => ({
@@ -160,6 +190,8 @@ beforeEach(() => {
   h.copied = [];
   h.environments = [environment()];
   h.updateResult = null;
+  h.webhooks = null;
+  h.clients = [];
 });
 
 afterEach(() => {
@@ -312,6 +344,44 @@ describe("AgentIntegrationsSection", () => {
     expect(h.updates).toEqual([
       { environmentId: "local", patch: { mcpCapabilities: DEFAULT_CAPABILITIES } },
     ]);
+  });
+
+  it("summarizes MCP, connected agents and webhooks in the header", async () => {
+    h.clients = [{ connected: true }, { connected: false }];
+    const container = await render();
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(
+      "MCP on · 1 agent connected · Webhooks off",
+    );
+
+    h.settings = settings({ enableMcpServer: false, enableWebhooks: true });
+    h.webhooks = {
+      endpoints: [
+        { enabled: true, consecutiveFailures: 0, disabledReason: null },
+        { enabled: true, consecutiveFailures: 2, disabledReason: null },
+        { enabled: false, consecutiveFailures: 10, disabledReason: "failures" },
+        { enabled: false, consecutiveFailures: 0, disabledReason: null },
+      ],
+    };
+    const on = await render();
+    expect(on.querySelector('[role="status"]')?.textContent).toBe(
+      "MCP off · 1 agent connected · 1 webhook active, 2 failing",
+    );
+  });
+
+  it("shows the MCP tab first and the webhooks of the same environment in the other tab", async () => {
+    const container = await render();
+    const tabs = [...container.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent);
+    expect(tabs).toEqual(["MCP", "Webhooks"]);
+    expect(container.querySelector('[aria-label="MCP server"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="webhooks-tab"]')).toBeNull();
+    const webhooksTab = [...container.querySelectorAll<HTMLElement>('[role="tab"]')].find(
+      (tab) => tab.textContent === "Webhooks",
+    )!;
+    await act(async () => webhooksTab.click());
+    expect(
+      container.querySelector('[data-testid="webhooks-tab"]')?.getAttribute("data-environment"),
+    ).toBe("local");
+    expect(container.querySelector('[aria-label="MCP server"]')).toBeNull();
   });
 
   it("quotes for the server host's own shell", () => {
