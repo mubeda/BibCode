@@ -412,6 +412,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     super::tools::feed::FAMILY,
     super::tools::panels::FAMILY,
     super::tools::clone::FAMILY,
+    super::tools::files::FAMILY,
 ];
 
 /// The spec and family of `name` for `kind` in `families`.
@@ -524,6 +525,9 @@ pub(super) struct Inner {
     previews: std::sync::OnceLock<super::tools::previews::PreviewServices>,
     /// The terminal manager the terminal tools use (slice T), attached by the runtime.
     terminals: std::sync::OnceLock<super::tools::terminals::TerminalServices>,
+    /// The base the Files tools build transfer URLs on (slice X5): the bound address, set by
+    /// the server once it has bound.
+    transfer_base: std::sync::OnceLock<String>,
 }
 
 #[derive(Default)]
@@ -640,6 +644,7 @@ impl McpControl {
                 claims: super::outcome::Claims::default(),
                 previews: std::sync::OnceLock::new(),
                 terminals: std::sync::OnceLock::new(),
+                transfer_base: std::sync::OnceLock::new(),
             }),
         };
         super::activity::watch_stops(&control);
@@ -933,6 +938,17 @@ impl McpControl {
     pub(crate) fn terminals(&self) -> Option<&super::tools::terminals::TerminalServices> {
         self.inner.terminals.get()
     }
+
+    /// Sets the base (`http://host:port`) the Files tools build transfer URLs on: the address
+    /// a process on this host reaches the server at. The first attachment wins.
+    pub fn attach_transfer_base(&self, base: String) {
+        let _ = self.inner.transfer_base.set(base);
+    }
+
+    /// The transfer base; `None` before the server has bound.
+    pub(crate) fn transfer_base(&self) -> Option<&str> {
+        self.inner.transfer_base.get().map(String::as_str)
+    }
 }
 
 /// A client tool's descriptor, with the hints its spec declares.
@@ -981,8 +997,8 @@ pub(crate) fn invalid_argument(message: &str) -> Value {
 }
 
 /// Fields of an RPC error a tool failure keeps beside its tag and message: the git manager's
-/// `code` and `blocked`, a stacked action's `phase`.
-const KEPT_ERROR_FIELDS: &[&str] = &["code", "blocked", "phase", "reason"];
+/// `code` and `blocked`, a stacked action's `phase`, a workspace error's `failure`.
+const KEPT_ERROR_FIELDS: &[&str] = &["code", "blocked", "phase", "reason", "failure"];
 
 /// An RPC error as a typed tool failure.
 pub(crate) fn rpc_failure(error: &Value) -> Value {

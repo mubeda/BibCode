@@ -5,6 +5,7 @@
 pub(crate) mod clone;
 pub(crate) mod diagnostics;
 pub(crate) mod feed;
+pub(crate) mod files;
 pub(crate) mod git;
 pub(crate) mod panels;
 pub(crate) mod previews;

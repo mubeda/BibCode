@@ -7,6 +7,7 @@ mod attribution;
 mod clone;
 mod diagnostics;
 mod feed;
+mod files;
 mod foundation;
 mod git;
 mod panels;
