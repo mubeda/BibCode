@@ -2992,6 +2992,39 @@ fn change_feed_heads(connection: &Connection) -> Result<(i64, i64)> {
     )?)
 }
 
+/// The window query: `?1` the cursor's sequence, `?2` the scan limit, `?3` the parse budget,
+/// `?4` the thread (a thread's window is read through its stream index).
+fn change_window_sql(thread: bool) -> String {
+    let stream = if thread {
+        "o.aggregate_kind = 'thread' AND o.stream_id = ?4 AND"
+    } else {
+        "?4 IS NULL AND"
+    };
+    format!(
+        "SELECT COUNT(*), COALESCE(SUM(kept), 0), MAX(CASE WHEN kept THEN sequence END) FROM ( \
+           SELECT sequence, (n = 1 OR spent <= ?3) AS kept FROM ( \
+             SELECT sequence, ROW_NUMBER() OVER w AS n, SUM(cost) OVER w AS spent FROM ( \
+               SELECT o.sequence AS sequence, {PARSE_COST} AS cost FROM orchestration_events AS o \
+               WHERE {stream} o.sequence > ?1 ORDER BY o.sequence LIMIT ?2) \
+             WINDOW w AS (ORDER BY sequence ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)))"
+    )
+}
+
+/// The transitions of the window: `?1` the cursor's sequence, `?2` the window's last, `?3`
+/// the thread (read through its stream index, not the whole range).
+fn transitions_sql(thread: bool) -> String {
+    let stream = if thread {
+        "e.stream_id = ?3 AND"
+    } else {
+        "?3 IS NULL AND"
+    };
+    format!(
+        "SELECT {TRANSITION_COLUMNS} FROM orchestration_events AS e \
+         WHERE {stream} e.sequence > ?1 AND e.sequence <= ?2 AND {TRANSITION_FILTER} \
+         ORDER BY e.sequence"
+    )
+}
+
 fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<ChangeFeedRead> {
     let (event_head, activity_head) = change_feed_heads(connection)?;
     let scan_limit = i64::try_from(query.scan_limit).unwrap_or(i64::MAX);
@@ -3002,37 +3035,14 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
     // session update a session update consults) would bring the bytes past `parse_budget`.
     // `octet_length` reads a payload's size from the record header, never its text. The first
     // event is always kept, and charged, so a call progresses.
-    let stream = if thread.is_some() {
-        "o.aggregate_kind = 'thread' AND o.stream_id = ?4 AND"
-    } else {
-        "?4 IS NULL AND"
-    };
     let (total, scanned, scanned_to): (i64, i64, Option<i64>) = connection.query_row(
-        &format!(
-            "SELECT COUNT(*), COALESCE(SUM(kept), 0), MAX(CASE WHEN kept THEN sequence END) FROM ( \
-               SELECT sequence, (n = 1 OR spent <= ?3) AS kept FROM ( \
-                 SELECT sequence, ROW_NUMBER() OVER w AS n, SUM(cost) OVER w AS spent FROM ( \
-                   SELECT o.sequence AS sequence, {PARSE_COST} AS cost FROM orchestration_events AS o \
-                   WHERE {stream} o.sequence > ?1 ORDER BY o.sequence LIMIT ?2) \
-                 WINDOW w AS (ORDER BY sequence ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)))"
-        ),
+        &change_window_sql(thread.is_some()),
         params![query.after_sequence, scan_limit, parse_budget, thread],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let scanned_to = scanned_to.unwrap_or(query.after_sequence);
     let transitions = {
-        // A thread's window is read through its stream index, not the whole range.
-        let stream = if thread.is_some() {
-            "e.stream_id = ?3 AND"
-        } else {
-            "?3 IS NULL AND"
-        };
-        let sql = format!(
-            "SELECT {TRANSITION_COLUMNS} FROM orchestration_events AS e \
-             WHERE {stream} e.sequence > ?1 AND e.sequence <= ?2 AND {TRANSITION_FILTER} \
-             ORDER BY e.sequence"
-        );
-        let mut statement = connection.prepare_cached(&sql)?;
+        let mut statement = connection.prepare_cached(&transitions_sql(thread.is_some()))?;
         statement
             .query_map(
                 params![query.after_sequence, scanned_to, thread],
@@ -3644,6 +3654,55 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         mcp_access_hand_back: row.get(18)?,
         delivery_state: row.get(16)?,
     })
+}
+
+#[cfg(test)]
+mod change_feed_plan_tests {
+    use super::*;
+    use crate::persistence::run_migrations;
+
+    /// Both previous-session lookups (the window's cost and the mapper's) seek a thread's
+    /// session updates directly, never walking the events between them.
+    #[tokio::test]
+    async fn the_previous_session_lookups_seek_the_session_update_index() {
+        let database = Database::open_in_memory().await.unwrap();
+        let plans = database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                let mut plans = Vec::new();
+                for (sql, parameters) in [
+                    (change_window_sql(false), 4),
+                    (change_window_sql(true), 4),
+                    (transitions_sql(false), 3),
+                    (transitions_sql(true), 3),
+                ] {
+                    let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let values = vec![rusqlite::types::Value::Null; parameters];
+                    let details = statement
+                        .query_map(rusqlite::params_from_iter(values), |row| {
+                            row.get::<_, String>(3)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    plans.push(details);
+                }
+                Ok(plans)
+            })
+            .await
+            .unwrap();
+        for plan in plans {
+            let lookups: Vec<&String> = plan
+                .iter()
+                .filter(|detail| detail.starts_with("SEARCH p "))
+                .collect();
+            assert!(!lookups.is_empty(), "{plan:?}");
+            assert!(
+                lookups
+                    .iter()
+                    .all(|detail| detail.contains("idx_orch_events_thread_session_updates")),
+                "{plan:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

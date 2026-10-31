@@ -3570,7 +3570,9 @@ instead of failing the call.
   back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`
   (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`);
   and the `mcp_activity` rows after the cursor's activity id. A session update reads the
-  status and turn of the thread's previous session update, so it maps to `turn.started`,
+  status and turn of the thread's previous session update (both that lookup and its cost
+  seek the partial index `idx_orch_events_thread_session_updates`, migration 60), so it maps
+  to `turn.started`,
   `turn.completed`, `turn.interrupted`, `turn.failed` or `session.status`, or to nothing.
   The cursor is `v1.<sequence>.<activityId>`; a page lists event entries first, then
   activity entries, each with the cursor just after it, so cursors increase strictly and

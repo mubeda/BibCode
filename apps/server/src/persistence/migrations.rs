@@ -2770,6 +2770,16 @@ fn migration_060(transaction: &Transaction<'_>) -> Result<()> {
                ON projection_turns(thread_id, turn_id) WHERE state = 'running';",
         )?;
     }
+    // `changes_since` (slice X3) maps a session update by the thread's previous one; this
+    // seeks it directly instead of walking every event between the two. Partial, so only
+    // session updates pay for it on write. A database that already ran 60 just lacks it.
+    if table_exists(transaction, "orchestration_events")? {
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_orch_events_thread_session_updates
+               ON orchestration_events(aggregate_kind, stream_id, event_type, sequence)
+               WHERE event_type = 'thread.session-set';",
+        )?;
+    }
     Ok(())
 }
 
@@ -3034,6 +3044,12 @@ mod tests {
             "INSERT INTO mcp_activity (occurred_at, session_id, label, tool, thread_id, outcome, target_json) VALUES ('2026-10-30T00:00:00Z', 's', 'Claude Code', 'git_commit', 't', 'success', '{}')",
             [],
         )?;
+        let session_index: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_orch_events_thread_session_updates'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(session_index, 1, "the session update index (slice X3)");
         // Running it again changes nothing.
         let transaction = connection.transaction()?;
         super::migration_060(&transaction)?;

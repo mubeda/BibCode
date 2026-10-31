@@ -4204,6 +4204,21 @@ is charged twice, which only makes the cut earlier. Test:
 `a_previous_session_update_the_read_consults_counts_toward_the_budget` (two threads whose
 running update holds a 20 MiB error: one `turn.completed` per call, each still mapped).
 
+**Codex review round 4 (2026-10-31).** One P2, confirmed with `EXPLAIN QUERY PLAN` and fixed
+test-first: both previous-session lookups (the window's cost and the mapper's) walked
+`idx_orch_events_stream_sequence`, which has no `event_type`, so a long turn with many
+activity events between two session updates made each lookup step over all of them.
+Migration 60 (unreleased; X8 owns 61 and R 62) now also creates the partial index
+`idx_orch_events_thread_session_updates ON orchestration_events(aggregate_kind, stream_id,
+event_type, sequence) WHERE event_type = 'thread.session-set'`; a dev database that already
+ran 60 lacks it, as with X1's. `event_type` is a column as well as the predicate because
+SQLite 3.53 otherwise ties it with the stream index and may keep that one; partial, so only
+session updates pay for it on write. No `INDEXED BY`: a database without the index still
+works, only slower. The two queries moved into `change_window_sql` and `transitions_sql` so
+`change_feed_plan_tests::the_previous_session_lookups_seek_the_session_update_index` can
+check every lookup in all four plans (with and without `threadId`) seeks the new index; it
+failed before the index existed.
+
 ## X4 implementation notes (2026-10-31)
 
 X4 was implemented on `claude/v0131-139-x4`, from the batch tip `8d400e20df` (slice 1, the CLI,
