@@ -34,6 +34,7 @@ pub mod server_terminal;
 pub mod step_gate;
 pub mod transfer_routes;
 pub mod turn_delivery;
+pub(crate) mod ui_intents_rpc;
 pub mod uploads_rpc;
 pub(crate) mod workspace_availability;
 pub mod workspace_preview;

@@ -33,6 +33,7 @@ use crate::{
 const METHODS: &[&str] = &[
     "vcs.refreshWorktreeCatalog",
     "worktree.createManaged",
+    "worktree.createPanel",
     "worktree.getRemovalPlan",
     "worktree.remove",
     "worktree.removeFromBibCode",

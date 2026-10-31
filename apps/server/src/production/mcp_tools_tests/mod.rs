@@ -8,6 +8,7 @@ mod diagnostics;
 mod feed;
 mod foundation;
 mod git;
+mod panels;
 mod previews;
 mod pull_requests;
 mod terminals;

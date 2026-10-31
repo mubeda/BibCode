@@ -79,6 +79,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "subscribeProjectEntries"
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
+        // An outside agent's UI suggestions (#139, slice X4).
+        | "subscribeUiIntents"
         | "subscribeVcsStatus"
         | "subscribeVcsStatusSummary"
         | "subscribeWorktreeCatalog"
@@ -163,7 +165,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.pull"
         | "vcs.stageFiles"
         | "vcs.switchRef"
-        | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
+        | "vcs.unstageFiles"
+        // Only an outside agent's session may publish; the handler checks it (slice X4).
+        | "ui.publishIntent" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "worktree.adopt"
         | "worktree.createManaged"
         | "worktree.createPanel"
