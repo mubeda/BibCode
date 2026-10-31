@@ -2405,8 +2405,14 @@ async function pressNativePageUpDuringGlide(
               value,
               scrollTop: Math.round(scroller.scrollTop),
               scrollHeight: scroller.scrollHeight,
-              stack: kind === "scroll-event" || kind === "keydown" ? [] : where(),
+              stack:
+                kind === "scroll-event" || kind === "keydown" || /^(ll|cv)-/u.test(kind)
+                  ? []
+                  : where(),
             });
+          // [DEBUG-214] LegendList's and ChatView's own decisions, from the diag patch.
+          (window as unknown as { __k64Trace?: (kind: string, value: unknown) => void }).__k64Trace =
+            record;
           for (const method of ["scrollTo", "scrollBy", "scrollIntoView"] as const) {
             const original = (scroller as unknown as Record<string, (...args: unknown[]) => void>)[
               method

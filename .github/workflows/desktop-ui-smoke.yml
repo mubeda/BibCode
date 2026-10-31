@@ -34,31 +34,31 @@ jobs:
             arch: x64
             bundle: dmg
             rustTarget: x86_64-apple-darwin
-          - label: macOS x64 d
-            runner: macos-26-intel
+          - label: macOS arm64 d
+            runner: macos-26
             platform: mac
-            arch: x64
+            arch: arm64
             bundle: dmg
-            rustTarget: x86_64-apple-darwin
-          - label: macOS x64 e
-            runner: macos-26-intel
+            rustTarget: aarch64-apple-darwin
+          - label: macOS arm64 e
+            runner: macos-26
             platform: mac
-            arch: x64
+            arch: arm64
             bundle: dmg
-            rustTarget: x86_64-apple-darwin
-          - label: macOS x64 f
-            runner: macos-26-intel
+            rustTarget: aarch64-apple-darwin
+          - label: macOS arm64 f
+            runner: macos-26
             platform: mac
-            arch: x64
+            arch: arm64
             bundle: dmg
-            rustTarget: x86_64-apple-darwin
+            rustTarget: aarch64-apple-darwin
     env:
       BIBCODE_E2E_PLATFORM: ${{ matrix.platform }}
       BIBCODE_E2E_ARCH: ${{ matrix.arch }}
       BIBCODE_E2E_BUNDLE: ${{ matrix.bundle }}
       # [DEBUG-k64r] only the keyboard case of the Mermaid timeline spec.
       BIBCODE_E2E_SPEC: ./specs/mermaid-diagrams.e2e.ts
-      BIBCODE_E2E_GREP: hands the timeline
+      BIBCODE_E2E_GREP: "hands the timeline|keeps a reader just above the end"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
