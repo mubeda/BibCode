@@ -365,6 +365,79 @@ async fn stop_revokes_the_agent_interrupts_its_running_turn_and_cancels_its_owne
     harness.shutdown().await;
 }
 
+/// Review round 2: Revoke first, then Stop while the agent's turn still runs.
+#[tokio::test]
+async fn stop_after_revoke_still_interrupts_the_agents_running_turn() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &agent, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-agent").await;
+    let session_id = agent.principal.session_id.clone();
+    assert!(
+        harness
+            .auth
+            .revoke_client("person", &session_id)
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(stop_interrupts(&harness, &theirs).await, 0, "Revoke alone");
+
+    // Stop on the already revoked agent still interrupts what it is running.
+    assert!(
+        harness
+            .auth
+            .stop_client("person", &session_id)
+            .await
+            .unwrap()
+    );
+    until_async(|| async { stop_interrupts(&harness, &theirs).await == 1 }).await;
+
+    // A session that was never an agent's, or never existed, is not stopped.
+    assert!(!harness.auth.stop_client("person", "missing").await.unwrap());
+    harness.shutdown().await;
+}
+
+/// Review round 2: an agent whose turn still runs stays active long after its last call.
+#[tokio::test]
+async fn an_agents_running_turn_keeps_it_active_without_recent_calls() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &agent, basic_start()).await;
+    // A fresh activity service has no recent calls: only the turn can make it active.
+    let activity = crate::mcp::activity::McpActivity::new(harness.repositories.database().clone());
+    assert!(activity.active_now().await.is_empty());
+
+    turn_running(&harness, &theirs, "turn-agent").await;
+    let active = activity.active_now().await;
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0]["clientId"], agent.principal.session_id.as_str());
+    assert_eq!(active[0]["label"], "MCP · test");
+    assert_eq!(active[0]["runningTurns"], 1);
+    assert_eq!(active[0]["running"], true);
+
+    // A person's running turn makes no agent active.
+    let mine = person_starts(&harness, json!({})).await;
+    turn_running(&harness, &mine, "turn-person").await;
+    assert_eq!(activity.active_now().await.len(), 1);
+
+    harness.provider_turn(&theirs, "turn-agent", "", true).await;
+    harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE projection_turns SET state = 'completed' WHERE turn_id = 'turn-agent'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(activity.active_now().await.is_empty());
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn take_over_refuses_mutations_stops_owned_work_and_hand_back_restores_the_level() {
     let harness = Harness::new().await;
