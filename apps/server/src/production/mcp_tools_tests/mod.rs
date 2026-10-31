@@ -10,6 +10,7 @@ mod feed;
 mod files;
 mod foundation;
 mod git;
+mod git_reads;
 mod panels;
 mod previews;
 mod pull_requests;
