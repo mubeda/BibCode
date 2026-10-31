@@ -780,9 +780,13 @@ async fn the_thread_branch_follows_an_agents_checkout() {
             .await,
     );
     assert_eq!(thread_branch(&fixture).await.as_deref(), Some("main"));
-    // A checkout made elsewhere is picked up when the agent deletes the branch it left.
-    fixture.git(&["checkout", "-q", "feature"]);
-    fixture.git(&["checkout", "-q", "-b", "next"]);
+    // The label never names a branch the agent deleted: it moves to the folder's checkout.
+    structured(
+        &fixture
+            .call("git_switch_branch", json!({ "name": "feature" }))
+            .await,
+    );
+    fixture.git(&["checkout", "-q", "main"]);
     structured(
         &fixture
             .call(
@@ -791,7 +795,30 @@ async fn the_thread_branch_follows_an_agents_checkout() {
             )
             .await,
     );
-    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("next"));
+    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("main"));
+    fixture.harness.shutdown().await;
+}
+
+/// A retry that replays a stored outcome ran no Git: a branch a person switched to since is
+/// theirs, and is never recorded as the agent's.
+#[tokio::test]
+async fn a_replayed_branch_outcome_never_records_a_persons_switch() {
+    let fixture = fixture().await;
+    structured(
+        &fixture
+            .call(
+                "git_create_branch",
+                json!({ "name": "old", "checkout": false }),
+            )
+            .await,
+    );
+    let delete = json!({ "name": "old", "force": true, "clientRequestId": "delete-old" });
+    structured(&fixture.call("git_delete_branch", delete.clone()).await);
+    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("main"));
+
+    fixture.git(&["checkout", "-q", "-b", "persons"]);
+    structured(&fixture.call("git_delete_branch", delete).await);
+    assert_eq!(thread_branch(&fixture).await.as_deref(), Some("main"));
     fixture.harness.shutdown().await;
 }
 
