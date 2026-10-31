@@ -112,7 +112,8 @@ the same handlers as the Source Control panel. They belong to the **Source contr
 
 - **Paths** are literal and relative to the thread's folder, at most 200 per call. A path
   that leaves the folder, directly or through a symlinked folder, and globs or Git pathspec
-  magic (`:(glob)…`, `*`, `?`, `[`, `\`) are refused. A file whose name contains one of
+  magic (`:(glob)…`, `*`, `?`, `[`, `\`) are refused, and so is Git's own metadata (`.git`, in
+  any case, or a path that resolves into the Git directory). A file whose name contains one of
   those characters cannot be named over MCP.
 - **Retries.** Every tool but `git_stage`, `git_unstage`, `git_fetch`, `git_create_branch`
   and `git_switch_branch` takes a `clientRequestId`. A retry with it returns the first

@@ -640,9 +640,15 @@ application surface. Its unary methods are:
 
 **Whole-file discard** (`gitManager.discard`, for the Changes view and MCP's
 `git_discard`) restores tracked paths from Git and sends untracked ones to the
-server's trash. A path whose folder resolves outside the checkout refuses the whole
-call before anything moves. On macOS and Linux the trash takes a path and resolves it
-later, so each entry is first staged by folder handle:
+server's trash. These refuse the whole call before anything moves:
+
+- a path whose folder resolves outside the checkout;
+- a path that starts with `.git` in any case. `validate_pathspecs` refuses this for
+  stage, unstage, stash and discard alike;
+- a path that resolves into, or holds, the Git directory or common directory.
+
+On macOS and Linux the trash takes a path and resolves it later, so each entry is
+first staged by folder handle:
 
 1. The canonical checkout is opened, and each folder of the path below it, with
    `O_DIRECTORY|O_NOFOLLOW`, so a folder that is, or turns into, a link is never
@@ -650,13 +656,22 @@ later, so each entry is first staged by folder handle:
 2. The entry is `renameat`ed by that handle into a new `0700` folder
    `<git_dir>/bibcode-discard/<uuid>/`, created and opened the same way. That
    folder sits on the repository's file system; Git never writes there, and no
-   checkout operation can reach it.
+   checkout operation can reach it. `bibcode-discard` must be owned by the
+   server's user and writable by no group or other user. Otherwise it is not
+   used: the entry counts as a trash refusal. Before the rename, an origin record
+   `<uuid>.origin` (the checkout root, a NUL, and the entry's path) is written
+   beside the holder.
 3. Before the trash runs, the staged path, resolved by string, must name the
    folders (from the Git directory down) and the entry BiBCode holds, by device and
    inode. After a trash that answered success, the entry must be gone from the held
    folder. If either check fails, the entry goes back and is kept.
 4. A refused entry is renamed back, never over a file created meanwhile
-   (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`).
+   (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). The holder and its
+   record are removed once the entry is trashed or back.
+5. Each discard first recovers what a crash left behind. A record whose holder still
+   holds its entry, and that no discard in this process is using, has the entry moved
+   back the same way, from the checkout root down, when its place is free. Otherwise
+   the entry stays and a warning is logged. A record whose holder is empty is removed.
 
 A folder that is a link keeps its entry in `trashUnavailable`, also under
 `permitPermanent`. Any other staging failure, such as a Git directory on another
