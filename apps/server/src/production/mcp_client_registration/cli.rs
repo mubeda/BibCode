@@ -11,7 +11,7 @@ use std::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{McpClient, SERVER_NAME, not_installed, refusal};
+use super::{McpClient, SERVER_NAME, State, not_installed, refusal};
 use crate::{
     git::{OutputPolicy, ProcessError, ProcessRequest, ProcessRunner},
     production::{
@@ -32,7 +32,6 @@ const NOT_REGISTERED: &str = "No MCP server named";
 const SUMMARY_LINES: usize = 3;
 const SUMMARY_CHARS: usize = 300;
 
-const GET_ARGS: [&str; 3] = ["mcp", "get", SERVER_NAME];
 /// Removing on request: for Claude without `--scope`, so an entry in any scope goes.
 const REMOVE_ARGS: [&str; 3] = ["mcp", "remove", SERVER_NAME];
 
@@ -45,7 +44,111 @@ pub(super) struct Cli {
 
 struct Output {
     code: i32,
+    stdout: String,
+    /// stderr, else stdout: what the tool said, for messages.
     text: String,
+}
+
+/// What the tool says about `bibcode`.
+enum Entry {
+    Absent,
+    /// Registered; the command it runs when its output could be read back.
+    Present(Option<Stored>),
+}
+
+/// A registered entry's command as the tool shows it.
+struct Stored {
+    /// The command line as the tool prints it (Claude Code joins the arguments with spaces).
+    shown: String,
+    /// The command split back into its parts, when that is unambiguous.
+    argv: Option<Vec<String>>,
+}
+
+/// `<tool> mcp get bibcode`: Codex prints JSON on request; Claude Code prints lines.
+fn get_args(client: McpClient) -> &'static [&'static str] {
+    match client {
+        McpClient::Claude => &["mcp", "get", SERVER_NAME],
+        _ => &["mcp", "get", SERVER_NAME, "--json"],
+    }
+}
+
+/// `claude mcp get` prints `  Command: <command>` and `  Args: <args joined by spaces>`.
+fn parse_claude_get(stdout: &str) -> Option<Stored> {
+    let field = |name: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix(name).map(str::trim_end))
+    };
+    let command = field("Command: ")?;
+    let args = field("Args:").map(str::trim).unwrap_or_default();
+    let shown = if args.is_empty() {
+        command.to_owned()
+    } else {
+        format!("{command} {args}")
+    };
+    Some(Stored {
+        shown,
+        argv: split_launch_args(args).map(|args| {
+            let mut argv = vec![command.to_owned()];
+            argv.extend(args);
+            argv
+        }),
+    })
+}
+
+/// `codex mcp get bibcode --json`: `{ "transport": { "type": "stdio", "command", "args" } }`.
+fn parse_codex_get(stdout: &str) -> Option<Stored> {
+    let value = serde_json::from_str::<Value>(stdout.trim()).ok()?;
+    let transport = value.get("transport")?;
+    if transport.get("type")?.as_str()? != "stdio" {
+        return None;
+    }
+    let mut argv = vec![transport.get("command")?.as_str()?.to_owned()];
+    for arg in transport
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        argv.push(arg.as_str()?.to_owned());
+    }
+    Some(Stored {
+        shown: argv.join(" "),
+        argv: Some(argv),
+    })
+}
+
+/// Space-joined arguments of a `bibcode mcp` command split back: `mcp`, then each
+/// `--flag value`, where a value may hold spaces (a data root) but not ` --`. `None` when the
+/// split would not join back to the same text.
+fn split_launch_args(joined: &str) -> Option<Vec<String>> {
+    if joined.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut pieces = joined.split(" --");
+    let mut args = pieces
+        .next()?
+        .split(' ')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for piece in pieces {
+        match piece.split_once(' ') {
+            Some((flag, value)) => {
+                args.push(format!("--{flag}"));
+                args.push(value.to_owned());
+            }
+            None => args.push(format!("--{piece}")),
+        }
+    }
+    (args.join(" ") == joined).then_some(args)
+}
+
+/// The start of a hand-typed add, for a message: the command follows it.
+fn add_prefix(client: McpClient) -> &'static str {
+    match client {
+        McpClient::Claude => "claude mcp add --scope user bibcode --",
+        _ => "codex mcp add bibcode --",
+    }
 }
 
 /// The tool's CLI from its provider settings (`binaryPath`, else `claude`/`codex`, and the
@@ -120,34 +223,56 @@ impl Cli {
             .await
             .map_err(|error| self.process_error(&error))?;
         let text = if output.stderr.trim().is_empty() {
-            output.stdout
+            output.stdout.clone()
         } else {
             output.stderr
         };
         Ok(Output {
             code: output.exit_code,
+            stdout: output.stdout,
             text,
         })
     }
 
-    pub(super) async fn is_registered(
-        &self,
-        cwd: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<bool, Value> {
-        let output = self.run(&GET_ARGS, cwd, READ_TIMEOUT, cancellation).await?;
-        if output.code == 0 {
-            Ok(true)
+    /// The entry as `mcp get` shows it. Its command is read even when the exit code is not
+    /// 0, as when `claude mcp get`'s health check of a stale entry fails.
+    async fn entry(&self, cwd: &Path, cancellation: &CancellationToken) -> Result<Entry, Value> {
+        let output = self
+            .run(get_args(self.client), cwd, READ_TIMEOUT, cancellation)
+            .await?;
+        let stored = match self.client {
+            McpClient::Claude => parse_claude_get(&output.stdout),
+            _ => parse_codex_get(&output.stdout),
+        };
+        if stored.is_some() || output.code == 0 {
+            Ok(Entry::Present(stored))
         } else if output.text.contains(NOT_REGISTERED) {
-            Ok(false)
+            Ok(Entry::Absent)
         } else {
             Err(self.failed("could not read its MCP servers", &output))
         }
     }
 
+    pub(super) async fn read(
+        &self,
+        launch: Option<&[String]>,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<State, Value> {
+        Ok(match self.entry(cwd, cancellation).await? {
+            Entry::Absent => State::Absent,
+            Entry::Present(stored) => State::Present {
+                up_to_date: stored
+                    .zip(launch)
+                    .map(|(stored, launch)| stored.shown == launch.join(" ")),
+            },
+        })
+    }
+
     /// Adds first, so a failing add never costs the person the entry they had. When the tool
-    /// refuses because `bibcode` exists (Claude Code), the entry is replaced; a tool whose add
-    /// overwrites (Codex) never gets that far.
+    /// refuses because `bibcode` exists (Claude Code), the entry is read, removed and added
+    /// again; if that add fails, the entry read is put back. A tool whose add overwrites
+    /// (Codex) never gets that far.
     pub(super) async fn add(&self, launch: &[String], cwd: &Path) -> Result<(), Value> {
         // A configuration change runs to the end even if the page that asked for it goes away.
         let cancellation = CancellationToken::new();
@@ -159,9 +284,11 @@ impl Cli {
         // Only a read that says the entry is absent ends here. An entry whose read fails (a
         // stale path failing `claude mcp get`'s health check) is replaced like a healthy one,
         // or nothing the person clicks would get them out.
-        if matches!(self.is_registered(cwd, &cancellation).await, Ok(false)) {
-            return Err(self.failed("could not add BiBCode", &added));
-        }
+        let previous = match self.entry(cwd, &cancellation).await {
+            Ok(Entry::Absent) => return Err(self.failed("could not add BiBCode", &added)),
+            Ok(Entry::Present(stored)) => stored,
+            Err(_) => None,
+        };
         let removed = self
             .run(
                 replace_args(self.client),
@@ -173,11 +300,62 @@ impl Cli {
         if removed.code != 0 {
             return Err(self.failed("could not replace its BiBCode entry", &removed));
         }
-        let added = self.run(&add, cwd, CHANGE_TIMEOUT, &cancellation).await?;
-        if added.code != 0 {
-            return Err(self.failed("could not add BiBCode", &added));
+        let added = match self.run(&add, cwd, CHANGE_TIMEOUT, &cancellation).await {
+            Ok(added) if added.code == 0 => return Ok(()),
+            Ok(added) => summary(&added.text),
+            Err(error) => error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim_end_matches('.')
+                .to_owned(),
+        };
+        Err(self.restore(previous, &added, cwd, &cancellation).await)
+    }
+
+    /// After a failed replacement: puts the previous entry back, and says what happened.
+    async fn restore(
+        &self,
+        previous: Option<Stored>,
+        said: &str,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Value {
+        let label = self.client.label();
+        if let Some(argv) = previous.as_ref().and_then(|stored| stored.argv.as_ref()) {
+            let restored = self
+                .run(
+                    &add_args(self.client, argv),
+                    cwd,
+                    CHANGE_TIMEOUT,
+                    cancellation,
+                )
+                .await;
+            if matches!(restored, Ok(Output { code: 0, .. })) {
+                return refusal(
+                    "failed",
+                    &format!(
+                        "{label} could not add BiBCode: {said}. Its previous BiBCode entry was put back. Check that `{}` works in a terminal, then try again.",
+                        self.list_command()
+                    ),
+                );
+            }
         }
-        Ok(())
+        let what = previous.map_or_else(
+            || "one BiBCode could not read".to_owned(),
+            |stored| format!("`{}`", stored.shown),
+        );
+        tracing::warn!(
+            client = self.client.id(),
+            "removed an MCP client's BiBCode entry and could not add it again"
+        );
+        refusal(
+            "failed",
+            &format!(
+                "{label} could not add BiBCode: {said}. BiBCode had removed its previous entry ({what}) and could not put it back. Fix the problem, then click Add to {label}, or run `{}` followed by the command under Other MCP clients.",
+                add_prefix(self.client)
+            ),
+        )
     }
 
     pub(super) async fn remove(&self, cwd: &Path) -> Result<(), Value> {
