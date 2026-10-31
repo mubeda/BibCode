@@ -79,7 +79,12 @@ fn iso_from_ms(ms: i64) -> Option<String> {
         })
 }
 
-fn endpoint_view(endpoint: &Endpoint, pending: i64, last_state: Option<&str>) -> Value {
+fn endpoint_view(
+    endpoint: &Endpoint,
+    pending: i64,
+    last_state: Option<&str>,
+    dropped: i64,
+) -> Value {
     json!({
         "id": endpoint.id,
         "name": endpoint.name,
@@ -92,6 +97,7 @@ fn endpoint_view(endpoint: &Endpoint, pending: i64, last_state: Option<&str>) ->
         "disabledReason": endpoint.disabled_reason,
         "pendingDeliveries": pending,
         "lastDeliveryState": last_state,
+        "droppedDeliveries": dropped,
         "createdAt": endpoint.created_at,
         "updatedAt": endpoint.updated_at,
     })
@@ -167,8 +173,9 @@ impl Webhooks {
         let endpoints: Vec<Value> = endpoints
             .iter()
             .map(|endpoint| {
-                let (pending, last) = summaries.get(&endpoint.id).cloned().unwrap_or((0, None));
-                endpoint_view(endpoint, pending, last.as_deref())
+                let (pending, last, dropped) =
+                    summaries.get(&endpoint.id).cloned().unwrap_or((0, None, 0));
+                endpoint_view(endpoint, pending, last.as_deref(), dropped)
             })
             .collect();
         Ok(json!({
@@ -319,7 +326,7 @@ impl Webhooks {
             .await
             .map_err(storage)?
             .ok_or_else(not_found)?;
-        let mut result = json!({ "endpoint": endpoint_view(&stored, 0, None) });
+        let mut result = json!({ "endpoint": endpoint_view(&stored, 0, None, 0) });
         if let Some(secret) = secret {
             result["secret"] = secret.into();
         }
@@ -400,6 +407,13 @@ impl Webhooks {
             .await
             .map_err(storage)?
             .ok_or_else(|| refusal("not_found", "This delivery is no longer in the log."))?;
+        // Still queued or being sent: a second copy would race it out of order.
+        if original.state == store::PENDING || original.state == store::SENDING {
+            return Err(refusal(
+                "queued",
+                "This delivery is still queued or being sent. Redeliver it after it finishes.",
+            ));
+        }
         let endpoint = self
             .store()
             .endpoint(&original.endpoint_id)
