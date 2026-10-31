@@ -77,8 +77,9 @@ struct GitExecutionOptions {
 struct GitExecutionInput {
     environment: Vec<(OsString, OsString)>,
     stdin: Option<Vec<u8>>,
-    /// Variables taken out of the inherited environment (an agent clone's).
-    removed: &'static [&'static str],
+    /// Inherit nothing: the child gets `environment` only (an agent clone's commands, which
+    /// put back an allowlist of the server's variables).
+    cleared: bool,
 }
 
 struct RewriteTempFiles {
@@ -107,16 +108,14 @@ pub(crate) trait GitProcessRunner: Send + Sync {
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a>;
 
-    /// [`Self::run`] with the variables `removed` names taken out of the inherited
-    /// environment (an agent clone's, `clone_policy`). A runner that starts no process
-    /// inherits nothing, so the default ignores them.
-    fn run_without_inherited<'a>(
+    /// [`Self::run`] inheriting nothing: the child gets `request.env` only (an agent clone's
+    /// commands, `clone_policy`). A runner that starts no process inherits nothing anyway,
+    /// so the default runs it as [`Self::run`].
+    fn run_cleared<'a>(
         &'a self,
         request: ProcessRequest,
-        removed: &'static [&'static str],
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a> {
-        let _ = removed;
         self.run(request, cancellation)
     }
 }
@@ -143,18 +142,12 @@ impl GitProcessRunner for ProcessRunner {
         Box::pin(ProcessRunner::run(self, request, cancellation))
     }
 
-    fn run_without_inherited<'a>(
+    fn run_cleared<'a>(
         &'a self,
         request: ProcessRequest,
-        removed: &'static [&'static str],
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a> {
-        Box::pin(ProcessRunner::run_without_inherited(
-            self,
-            request,
-            removed,
-            cancellation,
-        ))
+        Box::pin(ProcessRunner::run_cleared(self, request, cancellation))
     }
 }
 
@@ -519,7 +512,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment: git_environment(),
                 stdin: Some(stdin),
-                removed: &[],
+                cleared: false,
             },
             cancellation,
         )
@@ -566,7 +559,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment,
                 stdin: None,
-                removed: &[],
+                cleared: false,
             },
             cancellation,
         )
@@ -602,12 +595,10 @@ impl GitRepository {
             append_truncation_marker: false,
             allow_non_zero_exit: options.allow_non_zero_exit,
         };
-        let output = if input.removed.is_empty() {
-            self.runner.run(request, cancellation).await
+        let output = if input.cleared {
+            self.runner.run_cleared(request, cancellation).await
         } else {
-            self.runner
-                .run_without_inherited(request, input.removed, cancellation)
-                .await
+            self.runner.run(request, cancellation).await
         };
         output.map_err(|error| git_error(operation, cwd, argument_count, error))
     }
@@ -662,7 +653,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment: git_read_environment(),
                 stdin: Some(stdin),
-                removed: &[],
+                cleared: false,
             },
             cancellation,
         )
@@ -5252,18 +5243,16 @@ impl GitRepository {
 
     /// The URL `git clone <url>` run in `cwd` would contact, after the configuration's
     /// `url.<base>.insteadOf` rewrites: `git ls-remote --get-url`, which contacts nothing.
+    /// Like every command of an agent clone, it inherits only the allowlist and `environment`.
     pub(crate) async fn clone_remote_url(
         &self,
         cwd: &Path,
         url: &str,
-        environment: Vec<(OsString, OsString)>,
-        removed: &'static [&'static str],
+        environment: &[(OsString, OsString)],
         cancellation: &CancellationToken,
     ) -> Result<String, GitCommandError> {
-        let mut command_environment = git_read_environment();
-        command_environment.extend(environment);
         let output = self
-            .execute_with_environment_and_stdin(
+            .agent_clone_read(
                 "GitVcsDriver.cloneRemoteUrl",
                 cwd,
                 &[
@@ -5272,20 +5261,61 @@ impl GitRepository {
                     "--".into(),
                     url.into(),
                 ],
-                GitExecutionOptions {
-                    allow_non_zero_exit: false,
-                    max_output_bytes: 64 * 1024,
-                    output_policy: OutputPolicy::Error,
-                },
-                GitExecutionInput {
-                    environment: command_environment,
-                    stdin: None,
-                    removed,
-                },
+                environment,
                 cancellation,
             )
             .await?;
         Ok(output.stdout.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    /// `git --version` for an agent clone, inheriting only the allowlist and `environment`;
+    /// `None` when unparseable.
+    pub(crate) async fn clone_git_version(
+        &self,
+        cwd: &Path,
+        environment: &[(OsString, OsString)],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::git::GitVersion>, GitCommandError> {
+        let output = self
+            .agent_clone_read(
+                "GitVcsDriver.cloneGitVersion",
+                cwd,
+                &["--version".into()],
+                environment,
+                cancellation,
+            )
+            .await?;
+        Ok(crate::git::GitVersion::parse(&output.stdout))
+    }
+
+    async fn agent_clone_read(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        environment: &[(OsString, OsString)],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut command_environment = super::clone_policy::inherited_environment();
+        command_environment.extend(git_read_environment());
+        command_environment.extend(environment.iter().cloned());
+        self.execute_with_environment_and_stdin(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit: false,
+                max_output_bytes: 64 * 1024,
+                output_policy: OutputPolicy::Error,
+            },
+            GitExecutionInput {
+                environment: command_environment,
+                stdin: None,
+                cleared: true,
+            },
+            cancellation,
+        )
+        .await
     }
 
     /// The reuse check without reserving: `Ok(None)` when nothing exists at the destination,
@@ -7475,18 +7505,24 @@ impl ReservedClone {
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitCommandError> {
         let mut args = plan.map_or_else(Vec::new, |plan| plan.arguments().to_vec());
-        args.extend([
-            "clone".into(),
-            "--".into(),
-            self.url.clone(),
-            self.leaf.as_str().to_owned(),
-        ]);
-        let mut environment = git_environment();
+        args.push("clone".into());
+        if plan.is_some() {
+            // An empty template: no hooks are copied into the clone, whatever the
+            // environment or configuration names.
+            args.push("--template=".into());
+        }
+        args.extend(["--".into(), self.url.clone(), self.leaf.as_str().to_owned()]);
+        // An agent's clone inherits only the allowlist; a person's keeps the server's
+        // environment.
+        let mut environment = if plan.is_some() {
+            super::clone_policy::inherited_environment()
+        } else {
+            Vec::new()
+        };
+        environment.extend(git_environment());
         if let Some(plan) = plan {
             environment.extend(plan.environment().iter().cloned());
         }
-        // A person's clone keeps the server's inherited environment.
-        let removed = plan.map_or(&[][..], ClonePlan::removed_environment);
         self.repository
             .execute_with_environment_and_stdin(
                 CLONE_OPERATION,
@@ -7500,7 +7536,7 @@ impl ReservedClone {
                 GitExecutionInput {
                     environment,
                     stdin: None,
-                    removed,
+                    cleared: plan.is_some(),
                 },
                 cancellation,
             )
