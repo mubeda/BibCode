@@ -4923,3 +4923,26 @@ validation and the 20-endpoint limit. Also `webhooks::{signing,delivery,events}:
 `migration_061_adds_the_webhook_tables`, `webhooks_signal_follows_committed_setting`, the
 scope and latency tests, the contract settings test, `WebhooksTab.test.tsx` and two
 `AgentIntegrationsSection` tests (status line, tabs).
+
+**Advisor review fixes (before hand-off):**
+
+- **Idle cost.** A pass that finds nothing new in the feed writes nothing (it used to store
+  the same cursor each pass), and with webhooks off the loop reads nothing and sleeps up to
+  a minute unless the setting or a wake comes first; paired clients are checked only while
+  webhooks are on, before any delivery. Test: `an_idle_environment_writes_nothing_between_passes`
+  (SQLite `total_changes` unchanged over ten passes).
+- **A missing secret** is its own failure, `secret_missing`, never sent unsigned, and counts
+  toward health like any permanent failure (Rotate secret fixes it). Test:
+  `a_missing_secret_is_never_sent_unsigned`.
+- **No refused reads.** The header's summary reads `webhooks.list` only for the primary
+  environment when its session holds `access:read` (the scope this app knows); on other
+  environments the Webhooks tab reads it when opened and shows the server's refusal. The
+  primary environment without `access:read` says an administrator session is needed and
+  sends nothing.
+- **Redeliver** is disabled for a delivery still `pending` or `sending`, so a queued
+  delivery is never doubled.
+- **Revoked pairing in both tabs.** The MCP tab names the endpoints a revoked agent's
+  pairing turned off ("Webhooks turned off"), beside the Webhooks tab's own warning
+  (primary environment only, like the Agents list).
+- The header line truncates (full text in its tooltip) instead of overflowing at narrow
+  widths.
