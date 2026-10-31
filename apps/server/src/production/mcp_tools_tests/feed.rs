@@ -426,6 +426,174 @@ async fn one_call_scans_at_most_5000_events_and_returns_its_progress() {
     harness.shutdown().await;
 }
 
+async fn ask(harness: &Harness, thread_id: &str, kind: &str, request_id: &str) {
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.activity.append", "commandId": format!("ask-{kind}"),
+            "threadId": thread_id,
+            "activity": {
+                "id": format!("ask-{kind}"), "tone": "approval", "kind": kind,
+                "summary": "Asked", "payload": { "requestId": request_id, "requestKind": "command" },
+                "turnId": null, "createdAt": CREATED_AT,
+            },
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("request asked");
+}
+
+#[tokio::test]
+async fn a_request_id_that_is_not_a_plain_id_is_left_out() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    create_thread(&harness, "asks").await;
+    let cursor = head(&harness, &agent).await;
+    // A provider's request id is passed through as it gave it: a path and words here.
+    ask(
+        &harness,
+        "asks",
+        "approval.requested",
+        "/Users/someone/secret plan.txt",
+    )
+    .await;
+    ask(&harness, "asks", "user-input.requested", "per_01J:abc-9.x").await;
+    let page = feed(&harness, &agent, json!({ "cursor": cursor })).await;
+    let text = page.to_string();
+    assert!(!text.contains("secret"), "{text}");
+    assert!(!text.contains("/Users/someone"), "{text}");
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(kinds(&page), ["approval.requested", "input.requested"]);
+    assert!(entries[0].get("requestId").is_none(), "{}", entries[0]);
+    assert_eq!(entries[1]["requestId"], "per_01J:abc-9.x");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_call_parses_a_bounded_number_of_payload_bytes() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    create_thread(&harness, "loud").await;
+    let cursor = head(&harness, &agent).await;
+    // Three tool activities of 3 MiB each: each is a candidate type, so its payload would be
+    // parsed to learn its kind.
+    harness
+        .repositories
+        .database()
+        .call(|connection| {
+            let output = "x".repeat(3 * 1024 * 1024);
+            for version in 0..3 {
+                let payload = json!({
+                    "threadId": "loud",
+                    "activity": {
+                        "id": format!("tool-{version}"), "tone": "tool", "kind": "tool.completed",
+                        "summary": "Ran", "payload": { "output": output }, "turnId": null,
+                        "createdAt": CREATED_AT,
+                    },
+                });
+                connection.execute(
+                    "INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES (?, 'thread', 'loud', ?, 'thread.activity-appended', ?, NULL, NULL, NULL, 'provider', ?, '{}')",
+                    rusqlite::params![format!("tool-{version}"), 1_000 + version, CREATED_AT, payload.to_string()],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    ask(&harness, "loud", "approval.requested", "req-loud").await;
+    // At most one large payload is parsed per call: each call returns its progress, and the
+    // approval behind them is still found.
+    let first = feed(&harness, &agent, json!({ "cursor": cursor })).await;
+    assert_eq!(first["entries"], json!([]), "{first}");
+    assert_eq!(first["more"], true);
+    let (start, _) = positions(&cursor);
+    let (after_first, _) = positions(first["cursor"].as_str().unwrap());
+    assert_eq!(after_first, start + 1, "one large payload per call");
+    let mut at = first["cursor"].as_str().unwrap().to_owned();
+    let mut calls = 1;
+    let found = loop {
+        let page = feed(&harness, &agent, json!({ "cursor": at })).await;
+        calls += 1;
+        assert_increasing(&at, &page);
+        at = page["cursor"].as_str().unwrap().to_owned();
+        if !page["entries"].as_array().unwrap().is_empty() || page["more"] == false {
+            break page;
+        }
+        assert!(calls < 10, "the feed makes progress");
+    };
+    assert_eq!(kinds(&found), ["approval.requested"]);
+    assert_eq!(found["entries"][0]["requestId"], "req-loud");
+    harness.shutdown().await;
+}
+
+/// The worst case of one page, measured: 5,000 approval-shaped candidates of 100 KiB each
+/// in a file database. Run with `--ignored --nocapture`.
+#[tokio::test]
+#[ignore = "a measurement, not a check: it writes about 500 MB"]
+async fn measure_one_page_over_5000_large_events() {
+    let folder = tempfile::tempdir().expect("folder");
+    let path = folder.path().join("state.sqlite");
+    Database::create_new(&path)
+        .await
+        .expect("database")
+        .close()
+        .await;
+    let database = Database::open_existing(&path).await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            let transaction = connection.transaction()?;
+            let output = "x".repeat(100 * 1024);
+            for version in 0..5_000 {
+                let payload = json!({
+                    "threadId": "loud",
+                    "activity": {
+                        "id": format!("tool-{version}"), "tone": "tool", "kind": "tool.completed",
+                        "summary": "Ran", "payload": { "output": output }, "turnId": null,
+                        "createdAt": CREATED_AT,
+                    },
+                });
+                transaction.execute(
+                    "INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES (?, 'thread', 'loud', ?, 'thread.activity-appended', ?, NULL, NULL, NULL, 'provider', ?, '{}')",
+                    rusqlite::params![format!("tool-{version}"), version, CREATED_AT, payload.to_string()],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // Reopened, so SQLite's own page cache starts empty.
+    database.close().await;
+    let database = Database::open_existing(&path).await.expect("database");
+    let repositories = Repositories::new(database.clone());
+    // Bounded first, on a cold cache, so its window read is not helped by the full read.
+    for (name, budget) in [
+        ("bounded", crate::mcp::tools::feed::PARSE_BUDGET),
+        ("unbounded (before)", usize::MAX),
+        ("bounded", crate::mcp::tools::feed::PARSE_BUDGET),
+    ] {
+        let started = std::time::Instant::now();
+        let read = repositories
+            .read_change_feed(crate::persistence::ChangeFeedQuery {
+                after_sequence: 0,
+                after_activity: 0,
+                thread_id: None,
+                scan_limit: crate::mcp::tools::feed::SCAN_LIMIT,
+                parse_budget: budget,
+                activity_limit: 101,
+            })
+            .await
+            .unwrap();
+        println!(
+            "{name}: {} events scanned in {:?}",
+            read.scanned,
+            started.elapsed()
+        );
+    }
+    database.close().await;
+}
+
 #[tokio::test]
 async fn a_cursor_older_than_the_oldest_activity_row_reports_it_dropped() {
     let harness = Harness::new().await;
