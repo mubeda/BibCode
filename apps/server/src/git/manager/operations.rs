@@ -2383,7 +2383,7 @@ pub async fn discard_paths(
     cancellation: &CancellationToken,
 ) -> Result<DiscardOutcome, DiscardError> {
     validate_pathspecs("GitManager.discard", &request.cwd, &request.paths)?;
-    contain_discard_paths(&request.cwd, &request.paths).await?;
+    let root = contain_discard_paths(&request.cwd, &request.paths).await?;
     let tracked = repository
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
@@ -2403,7 +2403,15 @@ pub async fn discard_paths(
             restore_only.push(path.clone());
             continue;
         }
-        match trash.trash(absolute_path, cancellation).await {
+        // Checked again right before the move, and moved by the checked folder's canonical
+        // path: the trash takes a path, not a handle, so this is as close as the move can be
+        // bound to the folder that was checked. A folder swapped for a symlink to somewhere
+        // outside since the first check keeps its file.
+        let Some(checked_path) = contained_path(&root, &request.cwd, path).await else {
+            outcome.trash_unavailable.push(path.clone());
+            continue;
+        };
+        match trash.trash(checked_path, cancellation).await {
             Ok(()) => outcome.trashed.push(path.clone()),
             Err(_) if request.permit_permanent => {
                 outcome.permanently_discarded.push(path.clone());
@@ -2464,10 +2472,8 @@ pub async fn discard_paths(
 
 /// Refuses every path whose folder resolves outside the checkout, before anything is trashed or
 /// restored (#139 slice G, C5): a symlinked folder inside the checkout that points elsewhere
-/// cannot route a discard outside it. The deepest folder that exists is the one resolved, so a
-/// deleted tracked file in a deleted folder still passes. A path that is itself a symlink is
-/// allowed: the link is what is discarded.
-async fn contain_discard_paths(cwd: &Path, paths: &[String]) -> Result<(), DiscardError> {
+/// cannot route a discard outside it. Returns the checkout's canonical path.
+async fn contain_discard_paths(cwd: &Path, paths: &[String]) -> Result<PathBuf, DiscardError> {
     let refused = || {
         DiscardError::Git(GitCommandError {
             tag: "GitCommandError",
@@ -2480,27 +2486,49 @@ async fn contain_discard_paths(cwd: &Path, paths: &[String]) -> Result<(), Disca
     };
     let root = tokio::fs::canonicalize(cwd).await.map_err(|_| refused())?;
     for path in paths {
-        let Some(parent) = Path::new(path)
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        else {
-            continue;
-        };
-        let mut folder = cwd.join(parent);
-        while tokio::fs::metadata(&folder).await.is_err() {
-            match folder.parent() {
-                Some(up) if up.starts_with(cwd) && up != folder => folder = up.to_path_buf(),
-                _ => return Err(refused()),
-            }
-        }
-        let resolved = tokio::fs::canonicalize(&folder)
-            .await
-            .map_err(|_| refused())?;
-        if !resolved.starts_with(&root) {
+        if contained_path(&root, cwd, path).await.is_none() {
             return Err(refused());
         }
     }
-    Ok(())
+    Ok(root)
+}
+
+/// `path` (relative to `cwd`) below the canonical form of its deepest existing folder, or `None`
+/// when that folder resolves outside `root`, the canonical checkout. The deepest folder that
+/// exists is the one resolved, so a deleted tracked file in a deleted folder still passes. A
+/// path that is itself a symlink is allowed: the link is what is discarded.
+async fn contained_path(root: &Path, cwd: &Path, path: &str) -> Option<PathBuf> {
+    let absolute = cwd.join(path);
+    let mut folder = absolute.parent()?.to_path_buf();
+    while tokio::fs::metadata(&folder).await.is_err() {
+        match folder.parent() {
+            Some(up) if up.starts_with(cwd) && up != folder => folder = up.to_path_buf(),
+            _ => return None,
+        }
+    }
+    let resolved = tokio::fs::canonicalize(&folder).await.ok()?;
+    if !resolved.starts_with(root) {
+        return None;
+    }
+    Some(without_verbatim_prefix(
+        resolved.join(absolute.strip_prefix(&folder).ok()?),
+    ))
+}
+
+/// A canonical Windows path without its `\\?\` prefix, which the Recycle Bin refuses.
+#[cfg(windows)]
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{share}"));
+    }
+    text.strip_prefix(r"\\?\")
+        .map_or_else(|| path.clone(), PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn path_matches(requested: &str, candidate: &str) -> bool {
@@ -3721,6 +3749,84 @@ mod tests {
                 "base\n"
             );
         }
+    }
+
+    /// Moves each file into `destination`; while trashing the first, it swaps folder `swap.0`
+    /// for a symlink to `swap.1`, as another process could between the check and the move.
+    #[cfg(unix)]
+    struct SwappingTrash {
+        destination: PathBuf,
+        swap: (PathBuf, PathBuf),
+        trashed: Mutex<Vec<PathBuf>>,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for SwappingTrash {
+        fn trash<'a>(
+            &'a self,
+            path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            Box::pin(async move {
+                let mut trashed = self.trashed.lock().expect("swapping trash mutex");
+                if trashed.is_empty() {
+                    let (folder, outside) = &self.swap;
+                    std::fs::rename(folder, self.destination.join("swapped-away"))
+                        .expect("folder moves away");
+                    std::os::unix::fs::symlink(outside, folder).expect("symlink replaces it");
+                }
+                let destination = self.destination.join(trashed.len().to_string());
+                std::fs::rename(&path, destination).map_err(|_| TrashUnavailable)?;
+                trashed.push(path);
+                Ok(())
+            })
+        }
+    }
+
+    /// The containment check is repeated right before each move, and the move is given the
+    /// checked folder's canonical path: a folder swapped for a symlink to somewhere outside
+    /// after the first check cannot route the trash there (#139 slice G).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_swapped_for_an_outside_symlink_mid_discard_is_never_followed() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::tempdir().expect("outside folder");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("a.txt"), "a\n").expect("first file");
+        std::fs::create_dir(fixture.path().join("dir")).expect("folder");
+        std::fs::write(fixture.path().join("dir/victim.txt"), "inside\n").expect("inside file");
+        std::fs::write(outside.path().join("victim.txt"), "keep\n").expect("outside file");
+        let trash = Arc::new(SwappingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            swap: (fixture.path().join("dir"), outside.path().to_path_buf()),
+            trashed: Mutex::new(Vec::new()),
+        });
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            trash.clone(),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["a.txt".into(), "dir/victim.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(outcome.trashed, ["a.txt"]);
+        assert!(outcome.permanently_discarded.is_empty());
+        assert_eq!(outcome.trash_unavailable, ["dir/victim.txt"]);
+        assert_eq!(trash.trashed.lock().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep\n"
+        );
     }
 
     /// A symlinked folder inside the checkout that points elsewhere cannot route a discard
