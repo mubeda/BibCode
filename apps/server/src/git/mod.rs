@@ -20,7 +20,7 @@ pub use manager::graph::{
 };
 pub use manager::operations::{
     CoAuthor, CommitRequest, DiscardError, DiscardOutcome, DiscardRequest, FileTrash,
-    FileTrashFuture, NativeFileTrash, TrashUnavailable, UndoCommitDraft,
+    FileTrashFuture, NativeFileTrash, TrashUnavailable, UndoCommitDraft, without_verbatim_prefix,
 };
 pub use manager::refs::{
     GitManagerBlockedReason, GitManagerInProgressKind, GitManagerInProgressOperation,

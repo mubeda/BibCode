@@ -1,3 +1,4 @@
+pub(crate) mod beneath;
 mod entries;
 mod error;
 pub(crate) mod paths;

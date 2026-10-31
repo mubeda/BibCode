@@ -40,6 +40,8 @@ pub enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the system trash could not take {path}; it was left in place", path = .path.display())]
+    TrashUnavailable { path: PathBuf },
     #[error("workspace operation was cancelled")]
     Cancelled,
     #[error("invalid request: {0}")]
@@ -71,6 +73,7 @@ impl WorkspaceError {
             Self::NotFound { .. } | Self::RootNotFound { .. } => "path_not_found",
             Self::FileChangedOnDisk { .. } => "file_changed_on_disk",
             Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
+            Self::TrashUnavailable { .. } => "trash_unavailable",
             _ => "operation_failed",
         }
     }
@@ -103,7 +106,8 @@ impl WorkspaceError {
             | Self::AlreadyExists { path }
             | Self::NotFound { path }
             | Self::FileChangedOnDisk { path }
-            | Self::FileMissingOnDisk { path } => {
+            | Self::FileMissingOnDisk { path }
+            | Self::TrashUnavailable { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
             }
             Self::Operation {
