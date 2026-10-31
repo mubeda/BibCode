@@ -25,7 +25,7 @@ use super::{CREATED_AT, Harness, command, error_tag, structured};
 use crate::{
     git::{
         GitRepository,
-        clone_policy::{ClonePolicy, FixtureAllowance, REMOVED_ENVIRONMENT, tests::resolver},
+        clone_policy::{ClonePolicy, FixtureAllowance, tests::resolver},
     },
     mcp::{
         control::{ClientPrincipal, McpAccess, McpServerSettings},
@@ -1060,7 +1060,7 @@ async fn an_agent_may_not_detach_a_clone_and_cancels_only_its_own() {
     fixture.harness.shutdown().await;
 }
 
-/// The server variables an agent clone must not inherit, as the review named them.
+/// Server variables an agent clone must not inherit, as the reviews named them.
 const INHERITED: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -1081,28 +1081,59 @@ const INHERITED: &[&str] = &[
     "CURL_CA_BUNDLE",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    "GIT_TEMPLATE_DIR",
+    "GIT_EXEC_PATH",
+    "GIT_TRACE",
+    "GIT_TRACE2",
+    "GIT_TRACE_PACKFILE",
 ];
-const INHERITED_TEST: &str = "production::mcp_tools_tests::clone::an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone";
+const INHERITED_TEST: &str = "production::mcp_tools_tests::clone::an_inherited_server_environment_never_reaches_an_agent_clone";
 const INHERITED_PHASE: &str = "inherited-environment";
-/// The folder the inherited `GIT_WORK_TREE`, `GIT_DIR` and `GIT_INDEX_FILE` name.
+/// The folder the inherited variables point into.
 const OUTSIDE: &str = "BIBCODE_X6_OUTSIDE";
-/// A variable the agent clone's commands keep inheriting.
+/// A variable outside the allowlist, which a person's commands keep inheriting.
 const KEPT: &str = "BIBCODE_X6_KEPT";
 
-/// Review round 2 (second pass): an agent clone's commands do not inherit the server's
-/// repository-location or TLS trust variables, a person's commands still do, and an
-/// inherited `GIT_WORK_TREE` cannot move the checkout out of the reserved folder. In a
-/// process of its own, which inherits all of them (each TLS one set, and so exported, empty).
+/// Review round 2: an agent clone's commands inherit only an allowlist of the server's
+/// variables. In a process of its own that inherits a repository location
+/// (`GIT_WORK_TREE`, `GIT_DIR`, `GIT_INDEX_FILE`) outside the destination, the TLS trust
+/// overrides (exported empty), a `GIT_TEMPLATE_DIR` with an active `pre-commit` hook, a
+/// `GIT_EXEC_PATH` with fake `git-remote-http(s)` helpers that record being run, and
+/// `GIT_TRACE`, `GIT_TRACE2` and `GIT_TRACE_PACKFILE` files: the clone lands in its folder with
+/// no hooks, the helpers never run, no trace file appears, and nothing is written outside. A
+/// person's commands keep the whole environment.
 #[cfg(unix)]
 #[tokio::test]
-async fn an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone() {
+async fn an_inherited_server_environment_never_reaches_an_agent_clone() {
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::{
-        git::{OutputPolicy, ProcessRequest, ProcessRunner},
+        git::{OutputPolicy, ProcessRequest, ProcessRunner, clone_policy::inherited_environment},
         test_support::reexec,
     };
 
+    let executable = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
     let Some(child) = reexec::enter(INHERITED_TEST, INHERITED_PHASE) else {
         let outside = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let base = elsewhere.path();
+        let templates = base.join("templates");
+        std::fs::create_dir_all(templates.join("hooks")).unwrap();
+        executable(
+            &templates.join("hooks/pre-commit"),
+            &format!("#!/bin/sh\ntouch '{}/pre-commit-ran'\n", base.display()),
+        );
+        let exec_path = base.join("exec-path");
+        std::fs::create_dir_all(&exec_path).unwrap();
+        for helper in ["git-remote-http", "git-remote-https"] {
+            executable(
+                &exec_path.join(helper),
+                &format!("#!/bin/sh\ntouch '{}/helper-ran'\nexit 1\n", base.display()),
+            );
+        }
         reexec::run(INHERITED_TEST, INHERITED_PHASE, None, |command| {
             for name in INHERITED {
                 command.env(name, "");
@@ -1111,15 +1142,37 @@ async fn an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone() {
                 .env("GIT_WORK_TREE", outside.path())
                 .env("GIT_DIR", outside.path().join("git-dir"))
                 .env("GIT_INDEX_FILE", outside.path().join("index"))
+                .env("GIT_TEMPLATE_DIR", &templates)
+                .env("GIT_EXEC_PATH", &exec_path)
+                .env("GIT_TRACE", outside.path().join("trace"))
+                .env("GIT_TRACE2", outside.path().join("trace2"))
+                .env("GIT_TRACE_PACKFILE", outside.path().join("packfile"))
                 .env(OUTSIDE, outside.path())
                 .env(KEPT, "kept");
         });
-        let written = std::fs::read_dir(outside.path()).unwrap().count();
-        assert_eq!(written, 0, "the clone wrote outside its folder");
+        assert!(
+            !base.join("helper-ran").exists(),
+            "the fake remote helper ran"
+        );
+        let written = std::fs::read_dir(outside.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(written.is_empty(), "written outside the clone: {written:?}");
         return;
     };
 
+    let outside = PathBuf::from(std::env::var_os(OUTSIDE).expect("the outside folder"));
     let fixture = fixture(Options::default()).await;
+    // Only what the agent clone writes counts: clear what the setup's own Git left.
+    for entry in std::fs::read_dir(&outside).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
     let result = fixture
         .clone(
             &fixture.agent,
@@ -1129,19 +1182,32 @@ async fn an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone() {
     assert_eq!(structured(&result)["state"], "done", "{result}");
     let destination = fixture.projects.join("repo");
     assert!(destination.join("README.md").is_file());
-    assert!(destination.join(".git").is_dir());
-    let outside = PathBuf::from(std::env::var_os(OUTSIDE).expect("the outside folder"));
-    let written = std::fs::read_dir(&outside).unwrap().count();
-    assert_eq!(written, 0, "the clone wrote outside its folder");
+    let hooks = destination.join(".git/hooks");
+    let copied = std::fs::read_dir(&hooks)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        copied.is_empty(),
+        "hooks were copied into the clone: {copied:?}"
+    );
+    let written = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(written.is_empty(), "written outside the clone: {written:?}");
     fixture.harness.shutdown().await;
 
     let cwd = tempfile::tempdir().unwrap();
-    let request = || ProcessRequest {
+    let request = |env| ProcessRequest {
         operation: "test.environment".into(),
         command: PathBuf::from("env"),
         args: Vec::new(),
         cwd: cwd.path().to_path_buf(),
-        env: Vec::new(),
+        env,
         stdin: None,
         timeout: Duration::from_secs(10),
         max_output_bytes: 1 << 20,
@@ -1158,26 +1224,23 @@ async fn an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone() {
     let token = CancellationToken::new();
     let isolated = names(
         ProcessRunner
-            .run_without_inherited(request(), REMOVED_ENVIRONMENT, &token)
+            .run_cleared(request(inherited_environment()), &token)
             .await
             .expect("env runs")
             .stdout,
     );
     let inherited = names(
         ProcessRunner
-            .run(request(), &token)
+            .run(request(Vec::new()), &token)
             .await
             .expect("env runs")
             .stdout,
     );
-    for name in INHERITED {
+    for name in INHERITED.iter().chain(&[KEPT]) {
         assert!(!isolated.contains(*name), "an agent clone inherits {name}");
         assert!(inherited.contains(*name), "a person's command lost {name}");
     }
-    assert!(
-        isolated.contains(KEPT),
-        "an agent clone lost the rest of its environment"
-    );
+    assert!(isolated.contains("PATH"), "an agent clone lost PATH");
 
     child.complete();
 }

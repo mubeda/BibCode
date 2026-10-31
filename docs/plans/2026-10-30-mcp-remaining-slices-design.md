@@ -4536,30 +4536,45 @@ before its fix.
 - **Redirect tests.** The redirect fixtures now point at the target server by address: a
   redirect to `fixture.invalid` would fail to resolve whether or not it was followed, so
   the earlier `a_redirect_is_not_followed` proved the ban only through its message.
-- **Inherited server variables (Codex re-review, two P2s).** Agent clone commands still
-  inherited the server's environment. Each of them (the `ls-remote --get-url` read and the
-  clone) now has `REMOVED_ENVIRONMENT` (`clone_policy.rs`) taken out with `env_remove`, never
-  set empty, since Git treats an exported `GIT_SSL_NO_VERIFY`, even an empty one, as "skip
-  TLS verification": the repository-location variables (`GIT_DIR`, `GIT_WORK_TREE`,
-  `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-  `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`,
-  `GIT_DISCOVERY_ACROSS_FILESYSTEM`) and the TLS trust overrides (`GIT_SSL_NO_VERIFY`,
-  `GIT_SSL_CAINFO`, `GIT_SSL_CAPATH`, `GIT_SSL_CERT`, `GIT_SSL_KEY`, `GIT_SSL_CIPHER_LIST`,
-  `GIT_SSL_VERSION`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`). The system's default
-  trust store stays. `ProcessRequest` has no removal field and has 39 literals across other
-  slices' files, so the removal travels beside it instead:
-  `ProcessRunner::run_without_inherited` (`git/process.rs`, threaded to the command builder,
-  a file outside X6's rows), `GitProcessRunner::run_without_inherited` (its default, for
-  runners that start no process, ignores the list), and a `removed` list on the repository's
-  execution input that only `ReservedClone::transfer` with a plan and `clone_remote_url` set.
+- **Inherited server variables (Codex re-reviews: two P2s, then three more).** Agent clone
+  commands inherited the server's environment: first the repository-location variables
+  (`GIT_DIR`, `GIT_WORK_TREE`, ...) and the TLS trust overrides (`GIT_SSL_NO_VERIFY`, which
+  Git honours even exported empty, `GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`, `SSL_CERT_*`, ...),
+  which a denylist (`env_remove`, `3702646077`) closed; then `GIT_TEMPLATE_DIR` (hooks copied
+  into the clone, run on a later commit), `GIT_EXEC_PATH` (a custom `git-remote-https` that
+  ignores the pin) and `GIT_TRACE*` (raw clone data written to any file), which it missed.
+  The denylist is replaced by an allowlist that closes the class. Every Git command of an
+  agent clone (`git --version`, the `ls-remote --get-url` rewrite read, and the clone) now
+  runs with nothing inherited (`ProcessRunner::run_cleared`, `env_clear`) and gets back only
+  `PATH`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*` and `TZ`, plus `SystemRoot`, `windir`,
+  `ComSpec`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and `ProgramData` on Windows
+  (`clone_policy::is_inherited`, case-insensitive there), then Git's own non-interactive
+  settings (empty askpass, `GIT_TERMINAL_PROMPT=0`) and the isolation (`GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_NOSYSTEM`, `NO_PROXY`, ...). `HOME` is the null device, so nothing under a home
+  folder applies (curl's `.netrc` included). The clone also gets `--template=`: an empty
+  template, so no hooks are copied whatever the environment or configuration names. The
+  version check moved off the shared, cached `git_manager_git_version` onto the same cleared
+  path. The plumbing is small: `ProcessRunner::run_cleared` (`git/process.rs`, outside X6's
+  rows, beside the existing test-only cleared runner; the `env_remove` threading of
+  `3702646077` is reverted), `GitProcessRunner::run_cleared` (its default, for runners that
+  start no process, runs as `run`), and a `cleared` flag on the repository's execution input.
   A person's clone and every other Git command keep the inherited environment. Tests:
-  `an_agent_clone_drops_the_repository_location_and_tls_trust_variables` checks each name is
-  removed and none is set; `an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone`
-  re-runs itself in a process that inherits all nineteen (the TLS ones exported empty) with
-  `GIT_WORK_TREE`, `GIT_DIR` and `GIT_INDEX_FILE` naming an outside folder, checks with
-  `env` that the agent clone's runner drops each and keeps the rest while a person's keeps
-  them, and clones: the checkout lands in the reserved folder and nothing is written outside.
-  It failed with the list emptied.
+  `an_agent_clone_inherits_only_an_allowlist` checks the allowlist (every name the reviews
+  named, `HOME`, `XDG_CONFIG_HOME`, `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES` refused) and that
+  the plan sets none of them but `HOME`;
+  `an_inherited_server_environment_never_reaches_an_agent_clone` (unix) re-runs itself in a
+  process that inherits all of them, with `GIT_WORK_TREE`, `GIT_DIR` and `GIT_INDEX_FILE`
+  outside the destination, `GIT_TEMPLATE_DIR` holding an executable `pre-commit` hook,
+  `GIT_EXEC_PATH` holding fake `git-remote-http` and `git-remote-https` helpers that record
+  being run, and `GIT_TRACE`, `GIT_TRACE2` and `GIT_TRACE_PACKFILE` files: the clone lands in
+  its folder with an empty hooks folder, the helpers never run, no trace file appears and
+  nothing is written outside; `env` run through the agent path shows none of them (and no
+  other non-allowlisted variable) while a person's run shows all. With the clearing and the
+  empty template turned off it failed: Git took the outside `GIT_WORK_TREE` ("working tree
+  … already exists"), and, run again without the three repository-location variables, the
+  clone broke on the inherited `GIT_EXEC_PATH` and the other variables. That run does not
+  separate the template from the exec path and the trace files; the hooks, helper and trace
+  assertions each hold on the green run.
 - **New error tags for X3's table.** `McpCloneNotFoundError` and `McpCloneRefusedError`
   belong in `feed::ERRORS` (`mcp/tools/feed.rs`, not on this branch); the coordinator adds
   them when combining.

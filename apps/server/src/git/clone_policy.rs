@@ -69,31 +69,52 @@ const CURLOPT_RESOLVE: GitVersion = GitVersion {
     patch: 0,
 };
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Server variables an agent clone's Git commands do not inherit (`env_remove`; set empty,
-/// `GIT_SSL_NO_VERIFY` would still turn TLS verification off): where the repository, its
-/// work tree, index and objects are, and every TLS trust override. The system's default trust
-/// store stays.
-pub(crate) const REMOVED_ENVIRONMENT: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_SSL_NO_VERIFY",
-    "GIT_SSL_CAINFO",
-    "GIT_SSL_CAPATH",
-    "GIT_SSL_CERT",
-    "GIT_SSL_KEY",
-    "GIT_SSL_CIPHER_LIST",
-    "GIT_SSL_VERSION",
-    "CURL_CA_BUNDLE",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
+/// The only server variables an agent clone's Git commands inherit; everything else is cleared
+/// (`env_clear`). A denylist kept missing variables (`GIT_DIR` and `GIT_WORK_TREE`, the TLS
+/// trust overrides, `GIT_TEMPLATE_DIR`, `GIT_EXEC_PATH`, `GIT_TRACE*`), so the whole class is
+/// closed. `LC_*` is a prefix. Git's own settings, the isolation and `HOME` are set after.
+const INHERITED: &[&str] = &["PATH", "TMPDIR", "TEMP", "TMP", "LANG", "LC_*", "TZ"];
+/// What Windows programs need beside them.
+const INHERITED_ON_WINDOWS: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
 ];
+
+/// Whether an agent clone's Git commands inherit the server's variable `name`.
+pub(crate) fn is_inherited(name: &str) -> bool {
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let windows: &[&str] = if cfg!(windows) {
+        INHERITED_ON_WINDOWS
+    } else {
+        &[]
+    };
+    INHERITED
+        .iter()
+        .chain(windows)
+        .any(|allowed| match allowed.strip_suffix('*') {
+            Some(prefix) => name.len() >= prefix.len() && same(&name[..prefix.len()], prefix),
+            None => same(name, allowed),
+        })
+}
+
+/// The server's variables an agent clone's Git commands start from: the allowlist only.
+pub(crate) fn inherited_environment() -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_some_and(is_inherited))
+        .collect()
+}
 /// The null device, for an empty global configuration and an empty hooks folder.
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const OPERATION: &str = "GitVcsDriver.clone";
@@ -176,11 +197,6 @@ impl ClonePlan {
 
     pub(crate) fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
-    }
-
-    /// The server variables taken out of the clone's inherited environment.
-    pub(crate) fn removed_environment(&self) -> &'static [&'static str] {
-        REMOVED_ENVIRONMENT
     }
 }
 
@@ -387,6 +403,8 @@ impl ClonePolicy {
         // inherited `-c` parameters, and no proxy from the environment.
         environment.extend(
             [
+                // Nothing under a home folder: curl's `.netrc` included.
+                ("HOME", NULL_DEVICE),
                 ("GIT_CONFIG_GLOBAL", NULL_DEVICE),
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_PARAMETERS", ""),
@@ -422,8 +440,9 @@ impl ClonePolicy {
         check_leaf(leaf).map_err(refused)?;
         let allow_http = self.admits_fixture();
         let original = target(url, allow_http).map_err(refused)?;
+        let environment = self.environment();
         let version = repository
-            .git_manager_git_version(cwd, cancellation)
+            .clone_git_version(cwd, &environment, cancellation)
             .await
             .map_err(serialize)?;
         if version.is_none_or(|version| version < CURLOPT_RESOLVE) {
@@ -435,15 +454,8 @@ impl ClonePolicy {
                 ),
             )));
         }
-        let environment = self.environment();
         let expanded = repository
-            .clone_remote_url(
-                cwd,
-                url,
-                environment.clone(),
-                REMOVED_ENVIRONMENT,
-                cancellation,
-            )
+            .clone_remote_url(cwd, url, &environment, cancellation)
             .await
             .map_err(serialize)?;
         let expanded = target(&expanded, allow_http).map_err(refused)?;
@@ -813,12 +825,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_clone_drops_the_repository_location_and_tls_trust_variables() {
-        let policy = ClonePolicy::new(resolver(&[("github.com", "140.82.112.3")]));
-        let plan = plan(&policy, "https://github.com/owner/repo.git")
-            .await
-            .expect("a public host");
+    async fn an_agent_clone_inherits_only_an_allowlist() {
         for name in [
+            "PATH", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+        ] {
+            assert!(is_inherited(name), "{name}");
+        }
+        let refused = [
             "GIT_DIR",
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
@@ -838,14 +851,38 @@ pub(crate) mod tests {
             "CURL_CA_BUNDLE",
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
-        ] {
-            assert!(plan.removed_environment().contains(&name), "{name}");
-            // Removed, never set: an exported empty GIT_SSL_NO_VERIFY still skips TLS checks.
+            "GIT_TEMPLATE_DIR",
+            "GIT_EXEC_PATH",
+            "GIT_TRACE",
+            "GIT_TRACE2",
+            "GIT_TRACE2_EVENT",
+            "GIT_TRACE_PACKET",
+            "GIT_TRACE_PACKFILE",
+            "GIT_CURL_VERBOSE",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "PATHS",
+        ];
+        for name in refused {
+            assert!(!is_inherited(name), "{name}");
+        }
+        let policy = ClonePolicy::new(resolver(&[("github.com", "140.82.112.3")]));
+        let plan = plan(&policy, "https://github.com/owner/repo.git")
+            .await
+            .expect("a public host");
+        for name in refused.iter().filter(|name| **name != "HOME") {
+            // Never put back either: an exported empty GIT_SSL_NO_VERIFY still skips TLS checks.
             assert!(
-                !plan.environment().iter().any(|(key, _)| key == name),
+                !plan.environment().iter().any(|(key, _)| key == *name),
                 "{name} is set"
             );
         }
+        assert!(
+            plan.environment()
+                .contains(&("HOME".into(), NULL_DEVICE.into()))
+        );
     }
 
     #[tokio::test]

@@ -380,7 +380,9 @@ it, and add the clone as a project. These tools are in the **Workspace** set.
   redirect; clone the address it moved to.
 - **Your Git settings do not apply.** An agent's clone ignores your global and system Git
   configuration (rewrites, credentials, proxies, hooks, filters and URL-specific settings)
-  and any proxy in the environment, so it reaches only public repositories directly. On a
+  and the server's environment variables beyond the basics (`PATH`, temporary folders,
+  language and time zone), proxies and Git variables included, so it reaches only public
+  repositories directly, and copies no hooks into the clone. On a
   network that allows the internet only through a proxy, clone in BiBCode yourself.
 - **No Git LFS downloads.** LFS files stay pointer files, because a repository's
   `.lfsconfig` could point the download at any host. Run `git lfs pull` in the clone

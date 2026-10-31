@@ -3656,10 +3656,10 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   `GIT_CONFIG_GLOBAL` is the null device, `GIT_CONFIG_NOSYSTEM=1`,
   `GIT_CONFIG_PARAMETERS` empty, `GIT_CONFIG_COUNT=0`, every proxy variable empty and
   `NO_PROXY=*`, so none of the person's rewrites, credentials, proxies, URL-specific
-  `http.<url>.*` settings, hooks, fsmonitor or filter drivers apply, and the server's
-  repository-location (`GIT_DIR`, `GIT_WORK_TREE`, ...) and TLS trust (`GIT_SSL_*`,
-  `CURL_CA_BUNDLE`, `SSL_CERT_*`) variables are removed from what it inherits
-  (`REMOVED_ENVIRONMENT`, `env_remove`; never set empty);
+  `http.<url>.*` settings, hooks, fsmonitor or filter drivers apply; the commands inherit
+  nothing from the server (`env_clear`) but an allowlist (`PATH`, `TMPDIR`, `TEMP`, `TMP`,
+  `LANG`, `LC_*`, `TZ`, and the Windows system variables), with `HOME` the null device, and
+  the clone gets `--template=` so no hooks are copied;
 - `git ls-remote --get-url -- <url>` gives the URL after any `insteadOf` left (the clone
   folder's enclosing repository), which must pass the same checks;
 - every address of the original and the rewritten host is globally reachable: no range the
