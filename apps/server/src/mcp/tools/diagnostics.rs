@@ -578,9 +578,9 @@ fn event_fields(kind: &str) -> &'static [&'static str] {
             "operation",
             "durationMs",
         ],
-        "panic" => &[
-            "thread", "message", "location", "frames", "version", "os", "arch",
-        ],
+        // Not `message`: the hook redacts only home paths, so it can still name a file or
+        // quote a value.
+        "panic" => &["thread", "location", "frames", "version", "os", "arch"],
         "finding" => &["id", "fingerprint", "kindOf"],
         "telemetry.dropped" => &["count"],
         _ => &[],
@@ -842,7 +842,8 @@ fn evidence_fields(kind: &str) -> Vec<&'static str> {
         }
         "crash.oom" | "crash.system" => &[RUN],
         "crash.webview" => &[&["reason", "kind", "exitCode", "dump"], CRASH_RECORD],
-        "crash.panic" => &[&["thread", "location", "message"]],
+        // Not `message`, as for the `panic` event.
+        "crash.panic" => &[&["thread", "location"]],
         "subprocess.crash" => &[
             &[
                 "pid",

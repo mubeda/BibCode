@@ -254,7 +254,8 @@ set, and all but `refresh_providers` work at read-only.
   server draws at start, that matches across records until the server restarts; its
   correlation id and version are left out. A worktree path is kept only inside home (`~/…`),
   and a source location, crash module or stack frame keeps a relative path or its file name.
-  A panic's message is what the profiler redacted when it wrote it.
+  A panic's message is never returned, in its event, its `crash.panic` finding or a crash's
+  earlier events: it can still name a file. Its kind, thread, location and frames are.
 - **Catching up on findings.** `profiler_findings { since }` (inclusive) returns findings
   oldest first by `lastSeen`; follow `nextCursor` until it is null. A finding that recurs
   later comes again with its new `lastSeen` and `count`, even within the same second, and a
