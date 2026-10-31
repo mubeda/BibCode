@@ -8,6 +8,10 @@ read its replies and diffs, answer its approvals, and revert it to an earlier ch
 Each BiBCode environment hosts its own MCP server. The agent runs `bibcode mcp` on the host
 where that environment's server runs, and that command relays to the server over loopback.
 
+This page is for the person who sets it up. The [MCP reference](../reference/mcp.md) is
+written for the agent: every tool with its arguments, results and errors, the protocol
+versions, access levels and the safety model. Point an agent at it.
+
 ## Set it up
 
 1. In BiBCode, open **Settings → Agents → Agent integrations**. If several environments are
@@ -409,7 +413,7 @@ read and download tools work at read-only.
 | `files_list`     | Files and folders in the thread's folder, at most 200 (`limit`)                                              |
 | `files_search`   | Files and folders whose path matches `query`, best first                                                     |
 | `files_read`     | A text file in pages of up to 16,000 characters from `offset`, with the whole file's `version`               |
-| `files_write`    | Replaces a text file (at most 1 MiB), given the `version` it read or `createOnly`                            |
+| `files_write`    | Replaces a text file (at most 1 MiB), given the `version` it read (as `expectedVersion`) or `createOnly`     |
 | `files_create`   | Creates an empty file or a folder                                                                            |
 | `files_rename`   | Renames or moves a file or folder; refused when the target exists                                            |
 | `files_delete`   | **Destructive.** Moves a file or folder to the system trash, or deletes it with `permanent: true`            |
@@ -424,7 +428,8 @@ read and download tools work at read-only.
   operating system lets BiBCode prevent: another program moving a folder BiBCode already
   opened out of the thread's folder in the instant between that check and the change. BiBCode
   notices afterwards where it can and stops.
-- **No lost edits.** `files_write` needs the `version` `files_read` returned, or `createOnly`
+- **No lost edits.** `files_write` needs the `version` `files_read` returned (as
+  `expectedVersion`), or `createOnly`
   for a new file. A file changed since is refused (`file_changed_on_disk`); read it again.
   `createOnly` never replaces a file. A write is made in place, so the file keeps its links,
   owner and permissions; if it fails part-way, the old content is put back
@@ -537,12 +542,32 @@ echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
 - **Approvals.** A Supervised thread stops at its first approval, and whoever drives it may
   answer: you in BiBCode, or the agent with `answer_approval`. An agent may accept only on a
   thread at or below **Agents may**; it may decline or cancel on any thread.
-- **Not available.** There are no tools for worktree removal, discard, undo, revert,
-  delete, force-push, settings, credentials, the updater, pairing or relay.
+- **Destructive tools work at every level above Read only.** Supervised limits how the
+  threads an agent drives run, not what the agent itself may do: at Supervised an agent can
+  still answer approvals, revert a thread, remove a worktree, discard changes, undo a
+  commit, force-push, delete branches, merge a pull request, delete files, run JavaScript in
+  the preview, and (with **Terminals** on at Full access) type into a terminal. These tools
+  are marked destructive, so an agent that asks before destructive tools (such as Claude
+  Code) asks you first. To allow none of them, set **Agents may** to **Read only**, or turn
+  off the set that holds them under **What agents can use**. The
+  [safety model](../reference/mcp.md#safety-model) lists each one and what it can lose.
+- **Instructions inside results.** Every result tells the agent that thread messages,
+  diffs, files, pages and terminal output are untrusted, and the tools that accept an
+  approval tell it to approve only what you asked for.
+- **Live controls.** Turning **MCP server** off, lowering **Agents may** to Read only,
+  **Take over**, **Stop** or **Revoke** stops an agent's Source Control, pull request, clone
+  and transfer work in flight. Such work reports that its outcome is unknown, never that it
+  succeeded, and the agent is told to check before trying again.
+- **Not available.** There are no tools for settings, credentials and Authorized clients,
+  the updater, pairing, the relay, webhooks, the server log or the diagnostics bundle.
 - **Credential.** `bibcode mcp` signs in with its own credential, limited to reading and
-  operating threads, and only on `/mcp`. It lives only in that process's memory, never in a
-  command line, file or log, and is revoked when the agent stops the MCP server. Each
-  running agent shows as one **MCP · <agent name>** row in **Authorized clients**.
+  operating threads (and terminals, when **Terminals** was on at Full access when it
+  started), and only on `/mcp`. It lives only in that process's memory, never in a command
+  line, file or log, and is revoked when the agent stops the MCP server. Each running agent
+  shows as one **MCP · <agent name>** row in **Authorized clients**.
+- **Set names.** An error that a set is off names it as BiBCode does internally:
+  **Workspace** is the **Threads and worktrees** switch, and **Source control** is
+  **Source Control and pull requests**.
 
 ## Turning it off, and revoking one agent
 

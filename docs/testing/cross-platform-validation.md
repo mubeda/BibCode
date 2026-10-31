@@ -1753,6 +1753,37 @@ from `apps/web`.
    server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
    that the desktop executable's output reaches the terminal and a pipe.
 8. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
+9. **A destructive tool.** At Supervised, make a change in the disposable project and ask
+   the agent to discard it. Claude Code asks before `git_discard` runs (it is marked
+   destructive); after you allow it, the file is in the system trash, the server log has
+   one `MCP destructive tool` line with the tool, thread and outcome and no path, and
+   **Agent activity** lists the call with a file count.
+10. **A terminal.** Turn **Terminals** on under **What agents can use** (it is disabled until
+    **Agents may** is Full access), restart the agent's MCP server, and ask it to open a
+    terminal and run `echo $((40+2))`. The terminal appears as a tab in the thread's center
+    panel and the agent reads back `42`. Turn **Terminals** off: the agent's next terminal
+    call is refused naming the set, and the tab stays open.
+11. **The off switch mid-push.** Give the disposable project a remote whose `pre-receive`
+    hook sleeps 30 seconds. Ask the agent to push with a `clientRequestId`, and turn **MCP
+    server** off while the push waits. The agent gets `McpOutcomeUnknownError` with
+    `reason: "mcp-disabled"`; after you turn it on again, a retry with the same id answers
+    the same, and `git_status` shows whether the push landed.
+12. **Stop and Take over.** While a turn the agent started runs, press **Stop** on the
+    status bar's **Agent active** indicator: the turn is interrupted, a turn you started in
+    another thread keeps running, and the agent's next call says its access ended. Restart
+    its MCP server, press **Take over**: reads still work and its next change is refused as
+    read-only. **Hand back** restores the level it had, and its next change works.
+13. **A webhook delivery.** In the **Webhooks** tab turn **Webhooks** on, add an endpoint at
+    a disposable public HTTPS receiver with `thread.status_changed`, copy the secret, and
+    **Send test event**: the receiver gets `webhook.test`, and its `X-BibCode-Signature`
+    verifies with the secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
+    shows. Start a thread: the receiver gets `thread.status_changed` events, and
+    `changes_since` from the first event's `cursor` returns the entries after it.
+14. **A remote OAuth connect** with Claude Code and with Codex: see the remote section of the
+    [MCP reference](../reference/mcp.md#remote-http-with-oauth) once slice R lands.
+    <!-- TODO(R): replace this step with the remote OAuth smoke (connect, consent in
+    BiBCode, a call, a refresh after an hour, revocation, and reauthorizing for the
+    terminal scope). -->
 
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.

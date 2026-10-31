@@ -3,6 +3,15 @@
 Status: Approved 2026-10-24 with every recommended answer. Issue #139. Implemented last in
 the batch after v0.11.0.
 
+> **Superseded 2026-10-30 (historical).** Slice 1 shipped as designed here, and its
+> decisions are kept as they were. The remaining slices
+> ([2026-10-30-mcp-remaining-slices-design.md](./2026-10-30-mcp-remaining-slices-design.md))
+> replaced its non-goals and its answer on approvals: outside agents now answer approvals,
+> revert threads, remove worktrees, write Git and pull requests, use terminals, previews,
+> files, clone and diagnostics, and remote Streamable HTTP with OAuth is being added. For
+> current behavior read the [MCP reference](../reference/mcp.md) and
+> [Outside agents over MCP](../user/mcp.md), not this document.
+
 ## Goal
 
 Let an agent harness that BiBCode did not start, such as Claude Code or Codex
@@ -153,6 +162,12 @@ Goals:
 - Living docs, and a skill built test-first.
 
 Non-goals for slice 1:
+
+> **Superseded 2026-10-30.** Every non-goal below except the standalone `GET /mcp` stream,
+> the Tasks extension, resources, settings, credentials, the updater, pairing, the relay
+> and CLI session import was
+> delivered by the remaining slices; see the
+> [MCP reference](../reference/mcp.md#safety-model).
 
 - Remote Streamable HTTP for outside agents, which needs MCP OAuth (see
   Answers to the open questions).
@@ -620,7 +635,10 @@ Default on adds no capability. A same-user process can already run
   mints, revokes on exit, and sweeps orphans. Nothing is stored. A stored
   token would be one more live bearer at rest, and per-launch sessions keep
   Authorized clients showing one row per running agent.
-- **Approvals?** Keep the upstream stance in slice 1. A later
+- **Approvals?** _Superseded 2026-10-30: `answer_approval` shipped without
+  `anthropic/requiresUserInteraction` and without a separate opt-in; it is a destructive
+  tool available at every level above read-only (remaining-slices design, Revision 2,
+  questions 1 and 2)._ Keep the upstream stance in slice 1. A later
   `respond_to_approval` would need `_meta["anthropic/requiresUserInteraction"]: true`
   and an explicit per-environment opt-in that defaults off. Claude Code
   prompts on every such call, even in bypass modes, but other harnesses do not

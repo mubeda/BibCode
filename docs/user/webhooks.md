@@ -6,6 +6,9 @@ clones, or the profiler records a finding. It sends a signed HTTPS `POST` to eac
 you register. A request carries ids, kinds, statuses and a cursor, never a prompt, a
 message, a reply, terminal output, file contents, a diff or a token.
 
+The [webhooks reference](../reference/webhooks.md) is the complete contract for a
+receiver: every event's payload, signature verification, retries and catch-up.
+
 ## Set it up
 
 1. Open **Settings → Agents → Agent integrations**, choose the environment if you have more
