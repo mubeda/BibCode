@@ -446,7 +446,10 @@ read and download tools work at read-only.
 - **Nothing replaced by surprise.** `files_rename` and an upload without `overwrite` never
   replace a file, even one created while they run.
 - **Delete goes to the trash.** If the trash cannot take an entry, it is left in place
-  (`trash_unavailable`); nothing falls back to a permanent delete. A permanent delete of a
+  (`trash_unavailable`); nothing falls back to a permanent delete. If something else took
+  the entry's name while the trash was refusing it, it cannot go back and stays in
+  BiBCode's staging folder; the error (`McpTrashStagedError`) says where, and BiBCode moves
+  it back on the next delete or discard in that folder once the name is free. A permanent delete of a
   folder that stops part-way says where what is left is (`partially_removed`). `files_delete`
   takes a `clientRequestId`.
 - **Windows.** On a BiBCode server running on Windows, the tools that change files

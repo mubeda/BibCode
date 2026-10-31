@@ -661,14 +661,19 @@ first staged by folder handle:
    used: the entry counts as a trash refusal. Before the rename, an origin record
    `<uuid>.origin` is written beside the holder. It holds only the entry's path
    below the worktree root Git reports for this Git directory; the root itself is
-   never stored.
+   never stored. Right before the rename, the entry's held folder must still be
+   under the checkout (its `..` chain reaches the checkout's device and inode): a
+   folder another process moved out after it was opened stages nothing, and the
+   entry is kept where that folder went.
 3. Before the trash runs, the staged path, resolved by string, must name the
    folders (from the Git directory down) and the entry BiBCode holds, by device and
    inode. After a trash that answered success, the entry must be gone from the held
    folder. If either check fails, the entry goes back and is kept.
 4. A refused entry is renamed back, never over a file created meanwhile
    (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). The holder and its
-   record are removed once the entry is trashed or back.
+   record are removed once the entry is trashed or back. An entry whose name was taken
+   meanwhile stays in its holder: a discard lists it in `trashUnavailable`, and a Files
+   delete answers `kept_in_staging` with where it is (below).
 5. Each discard first recovers what a crash left behind. A discard holds an
    exclusive `flock` on its holder folder from just after creating it until it is
    done, so recovery, which takes that lock without waiting, never touches a holder a
@@ -3730,8 +3735,9 @@ them, and can move, swap or write anything there at any moment.
   through the parent's handle if the parent moved out (one that something was already put in
   stays, and the error says so). A folder's permanent removal renames it through the handle
   to a fresh name, opens that name by handle, and empties it with `openat` and `unlinkat`,
-  re-checking that it is under the root before each removal and stopping at the first failed
-  check; it removes the name only while it is still that folder, so a folder put at the
+  re-checking that it is under the root before each removal, the parked name's own included,
+  and stopping at the first failed check; it removes the name only while it is still that
+  folder, so a folder put at the
   parked name survives. If it stops, what is left goes back with a no-replace rename and the
   caller learns where (`partially_removed`, `leftAt`). Folder downloads plan and stream
   through the same no-follow handles (`plan_dir`, `archive_body_from`) and enforce the entry
@@ -3742,7 +3748,11 @@ them, and can move, swap or write anything there at any moment.
   directory, `workspace-trash/<hash of the root>`), each folder on the staged path is checked
   against what BiBCode holds, and only that path goes to the native trash. No workspace path
   is handed to it. A holder on another file system, or one without the no-replace rename,
-  stages nothing: `trash_unavailable`.
+  stages nothing: `trash_unavailable`. An entry the trash refused that cannot go back,
+  because something took its name meanwhile, stays in its holder and the delete answers
+  `kept_in_staging` (`McpTrashStagedError` for agents) with `stagedAt`, its path below the
+  folder `stagedIn` names (`git-dir` or `state-dir`); the panel's message gives the full
+  path. The next trash or discard there moves it back once the name is free.
 - **One writer per path.** `PathLocks` (in the workspace service, shared with the upload
   route), keyed by canonical path, serializes a guarded or plain write, an upload, a delete
   or trash, and a rename (both its paths, in key order). An upload holds it from its

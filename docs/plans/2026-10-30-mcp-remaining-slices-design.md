@@ -5359,3 +5359,32 @@ assembled.
 - Device twin failures keep only `_tag` and `message`, dropping `kind`, `running`, `imageId`
   and `state`.
 - A `files_read` of a missing path reports `operation_failed`, not `path_not_found`.
+
+**Review round 5 (Codex, 2026-10-31).** Three gaps against the narrowed model, each fixed
+with a test that failed first (all three confirmed by disabling the fix):
+
+- **A refused trash can strand the entry (P1).** A trash that refused an entry whose name
+  was taken meanwhile left it in the staging holder, yet the delete answered
+  `trash_unavailable` ("left in place"). G's `Moved` now has `Stranded(path)` (and
+  `Unstaged::Stranded`, `Staged::finish`/`put_back` return the staged path when it stays);
+  the workspace service answers `WorkspaceError::KeptInStaging` (`kept_in_staging`, with
+  `stagedAt` below the holder parent and `stagedIn`: `git-dir` or `state-dir`). The panel
+  shows the server's message, which names the full staged path; `files_delete` answers
+  `McpTrashStagedError` (in `feed::ERRORS`) with a message naming `stagedAt` and how to
+  recover, and no host path. Git discard still lists it in `trashUnavailable`.
+  `a_refused_trash_that_cannot_put_the_entry_back_says_where_it_is`,
+  `a_delete_the_trash_refused_after_its_name_was_taken_says_where_the_file_is`. The Files
+  panel deletes permanently (it never sends `toTrash`), so it reaches this only through a
+  future trash option; its generic error path already shows the message.
+- **Staging could move an entry out of a folder that left (P1).** `discard_staging::stage`
+  takes the checkout's identity first and, right before its `renameat`, re-checks that the
+  entry's held folder is still beneath it (`beneath::folder_beneath`, the same `..` walk);
+  a folder moved out stages nothing (`Unstaged::Escapes`, kept). Shared G code, so Git
+  discard gets it too. `a_folder_moved_out_of_the_checkout_before_staging_is_never_staged`.
+- **The final directory removal skipped the check (P2).** `remove_dir_all` re-checks the
+  held parent right before removing the parked, emptied folder's name.
+  `a_parent_moved_out_before_the_final_removal_keeps_the_parked_folder`.
+- **Contracts:** `kept_in_staging` failure, `stagedAt` and `stagedIn`
+  (`ProjectTrashStagingFolder`) on the delete error; RPC wire fixtures regenerated.
+- **Not closed:** the residual of (a): each of these checks still leaves the one system call
+  after it.
