@@ -7,6 +7,7 @@ mod foundation;
 mod git;
 mod previews;
 mod pull_requests;
+mod terminals;
 mod thread_actions;
 mod threads;
 mod worktrees;
