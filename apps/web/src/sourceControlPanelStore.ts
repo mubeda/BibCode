@@ -248,7 +248,11 @@ const persistedStore = persist<SourceControlPanelStoreState>(
             outcome: "dismissed",
           }),
         };
-        if (state.byCwdKey[cwdKey]?.message !== message) return retired;
+        // Only a draft the suggestion filled, or that Use it put in, is the agent's text: the
+        // person may have typed the same words, and an offered suggestion never touched them.
+        const handled = agentSuggestionOutcome(record, intentId);
+        const fromSuggestion = handled === "filled" || handled === "used";
+        if (!fromSuggestion || state.byCwdKey[cwdKey]?.message !== message) return retired;
         const { [cwdKey]: _committed, ...byCwdKey } = state.byCwdKey;
         return { ...retired, byCwdKey };
       }),
