@@ -535,6 +535,32 @@ async fn replayed_codes_denials_and_revocation_end_the_grant() {
             .map(|client| client["sessionId"].as_str().unwrap().to_owned())
             .expect("the grant is an authorized client")
     };
+    // Take over works on a remote grant: its still-valid access token is read only.
+    let taken = client()
+        .post(format!("{base}/api/auth/clients/mcp-access"))
+        .bearer_auth(&admin)
+        .json(&json!({ "sessionId": session_id, "access": "read-only" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(taken.status(), StatusCode::OK);
+    let refused: Value = client()
+        .post(format!("{base}/mcp"))
+        .bearer_auth(tokens["access_token"].as_str().unwrap())
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "start_thread", "arguments": {} },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["_tag"], "McpAccessCeilingError",
+        "{refused}"
+    );
     let revoked = client()
         .post(format!("{base}/api/auth/clients/revoke"))
         .bearer_auth(&admin)
