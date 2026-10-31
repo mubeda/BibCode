@@ -88,9 +88,26 @@ async fn register(base: &str, forwarded_for: Option<&str>) -> reqwest::Response 
             "response_types": ["code"],
         }));
     if let Some(forwarded_for) = forwarded_for {
-        request = request.header("x-forwarded-for", forwarded_for);
+        request = through_local_proxy(request, forwarded_for);
     }
     request.send().await.unwrap()
+}
+
+/// The public host a local HTTPS proxy in these tests serves.
+const PROXIED: &str = "https://bibcode.example.test";
+
+/// A request as the documented nginx recipe forwards it: a loopback `Host`, the public host
+/// and scheme, and the client's address in `X-Forwarded-For`.
+fn through_local_proxy(request: reqwest::RequestBuilder, client: &str) -> reqwest::RequestBuilder {
+    request
+        .header("x-forwarded-host", "bibcode.example.test")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-for", client)
+}
+
+/// An authorization URL for the proxied origin, sent to this server.
+fn proxied_url(base: &str, client_id: &str) -> String {
+    authorize_url(PROXIED, client_id, &[]).replace(PROXIED, base)
 }
 
 async fn client_id(base: &str, forwarded_for: Option<&str>) -> String {
@@ -129,7 +146,7 @@ struct Pending {
 async fn authorize(url: &str, forwarded_for: Option<&str>) -> reqwest::Response {
     let mut request = client().get(url);
     if let Some(forwarded_for) = forwarded_for {
-        request = request.header("x-forwarded-for", forwarded_for);
+        request = through_local_proxy(request, forwarded_for);
     }
     request.send().await.unwrap()
 }
@@ -491,6 +508,19 @@ async fn replayed_codes_denials_and_revocation_end_the_grant() {
     let (_, tokens) = exchange_code(&base, &client_id, &code, VERIFIER).await;
     let access = tokens["access_token"].as_str().unwrap().to_owned();
     assert_eq!(list_tools(&base, &access).await, StatusCode::OK);
+    // Review round 2: a captured code without its binding is refused without revoking.
+    // Without the verifier:
+    let (stolen, error) = exchange_code(&base, &client_id, &code, &"w".repeat(43)).await;
+    assert_eq!(
+        (stolen, error["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    assert_eq!(list_tools(&base, &access).await, StatusCode::OK);
+    // With the verifier but another client:
+    let (stolen, _) = exchange_code(&base, "mcp-somebody-else", &code, VERIFIER).await;
+    assert_eq!(stolen, StatusCode::BAD_REQUEST);
+    assert_eq!(list_tools(&base, &access).await, StatusCode::OK);
+    // With the whole binding, it is a replay: refused, and the grant it minted is revoked.
     let (replayed, error) = exchange_code(&base, &client_id, &code, VERIFIER).await;
     assert_eq!(
         (replayed, error["error"].as_str()),
@@ -840,27 +870,25 @@ async fn one_source_or_client_cannot_lock_out_another() {
     let second = client_id(&base, flood).await;
     let third = client_id(&base, flood).await;
     for client in [&first, &first, &second, &second] {
-        let page = authorize(&authorize_url(&base, client, &[]), flood).await;
+        let page = authorize(&proxied_url(&base, client), flood).await;
         assert_eq!(page.status(), StatusCode::OK);
     }
     // The client is at its own cap, and so is the source.
     assert_eq!(
-        authorize(&authorize_url(&base, &first, &[]), Some("198.51.100.7"))
+        authorize(&proxied_url(&base, &first), Some("198.51.100.7"))
             .await
             .status(),
         StatusCode::TOO_MANY_REQUESTS
     );
     assert_eq!(
-        authorize(&authorize_url(&base, &third, &[]), flood)
-            .await
-            .status(),
+        authorize(&proxied_url(&base, &third), flood).await.status(),
         StatusCode::TOO_MANY_REQUESTS
     );
     // Another source, and another client, still get through.
     let other = Some("198.51.100.7");
     let elsewhere = client_id(&base, other).await;
     assert_eq!(
-        authorize(&authorize_url(&base, &elsewhere, &[]), other)
+        authorize(&proxied_url(&base, &elsewhere), other)
             .await
             .status(),
         StatusCode::OK
@@ -958,6 +986,82 @@ async fn an_ineligible_origin_serves_no_oauth_but_keeps_the_token_exchange() {
     assert_eq!(
         (expired, error["error"].as_str()),
         (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// Review round 2: through a local proxy, `X-Forwarded-For` is the client's word. Rotating
+/// it cannot dodge the caps: the proxy class shares a coarse cap, and no proxy-class
+/// request evicts another class's pending request.
+#[tokio::test]
+async fn rotating_forwarded_for_through_a_proxy_cannot_dodge_the_caps_or_evict_others() {
+    let root = tempfile::tempdir().unwrap();
+    let server = start_server(root.path(), json!({})).await;
+    let base = format!("http://{}", server.local_addr());
+    let through_proxy = |request: reqwest::RequestBuilder, fake: usize| {
+        through_local_proxy(request, &format!("203.0.{}.7", fake % 250))
+    };
+    // A direct request waits first.
+    let direct_client = client_id(&base, None).await;
+    assert_eq!(
+        authorize(&authorize_url(&base, &direct_client, &[]), None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let mut admitted = 0;
+    let mut refused = 0;
+    for fake in 0..40 {
+        let registered = through_proxy(
+            client()
+                .post(format!("{base}/oauth/register"))
+                .json(&json!({
+                    "client_name": "Spoofer",
+                    "redirect_uris": [REDIRECT],
+                })),
+            fake,
+        )
+        .send()
+        .await
+        .unwrap();
+        if registered.status() != StatusCode::CREATED {
+            refused += 1;
+            continue;
+        }
+        let spoofed_client = registered.json::<Value>().await.unwrap()["client_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let answer = through_proxy(client().get(proxied_url(&base, &spoofed_client)), fake)
+            .send()
+            .await
+            .unwrap();
+        if answer.status() == StatusCode::OK {
+            admitted += 1;
+        } else {
+            assert_eq!(answer.status(), StatusCode::TOO_MANY_REQUESTS);
+            refused += 1;
+        }
+    }
+    assert!(
+        admitted <= 16,
+        "{admitted} proxy-class requests were admitted"
+    );
+    assert!(refused > 0);
+    // The direct request still waits.
+    let (repositories, database) = repositories(root.path()).await;
+    let pending = repositories
+        .list_pending_mcp_oauth_authorizations(super::now_ms())
+        .await
+        .unwrap();
+    database.close().await;
+    assert!(
+        pending
+            .iter()
+            .any(|request| request.client_id == direct_client),
+        "the direct request was evicted"
     );
 
     server.shutdown();

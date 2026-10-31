@@ -4053,6 +4053,65 @@ mod tests {
         );
     }
 
+    /// Review round 2: refresh-token history stays bounded per grant, and the reuse of a
+    /// recent old token is still detected.
+    #[tokio::test]
+    async fn a_thousand_refreshes_keep_the_token_history_bounded() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let _tokens = minted_remote_grant(&service, &repositories, "refresh-0").await;
+        let client_id = repositories
+            .get_mcp_oauth_authorization_by_code(super::super::oauth::secret_hash("code"))
+            .await
+            .unwrap()
+            .unwrap()
+            .client_id;
+        for index in 0..1_000 {
+            let outcome = repositories
+                .rotate_mcp_oauth_refresh_token(
+                    McpOAuthRefreshRotation {
+                        client_id: client_id.clone(),
+                        ..rotation(
+                            &format!("refresh-{index}"),
+                            &format!("refresh-{}", index + 1),
+                        )
+                    },
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, McpOAuthRefreshOutcome::Rotated(_)),
+                "rotation {index}"
+            );
+        }
+        let rows: i64 = repositories
+            .database()
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_refresh_tokens",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(rows <= 33, "{rows} refresh-token rows kept");
+        // A token used a few rotations ago is still recognized, and revokes the grant.
+        assert!(matches!(
+            repositories
+                .rotate_mcp_oauth_refresh_token(
+                    McpOAuthRefreshRotation {
+                        client_id,
+                        ..rotation("refresh-995", "refresh-x")
+                    },
+                    now_ms(),
+                )
+                .await
+                .unwrap(),
+            McpOAuthRefreshOutcome::Reused { .. }
+        ));
+    }
+
     /// A code works once; its second use revokes the session it minted.
     #[tokio::test]
     async fn a_replayed_code_revokes_the_grant_it_minted() {

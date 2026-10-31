@@ -221,8 +221,10 @@ pub struct RequestOrigin {
     pub class: RequestClass,
     /// `scheme://host[:port]` as the client reached this server; `None` for [`RequestClass::Other`].
     pub origin: Option<String>,
-    /// Who sent it, for the unauthenticated routes' admission: the peer's network (for a
-    /// loopback peer, the last `X-Forwarded-For` entry's), or the managed tunnel.
+    /// Who sent it, for the unauthenticated routes' admission: `<class>:<network>`. The
+    /// class is the request's own (`direct`, `proxy`, `tunnel`, `other`); the network is the
+    /// peer's /24 or /64, except behind a local proxy, where it is the last
+    /// `X-Forwarded-For` entry, which only the proxy vouches for.
     pub source_key: String,
 }
 
@@ -234,7 +236,7 @@ impl RequestOrigin {
         Self {
             class: RequestClass::Direct,
             origin: Some(origin.into()),
-            source_key: "loopback".to_owned(),
+            source_key: "direct:loopback".to_owned(),
         }
     }
 
@@ -317,7 +319,7 @@ fn classify_request(
     let forwarded =
         headers.contains_key(X_FORWARDED_HOST) || headers.contains_key(X_FORWARDED_PROTO);
     let honored = peer_loopback && (host_is_loopback || host_is_bound);
-    let source_key = source_key(peer, headers);
+    let peer_network = peer.map_or_else(|| "unknown".to_owned(), network_key);
     if !honored {
         headers.remove(X_FORWARDED_HOST);
         headers.remove(X_FORWARDED_PROTO);
@@ -342,7 +344,7 @@ fn classify_request(
         return RequestOrigin {
             class: RequestClass::LocalProxy,
             origin: normalized_origin(scheme, &host),
-            source_key,
+            source_key: format!("proxy:{}", forwarded_for_network(headers)),
         };
     }
     if !forwarded && ((peer_loopback && host_is_loopback) || host_is_bound) {
@@ -356,7 +358,7 @@ fn classify_request(
                 RequestClass::Other
             },
             origin,
-            source_key,
+            source_key: format!("direct:{peer_network}"),
         };
     }
     if let Some(local) = local
@@ -365,13 +367,13 @@ fn classify_request(
         return RequestOrigin {
             class: RequestClass::ManagedTunnel,
             origin: normalized_origin("https", &hostname),
-            source_key: "tunnel".to_owned(),
+            source_key: "tunnel:".to_owned(),
         };
     }
     RequestOrigin {
         class: RequestClass::Other,
         origin: None,
-        source_key,
+        source_key: format!("other:{peer_network}"),
     }
 }
 
@@ -408,16 +410,22 @@ fn authority_is_address(authority: &str, address: SocketAddr) -> bool {
         && url.port_or_known_default() == Some(address.port())
 }
 
-/// The admission source of a request: the peer's network (an IPv4 /24 or IPv6 /64), with a
-/// loopback peer keyed by the last `X-Forwarded-For` entry, which a local proxy appends.
-fn source_key(peer: Option<IpAddr>, headers: &HeaderMap) -> String {
-    let Some(peer) = peer else {
-        return "unknown".to_owned();
-    };
-    let forwarded_for = headers
+/// The network behind a local proxy: the last `X-Forwarded-For` entry, which the documented
+/// recipe sets to the client's address. The server cannot prove that, so admission treats the
+/// `proxy` class as unproven (review round 2).
+fn forwarded_for_network(headers: &HeaderMap) -> String {
+    headers
         .get(X_FORWARDED_FOR)
-        .and_then(|value| value.to_str().ok());
-    match crate::rpc::effective_preauth_peer(peer, forwarded_for) {
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next_back())
+        .map(|entry| entry.trim().trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|entry| entry.parse::<IpAddr>().ok())
+        .map_or_else(|| "unknown".to_owned(), network_key)
+}
+
+/// An address's admission network: an IPv4 /24 or IPv6 /64, or `loopback` or `unspecified`.
+fn network_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
         ip if ip.is_unspecified() => "unspecified".to_owned(),
         ip if ip.is_loopback() => "loopback".to_owned(),
         IpAddr::V4(ip) => {
@@ -1394,7 +1402,7 @@ mod tests {
         assert!(!headers.contains_key(X_FORWARDED_HOST));
         assert!(!headers.contains_key(X_FORWARDED_PROTO));
         assert_eq!(origin.class, RequestClass::ManagedTunnel);
-        assert_eq!(origin.source_key, "tunnel");
+        assert_eq!(origin.source_key, "tunnel:");
         assert_eq!(
             origin.eligible_origin(),
             Some("https://env-1.connect.example")
@@ -1424,7 +1432,7 @@ mod tests {
         let lan = classify("192.168.1.5:3773", "192.168.1.9", "192.168.1.5:3773");
         assert_eq!(lan.class, RequestClass::Direct);
         assert_eq!(lan.eligible_origin(), None);
-        assert_eq!(lan.source_key, "v4:192.168.1.0/24");
+        assert_eq!(lan.source_key, "direct:v4:192.168.1.0/24");
         // A LAN peer naming a loopback host is not direct.
         let spoofed = classify("127.0.0.1:3773", "192.168.1.9", "192.168.1.5:3773");
         assert_eq!(spoofed.class, RequestClass::Other);
