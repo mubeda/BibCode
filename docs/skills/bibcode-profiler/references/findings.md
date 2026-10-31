@@ -68,10 +68,14 @@ An outside agent's `profiler_status` and `profiler_findings` on BiBCode's own
 `/mcp` return each finding without `title` and `summary`, and with only the
 evidence fields its kind lists below plus the citations above. Free text
 (`exitDetail`, `journal`) is left out. A `clientId` becomes an opaque `h` and 12
-hex characters, a `worktree` or `path` outside home (not `~/…`) is left out, and
-`location`, `exe` and a path-shaped `rawRef` keep a relative path or the file
-name. Adding a kind or an evidence field here means adding it to
-`evidence_fields` in `apps/server/src/mcp/tools/diagnostics.rs` too.
+hex characters, keyed with a secret the server draws at start, so it matches
+the events' alias until the server restarts. A `worktree` or `path` outside home
+(not `~/…`) is left out, and `location`, `exe`, `module`, `faultModule`, a
+path-shaped `rawRef` and the module in each of `frames` keep a relative path or
+the file name. A finding too large to return alone comes with
+`evidenceOmitted: true` and no `evidence`. Adding a kind or an evidence field
+here means adding it to `evidence_fields` in
+`apps/server/src/mcp/tools/diagnostics.rs` too.
 
 ## Crashes
 

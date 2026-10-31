@@ -249,15 +249,17 @@ set, and all but `refresh_providers` work at read-only.
   The profiler tools return the profiler's own records cut to their documented fields: a
   finding keeps its kind, counts, times and its kind's evidence, without `title` or
   `summary`; an event keeps its envelope and its kind's fields, and an undocumented kind only
-  its envelope. A client's id comes back as an opaque `h…` value that matches across
-  records; its correlation id and version are left out. A worktree path is kept only inside
-  home (`~/…`), and a source location or stack frame keeps a relative path or its file name.
+  its envelope. A client's id comes back as an opaque `h…` value, keyed with a secret the
+  server draws at start, that matches across records until the server restarts; its
+  correlation id and version are left out. A worktree path is kept only inside home (`~/…`),
+  and a source location, crash module or stack frame keeps a relative path or its file name.
   A panic's message is what the profiler redacted when it wrote it.
 - **Catching up on findings.** `profiler_findings { since }` (inclusive) returns findings
   oldest first by `lastSeen`; follow `nextCursor` until it is null. A finding that recurs
   later comes again with its new `lastSeen` and `count`, even within the same second, and a
-  finding written into the second a page ended in comes on the next page. Up to 1,000
-  findings are kept.
+  finding written into the second a page ended in comes on the next page. A page shrinks to
+  fit beside its cursor, and a finding too large to return alone comes with
+  `evidenceOmitted: true`. Up to 1,000 findings are kept.
 - The profiler tools read the profiler's directory whether recording is on or off. Without a
   profiler runtime they return `McpProfilerUnavailableError`.
 - `profiler_symbolicate` and symbol downloads stay on `bibcode profiler mcp`, and the server

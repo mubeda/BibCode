@@ -2014,8 +2014,12 @@ bounded memory, and works while the server is stopped.
   inclusive, with an opaque `nextCursor` while more remain, so a gap of any
   size is caught up page by page. `lastSeen` is whole seconds and the book
   keeps no position, so the cursor names the second its page ended in and marks
-  each finding read there by id and count; that second is read again, which
-  returns a finding written into it later or one that recurred in it.
+  the latest count read of each finding still in that second; that second is
+  read again, which returns a finding written into it later or one that
+  recurred in it. One mark per finding bounds a cursor by the book's 1,000. A
+  page is fitted with its own cursor, dropping findings and never the cursor,
+  and a finding too large alone comes with `evidenceOmitted: true`, so every
+  page makes progress.
 - **Profiler tools on `/mcp`.** Outside agents get `profiler_status`,
   `profiler_findings`, `profiler_events` and `profiler_crash` in the
   Diagnostics set (`mcp/tools/diagnostics.rs`, slice X2 of #139). They run the
@@ -2027,10 +2031,12 @@ bounded memory, and works while the server is stopped.
   `title` or `summary`; an event keeps its envelope and the payload fields its
   kind documents in
   [`events.md`](../skills/bibcode-profiler/references/events.md), and an
-  undocumented kind its envelope only. A client's id becomes an opaque hash,
-  its correlation id and version are left out, worktree paths outside home are
-  left out, and source locations and frame files keep a relative path or a
-  file name.
+  undocumented kind its envelope only. A client's id becomes an HMAC-SHA-256
+  alias keyed with a random secret drawn once per server process, so it holds
+  within one run and cannot be recovered by hashing guesses; its correlation
+  id and version are left out, worktree paths outside home are left out, and
+  source locations, crash modules and frames, and frame files keep a relative
+  path or a file name.
   `profiler_symbolicate` stays on stdio. `git.stacked-action` records only a
   supported action name, or `unknown`, since the client chooses that text.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)

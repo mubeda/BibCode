@@ -4006,3 +4006,36 @@ after pruning, also with every row gone; refused cursors and limits; and a trans
 written to the file database while no server ran, read with the old cursor after a restart.
 `mcp::tools::feed::tests` covers the cursor's parsing, the session mapping and the error
 table scan; `mcp::relay::tests` the two typed relay failures.
+
+**Codex review fixes (review round 3, 2026-10-31).** All four P2s were confirmed and fixed
+test first; each new test was seen failing against the round-two code:
+
+- **OS crash paths.** Confirmed: `crash.native` (and `crash.webview`, `subprocess.crash`)
+  evidence kept `module`, `faultModule` and each frame's module as the host path. They now keep
+  a relative path or the file name; a frame `symbol (module + 0xoffset)` or
+  `module + 0xoffset` is rebuilt around its module's file name, so a module path with spaces
+  is reduced too. A panic event's frame `module` is reduced the same way.
+- **Guessable client ids.** Confirmed: the alias was an unsalted digest. It is now
+  HMAC-SHA-256 under a 32-byte key drawn once per server process with `getrandom`, never
+  stored or returned, so an alias matches across events and findings within one run and
+  changes on restart (chosen over a persisted key: correlation is only needed while an agent
+  reads one run's records). If no key can be drawn, the id is left out.
+- **A busy second outgrew its cursor.** Confirmed: every `(id, count)` mark was appended,
+  earlier counts of a recurring finding included. A mark is now a 10-hex id mark and a 6-hex
+  count mark (the count's low 24 bits), at most one per finding: a page overwrites the count
+  of a finding it read again, and marks of findings no longer in that second are dropped. The
+  limit is derived from the book (`64 + MAX_FINDINGS × 17` = 17,064 characters, with
+  `MAX_FINDINGS` now `pub(super)` in `findings.rs`), so every cursor the server emits parses.
+- **A large page lost its cursor.** Confirmed: the page was fitted with 256 characters of
+  room, and a long cursor then pushed the result over 80,000 characters, which the formatter
+  replaces with its note. The `/mcp` page is now projected first
+  (`profiler::findings_page(reader, arguments, project_finding)`) and fitted with its actual
+  cursor, dropping findings from its end and recomputing the cursor until `tool_result` would
+  return it whole. A finding too large alone comes without `evidence` and with
+  `evidenceOmitted: true`, so each page returns at least one finding.
+
+Tests: `a_busy_second_with_recurrences_keeps_its_cursor_within_the_limit` (1,000 findings in
+one second, half read, all recurring twice), `a_large_page_keeps_its_cursor_and_makes_progress`
+(899 small findings building a long cursor, 100 large ones in the same second, one of 90,000
+characters), `a_crash_records_modules_and_frames_keep_file_names_only` and
+`a_client_alias_is_keyed_not_a_plain_digest`.
