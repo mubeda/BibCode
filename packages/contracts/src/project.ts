@@ -194,6 +194,8 @@ export const ProjectFileFailure = Schema.Literals([
   "operation_failed",
   "file_changed_on_disk",
   "file_missing_on_disk",
+  // A delete asked for the system trash, which could not take the entry; it was left in place.
+  "trash_unavailable",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
@@ -383,6 +385,9 @@ export class ProjectRenameEntryError extends Schema.TaggedError<ProjectRenameEnt
 export const ProjectDeleteEntryInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_ENTRY_PATH_MAX_LENGTH)),
+  // Move the entry to the system trash instead of deleting it. Off unless set; a trash that cannot
+  // take it fails with `trash_unavailable` and leaves it in place.
+  toTrash: Schema.optional(Schema.Boolean),
 });
 export type ProjectDeleteEntryInput = typeof ProjectDeleteEntryInput.Type;
 
