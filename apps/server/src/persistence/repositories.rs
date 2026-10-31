@@ -2901,6 +2901,8 @@ pub struct ChangeFeedQuery {
     pub after_activity: i64,
     pub thread_id: Option<String>,
     pub scan_limit: usize,
+    /// The most payload bytes of transition-type events the read parses.
+    pub parse_budget: usize,
     pub activity_limit: usize,
 }
 
@@ -2947,6 +2949,8 @@ pub struct ChangeFeedRead {
     /// How many events were scanned, and the last one's sequence (the cursor's when none).
     pub scanned: usize,
     pub scanned_to: i64,
+    /// More events follow the window: it reached `scan_limit`, or the parse budget cut it.
+    pub more_events: bool,
     /// Activity rows after the cursor, in id order.
     pub activity: Vec<ActivityChangeRow>,
     /// The oldest activity row kept, if any.
@@ -2971,6 +2975,10 @@ const TRANSITION_COLUMNS: &str = "e.sequence, e.event_type, e.stream_id, e.occur
     CASE WHEN e.event_type = 'thread.activity-appended' THEN COALESCE(json_extract(e.payload_json, '$.activity.payload.requestId'), json_extract(e.metadata_json, '$.requestId')) END, \
     json_extract(e.metadata_json, '$.actor')";
 
+/// The bytes of an event's payload the transition read may parse: a transition type's whole
+/// payload (an approval's kind is inside it), nothing for any other event.
+const PARSE_COST: &str = "CASE WHEN aggregate_kind = 'thread' AND event_type IN ('thread.created', 'thread.archived', 'thread.turn-start-requested', 'thread.session-set', 'thread.activity-appended') THEN octet_length(payload_json) ELSE 0 END";
+
 fn change_feed_heads(connection: &Connection) -> Result<(i64, i64)> {
     Ok(connection.query_row(
         "SELECT (SELECT COALESCE(MAX(sequence), 0) FROM orchestration_events), \
@@ -2985,22 +2993,28 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
     let (event_head, activity_head) = change_feed_heads(connection)?;
     let scan_limit = i64::try_from(query.scan_limit).unwrap_or(i64::MAX);
     let thread = query.thread_id.as_deref();
-    // The scanned window: a thread's events through its stream index, or every event.
-    let (scanned, scanned_to): (i64, Option<i64>) = match thread {
-        Some(thread_id) => connection.query_row(
-            "SELECT COUNT(*), MAX(sequence) FROM (SELECT sequence FROM orchestration_events \
-             WHERE aggregate_kind = 'thread' AND stream_id = ?1 AND sequence > ?2 \
-             ORDER BY sequence LIMIT ?3)",
-            params![thread_id, query.after_sequence, scan_limit],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?,
-        None => connection.query_row(
-            "SELECT COUNT(*), MAX(sequence) FROM (SELECT sequence FROM orchestration_events \
-             WHERE sequence > ?1 ORDER BY sequence LIMIT ?2)",
-            params![query.after_sequence, scan_limit],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?,
+    let parse_budget = i64::try_from(query.parse_budget).unwrap_or(i64::MAX);
+    // The scanned window: at most `scan_limit` events after the cursor (a thread's through its
+    // stream index), cut before the event whose transition-type payload would bring the bytes
+    // to be parsed past `parse_budget`. `octet_length` reads a payload's size from the record
+    // header, never its text. The first event is always kept, so a call progresses.
+    let stream = if thread.is_some() {
+        "aggregate_kind = 'thread' AND stream_id = ?4 AND"
+    } else {
+        "?4 IS NULL AND"
     };
+    let (total, scanned, scanned_to): (i64, i64, Option<i64>) = connection.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(kept), 0), MAX(CASE WHEN kept THEN sequence END) FROM ( \
+               SELECT sequence, (n = 1 OR spent <= ?3) AS kept FROM ( \
+                 SELECT sequence, ROW_NUMBER() OVER w AS n, SUM(cost) OVER w AS spent FROM ( \
+                   SELECT sequence, {PARSE_COST} AS cost FROM orchestration_events \
+                   WHERE {stream} sequence > ?1 ORDER BY sequence LIMIT ?2) \
+                 WINDOW w AS (ORDER BY sequence ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)))"
+        ),
+        params![query.after_sequence, scan_limit, parse_budget, thread],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
     let scanned_to = scanned_to.unwrap_or(query.after_sequence);
     let transitions = {
         // A thread's window is read through its stream index, not the whole range.
@@ -3054,6 +3068,7 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
     Ok(ChangeFeedRead {
         transitions,
         scanned: usize::try_from(scanned).unwrap_or(0),
+        more_events: total >= scan_limit || scanned < total,
         scanned_to,
         activity,
         oldest_activity,

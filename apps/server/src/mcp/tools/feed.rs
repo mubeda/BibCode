@@ -28,6 +28,10 @@ use crate::{
 const READ: &str = SCOPE_ORCHESTRATION_READ;
 /// The most events one `changes_since` call scans.
 pub(crate) const SCAN_LIMIT: usize = 5_000;
+/// The most payload bytes of transition-type events one call lets SQLite parse. The scan stops
+/// before the event that would pass it; the first event is always scanned, so a call progresses
+/// past one larger payload.
+pub(crate) const PARSE_BUDGET: usize = 4 * 1024 * 1024;
 /// Entries per page: `(default, most)`.
 const LIMIT: (i64, i64) = (100, 500);
 
@@ -68,7 +72,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
             object_schema(json!({}), &[]),
         ),
         "changes_since" => (
-            "What changed since a cursor, as ids and states only, never text: threads and chat panels created or archived, turns requested, started, completed, interrupted or failed, session status, approvals and input requested or resolved (each entry has its requestId), and each change outside agents made through MCP (tool, outcome and a target of ids). Without a cursor it returns the current position and no entries: start there. Pass each call's cursor to the next; while more is true, call again at once. One call scans at most 5,000 events and returns its position even when nothing matched. A cursor older than the agent activity BiBCode keeps (7 days, 5,000 rows) sets activityDropped. Use one cursor with one threadId. Not in the feed: Git operations a person ran in the app, worktree and file changes, and profiler findings (profiler_findings has its own cursor).",
+            "What changed since a cursor, as ids and states only, never text: threads and chat panels created or archived, turns requested, started, completed, interrupted or failed, session status, approvals and input requested or resolved (with the requestId when it is a plain id; otherwise list_pending_requests names it), and each change outside agents made through MCP (tool, outcome and a target of ids). Without a cursor it returns the current position and no entries: start there. Pass each call's cursor to the next; while more is true, call again at once. One call scans at most 5,000 events (fewer when their payloads are large) and returns its position even when nothing matched. A cursor older than the agent activity BiBCode keeps (7 days, 5,000 rows) sets activityDropped. Use one cursor with one threadId. Not in the feed: Git operations a person ran in the app, worktree and file changes, and profiler findings (profiler_findings has its own cursor).",
             object_schema(
                 json!({
                     "cursor": { "type": "string", "description": "The cursor a previous call returned (the page's, or any entry's); omit it to start from now." },
@@ -185,6 +189,7 @@ impl ToolCall<'_> {
                 after_activity: cursor.activity,
                 thread_id,
                 scan_limit: SCAN_LIMIT,
+                parse_budget: PARSE_BUDGET,
                 // One more than a page, to know whether more remain.
                 activity_limit: limit + 1,
             })
@@ -230,7 +235,7 @@ impl ToolCall<'_> {
                 entries.push(entry);
             }
         }
-        let more = !complete || read.scanned >= SCAN_LIMIT;
+        let more = !complete || read.more_events;
         let mut content = json!({ "entries": entries });
         if fit_list(&mut content, "/entries", Cut::Back, 1) > 0 {
             let last = content["entries"]
@@ -373,8 +378,13 @@ fn event_actor(json: &str) -> Option<Value> {
     }))
 }
 
+/// A provider's request id is passed through as it gave it, so only a plain id is returned:
+/// `[A-Za-z0-9_.:-]{1,128}`. Any other is left out; `list_pending_requests` names it.
 fn is_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().count() <= 256 && !id.chars().any(char::is_control)
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
 /// Every error tag the MCP tools themselves return: `(tag, what it means, what fixes it)`.
