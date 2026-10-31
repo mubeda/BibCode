@@ -21,7 +21,7 @@ use crate::{
             CLIENT_REQUEST_ID, Family, McpCapability, ProgressSink, ToolCall, ToolFuture,
             ToolResult, ToolSpec, invalid_argument, object_schema,
         },
-        outcome::Owned,
+        outcome::{Owned, outcome_unknown},
         protocol::{Cut, tool_result, typed_tool_failure},
         target::validate_paths,
     },
@@ -247,7 +247,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "git_delete_branch" => (
-            "Destructive: deletes a local branch, and with deleteRemote its upstream branch on the remote too, in that order. If the remote deletion fails, the result is McpPartialOutcomeError naming the git_delete_remote_branch call that finishes it.",
+            "Destructive: deletes a local branch, and with deleteRemote its upstream branch on the remote too, in that order. If the remote deletion fails, or stops before it reports (remote: unknown; run git_fetch to check), the result is McpPartialOutcomeError naming the git_delete_remote_branch call that finishes it.",
             object(
                 json!({
                     "threadId": thread,
@@ -813,37 +813,53 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             match deleted {
                 Ok(_) => Ok(json!({ "branch": name, "local": "deleted", "remote": "deleted" })),
                 // Whether a stream that stopped reporting reached the remote is unknown, and is
-                // recorded so.
+                // recorded so, with the known local deletion and the remote target.
                 Err(failure)
                     if failure["structuredContent"]["error"]["_tag"]
                         == crate::rpc::STREAM_ENDED_TAG =>
                 {
-                    Err(failure)
+                    Err(outcome_unknown(partial(
+                        &remote,
+                        &remote_branch,
+                        &failure,
+                        true,
+                    )))
                 }
-                Err(failure) => Err(partial(&remote, &remote_branch, &failure)),
+                Err(failure) => Err(partial(&remote, &remote_branch, &failure, false)),
             }
         })
         .await;
     finish(call, &place, result).await
 }
 
-/// The local branch is gone and the remote one is not: the truth, with the call that finishes
-/// it. A keyed retry replays it.
-fn partial(remote: &str, remote_branch: &str, failure: &Value) -> Value {
+/// The local branch is gone and the remote one is not, or may not be (`unknown`, when the
+/// remote step stopped reporting): the truth, with the call that finishes it. A keyed retry
+/// replays it.
+fn partial(remote: &str, remote_branch: &str, failure: &Value, unknown: bool) -> Value {
     let error = &failure["structuredContent"]["error"];
     let reason = error["message"].as_str().unwrap_or("the remote refused it");
     let mut partial = typed_tool_failure(
         PARTIAL_TAG,
-        &format!(
-            "The local branch was deleted, but deleting the remote branch failed: {reason} Call git_delete_remote_branch with this remote and branch to finish."
-        ),
+        &if unknown {
+            format!(
+                "The local branch was deleted, but whether the remote branch was deleted is unknown: {reason} Run git_fetch; if {remote}/{remote_branch} is still listed, call git_delete_remote_branch with this remote and branch to finish."
+            )
+        } else {
+            format!(
+                "The local branch was deleted, but deleting the remote branch failed: {reason} Call git_delete_remote_branch with this remote and branch to finish."
+            )
+        },
     );
     let fields = &mut partial["structuredContent"]["error"];
     fields["local"] = "deleted".into();
-    fields["remote"] = "failed".into();
+    fields["remote"] = if unknown { "unknown" } else { "failed" }.into();
     fields["remoteName"] = remote.into();
     fields["remoteBranch"] = remote_branch.into();
-    fields["reason"] = error.get("code").cloned().unwrap_or(Value::Null);
+    fields["reason"] = error
+        .get("code")
+        .or_else(|| error.get("reason"))
+        .cloned()
+        .unwrap_or(Value::Null);
     fields["recovery"] = json!({
         "tool": "git_delete_remote_branch",
         "arguments": { "remote": remote, "branch": remote_branch },
