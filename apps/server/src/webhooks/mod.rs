@@ -157,6 +157,17 @@ struct Inner {
     task: Mutex<Option<JoinHandle<()>>>,
     /// Loop passes so far: a test counts them to catch a busy loop.
     passes: std::sync::atomic::AtomicU64,
+    /// A test holds the next sender here, just after its revision read.
+    #[cfg(test)]
+    revision_read_pause: Mutex<Option<Arc<Pause>>>,
+}
+
+/// Where a test holds a sender: it signals `reached`, then waits for `release`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Pause {
+    pub(crate) reached: Notify,
+    pub(crate) release: Notify,
 }
 
 /// The dispatcher's position in the findings book: the newest `lastSeen` second it delivered
@@ -223,6 +234,8 @@ impl Webhooks {
                 findings_version: Mutex::new(None),
                 task: Mutex::new(None),
                 passes: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                revision_read_pause: Mutex::new(None),
             }),
         };
         let task = tokio::spawn(run(webhooks.clone()));
@@ -240,6 +253,30 @@ impl Webhooks {
             && error.is_panic()
         {
             tracing::error!("the webhook dispatcher panicked");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_sender_after_revision_read(&self) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        *self.inner.revision_read_pause.lock().expect("pause lock") = Some(pause.clone());
+        pause
+    }
+
+    /// A sender has read the endpoint's revision and is about to post (a test may hold it).
+    async fn after_revision_read(&self) {
+        #[cfg(test)]
+        {
+            let pause = self
+                .inner
+                .revision_read_pause
+                .lock()
+                .expect("pause lock")
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
         }
     }
 
@@ -489,6 +526,7 @@ impl Webhooks {
             }
             return;
         }
+        self.after_revision_read().await;
         let attempt = self
             .attempt_holding_turn(
                 &endpoint,
@@ -801,18 +839,43 @@ impl Webhooks {
 
     /// Disables the endpoints paired with a revoked client.
     async fn client_removed(&self, session_id: &str) {
-        match self.inner.store.disable_paired(session_id).await {
-            Ok(disabled) => {
-                for endpoint in disabled {
-                    self.cancel_endpoint(&endpoint);
-                    tracing::warn!(
-                        endpoint = %endpoint,
-                        "webhook endpoint disabled: its paired MCP client was revoked"
-                    );
-                }
+        let paired = match self.inner.store.paired_endpoints(session_id).await {
+            Ok(paired) => paired,
+            Err(error) => {
+                tracing::warn!(%error, "could not read paired webhook endpoints");
+                return;
             }
-            Err(error) => tracing::warn!(%error, "could not disable paired webhook endpoints"),
+        };
+        for endpoint in paired {
+            let disabled = self
+                .under_send_lock(
+                    &endpoint,
+                    self.inner
+                        .store
+                        .disable_endpoint(&endpoint, store::DISABLED_CLIENT_REVOKED),
+                )
+                .await;
+            match disabled {
+                Ok(true) => tracing::warn!(
+                    endpoint = %endpoint,
+                    "webhook endpoint disabled: its paired MCP client was revoked"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "could not disable a paired webhook endpoint"),
+            }
         }
+    }
+
+    /// Runs `change`, a change that moves the endpoint's revision (or deletes it), with no
+    /// sender between its revision read and its request: it stops the endpoint's request in
+    /// flight, waits for its send lock, commits, and leaves a fresh token for the senders after
+    /// it, which read the new revision under that lock.
+    async fn under_send_lock<T>(&self, endpoint_id: &str, change: impl Future<Output = T>) -> T {
+        self.cancel_endpoint(endpoint_id);
+        let _turn = self.send_lock(endpoint_id).lock_owned().await;
+        let result = change.await;
+        self.cancel_endpoint(endpoint_id);
+        result
     }
 
     /// Disables the enabled endpoints whose paired client's session is revoked or gone.

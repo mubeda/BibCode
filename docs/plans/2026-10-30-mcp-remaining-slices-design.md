@@ -5272,3 +5272,21 @@ the round-three code:
   so numbers are never reused for the life of the store. Test:
   `an_acknowledgement_paused_across_off_and_on_keeps_a_newer_drop`.
 - **Contract.** The `endpoint_changed` reason; fixtures regenerated, counts unchanged.
+- **Follow-up (Codex re-review of round 4): edits take the send lock.** An edit could still
+  commit just after a sender's revision read, since it cancelled the token only after
+  `update_endpoint` returned, so a sender in that gap could start a signed POST to the old URL.
+  A change that moves the revision now runs through `Webhooks::under_send_lock`: it cancels the
+  endpoint's token (a request in flight stops at once), takes the endpoint's send lock, commits,
+  cancels again so the senders after it take a fresh token, and releases. That covers a URL,
+  project or event-list edit and turning an endpoint off or on (`upsert`), a revoked pairing's
+  disable (`client_removed`, now per endpoint through `Store::disable_endpoint`) and `delete`;
+  the automatic disable after ten failures already commits inside the failing sender's turn,
+  and `send_now` now holds its turn through that record. A rename moves no revision and takes
+  no lock. Senders re-read the revision while holding the lock, so none starts under an old
+  revision. Tests (a test hook holds the next sender just after its revision read):
+  `an_edit_waits_for_a_manual_send_past_its_revision_read_and_stops_it` and
+  `an_edit_waits_for_a_queued_send_past_its_revision_read_and_stops_it` (the edit does not
+  return while the sender is held, the sender is cancelled once released, and nothing reaches
+  the receiver); both failed before the change (the edit returned at once). The round-4
+  `a_manual_send_built_before_an_edit_is_refused` now queues the edit for the lock before the
+  test event, since the edit waits for the lock the test holds.

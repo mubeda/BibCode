@@ -312,25 +312,31 @@ impl Store {
             .await?
     }
 
-    /// Disables every enabled endpoint paired with `session_id`; returns their ids.
-    pub(crate) async fn disable_paired(&self, session_id: &str) -> Result<Vec<String>> {
+    /// The enabled endpoints paired with `session_id`.
+    pub(crate) async fn paired_endpoints(&self, session_id: &str) -> Result<Vec<String>> {
         let session_id = session_id.to_owned();
         self.database
             .call(move |connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT endpoint_id FROM webhook_endpoints WHERE paired_session_id = ?1 AND enabled = 1",
+                )?;
+                Ok(statement
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await
+    }
+
+    /// Turns an endpoint off with `reason`, bumping its revision and abandoning its queue.
+    /// Returns whether it was on.
+    pub(crate) async fn disable_endpoint(&self, id: &str, reason: &'static str) -> Result<bool> {
+        let id = id.to_owned();
+        self.database
+            .call(move |connection| {
                 let transaction = connection.transaction()?;
-                let ids = {
-                    let mut statement = transaction.prepare_cached(
-                        "SELECT endpoint_id FROM webhook_endpoints WHERE paired_session_id = ?1 AND enabled = 1",
-                    )?;
-                    statement
-                        .query_map(params![session_id], |row| row.get::<_, String>(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?
-                };
-                for id in &ids {
-                    disable(&transaction, id, DISABLED_CLIENT_REVOKED)?;
-                }
+                let changed = disable(&transaction, &id, reason)?;
                 transaction.commit()?;
-                Ok(ids)
+                Ok(changed)
             })
             .await
     }

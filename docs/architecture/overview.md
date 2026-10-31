@@ -2678,8 +2678,10 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md))
   revision moved (checked in its own transaction), and the dispatcher re-reads a picked
   row under the endpoint's lock and token and drops it when stale. A test event or
   redelivery re-reads the endpoint after its lock and token and is refused
-  (`endpoint_changed`) when the revision moved. Drop batch numbers come from a counter
-  that is never reset. A redelivery of a queued delivery is refused.
+  (`endpoint_changed`) when the revision moved. A change that moves the revision (and a
+  delete) cancels the endpoint's token, takes its send lock, commits and leaves a fresh
+  token, so no sender is ever between its revision read and its request when the
+  revision moves. Drop batch numbers come from a counter that is never reset. A redelivery of a queued delivery is refused.
 - **Outbound trust boundary.** HTTPS only; every resolved address must be public by
   `git::clone_policy::is_public` (shared with agent clones); the client connects to
   the checked addresses only (reqwest's resolve override, every other name refused),

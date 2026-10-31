@@ -263,6 +263,11 @@ impl Webhooks {
         };
         let (endpoint, secret) = match existing {
             Some(existing) => {
+                // Where its deliveries go, which events it gets, or on/off: a new revision.
+                let new_revision = existing.url != url
+                    || existing.project_id != project_id
+                    || existing.event_types != event_types
+                    || existing.enabled != input.enabled;
                 let endpoint = Endpoint {
                     name,
                     url,
@@ -272,15 +277,18 @@ impl Webhooks {
                     paired_session_id: paired,
                     ..existing
                 };
-                self.store()
-                    .update_endpoint(endpoint.clone())
-                    .await
-                    .map_err(|error| match error {
-                        StoreError::NotFound => not_found(),
-                        error => storage(error),
-                    })?;
-                // A request in flight goes to the old URL or filters: drop it; it stays queued.
-                self.cancel_endpoint(&endpoint.id);
+                let update = self.store().update_endpoint(endpoint.clone());
+                // A new revision commits only between requests, so no sender can post under
+                // the old one after it; a rename touches nothing a sender reads.
+                let updated = if new_revision {
+                    self.under_send_lock(&endpoint.id, update).await
+                } else {
+                    update.await
+                };
+                updated.map_err(|error| match error {
+                    StoreError::NotFound => not_found(),
+                    error => storage(error),
+                })?;
                 (endpoint, None)
             }
             None => {
@@ -336,13 +344,10 @@ impl Webhooks {
 
     pub(super) async fn delete(&self, payload: Value) -> Result<Value, Value> {
         let input: EndpointRef = decode(payload)?;
-        self.cancel_endpoint(&input.id);
-        if !self
-            .store()
-            .delete_endpoint(&input.id)
-            .await
-            .map_err(storage)?
-        {
+        let deleted = self
+            .under_send_lock(&input.id, self.store().delete_endpoint(&input.id))
+            .await;
+        if !deleted.map_err(storage)? {
             return Err(not_found());
         }
         if let Err(error) = self.inner.secrets.remove(&secret_name(&input.id)).await {
@@ -471,8 +476,11 @@ impl Webhooks {
                 ));
             }
         };
-        let attempt = match turn {
-            Some(_turn) => {
+        self.after_revision_read().await;
+        // The turn is held through the record, so an automatic disable commits with no
+        // sender between.
+        let attempt = match &turn {
+            Some(_) => {
                 self.attempt_holding_turn(
                     &current,
                     &delivery.delivery_id,
@@ -497,6 +505,7 @@ impl Webhooks {
             let record = self.record(&delivery, &attempt, health);
             self.finish(&current, &delivery, &attempt, record).await;
         }
+        drop(turn);
         self.wake();
         let stored = self
             .store()
