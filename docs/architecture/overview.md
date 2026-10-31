@@ -3233,7 +3233,9 @@ view), or free scrolling.
   each key, `MessagesTimeline` therefore asks LegendList to keep no content
   position (`resolveTimelineMaintainVisibleContentPosition`). A row that
   changes size above the reading line in that window moves it. The wheel, a
-  touch and a press scroll at once and do not hold, nor do the composer's
-  PageUp and PageDown, the minimap and find, which scroll the list
-  themselves; any of them ends a key's hold at once, so LegendList keeps the
-  reading line in place again while the reader scrolls by other means.
+  touch and a press do not hold, nor do the composer's PageUp and PageDown,
+  the minimap and find, which scroll the list themselves. All but a press end
+  a key's hold at once, so LegendList keeps the reading line in place again
+  while the reader scrolls by other means. A press scrolls nothing, and a
+  click on the timeline's text before WebKit starts the key's scroll leaves
+  the hold on until its timer ends it.
