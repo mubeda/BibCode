@@ -1,23 +1,35 @@
 //! Production handlers for the signed file-transfer routes.
 //!
-//! The signed token is the only authority these handlers trust: it carries the canonical
-//! workspace root plus the relative path the RPC layer already validated -- and, for an upload,
-//! the single file name it authorises -- so a client can never widen the scope of a download or
-//! steer an upload at another name or folder.
+//! The signed token is the authority these handlers trust for the target: it carries the
+//! canonical workspace root plus the relative path the RPC layer already validated -- and, for
+//! an upload, the single file name it authorises -- so a client can never widen the scope of a
+//! download or steer an upload at another name or folder.
+//!
+//! A token an outside agent minted over MCP (#139 X5) also names the agent's session, and is
+//! served only while that session's access lasts: the route checks it when the transfer
+//! starts, runs the transfer under the session's live controls, and an upload checks once more
+//! just before its final rename. An ended access answers like an expired token. Such a
+//! transfer, once started, writes one content-free activity row when it ends. The UI's tokens
+//! carry no session and behave as before.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::StatusCode;
+use futures_util::StreamExt;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
+use crate::mcp::control::McpControl;
+use crate::mcp::outcome::{TransferControls, TransferUse};
 use crate::production::http_routes::{
     BoxFuture, HttpRouteError, TransferArchiveLimitUnit, TransferDownloadHandler,
     TransferDownloadHttpOutcome, TransferDownloadHttpResponse, TransferUploadHandler,
     TransferUploadHttpOutcome,
 };
 use crate::transfer::{self, TransferAccess, TransferClaims};
+use crate::workspace::beneath::{Dir, Open};
 use crate::workspace::paths;
 
 /// Invoked after a successful upload so the owner of the workspace entry index can drop its
@@ -34,6 +46,21 @@ pub fn download_handler(access: TransferAccess) -> TransferDownloadHandler {
     )
 }
 
+/// [`download_handler`] that also serves the tokens outside agents mint, under `mcp`'s live
+/// controls.
+#[must_use]
+pub fn download_handler_with_mcp(
+    access: TransferAccess,
+    mcp: McpControl,
+) -> TransferDownloadHandler {
+    downloads(
+        access,
+        transfer::archive::MAX_ARCHIVE_ENTRIES,
+        transfer::archive::MAX_ARCHIVE_BYTES,
+        Some(mcp),
+    )
+}
+
 /// [`download_handler`] with explicit archive budgets, so a caller -- or a test -- can prove the
 /// oversized-folder path without building a workspace that exceeds the production limits.
 #[must_use]
@@ -42,19 +69,73 @@ pub fn download_handler_with_limits(
     max_entries: usize,
     max_bytes: u64,
 ) -> TransferDownloadHandler {
+    downloads(access, max_entries, max_bytes, None)
+}
+
+/// The live controls of a session-bound token, or `None` for a UI token; an ended access, or a
+/// server without the MCP service, is a missing transfer.
+async fn controls_for(
+    mcp: Option<&McpControl>,
+    session_id: Option<&str>,
+    transfer: TransferUse,
+) -> Result<Option<(TransferControls, Finish)>, HttpRouteError> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let Some(mcp) = mcp else {
+        return Err(not_found());
+    };
+    let Some(controls) = mcp.transfer_controls(session_id, transfer).await else {
+        tracing::debug!("transfer refused: the minting agent's access ended");
+        return Err(not_found());
+    };
+    Ok(Some((
+        controls,
+        Finish {
+            mcp: mcp.clone(),
+            session_id: session_id.to_owned(),
+            transfer,
+            transfer_id: String::new(),
+            recorded: false,
+        },
+    )))
+}
+
+fn downloads(
+    access: TransferAccess,
+    max_entries: usize,
+    max_bytes: u64,
+    mcp: Option<McpControl>,
+) -> TransferDownloadHandler {
     Arc::new(move |token, _context| {
         let access = access.clone();
+        let mcp = mcp.clone();
         Box::pin(async move {
-            let Some(TransferClaims::Download { root, relative, .. }) = access.verify(&token)
+            let Some(TransferClaims::Download {
+                root,
+                relative,
+                mcp_session_id,
+                ..
+            }) = access.verify(&token)
             else {
                 tracing::warn!("download rejected: transfer capability is invalid or expired");
                 return Err(not_found());
             };
+            let watched = controls_for(
+                mcp.as_ref(),
+                mcp_session_id.as_deref(),
+                TransferUse::Download,
+            )
+            .await?
+            .map(|(controls, mut finish)| {
+                finish.transfer_id = transfer::transfer_id(&token);
+                (controls, finish)
+            });
             let (target, _) = paths::resolve_relative(&root, &relative).map_err(|error| {
                 tracing::warn!(%error, "download path resolution failed");
                 not_found()
             })?;
-            let (_, canonical) = paths::canonical_existing_within(&root, &target)
+            let (canonical_root, canonical) = paths::canonical_existing_within(&root, &target)
                 .await
                 .map_err(|error| {
                     tracing::warn!(%error, "download path validation failed");
@@ -67,7 +148,7 @@ pub fn download_handler_with_limits(
                     not_found()
                 })?;
             let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
-            if metadata.is_dir() {
+            let outcome = if metadata.is_dir() {
                 // The plan both enforces the archive limits and proves to `archive_body` that
                 // they were enforced, so an oversized folder fails before the response starts.
                 let plan = match transfer::archive::plan_archive_with_limits(
@@ -95,40 +176,144 @@ pub fn download_handler_with_limits(
                         return Err(not_found());
                     }
                 };
-                Ok(TransferDownloadHttpOutcome::Stream(
-                    TransferDownloadHttpResponse {
-                        file_name,
-                        content_type: "application/zip",
-                        // A zip is produced as it streams, so its length is unknown until the
-                        // last entry: the archive response stays chunked.
-                        content_length: None,
-                        body: transfer::archive::archive_body(plan, canonical),
-                    },
-                ))
+                // The folder still resolves to itself just before it streams; the archive then
+                // reads by path (a residual window, see `workspace::beneath`).
+                if tokio::fs::canonicalize(&canonical).await.ok().as_ref() != Some(&canonical) {
+                    return Err(not_found());
+                }
+                TransferDownloadHttpResponse {
+                    file_name,
+                    content_type: "application/zip",
+                    // A zip is produced as it streams, so its length is unknown until the
+                    // last entry: the archive response stays chunked.
+                    content_length: None,
+                    body: transfer::archive::archive_body(plan, canonical),
+                }
             } else {
-                let file = tokio::fs::File::open(&canonical)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(path = %canonical.display(), %error, "download file open failed");
-                        not_found()
-                    })?;
+                // Opened through a handle on its folder, never by a path that could have
+                // changed since the check above.
+                let file = tokio::task::spawn_blocking(move || {
+                    let folder = canonical.parent().ok_or_else(not_found)?;
+                    let name = canonical.file_name().ok_or_else(not_found)?;
+                    let file = Dir::open(&canonical_root, folder, false)
+                        .and_then(|dir| dir.open_file(name, Open::Read))
+                        .map_err(|error| {
+                            tracing::warn!(%error, "download file open failed");
+                            not_found()
+                        })?;
+                    let regular = file.metadata().is_ok_and(|metadata| metadata.is_file());
+                    regular.then_some(file).ok_or_else(not_found)
+                })
+                .await
+                .map_err(|_| not_found())??;
+                let file = tokio::fs::File::from_std(file);
                 // The length comes from the opened handle, not the earlier stat, so the header
                 // describes the bytes this response will actually read.
                 let content_length = file.metadata().await.map(|metadata| metadata.len()).ok();
-                Ok(TransferDownloadHttpOutcome::Stream(
-                    TransferDownloadHttpResponse {
-                        file_name,
-                        content_type: "application/octet-stream",
-                        content_length,
-                        body: Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
-                            file,
-                            transfer::archive::DOWNLOAD_CHUNK_BYTES,
-                        )),
-                    },
-                ))
-            }
+                TransferDownloadHttpResponse {
+                    file_name,
+                    content_type: "application/octet-stream",
+                    content_length,
+                    body: Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+                        file,
+                        transfer::archive::DOWNLOAD_CHUNK_BYTES,
+                    )),
+                }
+            };
+            Ok(TransferDownloadHttpOutcome::Stream(match watched {
+                Some((controls, finish)) => TransferDownloadHttpResponse {
+                    body: watched_body(outcome.body, controls, finish),
+                    ..outcome
+                },
+                None => outcome,
+            }))
         }) as BoxFuture<_>
     })
+}
+
+/// The tag a transfer whose access ended mid-way records, and answers with.
+const ACCESS_ENDED_TAG: &str = "McpAccessEndedError";
+
+/// `body`, ended with an error as soon as the agent's access ends, so a client sees a broken
+/// transfer, never a short one that looks complete. Its activity row is written when it ends.
+fn watched_body(body: Body, controls: TransferControls, finish: Finish) -> Body {
+    let token = controls.token();
+    let state = Some((body.into_data_stream(), controls, finish));
+    Body::from_stream(futures_util::stream::unfold(state, move |state| {
+        let token = token.clone();
+        async move {
+            let (mut stream, controls, mut finish) = state?;
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {
+                    finish.record(ACCESS_ENDED_TAG).await;
+                    Some((Err(std::io::Error::other("the transfer's access ended")), None))
+                }
+                next = stream.next() => match next {
+                    Some(Ok(bytes)) => Some((Ok(bytes), Some((stream, controls, finish)))),
+                    Some(Err(error)) => {
+                        finish.record("TransferFailedError").await;
+                        Some((Err(std::io::Error::other(error)), None))
+                    }
+                    None => {
+                        finish.record("success").await;
+                        None
+                    }
+                },
+            }
+        }
+    }))
+}
+
+/// One activity row for an agent's transfer, written once when it ends; a transfer dropped
+/// before it ended (the client went away) records `McpCancelledError`.
+struct Finish {
+    mcp: McpControl,
+    session_id: String,
+    transfer: TransferUse,
+    transfer_id: String,
+    recorded: bool,
+}
+
+impl Finish {
+    fn row(&self, outcome: &str) -> crate::mcp::activity::NewActivity {
+        crate::mcp::activity::NewActivity {
+            session_id: self.session_id.clone(),
+            label: None,
+            tool: match self.transfer {
+                TransferUse::Download => "files_download",
+                TransferUse::Upload => "files_upload",
+            }
+            .to_owned(),
+            thread_id: None,
+            outcome: outcome.to_owned(),
+            target: json!({ "transferId": self.transfer_id }),
+        }
+    }
+
+    async fn record(&mut self, outcome: &str) {
+        self.recorded = true;
+        let mut row = self.row(outcome);
+        row.label = self.mcp.auth().client_label(&self.session_id).await;
+        self.mcp.activity().record(row).await;
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        let row = self.row("McpCancelledError");
+        let mcp = self.mcp.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut row = row;
+                row.label = mcp.auth().client_label(&row.session_id).await;
+                mcp.activity().record(row).await;
+            });
+        }
+    }
 }
 
 /// Streams a request body into the one file a valid upload token names.
@@ -142,15 +327,37 @@ pub fn upload_handler(
     access: TransferAccess,
     on_uploaded: UploadedCallback,
 ) -> TransferUploadHandler {
+    uploads(access, on_uploaded, None)
+}
+
+/// [`upload_handler`] that also serves the tokens outside agents mint, under `mcp`'s live
+/// controls.
+#[must_use]
+pub fn upload_handler_with_mcp(
+    access: TransferAccess,
+    on_uploaded: UploadedCallback,
+    mcp: McpControl,
+) -> TransferUploadHandler {
+    uploads(access, on_uploaded, Some(mcp))
+}
+
+fn uploads(
+    access: TransferAccess,
+    on_uploaded: UploadedCallback,
+    mcp: Option<McpControl>,
+) -> TransferUploadHandler {
     Arc::new(move |token, requested_name, overwrite, body, _context| {
         let access = access.clone();
         let on_uploaded = on_uploaded.clone();
+        let mcp = mcp.clone();
         Box::pin(async move {
             let Some(TransferClaims::Upload {
                 root,
                 relative_dir,
                 file_name,
                 max_bytes,
+                mcp_session_id,
+                overwrite: bound_overwrite,
                 ..
             }) = access.verify(&token)
             else {
@@ -161,29 +368,66 @@ pub fn upload_handler(
                     "Query parameter 'name' does not match the upload token.",
                 ));
             }
+            // A token that binds `overwrite` decides it; `?overwrite=1` on one minted without
+            // it is refused, so a URL can never replace a file its mint did not allow.
+            let overwrite = match bound_overwrite {
+                None => overwrite,
+                Some(false) if overwrite => {
+                    return Err(bad_request(
+                        "This upload URL does not allow overwriting; mint one with overwrite.",
+                    ));
+                }
+                Some(bound) => bound,
+            };
+            let watched =
+                controls_for(mcp.as_ref(), mcp_session_id.as_deref(), TransferUse::Upload).await?;
+            let (cancellation, mut finish) = match watched {
+                Some((controls, mut finish)) => {
+                    finish.transfer_id = transfer::transfer_id(&token);
+                    (Some(controls), Some(finish))
+                }
+                None => (None, None),
+            };
+            let token = cancellation
+                .as_ref()
+                .map_or_else(CancellationToken::new, TransferControls::token);
             // Both branches canonicalize, so the written path always shares a prefix with the
             // root the relative result is reported against.
-            let (canonical_root, directory) = if relative_dir.is_empty() {
-                let canonical_root = paths::normalize_root(&root, false)
-                    .await
-                    .map_err(|_| not_found())?;
-                (canonical_root.clone(), canonical_root)
+            let canonical_root = paths::normalize_root(&root, false)
+                .await
+                .map_err(|_| not_found())?;
+            let directory = if relative_dir.is_empty() {
+                canonical_root.clone()
             } else {
                 let (target, _) =
                     paths::resolve_relative(&root, &relative_dir).map_err(|_| not_found())?;
                 paths::canonical_existing_within(&root, &target)
                     .await
                     .map_err(|_| not_found())?
+                    .1
             };
-            match transfer::upload::write_upload(
+            let written = transfer::upload::write_upload(
+                &canonical_root,
                 &directory,
                 &file_name,
                 overwrite,
                 max_bytes,
                 body.into_data_stream(),
+                &token,
             )
-            .await
-            {
+            .await;
+            if let Some(finish) = finish.as_mut() {
+                let outcome = match &written {
+                    Ok(_) => "success",
+                    Err(transfer::TransferError::Cancelled) => ACCESS_ENDED_TAG,
+                    Err(transfer::TransferError::EntryExists { .. }) => "TransferEntryExistsError",
+                    Err(transfer::TransferError::UploadTooLarge { .. }) => "TransferTooLargeError",
+                    Err(_) => "TransferFailedError",
+                };
+                finish.record(outcome).await;
+            }
+            drop(cancellation);
+            match written {
                 Ok(written) => {
                     on_uploaded(canonical_root.clone()).await;
                     let relative = written
@@ -199,6 +443,11 @@ pub fn upload_handler(
                 }
                 Err(transfer::TransferError::UploadTooLarge { limit }) => {
                     Ok(TransferUploadHttpOutcome::TooLarge { limit })
+                }
+                // The agent's access ended, or a folder on the path changed into a symlink:
+                // nothing was written, and the route confirms nothing about the path.
+                Err(transfer::TransferError::Cancelled | transfer::TransferError::Workspace(_)) => {
+                    Err(not_found())
                 }
                 // The mint validates the name, so this is only reachable if a token outlived a
                 // change to the rules. It is still the client's name, not a server fault.

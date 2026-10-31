@@ -342,6 +342,129 @@ impl Drop for LiveControls {
     }
 }
 
+/// What an MCP-minted transfer URL is used for (#139 X5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransferUse {
+    Download,
+    Upload,
+}
+
+/// The live controls of one transfer an outside agent's URL started (#139 X5): a token that
+/// fires when the agent's access to it ends. It takes no owned-mutation slot.
+pub(crate) struct TransferControls {
+    token: CancellationToken,
+    settled: CancellationToken,
+}
+
+impl TransferControls {
+    /// Fires on shutdown, revocation (so Stop), the MCP server turned off or the Files set
+    /// turned off, and for an upload a read-only ceiling (so Take over).
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for TransferControls {
+    /// Ends the watcher, and with it the transfer's place among the live connections.
+    fn drop(&mut self) {
+        self.settled.cancel();
+    }
+}
+
+impl McpControl {
+    /// Starts the live controls of a transfer `session_id` minted, or `None` when that
+    /// session's access to it has ended: revoked or expired, not an outside agent, the MCP
+    /// server or the Files set off, or for an upload a read-only ceiling. The transfer counts
+    /// as one of the session's live connections while it runs, so revocation cancels it.
+    ///
+    /// Take over and Hand back cancel a session's live work without revoking it; a download
+    /// is then admitted again and goes on, while an upload under a read-only ceiling stops.
+    pub(crate) async fn transfer_controls(
+        &self,
+        session_id: &str,
+        transfer: TransferUse,
+    ) -> Option<TransferControls> {
+        let (mut connection, mut ended) = self.admit_transfer(session_id, transfer).await?;
+        let token = CancellationToken::new();
+        let settled = CancellationToken::new();
+        let mut settings = self.settings_signal();
+        let shutdown = self.shutdown_token();
+        let control = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::spawn({
+            let (token, settled) = (token.clone(), settled.clone());
+            async move {
+                let mut settings_open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = settled.cancelled() => return,
+                        () = shutdown.cancelled() => break,
+                        () = ended.cancelled() => {
+                            drop(connection);
+                            match control.admit_transfer(&session_id, transfer).await {
+                                Some((again, token)) => (connection, ended) = (again, token),
+                                None => break,
+                            }
+                        }
+                        changed = settings.changed(), if settings_open => {
+                            settings_open = changed.is_ok();
+                            settings.borrow_and_update();
+                            if !control.transfer_allowed(&session_id, transfer).await {
+                                break;
+                            }
+                        }
+                    }
+                }
+                token.cancel();
+            }
+        });
+        Some(TransferControls { token, settled })
+    }
+
+    /// Registers the transfer as a live connection of `session_id` (refused once revoked or
+    /// expired), then checks the rest of its access; the token fires on revocation.
+    async fn admit_transfer(
+        &self,
+        session_id: &str,
+        transfer: TransferUse,
+    ) -> Option<(crate::auth::AuthenticatedConnectionGuard, CancellationToken)> {
+        let ended = CancellationToken::new();
+        let connection = self
+            .auth()
+            .mark_connected_guard(session_id, ended.clone())
+            .await
+            .ok()?;
+        self.transfer_allowed(session_id, transfer)
+            .await
+            .then_some((connection, ended))
+    }
+
+    async fn transfer_allowed(&self, session_id: &str, transfer: TransferUse) -> bool {
+        let settings = self.settings();
+        if !settings.enabled || !settings.capabilities.files {
+            return false;
+        }
+        let (_, _, sessions) = self.auth().access_snapshot("").await;
+        let Some(session) = sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+        else {
+            return false;
+        };
+        if session.subject != crate::auth::MCP_CLIENT_SUBJECT {
+            return false;
+        }
+        let ceiling = session
+            .mcp_access
+            .as_deref()
+            .and_then(McpAccess::parse)
+            .unwrap_or(McpAccess::ReadOnly)
+            .min(settings.access);
+        transfer == TransferUse::Download || ceiling != McpAccess::ReadOnly
+    }
+}
+
 fn is_stream_ended(failure: &Value) -> bool {
     failure["structuredContent"]["error"]["_tag"] == STREAM_ENDED_TAG
 }

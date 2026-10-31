@@ -30,9 +30,7 @@ const MAX_AUTOMATION_CLIENTS: usize = 64;
 const WORKSPACE_METHODS: &[&str] = &[
     "assets.createUrl",
     "filesystem.browse",
-    "projects.createDownloadUrl",
     "projects.createEntry",
-    "projects.createUploadUrl",
     "projects.deleteEntry",
     "projects.duplicateEntry",
     "projects.getFileVersion",
@@ -120,6 +118,29 @@ impl WorkspacePreviewRpcServices {
     }
 }
 
+/// `projects.createDownloadUrl` and `projects.createUploadUrl`, with the caller's credential:
+/// a URL an outside agent mints names its session, taken from the authenticated principal so
+/// no client input decides it (#139 X5).
+pub(crate) fn register_transfer_mints(registry: &mut RpcRegistry, workspace: WorkspaceRpc) {
+    for method in ["projects.createDownloadUrl", "projects.createUploadUrl"] {
+        let workspace = workspace.clone();
+        registry.register_unary_with_context(method, move |request, context, cancellation| {
+            let workspace = workspace.clone();
+            let mcp_session_id = context
+                .principal()
+                .filter(|principal| principal.subject == crate::auth::MCP_CLIENT_SUBJECT)
+                .map(|principal| principal.session_id.clone());
+            async move {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => Err(interrupted_error(method)),
+                    result = workspace.handle_transfer_mint(method, request.payload, mcp_session_id) => result,
+                }
+            }
+        });
+    }
+}
+
 pub fn register_workspace_preview_rpc(
     registry: &mut RpcRegistry,
     services: WorkspacePreviewRpcServices,
@@ -131,6 +152,7 @@ pub fn register_workspace_preview_rpc(
             async move { services.handle_workspace(request, cancellation).await }
         });
     }
+    register_transfer_mints(registry, services.workspace.clone());
     for method in PREVIEW_METHODS {
         let services = services.clone();
         registry.register_unary(*method, move |request, cancellation| {

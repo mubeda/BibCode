@@ -201,10 +201,14 @@ impl ProductionRuntime {
         &self.preview_tunnels
     }
 
-    /// The handler that serves signed download URLs.
+    /// The handler that serves signed download URLs. A URL an outside agent minted is served
+    /// only while its access lasts (#139 X5).
     #[must_use]
     pub fn transfer_download_handler(&self) -> TransferDownloadHandler {
-        transfer_routes::download_handler(self.transfer_access.clone())
+        transfer_routes::download_handler_with_mcp(
+            self.transfer_access.clone(),
+            self.mcp_control.clone(),
+        )
     }
 
     /// The handler that accepts signed uploads.
@@ -217,7 +221,7 @@ impl ProductionRuntime {
     pub fn transfer_upload_handler(&self) -> TransferUploadHandler {
         let workspace = self.workspace.clone();
         let status_broadcaster = self.status_broadcaster.clone();
-        transfer_routes::upload_handler(
+        transfer_routes::upload_handler_with_mcp(
             self.transfer_access.clone(),
             Arc::new(move |root| {
                 let workspace = workspace.clone();
@@ -227,6 +231,7 @@ impl ProductionRuntime {
                     status_broadcaster.notify_local_change(&root).await;
                 })
             }),
+            self.mcp_control.clone(),
         )
     }
 
@@ -541,8 +546,11 @@ impl ProductionRuntime {
                 status_broadcaster.notify_local_change(&cwd).await;
             })
         }));
+        // One system trash for Source Control's discard and the Files tools' delete (#139 X5).
+        let file_trash: Arc<dyn crate::git::FileTrash> =
+            Arc::new(crate::git::NativeFileTrash::default());
         let workspace = WorkspaceRpc::with_dependencies(
-            WorkspaceService::default(),
+            WorkspaceService::default().with_trash(file_trash.clone()),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
                 transfer_access: Some(transfer_access.clone()),
@@ -695,7 +703,7 @@ impl ProductionRuntime {
             worktree_catalog.clone(),
             repositories.clone(),
             workspace_availability.clone(),
-            Arc::new(crate::git::NativeFileTrash::default()),
+            file_trash,
         );
         register_git_vcs_rpc(&mut registry, git_vcs);
         register_git_manager_rpc(&mut registry, git_manager);
