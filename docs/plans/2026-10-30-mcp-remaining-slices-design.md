@@ -4998,3 +4998,46 @@ scope and latency tests, the contract settings test, `WebhooksTab.test.tsx` and 
   (primary environment only, like the Agents list).
 - The header line truncates (full text in its tooltip) instead of overflowing at narrow
   widths.
+
+**Codex review round 2 (2026-10-31).** All five P2s were confirmed in source and fixed test
+first; each new test was seen failing against the round-one code:
+
+- **Agent labels carried paths.** `redact_sensitive_text` blanks credentials, not paths, so a
+  client labelled `/Users/alice/private/customer` reached the receiver. The payload's `actor`
+  is now `{ kind, clientId }` only, each kept only when id-shaped
+  (`[A-Za-z0-9_.:-]{1,128}`), otherwise the actor is left out. Test:
+  `a_payload_holds_ids_and_states_only` (a path-shaped label and a path-shaped client id).
+- **An edit readdressed the queue.** `update_endpoint` now abandons the endpoint's pending
+  deliveries, as `endpoint_changed`, when its URL, project or event list changes (in the same
+  transaction as the edit); a rename keeps them. The log shows "Not sent: the endpoint's URL
+  or events changed". Test: `changing_an_endpoint_url_or_filter_abandons_what_it_queued`.
+- **Manual sends overtook the slot.** Every request now takes a per-endpoint lock
+  (`Webhooks::send_lock`, waited for under the endpoint's cancellation token): the
+  dispatcher's, `sendTest`'s and `redeliver`'s, so an endpoint never has two requests open.
+  `redeliver` refuses a delivery that is `pending` or `sending` with the new
+  `WebhookError` reason `queued`. A redelivery of a finished delivery still goes ahead of the
+  endpoint's queue once the request in flight ends: it re-sends an event already delivered or
+  failed, so it carries no order of its own. Test:
+  `a_redelivery_waits_for_the_request_in_flight_and_a_queued_one_is_refused` (the receiver
+  never sees two requests open, and a queued delivery is refused).
+- **Queue loss was silent.** Deliveries abandoned past the cap (now `max_pending`, 10,000 in
+  production and settable for tests) keep `queue_full` in their log, the endpoint's list row
+  gains `droppedDeliveries` (their count in the log, shown on its status line), and the cap's
+  `UPDATE … RETURNING` records per endpoint, in `webhook_state` (`dropped:<id>`, no migration
+  change), the count, the range of feed cursors (ordered by position) and the earliest finding
+  `lastSeen`. The endpoint's next request carries it as `dropped` and it is cleared after a
+  2xx (only if unchanged, so a loss recorded meanwhile stays); the stored body stays as it
+  was. Activity retention is X1's and unchanged: the user guide now says catch-up of agent
+  operations works within the activity log's 7 days and 5,000 rows (`activityDropped` beyond),
+  events are never pruned, and the findings book holds 1,000. Test:
+  `deliveries_dropped_from_a_full_queue_are_logged_shown_and_announced_once` (four deliveries
+  queued at once with a cap of two; cursors that sort wrong as text).
+- **A blocked retry spun the loop.** `next_due_ms` took the earliest due time over every
+  pending row, but only each endpoint's oldest is sendable, so a row queued behind a retry
+  woke the loop every 50 ms. It now takes each enabled endpoint's oldest pending row only, and
+  skips endpoints with a request in flight (their end wakes the loop). The loop counts its
+  passes for tests. Test: `a_retry_waiting_behind_its_delay_does_not_spin_the_dispatcher`
+  (19 passes a second before, at most 3 after).
+- **Contract.** `WebhookEndpoint.droppedDeliveries` and the `queued` reason; fixtures
+  regenerated, counts unchanged. **UI.** The status line names dropped deliveries; the log
+  names `queue_full` and `endpoint_changed`.

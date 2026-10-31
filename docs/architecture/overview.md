@@ -2661,19 +2661,24 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md))
   `webhook_deliveries`, `webhook_state`), so a restart resumes without loss or
   repeats. The engine's in-process event broadcast, which drops under load, is not a
   source; Authorized-clients changes only wake the dispatcher.
-- **Queue.** Delivery rows are the queue and the log: one request in flight per
-  endpoint, oldest first, at most eight endpoints at once; retries after 30 s, 2, 5,
-  10 and 15 minutes on a timeout, connection error, unresolved host, 5xx or 429;
-  10 failed deliveries in a row disable the endpoint; at most 10,000 pending, oldest
-  abandoned past that; finished rows kept 7 days, 1,000 per endpoint.
+- **Queue.** Delivery rows are the queue and the log: one request open per endpoint
+  (a per-endpoint lock that the dispatcher, test events and redeliveries all take),
+  oldest first, at most eight endpoints at once; retries after 30 s, 2, 5, 10 and 15
+  minutes on a timeout, connection error, unresolved host, 5xx or 429; 10 failed
+  deliveries in a row disable the endpoint; at most 10,000 pending, oldest abandoned
+  past that (`queue_full`), recorded per endpoint in `webhook_state` and announced as
+  `dropped` on its next delivery; finished rows kept 7 days, 1,000 per endpoint. The
+  loop sleeps until the earliest due head of an endpoint with nothing in flight, or the
+  poll. A new URL, project or event list abandons the endpoint's queue
+  (`endpoint_changed`); a redelivery of a queued delivery is refused.
 - **Outbound trust boundary.** HTTPS only; every resolved address must be public by
   `git::clone_policy::is_public` (shared with agent clones); the client connects to
   the checked addresses only (reqwest's resolve override, every other name refused),
   ignores proxies, follows no redirects, and gives up after 10 seconds without
   reading the body.
 - **Content.** Payloads carry ids, kinds, statuses and the feed cursor (or a
-  finding's `{ id, count, lastSeen }`); an agent label passes through
-  `redact_sensitive_text`. Each body is HMAC-SHA256 signed over its timestamp with
+  finding's `{ id, count, lastSeen }`); an agent is its kind and opaque client id,
+  never its label. Each body is HMAC-SHA256 signed over its timestamp with
   the endpoint's secret, kept in the secret store as `webhook-<id>`.
 - **Controls.** `enableWebhooks` (default off) is a live setting: off cancels every
   request in flight, abandons the queue and resets the positions to the heads.
