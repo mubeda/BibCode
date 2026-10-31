@@ -538,6 +538,10 @@
       "mode": "stream"
     },
     {
+      "name": "subscribeUiIntents",
+      "mode": "stream"
+    },
+    {
       "name": "subscribeVcsStatus",
       "mode": "stream"
     },
@@ -591,6 +595,10 @@
     },
     {
       "name": "terminal.writeInput",
+      "mode": "unary"
+    },
+    {
+      "name": "ui.publishIntent",
       "mode": "unary"
     },
     {
@@ -714,8 +722,8 @@
       "mode": "unary"
     }
   ],
-  "streamMethodCount": 28,
-  "expectedTopLevelStreamShapes": 88,
+  "streamMethodCount": 29,
+  "expectedTopLevelStreamShapes": 90,
   "expectedOrchestrationEventShapes": 27,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -788,6 +796,8 @@
     "stream-shapes/subscribeTerminalMetadata-00.json",
     "stream-shapes/subscribeTerminalMetadata-01.json",
     "stream-shapes/subscribeTerminalMetadata-02.json",
+    "stream-shapes/subscribeUiIntents-00.json",
+    "stream-shapes/subscribeUiIntents-01.json",
     "stream-shapes/subscribeVcsStatus-00.json",
     "stream-shapes/subscribeVcsStatus-01.json",
     "stream-shapes/subscribeVcsStatus-02.json",
@@ -1083,6 +1093,8 @@
     "typed-failures/terminal__writeInput-02.json",
     "typed-failures/terminal__writeInput-03.json",
     "typed-failures/terminal__writeInput-04.json",
+    "typed-failures/ui__publishIntent-00.json",
+    "typed-failures/ui__publishIntent-01.json",
     "typed-failures/updater__activeWork-00.json",
     "typed-failures/updater__activeWork-01.json",
     "typed-failures/updater__check-00.json",
@@ -1491,6 +1503,8 @@
     "stream-shapes/subscribeTerminalMetadata-00.json": "b0bc0a92d30319c73eeb61c67f44a20e11af8065f9e411f57050078ef838d4c2",
     "stream-shapes/subscribeTerminalMetadata-01.json": "5cfb365048fa183965afceca67a9bcfb148ca7694e6c9fdd93b5b6201a124a50",
     "stream-shapes/subscribeTerminalMetadata-02.json": "0af3ea80cd5f04ea8015e0d3d5118b33e4350e7b641c692c2fc0b4819a487e08",
+    "stream-shapes/subscribeUiIntents-00.json": "3f7d0c0bcc7f836b302c51f61b1018560e6b49d251b5727dee2b65a376dfddd6",
+    "stream-shapes/subscribeUiIntents-01.json": "9470c0b23985a0186644e296b7b040c8c89f46e233b125bcd9bb63036efae03e",
     "stream-shapes/subscribeVcsStatus-00.json": "7894cc605863be80eb958dbd8d7455d0e31158e967ba39a012376c1f960b08e3",
     "stream-shapes/subscribeVcsStatus-01.json": "6a602fa3250021dec3c208edca1ad9da28195de283f4e1f4dacb1d72368e1aab",
     "stream-shapes/subscribeVcsStatus-02.json": "1c95e49a4309c2c6f0b5b8f85ac8798575730cce4e9f321123e54e34b5380e22",
@@ -1544,6 +1558,8 @@
     "typed-failures/terminal__writeInput-02.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/terminal__writeInput-03.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/terminal__writeInput-04.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/ui__publishIntent-00.json": "72d32b6158bc39a9a1674da1d5c62624cd4c04bd0b0a5cfde45e9418e1dfef44",
+    "typed-failures/ui__publishIntent-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/updater__activeWork-00.json": "5dba11a0de1994b64539549648f84ec2df192752488bdb02460379f0d2164f01",
     "typed-failures/updater__activeWork-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/updater__check-00.json": "dc314faff42f01158f72c6b6ac11308814faeee7a4f37bbc0612cbf1652c1eda",
@@ -1749,6 +1765,8 @@
     "stream-shapes/subscribeTerminalMetadata-00.json",
     "stream-shapes/subscribeTerminalMetadata-01.json",
     "stream-shapes/subscribeTerminalMetadata-02.json",
+    "stream-shapes/subscribeUiIntents-00.json",
+    "stream-shapes/subscribeUiIntents-01.json",
     "stream-shapes/subscribeVcsStatus-00.json",
     "stream-shapes/subscribeVcsStatus-01.json",
     "stream-shapes/subscribeVcsStatus-02.json",
@@ -2042,6 +2060,8 @@
     "typed-failures/terminal__writeInput-02.json",
     "typed-failures/terminal__writeInput-03.json",
     "typed-failures/terminal__writeInput-04.json",
+    "typed-failures/ui__publishIntent-00.json",
+    "typed-failures/ui__publishIntent-01.json",
     "typed-failures/updater__activeWork-00.json",
     "typed-failures/updater__activeWork-01.json",
     "typed-failures/updater__check-00.json",

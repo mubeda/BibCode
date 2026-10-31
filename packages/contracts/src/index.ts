@@ -1,6 +1,7 @@
 export * from "./baseSchemas.ts";
 export * from "./auth.ts";
 export * from "./mcpActivity.ts";
+export * from "./uiIntents.ts";
 export * from "./activity.ts";
 export * from "./agentSessions.ts";
 export * from "./environment.ts";

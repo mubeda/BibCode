@@ -87,6 +87,12 @@ import {
 } from "./auth.ts";
 import { McpActivityError, McpActivityStreamEvent } from "./mcpActivity.ts";
 import {
+  UiIntentError,
+  UiIntentStreamEvent,
+  UiPublishIntentInput,
+  UiPublishIntentResult,
+} from "./uiIntents.ts";
+import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
   ActivityError,
@@ -664,6 +670,9 @@ export const WS_METHODS = {
   serverRefreshProviderUsage: "server.refreshProviderUsage",
   serverConsumeCodexRateLimitReset: "server.consumeCodexRateLimitReset",
 
+  // An outside agent's UI suggestions (#139, slice X4)
+  uiPublishIntent: "ui.publishIntent",
+
   // Remote updater methods
   updaterActiveWork: "updater.activeWork",
   updaterStatus: "updater.status",
@@ -690,6 +699,7 @@ export const WS_METHODS = {
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
   subscribeMcpActivity: "subscribeMcpActivity",
+  subscribeUiIntents: "subscribeUiIntents",
   subscribeActivity: "subscribeActivity",
   subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
   subscribeGitManagerSignal: "subscribeGitManagerSignal",
@@ -2041,6 +2051,24 @@ export const WsSubscribeMcpActivityRpc = Rpc.make(WS_METHODS.subscribeMcpActivit
   stream: true,
 });
 
+/**
+ * Publishes an outside agent's UI suggestion (#139, slice X4). Only an `mcp-client` session
+ * may publish; clients only raise a notice, and nothing moves until a person clicks Show.
+ */
+export const WsUiPublishIntentRpc = Rpc.make(WS_METHODS.uiPublishIntent, {
+  payload: UiPublishIntentInput,
+  success: UiPublishIntentResult,
+  error: Schema.Union([UiIntentError, EnvironmentRpcError]),
+});
+
+/** The pending UI suggestions, then each new one (#139, slice X4). */
+export const WsSubscribeUiIntentsRpc = Rpc.make(WS_METHODS.subscribeUiIntents, {
+  payload: Schema.Struct({}),
+  success: UiIntentStreamEvent,
+  error: EnvironmentRpcError,
+  stream: true,
+});
+
 export const WsActivityGetSnapshotRpc = Rpc.make(WS_METHODS.activityGetSnapshot, {
   payload: ActivityGetSnapshotInput,
   success: ActivitySnapshot,
@@ -2273,6 +2301,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
   WsSubscribeMcpActivityRpc,
+  WsUiPublishIntentRpc,
+  WsSubscribeUiIntentsRpc,
   WsActivityGetSnapshotRpc,
   WsActivityListRosterRpc,
   WsActivityListDetailRpc,

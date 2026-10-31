@@ -1,0 +1,23 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "type": "intent",
+      "intent": {
+        "kind": "focus",
+        "intentId": "-1",
+        "threadId": "!go",
+        "surface": "thread",
+        "path": "",
+        "actor": {
+          "kind": "mcp-client",
+          "clientId": "toString",
+          "label": null
+        },
+        "createdAt": "v",
+        "expiresAt": "😀"
+      }
+    }
+  ]
+}
