@@ -2096,7 +2096,7 @@ fn device_screenshot_describes_both_image_formats() {
 }
 
 #[test]
-fn every_listed_provider_tool_is_registered_for_providers_only() {
+fn every_listed_provider_tool_is_registered_with_a_client_twin_of_its_own() {
     use crate::mcp::control::{PrincipalKind, tool_spec, tool_specs};
     let listed: Vec<String> = tool_descriptors(true)
         .iter()
@@ -2110,7 +2110,12 @@ fn every_listed_provider_tool_is_registered_for_providers_only() {
         let spec = tool_spec(PrincipalKind::Provider, name).unwrap();
         // They wait on a page or an emulator, so `mcp.<name>` is long-running.
         assert!(spec.long_running, "{name}");
-        assert!(tool_spec(PrincipalKind::Client, name).is_none(), "{name}");
+        assert_eq!(spec.kind, PrincipalKind::Provider, "{name}");
+        assert!(spec.capability.is_none(), "{name}");
+        // Outside agents' twin (slice D) is a spec of its own, in the Workspace set.
+        let twin = tool_spec(PrincipalKind::Client, name).unwrap();
+        assert_eq!(twin.kind, PrincipalKind::Client, "{name}");
+        assert!(twin.long_running && !twin.holds_wait_slot, "{name}");
     }
 }
 
@@ -2828,11 +2833,14 @@ async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks()
     );
     let client_tools = names(&listed);
     assert!(client_tools.contains(&"start_thread".to_owned()));
-    assert!(
-        client_tools
-            .iter()
-            .all(|name| !name.starts_with("preview_"))
-    );
+    // Outside agents list their own twin of each preview tool, which names its thread.
+    let twin = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "preview_status")
+        .expect("the client twin is listed");
+    assert_eq!(twin["inputSchema"]["required"], json!(["threadId"]));
     assert_eq!(listed["result"]["cacheScope"], "private");
 
     // A provider lists no thread tools, and a provider's legacy initialize also negotiates.
@@ -2862,18 +2870,41 @@ async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks()
         crossed["result"]["structuredContent"]["error"]["_tag"],
         "McpScopeError"
     );
-    let crossed = body(
-        &post(
+
+    // A provider still reaches its own preview tool, for the thread its credential names.
+    let own = rpc(
+        &service,
+        initialize(&service, &issued).await,
+        json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"preview_status","arguments":{}}}),
+    )
+    .await;
+    assert_eq!(own["result"]["isError"], false, "{own}");
+    {
+        let calls = connect.controls.preview_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.provider_session_id, issued.provider_session_id);
+        assert_eq!(calls[0].0.thread_id, "thread");
+    }
+    // An outside agent's call of that name is its twin's, never the provider's: it needs a
+    // thread of this environment, not a provider's credential.
+    let twin_call = |id: u64, arguments: Value| {
+        post(
             &service,
             bearer(&token),
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"preview_status","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"preview_status","arguments":arguments}}),
         )
-        .await,
-    );
+    };
+    let missing = body(&twin_call(6, json!({})).await);
     assert_eq!(
-        crossed["result"]["structuredContent"]["error"]["_tag"],
-        "McpScopeError"
+        missing["result"]["structuredContent"]["error"]["_tag"],
+        "McpInvalidArgumentError"
     );
+    let unknown = body(&twin_call(7, json!({ "threadId": "thread" })).await);
+    assert_eq!(
+        unknown["result"]["structuredContent"]["error"]["_tag"],
+        "McpThreadNotFoundError"
+    );
+    assert_eq!(connect.controls.preview_calls.lock().await.len(), 1);
 
     // A modern request whose headers disagree with its body is refused.
     let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});

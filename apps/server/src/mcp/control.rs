@@ -512,6 +512,9 @@ pub(super) struct Inner {
     owned: AtomicUsize,
     /// The `clientRequestId`s whose recorded call runs in this process (`outcome.rs`).
     pub(super) claims: super::outcome::Claims,
+    /// The preview host and devices the client twins of the provider tools use (slice D),
+    /// attached by the Connect service that owns them.
+    previews: std::sync::OnceLock<super::tools::previews::PreviewServices>,
 }
 
 #[derive(Default)]
@@ -609,6 +612,7 @@ impl McpControl {
                 waits: AtomicUsize::new(0),
                 owned: AtomicUsize::new(0),
                 claims: super::outcome::Claims::default(),
+                previews: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -858,6 +862,17 @@ impl McpControl {
 
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
         self.inner.shutdown.clone()
+    }
+
+    /// Lets the client twins of `preview_*` and `device_*` reach the preview host and the
+    /// devices. The first attachment wins.
+    pub(crate) fn attach_previews(&self, services: super::tools::previews::PreviewServices) {
+        let _ = self.inner.previews.set(services);
+    }
+
+    /// The attached preview services; `None` on a server without the Connect service.
+    pub(crate) fn previews(&self) -> Option<&super::tools::previews::PreviewServices> {
+        self.inner.previews.get()
     }
 }
 
@@ -1257,7 +1272,15 @@ mod tests {
             refused["structuredContent"]["error"]["_tag"],
             "McpScopeError"
         );
-        let refused = authorize_call(PrincipalKind::Client, scopes, "preview_status").unwrap_err();
+        // An outside agent's `preview_status` is its own twin (slice D), and needs operate.
+        let twin = authorize_call(PrincipalKind::Client, scopes, "preview_status").unwrap();
+        assert_eq!(twin.kind, PrincipalKind::Client);
+        let refused = authorize_call(
+            PrincipalKind::Client,
+            &[SCOPE_ORCHESTRATION_READ],
+            "preview_status",
+        )
+        .unwrap_err();
         assert_eq!(
             refused["structuredContent"]["error"]["_tag"],
             "McpScopeError"
