@@ -11,7 +11,10 @@ import {
 
 import { sourceControlDraftKey } from "~/sourceControlDraft";
 import { agentSuggestionOutcome, useSourceControlPanelStore } from "~/sourceControlPanelStore";
+import { usePrimaryMcpActivity } from "~/state/mcpActivity";
 import { uiIntentsEnvironment } from "~/state/uiIntents";
+import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
+import { vcsEnvironment } from "~/state/vcs";
 
 import { Button } from "./ui/button";
 
@@ -109,6 +112,59 @@ function useCommitMessageSuggestion(
   return intent;
 }
 
+/** How many of the folder's newest commits are searched for the agent's commit. */
+const COMMITS_SEARCHED = 20;
+
+/**
+ * Retires `suggestion` once the agent that suggested it commits with its message on its
+ * thread, as its activity log reports: the commit's subject must be the message's first line.
+ * The store then clears the draft only while it is still the suggestion, untouched. Only the
+ * primary environment's activity is watched.
+ */
+function useRetireCommittedSuggestion(
+  environmentId: EnvironmentId,
+  cwd: string | null,
+  cwdKey: string | null,
+  suggestion: PendingCommitMessage | null,
+) {
+  const activity = usePrimaryMcpActivity();
+  const listCommits = useAtomQueryRunner(vcsEnvironment.listCommits, { reportFailure: false });
+  const retire = useSourceControlPanelStore((state) => state.retireCommittedAgentSuggestion);
+  const suggestedAt = suggestion === null ? Number.NaN : Date.parse(suggestion.createdAt);
+  const committedSha =
+    suggestion === null || activity.environmentId !== environmentId
+      ? null
+      : (activity.rows.find(
+          (row) =>
+            row.tool === "git_commit" &&
+            row.outcome === "success" &&
+            row.threadId === suggestion.threadId &&
+            row.target.sha !== undefined &&
+            !(Date.parse(row.occurredAt) < suggestedAt),
+        )?.target.sha ?? null);
+  const intentId = suggestion?.intentId ?? null;
+  const message = suggestion?.message ?? null;
+  useEffect(() => {
+    if (committedSha === null || cwd === null || cwdKey === null) return;
+    if (intentId === null || message === null) return;
+    let current = true;
+    void listCommits({ environmentId, input: { cwd, limit: COMMITS_SEARCHED } }).then((result) => {
+      const subject = message.trim().split("\n", 1)[0]?.trim() ?? "";
+      const landed =
+        result._tag === "Success" &&
+        result.value.commits.some(
+          (commit) =>
+            (commit.sha.startsWith(committedSha) || committedSha.startsWith(commit.sha)) &&
+            commit.subject.trim() === subject,
+        );
+      if (current && landed) retire(cwdKey, intentId, message);
+    });
+    return () => {
+      current = false;
+    };
+  }, [committedSha, cwd, cwdKey, environmentId, intentId, listCommits, message, retire]);
+}
+
 /**
  * An outside agent's commit message suggestion under the Source Control message box (#139,
  * slice X7): **Message from Agent <label>** while the draft is the message it filled in, or
@@ -125,6 +181,7 @@ export function SourceControlAgentSuggestion(props: {
   const { environmentId, cwd, legacyThreadKey, draftMessage } = props;
   const cwdKey = cwd === null ? null : sourceControlDraftKey({ environmentId, cwd });
   const suggestion = useCommitMessageSuggestion(environmentId, cwdKey, legacyThreadKey);
+  useRetireCommittedSuggestion(environmentId, cwd, cwdKey, suggestion);
   const record = useSourceControlPanelStore((state) =>
     cwdKey === null ? undefined : state.agentSuggestionByCwdKey[cwdKey],
   );

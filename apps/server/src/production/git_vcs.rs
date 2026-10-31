@@ -1601,6 +1601,13 @@ impl GitVcsRpcServices {
                             )
                             .await;
                             mutation.finish().await;
+                            // A created or found request changes no remote ref, so the status
+                            // streams would not look it up again (#139: the panel kept Create PR).
+                            if let Ok(result) = &result
+                                && !matches!(result.pr, PullRequestStep::SkippedNotRequested)
+                            {
+                                broadcaster.notify_pull_request_change(&input.cwd).await;
+                            }
                             if let (Ok(result), Some(observer)) =
                                 (&result, created_request_observer.as_deref())
                             {

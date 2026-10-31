@@ -70,6 +70,11 @@ interface SourceControlPanelStoreState {
   /** The person chose **Undo** after **Use it**: the draft it replaced comes back. */
   undoAgentCommitSuggestion: (cwdKey: string, intentId: string) => void;
   dismissAgentCommitSuggestion: (cwdKey: string, intentId: string) => void;
+  /**
+   * A commit landed with suggestion `intentId`'s message: it is handled, and the draft goes
+   * when it is still that message, untouched. Text the person edited stays.
+   */
+  retireCommittedAgentSuggestion: (cwdKey: string, intentId: string, message: string) => void;
 }
 
 /** `suggestions` with `cwdKey` set last, keeping the newest {@link MOST_REMEMBERED_SUGGESTIONS}. */
@@ -232,6 +237,20 @@ const persistedStore = persist<SourceControlPanelStoreState>(
             outcome: "dismissed",
           }),
         };
+      }),
+    retireCommittedAgentSuggestion: (cwdKey, intentId, message) =>
+      set((state) => {
+        const record = state.agentSuggestionByCwdKey[cwdKey];
+        if (record?.intentId === intentId && record.outcome === "dismissed") return state;
+        const retired = {
+          agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
+            intentId,
+            outcome: "dismissed",
+          }),
+        };
+        if (state.byCwdKey[cwdKey]?.message !== message) return retired;
+        const { [cwdKey]: _committed, ...byCwdKey } = state.byCwdKey;
+        return { ...retired, byCwdKey };
       }),
     dismissAgentCommitSuggestion: (cwdKey, intentId) =>
       set((state) => {
