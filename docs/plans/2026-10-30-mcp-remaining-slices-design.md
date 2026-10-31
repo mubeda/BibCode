@@ -4536,6 +4536,30 @@ before its fix.
 - **Redirect tests.** The redirect fixtures now point at the target server by address: a
   redirect to `fixture.invalid` would fail to resolve whether or not it was followed, so
   the earlier `a_redirect_is_not_followed` proved the ban only through its message.
+- **Inherited server variables (Codex re-review, two P2s).** Agent clone commands still
+  inherited the server's environment. Each of them (the `ls-remote --get-url` read and the
+  clone) now has `REMOVED_ENVIRONMENT` (`clone_policy.rs`) taken out with `env_remove`, never
+  set empty, since Git treats an exported `GIT_SSL_NO_VERIFY`, even an empty one, as "skip
+  TLS verification": the repository-location variables (`GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+  `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`,
+  `GIT_DISCOVERY_ACROSS_FILESYSTEM`) and the TLS trust overrides (`GIT_SSL_NO_VERIFY`,
+  `GIT_SSL_CAINFO`, `GIT_SSL_CAPATH`, `GIT_SSL_CERT`, `GIT_SSL_KEY`, `GIT_SSL_CIPHER_LIST`,
+  `GIT_SSL_VERSION`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`). The system's default
+  trust store stays. `ProcessRequest` has no removal field and has 39 literals across other
+  slices' files, so the removal travels beside it instead:
+  `ProcessRunner::run_without_inherited` (`git/process.rs`, threaded to the command builder,
+  a file outside X6's rows), `GitProcessRunner::run_without_inherited` (its default, for
+  runners that start no process, ignores the list), and a `removed` list on the repository's
+  execution input that only `ReservedClone::transfer` with a plan and `clone_remote_url` set.
+  A person's clone and every other Git command keep the inherited environment. Tests:
+  `an_agent_clone_drops_the_repository_location_and_tls_trust_variables` checks each name is
+  removed and none is set; `an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone`
+  re-runs itself in a process that inherits all nineteen (the TLS ones exported empty) with
+  `GIT_WORK_TREE`, `GIT_DIR` and `GIT_INDEX_FILE` naming an outside folder, checks with
+  `env` that the agent clone's runner drops each and keeps the rest while a person's keeps
+  them, and clones: the checkout lands in the reserved folder and nothing is written outside.
+  It failed with the list emptied.
 - **New error tags for X3's table.** `McpCloneNotFoundError` and `McpCloneRefusedError`
   belong in `feed::ERRORS` (`mcp/tools/feed.rs`, not on this branch); the coordinator adds
   them when combining.

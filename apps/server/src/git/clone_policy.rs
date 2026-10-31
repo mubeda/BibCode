@@ -69,6 +69,31 @@ const CURLOPT_RESOLVE: GitVersion = GitVersion {
     patch: 0,
 };
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Server variables an agent clone's Git commands do not inherit (`env_remove`; set empty,
+/// `GIT_SSL_NO_VERIFY` would still turn TLS verification off): where the repository, its
+/// work tree, index and objects are, and every TLS trust override. The system's default trust
+/// store stays.
+pub(crate) const REMOVED_ENVIRONMENT: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_SSL_NO_VERIFY",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "GIT_SSL_CERT",
+    "GIT_SSL_KEY",
+    "GIT_SSL_CIPHER_LIST",
+    "GIT_SSL_VERSION",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
 /// The null device, for an empty global configuration and an empty hooks folder.
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const OPERATION: &str = "GitVcsDriver.clone";
@@ -151,6 +176,11 @@ impl ClonePlan {
 
     pub(crate) fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
+    }
+
+    /// The server variables taken out of the clone's inherited environment.
+    pub(crate) fn removed_environment(&self) -> &'static [&'static str] {
+        REMOVED_ENVIRONMENT
     }
 }
 
@@ -407,7 +437,13 @@ impl ClonePolicy {
         }
         let environment = self.environment();
         let expanded = repository
-            .clone_remote_url(cwd, url, environment.clone(), cancellation)
+            .clone_remote_url(
+                cwd,
+                url,
+                environment.clone(),
+                REMOVED_ENVIRONMENT,
+                cancellation,
+            )
             .await
             .map_err(serialize)?;
         let expanded = target(&expanded, allow_http).map_err(refused)?;
@@ -774,6 +810,42 @@ pub(crate) mod tests {
             v6.arguments()
                 .contains(&"http.curloptResolve=v6.example.com:443:[2606:4700::1111]".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_clone_drops_the_repository_location_and_tls_trust_variables() {
+        let policy = ClonePolicy::new(resolver(&[("github.com", "140.82.112.3")]));
+        let plan = plan(&policy, "https://github.com/owner/repo.git")
+            .await
+            .expect("a public host");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_SSL_NO_VERIFY",
+            "GIT_SSL_CAINFO",
+            "GIT_SSL_CAPATH",
+            "GIT_SSL_CERT",
+            "GIT_SSL_KEY",
+            "GIT_SSL_CIPHER_LIST",
+            "GIT_SSL_VERSION",
+            "CURL_CA_BUNDLE",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            assert!(plan.removed_environment().contains(&name), "{name}");
+            // Removed, never set: an exported empty GIT_SSL_NO_VERIFY still skips TLS checks.
+            assert!(
+                !plan.environment().iter().any(|(key, _)| key == name),
+                "{name} is set"
+            );
+        }
     }
 
     #[tokio::test]

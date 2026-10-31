@@ -25,7 +25,7 @@ use super::{CREATED_AT, Harness, command, error_tag, structured};
 use crate::{
     git::{
         GitRepository,
-        clone_policy::{ClonePolicy, FixtureAllowance, tests::resolver},
+        clone_policy::{ClonePolicy, FixtureAllowance, REMOVED_ENVIRONMENT, tests::resolver},
     },
     mcp::{
         control::{ClientPrincipal, McpAccess, McpServerSettings},
@@ -54,7 +54,12 @@ fn empty_config() -> &'static Path {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    // The setup is the test's own: a repository location a test process inherited is not.
+    for name in INHERITED {
+        command.env_remove(name);
+    }
+    let output = command
         .args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1053,4 +1058,126 @@ async fn an_agent_may_not_detach_a_clone_and_cancels_only_its_own() {
     assert!(!folder.exists());
     fixture.server.release();
     fixture.harness.shutdown().await;
+}
+
+/// The server variables an agent clone must not inherit, as the review named them.
+const INHERITED: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_SSL_NO_VERIFY",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "GIT_SSL_CERT",
+    "GIT_SSL_KEY",
+    "GIT_SSL_CIPHER_LIST",
+    "GIT_SSL_VERSION",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+const INHERITED_TEST: &str = "production::mcp_tools_tests::clone::an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone";
+const INHERITED_PHASE: &str = "inherited-environment";
+/// The folder the inherited `GIT_WORK_TREE`, `GIT_DIR` and `GIT_INDEX_FILE` name.
+const OUTSIDE: &str = "BIBCODE_X6_OUTSIDE";
+/// A variable the agent clone's commands keep inheriting.
+const KEPT: &str = "BIBCODE_X6_KEPT";
+
+/// Review round 2 (second pass): an agent clone's commands do not inherit the server's
+/// repository-location or TLS trust variables, a person's commands still do, and an
+/// inherited `GIT_WORK_TREE` cannot move the checkout out of the reserved folder. In a
+/// process of its own, which inherits all of them (each TLS one set, and so exported, empty).
+#[cfg(unix)]
+#[tokio::test]
+async fn an_inherited_repository_or_tls_setting_never_reaches_an_agent_clone() {
+    use crate::{
+        git::{OutputPolicy, ProcessRequest, ProcessRunner},
+        test_support::reexec,
+    };
+
+    let Some(child) = reexec::enter(INHERITED_TEST, INHERITED_PHASE) else {
+        let outside = tempfile::tempdir().unwrap();
+        reexec::run(INHERITED_TEST, INHERITED_PHASE, None, |command| {
+            for name in INHERITED {
+                command.env(name, "");
+            }
+            command
+                .env("GIT_WORK_TREE", outside.path())
+                .env("GIT_DIR", outside.path().join("git-dir"))
+                .env("GIT_INDEX_FILE", outside.path().join("index"))
+                .env(OUTSIDE, outside.path())
+                .env(KEPT, "kept");
+        });
+        let written = std::fs::read_dir(outside.path()).unwrap().count();
+        assert_eq!(written, 0, "the clone wrote outside its folder");
+        return;
+    };
+
+    let fixture = fixture(Options::default()).await;
+    let result = fixture
+        .clone(
+            &fixture.agent,
+            json!({ "url": fixture.url(), "addAsProject": false }),
+        )
+        .await;
+    assert_eq!(structured(&result)["state"], "done", "{result}");
+    let destination = fixture.projects.join("repo");
+    assert!(destination.join("README.md").is_file());
+    assert!(destination.join(".git").is_dir());
+    let outside = PathBuf::from(std::env::var_os(OUTSIDE).expect("the outside folder"));
+    let written = std::fs::read_dir(&outside).unwrap().count();
+    assert_eq!(written, 0, "the clone wrote outside its folder");
+    fixture.harness.shutdown().await;
+
+    let cwd = tempfile::tempdir().unwrap();
+    let request = || ProcessRequest {
+        operation: "test.environment".into(),
+        command: PathBuf::from("env"),
+        args: Vec::new(),
+        cwd: cwd.path().to_path_buf(),
+        env: Vec::new(),
+        stdin: None,
+        timeout: Duration::from_secs(10),
+        max_output_bytes: 1 << 20,
+        output_policy: OutputPolicy::Truncate,
+        append_truncation_marker: false,
+        allow_non_zero_exit: false,
+    };
+    let names = |output: String| {
+        output
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let token = CancellationToken::new();
+    let isolated = names(
+        ProcessRunner
+            .run_without_inherited(request(), REMOVED_ENVIRONMENT, &token)
+            .await
+            .expect("env runs")
+            .stdout,
+    );
+    let inherited = names(
+        ProcessRunner
+            .run(request(), &token)
+            .await
+            .expect("env runs")
+            .stdout,
+    );
+    for name in INHERITED {
+        assert!(!isolated.contains(*name), "an agent clone inherits {name}");
+        assert!(inherited.contains(*name), "a person's command lost {name}");
+    }
+    assert!(
+        isolated.contains(KEPT),
+        "an agent clone lost the rest of its environment"
+    );
+
+    child.complete();
 }

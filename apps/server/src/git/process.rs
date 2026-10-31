@@ -245,8 +245,27 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Inherit, &[])
             .await
+    }
+
+    /// [`Self::run`] with each variable `removed` names taken out of the inherited
+    /// environment (`env_remove`), before `request.env` applies. Removing differs from
+    /// setting a variable empty: Git treats an exported `GIT_SSL_NO_VERIFY`, even an empty
+    /// one, as "skip TLS verification".
+    pub(crate) async fn run_without_inherited(
+        &self,
+        request: ProcessRequest,
+        removed: &[&str],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_with_environment(
+            request,
+            cancellation,
+            EnvironmentInheritance::Inherit,
+            removed,
+        )
+        .await
     }
 
     pub async fn run_bytes(
@@ -257,7 +276,7 @@ impl ProcessRunner {
         #[cfg(feature = "hermetic-test-guard")]
         let request = checked_guarded_request(request, EnvironmentInheritance::Inherit)?;
         let command_label = request.command.to_string_lossy().into_owned();
-        let output = run_request(&request, EnvironmentInheritance::Inherit, cancellation)
+        let output = run_request(&request, EnvironmentInheritance::Inherit, &[], cancellation)
             .await
             .map_err(|error| map_supervised_error(error, &request, command_label))?;
 
@@ -300,7 +319,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared, &[])
             .await
     }
 
@@ -309,11 +328,12 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
         inheritance: EnvironmentInheritance,
+        removed: &[&str],
     ) -> Result<ProcessOutput, ProcessError> {
         #[cfg(feature = "hermetic-test-guard")]
         let request = checked_guarded_request(request, inheritance)?;
         let command_label = request.command.to_string_lossy().into_owned();
-        let output = run_request(&request, inheritance, cancellation)
+        let output = run_request(&request, inheritance, removed, cancellation)
             .await
             .map_err(|error| map_supervised_error(error, &request, command_label))?;
 
@@ -400,10 +420,11 @@ fn checked_guarded_request(
 async fn run_request(
     request: &ProcessRequest,
     inheritance: EnvironmentInheritance,
+    removed: &[&str],
     cancellation: &CancellationToken,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
     SpawnPlan::new(&request.command, |program| {
-        process_command(request, inheritance, program)
+        process_command(request, inheritance, removed, program)
     })
     .start(
         |command| {
@@ -423,11 +444,15 @@ async fn run_request(
 fn process_command(
     request: &ProcessRequest,
     inheritance: EnvironmentInheritance,
+    removed: &[&str],
     program: &std::path::Path,
 ) -> Command {
     let mut command = Command::new(program);
     if inheritance == EnvironmentInheritance::Cleared {
         command.env_clear();
+    }
+    for name in removed {
+        command.env_remove(name);
     }
     command
         .args(&request.args)
