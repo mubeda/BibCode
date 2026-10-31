@@ -136,6 +136,27 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   directory (`bibcode-discard`), and the trash takes it from there. **Put Back** in the Trash
   therefore does not return a file to the checkout; drag it back instead.
 
+#### Reading history and suggesting a commit message
+
+| Tool                          | What it does                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `git_diff`                    | One file's changes against HEAD as a patch, 16,000 characters a page; `staged` for the index only |
+| `git_log`                     | Commits from a branch, tag or sha (HEAD unless set), newest first, paged by `cursor`              |
+| `git_refs`                    | Branches with upstream and ahead/behind, remotes, tags, stashes, and any operation in progress    |
+| `git_generate_commit_message` | The plain "Update <paths>" line BiBCode would use; nothing is committed                           |
+| `git_set_commit_message`      | Suggests a commit message to you in the Source Control panel; it never commits                    |
+
+- **Reads work at Read only.** `git_diff`, `git_log` and `git_refs` change nothing. Their
+  text, like every result, is untrusted. `git_diff` needs a `path` (`git_status` lists the
+  changed files); a file too large to show returns its size and no content. `git_log` cuts a
+  long message at 2,000 characters and a long file list at 50, and says how long each was.
+- **A suggested message never replaces your words.** When the box is empty, the message
+  fills it with **Message from Agent <name>** under it. When you already typed something,
+  you see **Agent <name> suggested a message** with its first line, **Use it** and
+  **Dismiss**; **Undo** brings your text back after **Use it**. Once you commit, the same
+  suggestion does not come back. BiBCode keeps the last suggestion per folder for 24 hours,
+  so a panel you open later still shows it. A message holds at most 8,000 characters.
+
 ### Pull requests
 
 These work on the repository of the folder a thread works in, through the provider CLI

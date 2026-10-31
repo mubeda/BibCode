@@ -3460,6 +3460,37 @@ handlers, so creation and removal keep their command claims, generation checks,
   writes the line when the removal ends; a close-then-`try_recv` on the waiting side
   makes that exactly one line.
 
+### Source Control reads and the commit message suggestion
+
+`mcp::tools::git` (slice X7, beside slice G's write tools) resolves the thread's folder
+when the call runs and calls the Source Control panel's reads. Every tool is in the
+`sourceControl` set; the three reads are read-only and idempotent, so they work at the
+read-only ceiling.
+
+| Tool                          | Maps to                                                                                   | Scope   |
+| ----------------------------- | ----------------------------------------------------------------------------------------- | ------- |
+| `git_diff`                    | `gitManager.getDiff` `working-tree` for one C5-checked path, paged at 16,000 characters   | read    |
+| `git_log`                     | `gitManager.getRefs` to resolve the ref, then `gitManager.getCommits` with one pinned tip | read    |
+| `git_refs`                    | `gitManager.getRefs` and `gitManager.getStashes`, projected without the guard reasons     | read    |
+| `git_generate_commit_message` | `vcs.generateCommitMessage` (deterministic "Update <paths>")                              | operate |
+| `git_set_commit_message`      | `ui.publishIntent` with `kind: "commitMessage"` and the folder the tool resolved          | operate |
+
+- **Diff.** `path` is required: the handler diffs one path and refuses `.`. The tool
+  drops Git's `--patch-with-raw -z` header (everything before the first `diff --git`
+  that starts a line) and pages the rest with `get_turn_diff`'s `diff_page`. A
+  `large-text` or `unrenderable` diff returns its kind and `byteLength` only, and an
+  image's bytes are never returned.
+- **Log.** `ref` is HEAD unless set; a branch, remote branch, tag (peeled) or full sha
+  resolves to one commit, which is the only pinned tip. The cursor is `sha:offset`, so
+  pages follow the first page's tip after the branch moves. Each subject is cut at
+  1,000 characters, each body at 2,000 (with `bodyChars`), and each file list at 50 (with
+  `changedFileCount`); the page is fitted to the result cap before its cursor is set.
+- **Generate** needs `orchestration:operate` because its method is registered as a
+  mutation, though it changes nothing; it carries `idempotentHint`.
+- **Suggest.** See the UI intents bullet below. The message must hold text, at most
+  8,000 characters, with no control character but tabs and line breaks
+  (`McpInvalidArgumentError` from the tool, `UiIntentError` `invalid` from the handler).
+
 ### Pull request tools
 
 `mcp::tools::pull_requests` resolves the thread's folder and calls the handlers the
@@ -3771,14 +3802,28 @@ Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
   (`UiIntentError`, `reason: "limit"`), and at most 256 in all, past which the oldest are
   dropped; the result reports how many streams were subscribed.
   `subscribeUiIntents` (`orchestration:read`, read stream) sends the newest 64 pending
-  intents (one server is one environment) and then each new one (a lagging stream gets a fresh snapshot). The kind field lets slice X7
-  add `commitMessage` with its own retention.
+  intents (one server is one environment) and then each new one (a lagging stream gets a
+  fresh snapshot).
+- **Commit message suggestions** (slice X7). `ui.publishIntent` takes `kind`, `focus`
+  unless set; `kind: "commitMessage"` takes `{ threadId, cwd, message }` and publishes
+  `{ kind: "commitMessage", intentId, threadId, cwd, message, actor, createdAt, expiresAt }`.
+  These live apart from the `focus` intents: the last one per `cwd` for 24 hours, at most
+  64 folders (the oldest dropped first), outside the per-thread and per-agent limits, and
+  every snapshot carries all of them after the newest 64 `focus` intents. The handler
+  trusts the `cwd` the tool resolved from the thread; it has no projection to check it
+  against, and the suggestion is advice a panel labels. The client runtime caps each kind
+  separately and keeps a folder's newest message.
 - **Clients.** `UiIntentNotifier` (one per environment, outside the router) raises a
   non-modal toast per intent, **Agent <label> wants to show <surface>** with **Show**, and
   moves nothing until it is clicked; a hidden window raises it when shown again if it has
   not expired. **Show** routes to the thread (a panel's host, with the panel's tab active)
   and opens the surface there. A chat panel tab an agent opened carries an **Agent** badge,
-  with the agent and purpose in its tooltip.
+  with the agent and purpose in its tooltip. `UiIntentNotifier` skips `commitMessage`
+  intents; `SourceControlAgentSuggestion`, under the Source Control message box, follows
+  only its folder's newest one. The draft store (`sourceControlPanelStore`) fills an empty
+  draft (**Message from Agent <label>**), or offers it beside text (**Use it**, **Dismiss**,
+  then **Undo**), and remembers each intent id per folder in local storage, so a pending
+  suggestion never refills the box after a commit cleared it.
 
 ## Targeted Activity cancellation flow
 

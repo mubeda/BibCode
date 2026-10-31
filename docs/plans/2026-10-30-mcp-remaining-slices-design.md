@@ -4641,3 +4641,83 @@ changes a settled decision.
   tools remain with Workspace and Source control off (as P and X2 did for theirs).
 - **Not run:** a Windows build. The cross-check cannot compile `aws-lc-sys` without the
   Windows SDK; the non-Unix `beneath` code is type-checked only by Windows CI.
+
+## X7 implementation notes (2026-10-31)
+
+X7 was implemented on `claude/v0131-139-x7`, from the batch tip `4d4287c818` (slice 1, the
+CLI, F0 and waves 1 to 3 with their review fixes). It adds five tools to the `git` family
+(`mcp/tools/git.rs`, Source control set), the `commitMessage` kind in
+`production/ui_intents_rpc.rs` and `packages/contracts/src/uiIntents.ts`,
+`SourceControlAgentSuggestion.tsx` and the draft store's suggestion state, and
+`mcp_tools_tests/git_reads.rs`. No migration, no new RPC method or stream.
+
+**Drift found:**
+
+- **`git_diff` requires `path`.** The design gives `path?`, but `gitManager.getDiff`'s
+  `working-tree` source takes one path and `validate_pathspecs` refuses `.`, and no
+  folder-wide diff method exists. Paging one `getDiff` per changed file would recompute
+  every diff on every cursor, so the tool names one file; its description points at
+  `git_status` for the list.
+- **`getDiff`'s patch carries Git's raw header.** It runs `--patch-with-raw -z`, so the text
+  starts with NUL-separated raw records. The tool keeps what follows the first `diff --git`
+  that starts a line (as `parse_working_tree_diff` does) and pages it with
+  `threads::diff_page`, made `pub(crate)`; the cursor is its `file:offset`. A `large-text` or
+  `unrenderable` diff returns `kind` and `byteLength` without content, and an `image` diff
+  (commit sources only, which the tool does not request) would be `unrenderable`: its
+  base64 bytes are never returned. `staged: false` is `git diff HEAD`, so staged changes are
+  included; an untracked file reads as added.
+- **`gitManager.getCommits` has no `ref`.** It takes `pinnedTips` (full shas), `offset` and
+  `limit` (at most 100). `git_log` resolves `ref` (HEAD unless set; a local or remote
+  branch, a peeled tag or a full sha) through `gitManager.getRefs` and pins that one tip.
+  The cursor is `sha:offset`, so pages follow the first page's tip after the branch moves.
+  An unborn HEAD returns no commits. `git_log` lists only `gitManager.getCommits` in its
+  spec; its `getRefs` read has the same scope.
+- **`vcs.generateCommitMessage` is a mutation method**, so the family test pins
+  `git_generate_commit_message` to `orchestration:operate`. It is not under Reads: it is
+  hidden at read-only, carries `idempotentHint`, and records an activity row like other
+  operate tools.
+- **`ui.publishIntent` takes a `kind`** (`focus` unless set) rather than a second method, as
+  X4's notes allowed, so `rpc/methods.rs`, `auth/scope.rs` and the RPC counts are
+  untouched. The commit message input is `{ kind: "commitMessage", threadId, cwd, message }`
+  and the intent `{ kind, intentId, threadId, cwd, message, actor, createdAt, expiresAt }`
+  (the design's `{ cwd, message, actor }` plus X4's common fields). Regenerating the wire
+  fixtures changed only the `subscribeUiIntents` stream shapes and the manifest.
+- **The client-runtime fold was X4's file.** It kept the newest 64 intents of any kind, so
+  a flood of `focus` intents dropped a pending commit message. It now caps each kind on its
+  own and keeps a folder's newest message.
+
+**Choices made while implementing:**
+
+- **Retention.** Commit messages live in a second list in `UiIntents`, the last per `cwd`
+  for 24 hours, at most 64 folders (oldest dropped). They do not count toward the 16 per
+  thread, 64 per agent or 256 in all of `focus` intents, and every snapshot carries them
+  after the newest 64 `focus` intents.
+- **What a message may hold.** Text, at most 8,000 characters, and no control character but
+  tab, CR and LF, checked in the tool (`McpInvalidArgumentError`) and again in the handler
+  (`UiIntentError`, `invalid`). A person reads it in the panel, so nothing in it may redraw
+  or hide what they see. The handler trusts the tool's `cwd` (it has no projection); MCP
+  clients reach it only through the tool, which resolves `cwd` from the thread.
+- **`git_set_commit_message`** takes no `clientRequestId` and has no `idempotentHint`: a
+  repeat publishes a new intent that a panel offers again.
+- **Log bounds.** Subjects are cut at 1,000 characters, bodies at 2,000 (`bodyChars` gives
+  the full length, which counts Git's trailing line break), file lists at 50
+  (`changedFileCount`); the page is fitted with `fit_list` before its cursor is set, so a
+  cut page skips nothing. `limit` defaults to 20.
+- **Refs.** `git_refs` returns each branch and tag without the panel's `blocked` guard
+  reasons, and stashes with their changed files; lists give way in the order tags, remote
+  branches, stashes, local branches, conflicted paths.
+- **Panel.** `SourceControlAgentSuggestion` subscribes through `RegistryContext` and keeps
+  only its folder's newest suggestion in state, so other intents re-render nothing. The draft
+  store applies a suggestion atomically: it fills an empty (or whitespace-only) draft and
+  records `filled`, else records `offered`; each intent id is handled once and remembered per
+  folder (at most 128) in the persisted store, so a suggestion still pending never refills
+  the box after a commit cleared it. A draft an earlier suggestion filled is not
+  overwritten either. **Message from Agent <label>** shows only while the draft is the
+  suggested text. Beyond the design's copy, the offer shows the message's first line (the
+  full text as a tooltip) so the person sees what **Use it** brings, and **Undo** follows
+  **Use it**, restoring the draft it replaced (UI.md: recover from mistakes).
+- **Tests.** The Git fixture of `mcp_tools_tests/git.rs` gained `fixture_with` so
+  `git_reads.rs` also registers the UI intents service; nothing else in G's tests changed.
+  `.git/config` is refused by the handler (`GitManagerOperationError`, `invalid-path`),
+  since C5's `validate_paths` does not name Git's metadata. `SourceControlPanel.test.tsx`
+  mocks the new component; its own happy-dom test covers it.
