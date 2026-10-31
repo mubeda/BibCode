@@ -3892,6 +3892,17 @@ one second, half read, all recurring twice), `a_large_page_keeps_its_cursor_and_
 characters), `a_crash_records_modules_and_frames_keep_file_names_only` and
 `a_client_alias_is_keyed_not_a_plain_digest`.
 
+**Codex review fix (review round 4, 2026-10-31).** Confirmed: a panic's `message` reached
+outside agents in `panic` events, in `crash.panic` findings' evidence and in a crash record's
+`lastEvents`, and the panic hook redacts only home paths, so `failed opening
+/mnt/private/customer.txt` passed. `message` is now left out of both `/mcp` allowlists
+(`event_fields("panic")` and `evidence_fields("crash.panic")`); `lastEvents` go through the
+same event projection. Agents keep the kind, thread, location (a relative path or file name)
+and frames. The stdio server is unchanged. The own-process store test now holds that message
+in a panic event, a `crash.panic` finding and a crash's `lastEvents`, and asserts it in none of
+`profiler_status`, `profiler_findings`, `profiler_events` or `profiler_crash`; it failed before
+the fix. This supersedes round one's choice to keep the panic message.
+
 ## X1 implementation notes (2026-10-31)
 
 X1 was implemented on `claude/v0131-139-x1`, from `1d4eda69bd` (slice 1, the CLI, F0, wave 1
@@ -4222,14 +4233,3 @@ reads, so the server derives it rather than trusting a client:
   `ui.publishCommitMessage` if a separate scope or shape reads better, and move the counts.
 - `UiIntentNotifier` already skips any kind other than `focus`; the Source Control panel
   folds `uiIntentsEnvironment.intents` for its own kind.
-
-**Codex review fix (review round 4, 2026-10-31).** Confirmed: a panic's `message` reached
-outside agents in `panic` events, in `crash.panic` findings' evidence and in a crash record's
-`lastEvents`, and the panic hook redacts only home paths, so `failed opening
-/mnt/private/customer.txt` passed. `message` is now left out of both `/mcp` allowlists
-(`event_fields("panic")` and `evidence_fields("crash.panic")`); `lastEvents` go through the
-same event projection. Agents keep the kind, thread, location (a relative path or file name)
-and frames. The stdio server is unchanged. The own-process store test now holds that message
-in a panic event, a `crash.panic` finding and a crash's `lastEvents`, and asserts it in none of
-`profiler_status`, `profiler_findings`, `profiler_events` or `profiler_crash`; it failed before
-the fix. This supersedes round one's choice to keep the panic message.
