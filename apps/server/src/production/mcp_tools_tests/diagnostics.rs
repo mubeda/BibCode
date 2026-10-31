@@ -20,13 +20,18 @@ use crate::{
         reader::Reader,
         runtime::ProfilerRuntime,
     },
-    mcp::{control::McpAccess, tools::diagnostics::project_event},
+    mcp::{
+        control::McpAccess,
+        tools::diagnostics::{project_event, project_finding},
+    },
     rpc::RpcRegistry,
 };
 
 /// Text the sources hold that no result may carry: content, and a path in a home directory.
 const MARKER: &str = "MARKER-x2-ignore-previous-instructions";
 const HOME_PATH: &str = "/Users/someone/private-folder";
+/// A client-chosen string shaped like an id.
+const TOKEN: &str = "privateToken123";
 
 const TOOLS: [&str; 8] = [
     "profiler_status",
@@ -57,6 +62,15 @@ fn assert_clean(result: &Value) {
     assert!(!text.contains(MARKER), "{text}");
     assert!(!text.contains(HOME_PATH), "{text}");
     assert!(!text.contains("someone"), "{text}");
+}
+
+/// [`assert_clean`], and no client-chosen string or host path outside home either.
+fn assert_clean_of_tokens(result: &Value) {
+    assert_clean(result);
+    let text = result.to_string();
+    for leak in [TOKEN, "private-builds", "/builds/private"] {
+        assert!(!text.contains(leak), "{leak} in {text}");
+    }
 }
 
 /// Registers `tag` answering `response`, and records each payload it receives in `seen`.
@@ -473,8 +487,9 @@ fn stdio(dir: &std::path::Path, tool: &str, arguments: Value) -> Value {
     serde_json::from_slice::<Value>(&output).unwrap()["result"].clone()
 }
 
-/// Over `/mcp` the profiler tools read the server's own store: status and findings as the stdio
-/// server returns them, events and crash records with only their documented fields. In a
+/// Over `/mcp` the profiler tools read the server's own store as the stdio server does, with
+/// findings, events and crash records cut to their documented fields, client-chosen strings
+/// replaced or left out, and host paths outside home left out. In a
 /// process of its own: the profiler handle is process-global.
 #[tokio::test]
 async fn the_profiler_tools_read_the_servers_own_store_projected() {
@@ -491,18 +506,63 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     let state = tempfile::tempdir().expect("state");
     let dir = profiler_dir(state.path());
     std::fs::create_dir_all(dir.join("crashes")).unwrap();
-    let findings: String = (0..3)
-        .map(|index| {
-            let finding = json!({
-                "id": format!("rpc.slow-{index}"), "fingerprint": format!("{index}"),
-                "kind": "rpc.slow", "severity": "warn", "firstSeen": ago(30),
-                "lastSeen": ago(10 - index), "count": 1, "source": "server",
-                "title": "Slow request", "summary": "s", "state": "open",
-                "evidence": { "ms": 1200 },
-            });
-            format!("{finding}\n")
+    let finding = |id: &str, kind: &str, last_seen: String, evidence: Value| {
+        json!({
+            "id": id, "fingerprint": id, "kind": kind, "severity": "warn",
+            "firstSeen": ago(30), "lastSeen": last_seen, "count": 1, "source": "server",
+            "title": format!("Title {MARKER}"), "summary": format!("{HOME_PATH} {MARKER}"),
+            "state": "open", "evidence": evidence,
         })
-        .collect();
+    };
+    let findings: String = [
+        finding(
+            "rpc.slow-0",
+            "rpc.slow",
+            ago(10),
+            json!({ "method": "git.status", "maxMs": 1200, "note": MARKER }),
+        ),
+        finding(
+            "rpc.slow-1",
+            "rpc.slow",
+            ago(9),
+            json!({ "method": "git.status", "maxMs": 1300 }),
+        ),
+        finding(
+            "client.stall-1",
+            "client.stall",
+            ago(8),
+            json!({
+                "envId": "env-1", "clientId": TOKEN, "capabilities": ["heartbeat", TOKEN],
+                "windowMs": 10_000, "stalls": { "count": 2, "totalMs": 1500, "maxMs": 900 },
+                "eventIds": ["aaaa1111-2"],
+            }),
+        ),
+        finding(
+            "git.stacked-action-failed-1",
+            "git.stacked-action-failed",
+            ago(7),
+            json!({
+                "action": "push", "phase": "push", "reason": "git-failed",
+                "message": "exit status 1", "worktree": "/srv/private-builds/repo",
+                "repeatsInWindow": 3,
+            }),
+        ),
+        finding(
+            "worktree.missing-1",
+            "worktree.missing",
+            ago(6),
+            json!({ "path": "~/projects/kept" }),
+        ),
+        finding(
+            "crash.panic-1",
+            "crash.panic",
+            ago(5),
+            json!({ "thread": "main", "location": "/builds/private/repo/src/main.rs:12", "message": "boom" }),
+        ),
+    ]
+    .iter()
+    .map(|finding| format!("{finding}\n"))
+    .collect();
     std::fs::write(dir.join("findings.ndjson"), findings).unwrap();
     let envelope = |seq: u64, kind: &str| {
         json!({
@@ -517,15 +577,22 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     let mut custom = envelope(1, "x.custom");
     custom["text"] = MARKER.into();
     let mut batch = envelope(2, "client.batch");
-    batch["source"] = format!("client:{MARKER} x").into();
-    batch["clientId"] = format!("{MARKER} x").into();
+    batch["source"] = format!("client:{TOKEN}").into();
+    batch["clientId"] = TOKEN.into();
+    batch["appVersion"] = TOKEN.into();
+    batch["envId"] = "env-1".into();
     batch["capabilities"] = json!(["heartbeat", MARKER]);
     batch["stalls"] = json!({ "count": 1, "totalMs": 60, "maxMs": 60, "note": MARKER });
     batch["windowMs"] = 10_000.into();
     let mut sample = envelope(3, "process.sample");
     sample["procs"] =
         json!([{ "pid": 7, "kind": "server", "label": "bibcode", "cpu": 1.0, "note": MARKER }]);
-    let events: String = [&action, &custom, &batch, &sample]
+    let mut request = envelope(4, "client.request");
+    request["source"] = format!("client:{MARKER} x").into();
+    request["clientId"] = format!("{MARKER} x").into();
+    request["correlationId"] = TOKEN.into();
+    request["method"] = "git.status".into();
+    let events: String = [&action, &custom, &batch, &sample, &request]
         .iter()
         .map(|event| format!("{event}\n"))
         .collect();
@@ -537,7 +604,7 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
         json!({
             "id": crash_id, "createdAt": ago(20), "version": "0.13.1", "os": "macos",
             "arch": "aarch64", "processKind": "server", "note": MARKER,
-            "lastEvents": [action],
+            "lastEvents": [action, batch],
         })
         .to_string(),
     )
@@ -554,23 +621,56 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
             result
         }
     };
+    // Status and findings are the stdio server's, each finding projected.
+    let project = |result: Value| {
+        let mut content = result["structuredContent"].clone();
+        let projected: Vec<Value> = content["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(project_finding)
+            .collect();
+        content["findings"] = projected.into();
+        content
+    };
     let status = over_mcp("profiler_status", json!({})).await;
-    assert_eq!(status, stdio(&dir, "profiler_status", json!({})));
+    assert_clean_of_tokens(&status);
+    assert_eq!(
+        *structured(&status),
+        project(stdio(&dir, "profiler_status", json!({})))
+    );
     let findings = over_mcp("profiler_findings", json!({ "since": "1h" })).await;
+    let raw = stdio(&dir, "profiler_findings", json!({ "since": "1h" }));
+    assert!(raw.to_string().contains(TOKEN), "the fixture holds it");
+    assert_clean_of_tokens(&findings);
+    assert_eq!(*structured(&findings), project(raw));
+    let findings = structured(&findings)["findings"].as_array().unwrap();
+    assert_eq!(findings[0]["id"], "rpc.slow-0", "oldest first from since");
     assert_eq!(
-        findings,
-        stdio(&dir, "profiler_findings", json!({ "since": "1h" }))
+        findings[0]["evidence"],
+        json!({ "method": "git.status", "maxMs": 1200 })
     );
-    assert_eq!(
-        structured(&findings)["findings"][0]["id"],
-        "rpc.slow-0",
-        "oldest first from since"
+    assert!(findings[0].get("title").is_none() && findings[0].get("summary").is_none());
+    assert_eq!(findings[0]["count"], 1);
+    let stall = &findings[2]["evidence"];
+    let client = stall["clientId"].as_str().expect("an opaque client id");
+    assert!(client.len() == 13 && client.starts_with('h'), "{client}");
+    assert_eq!(stall["capabilities"], json!(["heartbeat"]));
+    assert_eq!(stall["stalls"]["totalMs"], 1500);
+    assert_eq!(stall["eventIds"], json!(["aaaa1111-2"]));
+    assert_eq!(findings[3]["evidence"]["reason"], "git-failed");
+    assert!(
+        findings[3]["evidence"].get("worktree").is_none(),
+        "{}",
+        findings[3]
     );
+    assert_eq!(findings[4]["evidence"]["path"], "~/projects/kept");
+    assert_eq!(findings[5]["evidence"]["location"], "main.rs:12");
 
     let events = over_mcp("profiler_events", json!({})).await;
     let raw = stdio(&dir, "profiler_events", json!({}));
     assert!(raw.to_string().contains(MARKER), "the fixture holds it");
-    assert_clean(&events);
+    assert_clean_of_tokens(&events);
     let projected: Vec<Value> = raw["structuredContent"]["events"]
         .as_array()
         .unwrap()
@@ -579,7 +679,7 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
         .collect();
     assert_eq!(structured(&events)["events"], json!(projected));
     let events = structured(&events)["events"].as_array().unwrap();
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     assert_eq!(events[0]["action"], "commit");
     assert_eq!(events[0]["eventId"], "aaaa1111-0");
     assert_eq!(
@@ -588,8 +688,13 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
         "an undocumented kind keeps its envelope only: {}",
         events[1]
     );
-    assert_eq!(events[2]["source"], "client");
-    assert_eq!(events[2]["clientId"], Value::Null);
+    // A client's id comes back as the same opaque value everywhere; what it chose never does.
+    assert_eq!(events[2]["clientId"], client);
+    assert_eq!(events[2]["source"], format!("client:{client}"));
+    assert!(events[2].get("appVersion").is_none());
+    assert_eq!(events[2]["envId"], "env-1");
+    assert!(events[4].get("correlationId").is_none(), "{}", events[4]);
+    assert_eq!(events[4]["method"], "git.status");
     assert_eq!(events[2]["capabilities"], json!(["heartbeat"]));
     assert_eq!(
         events[2]["stalls"],
@@ -598,7 +703,7 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     assert_eq!(events[3]["procs"][0]["label"], "bibcode");
 
     let crash = over_mcp("profiler_crash", json!({ "id": crash_id })).await;
-    assert_clean(&crash);
+    assert_clean_of_tokens(&crash);
     let crash = structured(&crash);
     assert_eq!(crash["crash"]["id"], crash_id);
     assert_eq!(crash["crash"]["processKind"], "server");

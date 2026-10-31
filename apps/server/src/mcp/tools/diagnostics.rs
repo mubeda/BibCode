@@ -17,7 +17,7 @@ use crate::{
     auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     diagnostics::profiler::{
         mcp::{self as profiler, Producer, Refusal},
-        redact::{redact_message, redact_path},
+        redact::redact_message,
     },
     mcp::{
         control::{
@@ -96,8 +96,14 @@ fn call<'a>(
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         match name {
-            "profiler_status" => call.profiler(profiler::status_content, |_| {}).await,
-            "profiler_findings" => call.profiler(profiler::findings_content, |_| {}).await,
+            "profiler_status" => {
+                call.profiler(profiler::status_content, project_findings)
+                    .await
+            }
+            "profiler_findings" => {
+                call.profiler(profiler::findings_content, project_findings)
+                    .await
+            }
             "profiler_events" => {
                 call.profiler(profiler::events_content, project_events)
                     .await
@@ -604,10 +610,16 @@ const NESTED: &[(&str, &[&str])] = &[
     ("frames", &["module", "debugId", "offset"]),
     ("histograms", &["method", "buckets"]),
 ];
-/// Client-chosen ids an event carries, kept only when they look like one.
-const CLIENT_IDS: &[&str] = &["clientId", "correlationId", "envId", "appVersion"];
 /// What a client batch may say it measures with.
 const CLIENT_CAPABILITIES: &[&str] = &["long-animation-frame", "heartbeat", "event", "memory"];
+
+fn project_findings(content: &mut Value) {
+    if let Some(Value::Array(findings)) = content.get_mut("findings") {
+        for finding in findings {
+            *finding = project_finding(finding);
+        }
+    }
+}
 
 fn project_events(content: &mut Value) {
     if let Some(Value::Array(events)) = content.get_mut("events") {
@@ -638,27 +650,19 @@ pub(crate) fn project_event(event: &Value) -> Value {
             projected[field] = numbers_only(value);
         }
     }
-    for field in CLIENT_IDS {
-        if let Some(value) = projected.get(*field) {
-            projected[*field] = token(value).map_or(Value::Null, Value::from);
-        }
+    clean_client_fields(&mut projected);
+    // The server's environment id, kept while it looks like one.
+    if let Some(env) = projected.get("envId") {
+        projected["envId"] = token(env).map_or(Value::Null, Value::from);
     }
-    if let Some(capabilities) = projected.get("capabilities").and_then(Value::as_array) {
-        projected["capabilities"] = capabilities
-            .iter()
-            .filter(|capability| {
-                capability
-                    .as_str()
-                    .is_some_and(|capability| CLIENT_CAPABILITIES.contains(&capability))
-            })
-            .cloned()
-            .collect();
+    if let Some(location) = projected.get("location").and_then(Value::as_str) {
+        projected["location"] = relative_or_file_name(location).into();
     }
     if let Some(source) = projected.get("source") {
         projected["source"] = match source.as_str() {
             Some("server") => "server".into(),
-            Some(source) => match source.strip_prefix("client:").and_then(id_like) {
-                Some(id) => format!("client:{id}").into(),
+            Some(source) => match source.strip_prefix("client:") {
+                Some(id) => format!("client:{}", opaque(id)).into(),
                 None => "client".into(),
             },
             None => Value::Null,
@@ -667,8 +671,8 @@ pub(crate) fn project_event(event: &Value) -> Value {
     projected
 }
 
-/// A crash record's documented fields, its events projected, and its stack with local paths
-/// redacted.
+/// A crash record's documented fields, its events projected, and its stack with each frame's
+/// file as a relative path or a file name.
 fn project_crash(content: &mut Value) {
     let crash = &content["crash"];
     let mut projected = pick(
@@ -697,7 +701,7 @@ fn project_crash(content: &mut Value) {
             .map(|frame| {
                 let mut frame = pick(frame, &["module", "function", "file", "line", "offset"]);
                 if let Some(file) = frame["file"].as_str() {
-                    frame["file"] = redact_path(file).into();
+                    frame["file"] = relative_or_file_name(file).into();
                 }
                 frame
             })
@@ -775,4 +779,280 @@ fn id_like(text: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:+-".contains(&byte)))
     .then_some(text)
+}
+
+/// The fields every finding keeps. `title` and `summary` are prose that can quote a path or a
+/// value, so they are left out: the kind and the evidence carry the facts.
+const FINDING_FIELDS: &[&str] = &[
+    "id",
+    "fingerprint",
+    "kind",
+    "severity",
+    "firstSeen",
+    "lastSeen",
+    "count",
+    "source",
+    "state",
+    "firstVersion",
+    "lastVersion",
+];
+/// The evidence every finding may cite.
+const CITATIONS: &[&str] = &["eventIds", "crashId", "crashIds"];
+/// A crashed previous run's evidence.
+const RUN: &[&str] = &["pid", "version", "startedAt"];
+/// A crash record's evidence: a dump's, an OS record's, or both.
+const CRASH_RECORD: &[&str] = &[
+    "source",
+    "processKind",
+    "createdAt",
+    "crashReason",
+    "faultModule",
+    "faultOffset",
+    "recordSource",
+    "signalOrCode",
+    "module",
+    "frames",
+    "rawRef",
+    "signal",
+    "exe",
+    "crashedAt",
+];
+
+/// The evidence fields each finding kind documents in `findings.md`. Free text (an exit
+/// detail, a journal excerpt) is left out.
+fn evidence_fields(kind: &str) -> Vec<&'static str> {
+    let fields: &[&[&'static str]] = match kind {
+        "crash.native" => &[RUN, CRASH_RECORD],
+        "crash.unclean-exit" | "shutdown.incomplete" => {
+            &[RUN, &["facility", "exitCause", "exitNotedAt", "goneAt"]]
+        }
+        "crash.oom" | "crash.system" => &[RUN],
+        "crash.webview" => &[&["reason", "kind", "exitCode", "dump"], CRASH_RECORD],
+        "crash.panic" => &[&["thread", "location", "message"]],
+        "subprocess.crash" => &[
+            &[
+                "pid",
+                "processKind",
+                "label",
+                "outcome",
+                "uptimeMs",
+                "likelyOom",
+                "lastRssBytes",
+                "lastPrivateBytes",
+                "sampledAgoMs",
+            ],
+            CRASH_RECORD,
+        ],
+        "provider.turn-failed" => &[&["provider", "terminalReason", "errorClass"]],
+        "provider.compaction-failed" => {
+            &[&["provider", "trigger", "outcome", "reason", "durationMs"]]
+        }
+        "memory.leak-suspect" | "memory.leak-likely" => &[&[
+            "pid",
+            "processKind",
+            "label",
+            "slopeMbPerH",
+            "privateBytes",
+            "metric",
+            "r2",
+        ]],
+        "cpu.sustained" => &[&["pid", "processKind", "label"]],
+        "rpc.slow" => &[&[
+            "method",
+            "outcome",
+            "slowPart",
+            "count",
+            "maxMs",
+            "tier",
+            "envId",
+            "clientId",
+            "joinedBy",
+            "rttMs",
+            "renderMs",
+            "serverMs",
+            "networkMs",
+            "queuedMs",
+            "totalMs",
+        ]],
+        "rpc.hang" => &[&["method", "slowPart", "elapsedSecs"]],
+        "rpc.saturation" => &[&["slowPart", "methods"]],
+        "client.stall" => &[&["envId", "clientId", "capabilities", "windowMs", "stalls"]],
+        "client.interaction" => &[&[
+            "envId",
+            "clientId",
+            "capabilities",
+            "windowMs",
+            "interactions",
+        ]],
+        "worktree.removal-failed" => &[&[
+            "mode",
+            "reason",
+            "durationMs",
+            "drainTimedOut",
+            "cancelled",
+            "capacity",
+        ]],
+        "worktree.missing" | "worktree.orphan-dir" | "worktree.registration-mismatch" => {
+            &[&["path"]]
+        }
+        "worktree.stuck-removal" => &[&["path", "minutes"]],
+        "worktree.held-open" => &[&["path", "pid"]],
+        "git.stacked-action-failed" => &[&[
+            "action",
+            "featureBranch",
+            "phase",
+            "reason",
+            "operation",
+            "message",
+            "worktree",
+            "repeatsInWindow",
+            "windowMinutes",
+            "durationMs",
+        ]],
+        _ => &[],
+    };
+    CITATIONS
+        .iter()
+        .chain(fields.iter().copied().flatten())
+        .copied()
+        .collect()
+}
+
+/// One finding as `/mcp` returns it: its documented fields and its kind's evidence, with
+/// client-chosen strings replaced or left out and host paths outside home left out.
+pub(crate) fn project_finding(finding: &Value) -> Value {
+    let mut projected = pick(finding, FINDING_FIELDS);
+    let Some(evidence) = finding.get("evidence") else {
+        return projected;
+    };
+    let kind = finding["kind"].as_str().unwrap_or_default();
+    let mut evidence = pick(evidence, &evidence_fields(kind));
+    if let Some(methods) = evidence.get("methods") {
+        evidence["methods"] = pick_each(methods, &["method", "outcome", "count", "maxMs"]);
+    }
+    if let Some(frames) = evidence.get("frames") {
+        evidence["frames"] = frames
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|frame| frame.is_string())
+            .cloned()
+            .collect();
+    }
+    for field in ["stalls", "interactions"] {
+        if let Some(value) = evidence.get(field) {
+            evidence[field] = numbers_only(value);
+        }
+    }
+    clean_client_fields(&mut evidence);
+    // A worktree's path is kept only inside home, where it reads `~/…`.
+    for field in ["worktree", "path"] {
+        let inside_home = evidence
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|path| path == "~" || path.starts_with("~/") || path.starts_with("~\\"));
+        if !inside_home && let Some(fields) = evidence.as_object_mut() {
+            fields.remove(field);
+        }
+    }
+    for field in ["location", "exe", "rawRef"] {
+        if let Some(path) = evidence.get(field).and_then(Value::as_str) {
+            evidence[field] = relative_or_file_name(path).into();
+        }
+    }
+    projected["evidence"] = evidence;
+    projected
+}
+
+/// Client-chosen strings in an event or a finding's evidence: the client's id becomes an
+/// opaque value that still matches across records, its correlation id and version are left
+/// out (an id's shape says nothing of who chose it), and capabilities keep the known ones.
+fn clean_client_fields(record: &mut Value) {
+    if let Some(client) = record.get("clientId") {
+        record["clientId"] = client.as_str().map_or(Value::Null, |id| opaque(id).into());
+    }
+    if let Some(fields) = record.as_object_mut() {
+        fields.remove("correlationId");
+        fields.remove("appVersion");
+    }
+    if let Some(capabilities) = record.get("capabilities").and_then(Value::as_array) {
+        record["capabilities"] = capabilities
+            .iter()
+            .filter(|capability| {
+                capability
+                    .as_str()
+                    .is_some_and(|capability| CLIENT_CAPABILITIES.contains(&capability))
+            })
+            .cloned()
+            .collect();
+    }
+}
+
+/// `h` and 12 hex characters of SHA-256 over a client-chosen id: stable, and never its text.
+fn opaque(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let hex: String = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("h{hex}")
+}
+
+/// A relative path as it is; a rooted one (`/…`, `~/…`, `C:\…`) as its file name, with any
+/// `:line` suffix kept. A build machine's or this host's folders never reach an agent.
+fn relative_or_file_name(path: &str) -> &str {
+    let rooted = path.starts_with(['/', '\\', '~']) || path.as_bytes().get(1) == Some(&b':');
+    if rooted {
+        path.rsplit(['/', '\\']).next().unwrap_or_default()
+    } else {
+        path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A symbolicated frame's file is the build machine's path, which `redact_path` cannot
+    /// clean: only a relative path or the file's name reaches an agent (#139, review round 2).
+    #[test]
+    fn a_crash_frame_keeps_a_relative_path_or_the_file_name_only() {
+        let frame = |file: &str| json!({ "module": "bibcode", "function": "f", "file": file, "line": 7, "offset": 16 });
+        let mut content = json!({
+            "crash": { "id": "c1" },
+            "dump": "read",
+            "stack": {
+                "crashReason": "SIGSEGV",
+                "crashingThread": { "frames": [
+                    frame("/builds/private/repo/src/main.rs"),
+                    frame("apps/server/src/lib.rs"),
+                    frame("~/.cargo/registry/src/index/serde-1.0/src/de.rs"),
+                    frame("C:\\builds\\private\\src\\win.rs"),
+                    frame("/rustc/abc123/library/core/src/option.rs"),
+                ] },
+            },
+            "stackError": null,
+        });
+
+        project_crash(&mut content);
+
+        let files: Vec<&str> = content["stack"]["crashingThread"]["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|frame| frame["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            files,
+            [
+                "main.rs",
+                "apps/server/src/lib.rs",
+                "de.rs",
+                "win.rs",
+                "option.rs"
+            ]
+        );
+        assert_eq!(content["stack"]["crashingThread"]["frames"][0]["line"], 7);
+    }
 }
