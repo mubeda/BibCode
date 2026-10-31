@@ -568,9 +568,9 @@ echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
   started), and only on `/mcp`. It lives only in that process's memory, never in a command
   line, file or log, and is revoked when the agent stops the MCP server. Each running agent
   shows as one **MCP · <agent name>** row in **Authorized clients**.
-- **Set names.** An error that a set is off names it as BiBCode does internally:
-  **Workspace** is the **Threads and worktrees** switch, and **Source control** is
-  **Source Control and pull requests**.
+- **Set names.** An error that a set is off names it as the Settings switch reads, for
+  example **Threads and worktrees** or **Source Control and pull requests**. This guide calls
+  those two sets **Workspace** and **Source control**.
 
 ## Turning it off, and revoking one agent
 

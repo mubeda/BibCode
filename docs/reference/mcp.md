@@ -322,9 +322,10 @@ refuses the next call.
 | `terminals`     | Terminals                        | off     | `terminal_*`                                                                                                 |
 | (none)          | always on                        | —       | `server_capabilities`, `changes_since`                                                                       |
 
-The message of `McpCapabilityDisabledError` names a set by its internal label (`Workspace`,
-`Source control`, `Files`, `Diagnostics`, `Terminals`), which differs from the Settings
-switch for the first two.
+The message of `McpCapabilityDisabledError` names a set by its Settings switch (`Threads and
+worktrees`, `Source Control and pull requests`, `Files`, `Diagnostics`, `Terminals`), so a
+person can find the switch to turn on. This reference calls the first two sets Workspace and
+Source control.
 
 Terminals need all three of: the **Terminals** set on, an effective ceiling of
 `full-access`, and a credential holding `terminal:operate` (minted under both conditions).
