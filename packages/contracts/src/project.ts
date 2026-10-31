@@ -200,6 +200,10 @@ export const ProjectFileFailure = Schema.Literals([
   "partially_removed",
   // Another BiBCode writer (an upload, or a write that did not finish in time) holds the file.
   "path_busy",
+  // The file has more than one hard link, and the write asked for a single-link file only.
+  "hard_linked",
+  // A write failed after emptying the file; `restored` says whether its old content came back.
+  "write_failed",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
@@ -228,6 +232,7 @@ type ProjectFileFailureContext = {
   readonly operation?: ProjectFileOperation;
   readonly operationPath?: string;
   readonly leftAt?: string;
+  readonly restored?: boolean;
   readonly cause?: unknown;
 };
 
@@ -278,6 +283,9 @@ export type ProjectWritePrecondition = typeof ProjectWritePrecondition.Type;
 export const ProjectWriteFileIfUnchangedInput = Schema.Struct({
   ...ProjectWriteFileInput.fields,
   precondition: ProjectWritePrecondition,
+  // Refuse a file with more than one hard link (`hard_linked`). Outside agents' writes set it; a
+  // person may save their own hard-linked file, so the Files panel does not.
+  singleLinkOnly: Schema.optional(Schema.Boolean),
 });
 export type ProjectWriteFileIfUnchangedInput = typeof ProjectWriteFileIfUnchangedInput.Type;
 
@@ -298,6 +306,8 @@ export class ProjectWriteFileError extends Schema.TaggedError<ProjectWriteFileEr
     resolvedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
     operation: Schema.optional(ProjectFileOperation),
     operationPath: Schema.optional(TrimmedNonEmptyString),
+    // With `write_failed`: whether the file's old content was put back after the write failed.
+    restored: Schema.optional(Schema.Boolean),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },

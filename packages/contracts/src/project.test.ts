@@ -145,6 +145,30 @@ describe("project RPC inputs", () => {
     ).toBe("trash_unavailable");
   });
 
+  it("lets a guarded write ask for a single-link file and names the failures it can meet", () => {
+    expect(
+      decodeGuardedWrite({
+        cwd: "/workspace",
+        relativePath: "a.txt",
+        contents: "x",
+        precondition: { _tag: "missing" },
+        singleLinkOnly: true,
+      }).singleLinkOnly,
+    ).toBe(true);
+    for (const failure of ["hard_linked", "write_failed"] as const) {
+      expect(
+        decodeWriteError({
+          _tag: "ProjectWriteFileError",
+          cwd: "/workspace",
+          relativePath: "a.txt",
+          failure,
+          restored: true,
+          message: "Writing a.txt failed.",
+        }).failure,
+      ).toBe(failure);
+    }
+  });
+
   it("names a write refused while another BiBCode writer holds the file", () => {
     expect(
       decodeWriteError({
