@@ -1808,7 +1808,9 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   another, and a tunnel hostname change needs a new sign-in (RFC 8707). A
   request without an accepted credential gets 401; on an eligible origin it
   carries `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp", scope="orchestration:read orchestration:operate"`,
-  for GET as for POST. An authenticated GET gets 405, and outside agents, which
+  for GET as for POST, and its body says an MCP OAuth sign-in is needed (a
+  provider's credential refused there keeps the provider wording). An
+  authenticated GET gets 405, and outside agents, which
   are sessionless, get 405 on `DELETE`. A tool whose scope the credential lacks
   is hidden from `tools/list` and refused with `McpScopeError` naming the scope. Each tool is
   registered in `mcp::control` with its principal kind and the required scope of

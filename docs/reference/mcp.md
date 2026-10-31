@@ -258,8 +258,12 @@ HTTP/1.1 401 Unauthorized
 WWW-Authenticate: Bearer resource_metadata="https://bibcode.example.com/.well-known/oauth-protected-resource/mcp", scope="orchestration:read orchestration:operate"
 Content-Type: application/json
 
-{"error":"invalid_mcp_credential","message":"A valid provider-scoped MCP bearer credential is required."}
+{"error":"invalid_mcp_credential","message":"This MCP server needs an MCP OAuth sign-in: read the resource_metadata URL in WWW-Authenticate to find the authorization server."}
 ```
+
+On an origin that serves no OAuth, and for a provider's own credential refused for how it
+arrived, the challenge is the same but the message stays "A valid provider-scoped MCP bearer
+credential is required."
 
 Read the protected resource metadata (RFC 9728), served at that path and at
 `/.well-known/oauth-protected-resource`, then the authorization server metadata (RFC 8414)
