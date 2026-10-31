@@ -4857,6 +4857,35 @@ CLI, F0 and waves 1 to 3 with their review fixes). It adds five tools to the `gi
   are announced in strictly rising order with the kept one last, and a second server's
   first sequence is above the first's. Wire fixtures were regenerated; counts unchanged.
 
+**Review round 3 (Codex, 2026-10-31).** Four P2s, each fixed with a test that failed first:
+
+- **The stale-tab merge could write back an older draft or drop another folder's draft**
+  (two findings). Round 2 rebuilt the saved drafts around the folder it filled. Now a
+  suggestion fills only when this tab's draft and the saved draft are both empty. The fill
+  writes only that folder's draft and suggestion record into the saved state, then sets this
+  tab's state through the raw `set` captured outside `persist` (`setWithoutSaving`), so the
+  whole of this tab's possibly stale state is not saved. Otherwise the suggestion is
+  offered and nothing is written: offering records nothing (`agentSuggestionOutcome` reads an
+  unhandled suggestion as `offered`), and the panel applies each suggestion once while it is
+  mounted, so clearing the box never pulls it in. Tests: a tab holding "Fix" never writes
+  over a saved "Fix parser"; `/other` survives a fill of `/repo`; an offer leaves storage
+  byte-identical. The person's own actions (typing, **Use it**, **Dismiss**) still save the
+  whole state, as typing always has.
+- **Client clock skew.** Every intent, both kinds, carries `expiresInMs`: the time it had
+  left when sent, recomputed for each snapshot. The fold gives each pending intent a
+  `deadline` (its arrival on this client's clock plus `expiresInMs`), and the fold and the
+  panel (filter and timer) use only that. Test: a client 25 hours ahead keeps a fresh
+  suggestion and drops it a day after it arrived. `UiIntentNotifier` still times its toast
+  from `expiresAt`; a skewed clock can shorten or lengthen that 60-second toast (not
+  changed).
+- **A sequence going backwards across a restart.** Each `commitMessage` intent names
+  `bootId`, random per `UiIntents` (one per server process). Within a boot the higher
+  sequence wins; a message from another boot, which can only arrive later, replaces what the
+  client holds whatever its sequence (`replacesCommitMessage`). One server serves one
+  environment, so two live boots never interleave for one client. Tests: a restarted
+  server's lower sequence wins in the fold; a boot id is shared within a server and differs
+  across two.
+
 ## X8 implementation notes (2026-10-31)
 
 X8 was implemented on `claude/v0131-139-x8`, from the batch tip `4d4287c818` (slice 1, the
