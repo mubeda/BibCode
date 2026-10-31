@@ -2265,7 +2265,7 @@ A plain commit message line for the thread's changes: `Update <paths>` for the p
 
 #### `git_set_commit_message`
 
-Suggests a commit message to the person in the Source Control panel of the thread's folder. An empty message box is filled, labelled as the agent's; text the person typed is never replaced, and they are offered the suggestion to use or dismiss. BiBCode keeps the last suggestion per folder for 24 hours (at most 64 folders at once; the oldest is dropped). It never commits; use `git_commit` for that.
+Suggests a commit message to the person in the Source Control panel of the thread's folder. An empty message box is filled, labelled as the agent's; text the person typed is never replaced, and they are offered the suggestion to use or dismiss. BiBCode keeps the last suggestion per folder for 24 hours (at most 64 folders at once; the oldest is dropped). It never commits; use `git_commit` for that. Once the agent's own `git_commit` on the same thread lands a commit whose subject is the suggestion's first line, the panel drops the suggestion and clears the message box if it still holds the suggestion untouched; text the person edited stays. A pull request the agent creates with `create_pull_request` shows in the panel right after, as one a person creates does.
 
 - **Set / scope:** Source control · `orchestration:operate`
 - **Access:** operate (hidden at read-only)

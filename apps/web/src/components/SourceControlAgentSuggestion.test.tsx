@@ -13,6 +13,22 @@ vi.mock("~/state/uiIntents", () => ({
   },
 }));
 
+/** The agent activity log and the commits a read of the folder returns. */
+const activity = vi.hoisted(() => ({
+  rows: [] as unknown[],
+  commits: [] as Array<{ sha: string; subject: string }>,
+}));
+vi.mock("~/state/mcpActivity", () => ({
+  usePrimaryMcpActivity: () => ({ rows: activity.rows, environmentId: "env-1" }),
+}));
+vi.mock("~/state/vcs", () => ({ vcsEnvironment: { listCommits: () => "list-commits" } }));
+vi.mock("~/state/use-atom-query-runner", () => ({
+  useAtomQueryRunner: () => async () => ({
+    _tag: "Success",
+    value: { commits: activity.commits, nextCursor: null },
+  }),
+}));
+
 import { sourceControlDraftKey, useSourceControlDraft } from "~/sourceControlDraft";
 import { useSourceControlPanelStore } from "~/sourceControlPanelStore";
 
@@ -120,6 +136,8 @@ const click = (name: string) =>
   });
 
 beforeEach(() => {
+  activity.rows = [];
+  activity.commits = [];
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   window.localStorage.clear();
   useSourceControlPanelStore.setState({
@@ -133,6 +151,57 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await act(async () => root.unmount());
   document.body.replaceChildren();
   vi.useRealTimers();
+});
+
+/** A row of the agent activity log for a `git_commit` that made `sha` on thread-1. */
+function committed(sha: string, occurredAt = new Date(Date.now() + 1_000).toISOString()) {
+  return {
+    id: 1,
+    occurredAt,
+    clientId: "session-1",
+    label: "Claude Code",
+    tool: "git_commit",
+    threadId: "thread-1",
+    outcome: "success",
+    target: { sha },
+  };
+}
+
+describe("SourceControlAgentSuggestion after the agent commits", () => {
+  it("clears the suggested draft once a commit lands with its message, untouched only", async () => {
+    const registry = fakeRegistry();
+    await mount(registry);
+    const pending = suggestion();
+    await emit(registry, [pending]);
+    expect(textarea().value).toBe(pending.message);
+    expect(container.textContent).toContain("Message from Agent Claude Code");
+
+    // The agent's own git_commit used the suggestion: the box and its label go.
+    activity.commits = [{ sha: "c0ffee1", subject: "Fix the parser" }];
+    activity.rows = [committed("c0ffee1")];
+    await mount(registry);
+    expect(textarea().value).toBe("");
+    expect(container.textContent).not.toContain("Message from");
+  });
+
+  it("never clears text the person edited, nor for a commit with another message", async () => {
+    const registry = fakeRegistry();
+    await mount(registry);
+    const pending = suggestion();
+    await emit(registry, [pending]);
+    activity.commits = [{ sha: "c0ffee1", subject: "Something else" }];
+    activity.rows = [committed("c0ffee1")];
+    await mount(registry);
+    expect(textarea().value).toBe(pending.message);
+
+    await act(async () => {
+      useSourceControlPanelStore.getState().setCwdMessage(CWD_KEY, `${pending.message} (edited)`);
+    });
+    activity.commits = [{ sha: "c0ffee2", subject: "Fix the parser" }];
+    activity.rows = [committed("c0ffee2")];
+    await mount(registry);
+    expect(textarea().value).toBe(`${pending.message} (edited)`);
+  });
 });
 
 describe("SourceControlAgentSuggestion review round 2", () => {

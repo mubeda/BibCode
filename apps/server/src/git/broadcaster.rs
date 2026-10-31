@@ -94,6 +94,9 @@ struct RepositoryState {
     remote_fence: Option<StatusReadFence>,
     remote_ref_name: Option<Option<String>>,
     pending_local_reconcile: bool,
+    /// The next remote read publishes even when unchanged: a pull request changed, which only
+    /// a published remote makes the status streams look up again.
+    republish_remote: bool,
     remote_refresh_requests: watch::Sender<u64>,
     git_manager_signature: Option<u64>,
     git_manager_signal: watch::Sender<GitManagerSignal>,
@@ -505,6 +508,7 @@ impl StatusBroadcaster {
                         remote_fence: None,
                         remote_ref_name: None,
                         pending_local_reconcile: false,
+                        republish_remote: false,
                         remote_refresh_requests,
                         git_manager_signature: None,
                         git_manager_signal,
@@ -888,6 +892,22 @@ impl StatusBroadcaster {
         }
     }
 
+    /// A pull request of `cwd`'s branch was created, or may have been, from outside the
+    /// subscribed clients (an MCP agent, say). That changes no remote ref, so the remote is read
+    /// again and published even if unchanged, and each status stream looks the request up again.
+    pub async fn notify_pull_request_change(&self, cwd: &Path) {
+        let cwd = tokio::fs::canonicalize(cwd)
+            .await
+            .unwrap_or_else(|_| cwd.to_path_buf());
+        let mut state = self.lock_state();
+        if let Some(entry) = state.repositories.get_mut(&cwd) {
+            entry.republish_remote = true;
+            entry
+                .remote_refresh_requests
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
     /// Registers the observer that runs after a finished mutation or a
     /// reported local change (`notify_local_change`). Status reads, including
     /// watcher-driven reads, also reach it when repository availability changes.
@@ -1223,7 +1243,8 @@ impl StatusBroadcaster {
                     return Some((None, request_local_refresh));
                 }
                 let remote = observed.remote;
-                let changed = entry.remote.as_ref() != Some(&remote);
+                let changed = std::mem::take(&mut entry.republish_remote)
+                    || entry.remote.as_ref() != Some(&remote);
                 entry.remote = Some(remote.clone());
                 entry.remote_fence = Some(fence.clone());
                 entry.remote_ref_name = Some(observed.ref_name);
@@ -7039,6 +7060,67 @@ mod tests {
         tasks.wait().await;
     }
 
+    /// A pull request created outside a stream's own client (an MCP agent, say) changes no
+    /// remote ref, so the next remote read is unchanged; a pull request change still publishes
+    /// it, which is what makes each status stream look the request up again.
+    #[tokio::test]
+    async fn a_pull_request_change_republishes_an_unchanged_remote() {
+        let sandbox = TestSandbox::new("git-broadcaster-pull-request-change");
+        let cwd = sandbox.path("repository");
+        fs::create_dir_all(&cwd).expect("repository fixture");
+        let cwd = fs::canonicalize(cwd).expect("canonical repository fixture");
+        let (ref_started, _) = mpsc::unbounded_channel();
+        let (remote_started, _) = mpsc::unbounded_channel();
+        let runner = Arc::new(EpochGitRunner {
+            branch: Mutex::new("old".to_owned()),
+            ref_calls: AtomicUsize::new(0),
+            remote_calls: AtomicUsize::new(0),
+            ref_started,
+            remote_started,
+            release_ref: Arc::new(Semaphore::new(0)),
+            release_remote: Arc::new(Semaphore::new(1)),
+        });
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::with_runner_for_test(runner)),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let mut events = install_epoch_repository(&broadcaster, &cwd);
+        let refresh = || async {
+            broadcaster
+                .refresh_remote(&cwd, &CancellationToken::new())
+                .await
+                .expect("remote refresh");
+        };
+        refresh().await;
+        while events.try_recv().is_ok() {}
+        refresh().await;
+        assert!(
+            events.try_recv().is_err(),
+            "an unchanged remote publishes nothing"
+        );
+
+        let requests = broadcaster
+            .lock_state()
+            .repositories
+            .get(&cwd)
+            .expect("repository entry")
+            .remote_refresh_requests
+            .subscribe();
+        broadcaster.notify_pull_request_change(&cwd).await;
+        assert!(requests.has_changed().unwrap(), "the remote is read again");
+        refresh().await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(StatusPublication {
+                value: VcsStatusStreamEvent::RemoteUpdated { remote: Some(_) },
+                ..
+            })
+        ));
+        refresh().await;
+        assert!(events.try_recv().is_err(), "only once");
+    }
+
     #[tokio::test]
     async fn remote_refresh_publishes_only_for_the_current_observed_ref() {
         let sandbox = TestSandbox::new("git-broadcaster-current-remote-branch");
@@ -7233,6 +7315,7 @@ mod tests {
                 remote_fence: None,
                 remote_ref_name: None,
                 pending_local_reconcile: false,
+                republish_remote: false,
                 remote_refresh_requests,
                 git_manager_signature: None,
                 git_manager_signal,
