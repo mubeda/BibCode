@@ -141,8 +141,8 @@ impl McpCapability {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Workspace => "Workspace",
-            Self::SourceControl => "Source control",
+            Self::Workspace => "Threads and worktrees",
+            Self::SourceControl => "Source Control and pull requests",
             Self::Files => "Files",
             Self::Diagnostics => "Diagnostics",
             Self::Terminals => "Terminals",

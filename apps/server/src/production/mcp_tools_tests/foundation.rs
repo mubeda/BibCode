@@ -907,7 +907,7 @@ async fn a_capability_set_turned_off_hides_and_refuses_its_tools_live() {
         refused["structuredContent"]["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("Source control")
+            .contains("Source Control and pull requests")
     );
     settings.capabilities.workspace = false;
     harness.settings.send_replace(settings);
@@ -929,6 +929,12 @@ async fn a_capability_set_turned_off_hides_and_refuses_its_tools_live() {
         .call(&agent, "read_thread", json!({ "threadId": thread_id }))
         .await;
     assert_eq!(error_tag(&refused), "McpCapabilityDisabledError");
+    assert!(
+        refused["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Threads and worktrees")
+    );
     settings.capabilities.workspace = true;
     settings.capabilities.source_control = true;
     harness.settings.send_replace(settings);
