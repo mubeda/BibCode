@@ -80,7 +80,7 @@ durable record of them to send from.
   "cursor": "v1.4821.37",
   "kind": "turn.completed",
   "status": "ready",
-  "actor": { "kind": "mcp-client", "clientId": "…", "label": "Claude Code" }
+  "actor": { "kind": "mcp-client", "clientId": "…" }
 }
 ```
 
@@ -89,9 +89,13 @@ durable record of them to send from.
 - `cursor` is on every event except `profiler.finding` and `webhook.test`. It is the
   `changes_since` cursor just after this event.
 - `kind`, `status`, `requestId`, `tool`, `target` and `actor` are those of the
-  `changes_since` entry. `actor` is present when an outside agent caused the change; its
-  `label` is the agent's name as shown in Authorized clients.
+  `changes_since` entry. `actor` is present when an outside agent caused the change: its
+  kind and an opaque `clientId`, never the agent's name, which is text the client chose.
 - `profiler.finding` carries `finding: { "id", "count", "lastSeen" }` instead of `cursor`.
+- `dropped` appears on the first delivery after BiBCode had to drop deliveries for this
+  endpoint because its queue was full: `{ "count", "fromCursor", "toCursor",
+  "sinceLastSeen" }` (each range field only when a dropped event had one). Catch up from
+  `fromCursor` with `changes_since`, and from `sinceLastSeen` with `profiler_findings`.
 
 ## Headers and signature
 
@@ -132,19 +136,25 @@ signature is `v1=35495024f4ef3f94e5a93e22221544c4b75e9a42300cd965ab81cb85cd994e9
 - A timeout, a connection error, a host that did not resolve, a `5xx` or a `429` is tried
   again after 30 seconds, 2, 5, 10 and 15 minutes: the first attempt and five retries over
   about 32 minutes. Any other answer (a `4xx`, a redirect, a refused address) fails at once.
-- One request at a time goes to each endpoint, oldest first, so events arrive in order.
+- One request at a time goes to each endpoint, oldest first, so events arrive in order. A
+  test event or a redelivery waits for the endpoint's request in flight. **Redeliver** works
+  on a finished delivery only, never one still queued or being sent.
+- Changing an endpoint's URL, project or events drops what was waiting for it (the log shows
+  "Not sent: the endpoint's URL or events changed"): nothing queued for the old destination
+  or filters goes to the new one. Renaming it keeps the queue.
 - Ten failed deliveries in a row turn the endpoint off, with a warning and **Re-enable**.
 - Turning **Webhooks** off, or an endpoint, stops its request in flight and drops what was
   waiting for it. Turning webhooks on again starts from that moment; what happened while
   they were off is not sent.
 - Deliveries wait in BiBCode's database, so a restart resumes them. At most 10,000 wait; past
-  that the oldest are dropped. Finished deliveries are kept for 7 days, at most 1,000 per
-  endpoint.
+  that the oldest are dropped, each shown in the log as "Not sent: the queue was full", the
+  endpoint's status counts them, and its next delivery carries `dropped` (see Payload).
+  Finished deliveries are kept for 7 days, at most 1,000 per endpoint.
 
 ## Catching up after missed deliveries
 
-Every event can be recovered, so a receiver that was down, or dropped a request, loses
-nothing:
+A receiver that was down, or missed requests, recovers the events it missed, within the
+limits below:
 
 - **Thread, approval and agent events:** call the MCP tool `changes_since` with the `cursor`
   of the last event you processed, and again with each result's `cursor` while `more` is
@@ -156,6 +166,13 @@ nothing:
   set.
 
 Both tools need an MCP connection to the environment ([Outside agents over MCP](./mcp.md)).
+
+**Limits.** Thread and approval events come from BiBCode's event log, which is never pruned.
+Agent operations (clones, Git and pull request changes, transfers) come from the agent
+activity log, which keeps 7 days and at most 5,000 rows: a cursor older than that returns
+`activityDropped: true`, and those operations cannot be recovered. The findings book keeps
+at most 1,000 findings. Catch up soon after a gap, and especially after `dropped`, which
+means the gap was large.
 
 ## Where secrets live
 
