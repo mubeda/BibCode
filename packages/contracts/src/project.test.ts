@@ -145,6 +145,18 @@ describe("project RPC inputs", () => {
     ).toBe("trash_unavailable");
   });
 
+  it("names a write refused while another BiBCode writer holds the file", () => {
+    expect(
+      decodeWriteError({
+        _tag: "ProjectWriteFileError",
+        cwd: "/workspace",
+        relativePath: "up.txt",
+        failure: "path_busy",
+        message: "Another BiBCode write or upload of up.txt is in progress.",
+      }).failure,
+    ).toBe("path_busy");
+  });
+
   it("says where a folder delete that stopped part-way left what remains", () => {
     const decoded = decodeDeleteError({
       _tag: "ProjectDeleteEntryError",

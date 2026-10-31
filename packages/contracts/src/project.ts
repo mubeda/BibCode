@@ -198,6 +198,8 @@ export const ProjectFileFailure = Schema.Literals([
   "trash_unavailable",
   // A folder delete stopped part-way; `leftAt` names where what is left now is.
   "partially_removed",
+  // Another BiBCode writer (an upload, or a write that did not finish in time) holds the file.
+  "path_busy",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
