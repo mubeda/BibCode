@@ -553,7 +553,8 @@ impl ProductionRuntime {
         let file_trash: Arc<dyn crate::git::FileTrash> =
             Arc::new(crate::git::NativeFileTrash::default());
         let workspace = WorkspaceRpc::with_dependencies(
-            WorkspaceService::default().with_trash(file_trash.clone()),
+            WorkspaceService::default()
+                .with_trash(file_trash.clone(), state_paths.state_dir.clone()),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
                 transfer_access: Some(transfer_access.clone()),

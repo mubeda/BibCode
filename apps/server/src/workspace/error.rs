@@ -44,6 +44,18 @@ pub enum WorkspaceError {
     TrashUnavailable { path: PathBuf },
     #[error("another BiBCode write or an upload of {path} is in progress; try again when it ends", path = .path.display())]
     PathBusy { path: PathBuf },
+    #[error("{path} has more than one hard link; writing it would change its other names too", path = .path.display())]
+    HardLinked { path: PathBuf },
+    #[error(
+        "writing {path} failed after it was emptied ({reason}); {outcome}",
+        path = .path.display(),
+        outcome = if *.restored { "its old content was put back" } else { "its old content could NOT be put back" }
+    )]
+    WriteFailed {
+        path: PathBuf,
+        reason: String,
+        restored: bool,
+    },
     #[error(
         "deleting {path} stopped part-way ({reason}); what is left is at {left_at}",
         path = .path.display(),
@@ -89,6 +101,8 @@ impl WorkspaceError {
             Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
             Self::TrashUnavailable { .. } => "trash_unavailable",
             Self::PathBusy { .. } => "path_busy",
+            Self::HardLinked { .. } => "hard_linked",
+            Self::WriteFailed { .. } => "write_failed",
             Self::PartiallyRemoved { .. } => "partially_removed",
             _ => "operation_failed",
         }
@@ -124,8 +138,13 @@ impl WorkspaceError {
             | Self::FileChangedOnDisk { path }
             | Self::FileMissingOnDisk { path }
             | Self::TrashUnavailable { path }
-            | Self::PathBusy { path } => {
+            | Self::PathBusy { path }
+            | Self::HardLinked { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+            }
+            Self::WriteFailed { path, restored, .. } => {
+                object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+                object.insert("restored".to_owned(), json!(restored));
             }
             Self::PartiallyRemoved { path, left_at, .. } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
