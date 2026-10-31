@@ -32,9 +32,19 @@ const ATTEMPTS: usize = 3;
 /// One lock per config file path: BiBCode's own changes never race each other.
 static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
 
+/// When a test's stand-in for another program saves the file during a change.
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Moment {
+    /// After the read, just before the check that precedes the rename.
+    BeforeCheck,
+    /// Just after the rename: a save no check can stop.
+    AfterRename,
+}
+
 /// A test's stand-in for another program saving the file during a change.
 #[cfg(all(test, unix))]
-type Interference = Arc<dyn Fn(&Path) + Send + Sync>;
+type Interference = Arc<dyn Fn(&Path, Moment) + Send + Sync>;
 
 /// One tool's user config files and the object in them that holds MCP servers.
 #[derive(Clone)]
@@ -68,6 +78,10 @@ enum Change<'a> {
 enum ReplaceError {
     /// Someone saved the file after it was read.
     Changed,
+    /// Someone saved the file in the instant between the last check and the rename, so it
+    /// no longer holds what BiBCode wrote. With no lock shared with the tool, this can be made
+    /// rare but not impossible; it is reported, never claimed as success.
+    Raced(PathBuf),
     Io(std::io::Error),
 }
 
@@ -141,10 +155,20 @@ impl ConfigFile {
         }
     }
 
-    /// The command an entry launches, when it is one BiBCode can read.
+    /// The command an entry launches, when it is one BiBCode can read and the tool runs it:
+    /// for OpenCode a `"type": "local"` entry not turned off with `"enabled": false` (left out,
+    /// it is on). Cursor's `mcp.json` has no such flag; Cursor turns servers off in its own
+    /// settings.
     fn launch_of(&self, entry: &Json) -> Option<Vec<String>> {
         match self.client {
-            McpClient::Opencode => entry.get("command")?.strings(),
+            McpClient::Opencode => {
+                if entry.get("type").and_then(Json::as_str) != Some("local")
+                    || matches!(entry.get("enabled"), Some(Json::Bool(false)))
+                {
+                    return None;
+                }
+                entry.get("command")?.strings()
+            }
             _ => {
                 let mut launch = vec![entry.get("command")?.as_str()?.to_owned()];
                 if let Some(args) = entry.get("args") {
@@ -204,6 +228,15 @@ impl ConfigFile {
         for _ in 0..ATTEMPTS {
             match self.change_once(change) {
                 Err(ReplaceError::Changed) => {}
+                Err(ReplaceError::Raced(path)) => {
+                    return Err(refusal(
+                        "failed",
+                        &format!(
+                            "Another app changed {} at the same time as BiBCode. Check the file, then try again.",
+                            self.shown(&path)
+                        ),
+                    ));
+                }
                 Err(ReplaceError::Io(error)) => {
                     tracing::warn!(client = self.client.id(), %error, "could not save an MCP client's config");
                     return Err(refusal(
@@ -446,12 +479,26 @@ impl ConfigFile {
             }
             #[cfg(all(test, unix))]
             if let Some(interfere) = &self.interfere {
-                interfere(destination);
+                interfere(destination, Moment::BeforeCheck);
             }
             if !unchanged(destination, read).map_err(ReplaceError::Io)? {
                 return Err(ReplaceError::Changed);
             }
-            std::fs::rename(&temporary, destination).map_err(ReplaceError::Io)
+            std::fs::rename(&temporary, destination).map_err(ReplaceError::Io)?;
+            #[cfg(all(test, unix))]
+            if let Some(interfere) = &self.interfere {
+                interfere(destination, Moment::AfterRename);
+            }
+            // Read back: a save landing between the check and the rename leaves the file
+            // without what BiBCode wrote.
+            match std::fs::read(destination) {
+                Ok(saved) if saved == contents => Ok(()),
+                Ok(_) => Err(ReplaceError::Raced(destination.to_path_buf())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(ReplaceError::Raced(destination.to_path_buf()))
+                }
+                Err(error) => Err(ReplaceError::Io(error)),
+            }
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temporary);

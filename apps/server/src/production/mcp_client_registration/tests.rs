@@ -10,7 +10,11 @@ use std::{
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{Host, cli, config_file::ConfigFile, register, registrations, unregister};
+use super::{
+    Host, State, cli,
+    config_file::{ConfigFile, Moment},
+    register, registrations, unregister,
+};
 use crate::test_support::TestSandbox;
 
 /// How a stand-in CLI behaves. It keeps one `bibcode` entry in a state file (command, then
@@ -338,24 +342,55 @@ async fn an_entry_that_cannot_be_read_back_is_registered_with_an_unknown_command
     );
 }
 
-#[tokio::test]
-async fn a_failed_claude_replacement_puts_the_previous_entry_back() {
-    let sandbox = TestSandbox::new("mcp-client-restore");
-    let mut clients = Clients::installed(&sandbox);
+/// An old entry whose data root holds ` --`: Claude Code prints it joined with spaces, so
+/// only its own JSON config gives the arguments back exactly.
+const TRICKY_LAUNCH: [&str; 4] = [
+    "/old/BiBCode/bibcode",
+    "mcp",
+    "--base-dir",
+    "/work --archive",
+];
+
+/// Claude Code's user-scope `~/.claude.json` with BiBCode's entry, as `claude mcp add
+/// --scope user` writes it.
+fn seed_claude_json(home: &Path, launch: &[&str]) {
+    write(
+        &home.join(".claude.json"),
+        &json!({
+            "numStartups": 3,
+            "mcpServers": {
+                "bibcode": { "type": "stdio", "command": launch[0], "args": launch[1..] },
+            },
+        })
+        .to_string(),
+    );
+}
+
+fn failing_new_adds(sandbox: &TestSandbox, name: &str) -> Clients {
+    let mut clients = Clients::installed(sandbox);
     clients.claude = fake_cli(
-        &sandbox,
-        "claude-restore",
+        sandbox,
+        name,
         Fake {
             fail_adds_of: Some("/opt/BiBCode/bibcode"),
             ..Fake::default()
         },
     );
-    seed_cli_entry(&sandbox, "claude-restore", &OLD_LAUNCH);
+    seed_cli_entry(sandbox, name, &TRICKY_LAUNCH);
+    clients
+}
+
+#[tokio::test]
+async fn a_failed_claude_replacement_puts_back_the_exact_previous_arguments() {
+    let sandbox = TestSandbox::new("mcp-client-restore");
+    let clients = failing_new_adds(&sandbox, "claude-restore");
+    let home = home(&sandbox);
+    seed_claude_json(&home, &TRICKY_LAUNCH);
     let error = register(
         &clients.settings(),
         launch(),
         json!({ "client": "claude" }),
-        &Host::for_home(&home(&sandbox)),
+        &Host::for_home(&home),
     )
     .await
     .unwrap_err();
@@ -365,18 +400,61 @@ async fn a_failed_claude_replacement_puts_the_previous_entry_back() {
             "Claude Code could not add BiBCode: {ADD_ERROR}. Its previous BiBCode entry was put back. Check that `claude mcp list` works in a terminal, then try again."
         )
     );
-    assert_eq!(
-        log(&sandbox, "claude-restore").last().unwrap(),
-        "mcp add --scope user bibcode -- /old/BiBCode/bibcode mcp --base-dir /old root"
-    );
+    // The fake keeps each argument as a JSON string: `/work --archive` stays one argument.
     assert_eq!(
         std::fs::read_to_string(sandbox.path("claude-restore.state"))
             .unwrap()
             .lines()
-            .take(2)
             .collect::<Vec<_>>(),
-        ["/old/BiBCode/bibcode", "mcp --base-dir /old root"]
+        [
+            "/old/BiBCode/bibcode",
+            "mcp --base-dir /work --archive",
+            r#""mcp","--base-dir","/work --archive""#,
+        ]
     );
+}
+
+#[tokio::test]
+async fn without_the_exact_previous_arguments_nothing_is_claimed_restored() {
+    let sandbox = TestSandbox::new("mcp-client-no-exact");
+    let clients = failing_new_adds(&sandbox, "claude-no-exact");
+    let home = home(&sandbox);
+    let expected = format!(
+        "Claude Code could not add BiBCode: {ADD_ERROR}. BiBCode had removed its previous entry (`/old/BiBCode/bibcode mcp --base-dir /work --archive`) and could not put it back. Fix the problem, then click Add to Claude Code, or run `claude mcp add --scope user bibcode --` followed by the command under Other MCP clients."
+    );
+    // No `~/.claude.json` entry: the printed line is never split into a guess.
+    let error = register(
+        &clients.settings(),
+        launch(),
+        json!({ "client": "claude" }),
+        &Host::for_home(&home),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error["message"], expected);
+    let adds = |sandbox: &TestSandbox, name: &str| {
+        log(sandbox, name)
+            .iter()
+            .filter(|line| line.starts_with("mcp add"))
+            .count()
+    };
+    assert_eq!(adds(&sandbox, "claude-no-exact"), 2, "no restore was tried");
+
+    // A JSON entry that is not the one `claude mcp get` showed is not trusted either.
+    let sandbox = TestSandbox::new("mcp-client-mismatch");
+    let clients = failing_new_adds(&sandbox, "claude-mismatch");
+    let home = self::home(&sandbox);
+    seed_claude_json(&home, &OLD_LAUNCH);
+    let error = register(
+        &clients.settings(),
+        launch(),
+        json!({ "client": "claude" }),
+        &Host::for_home(&home),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error["message"], expected);
+    assert_eq!(adds(&sandbox, "claude-mismatch"), 2, "no restore was tried");
 }
 
 #[tokio::test]
@@ -392,11 +470,13 @@ async fn a_replacement_that_cannot_restore_says_what_was_removed_and_how_to_add_
         },
     );
     seed_cli_entry(&sandbox, "claude-lost", &OLD_LAUNCH);
+    let home = home(&sandbox);
+    seed_claude_json(&home, &OLD_LAUNCH);
     let error = register(
         &clients.settings(),
         launch(),
         json!({ "client": "claude" }),
-        &Host::for_home(&home(&sandbox)),
+        &Host::for_home(&home),
     )
     .await
     .unwrap_err();
@@ -575,8 +655,8 @@ async fn a_config_saved_by_another_program_meanwhile_is_read_again_not_overwritt
     let saves = Arc::new(AtomicUsize::new(0));
     let counter = saves.clone();
     let file = ConfigFile::cursor(directory.clone(), &home).with_interference(Arc::new(
-        move |destination: &Path| {
-            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+        move |destination: &Path, moment| {
+            if moment == Moment::BeforeCheck && counter.fetch_add(1, Ordering::SeqCst) == 0 {
                 std::fs::write(
                     destination,
                     r#"{"mcpServers": {"github": {"command": "gh-mcp"}, "linear": {"command": "linear-mcp"}}}"#,
@@ -596,21 +676,104 @@ async fn a_config_saved_by_another_program_meanwhile_is_read_again_not_overwritt
     assert_eq!(saves.load(Ordering::SeqCst), 2);
 
     // A file that changes on every attempt is left to its owner, with a message.
-    let busy =
-        ConfigFile::cursor(directory, &home).with_interference(Arc::new(|destination: &Path| {
-            let stamp = uuid::Uuid::new_v4();
-            std::fs::write(
-                destination,
-                format!(r#"{{"mcpServers": {{}}, "stamp": "{stamp}"}}"#),
-            )
-            .unwrap();
-        }));
+    let busy = ConfigFile::cursor(directory, &home).with_interference(Arc::new(
+        |destination: &Path, moment| {
+            if moment == Moment::BeforeCheck {
+                let stamp = uuid::Uuid::new_v4();
+                std::fs::write(
+                    destination,
+                    format!(r#"{{"mcpServers": {{}}, "stamp": "{stamp}"}}"#),
+                )
+                .unwrap();
+            }
+        },
+    ));
     let error = busy.add(&launch().unwrap()).await.unwrap_err();
     assert_eq!(
         error["message"],
         "~/.cursor/mcp.json kept changing while BiBCode was saving it. Close the apps that edit it, then try again."
     );
     assert!(read_json(&path)["mcpServers"].get("bibcode").is_none());
+}
+
+#[tokio::test]
+async fn a_save_that_lands_with_the_rename_is_reported_not_claimed_as_success() {
+    let sandbox = TestSandbox::new("mcp-client-raced");
+    let home = home(&sandbox);
+    let directory = home.join(".cursor");
+    let path = directory.join("mcp.json");
+    write(
+        &path,
+        r#"{"mcpServers": {"github": {"command": "gh-mcp"}}}"#,
+    );
+    // Cursor saves its own copy right as BiBCode renames: no lock between the two apps.
+    let raced =
+        r#"{"mcpServers": {"github": {"command": "gh-mcp"}, "linear": {"command": "linear-mcp"}}}"#;
+    let file = ConfigFile::cursor(directory.clone(), &home).with_interference(Arc::new(
+        move |destination: &Path, moment| {
+            if moment == Moment::AfterRename {
+                std::fs::write(destination, raced).unwrap();
+            }
+        },
+    ));
+    let error = file.add(&launch().unwrap()).await.unwrap_err();
+    assert_eq!(
+        error["message"],
+        "Another app changed ~/.cursor/mcp.json at the same time as BiBCode. Check the file, then try again."
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), raced);
+    let read = ConfigFile::cursor(directory, &home)
+        .read(launch().as_deref())
+        .await
+        .unwrap();
+    assert_eq!(read, State::Absent);
+}
+
+#[tokio::test]
+async fn a_disabled_opencode_entry_is_out_of_date_and_update_enables_it() {
+    let sandbox = TestSandbox::new("mcp-client-opencode-disabled");
+    let clients = Clients::installed(&sandbox);
+    let settings = clients.settings();
+    let home = home(&sandbox);
+    let host = Host::for_home(&home);
+    let path = home.join(".config/opencode/opencode.json");
+    let entry = |extra: Value| {
+        let mut entry = json!({ "type": "local", "command": LAUNCH, "enabled": true });
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({ "mcp": { "bibcode": entry } }).to_string()
+    };
+    for (stale, why) in [
+        (json!({ "enabled": false }), "turned off"),
+        (json!({ "type": "remote" }), "not local"),
+    ] {
+        write(&path, &entry(stale));
+        assert_eq!(
+            lines(&read_all(&settings, &host).await)[3].3,
+            json!(false),
+            "{why}"
+        );
+        register(&settings, launch(), json!({ "client": "opencode" }), &host)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_json(&path)["mcp"]["bibcode"],
+            json!({ "type": "local", "command": LAUNCH, "enabled": true })
+        );
+        assert_eq!(
+            lines(&read_all(&settings, &host).await)[3].3,
+            json!(true),
+            "{why}"
+        );
+    }
+    // Leaving out `enabled` is OpenCode's default: on.
+    write(
+        &path,
+        &json!({ "mcp": { "bibcode": { "type": "local", "command": LAUNCH } } }).to_string(),
+    );
+    assert_eq!(lines(&read_all(&settings, &host).await)[3].3, json!(true));
 }
 
 #[tokio::test]

@@ -86,14 +86,34 @@ fn parse_claude_get(stdout: &str) -> Option<Stored> {
     } else {
         format!("{command} {args}")
     };
-    Some(Stored {
-        shown,
-        argv: split_launch_args(args).map(|args| {
-            let mut argv = vec![command.to_owned()];
-            argv.extend(args);
-            argv
-        }),
-    })
+    // The joined line cannot be split back exactly (an argument may hold ` --`); the exact
+    // arguments come from Claude Code's own config, `claude_config_argv`.
+    Some(Stored { shown, argv: None })
+}
+
+/// The user-scope entry in Claude Code's own config, read only: `mcpServers.bibcode` in
+/// `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`, which `claude mcp add --scope
+/// user` writes. `None` unless it is a stdio entry with string arguments.
+fn claude_config_argv(path: &Path) -> Option<Vec<String>> {
+    let value = serde_json::from_slice::<Value>(&std::fs::read(path).ok()?).ok()?;
+    let entry = value.get("mcpServers")?.get(SERVER_NAME)?;
+    if entry
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "stdio")
+    {
+        return None;
+    }
+    let mut argv = vec![entry.get("command")?.as_str()?.to_owned()];
+    for arg in entry
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        argv.push(arg.as_str()?.to_owned());
+    }
+    Some(argv)
 }
 
 /// `codex mcp get bibcode --json`: `{ "transport": { "type": "stdio", "command", "args" } }`.
@@ -116,31 +136,6 @@ fn parse_codex_get(stdout: &str) -> Option<Stored> {
         shown: argv.join(" "),
         argv: Some(argv),
     })
-}
-
-/// Space-joined arguments of a `bibcode mcp` command split back: `mcp`, then each
-/// `--flag value`, where a value may hold spaces (a data root) but not ` --`. `None` when the
-/// split would not join back to the same text.
-fn split_launch_args(joined: &str) -> Option<Vec<String>> {
-    if joined.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut pieces = joined.split(" --");
-    let mut args = pieces
-        .next()?
-        .split(' ')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for piece in pieces {
-        match piece.split_once(' ') {
-            Some((flag, value)) => {
-                args.push(format!("--{flag}"));
-                args.push(value.to_owned());
-            }
-            None => args.push(format!("--{piece}")),
-        }
-    }
-    (args.join(" ") == joined).then_some(args)
 }
 
 /// The start of a hand-typed add, for a message: the command follows it.
@@ -271,9 +266,15 @@ impl Cli {
 
     /// Adds first, so a failing add never costs the person the entry they had. When the tool
     /// refuses because `bibcode` exists (Claude Code), the entry is read, removed and added
-    /// again; if that add fails, the entry read is put back. A tool whose add overwrites
-    /// (Codex) never gets that far.
-    pub(super) async fn add(&self, launch: &[String], cwd: &Path) -> Result<(), Value> {
+    /// again; if that add fails, the entry is put back, but only from its exact arguments
+    /// (Claude Code's own config, `claude_json`). A tool whose add overwrites (Codex) never
+    /// gets that far.
+    pub(super) async fn add(
+        &self,
+        launch: &[String],
+        cwd: &Path,
+        claude_json: &Path,
+    ) -> Result<(), Value> {
         // A configuration change runs to the end even if the page that asked for it goes away.
         let cancellation = CancellationToken::new();
         let add = add_args(self.client, launch);
@@ -289,6 +290,7 @@ impl Cli {
             Ok(Entry::Present(stored)) => stored,
             Err(_) => None,
         };
+        let exact = self.exact_argv(previous.as_ref(), claude_json).await;
         let removed = self
             .run(
                 replace_args(self.client),
@@ -310,19 +312,53 @@ impl Cli {
                 .trim_end_matches('.')
                 .to_owned(),
         };
-        Err(self.restore(previous, &added, cwd, &cancellation).await)
+        Err(self
+            .restore(previous, exact, &added, cwd, &cancellation)
+            .await)
     }
 
-    /// After a failed replacement: puts the previous entry back, and says what happened.
+    /// The previous entry's exact command, read before it is removed. For Claude Code it
+    /// comes from its own config, and only when that is the entry `claude mcp get` showed;
+    /// the printed line is never split into a guess.
+    async fn exact_argv(
+        &self,
+        previous: Option<&Stored>,
+        claude_json: &Path,
+    ) -> Option<Vec<String>> {
+        if self.client != McpClient::Claude {
+            return previous.and_then(|stored| stored.argv.clone());
+        }
+        let path = self
+            .environment
+            .iter()
+            .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+            .map(|(_, directory)| PathBuf::from(directory))
+            .filter(|directory| directory.is_absolute())
+            .map_or_else(
+                || claude_json.to_path_buf(),
+                |directory| directory.join(".claude.json"),
+            );
+        let argv = tokio::task::spawn_blocking(move || claude_config_argv(&path))
+            .await
+            .ok()
+            .flatten()?;
+        previous
+            .is_none_or(|stored| stored.shown == argv.join(" "))
+            .then_some(argv)
+    }
+
+    /// After a failed replacement: puts the previous entry back from its exact command, and
+    /// says what happened. Without the exact command nothing is claimed put back.
     async fn restore(
         &self,
         previous: Option<Stored>,
+        exact: Option<Vec<String>>,
         said: &str,
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Value {
         let label = self.client.label();
-        if let Some(argv) = previous.as_ref().and_then(|stored| stored.argv.as_ref()) {
+        if let Some(argv) = &exact {
             let restored = self
                 .run(
                     &add_args(self.client, argv),
@@ -341,10 +377,11 @@ impl Cli {
                 );
             }
         }
-        let what = previous.map_or_else(
-            || "one BiBCode could not read".to_owned(),
-            |stored| format!("`{}`", stored.shown),
-        );
+        let what = match (exact, previous) {
+            (Some(argv), _) => format!("`{}`", argv.join(" ")),
+            (None, Some(stored)) => format!("`{}`", stored.shown),
+            (None, None) => "one BiBCode could not read".to_owned(),
+        };
         tracing::warn!(
             client = self.client.id(),
             "removed an MCP client's BiBCode entry and could not add it again"
