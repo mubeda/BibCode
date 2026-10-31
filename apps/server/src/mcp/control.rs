@@ -471,7 +471,15 @@ fn authorize_in<'f>(
     };
     match lookup(families, kind, name) {
         Some((family, spec)) if scopes.contains(&spec.scope) => Ok((family, spec)),
-        Some(_) => Err(refused()),
+        // The credential lacks the scope (slice R): say which, and how to gain it, since no
+        // harness steps up by itself.
+        Some((_, spec)) => Err(typed_tool_failure(
+            "McpScopeError",
+            &format!(
+                "This MCP credential may not call {name}: it needs the {} scope. A remote agent signs in again asking for it; `bibcode mcp` gets it when its MCP server restarts with the setting on.",
+                spec.scope
+            ),
+        )),
         None if families
             .iter()
             .flat_map(|family| family.tools)
@@ -697,12 +705,14 @@ impl McpControl {
         principal.ceiling.min(self.settings().access)
     }
 
-    /// The tools this principal may call now: a set that is off hides its tools, and the
-    /// operate tools are hidden at read-only.
+    /// The tools this principal may call now: a set that is off hides its tools, the operate
+    /// tools are hidden at read-only, and a tool whose scope the credential lacks is hidden
+    /// (slice R), as `call` refuses it.
     #[must_use]
     pub fn tools(&self, principal: &ClientPrincipal) -> Value {
         let read_only = self.effective_ceiling(principal) == McpAccess::ReadOnly;
         let capabilities = self.settings().capabilities;
+        let scopes = &principal.principal.scopes;
         Value::Array(
             FAMILIES
                 .iter()
@@ -710,6 +720,7 @@ impl McpControl {
                 .filter(|(_, spec)| spec.kind == PrincipalKind::Client)
                 .filter(|(_, spec)| spec.read_only || !read_only)
                 .filter(|(_, spec)| spec.capability.is_none_or(|set| capabilities.allows(set)))
+                .filter(|(_, spec)| scopes.iter().any(|scope| scope == spec.scope))
                 .map(|(family, spec)| describe(family, spec))
                 .collect(),
         )
