@@ -778,6 +778,74 @@ async fn turning_mcp_off_mid_push_records_unknown() {
     fixture.harness.shutdown().await;
 }
 
+#[cfg(unix)]
+async fn row_state(fixture: &Fixture, key: &str) -> String {
+    let key = key.to_owned();
+    fixture
+        .harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT state FROM mcp_tool_requests WHERE client_request_id = ?",
+                [key],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+/// The local branch is gone when the remote deletion stops reporting: the outcome keeps the
+/// known local deletion and the remote target it captured, and is recorded `unknown`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_remote_delete_that_stops_reporting_keeps_the_local_deletion_and_its_target() {
+    let fixture = fixture().await;
+    publish_feature(&fixture).await;
+    let started = fixture.remote.join("delete-started");
+    hook(
+        &fixture,
+        &format!("touch '{}'\nsleep 30", started.to_string_lossy()),
+    );
+    let arguments =
+        json!({ "name": "feature", "deleteRemote": true, "clientRequestId": "del-cut" });
+    let call = fixture.spawn(
+        "git_delete_branch",
+        arguments.clone(),
+        CancellationToken::new(),
+    );
+    until(|| started.exists()).await;
+    fixture
+        .harness
+        .settings
+        .send_modify(|settings| settings.enabled = false);
+    let cut = tokio::time::timeout(Duration::from_secs(20), call)
+        .await
+        .expect("the deletion stops")
+        .unwrap();
+    assert_eq!(error_tag(&cut), "McpPartialOutcomeError", "{cut}");
+    let outcome = error(&cut).clone();
+    assert_eq!(outcome["local"], "deleted");
+    assert_eq!(outcome["remote"], "unknown");
+    assert_eq!(outcome["outcome"], "unknown");
+    assert_eq!(outcome["remoteName"], "origin");
+    assert_eq!(outcome["remoteBranch"], "feature");
+    assert_eq!(
+        outcome["recovery"]["arguments"],
+        json!({ "remote": "origin", "branch": "feature" })
+    );
+    assert_eq!(branches(&fixture.repo), "main");
+    assert_eq!(row_state(&fixture, "del-cut").await, "unknown");
+    fixture
+        .harness
+        .settings
+        .send_modify(|settings| settings.enabled = true);
+    let replayed = fixture.call("git_delete_branch", arguments).await;
+    assert_eq!(error(&replayed), &outcome);
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn tools_list_carries_each_tools_hints_and_source_control_off_hides_them() {
     let fixture = fixture().await;

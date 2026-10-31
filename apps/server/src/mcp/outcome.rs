@@ -312,6 +312,11 @@ impl LiveControls {
         self.settled.cancel();
         let interruption = self.fired.get().copied();
         match (result, interruption) {
+            // Work that returned its own unknown outcome in time (a partial one, say) knows
+            // more than that it was interrupted, and keeps it.
+            (Some(Err(failure)), Some(interruption)) if is_outcome_unknown(&failure) => {
+                (Err(failure), Some(interruption))
+            }
             (_, Some(interruption)) => (Err(unknown_failure(interruption)), Some(interruption)),
             (Some(Err(failure)), None) if is_stream_ended(&failure) => (
                 Err(unknown_failure(Interruption::StreamEnded)),

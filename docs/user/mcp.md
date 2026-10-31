@@ -119,7 +119,9 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   answer is `McpOutcomeUnknownError`: check `git_status`, then retry with a new id.
 - **Deleting a branch with its remote** is two steps. If the remote step fails, the local
   branch is already gone and the answer is `McpPartialOutcomeError`, naming the
-  `git_delete_remote_branch` call that finishes it.
+  `git_delete_remote_branch` call that finishes it. If the remote step stopped before it
+  reported, the partial says `remote: "unknown"`: run `git_fetch` and finish only if the
+  remote branch is still there.
 - **Results** end with the folder's Git status. A refused operation returns its `code` and,
   when a guard refused it, its `blocked` reason, such as uncommitted changes.
 
@@ -146,6 +148,11 @@ These work on the repository of the folder a thread works in, through the provid
   `McpOutcomeUnknownError` and should look for the branch's pull request with
   `list_pull_requests` before creating again. When one is already open for the branch, a
   create returns it.
+- A merge or update whose provider CLI timed out or lost the host may still have happened,
+  so it is `McpOutcomeUnknownError` (`reason: "no-answer"`), never a failure: check
+  `view_pull_request` before trying again.
+- A retry with the same `clientRequestId` returns the recorded outcome even after the
+  thread is deleted.
 
 ## From a shell: `bibcode thread`
 
