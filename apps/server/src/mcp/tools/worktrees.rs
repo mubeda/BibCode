@@ -7,7 +7,10 @@
 //! cancelled. Creation and removal carry a `commandId`, so a retry with the same
 //! `clientRequestId` replays the stored request by its receipt ([`ToolCall::commands`]).
 
-use serde_json::{Value, json};
+use std::time::Instant;
+
+use serde_json::{Map, Value, json};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
@@ -124,6 +127,52 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
         ),
         _ => return None,
     })
+}
+
+/// What the `MCP destructive tool` line of a removal names (C7): never a path or a branch.
+#[derive(Clone)]
+struct RemovalAudit {
+    session_id: String,
+    thread_id: Option<String>,
+    started: Instant,
+}
+
+impl RemovalAudit {
+    fn log(&self, result: &Result<Value, Value>) {
+        let outcome = match result {
+            Ok(_) => "success",
+            Err(failure) => failure["structuredContent"]["error"]["_tag"]
+                .as_str()
+                .unwrap_or("McpToolError"),
+        };
+        tracing::info!(
+            tool = "remove_worktree",
+            session_id = self.session_id.as_str(),
+            thread_id = self.thread_id.as_deref(),
+            outcome,
+            duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "MCP destructive tool"
+        );
+    }
+}
+
+/// The answer a removal call waits for. Dropped unanswered, it logs an answer already sent;
+/// one sent after the drop is logged by the removal, so each removal logs exactly once.
+struct Waiting {
+    receiver: oneshot::Receiver<Result<Value, Value>>,
+    audit: Option<RemovalAudit>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if let Some(audit) = self.audit.take() {
+            // Closed first, so a later send fails and the removal logs it instead.
+            self.receiver.close();
+            if let Ok(result) = self.receiver.try_recv() {
+                audit.log(&result);
+            }
+        }
+    }
 }
 
 /// The descriptor fields an agent needs, joined with the host thread's status.
@@ -403,20 +452,17 @@ impl ToolCall<'_> {
         };
         let stored = self.stored("remove_worktree", fresh).await?;
         let method = match stored["method"].as_str() {
-            Some(method @ (REMOVE | DETACH)) => method,
+            Some(REMOVE) => REMOVE,
+            Some(DETACH) => DETACH,
             _ => {
                 return Err(storage_failure(
                     "a stored remove_worktree request has no method",
                 ));
             }
         };
-        // A removal the catalog took over finishes even when this call is cancelled (C4: a
-        // handler-owned operation), so it runs under the server's token, not the call's.
-        let handed_off = ToolCall {
-            cancellation: self.control.shutdown_token(),
-            ..*self
-        };
-        let removed = handed_off.invoke(method, stored["payload"].clone()).await?;
+        let removed = self
+            .hand_off_removal(method, stored["payload"].clone(), thread_id)
+            .await?;
         Ok(tool_result(
             json!({
                 "threadId": thread_id,
@@ -428,6 +474,58 @@ impl ToolCall<'_> {
             }),
             &[],
         ))
+    }
+
+    /// Runs removal RPC `method` in a task of its own, under the server's token, not this
+    /// call's: a removal the catalog took over finishes even when the call is cancelled or
+    /// dropped (C4: a handler-owned operation). The call writes its `MCP destructive tool`
+    /// line (C7) once this returns; when nobody waits for the answer any more, the removal
+    /// writes that line itself when it ends.
+    async fn hand_off_removal(
+        &self,
+        method: &'static str,
+        payload: Value,
+        thread_id: &str,
+    ) -> Result<Value, Value> {
+        let audit = RemovalAudit {
+            session_id: self.principal.principal.session_id.clone(),
+            thread_id: Some(thread_id)
+                .filter(|id| {
+                    id.len() <= 64
+                        && id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+                .map(str::to_owned),
+            started: Instant::now(),
+        };
+        let (answer, receiver) = oneshot::channel();
+        let (control, principal) = (self.control.clone(), self.principal.clone());
+        let unanswered = audit.clone();
+        tokio::spawn(async move {
+            let arguments = Map::new();
+            let call = ToolCall {
+                control: &control,
+                principal: &principal,
+                arguments: &arguments,
+                cancellation: control.shutdown_token(),
+            };
+            if let Err(result) = answer.send(call.invoke(method, payload).await) {
+                unanswered.log(&result);
+            }
+        });
+        let mut waiting = Waiting {
+            receiver,
+            audit: Some(audit),
+        };
+        let result = (&mut waiting.receiver).await;
+        waiting.audit = None;
+        result.unwrap_or_else(|_| {
+            Err(typed_tool_failure(
+                "McpToolError",
+                "The worktree removal ended without a result; get_worktree_removal_plan shows what is left.",
+            ))
+        })
     }
 
     /// The one request `tool` stores: a receipt-backed RPC payload under `payload`.

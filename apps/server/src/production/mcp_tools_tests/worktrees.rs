@@ -569,3 +569,115 @@ async fn a_removal_cancelled_after_handoff_still_finishes() {
     assert!(!path.exists());
     fixture.shutdown().await;
 }
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A removal whose caller stopped waiting after the catalog took it over still writes its one
+/// `MCP destructive tool` line when it finishes (C7). In a process of its own: the log
+/// capture is this thread's default subscriber, and sibling tests remove worktrees too.
+#[tokio::test]
+async fn a_removal_nobody_waits_for_still_writes_its_audit_line() {
+    let Some(child) = crate::test_support::in_own_process(
+        "production::mcp_tools_tests::worktrees::a_removal_nobody_waits_for_still_writes_its_audit_line",
+    ) else {
+        return;
+    };
+    let log = CapturedLog::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+    let waiter: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>> = Arc::default();
+    let fixture = Fixture::quiesced_by(Some(Arc::new(OnQuiesce(Box::new({
+        let waiter = waiter.clone();
+        move || {
+            if let Some(waiter) = waiter.lock().unwrap().take() {
+                waiter.abort();
+            }
+        }
+    })))))
+    .await;
+    let (agent, _) = fixture.harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, path) = fixture.create(&agent, "unwatched").await;
+    let plan = fixture.plan(&agent, &thread_id).await;
+    let Value::Object(arguments) = removal(&plan, &thread_id, "delete") else {
+        unreachable!()
+    };
+    let call = tokio::spawn({
+        let (control, agent) = (fixture.harness.control.clone(), agent.clone());
+        async move {
+            control
+                .call(
+                    &agent,
+                    "remove_worktree",
+                    &arguments,
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    *waiter.lock().unwrap() = Some(call.abort_handle());
+    assert!(
+        call.await
+            .expect_err("the caller stopped waiting")
+            .is_cancelled()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !log.text().contains("MCP destructive tool") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no audit line:\n{}", log.text()));
+    assert!(!path.exists(), "the removal finished");
+    // A removal its caller waits for is logged once too, by the call.
+    let (thread_id, _) = fixture.create(&agent, "watched").await;
+    let plan = fixture.plan(&agent, &thread_id).await;
+    let removed = fixture
+        .call(
+            &agent,
+            "remove_worktree",
+            removal(&plan, &thread_id, "delete"),
+        )
+        .await;
+    assert_eq!(structured(&removed)["gitOutcome"], "removed");
+    fixture.shutdown().await;
+    let text = log.text();
+    let audit: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("MCP destructive tool"))
+        .collect();
+    assert_eq!(audit.len(), 2, "{text}");
+    assert!(
+        audit
+            .iter()
+            .all(|line| line.contains("remove_worktree") && line.contains("success")),
+        "{text}"
+    );
+    child.complete();
+}
