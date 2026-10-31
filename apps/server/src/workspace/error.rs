@@ -42,6 +42,8 @@ pub enum WorkspaceError {
     },
     #[error("the system trash could not take {path}; it was left in place", path = .path.display())]
     TrashUnavailable { path: PathBuf },
+    #[error("another BiBCode write or an upload of {path} is in progress; try again when it ends", path = .path.display())]
+    PathBusy { path: PathBuf },
     #[error(
         "deleting {path} stopped part-way ({reason}); what is left is at {left_at}",
         path = .path.display(),
@@ -86,6 +88,7 @@ impl WorkspaceError {
             Self::FileChangedOnDisk { .. } => "file_changed_on_disk",
             Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
             Self::TrashUnavailable { .. } => "trash_unavailable",
+            Self::PathBusy { .. } => "path_busy",
             Self::PartiallyRemoved { .. } => "partially_removed",
             _ => "operation_failed",
         }
@@ -120,7 +123,8 @@ impl WorkspaceError {
             | Self::NotFound { path }
             | Self::FileChangedOnDisk { path }
             | Self::FileMissingOnDisk { path }
-            | Self::TrashUnavailable { path } => {
+            | Self::TrashUnavailable { path }
+            | Self::PathBusy { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
             }
             Self::PartiallyRemoved { path, left_at, .. } => {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{Read, Write as _};
+use std::io::{Read, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 #[cfg(test)]
@@ -23,21 +23,18 @@ const READ_LIMIT_BYTES: usize = 1024 * 1024;
 const VERSION_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLICATE_LIMIT: usize = 1000;
 const DEFAULT_MAX_CONCURRENT_OPERATIONS: usize = 32;
-/// The tail of the sibling a version-checked write is written to before it replaces the file.
-const WRITE_PARTIAL_SUFFIX: &str = "bibcode-write.part";
-
-/// How [`WorkspaceService::write_target`] writes.
+/// How [`WorkspaceService::write_target`] writes. Every mode writes the file in place, so it
+/// keeps its inode, links, owner, permissions, ACLs and extended attributes.
 enum WriteMode {
-    /// Truncate and write in place (`projects.writeFile`, which has no precondition).
+    /// Truncate and write (`projects.writeFile`, which has no precondition).
     InPlace,
     /// The file must not exist: created exclusively.
     CreateNew,
-    /// The file must still be the one hashed (`id`) with content `version`; it is replaced by
-    /// a sibling that keeps its permissions.
-    Replace {
+    /// The file must still be the one hashed (`id`) with content `version`, checked through
+    /// the very descriptor that then truncates and writes it.
+    Unchanged {
         version: String,
         id: Option<Identity>,
-        permissions: std::fs::Permissions,
     },
 }
 
@@ -124,7 +121,6 @@ enum ScannedFile {
         binary: bool,
         /// The file that was hashed, so a write can tell it is still the same file.
         id: Option<Identity>,
-        permissions: std::fs::Permissions,
     },
 }
 
@@ -252,10 +248,22 @@ fn scan_file_blocking(place: &Place) -> Result<ScannedFile, WorkspaceError> {
         }
         Err(error) => return Err(error),
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| place.fault("stat", error))?;
     let id = Identity::of(&file).map_err(|error| place.fault("stat", error))?;
+    let (version, byte_length, binary) = hash_open(&mut file, place)?;
+    Ok(ScannedFile::Present {
+        version,
+        byte_length,
+        binary,
+        id,
+    })
+}
+
+/// The version (SHA-256 of the whole content), length and binary flag of an open file, read
+/// from its start.
+fn hash_open(
+    file: &mut std::fs::File,
+    place: &Place,
+) -> Result<(String, u64, bool), WorkspaceError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; VERSION_SCAN_CHUNK_BYTES];
     let mut byte_length = 0_u64;
@@ -275,13 +283,7 @@ fn scan_file_blocking(place: &Place) -> Result<ScannedFile, WorkspaceError> {
         hasher.update(chunk);
         byte_length += read as u64;
     }
-    Ok(ScannedFile::Present {
-        version: lowercase_hex(&hasher.finalize()),
-        byte_length,
-        binary,
-        id,
-        permissions: metadata.permissions(),
-    })
+    Ok((lowercase_hex(&hasher.finalize()), byte_length, binary))
 }
 
 async fn scan_file(place: Place) -> Result<ScannedFile, WorkspaceError> {
@@ -296,30 +298,105 @@ async fn scan_file(place: Place) -> Result<ScannedFile, WorkspaceError> {
 /// keeps the caller's, and on a case-insensitive volume (the default on Windows and macOS) two
 /// spellings name one file. Folding costs nothing on a case-sensitive volume beyond making
 /// writes to names that differ only in case wait for each other.
+///
+/// The same locks serialize every BiBCode writer of a path (#139 X5): a guarded or plain write
+/// from the Files panel or `files_write`, and an upload from its reservation to its install.
+/// A write waits for another write at most [`PATH_LOCK_WAIT`]; it never waits for an upload,
+/// which can stream for minutes, and is refused at once with [`PathBusy`] instead.
 #[derive(Clone, Default)]
-struct PathLocks {
-    locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+pub(crate) struct PathLocks {
+    locks: Arc<StdMutex<HashMap<String, Weak<PathEntry>>>>,
+}
+
+/// One path's lock, and how many uploads hold or are waiting for it.
+#[derive(Default)]
+struct PathEntry {
+    lock: Arc<Mutex<()>>,
+    uploads: std::sync::atomic::AtomicUsize,
+}
+
+/// The longest a write or an upload waits for another BiBCode writer of the same path.
+const PATH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Another BiBCode writer holds the path: an upload, or a write that did not finish in time.
+#[derive(Debug)]
+pub(crate) struct PathBusy;
+
+/// Holds a path for one writer; dropping it lets the next one in.
+pub(crate) struct PathGuard {
+    _guard: OwnedMutexGuard<()>,
+    entry: Arc<PathEntry>,
+    upload: bool,
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        if self.upload {
+            self.entry
+                .uploads
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
 }
 
 impl PathLocks {
-    async fn lock(&self, path: &Path) -> OwnedMutexGuard<()> {
+    fn entry(&self, path: &Path) -> Arc<PathEntry> {
         let key = path.to_string_lossy().to_lowercase();
-        let lock = {
-            let mut locks = self
-                .locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&key).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    locks.insert(key, Arc::downgrade(&lock));
-                    lock
-                }
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, entry| entry.strong_count() > 0);
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(entry) => entry,
+            None => {
+                let entry = Arc::new(PathEntry::default());
+                locks.insert(key, Arc::downgrade(&entry));
+                entry
             }
-        };
-        lock.lock_owned().await
+        }
+    }
+
+    /// The path for a write: refused at once while an upload holds or awaits it.
+    pub(crate) async fn lock(&self, path: &Path) -> Result<PathGuard, PathBusy> {
+        let entry = self.entry(path);
+        if entry.uploads.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return Err(PathBusy);
+        }
+        let guard = tokio::time::timeout(PATH_LOCK_WAIT, Arc::clone(&entry.lock).lock_owned())
+            .await
+            .map_err(|_| PathBusy)?;
+        // An upload that arrived while this write waited goes first.
+        if entry.uploads.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return Err(PathBusy);
+        }
+        Ok(PathGuard {
+            _guard: guard,
+            entry,
+            upload: false,
+        })
+    }
+
+    /// The path for an upload, from its reservation to its install. Writes arriving meanwhile
+    /// are refused; a write already in progress is waited for.
+    pub(crate) async fn lock_upload(&self, path: &Path) -> Result<PathGuard, PathBusy> {
+        let entry = self.entry(path);
+        entry
+            .uploads
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        match tokio::time::timeout(PATH_LOCK_WAIT, Arc::clone(&entry.lock).lock_owned()).await {
+            Ok(guard) => Ok(PathGuard {
+                _guard: guard,
+                entry,
+                upload: true,
+            }),
+            Err(_) => {
+                entry
+                    .uploads
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                Err(PathBusy)
+            }
+        }
     }
 }
 
@@ -373,6 +450,11 @@ impl WorkspaceService {
     pub(crate) fn with_write_hook_for_test(mut self, hook: Arc<dyn WorkspaceWriteHook>) -> Self {
         self.write_hook = Some(hook);
         self
+    }
+
+    /// The per-path locks every BiBCode writer of a workspace file takes, uploads included.
+    pub(crate) fn path_locks(&self) -> PathLocks {
+        self.path_locks.clone()
     }
 
     pub(crate) async fn permit(&self) -> Result<OwnedSemaphorePermit, WorkspaceError> {
@@ -517,7 +599,13 @@ impl WorkspaceService {
     ) -> Result<WriteFileOutcome, WorkspaceError> {
         let _permit = self.permit().await?;
         let (place, normalized) = self.mutation_place(root, relative_path).await?;
-        let _path_lock = self.path_locks.lock(&place.target).await;
+        let _path_lock = self
+            .path_locks
+            .lock(&place.target)
+            .await
+            .map_err(|PathBusy| WorkspaceError::PathBusy {
+                path: place.target.clone(),
+            })?;
         self.containment_checked(&place.target).await?;
         self.write_target(place, normalized, contents, WriteMode::InPlace)
             .await
@@ -537,7 +625,13 @@ impl WorkspaceService {
     ) -> Result<WriteFileOutcome, WorkspaceError> {
         let _permit = self.permit().await?;
         let (place, normalized) = self.mutation_place(root, relative_path).await?;
-        let _path_lock = self.path_locks.lock(&place.target).await;
+        let _path_lock = self
+            .path_locks
+            .lock(&place.target)
+            .await
+            .map_err(|PathBusy| WorkspaceError::PathBusy {
+                path: place.target.clone(),
+            })?;
         self.containment_checked(&place.target).await?;
         let target = place.target.clone();
         let mode = match (precondition, scan_file(place.clone()).await?) {
@@ -554,16 +648,12 @@ impl WorkspaceService {
                 return Err(WorkspaceError::FileChangedOnDisk { path: target });
             }
             (WritePrecondition::Missing, ScannedFile::Missing) => WriteMode::CreateNew,
-            (
-                WritePrecondition::Version { version },
-                ScannedFile::Present {
-                    id, permissions, ..
-                },
-            ) => WriteMode::Replace {
-                version: version.clone(),
-                id,
-                permissions,
-            },
+            (WritePrecondition::Version { version }, ScannedFile::Present { id, .. }) => {
+                WriteMode::Unchanged {
+                    version: version.clone(),
+                    id,
+                }
+            }
         };
         #[cfg(test)]
         if let Some(hook) = &self.write_hook {
@@ -576,9 +666,9 @@ impl WorkspaceService {
     /// so a write to a symlink inside the root writes the file it names, as before; a symlink
     /// found at the name now (a dangling one, or a swap) is refused.
     ///
-    /// A guarded write never truncates a file that changed after its check: `CreateNew`
-    /// creates exclusively, and `Replace` writes a sibling, checks the file is still the one
-    /// hashed with the same content, and renames the sibling over it.
+    /// A guarded write never truncates a file another BiBCode writer changed after its check
+    /// (the path's lock serializes them): `CreateNew` creates exclusively, and `Unchanged`
+    /// re-checks identity and content through the descriptor it then writes.
     async fn write_target(
         &self,
         place: Place,
@@ -617,45 +707,37 @@ impl WorkspaceService {
                     file.write_all(&bytes)
                         .map_err(|error| place.fault("write-file", error))?;
                 }
-                WriteMode::Replace {
-                    version,
-                    id,
-                    permissions,
-                } => {
-                    let sibling =
-                        OsString::from(crate::transfer::upload::partial_transfer_file_name(
-                            &place.name.to_string_lossy(),
-                            WRITE_PARTIAL_SUFFIX,
-                        ));
-                    let mut file = dir
-                        .open_file(&sibling, Open::CreateNew)
-                        .map_err(|error| place.fault("write-file", error))?;
-                    let sibling_id =
-                        Identity::of(&file).map_err(|error| place.fault("write-file", error))?;
-                    let written = file
-                        .set_permissions(permissions)
-                        .and_then(|()| file.write_all(&bytes))
-                        .and_then(|()| file.sync_all());
-                    drop(file);
-                    let discard = || dir.remove_own(&sibling, sibling_id, false);
-                    if let Err(error) = written {
-                        discard();
-                        return Err(place.fault("write-file", error));
+                WriteMode::Unchanged { version, id } => {
+                    // Opened without creating or truncating; checked through this descriptor,
+                    // then truncated and written through it. Other BiBCode writers of the path
+                    // wait on its lock; an outside editor writing between the check and the
+                    // write is the documented residual (POSIX has no compare-and-swap).
+                    let mut file = match dir.open_file(&place.name, Open::Existing) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(WorkspaceError::FileMissingOnDisk {
+                                path: place.target.clone(),
+                            });
+                        }
+                        Err(error) => return Err(place.fault("write-file", error)),
+                    };
+                    let metadata = file
+                        .metadata()
+                        .map_err(|error| place.fault("stat", error))?;
+                    if !metadata.is_file() {
+                        return Err(WorkspaceError::NotFile {
+                            path: place.target.clone(),
+                        });
                     }
-                    // Still the file that was hashed, with the content that was hashed.
-                    let unchanged = matches!(
-                        scan_file_blocking(&place),
-                        Ok(ScannedFile::Present { version: now, id: now_id, .. })
-                            if now == version && now_id == id
-                    );
-                    if !unchanged {
-                        discard();
+                    let now_id = Identity::of(&file).map_err(|error| place.fault("stat", error))?;
+                    let (now, _, _) = hash_open(&mut file, &place)?;
+                    if now_id != id || now != version {
                         return Err(changed());
                     }
-                    if let Err(error) = dir.rename(&sibling, &dir, &place.name, Replace::Allowed) {
-                        discard();
-                        return Err(place.fault("write-file", error));
-                    }
+                    file.set_len(0)
+                        .and_then(|()| file.seek(std::io::SeekFrom::Start(0)).map(drop))
+                        .and_then(|()| file.write_all(&bytes))
+                        .map_err(|error| place.fault("write-file", error))?;
                 }
             }
             Ok((target_existed, parent_existed))
@@ -1352,6 +1434,71 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_guarded_save_writes_the_same_file_in_place_and_leaves_no_sibling() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("notes.txt");
+        std::fs::write(&file, "base").unwrap();
+        std::fs::hard_link(&file, root.path().join("linked.txt")).unwrap();
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        WorkspaceService::default()
+            .write_file_if_unchanged(
+                root.path(),
+                "notes.txt",
+                "saved",
+                &WritePrecondition::Version {
+                    version: sha256_hex(b"base"),
+                },
+            )
+            .await
+            .map(|_| ())
+            .unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("linked.txt")).unwrap(),
+            "saved"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["linked.txt", "notes.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_refused_while_an_upload_holds_its_path() {
+        let root = TempDir::new().unwrap();
+        let service = WorkspaceService::default();
+        let target = std::fs::canonicalize(root.path()).unwrap().join("up.txt");
+        let upload = service.path_locks().lock_upload(&target).await.unwrap();
+        let refused = service
+            .write_file(root.path(), "up.txt", "panel")
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(refused, Err(WorkspaceError::PathBusy { .. })),
+            "{refused:?}"
+        );
+        let refused = service
+            .write_file_if_unchanged(root.path(), "up.txt", "agent", &WritePrecondition::Missing)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(refused, Err(WorkspaceError::PathBusy { .. })),
+            "{refused:?}"
+        );
+        assert!(!target.exists());
+        drop(upload);
+        service
+            .write_file(root.path(), "up.txt", "panel")
+            .await
+            .map(|_| ())
+            .unwrap();
     }
 
     #[tokio::test]
