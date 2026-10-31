@@ -5412,3 +5412,88 @@ fixed with a failing-first test, one commit each, and the reference updated to m
   delivered entry), because `changes_since` reads strictly after its cursor; the preview
   example opens a tab first; a `webhook.test` body can carry `dropped`; minting a download URL
   writes no activity row.
+
+
+## R implementation notes (2026-10-31)
+
+**Revision 4 (P1) is met.** The session-token verifier
+(`authenticate_session_token_with_resource` in `auth/service.rs`) checks a remote grant's
+expiry and its access token's expiry separately: for a session with `mcp_resource` it refuses
+a token whose `exp` is past the grant's expiry (never one whose `exp` merely differs), and
+every other session keeps the equality check. Failing first:
+`a_remote_grant_s_hour_long_access_token_works_on_its_thirty_day_grant` and
+`a_remote_access_token_fails_past_its_own_expiry_or_its_grant_s` failed with
+`InvalidCredential` right after the exchange under the old rule, and pass now. Over HTTP,
+`the_authorization_code_flow_mints_a_grant_that_works_at_once_and_after_refresh`
+(`auth/oauth_flow_tests.rs`) calls `/mcp` at once after the exchange and again after a
+refresh. Revision 3's strict reuse holds: the old refresh token used again is
+`invalid_grant` and revokes the grant, so the new access and refresh tokens fail too
+(the same test, and the service-level one).
+
+**Where it lives.** `auth/oauth.rs` (metadata, registration and request validation, PKCE,
+scopes, admission limits, secrets), `auth/consent_page.rs` (the pages), the routes in
+`auth/http.rs`, grant minting and rotation in `auth/service.rs`, the rows in
+`persistence/repositories.rs` (migration 62), the request classes in `http.rs`
+(`RequestOrigin`), the audience and challenge in `production/connect_mcp.rs`, and
+`bibcode mcp authorize` in the new `mcp/authorize_cli.rs`.
+
+**Drift and choices the design left open:**
+
+- **Approval routes.** `POST /api/auth/mcp-authorizations/approve` and `/deny` take the
+  `id` in the body, not the path: the auth fixture test compares `ROUTE_INVENTORY` paths
+  string for string with the Effect HTTP contract, whose path parameters are spelled
+  differently. The answer is `{ id, status: "approved" | "denied" }`.
+- **Pending list.** `pendingMcpAuthorizations` is an optional field of the access
+  snapshot's payload (`AuthAccessSnapshot`), and a change goes out as a snapshot event, so a
+  client that predates it still decodes the stream. The client reducer needed no change.
+- **Times.** The three OAuth tables keep epoch-millisecond `INTEGER` times, so expiry and
+  pruning compare numbers (RFC 3339 text with trimmed fractions does not sort).
+- **Direct is tighter than the table.** A loopback `Host` counts as direct only from a
+  loopback peer; a LAN peer naming `127.0.0.1` is `Other`. The bound address counts from any
+  peer, but plain HTTP on a non-loopback host is never an eligible origin.
+- **Caps answer 429.** A client at 2 pending, or a source at 4 pending or 8 registrations an
+  hour, is refused; only the global caps evict (the oldest entry of the source holding the
+  most). A consent page that is refused says to approve or deny the waiting requests, or wait.
+- **Refresh narrowing is permanent.** A refresh's `scope` may only narrow, and the narrowed
+  set is stored on the session, because the verifier requires the token's scopes to equal
+  the session's. A refresh without `resource` defaults to the current origin's `/mcp`.
+- **Writes under GET.** `GET /oauth/authorize` and the status poll write rows; each admits a
+  mutation through the maintenance gate itself, since `http_mutability` classes every GET as
+  a read.
+- **Token form.** `POST /oauth/token` buffers the form (16 KB) and dispatches on
+  `grant_type`; any other grant is rebuilt into the original `Form<TokenExchangeRequest>`
+  extractor, so the RFC 8693 exchange keeps its exact behavior, rejections included.
+- **`GET /mcp`.** It is now routed: unauthenticated it is the 401 challenge (it used to fall
+  through to the web app), authenticated it is 405. It is in `ROUTE_INVENTORY`.
+- **Scopes in `tools/list`.** `McpControl::tools` now hides a tool whose scope the
+  credential lacks, as `call` already refused it, and `McpScopeError` names the scope and the
+  sign-in that grants it. No new `Mcp…Error` tag, so `feed::ERRORS` is unchanged.
+- **Primary environment only.** **Requests to connect** and the toast show the primary
+  environment's requests, with its `access:write`, as **Agents** and **Authorized clients**
+  do (X1). The **Remote agents** URL comes from the environment's HTTPS base URL, so a local
+  desktop environment that also runs its own managed tunnel shows "Remote agents need an
+  HTTPS address…" there; its tunnel URL works all the same. The docs say to approve from the
+  BiBCode app that manages the environment, or with `bibcode mcp authorize` on the host.
+- **Status cookie.** One per authorization (`bibcode_mcp_authorization_<id>`,
+  `Path=/oauth/authorize`, `Secure` on HTTPS), so two sign-ins in one browser do not collide.
+- **Source key.** `v4:a.b.c.0/24`, `v6:…/64`, `loopback`, `unspecified` or `tunnel`, from the
+  peer, or a loopback peer's last `X-Forwarded-For` entry (`effective_preauth_peer`).
+- **Toast copy.** "Claude Code wants to operate <environment>" with "Check the code
+  XXXX-XXXX, then approve or deny it." and **Review**, which opens Settings → Agents and
+  scrolls to the requests.
+
+**Files outside R's row:** `mcp/control.rs` (`ClientPrincipal.resource`, the settings hook
+the OAuth routes read, the scope filter), `preview/gateway/registry.rs`
+(`managed_hostname`), `mcp/relay.rs` (three helpers made `pub(crate)` for the CLI),
+`mcp/mod.rs`, `mcp/outcome.rs` (a tuple arity), `diagnostics/profiler/cli.rs` (desktop
+`mcp authorize` dispatch, which attaches the console), `production/runtime.rs`,
+`production/mcp_tools_tests/{files,terminals}.rs`, `tests/{production_jwt,
+production_connect_mcp,preview_open_url,server_runtime}.rs` (the `RouteContext.origin` field
+and the route list), `apps/web/src/AppRoot.tsx` (the notifier's mount),
+`apps/web/src/environments/primary/*` (the decision request), and
+`CreateWorktreeDialog.settings.dom.test.tsx` (its environments mock).
+
+**Not verified here:** the live smoke (`claude mcp add --transport http` and
+`codex mcp add --url` through an HTTPS proxy and through BiBCode Connect, across a refresh)
+needs a real tunnel and was not run. Whether Claude Code refreshes one token from two
+processes at once is still unknown; if it does, strict reuse shows **Re-authenticate**.
