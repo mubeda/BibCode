@@ -23,6 +23,8 @@ vi.mock("../../state/environments", async (importOriginal) => ({
 }));
 
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
+// The agent indicator reads the primary session; these tests are about the bar itself.
+vi.mock("./McpAgentIndicator", () => ({ McpAgentIndicator: () => null }));
 
 vi.mock("../ui/popover", () => ({
   Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
