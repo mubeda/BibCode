@@ -2327,9 +2327,10 @@ impl Repositories {
     }
 
     /// Registers an MCP OAuth client (#139, slice R) under the admission limits, after
-    /// pruning what has expired. A source past its hourly registrations is refused; when the
-    /// global cap of never-approved clients is full, the oldest never-approved client of the
-    /// source holding the most is evicted, with its pending authorizations.
+    /// pruning what has expired. A source past its hourly registrations, or an unproven class
+    /// past its own, is refused. When the global cap of never-approved clients is full, the
+    /// oldest never-approved client of the source holding the most *within the requester's
+    /// class* is evicted, with its pending authorizations; an unproven class evicts nothing.
     pub async fn register_mcp_oauth_client(
         &self,
         client: McpOAuthClient,
@@ -2346,37 +2347,57 @@ impl Repositories {
                     params![client.source_key, now_ms - 60 * 60 * 1_000],
                     |row| row.get(0),
                 )?;
-                let admission = if recent >= limits.registrations_per_source_per_hour {
+                let class = source_class(&client.source_key);
+                let unproven = limits.unproven_classes.contains(&class);
+                let class_pattern = format!("{class}:%");
+                let class_recent: i64 = if unproven {
+                    transaction.query_row(
+                        "SELECT COUNT(*) FROM mcp_oauth_clients \
+                         WHERE source_key LIKE ? AND created_at > ?",
+                        params![class_pattern, now_ms - 60 * 60 * 1_000],
+                        |row| row.get(0),
+                    )?
+                } else {
+                    0
+                };
+                let unapproved: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM mcp_oauth_clients WHERE approved_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                // At the global cap, room is made only within the requester's own proven class.
+                let victim = if unapproved >= limits.unapproved_clients && !unproven {
+                    transaction
+                        .query_row(
+                            "SELECT client_id FROM mcp_oauth_clients WHERE approved_at IS NULL \
+                             AND source_key = (SELECT source_key FROM mcp_oauth_clients \
+                               WHERE approved_at IS NULL AND source_key LIKE ?1 \
+                               GROUP BY source_key \
+                               ORDER BY COUNT(*) DESC, MIN(created_at) ASC LIMIT 1) \
+                             ORDER BY created_at ASC, client_id ASC LIMIT 1",
+                            [&class_pattern],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                } else {
+                    None
+                };
+                let admission = if recent >= limits.registrations_per_source_per_hour
+                    || class_recent >= limits.unproven_class_registrations_per_hour
+                    || (unapproved >= limits.unapproved_clients && victim.is_none())
+                {
                     McpOAuthAdmission::Refused
                 } else {
-                    let unapproved: i64 = transaction.query_row(
-                        "SELECT COUNT(*) FROM mcp_oauth_clients WHERE approved_at IS NULL",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    if unapproved >= limits.unapproved_clients {
-                        let victim = transaction
-                            .query_row(
-                                "SELECT client_id FROM mcp_oauth_clients WHERE approved_at IS NULL \
-                                 AND source_key = (SELECT source_key FROM mcp_oauth_clients \
-                                   WHERE approved_at IS NULL GROUP BY source_key \
-                                   ORDER BY COUNT(*) DESC, MIN(created_at) ASC LIMIT 1) \
-                                 ORDER BY created_at ASC, client_id ASC LIMIT 1",
-                                [],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .optional()?;
-                        if let Some(victim) = victim {
-                            changed |= transaction.execute(
-                                "DELETE FROM mcp_oauth_authorizations \
-                                 WHERE client_id = ? AND status = 'pending'",
-                                [&victim],
-                            )? > 0;
-                            transaction.execute(
-                                "DELETE FROM mcp_oauth_clients WHERE client_id = ?",
-                                [&victim],
-                            )?;
-                        }
+                    if let Some(victim) = victim {
+                        changed |= transaction.execute(
+                            "DELETE FROM mcp_oauth_authorizations \
+                             WHERE client_id = ? AND status = 'pending'",
+                            [&victim],
+                        )? > 0;
+                        transaction.execute(
+                            "DELETE FROM mcp_oauth_clients WHERE client_id = ?",
+                            [&victim],
+                        )?;
                     }
                     transaction.execute(
                         "INSERT INTO mcp_oauth_clients (client_id, client_name, redirect_uris_json, \
@@ -2414,10 +2435,11 @@ impl Repositories {
             })
             .await
     }
-    /// Creates a pending authorization under the admission limits. A client or a source at
-    /// its own cap is refused; when the global cap is full (or, for a source that already has
-    /// one pending, all but the reserved headroom), the oldest pending entry of the source
-    /// holding the most is evicted, so one source's flood evicts its own entries.
+    /// Creates a pending authorization under the admission limits. A client, a source or an
+    /// unproven class at its own cap is refused. When the global cap is full (or, for a source
+    /// that already has one pending, all but the reserved headroom), the oldest pending entry
+    /// of the source holding the most within the requester's own class is evicted, so a flood
+    /// evicts only its class's entries; an unproven class evicts nothing and is refused.
     pub async fn create_mcp_oauth_authorization(
         &self,
         row: NewMcpOAuthAuthorization,
@@ -2441,8 +2463,22 @@ impl Repositories {
                     params![row.source_key, now_ms],
                     |row| row.get(0),
                 )?;
+                let class = source_class(&row.source_key);
+                let unproven = limits.unproven_classes.contains(&class);
+                let class_pattern = format!("{class}:%");
+                let for_class: i64 = if unproven {
+                    transaction.query_row(
+                        "SELECT COUNT(*) FROM mcp_oauth_authorizations \
+                         WHERE source_key LIKE ? AND status = 'pending' AND expires_at > ?",
+                        params![class_pattern, now_ms],
+                        |row| row.get(0),
+                    )?
+                } else {
+                    0
+                };
                 if for_client >= limits.pending_per_client
                     || for_source >= limits.pending_per_source
+                    || for_class >= limits.unproven_class_pending
                 {
                     if pruned {
                         bump_auth_authority_revision_on(&transaction)?;
@@ -2461,17 +2497,28 @@ impl Repositories {
                 } else {
                     limits.pending - limits.pending_reserved
                 };
+                // At the global cap, room is made only within the requester's own proven class:
+                // an unproven class evicts nothing, and no class evicts another's.
                 if total >= room {
-                    transaction.execute(
-                        "DELETE FROM mcp_oauth_authorizations WHERE id = (\
-                           SELECT id FROM mcp_oauth_authorizations \
-                           WHERE status = 'pending' AND expires_at > ?1 \
-                           AND source_key = (SELECT source_key FROM mcp_oauth_authorizations \
-                             WHERE status = 'pending' AND expires_at > ?1 GROUP BY source_key \
-                             ORDER BY COUNT(*) DESC, MIN(created_at) ASC LIMIT 1) \
-                           ORDER BY created_at ASC, id ASC LIMIT 1)",
-                        params![now_ms],
-                    )?;
+                    let evicted = !unproven
+                        && transaction.execute(
+                            "DELETE FROM mcp_oauth_authorizations WHERE id = (\
+                               SELECT id FROM mcp_oauth_authorizations \
+                               WHERE status = 'pending' AND expires_at > ?1 \
+                               AND source_key = (SELECT source_key FROM mcp_oauth_authorizations \
+                                 WHERE status = 'pending' AND expires_at > ?1 \
+                                 AND source_key LIKE ?2 GROUP BY source_key \
+                                 ORDER BY COUNT(*) DESC, MIN(created_at) ASC LIMIT 1) \
+                               ORDER BY created_at ASC, id ASC LIMIT 1)",
+                            params![now_ms, class_pattern],
+                        )? == 1;
+                    if !evicted {
+                        if pruned {
+                            bump_auth_authority_revision_on(&transaction)?;
+                        }
+                        transaction.commit()?;
+                        return Ok(McpOAuthAdmission::Refused);
+                    }
                 }
                 transaction.execute(
                     "INSERT INTO mcp_oauth_authorizations (id, user_code, client_id, redirect_uri, \
@@ -3131,6 +3178,13 @@ pub struct McpOAuthLimits {
     pub pending: i64,
     /// Of `pending`, the entries kept for sources that have none pending.
     pub pending_reserved: i64,
+    /// Source classes whose per-source key the server cannot prove (a local proxy's
+    /// `X-Forwarded-For`): they share a class cap and never evict another entry.
+    pub unproven_classes: &'static [&'static str],
+    /// Pending authorizations an unproven class may hold in all.
+    pub unproven_class_pending: i64,
+    /// Registrations an unproven class may make in an hour, in all.
+    pub unproven_class_registrations_per_hour: i64,
     pub unapproved_client_ttl_ms: i64,
     pub approved_client_idle_ms: i64,
     /// How long an authorization row outlives its expiry, so a replayed code still finds it.
@@ -3386,6 +3440,12 @@ fn decode_string_list(value: String) -> rusqlite::Result<Vec<String>> {
     })
 }
 
+/// A source key's class: what comes before its first `:` (`direct`, `proxy`, `tunnel`,
+/// `other`).
+fn source_class(source_key: &str) -> &str {
+    source_key.split(':').next().unwrap_or_default()
+}
+
 /// Epoch milliseconds as an RFC 3339 timestamp.
 fn format_epoch_ms(epoch_ms: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
@@ -3403,6 +3463,9 @@ fn parse_epoch_ms(value: &str) -> Option<i64> {
         .ok()
         .and_then(|timestamp| i64::try_from(timestamp.unix_timestamp_nanos() / 1_000_000).ok())
 }
+
+/// How many used refresh tokens a grant keeps for reuse detection, beside its current one.
+const MCP_OAUTH_USED_REFRESH_TOKENS_KEPT: i64 = 32;
 
 /// Removes what the OAuth routes no longer need: clients never approved after a day,
 /// approved clients unused for 90 days (with their pending authorizations), authorizations
@@ -3431,10 +3494,11 @@ fn prune_mcp_oauth_on(
         "DELETE FROM mcp_oauth_authorizations WHERE expires_at <= ?",
         params![now_ms - limits.finished_authorization_ttl_ms],
     )?;
+    // Every token of a grant that is revoked, expired or gone.
     connection.execute(
         "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id NOT IN \
-         (SELECT session_id FROM auth_sessions WHERE revoked_at IS NULL)",
-        [],
+         (SELECT session_id FROM auth_sessions WHERE revoked_at IS NULL AND expires_at > ?)",
+        params![format_epoch_ms(now_ms)],
     )?;
     Ok(pending_gone)
 }
@@ -3548,6 +3612,15 @@ fn rotate_refresh_token_on(
         "INSERT INTO mcp_oauth_refresh_tokens (token_hash, session_id, client_id, issued_at, \
          used_at) VALUES (?, ?, ?, ?, NULL)",
         params![rotation.new_token_hash, session_id, client_id, now_ms],
+    )?;
+    // Keep the current token and only the most recent used ones, which are enough to catch a
+    // replay; an older used token is merely unknown (review round 2).
+    connection.execute(
+        "DELETE FROM mcp_oauth_refresh_tokens WHERE session_id = ?1 AND used_at IS NOT NULL \
+         AND token_hash NOT IN (SELECT token_hash FROM mcp_oauth_refresh_tokens \
+           WHERE session_id = ?1 AND used_at IS NOT NULL \
+           ORDER BY used_at DESC, issued_at DESC, rowid DESC LIMIT ?2)",
+        params![session_id, MCP_OAUTH_USED_REFRESH_TOKENS_KEPT],
     )?;
     if let Some(requested) = &rotation.scopes {
         // Narrowing keeps the grant's order, so the access token's scopes match the session.

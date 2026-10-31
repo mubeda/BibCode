@@ -51,6 +51,9 @@ pub(crate) const LIMITS: McpOAuthLimits = McpOAuthLimits {
     pending_per_source: 4,
     pending: 64,
     pending_reserved: 16,
+    unproven_classes: &["proxy"],
+    unproven_class_pending: 16,
+    unproven_class_registrations_per_hour: 16,
     unapproved_client_ttl_ms: 24 * 60 * 60 * 1_000,
     approved_client_idle_ms: 90 * 24 * 60 * 60 * 1_000,
     finished_authorization_ttl_ms: 60 * 60 * 1_000,
@@ -581,6 +584,131 @@ pub(crate) async fn test_remote_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn store() -> crate::persistence::Repositories {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .unwrap();
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        crate::persistence::Repositories::new(database)
+    }
+
+    async fn ask(
+        repositories: &crate::persistence::Repositories,
+        source_key: &str,
+        index: usize,
+    ) -> crate::persistence::McpOAuthAdmission {
+        let now = super::super::now_ms();
+        let client_id = format!("mcp-{source_key}-{index}");
+        repositories
+            .register_mcp_oauth_client(
+                crate::persistence::McpOAuthClient {
+                    client_id: client_id.clone(),
+                    client_name: "c".to_owned(),
+                    redirect_uris: vec!["http://localhost/cb".to_owned()],
+                    source_key: format!("direct:seed-{source_key}-{index}"),
+                    created_at_ms: now,
+                    approved_at_ms: None,
+                    last_used_at_ms: None,
+                },
+                now,
+                LIMITS,
+            )
+            .await
+            .unwrap();
+        // Approved clients hold no place in the never-approved cap, so only pending
+        // authorizations fill the store here.
+        let approved = client_id.clone();
+        repositories
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE mcp_oauth_clients SET approved_at = ?1 WHERE client_id = ?2",
+                    rusqlite::params![now, approved],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repositories
+            .create_mcp_oauth_authorization(
+                crate::persistence::NewMcpOAuthAuthorization {
+                    id: format!("{source_key}-{index}"),
+                    user_code: random_user_code().unwrap(),
+                    client_id,
+                    redirect_uri: "http://localhost/cb".to_owned(),
+                    code_challenge: s256(&"v".repeat(43)),
+                    state: None,
+                    resource: "https://e.example/mcp".to_owned(),
+                    scopes: "orchestration:read".to_owned(),
+                    origin: "https://e.example".to_owned(),
+                    source_key: source_key.to_owned(),
+                    status_cookie_hash: secret_hash("c"),
+                    created_at_ms: now + i64::try_from(index).unwrap(),
+                    expires_at_ms: now + AUTHORIZATION_TTL_MS,
+                },
+                now,
+                LIMITS,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Review round 2: with the global cap full, a request evicts only within its own source
+    /// class, and an unproven class (a local proxy's `X-Forwarded-For`) evicts nothing.
+    #[tokio::test]
+    async fn the_global_cap_evicts_only_within_a_proven_source_class() {
+        use crate::persistence::McpOAuthAdmission::{Admitted, Refused};
+        let repositories = store().await;
+        // 64 pending from 64 direct networks, the whole global cap.
+        for network in 0..64 {
+            assert_eq!(
+                ask(
+                    &repositories,
+                    &format!("direct:v4:10.0.{network}.0/24"),
+                    network
+                )
+                .await,
+                Admitted
+            );
+        }
+        let pending = |repositories: &crate::persistence::Repositories| {
+            let repositories = repositories.clone();
+            async move {
+                repositories
+                    .list_pending_mcp_oauth_authorizations(super::super::now_ms())
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(pending(&repositories).await.len(), 64);
+        // A proxy-class request cannot make room by evicting a direct one.
+        assert_eq!(
+            ask(&repositories, "proxy:v4:203.0.113.0/24", 0).await,
+            Refused
+        );
+        assert_eq!(pending(&repositories).await.len(), 64);
+        // A tunnel request cannot either: it has nothing of its own class to evict.
+        assert_eq!(ask(&repositories, "tunnel:", 0).await, Refused);
+        // A new direct network evicts the oldest entry of the direct source holding the most.
+        assert_eq!(
+            ask(&repositories, "direct:v4:10.9.9.0/24", 0).await,
+            Admitted
+        );
+        let after = pending(&repositories).await;
+        assert_eq!(after.len(), 64);
+        assert!(
+            after
+                .iter()
+                .all(|row| row.source_key.starts_with("direct:"))
+        );
+    }
 
     fn settings(terminals: bool) -> McpOAuthSettings {
         McpOAuthSettings {

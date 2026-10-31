@@ -1466,18 +1466,25 @@ async fn oauth_token(
             );
         }
     };
+    // The code's binding is checked whatever its state: a code that was already exchanged
+    // revokes the grant it minted only for a caller that also holds the original client,
+    // redirect URI, resource and PKCE verifier (review round 2). Anyone else who saw the code
+    // in a callback URL gets `invalid_grant`, and the agent stays signed in.
+    let bound = authorization.client_id == client_id
+        && authorization.redirect_uri == redirect_uri
+        && authorization.origin == origin_value
+        && oauth::resource_matches(&authorization.resource, origin_value)
+        && oauth::pkce_verifies(verifier, &authorization.code_challenge);
+    if !bound {
+        return invalid_grant("binding-mismatch");
+    }
     let now = now_ms();
     if authorization.status == "approved"
-        && (authorization.client_id != client_id
-            || authorization.redirect_uri != redirect_uri
-            || authorization.origin != origin_value
-            || !oauth::resource_matches(&authorization.resource, origin_value)
-            || authorization
-                .code_expires_at_ms
-                .is_none_or(|expiry| expiry <= now)
-            || !oauth::pkce_verifies(verifier, &authorization.code_challenge))
+        && authorization
+            .code_expires_at_ms
+            .is_none_or(|expiry| expiry <= now)
     {
-        return invalid_grant("mismatch-or-expired");
+        return invalid_grant("expired");
     }
     let Ok(refresh_token) = oauth::random_secret() else {
         return oauth_error(
