@@ -16,47 +16,73 @@ import { createEnvironmentSubscriptionAtomFamily } from "./runtime.ts";
 const MOST_UI_INTENTS = 64;
 
 /**
+ * A pending intent and its `deadline` on this client's clock: the moment it arrived plus the
+ * time the server said it had left (`expiresInMs`), so a client clock that is off never drops
+ * a fresh intent or keeps a stale one.
+ */
+export type PendingUiIntent = UiIntent & { readonly deadline: number };
+
+/**
  * An outside agent's UI suggestions still pending, oldest first (#139, slices X4 and X7): the
  * newest 64 `focus` intents, and the last `commitMessage` intent of up to 64 folders.
  */
-export type UiIntentsState = ReadonlyArray<UiIntent>;
+export type UiIntentsState = ReadonlyArray<PendingUiIntent>;
 
 export const EMPTY_UI_INTENTS: UiIntentsState = [];
 
-/** Whether `intent` is still pending at `now` (milliseconds since the epoch). */
-export function isUiIntentPending(intent: UiIntent, now: number): boolean {
-  return Date.parse(intent.expiresAt) > now;
+/** Whether `intent` is still pending at `now` on this client's clock. */
+export function isUiIntentPending(intent: PendingUiIntent, now: number): boolean {
+  return intent.deadline > now;
+}
+
+/**
+ * Whether commit message `candidate`, which arrived after `kept`, replaces it. Within one
+ * server boot the higher sequence wins. A message from another boot is newer, whatever its
+ * sequence: the server's store does not survive a restart, and a clock set back across one can
+ * issue a lower sequence. One server serves one environment, so boots never interleave.
+ */
+export function replacesCommitMessage(
+  kept: UiIntent & { kind: "commitMessage" },
+  candidate: UiIntent & { kind: "commitMessage" },
+): boolean {
+  return candidate.bootId !== kept.bootId || candidate.sequence > kept.sequence;
 }
 
 /**
  * Drops expired intents and caps each kind on its own, so a flood of `focus` intents never
- * pushes out a folder's commit message. A folder keeps only its commit message with the
- * highest `sequence`, so a live event that arrives after a newer snapshot never wins.
+ * pushes out a folder's commit message. `pending` is in the order intents arrived. A folder
+ * keeps only its newest commit message, so a live event that arrives after a newer snapshot
+ * never wins.
  */
-function bound(intents: ReadonlyArray<UiIntent>, now: number): UiIntentsState {
+function bound(intents: UiIntentsState, now: number): UiIntentsState {
   const pending = intents.filter((intent) => isUiIntentPending(intent, now));
-  const newestPerFolder = new Map<string, UiIntent & { kind: "commitMessage" }>();
+  const newestPerFolder = new Map<string, PendingUiIntent & { kind: "commitMessage" }>();
   for (const intent of pending) {
     if (intent.kind !== "commitMessage") continue;
     const kept = newestPerFolder.get(intent.cwd);
-    if (kept === undefined || intent.sequence > kept.sequence) {
+    if (kept === undefined || replacesCommitMessage(kept, intent)) {
       newestPerFolder.set(intent.cwd, intent);
     }
   }
   const focus = pending.filter((intent) => intent.kind === "focus");
-  const messages = [...newestPerFolder.values()].toSorted(
-    (left, right) => left.sequence - right.sequence,
+  const messages = pending.filter(
+    (intent) => intent.kind === "commitMessage" && newestPerFolder.get(intent.cwd) === intent,
   );
-  const kept = new Set<UiIntent>([
+  const kept = new Set<PendingUiIntent>([
     ...focus.slice(-MOST_UI_INTENTS),
     ...messages.slice(-MOST_UI_INTENTS),
   ]);
   return pending.filter((intent) => kept.has(intent));
 }
 
+/** `intent` with its deadline on this client's clock, arriving at `now`. */
+function arrived(intent: UiIntent, now: number): PendingUiIntent {
+  return { ...intent, deadline: now + intent.expiresInMs };
+}
+
 /**
- * Folds one `subscribeUiIntents` event into the pending intents at `now`; an id is kept once,
- * and intents that expired are dropped.
+ * Folds one `subscribeUiIntents` event, arriving at `now` on this client's clock, into the
+ * pending intents; an id is kept once, and intents past their deadline are dropped.
  */
 export function applyUiIntentEvent(
   current: UiIntentsState,
@@ -65,11 +91,14 @@ export function applyUiIntentEvent(
 ): UiIntentsState {
   switch (event.type) {
     case "snapshot":
-      return bound(event.intents, now);
+      return bound(
+        event.intents.map((intent) => arrived(intent, now)),
+        now,
+      );
     case "intent":
       return current.some((intent) => intent.intentId === event.intent.intentId)
         ? current
-        : bound([...current, event.intent], now);
+        : bound([...current, arrived(event.intent, now)], now);
   }
 }
 

@@ -5,6 +5,7 @@ import { applyUiIntentEvent, EMPTY_UI_INTENTS } from "./uiIntents.ts";
 
 /** The fixtures' clock: every intent below is pending at this time. */
 const NOW = Date.parse("2026-10-31T00:00:00.000Z");
+const DAY = 86_400_000;
 
 function intent(intentId: string): UiIntent {
   return {
@@ -16,13 +17,20 @@ function intent(intentId: string): UiIntent {
     actor: { kind: "mcp-client", clientId: "session-1", label: "Claude Code" },
     createdAt: "2026-10-31T00:00:00.000Z",
     expiresAt: "2026-10-31T00:01:00.000Z",
+    expiresInMs: 60_000,
   };
 }
 
-function commitMessage(intentId: string, cwd: string, sequence: number): UiIntent {
+function commitMessage(
+  intentId: string,
+  cwd: string,
+  sequence: number,
+  bootId = "boot-1",
+): UiIntent {
   return {
     kind: "commitMessage",
     intentId,
+    bootId,
     sequence,
     threadId: ThreadId.make("thread-1"),
     cwd,
@@ -30,8 +38,11 @@ function commitMessage(intentId: string, cwd: string, sequence: number): UiInten
     actor: { kind: "mcp-client", clientId: "session-1", label: "Claude Code" },
     createdAt: "2026-10-31T00:00:00.000Z",
     expiresAt: "2026-11-01T00:00:00.000Z",
+    expiresInMs: DAY,
   };
 }
+
+const ids = (state: ReadonlyArray<UiIntent>) => state.map((entry) => entry.intentId);
 
 describe("applyUiIntentEvent", () => {
   it("replaces on a snapshot and appends a new intent once", () => {
@@ -40,9 +51,9 @@ describe("applyUiIntentEvent", () => {
       { type: "snapshot", intents: [intent("a")] },
       NOW,
     );
-    expect(snapshot.map((entry) => entry.intentId)).toEqual(["a"]);
+    expect(ids(snapshot)).toEqual(["a"]);
     const added = applyUiIntentEvent(snapshot, { type: "intent", intent: intent("b") }, NOW);
-    expect(added.map((entry) => entry.intentId)).toEqual(["a", "b"]);
+    expect(ids(added)).toEqual(["a", "b"]);
     // The snapshot and the live event can both carry one published in between.
     expect(applyUiIntentEvent(added, { type: "intent", intent: intent("b") }, NOW)).toBe(added);
   });
@@ -73,8 +84,7 @@ describe("applyUiIntentEvent", () => {
       { type: "intent", intent: commitMessage("m3", "/repo/a", 3) },
       NOW,
     );
-    const messages = state.filter((entry) => entry.kind === "commitMessage");
-    expect(messages.map((entry) => entry.intentId)).toEqual(["m2", "m3"]);
+    expect(ids(state.filter((entry) => entry.kind === "commitMessage"))).toEqual(["m2", "m3"]);
     expect(state.filter((entry) => entry.kind === "focus")).toHaveLength(64);
   });
 
@@ -90,10 +100,25 @@ describe("applyUiIntentEvent", () => {
       { type: "intent", intent: commitMessage("older", "/repo", 6) },
       NOW,
     );
-    expect(state.map((entry) => entry.intentId)).toEqual(["newer"]);
+    expect(ids(state)).toEqual(["newer"]);
   });
 
-  it("drops intents that expired, on the next event and in a snapshot", () => {
+  it("takes a restarted server's message as newer, even with a lower sequence", () => {
+    // A clock set back across a restart can issue a lower sequence; the boot differs.
+    let state = applyUiIntentEvent(
+      EMPTY_UI_INTENTS,
+      { type: "snapshot", intents: [commitMessage("before", "/repo", 100, "boot-1")] },
+      NOW,
+    );
+    state = applyUiIntentEvent(
+      state,
+      { type: "intent", intent: commitMessage("after", "/repo", 5, "boot-2") },
+      NOW,
+    );
+    expect(ids(state)).toEqual(["after"]);
+  });
+
+  it("drops intents when the time they had left runs out on this client", () => {
     const pending = applyUiIntentEvent(
       EMPTY_UI_INTENTS,
       { type: "snapshot", intents: [intent("focus"), commitMessage("message", "/repo", 1)] },
@@ -106,12 +131,26 @@ describe("applyUiIntentEvent", () => {
       { type: "intent", intent: commitMessage("other", "/repo/b", 2) },
       NOW + 60_000,
     );
-    expect(minute.map((entry) => entry.intentId)).toEqual(["message", "other"]);
-    const day = applyUiIntentEvent(
+    expect(ids(minute)).toEqual(["message", "other"]);
+    const day = applyUiIntentEvent(minute, { type: "intent", intent: intent("later") }, NOW + DAY);
+    expect(ids(day)).toEqual(["other", "later"]);
+  });
+
+  it("keeps a fresh suggestion on a client whose clock runs 25 hours ahead", () => {
+    // By this client's clock the server's expiresAt has passed; the time left has not.
+    const ahead = NOW + 25 * 3_600_000;
+    const state = applyUiIntentEvent(
       EMPTY_UI_INTENTS,
-      { type: "snapshot", intents: [...minute] },
-      NOW + 86_400_000,
+      { type: "intent", intent: commitMessage("fresh", "/repo", 1) },
+      ahead,
     );
-    expect(day).toEqual([]);
+    expect(ids(state)).toEqual(["fresh"]);
+    expect(state[0]?.deadline).toBe(ahead + DAY);
+    const expired = applyUiIntentEvent(
+      state,
+      { type: "intent", intent: intent("later") },
+      ahead + DAY,
+    );
+    expect(ids(expired)).toEqual(["later"]);
   });
 });
