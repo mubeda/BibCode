@@ -24,16 +24,48 @@ pub(crate) struct TerminalHistory {
     /// Every byte ever pushed, eviction and clearing included: the end offset of the output,
     /// which a reader's cursor counts in.
     total_bytes_written: u64,
+    /// Unique to this history in the process: a restarted or reopened terminal gets a new
+    /// history whose offsets start again at 0, so a cursor names its history too.
+    epoch: u64,
+}
+
+/// Hands out history epochs; never reused while the process runs.
+static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A position in one history's output: its epoch and a byte offset into everything it was
+/// ever given. Written `<epoch>:<offset>`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryCursor {
+    pub(crate) epoch: u64,
+    pub(crate) offset: u64,
+}
+
+impl HistoryCursor {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let (epoch, offset) = text.split_once(':')?;
+        Some(Self {
+            epoch: epoch.parse().ok()?,
+            offset: offset.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for HistoryCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.epoch, self.offset)
+    }
 }
 
 /// A run of retained output between two byte offsets of everything ever written.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HistoryWindow {
     pub(crate) text: String,
+    /// The history the offsets count in.
+    pub(crate) epoch: u64,
     pub(crate) start: u64,
     pub(crate) end: u64,
-    /// The requested offset is no longer retained (evicted, cleared, or from an earlier
-    /// session), so the window starts at the oldest retained byte instead.
+    /// The requested offset is no longer retained (evicted, cleared, or from another
+    /// history), so the window starts at the oldest retained byte instead.
     pub(crate) dropped: bool,
 }
 
@@ -116,6 +148,16 @@ impl TerminalHistory {
             total_bytes: 0,
             byte_limit,
             total_bytes_written: 0,
+            epoch: NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// The cursor at `offset` of this history.
+    #[cfg(test)]
+    pub(crate) fn at(&self, offset: u64) -> HistoryCursor {
+        HistoryCursor {
+            epoch: self.epoch,
+            offset,
         }
     }
 
@@ -132,12 +174,14 @@ impl TerminalHistory {
         self.total_bytes_written - self.total_bytes as u64
     }
 
-    /// At most `max_chars` characters of retained output from offset `from`. An offset no
-    /// longer retained, or past the end, starts at the oldest retained byte and reports
-    /// `dropped`; one inside a character starts at the next character.
-    pub(crate) fn read_window(&self, from: u64, max_chars: usize) -> HistoryWindow {
+    /// At most `max_chars` characters of retained output from `cursor`. A cursor of another
+    /// history, or an offset no longer retained or past the end, starts at the oldest retained
+    /// byte and reports `dropped`; one inside a character starts at the next character.
+    pub(crate) fn read_window(&self, cursor: HistoryCursor, max_chars: usize) -> HistoryWindow {
+        let from = cursor.offset;
         let oldest = self.oldest();
-        let dropped = from < oldest || from > self.total_bytes_written;
+        let dropped =
+            cursor.epoch != self.epoch || from < oldest || from > self.total_bytes_written;
         let mut skip = if dropped {
             0
         } else {
@@ -172,6 +216,7 @@ impl TerminalHistory {
         let end = start + text.len() as u64;
         HistoryWindow {
             text,
+            epoch: self.epoch,
             start,
             end,
             dropped,
@@ -198,6 +243,7 @@ impl TerminalHistory {
         }
         let text: String = pieces.into_iter().rev().collect();
         HistoryWindow {
+            epoch: self.epoch,
             start: self.total_bytes_written - text.len() as u64,
             end: self.total_bytes_written,
             text,
@@ -330,7 +376,7 @@ fn byte_index_after_nth_newline(data: &str, count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalHistory;
+    use super::{HistoryCursor, TerminalHistory};
 
     fn legacy_push(history: &mut String, data: &str, line_limit: usize) {
         history.push_str(data);
@@ -586,25 +632,25 @@ mod tests {
         history.push("one\n");
         history.push("twö\n");
         assert_eq!(history.total_bytes_written(), 9);
-        let all = history.read_window(0, 100);
+        let all = history.read_window(history.at(0), 100);
         assert_eq!(
             (all.text.as_str(), all.start, all.end),
             ("one\ntwö\n", 0, 9)
         );
         assert!(!all.dropped);
-        let rest = history.read_window(4, 100);
+        let rest = history.read_window(history.at(4), 100);
         assert_eq!((rest.text.as_str(), rest.start, rest.end), ("twö\n", 4, 9));
         // At most `max_chars` characters, ending on a character boundary.
-        let page = history.read_window(4, 3);
+        let page = history.read_window(history.at(4), 3);
         assert_eq!((page.text.as_str(), page.end), ("twö", 8));
         // Nothing new past the end.
-        let caught_up = history.read_window(9, 100);
+        let caught_up = history.read_window(history.at(9), 100);
         assert_eq!(
             (caught_up.text.as_str(), caught_up.start, caught_up.end),
             ("", 9, 9)
         );
         // A cursor inside a character starts at the next one.
-        let inside = history.read_window(7, 100);
+        let inside = history.read_window(history.at(7), 100);
         assert_eq!((inside.text.as_str(), inside.start), ("\n", 8));
     }
 
@@ -618,7 +664,7 @@ mod tests {
             history.push(&block);
         }
         assert!(history.total_bytes_written() > 1_048_576 + cursor);
-        let window = history.read_window(cursor, 10);
+        let window = history.read_window(history.at(cursor), 10);
         assert!(window.dropped);
         let oldest = history.total_bytes_written() - history.snapshot().len() as u64;
         assert_eq!(window.start, oldest);
@@ -626,24 +672,44 @@ mod tests {
         // Clearing keeps the count, so an old cursor is dropped, never reused.
         history.clear();
         let after = history.total_bytes_written();
-        let cleared = history.read_window(cursor, 10);
+        let cleared = history.read_window(history.at(cursor), 10);
         assert!(cleared.dropped);
         assert_eq!(
             (cleared.start, cleared.end, cleared.text.as_str()),
             (after, after, "")
         );
         history.push("new");
-        assert_eq!(history.read_window(after, 10).text, "new");
+        assert_eq!(history.read_window(history.at(after), 10).text, "new");
     }
 
     #[test]
     fn a_cursor_past_the_end_is_dropped_and_starts_at_the_oldest_byte() {
-        // A restarted terminal has a new history, so an old session's cursor can lie ahead.
         let mut history = TerminalHistory::new(100);
         history.push("fresh");
-        let window = history.read_window(1_000, 100);
+        let window = history.read_window(history.at(1_000), 100);
         assert!(window.dropped);
         assert_eq!((window.start, window.text.as_str()), (0, "fresh"));
+    }
+
+    #[test]
+    fn a_cursor_from_another_history_is_dropped_even_inside_its_range() {
+        // A restarted or reopened terminal has a new history whose offsets start again at 0,
+        // so an earlier session's cursor can land inside the new range.
+        let mut before = TerminalHistory::new(100);
+        before.push("old\n");
+        let stale = before.at(before.total_bytes_written());
+        let mut after = TerminalHistory::new(100);
+        after.push("new output\n");
+        assert_ne!(stale.epoch, after.at(0).epoch);
+        let window = after.read_window(stale, 100);
+        assert!(window.dropped);
+        assert_eq!((window.start, window.text.as_str()), (0, "new output\n"));
+        assert_eq!(window.epoch, after.at(0).epoch);
+        // A cursor round-trips through its text form.
+        let cursor = after.at(window.end);
+        assert_eq!(HistoryCursor::parse(&cursor.to_string()), Some(cursor));
+        assert_eq!(HistoryCursor::parse("12"), None);
+        assert_eq!(HistoryCursor::parse("a:1"), None);
     }
 
     #[test]
@@ -654,6 +720,7 @@ mod tests {
         let tail = history.tail(4);
         assert_eq!((tail.text.as_str(), tail.start, tail.end), ("\ndéf", 3, 8));
         assert!(!tail.dropped);
+        assert_eq!(tail.epoch, history.at(0).epoch);
         let all = history.tail(100);
         assert_eq!((all.text.as_str(), all.start), ("abc\ndéf", 0));
     }

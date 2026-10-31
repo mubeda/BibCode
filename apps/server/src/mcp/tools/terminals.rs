@@ -17,6 +17,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -29,10 +30,11 @@ use crate::{
             CLIENT_REQUEST_ID, Family, McpAccess, McpCapability, ProgressSink, ToolCall,
             ToolFuture, ToolResult, ToolSpec, invalid_argument, object_schema,
         },
+        outcome::{OUTCOME_UNKNOWN_TAG, outcome_unknown},
         protocol::{Cut, chars, tool_result, typed_tool_failure},
     },
     persistence::ProjectionThread,
-    terminal::{TerminalError, TerminalManager, TerminalStatus},
+    terminal::{HistoryCursor, HistoryWindow, TerminalError, TerminalManager, TerminalStatus},
 };
 
 /// The most characters one `terminal_write` sends.
@@ -41,6 +43,12 @@ pub(crate) const MOST_WRITE_CHARS: usize = 16_384;
 pub(crate) const MOST_PAGE_CHARS: usize = 16_000;
 /// The characters a read without a cursor returns unless `tailChars` says otherwise.
 const DEFAULT_TAIL_CHARS: usize = 4_000;
+/// How long a write may wait for the terminal to take its input; a program that reads no
+/// input holds it. Short under test.
+#[cfg(not(test))]
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// A page whose escaped text does not fit a result is halved down to this.
 const LEAST_PAGE_CHARS: usize = 500;
 /// `TERMINAL_COLS_MAX` and `TERMINAL_ROWS_MAX` in `packages/contracts/src/terminal.ts`, and
@@ -118,13 +126,17 @@ impl TerminalServices {
         &self,
         thread_id: &str,
         terminal_id: &str,
-    ) -> Result<(TerminalStatus, Option<i32>, u64), Value> {
+    ) -> Result<(TerminalStatus, Option<i32>, HistoryCursor), Value> {
         let read = self
             .manager
             .read_history(thread_id, terminal_id, None, 0)
             .await
             .map_err(|error| lookup_failure(&error, terminal_id))?;
-        Ok((read.status, read.exit_code, read.window.end))
+        let end = HistoryCursor {
+            epoch: read.window.epoch,
+            offset: read.window.end,
+        };
+        Ok((read.status, read.exit_code, end))
     }
 }
 
@@ -146,6 +158,28 @@ fn lookup_failure(error: &TerminalError, terminal_id: &str) -> Value {
         ),
         _ => unavailable(),
     }
+}
+
+fn exited(exit_code: Option<i32>) -> Value {
+    let mut failure = typed_tool_failure(
+        "McpTerminalExitedError",
+        "This terminal's process has ended; open another with terminal_open.",
+    );
+    failure["structuredContent"]["error"]["exitCode"] = json!(exit_code);
+    failure
+}
+
+/// A write the terminal did not take in time: it may still go in, so it is never success.
+fn not_taken() -> Value {
+    let mut failure = typed_tool_failure(
+        OUTCOME_UNKNOWN_TAG,
+        &format!(
+            "The terminal did not take this input within {} s: the program in it may not be reading its input. It may still go in once the program reads; check with terminal_read before you write again.",
+            WRITE_TIMEOUT.as_secs()
+        ),
+    );
+    failure["structuredContent"]["error"]["reason"] = "no-answer".into();
+    outcome_unknown(failure)
 }
 
 fn unavailable() -> Value {
@@ -238,6 +272,30 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
         ),
         _ => return None,
     })
+}
+
+/// Where a read goes on after a page that is one unfinished escape sequence: just past the
+/// sequence when the retained output (at most 1 MiB, from memory) holds its end, else at its
+/// start, so its continuation never shows as text.
+async fn escape_skip(
+    services: &TerminalServices,
+    owner: &str,
+    terminal_id: &str,
+    window: &HistoryWindow,
+) -> u64 {
+    let from = HistoryCursor {
+        epoch: window.epoch,
+        offset: window.start,
+    };
+    match services
+        .manager
+        .read_history(owner, terminal_id, Some(from), usize::MAX)
+        .await
+    {
+        Ok(read) if !read.window.dropped => escape_end(read.window.text.as_bytes(), 0)
+            .map_or(window.start, |length| window.start + length as u64),
+        _ => window.start,
+    }
 }
 
 /// A run of output with CSI, OSC and other escape sequences removed, and the bytes of an
@@ -429,19 +487,33 @@ impl ToolCall<'_> {
             let _writing = lock.lock().await;
             let (status, exit_code, cursor) = services.status(&owner, &terminal_id).await?;
             if matches!(status, TerminalStatus::Exited | TerminalStatus::Error) {
-                let mut failure = typed_tool_failure(
-                    "McpTerminalExitedError",
-                    "This terminal's process has ended; open another with terminal_open.",
-                );
-                failure["structuredContent"]["error"]["exitCode"] = json!(exit_code);
-                return Err(failure);
+                return Err(exited(exit_code));
             }
-            owned
-                .invoke(
+            let written = tokio::time::timeout(
+                WRITE_TIMEOUT,
+                owned.invoke(
                     "terminal.write",
                     json!({ "threadId": owner, "terminalId": terminal_id, "data": data }),
-                )
-                .await?;
+                ),
+            )
+            .await;
+            match written {
+                // The PTY write goes on in the terminal manager, which may still deliver it.
+                Err(_) => return Err(not_taken()),
+                // The process ended between the check above and the write.
+                Ok(Err(failure))
+                    if failure["structuredContent"]["error"]["_tag"]
+                        == "TerminalNotRunningError" =>
+                {
+                    let exit_code = services
+                        .status(&owner, &terminal_id)
+                        .await
+                        .ok()
+                        .and_then(|(_, exit_code, _)| exit_code);
+                    return Err(exited(exit_code));
+                }
+                Ok(result) => result?,
+            };
             Ok(tool_result(
                 json!({
                     "threadId": thread_id,
@@ -462,7 +534,7 @@ impl ToolCall<'_> {
         let cursor = self
             .string("cursor")?
             .map(|cursor| {
-                cursor.parse::<u64>().map_err(|_| {
+                HistoryCursor::parse(cursor).ok_or_else(|| {
                     invalid_argument("cursor is a nextCursor or cursor an earlier call returned")
                 })
             })
@@ -495,12 +567,18 @@ impl ToolCall<'_> {
                 (window.text, window.end)
             } else {
                 let (clean, open) = strip_escapes(&window.text);
-                // An escape cut at the page's end is read whole by the next page, unless it
-                // fills the page, which would never move the cursor.
-                if open < window.text.len() {
+                if open == 0 {
+                    (clean, window.end)
+                } else if open < window.text.len() {
+                    // An escape cut at the page's end is read whole by the next page.
                     (clean, window.end - open as u64)
                 } else {
-                    (clean, window.end)
+                    // The page is one unfinished escape: skip it whole once it has ended, and
+                    // stay before it while it is still arriving.
+                    (
+                        String::new(),
+                        escape_skip(&services, &owner, terminal_id, &window).await,
+                    )
                 }
             };
             let result = tool_result(
@@ -508,7 +586,7 @@ impl ToolCall<'_> {
                     "threadId": thread_id,
                     "terminalId": terminal_id,
                     "text": text,
-                    "nextCursor": end.to_string(),
+                    "nextCursor": HistoryCursor { epoch: window.epoch, offset: end }.to_string(),
                     "dropped": window.dropped,
                     "more": end < read.total,
                     "status": read.status.as_str(),

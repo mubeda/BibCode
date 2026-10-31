@@ -21,7 +21,7 @@ use super::{
     TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput,
     TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
     TerminalStatus, TerminalSummary,
-    history::{HistoryWindow, TerminalHistory},
+    history::{HistoryCursor, HistoryWindow, TerminalHistory},
 };
 use super::{TerminalAgentStatus, TerminalAgentStatusState};
 use crate::{
@@ -395,7 +395,19 @@ impl TerminalSessionIdentity {
             });
         }
         drop(session);
-        self.process.write(data).map_err(TerminalError::Io)
+        // The write stays inside this poll: `PreparedTerminalInput::write` runs this again
+        // when its admission is replaced, so a write handed to another thread and abandoned
+        // here would send the frame twice. `block_in_place` instead hands this worker's other
+        // tasks to another thread while a child that reads no input holds the write.
+        let write = || self.process.write(data).map_err(TerminalError::Io);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(write)
+            }
+            _ => write(),
+        }
     }
 }
 
@@ -1178,6 +1190,8 @@ struct SessionGeneration {
     cancellation: CancellationToken,
     publication: Mutex<()>,
     startup: Arc<Mutex<()>>,
+    /// Orders unary `write`s, which run on blocking threads; held until the bytes are in.
+    unary_writes: Arc<Mutex<()>>,
     output_started: std::sync::atomic::AtomicBool,
     output_stop: CancellationToken,
     output_completed: CancellationToken,
@@ -1201,6 +1215,7 @@ impl SessionGeneration {
             cancellation: CancellationToken::new(),
             publication: Mutex::new(()),
             startup: Arc::new(Mutex::new(())),
+            unary_writes: Arc::new(Mutex::new(())),
             output_started: std::sync::atomic::AtomicBool::new(false),
             output_stop: CancellationToken::new(),
             output_completed: CancellationToken::new(),
@@ -3349,27 +3364,49 @@ impl TerminalManager {
         terminal_id: &str,
         data: &str,
     ) -> Result<(), TerminalError> {
+        let not_running = || TerminalError::NotRunning {
+            thread_id: thread_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+        };
         let session = self.require_session(thread_id, terminal_id).await?;
         let generation = session.lock().await.generation.clone();
-        let _publication = generation.publication.lock().await;
-        if generation.is_invalidated() {
-            return Err(TerminalError::NotFound {
-                thread_id: thread_id.to_owned(),
-                terminal_id: terminal_id.to_owned(),
-            });
-        }
-        let (process, status) = {
-            let session = session.lock().await;
-            (session.process.clone(), session.status)
+        let (process, writes) = {
+            let _publication = generation.publication.lock().await;
+            let (process, status) = {
+                let session = session.lock().await;
+                (session.process.clone(), session.status)
+            };
+            // An exit invalidates the generation and then marks the session exited, both under
+            // this lock, so a session that is still listed but whose process ended is refused
+            // here, never reported as written.
+            if matches!(status, TerminalStatus::Exited | TerminalStatus::Error) {
+                return Err(not_running());
+            }
+            if generation.is_invalidated() {
+                return Err(TerminalError::NotFound {
+                    thread_id: thread_id.to_owned(),
+                    terminal_id: terminal_id.to_owned(),
+                });
+            }
+            (
+                process.ok_or_else(not_running)?,
+                generation.unary_writes.clone(),
+            )
         };
-        if status == TerminalStatus::Exited {
-            return Ok(());
-        }
-        let process = process.ok_or_else(|| TerminalError::NotRunning {
-            thread_id: thread_id.to_string(),
-            terminal_id: terminal_id.to_string(),
-        })?;
-        process.write(data).map_err(TerminalError::Io)
+        // A PTY write blocks while the child reads no input. It runs on a blocking thread,
+        // outside the publication lock, so neither a runtime worker nor the terminal's output
+        // waits for it. The generation's write lock, taken in order and held by the blocking
+        // thread until the bytes are in, keeps unary writes ordered; dropping this future
+        // leaves the write to finish, and the next one waits behind it.
+        let writing = writes.lock_owned().await;
+        let data = data.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _writing = writing;
+            process.write(&data)
+        })
+        .await
+        .map_err(|error| TerminalError::Io(error.to_string()))?
+        .map_err(TerminalError::Io)
     }
 
     pub async fn resize(
@@ -3833,7 +3870,7 @@ impl TerminalManager {
         &self,
         thread_id: &str,
         terminal_id: &str,
-        from: Option<u64>,
+        from: Option<HistoryCursor>,
         max_chars: usize,
     ) -> Result<TerminalHistoryRead, TerminalError> {
         let session = self.require_session(thread_id, terminal_id).await?;
@@ -4845,9 +4882,69 @@ mod tests {
         kill_error: std::sync::Mutex<Option<String>>,
         write_error: std::sync::Mutex<Option<String>>,
         writes: std::sync::Mutex<Vec<String>>,
+        /// When set, a write blocks until the gate opens, as a PTY write does while the child
+        /// reads no input.
+        write_gate: std::sync::Mutex<Option<Arc<WriteGate>>>,
         resize_error: std::sync::Mutex<Option<String>>,
         resizes: std::sync::Mutex<Vec<(u16, u16)>>,
         output_on_resize: std::sync::Mutex<Option<String>>,
+    }
+
+    /// Holds PTY writes until opened. Opening it on drop keeps a failed test from hanging in
+    /// the runtime's wait for its blocking threads.
+    #[derive(Debug, Default)]
+    struct WriteGate {
+        open: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+        entered: std::sync::atomic::AtomicBool,
+    }
+
+    impl WriteGate {
+        fn pass(&self) {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            let open = self.open.lock().expect("gate");
+            drop(
+                self.changed
+                    .wait_while(open, |open| !*open)
+                    .expect("gate wait"),
+            );
+        }
+
+        fn open(&self) {
+            *self.open.lock().expect("gate") = true;
+            self.changed.notify_all();
+        }
+
+        /// Waits on this thread, never a runtime worker, until a write is held.
+        fn wait_entered(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !self.entered.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no write reached the PTY"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    struct OpenOnDrop(Arc<WriteGate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// Whether the runtime still runs a newly spawned task within two seconds, observed from
+    /// the test thread.
+    fn runtime_responds() -> bool {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(());
+        });
+        receiver.recv_timeout(Duration::from_secs(2)).is_ok()
     }
 
     impl HistoryTestPty {
@@ -4869,6 +4966,7 @@ mod tests {
                 kill_error: std::sync::Mutex::new(None),
                 write_error: std::sync::Mutex::new(None),
                 writes: std::sync::Mutex::new(Vec::new()),
+                write_gate: std::sync::Mutex::new(None),
                 resize_error: std::sync::Mutex::new(None),
                 resizes: std::sync::Mutex::new(Vec::new()),
                 output_on_resize: std::sync::Mutex::new(None),
@@ -4957,6 +5055,10 @@ mod tests {
         }
 
         fn write(&self, data: &str) -> Result<(), String> {
+            let gate = self.write_gate.lock().expect("write gate").clone();
+            if let Some(gate) = gate {
+                gate.pass();
+            }
             self.writes
                 .lock()
                 .expect("writes lock")
@@ -8385,7 +8487,15 @@ mod tests {
         assert_eq!((tail.window.text.as_str(), tail.window.end), ("d-b\n", 14));
         assert_eq!(tail.status, TerminalStatus::Running);
         let from = manager
-            .read_history("thread-b", "term-1", Some(5), 100)
+            .read_history(
+                "thread-b",
+                "term-1",
+                Some(super::super::HistoryCursor {
+                    epoch: tail.window.epoch,
+                    offset: 5,
+                }),
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(from.window.text, "thread-b\n");
@@ -8393,6 +8503,126 @@ mod tests {
             manager.read_history("thread-a", "term-9", None, 10).await,
             Err(TerminalError::NotFound { .. })
         ));
+        manager.shutdown().await;
+    }
+
+    async fn gated_terminal() -> (
+        tempfile::TempDir,
+        Arc<HistoryTestBackend>,
+        TerminalManager,
+        Arc<WriteGate>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        (root, backend, manager, gate)
+    }
+
+    /// A PTY write blocks while the child reads no input. The unary write runs it on a
+    /// blocking thread, outside the publication lock, so neither the runtime nor the
+    /// terminal's output waits for it (#139 slice T review).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_unary_write_holds_neither_a_runtime_worker_nor_the_publication_lock() {
+        let (_root, backend, manager, gate) = gated_terminal().await;
+        let _open = OpenOnDrop(gate.clone());
+        let writing = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write("thread", "term", "stuck").await }
+        });
+        gate.wait_entered();
+        assert!(
+            runtime_responds(),
+            "the blocked write holds the only worker"
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                let _ = sender.send(manager.clear("thread", "term").await.is_ok());
+            }
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "the blocked write holds the publication lock"
+        );
+        gate.open();
+        writing.await.unwrap().unwrap();
+        assert_eq!(backend.latest().writes(), ["stuck"]);
+        manager.shutdown().await;
+    }
+
+    /// The ordered input path keeps its write inside the poll, so a frame is never written
+    /// twice, but hands the worker's other tasks to another thread while it blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_ordered_write_does_not_hold_a_runtime_worker() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        let writing = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                ordered_write(
+                    &manager, connection, "thread", "term", &input_id, 0, "typed",
+                )
+                .await
+            }
+        });
+        gate.wait_entered();
+        assert!(
+            runtime_responds(),
+            "the blocked write holds the only worker"
+        );
+        gate.open();
+        writing.await.unwrap().unwrap();
+        assert_eq!(backend.latest().writes(), ["typed"]);
+        manager.shutdown().await;
+    }
+
+    /// A unary write after the process ended is refused, never reported as written.
+    #[tokio::test]
+    async fn a_unary_write_after_the_process_exits_is_not_running() {
+        let (_root, backend, manager, gate) = gated_terminal().await;
+        gate.open();
+        backend.latest().exit(0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager
+                .read_history("thread", "term", None, 0)
+                .await
+                .unwrap()
+                .status
+                != TerminalStatus::Exited
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the process exits");
+        assert!(matches!(
+            manager.write("thread", "term", "late").await,
+            Err(TerminalError::NotRunning { .. })
+        ));
+        assert!(backend.latest().writes().is_empty());
         manager.shutdown().await;
     }
 
