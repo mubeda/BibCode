@@ -995,6 +995,11 @@ impl ToolCall<'_> {
         // Subscribe before dispatching, so the outcome cannot pass unseen.
         let mut events = self.control.engine().subscribe_events();
         let mut requested_at = 0;
+        let request = commands
+            .first()
+            .and_then(|command| command["commandId"].as_str())
+            .unwrap_or_default()
+            .to_owned();
         for command in commands {
             requested_at = self.dispatch(command).await?["sequence"]
                 .as_i64()
@@ -1003,10 +1008,14 @@ impl ToolCall<'_> {
         let deadline = tokio::time::Instant::now() + REVERT_WAIT;
         let shutdown = self.control.shutdown_token();
         loop {
-            if let Some((event_type, kind, detail)) =
-                revert_outcome(self.control.repositories(), &thread_id, requested_at)
-                    .await
-                    .map_err(storage_failure)?
+            if let Some((event_type, kind, detail)) = revert_outcome(
+                self.control.repositories(),
+                &thread_id,
+                &request,
+                requested_at,
+            )
+            .await
+            .map_err(storage_failure)?
             {
                 if kind.as_deref() == Some("checkpoint.revert.failed") {
                     return Err(typed_tool_failure(
@@ -1361,14 +1370,17 @@ async fn latest_checkpoint(
         .await
 }
 
-/// The first revert outcome the effects worker recorded on `thread_id` after event `after`:
-/// its event type, its activity kind, and the failure's detail.
+/// The first outcome the effects worker recorded on `thread_id` after event `after` for revert
+/// request `request` (the worker's outcome command ids contain `:{request}:`): its event type,
+/// its activity kind, and the failure's detail.
 async fn revert_outcome(
     repositories: &Repositories,
     thread_id: &str,
+    request: &str,
     after: i64,
 ) -> crate::persistence::Result<Option<(String, Option<String>, Option<String>)>> {
     let thread_id = thread_id.to_owned();
+    let request = format!(":{request}:");
     repositories
         .database()
         .call(move |connection| {
@@ -1377,11 +1389,12 @@ async fn revert_outcome(
                     "SELECT event_type, json_extract(payload_json, '$.activity.kind'), json_extract(payload_json, '$.activity.payload.detail')
                        FROM orchestration_events
                       WHERE aggregate_kind = 'thread' AND stream_id = ? AND sequence > ?
+                        AND instr(command_id, ?) > 0
                         AND (event_type = 'thread.reverted'
                           OR (event_type = 'thread.activity-appended'
                               AND json_extract(payload_json, '$.activity.kind') IN ('checkpoint.revert.failed', 'checkpoint.revert.files-only')))
                       ORDER BY sequence LIMIT 1",
-                    params![thread_id, after],
+                    params![thread_id, after, request],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
