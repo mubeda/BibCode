@@ -2518,12 +2518,14 @@ async fn contained_path(root: &Path, cwd: &Path, path: &str) -> Option<PathBuf> 
 /// A canonical Windows path without its `\\?\` prefix, which the Recycle Bin refuses.
 #[cfg(windows)]
 fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{share}"));
-    }
-    text.strip_prefix(r"\\?\")
-        .map_or_else(|| path.clone(), PathBuf::from)
+    let stripped = {
+        let text = path.to_string_lossy();
+        match text.strip_prefix(r"\\?\UNC\") {
+            Some(share) => Some(format!(r"\\{share}")),
+            None => text.strip_prefix(r"\\?\").map(str::to_owned),
+        }
+    };
+    stripped.map_or(path, PathBuf::from)
 }
 
 #[cfg(not(windows))]
