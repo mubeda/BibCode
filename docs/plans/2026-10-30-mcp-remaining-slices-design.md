@@ -4086,6 +4086,10 @@ reads, so the server derives it rather than trusting a client:
 - Test: `a_source_thread_named_outside_a_panel_message_never_persists` (a person's forged
   value, an agent naming another worktree's thread, and an agent naming the target itself
   are each refused with no user message stored). It failed with X1's rule.
+- A panel message queued behind a running turn is delivered by the server's turn delivery,
+  which advances the outbox and never re-plans the `thread.turn.start`, so the actor check
+  does not refuse it later (`a_panel_message_queued_behind_a_running_turn_is_delivered_once_it_settles`:
+  the message leaves the queue, no receipt is rejected, and its source is kept).
 
 **Drift and verified facts:**
 

@@ -385,3 +385,75 @@ async fn focus_ui_raises_an_intent_for_subscribers_and_moves_nothing() {
     }
     harness.shutdown().await;
 }
+
+/// The outbox state of `message_id`, and how many command receipts were rejected.
+async fn delivery_of(harness: &Harness, message_id: &str) -> (Option<String>, i64) {
+    let message_id = message_id.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            use rusqlite::OptionalExtension;
+            let state = connection
+                .query_row(
+                    "SELECT state FROM provider_turn_outbox WHERE message_id = ?",
+                    params![message_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let rejected = connection.query_row(
+                "SELECT COUNT(*) FROM orchestration_command_receipts WHERE status = 'rejected'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((state, rejected))
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_panel_message_queued_behind_a_running_turn_is_delivered_once_it_settles() {
+    let fixture = Fixture::new().await;
+    let harness = &fixture.harness;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let host = host(harness, &agent, "feature-queued").await;
+    let panel = panel(harness, &agent, &host).await;
+    harness
+        .provider_turn(&host, "turn-busy", "working", false)
+        .await;
+    let sent = harness
+        .call(
+            &agent,
+            "send_panel_message",
+            json!({ "fromThreadId": panel, "toThreadId": host, "text": "When you are done" }),
+        )
+        .await;
+    let message_id = structured(&sent)["messageId"].as_str().unwrap().to_owned();
+    let (queued, rejected_before) = delivery_of(harness, &message_id).await;
+    assert_eq!(queued.as_deref(), Some("queued"));
+
+    // The turn settles; the server delivers the queued message without re-checking its source.
+    harness
+        .provider_turn(&host, "turn-busy", " done", true)
+        .await;
+    let mut delivered = None;
+    for _ in 0..100 {
+        let (state, rejected) = delivery_of(harness, &message_id).await;
+        assert_eq!(rejected, rejected_before, "no command was rejected");
+        if state.as_deref() != Some("queued") {
+            delivered = state;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        delivered.is_some(),
+        "the queued panel message left the queue"
+    );
+    assert_eq!(
+        user_messages(harness, &host).await,
+        [("When you are done".to_owned(), Some(panel.clone()))]
+    );
+    fixture.shutdown().await;
+}

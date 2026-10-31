@@ -1,6 +1,4 @@
 import type { OrchestrationThreadRequester, ThreadId } from "@bibcode/contracts";
-import { useMemo } from "react";
-
 import { findThreadRef, useThreadShell } from "~/state/entities";
 import { agentChipText } from "./chat/AgentActorChip";
 
@@ -10,7 +8,9 @@ import { agentChipText } from "./chat/AgentActorChip";
  * environments, so the panel's thread is found by id; the tab bar has no environment of its own.
  */
 export function usePanelRequester(threadId: ThreadId | null): OrchestrationThreadRequester | null {
-  const ref = useMemo(() => (threadId === null ? null : findThreadRef(threadId)), [threadId]);
+  // Looked up on every render, not memoized: a tab restored before its thread's shell arrives
+  // finds it on a later render. The shell atom is keyed by the ref's string key.
+  const ref = threadId === null ? null : findThreadRef(threadId);
   return useThreadShell(ref)?.requester ?? null;
 }
 
