@@ -630,6 +630,19 @@ async fn a_symlink_out_of_the_threads_folder_is_refused_by_every_tool() {
         )
         .await;
     assert_eq!(error_tag(&refused), "McpInvalidArgumentError");
+    // A dangling symlink is never followed to create its target outside.
+    std::os::unix::fs::symlink(
+        fixture.outside.join("created.txt"),
+        fixture.folder.join("dangling.txt"),
+    )
+    .unwrap();
+    for arguments in [
+        json!({ "path": "dangling.txt", "content": "x", "createOnly": true }),
+        json!({ "path": "dangling.txt", "content": "x", "expectedVersion": "0".repeat(64) }),
+    ] {
+        let refused = fixture.call("files_write", arguments).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+    }
     assert_eq!(
         std::fs::read_to_string(fixture.outside.join("secret.txt")).unwrap(),
         "secret"
