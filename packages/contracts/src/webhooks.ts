@@ -158,7 +158,9 @@ export type WebhooksSendResult = typeof WebhooksSendResult.Type;
 export class WebhookError extends Schema.TaggedError<WebhookError>()("WebhookError", {
   /**
    * `invalid`, `not_found`, `limit` (20 endpoints), `webhooks_off`, `endpoint_disabled`,
-   * `queued` (a redelivery of a delivery still queued or being sent) or `storage`.
+   * `queued` (a redelivery of a delivery still queued or being sent), `endpoint_changed`
+   * (the endpoint was edited, turned off or on while a test event or redelivery waited to
+   * be sent; nothing was sent) or `storage`.
    */
   reason: Schema.Literals([
     "invalid",
@@ -167,6 +169,7 @@ export class WebhookError extends Schema.TaggedError<WebhookError>()("WebhookErr
     "webhooks_off",
     "endpoint_disabled",
     "queued",
+    "endpoint_changed",
     "storage",
   ]),
   message: Schema.String,
