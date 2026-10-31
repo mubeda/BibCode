@@ -2326,7 +2326,10 @@ mod tests {
             starting
         ));
         // A thread with turns before checkpoints, the new turn not started or already running.
-        assert!(had_turns_before_checkpoints(&[old.clone()], starting));
+        assert!(had_turns_before_checkpoints(
+            std::slice::from_ref(&old),
+            starting
+        ));
         assert!(had_turns_before_checkpoints(
             &[old.clone(), turn("new", "m-new", "running", None)],
             starting
