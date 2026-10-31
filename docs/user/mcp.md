@@ -461,6 +461,14 @@ read and download tools work at read-only.
   operating system lets BiBCode prevent: another program moving a folder BiBCode already
   opened out of the thread's folder in the instant between that check and the change. BiBCode
   notices afterwards where it can and stops.
+- **Git's own metadata is off limits.** No Files tool reads, writes, creates, renames,
+  deletes, downloads or uploads anything in `.git` (in any letter case, anywhere in the path,
+  so a nested repository's too), through a symlink that leads there, or in the repository's
+  Git directory wherever a `.git` file puts it; such a path is refused as an invalid argument.
+  Changing Git's configuration or hooks would let an agent run commands through Git. Use the
+  Git tools for repository state. Listing, searching and folder downloads leave `.git` out.
+  The Files panel never shows `.git` and refuses it the same way. `.gitignore`, `.github/` and
+  other files whose names only start with `.git` work as usual.
 - **No lost edits.** `files_write` needs the `version` `files_read` returned (as
   `expectedVersion`), or `createOnly`
   for a new file. A file changed since is refused (`file_changed_on_disk`); read it again.
