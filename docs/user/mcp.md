@@ -337,6 +337,38 @@ at read-only.
 - A panel an agent opened carries an **Agent** badge on its tab; its tooltip names the agent
   and the reason it gave (`purpose`).
 
+### Clone
+
+An agent can clone a repository into the folder that holds one of your projects, beside
+it, and add the clone as a project. These tools are in the **Workspace** set.
+
+| Tool               | What it does                                                                                                     |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `clone_repository` | Clones an `https://` URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)    |
+| `clone_status`     | How a clone this connection started is going: `running`, the finished folder and project, or why it failed       |
+| `cancel_clone`     | Stops a clone this connection started and removes its folder; a clone you started that the agent joined goes on |
+
+- **HTTPS from public hosts only.** The URL must start with `https://`, with no user name or
+  token in it. SSH, `host:path`, `git://`, `file://` and other transports are refused, and so
+  is any host that resolves to a local or private network address, also after Git's own
+  `url.<base>.insteadOf` rewrites. Clone those in BiBCode yourself: your own clones are
+  unchanged. The address BiBCode checked is the one Git connects to, and a repository that
+  redirects elsewhere fails with a message naming the redirect; clone the address it moved
+  to. Behind an HTTP proxy, the proxy resolves the host itself.
+- **No Git LFS downloads.** LFS files stay pointer files, because a repository's
+  `.lfsconfig` could point the download at any host. Run `git lfs pull` in the clone
+  yourself if you want them.
+- **Long clones.** `clone_repository` waits up to 50 seconds, then returns `state: running`
+  with its `cloneId`, and the clone goes on; `clone_status` reads it later. Without a
+  `clientRequestId`, BiBCode makes one, and that is the `cloneId`.
+- **Stopping.** Turning the MCP server off, **Read only**, revoking the agent, **Stop**,
+  **Take over** and `cancel_clone` stop the agent's clone and remove the folder it made. A
+  clone stopped while Git ran is `unknown`, since Git may have finished at that moment.
+- **Again.** A finished clone of the same URL already in the folder is reused, not cloned
+  again, and a folder that is already a project gives that project, never a second one. A
+  folder holding anything else is refused and left as it is.
+- Git 2.37 or later is needed on the server.
+
 ### Who acted, Stop and Take over
 
 BiBCode marks what an outside agent does, whoever is looking:

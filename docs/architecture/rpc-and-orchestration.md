@@ -2144,7 +2144,8 @@ every live clone, and drains beside the worktree-removal tasks, so Git stops
 and each partial folder is removed before providers and terminals shut down.
 Clients send `attach` and `detach` only when the server advertises
 `vcsCloneReattach`: `CloneInput` accepts unknown fields, so an older server
-would run an `attach` as a new clone.
+would run an `attach` as a new clone. An outside agent's clone also meets the
+agent clone policy first (see [Clone tools](#clone-tools)).
 
 With that claim held, an already-accepted retry is replayed first. Every new
 removal must then acquire one finite runtime-cleanup lifetime slot before receipt
@@ -3575,6 +3576,60 @@ instead of failing the call.
   `McpCredentialRefusedError`, one it cannot deliver with `McpServerUnreachableError`, and
   one it cannot sign in for with `McpSignInError`, each a typed tool result; other requests
   keep their JSON-RPC errors.
+
+### Clone tools
+
+`mcp::tools::clone` is in the `workspace` set.
+
+| Tool               | Maps to                                                                                 | Scope   |
+| ------------------ | --------------------------------------------------------------------------------------- | ------- |
+| `clone_repository` | one owned mutation: `vcs.clone` (no `detach`), then `project.create` with frozen ids    | operate |
+| `clone_status`     | the clone's `mcp_tool_requests` row, read by replaying its key through `recorded`       | read    |
+| `cancel_clone`     | fires the clone task's stop token, then waits up to 15 s for the row to settle          | operate |
+
+- **Always owned.** `clone_repository` runs through `ToolCall::recorded` with the agent's
+  `clientRequestId` or a minted `clone-<uuid>`; that key is the `cloneId`, returned at the
+  top of every result so the activity row records it. The stored payload holds the
+  arguments, the URL, the destination and the frozen `projectId` and `commandId`. The call
+  waits 50 s, then answers `{ state: "running", cloneId }` and the task goes on, holding its
+  owned slot. `clone_status` replays the stored arguments with an already-cancelled wait:
+  a held claim answers `running`, a settled row its outcome, and a `running` row no process
+  owns `McpOutcomeUnknownError` (`restarted`).
+- **Stopping.** The task races its `vcs.clone` call against a stop token, the child of the
+  live controls' token, that `cancel_clone` also fires (a process-wide map by session and
+  `cloneId`). Dropping the call is what stops Git: without `detach`, the clone runtime's drop
+  guard cancels a clone this task started and removes its folder, and a clone it joined
+  goes on. Either way the work answers `McpOutcomeUnknownError`, recorded `unknown`; a live
+  control replaces it with its own reason, `cancel_clone`'s keeps `cancelled`.
+- **Registration.** After Git finishes, `project.create` runs with a fresh cancellation
+  token, under the agent's credential, so its events carry the agent's actor. The engine
+  answers a workspace root that is already registered with that project's id
+  (`process_envelope`'s existing-root check), so a retry never creates a second project.
+
+`vcs.clone` and `sourceControl.cloneRepository` read the principal from their context.
+For an `mcp-client` principal, before the runtime admits or joins anything, the parent
+folder must be the folder that holds a registered project (`clone_destination_refused`),
+and `git::clone_policy` checks the URL and returns the `ClonePlan` that
+`ReservedClone::transfer` runs Git with:
+
+- the URL is `https://`, written as the URL parser would write it, without user
+  information, and the folder name does not start with `-` (`clone_url_refused`);
+- Git is 2.37 or later, for `http.curloptResolve` (`clone_git_too_old`);
+- `git ls-remote --get-url -- <url>` gives the URL after `insteadOf`, which must pass the
+  same checks;
+- every address of the original and the rewritten host is public: not loopback, private,
+  link-local, CGNAT, unique-local, multicast, unspecified, broadcast or reserved, mapped
+  forms included (`clone_host_refused`, or `clone_host_unresolved`);
+- Git runs with `protocol.allow=never`, `protocol.https.allow=always`,
+  `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false`, one
+  `http.curloptResolve=<host>:<port>:<addresses>` per named host, an empty and optional
+  `filter.lfs` smudge and process, and `GIT_LFS_SKIP_SMUDGE=1`.
+
+A refusal is a `GitCommandError` with a `reason` (`vcs.clone`), or a
+`SourceControlRepositoryError` with one (`sourceControl.cloneRepository`). A person's clone
+gets no plan and is unchanged. A request that joins a running clone shares the starter's
+Git, so an agent that joins a person's clone of the same URL, after its own check passed,
+waits on that unpinned clone.
 
 ### Actor attribution and agent activity
 
