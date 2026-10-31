@@ -3601,3 +3601,103 @@ events and crash projected, typed refusals), and the rejected action. The cursor
 on the stdio server (`a_cursor_catches_up_more_than_100_findings_oldest_first`: 250 findings,
 ties on `lastSeen` broken by id) and over `/mcp` for its refusal. The git action and cursor
 tests were each seen failing before their fix.
+
+## X1 implementation notes (2026-10-31)
+
+X1 was implemented on `claude/v0131-139-x1`, from `1d4eda69bd` (slice 1, the CLI, F0, wave 1
+with its review fixes, and slice D). Migration 60 is `McpActorAttribution`. Nothing below
+changes a settled decision; it records drift and the APIs X3 to X6 build on.
+
+**APIs later slices plug into:**
+
+- **Actor.** `mcp::activity::principal_actor(&RpcSessionContext) -> Option<Value>` is
+  `{ kind: "mcp-client", clientId: <session id>, label }` for an `mcp-client` principal.
+  `CommandAdmissionClaim::attribute_to(actor)` (engine) attributes every event a command plans;
+  a handler that acquires its own claim (X4's panel tools go through `worktree.createPanel`,
+  which already does it) calls it right after acquiring. The engine reads the actor only from
+  the claim, never from the command.
+- **Projections.** `ProjectionThreadMessage.actor` / `.source_thread_id` and
+  `ProjectionThread.requester` (`{ actor, purpose }`), from `actor_json`, `source_thread_id`
+  and `requester_json`. `thread.turn.start`'s `message.sourceThreadId` is accepted from any
+  client, checked to be a live thread of the same project, carried on the
+  `thread.message-sent` payload and projected; X4 decides who may set it and renders it.
+- **Purpose.** `thread.create.purpose`, `bootstrap.createThread.purpose`,
+  `worktree.createManaged.purpose` and `worktree.createPanel.purpose` (at most 200
+  characters, an engine invariant). Tools read it with `ToolCall::purpose()` and describe it
+  with `activity::PURPOSE`.
+- **Activity.** `McpControl::activity()` is the `McpActivity`: `record(NewActivity)`,
+  `recent()`, `active()`, `call_started`, `owned_changed`. Rows are written by the one hook
+  in `call_in`; a family adds no code. The target is extracted from the arguments and the
+  result's `structuredContent` by `activity::target`, which keeps only `sha`, `revertedSha`,
+  `pullRequest` (from `number`), `worktreeKey`, `fileCount` (from `paths`), `cloneId` and
+  `transferId`; X5 and X6 return `transferId`/`cloneId` in their results to have them
+  recorded. X3's `changes_since` reads `mcp_activity` by `activity_id`, which is monotonic.
+- **Stop and Take over.** `AuthService::stop_client`, `subscribe_mcp_stops`, `client_label`
+  and `set_mcp_access` (`McpAccessChange`); `activity::interrupt_turns_of(control, session)`.
+
+**Drift found:**
+
+- **`start_thread` does not send `thread.create`.** It sends `thread.turn.start` with
+  `bootstrap.createThread`, so `purpose` is on both, and the engine checks the length on both.
+- **Actor through the claim, not a command field.** The command's admission claim is the one
+  server-held object every dispatch path (unary, turn start, worktree handlers) hands to the
+  engine worker, so the actor rides on it (`OnceLock`) and `process_envelope` stamps the
+  planned events after `plan_command`, including the turn-delivery event a turn start adds.
+- **Stop needs a flag on the revoke route.** The `bibcode thread` CLI revokes its own
+  credential on the way out, so interrupting on every revocation would cancel the turn
+  `bibcode thread start` just started. `RevokeClientRequest` gains `interruptTurns`; only a
+  revocation made with it is announced (a broadcast of its own, not the access events, whose
+  subscription would keep the authority watcher alive). Revoke in the Agents list sends the
+  plain body and leaves turns running. The interrupt goes through `orchestration.dispatchCommand`
+  with an unauthenticated server context, so the provider is told, as for the UI's stop button.
+- **Take over stores the level it replaced.** `auth_sessions.mcp_access_hand_back` (in
+  migration 60, beyond the design's table list) is read back by the authority snapshot, so
+  Hand back survives restarts and other processes. The route accepts `read-only`, or exactly
+  the stored level; anything else, an unknown or revoked session and a person's session are
+  one 400 `invalid_mcp_access` (the HTTP contract has no 404/409 shapes for auth routes). The
+  route cancels the session's live tokens without removing them, so connection counts stay
+  right; owned work it interrupts records `revoked`, since `LiveControls` sees the
+  revocation token, not the new level.
+- **The HTTP route needed contract and fixture work outside X1's rows:** `http.rs`
+  `ROUTE_INVENTORY` (R's file), `environmentHttp.ts` `setMcpAccess`, `auth.ts`
+  (`AuthSetMcpAccessInput`, `interruptTurns`, `mcpAccess`/`mcpAccessHandBack` on
+  `AuthClientSession`), the auth fixture exporter and `authRustParity.test.ts`, and the web
+  test HTTP harness. The RPC fixture counts (methods 178, streams 28, stream shapes 88,
+  fixtures 495) moved in the exporter, its test and `tests/rpc_wire.rs`.
+- **Retry detection is a read, not a sink.** A keyed call is a retry when its
+  `clientRequestId` already has a live `mcp_tool_requests` row before the call runs; this
+  keeps `outcome.rs` and every family untouched. Two concurrent first calls with one key can
+  each record a row (only one runs the work). A keyed call cancelled while its owned
+  mutation goes on (`McpCancelledError`) polls the row every 2 s, up to 35 minutes, and
+  records the stored outcome.
+- **Rows are written for refusals the handler returns** (an unknown thread, a bad
+  argument), not for calls refused at the gate (off, scope, capability, read-only, busy).
+- **No app header exists.** The indicator sits in the status bar beside the profiler marker,
+  which every screen shows. It names the most recent active agent (with `+N`) and offers its
+  Stop and Take over or Hand back; the Agents list covers every agent.
+- **Primary environment only.** Watching and managing agents uses the primary environment's
+  HTTP client and `access:read`/`access:write`, as **Authorized clients** does, so the
+  status bar, the Agents list and the commit chip show the primary environment's agents.
+  Message and thread chips come from the thread data and show in every environment.
+- **Panel tabs show no chip.** Center panel tabs render surfaces, not threads; the panel's
+  thread carries `requester` and its messages their actor. X4, which owns the panel
+  provenance UI, can add it to the tab.
+- **`production/runtime.rs`** (X5's file in W3) gained the activity service and its stream
+  registration before the registry is finished; `McpControl::new_with_activity` takes it,
+  and `McpControl::new` builds its own for tests.
+- **Shared test files.** `mcp_tools_tests/worktrees.rs`'s `Fixture` became `pub(super)` so
+  the attribution tests reuse it; three `AppStatusBar` tests mock the new indicator, and
+  `CreateWorktreeDialog.settings.dom.test.tsx` and `SourceControlCommits.behavior.test.tsx`
+  mock `~/state/mcpActivity`.
+
+**Tests:** `production::mcp_tools_tests::attribution` (actor on every event of an MCP start
+and none for a person's, an injected `actor`/`metadata` ignored, message actor and thread
+requester in the projection, `read_thread` and the shell snapshot; purpose length;
+one activity row per mutating call, none per read or retry, a failure's tag; Stop revoking,
+interrupting the agent's running turn but not a person's, cancelling owned work, and a plain
+revocation interrupting nothing; Take over refusing mutations and stopping owned work,
+Hand back restoring only the stored level; `create_worktree` and a panel stamping their
+threads), `mcp::activity::tests` (the stream's snapshot, row and active events; pruning;
+targets keep ids only), migration 60, and web tests for the chip, the status-bar indicator,
+the Agents panel, the commit labels and the reducer's actor. The tests were written with the
+code, not each one failing first.
