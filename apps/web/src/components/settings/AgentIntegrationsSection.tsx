@@ -581,38 +581,41 @@ function McpClientLine({
   const name = MCP_CLIENT_LABELS[registration.client];
   const register = useAtomCommand(mcpClientsEnvironment.register, { reportFailure: false });
   const unregister = useAtomCommand(mcpClientsEnvironment.unregister, { reportFailure: false });
-  const [busy, setBusy] = useState<"add" | "remove" | null>(null);
+  const [busy, setBusy] = useState<"add" | "update" | "remove" | null>(null);
   const [error, setError] = useState<string | null>(null);
   // What the last change returned, until the next read of the tool replaces `registration`.
   const [changed, setChanged] = useState<{
     readonly basis: McpClientRegistration;
     readonly registered: boolean;
+    readonly upToDate: boolean | null;
   } | null>(null);
   const reasonId = useId();
-  const registered =
-    changed !== null && changed.basis === registration
-      ? changed.registered
-      : registration.registered;
+  const current = changed !== null && changed.basis === registration ? changed : registration;
+  const { registered, upToDate } = current;
   const notInstalled = registration.installed ? null : `${name} isn't installed on ${where}.`;
 
-  const change = async (action: "add" | "remove") => {
+  const change = async (action: "add" | "update" | "remove") => {
     setBusy(action);
     setError(null);
     const input = { environmentId, input: { client: registration.client } };
-    const result = await (action === "add" ? register(input) : unregister(input));
+    const result = await (action === "remove" ? unregister(input) : register(input));
     setBusy(null);
     const failure = commandFailure(
       result,
-      action === "add"
-        ? `Could not add BiBCode to ${name}. Check the connection and try again.`
-        : `Could not remove BiBCode from ${name}. Check the connection and try again.`,
+      action === "remove"
+        ? `Could not remove BiBCode from ${name}. Check the connection and try again.`
+        : `Could not add BiBCode to ${name}. Check the connection and try again.`,
     );
     if (failure !== null) {
       setError(failure);
       return;
     }
     if (result._tag === "Success") {
-      setChanged({ basis: registration, registered: action === "add" });
+      setChanged(
+        action === "remove"
+          ? { basis: registration, registered: false, upToDate: null }
+          : { basis: registration, registered: true, upToDate: true },
+      );
       onChanged();
     }
   };
@@ -627,8 +630,18 @@ function McpClientLine({
         <div className="text-[13px] font-medium text-foreground">{name}</div>
         {registered ? (
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <CheckIcon aria-hidden className="size-3.5 shrink-0" />
-            <span>Added to {name}</span>
+            {upToDate === true ? (
+              <CheckIcon aria-hidden className="size-3.5 shrink-0" />
+            ) : (
+              <InfoIcon aria-hidden className="size-3.5 shrink-0" />
+            )}
+            <span>
+              {upToDate === true
+                ? `Added to ${name}`
+                : upToDate === false
+                  ? `Added to ${name} (out of date)`
+                  : `Added to ${name}. BiBCode couldn't check which command it runs.`}
+            </span>
           </div>
         ) : null}
         {notInstalled === null ? null : (
@@ -644,16 +657,28 @@ function McpClientLine({
         )}
       </div>
       {registered ? (
-        <Button
-          size="sm"
-          variant="outline"
-          className="shrink-0"
-          aria-label={busy === "remove" ? undefined : `Remove BiBCode from ${name}`}
-          disabled={busy !== null}
-          onClick={() => void change("remove")}
-        >
-          {busy === "remove" ? "Removing…" : "Remove"}
-        </Button>
+        <div className="flex shrink-0 gap-2">
+          {upToDate === true ? null : (
+            <Button
+              size="sm"
+              variant="outline"
+              aria-label={busy === "update" ? undefined : `Update BiBCode in ${name}`}
+              disabled={busy !== null}
+              onClick={() => void change("update")}
+            >
+              {busy === "update" ? "Updating…" : "Update"}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            aria-label={busy === "remove" ? undefined : `Remove BiBCode from ${name}`}
+            disabled={busy !== null}
+            onClick={() => void change("remove")}
+          >
+            {busy === "remove" ? "Removing…" : "Remove"}
+          </Button>
+        </div>
       ) : (
         <Button
           size="sm"
