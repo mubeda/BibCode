@@ -20,6 +20,8 @@ const ANNOUNCED_LIMIT = 256;
  * never raises the same notice twice.
  */
 const announced = new Set<string>();
+/** The notice still up for each request, so it goes once the request is decided. */
+const shown = new Map<string, string>();
 
 /** "Claude Code wants to operate Office", and the code to compare. */
 export function mcpAuthorizationToastCopy(
@@ -59,6 +61,16 @@ export function McpAuthorizationNotifier(props: { readonly router: ReviewRouter 
   const { requests, canManage } = usePrimaryMcpAuthorizations();
   const environmentLabel = usePrimaryEnvironment()?.label ?? "";
 
+  // An approved, denied or expired request leaves the pending list; its notice goes with it.
+  useEffect(() => {
+    const pending = new Set(requests.map((request) => request.id));
+    for (const [requestId, toastId] of shown) {
+      if (pending.has(requestId)) continue;
+      shown.delete(requestId);
+      toastManager.close(toastId);
+    }
+  }, [requests]);
+
   useEffect(() => {
     if (!canManage) return;
     const announce = (request: AuthPendingMcpAuthorization) => {
@@ -73,12 +85,14 @@ export function McpAuthorizationNotifier(props: { readonly router: ReviewRouter 
           actionProps: {
             children: "Review",
             onClick: () => {
+              shown.delete(request.id);
               toastManager.close(toastId);
               void reviewMcpAuthorizations(router);
             },
           },
         }),
       );
+      shown.set(request.id, toastId);
     };
     const fresh = requests.filter((request) => !announced.has(request.id));
     const raise = () => {
@@ -108,4 +122,5 @@ export function McpAuthorizationNotifier(props: { readonly router: ReviewRouter 
 /** Forgets what was announced, between tests. */
 export function __resetMcpAuthorizationNotifierForTests(): void {
   announced.clear();
+  shown.clear();
 }
