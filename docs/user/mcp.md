@@ -77,7 +77,10 @@ read the change counts first, and a worktree that changed since is refused. Its 
 
 - **`delete`** runs `git worktree remove`. It refuses uncommitted or untracked changes unless
   `discardChanges` is true, which loses them for good.
-- **`cleanup`** clears Git's registration of a worktree whose folder is already gone.
+- **`cleanup`** clears Git's registration of a worktree whose folder is already gone. When
+  other stale worktrees would be pruned with it, `confirmRepositoryWidePrune` must be true.
+  It is refused when the plan had too many to list in full; remove such a worktree in
+  BiBCode, which shows every worktree the prune affects.
 - **`detach`** removes the worktree from BiBCode only and keeps the folder and its changes.
 
 A removal finishes in BiBCode even if the agent's call is cancelled, and a retry with the

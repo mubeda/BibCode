@@ -3101,6 +3101,33 @@ W was implemented on `claude/v0131-139-w`, from `claude/v0131-139-f0`. It adds
   `docs/architecture/rpc-and-orchestration.md` a "Worktree tools" subsection. The user doc's
   "Not available" bullet still lists worktree removal; slice Z rewrites that section.
 
+**Codex review fixes (round 2, `claude/v0131-139-w-r2`).** All three findings were confirmed
+in source, and each fix has a test that failed first:
+
+- **A cancellation after handoff stopped the removal.** `remove_worktree` passed the call's
+  token to `worktree.remove`, and the catalog checks it after preparing the removal and
+  before Git runs (`remove_worktree_owned`, after `quiesce`), so the removal answered
+  `orchestration-failed` and left the folder. The removal now runs under
+  `McpControl::shutdown_token()`. A test quiescer cancels the call's token in that window,
+  and the removal still deletes the folder. Shutdown still stops a removal there, as it
+  does for the UI. A cancellation before handoff no longer stops the request either; a
+  claim wait is the only step there that can block.
+- **A truncated plan could confirm an unseen prune.** The smallest fix was chosen over
+  paging: when `pruneImpact` does not fit (`fit_list`), the plan reports `pruneImpactCount`
+  and its `planToken` gains a `partial-impact:` prefix. `remove_worktree` strips the prefix
+  and refuses `confirmRepositoryWidePrune` with `McpPruneImpactTooLongError`. A non-empty
+  impact means the target's folder is already gone, and Git cleans such a registration
+  alone only when it is the only stale one. Such a worktree is therefore removed in the
+  app. The test creates 100 stale worktrees with long paths, so it is `cfg(unix)`.
+- **A dropped caller lost the audit line.** The fix stays in `worktrees.rs`, and
+  `control.rs` is unchanged. The removal RPC runs in its own `tokio::spawn`ed task and
+  answers on a oneshot. If the send fails, the task writes the same `MCP destructive tool`
+  line. If the waiting side is dropped after the send, its `Drop` writes it: the guard
+  closes the receiver and then calls `try_recv`. Each removal therefore logs exactly once.
+  The own-process test aborts the waiting call from the quiescer and finds one line. A
+  waited removal then adds exactly one more. `record_removal_outcome` is unchanged: both
+  paths still reach the catalog handlers.
+
 ## G (git write tools) implementation notes (2026-10-30)
 
 G was implemented on `claude/v0131-139-g`, from `claude/v0131-139-f0`. It registers the
