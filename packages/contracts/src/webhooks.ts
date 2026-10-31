@@ -80,7 +80,7 @@ export const WebhookDelivery = Schema.Struct({
   lastStatus: Schema.NullOr(Schema.Int),
   /**
    * Why the last attempt failed: `status` (see `lastStatus`), `timeout`, `connect`,
-   * `unresolved`, `address_refused`, `url_refused`, `redirect`, `cancelled`, `queue_full`
+   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `redirect`, `cancelled`, `queue_full`
    * or `interrupted`.
    */
   lastError: Schema.NullOr(Schema.String),

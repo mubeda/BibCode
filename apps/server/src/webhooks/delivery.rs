@@ -148,6 +148,8 @@ impl Attempt {
 pub(crate) enum Failure {
     /// The URL is no longer one BiBCode sends to.
     UrlRefused,
+    /// The endpoint's secret could not be read, so nothing was sent unsigned.
+    SecretMissing,
     /// The host resolved to a loopback, private, link-local or other non-public address.
     AddressRefused,
     /// The host did not resolve.
@@ -168,6 +170,7 @@ impl Failure {
     pub(crate) const fn tag(self) -> &'static str {
         match self {
             Self::UrlRefused => "url_refused",
+            Self::SecretMissing => "secret_missing",
             Self::AddressRefused => "address_refused",
             Self::Unresolved => "unresolved",
             Self::Timeout => "timeout",

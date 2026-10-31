@@ -77,6 +77,8 @@ const POLL: Duration = Duration::from_secs(2);
 const FEED_PAGES_PER_PASS: usize = 10;
 const FEED_PAGE: usize = 500;
 const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How long the loop sleeps while webhooks are off, unless the setting or a wake comes first.
+const IDLE_WAIT: Duration = Duration::from_secs(60);
 
 /// Where profiler findings are read from: the running server's profiler directory.
 pub(crate) type FindingsSource = Arc<dyn Fn() -> Option<Reader> + Send + Sync>;
@@ -316,9 +318,10 @@ impl Webhooks {
         cancel: &CancellationToken,
     ) -> Attempt {
         let Some(secret) = self.secret(&endpoint.id).await else {
+            // Never sent unsigned; Rotate secret makes a new one.
             return Attempt {
                 status: None,
-                failure: Some(Failure::UrlRefused),
+                failure: Some(Failure::SecretMissing),
                 latency_ms: 0,
             };
         };
@@ -485,6 +488,10 @@ impl Webhooks {
                 .collect();
             let deliveries = self.address(&events, endpoints);
             let more = page.more;
+            // Nothing new: no write, so an idle environment costs one read per pass.
+            if deliveries.is_empty() && page.cursor == cursor {
+                return;
+            }
             if !self
                 .queue(
                     deliveries,
@@ -741,7 +748,6 @@ async fn run(webhooks: Webhooks) {
         if inner.shutdown.is_cancelled() {
             break;
         }
-        webhooks.reconcile_pairings().await;
         let enabled = *enabled_signal.borrow_and_update();
         if was_enabled != Some(enabled) {
             if !enabled {
@@ -749,8 +755,12 @@ async fn run(webhooks: Webhooks) {
             }
             was_enabled = Some(enabled);
         }
-        let mut wait = inner.poll;
+        // Off, nothing is read: the loop waits for the setting (or a wake) and checks again
+        // at most once a minute.
+        let mut wait = if enabled { inner.poll } else { IDLE_WAIT };
         if enabled {
+            // Before any delivery: a revoked paired client's endpoints never get another.
+            webhooks.reconcile_pairings().await;
             match inner.store.endpoints().await {
                 Ok(endpoints) => {
                     webhooks.follow_feed(&endpoints).await;
