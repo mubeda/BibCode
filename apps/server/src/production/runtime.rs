@@ -112,6 +112,8 @@ pub struct ProductionRuntime {
     pub registry: RpcRegistry,
     /// The outside-agent tools on `/mcp` (#139).
     mcp_control: crate::mcp::control::McpControl,
+    /// Outbound webhooks and their dispatcher (#139 slice X8).
+    webhooks: crate::webhooks::Webhooks,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -744,6 +746,22 @@ impl ProductionRuntime {
             &mut registry,
             crate::production::ui_intents_rpc::UiIntents::new(),
         );
+        // The secret store `lifecycle.rs` opens for auth: endpoint secrets live beside the host
+        // identity secret, as `webhook-<id>`.
+        let webhook_secrets = crate::auth::SecretStore::new(config.state_dir().join("secrets"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let webhooks =
+            crate::webhooks::Webhooks::start(crate::webhooks::WebhooksConfig::production(
+                repositories.database().clone(),
+                repositories.clone(),
+                webhook_secrets,
+                config.environment_id.clone(),
+                control.webhooks_enabled_signal(),
+                control.mcp_server_signal(),
+            ));
+        webhooks.wake_on(auth.subscribe_access());
+        crate::webhooks::register_webhooks_rpc(&mut registry, webhooks.clone());
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
             registry.clone(),
@@ -756,6 +774,7 @@ impl ProductionRuntime {
 
         Ok(Self {
             mcp_control,
+            webhooks,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -921,6 +940,9 @@ impl ProductionRuntime {
         // Outside agents' MCP calls: refused from here on, and every wait in flight ends, long
         // before the orchestration engine shuts down.
         self.mcp_control.shutdown();
+        // Outbound webhooks: requests in flight end and stay queued for the next start, before
+        // the profiler's teardown.
+        self.webhooks.shutdown().await;
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         self.server_control.shutdown_capability_discovery().await;

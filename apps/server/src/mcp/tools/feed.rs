@@ -22,7 +22,7 @@ use crate::{
         },
         protocol::{self, Cut, fit_list, tool_result, typed_tool_failure},
     },
-    persistence::{ActivityChangeRow, ChangeFeedQuery, TransitionRow},
+    persistence::{ActivityChangeRow, ChangeFeedQuery, Repositories, TransitionRow},
 };
 
 const READ: &str = SCOPE_ORCHESTRATION_READ;
@@ -167,99 +167,138 @@ impl ToolCall<'_> {
         };
         let repositories = self.control.repositories();
         let Some(cursor) = self.string("cursor")? else {
-            let (sequence, activity) = repositories
-                .change_feed_heads()
-                .await
-                .map_err(storage_failure)?;
-            return Ok(page(
-                Cursor { sequence, activity },
-                Vec::new(),
-                false,
-                false,
-            ));
+            let cursor = head(repositories).await.map_err(storage_failure)?;
+            return Ok(page_result(&cursor, Vec::new(), false, false));
         };
-        let cursor = Cursor::parse(cursor).ok_or_else(|| {
-            invalid_argument(
-                "cursor is not one changes_since returned; call it without a cursor to start from now",
-            )
-        })?;
-        let read = repositories
-            .read_change_feed(ChangeFeedQuery {
-                after_sequence: cursor.sequence,
-                after_activity: cursor.activity,
-                thread_id,
-                scan_limit: SCAN_LIMIT,
-                parse_budget: PARSE_BUDGET,
-                // One more than a page, to know whether more remain.
-                activity_limit: limit + 1,
-            })
+        let page = page_after(repositories, cursor, thread_id, limit)
             .await
-            .map_err(storage_failure)?;
-        if cursor.sequence > read.event_head || cursor.activity > read.activity_head {
-            return Err(invalid_argument(
-                "This cursor is ahead of this server's logs, so it comes from another BiBCode database. Call changes_since without a cursor to start from now.",
-            ));
-        }
-        let activity_dropped = match read.oldest_activity {
-            Some(oldest) => cursor.activity.saturating_add(1) < oldest,
-            None => cursor.activity < read.activity_head,
-        };
+            .map_err(|error| match error {
+                FeedError::Cursor => invalid_argument(
+                    "cursor is not one changes_since returned; call it without a cursor to start from now",
+                ),
+                FeedError::Ahead => invalid_argument(
+                    "This cursor is ahead of this server's logs, so it comes from another BiBCode database. Call changes_since without a cursor to start from now.",
+                ),
+                FeedError::Storage(error) => storage_failure(error),
+            })?;
+        Ok(page_result(
+            &page.cursor,
+            page.entries,
+            page.more,
+            page.activity_dropped,
+        ))
+    }
+}
 
-        // Events first, then activity rows, each in its own order.
-        let mut entries = Vec::new();
-        let mut position = cursor;
-        let mut complete = true;
-        for row in &read.transitions {
-            let Some(mut entry) = transition(row) else {
-                continue;
-            };
+/// One page of the change feed: what `changes_since` returns, and what the webhook dispatcher
+/// (slice X8) follows from its stored cursor, so both see the same entries and cursors.
+#[derive(Clone, Debug)]
+pub(crate) struct FeedPage {
+    pub(crate) cursor: String,
+    pub(crate) entries: Vec<Value>,
+    pub(crate) more: bool,
+    pub(crate) activity_dropped: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum FeedError {
+    /// Not a cursor this feed returns.
+    Cursor,
+    /// Ahead of this server's logs: another database's.
+    Ahead,
+    Storage(crate::persistence::PersistenceError),
+}
+
+/// The current position of both logs: where a reader with no cursor starts.
+pub(crate) async fn head(
+    repositories: &Repositories,
+) -> Result<String, crate::persistence::PersistenceError> {
+    let (sequence, activity) = repositories.change_feed_heads().await?;
+    Ok(Cursor { sequence, activity }.text())
+}
+
+/// The entries after `cursor` (only `thread_id`'s when set), at most `limit`.
+pub(crate) async fn page_after(
+    repositories: &Repositories,
+    cursor: &str,
+    thread_id: Option<String>,
+    limit: usize,
+) -> Result<FeedPage, FeedError> {
+    let cursor = Cursor::parse(cursor).ok_or(FeedError::Cursor)?;
+    let read = repositories
+        .read_change_feed(ChangeFeedQuery {
+            after_sequence: cursor.sequence,
+            after_activity: cursor.activity,
+            thread_id,
+            scan_limit: SCAN_LIMIT,
+            parse_budget: PARSE_BUDGET,
+            // One more than a page, to know whether more remain.
+            activity_limit: limit + 1,
+        })
+        .await
+        .map_err(FeedError::Storage)?;
+    if cursor.sequence > read.event_head || cursor.activity > read.activity_head {
+        return Err(FeedError::Ahead);
+    }
+    let activity_dropped = match read.oldest_activity {
+        Some(oldest) => cursor.activity.saturating_add(1) < oldest,
+        None => cursor.activity < read.activity_head,
+    };
+
+    // Events first, then activity rows, each in its own order.
+    let mut entries = Vec::new();
+    let mut position = cursor;
+    let mut complete = true;
+    for row in &read.transitions {
+        let Some(mut entry) = transition(row) else {
+            continue;
+        };
+        if entries.len() == limit {
+            complete = false;
+            break;
+        }
+        position.sequence = row.sequence;
+        entry["cursor"] = position.text().into();
+        entries.push(entry);
+    }
+    if complete {
+        // Every event scanned was examined: the next call starts after the last one.
+        position.sequence = read.scanned_to;
+        for row in &read.activity {
             if entries.len() == limit {
                 complete = false;
                 break;
             }
-            position.sequence = row.sequence;
+            position.activity = row.activity_id;
+            let mut entry = activity(row);
             entry["cursor"] = position.text().into();
             entries.push(entry);
         }
-        if complete {
-            // Every event scanned was examined: the next call starts after the last one.
-            position.sequence = read.scanned_to;
-            for row in &read.activity {
-                if entries.len() == limit {
-                    complete = false;
-                    break;
-                }
-                position.activity = row.activity_id;
-                let mut entry = activity(row);
-                entry["cursor"] = position.text().into();
-                entries.push(entry);
-            }
-        }
-        let more = !complete || read.more_events;
-        let mut content = json!({ "entries": entries });
-        if fit_list(&mut content, "/entries", Cut::Back, 1) > 0 {
-            let last = content["entries"]
-                .as_array()
-                .and_then(|entries| entries.last())
-                .and_then(|entry| entry["cursor"].as_str())
-                .and_then(Cursor::parse);
-            if let Some(last) = last {
-                position = last;
-            }
-            return Ok(page(
-                position,
-                take_entries(content),
-                true,
-                activity_dropped,
-            ));
-        }
-        Ok(page(
-            position,
-            take_entries(content),
-            more,
-            activity_dropped,
-        ))
     }
+    let more = !complete || read.more_events;
+    let mut content = json!({ "entries": entries });
+    if fit_list(&mut content, "/entries", Cut::Back, 1) > 0 {
+        let last = content["entries"]
+            .as_array()
+            .and_then(|entries| entries.last())
+            .and_then(|entry| entry["cursor"].as_str())
+            .and_then(Cursor::parse);
+        if let Some(last) = last {
+            position = last;
+        }
+        return Ok(FeedPage {
+            cursor: position.text(),
+            entries: take_entries(content),
+            more: true,
+            activity_dropped,
+        });
+    }
+    Ok(FeedPage {
+        cursor: position.text(),
+        entries: take_entries(content),
+        more,
+        activity_dropped,
+    })
 }
 
 fn take_entries(mut content: Value) -> Vec<Value> {
@@ -269,10 +308,10 @@ fn take_entries(mut content: Value) -> Vec<Value> {
     }
 }
 
-fn page(cursor: Cursor, entries: Vec<Value>, more: bool, activity_dropped: bool) -> Value {
+fn page_result(cursor: &str, entries: Vec<Value>, more: bool, activity_dropped: bool) -> Value {
     tool_result(
         json!({
-            "cursor": cursor.text(),
+            "cursor": cursor,
             "entries": entries,
             "more": more,
             "activityDropped": activity_dropped,

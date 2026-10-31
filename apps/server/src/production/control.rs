@@ -293,6 +293,7 @@ pub struct NativeServerControl {
     automatic_git_fetch_interval: watch::Sender<Duration>,
     profiler_enabled: watch::Sender<bool>,
     device_previews_enabled: watch::Sender<bool>,
+    webhooks_enabled: watch::Sender<bool>,
     mcp_server: watch::Sender<crate::mcp::control::McpServerSettings>,
     settings_update_lock: Arc<Mutex<()>>,
     settings_generation: Arc<AtomicU64>,
@@ -390,6 +391,7 @@ impl NativeServerControl {
             watch::channel(automatic_git_fetch_interval(&settings));
         let (profiler_enabled, _) = watch::channel(enabled_setting(&settings));
         let (device_previews_enabled, _) = watch::channel(device_previews_setting(&settings));
+        let (webhooks_enabled, _) = watch::channel(webhooks_setting(&settings));
         let (mcp_server, _) = watch::channel(crate::mcp::control::mcp_server_settings(&settings));
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
@@ -410,6 +412,7 @@ impl NativeServerControl {
             automatic_git_fetch_interval,
             profiler_enabled,
             device_previews_enabled,
+            webhooks_enabled,
             mcp_server,
             settings_update_lock: Arc::new(Mutex::new(())),
             settings_generation: Arc::new(AtomicU64::new(0)),
@@ -500,6 +503,12 @@ impl NativeServerControl {
     /// The committed `enableDevicePreviews`; changes as soon as a settings update commits.
     pub fn device_previews_enabled_signal(&self) -> watch::Receiver<bool> {
         self.device_previews_enabled.subscribe()
+    }
+
+    /// The committed `enableWebhooks` (#139 slice X8); changes as soon as a settings update
+    /// commits, so turning webhooks off stops deliveries at once.
+    pub fn webhooks_enabled_signal(&self) -> watch::Receiver<bool> {
+        self.webhooks_enabled.subscribe()
     }
 
     /// The committed `enableMcpServer` and `mcpServerAccess`; changes as soon as a settings
@@ -658,6 +667,12 @@ impl NativeServerControl {
                     *current = next_device_previews;
                     changed
                 });
+            let next_webhooks = webhooks_setting(&next);
+            commit_control.webhooks_enabled.send_if_modified(|current| {
+                let changed = *current != next_webhooks;
+                *current = next_webhooks;
+                changed
+            });
             let next_mcp_server = crate::mcp::control::mcp_server_settings(&next);
             commit_control.mcp_server.send_if_modified(|current| {
                 if *current == next_mcp_server {
@@ -2022,6 +2037,7 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
     validate_optional_bool(object, "enableProfiler")?;
     validate_optional_bool(object, "enableDevicePreviews")?;
     validate_optional_bool(object, "enableMcpServer")?;
+    validate_optional_bool(object, "enableWebhooks")?;
     if let Some(access) = object.get("mcpServerAccess")
         && access
             .as_str()
@@ -2097,6 +2113,10 @@ fn mcp_launch(config: &ServerConfig) -> Value {
         argv.extend(["--dev-url".to_owned(), dev_url.to_string()]);
     }
     json!({ "argv": argv })
+}
+
+fn webhooks_setting(settings: &Value) -> bool {
+    settings.get("enableWebhooks").and_then(Value::as_bool) == Some(true)
 }
 
 fn device_previews_setting(settings: &Value) -> bool {
@@ -2454,6 +2474,7 @@ fn apply_settings_defaults(settings: &mut Value) {
             "enableChatAgentActivity": true,
             "enableTerminalAgentActivity": false,
             "enableMcpServer": true,
+            "enableWebhooks": false,
             "mcpServerAccess": "approval-required",
             "mcpCapabilities": {
                 "workspace": true,
@@ -5128,6 +5149,28 @@ mod tests {
             .expect("enable device previews");
         signal.changed().await.expect("signal changes");
         assert!(*signal.borrow());
+    }
+
+    #[tokio::test]
+    async fn webhooks_signal_follows_committed_setting() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let mut signal = control.webhooks_enabled_signal();
+        assert!(!*signal.borrow(), "webhooks start off");
+        control
+            .update_settings(json!({"patch":{"enableWebhooks":true}}))
+            .await
+            .expect("enable webhooks");
+        signal.changed().await.expect("signal changes");
+        assert!(*signal.borrow());
+        assert!(
+            control
+                .update_settings(json!({"patch":{"enableWebhooks":"yes"}}))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
