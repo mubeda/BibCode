@@ -640,6 +640,11 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Retry when it ends; read the file again first if you write with expectedVersion.",
     ),
     (
+        "McpHardLinkedFileError",
+        "The file has more than one hard link: writing it in place would change its other names too, which can be outside the thread's folder.",
+        "Ask the person to change it in BiBCode.",
+    ),
+    (
         "McpTransferUnavailableError",
         "This BiBCode server has no transfer address yet: it is still starting.",
         "Retry in a moment.",

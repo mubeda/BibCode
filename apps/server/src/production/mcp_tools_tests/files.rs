@@ -76,7 +76,7 @@ struct Fixture {
     access: TransferAccess,
     /// The workspace RPC the Files panel calls, sharing the tools' service and locks.
     workspace: WorkspaceRpc,
-    _folders: [tempfile::TempDir; 3],
+    _folders: [tempfile::TempDir; 4],
 }
 
 async fn fixture() -> Fixture {
@@ -84,6 +84,7 @@ async fn fixture() -> Fixture {
         tempfile::tempdir().expect("folder"),
         tempfile::tempdir().expect("outside"),
         tempfile::tempdir().expect("trash"),
+        tempfile::tempdir().expect("state"),
     ];
     let folder = folders[0].path().canonicalize().unwrap();
     let outside = folders[1].path().canonicalize().unwrap();
@@ -94,7 +95,7 @@ async fn fixture() -> Fixture {
     });
     let access = TransferAccess::new(vec![9_u8; 32]);
     let workspace = WorkspaceRpc::with_dependencies(
-        WorkspaceService::default().with_trash(trash.clone()),
+        WorkspaceService::default().with_trash(trash.clone(), folders[3].path().to_path_buf()),
         WorkspaceRpcDependencies {
             transfer_access: Some(access.clone()),
             ..WorkspaceRpcDependencies::default()
@@ -952,6 +953,48 @@ async fn an_unexpected_failure_names_the_agents_path_never_the_hosts() {
             .contains("locked.txt"),
         "{refused}"
     );
+    fixture.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_agent_may_not_write_a_hard_linked_file_and_a_person_may() {
+    let fixture = fixture().await;
+    fixture.write("a.txt", "base");
+    // The other name sits outside the thread's folder.
+    std::fs::hard_link(
+        fixture.folder.join("a.txt"),
+        fixture.outside.join("alias.txt"),
+    )
+    .unwrap();
+    let version = crate::crypto::sha256_hex(b"base");
+    let refused = fixture
+        .call(
+            "files_write",
+            json!({ "path": "a.txt", "content": "agent", "expectedVersion": version }),
+        )
+        .await;
+    assert_eq!(error_tag(&refused), "McpHardLinkedFileError");
+    assert_eq!(
+        std::fs::read_to_string(fixture.outside.join("alias.txt")).unwrap(),
+        "base"
+    );
+    assert!(
+        crate::mcp::tools::feed::ERRORS
+            .iter()
+            .any(|(tag, _, _)| *tag == "McpHardLinkedFileError")
+    );
+    // The Files panel's save of the same file goes through.
+    let cwd = fixture.folder.to_string_lossy().into_owned();
+    let saved = fixture
+        .workspace
+        .handle(
+            "projects.writeFileIfUnchanged",
+            json!({ "cwd": cwd, "relativePath": "a.txt", "contents": "person",
+                    "precondition": { "_tag": "version", "version": version } }),
+        )
+        .await;
+    assert!(saved.is_ok(), "{saved:?}");
     fixture.shutdown().await;
 }
 
