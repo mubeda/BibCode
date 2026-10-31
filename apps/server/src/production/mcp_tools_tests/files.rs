@@ -74,6 +74,8 @@ struct Fixture {
     outside: PathBuf,
     trash: Arc<TestTrash>,
     access: TransferAccess,
+    /// The workspace RPC the Files panel calls, sharing the tools' service and locks.
+    workspace: WorkspaceRpc,
     _folders: [tempfile::TempDir; 3],
 }
 
@@ -98,6 +100,7 @@ async fn fixture() -> Fixture {
             ..WorkspaceRpcDependencies::default()
         },
     );
+    let panel = workspace.clone();
     let harness = Harness::with_methods(move |registry| {
         for method in PLAIN_METHODS {
             let workspace = workspace.clone();
@@ -133,6 +136,7 @@ async fn fixture() -> Fixture {
         outside,
         trash,
         access,
+        workspace: panel,
         _folders: folders,
     }
 }
@@ -203,6 +207,7 @@ impl Fixture {
             self.access.clone(),
             Arc::new(|_| Box::pin(async {})),
             self.harness.control.clone(),
+            self.workspace.path_locks(),
         )
     }
 
@@ -947,5 +952,60 @@ async fn an_unexpected_failure_names_the_agents_path_never_the_hosts() {
             .contains("locked.txt"),
         "{refused}"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upload_holds_its_file_against_the_panel_and_the_agent_until_it_installs() {
+    let fixture = fixture().await;
+    let token = fixture.upload_url("up.txt", false).await;
+    let (sender, receiver) =
+        tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
+    sender
+        .send(Ok(axum::body::Bytes::from_static(b"upload")))
+        .unwrap();
+    let body = Body::from_stream(tokio_stream::wrappers::UnboundedReceiverStream::new(
+        receiver,
+    ));
+    let uploads = fixture.uploads();
+    let upload = tokio::spawn(async move { uploads(token, None, false, body, context()).await });
+    let reservation = fixture.folder.join("up.txt");
+    while !reservation.exists() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The Files panel saves the empty file it sees, and the agent writes it: both refused.
+    let cwd = fixture.folder.to_string_lossy().into_owned();
+    let panel = fixture
+        .workspace
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": "up.txt", "contents": "panel" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(panel["failure"], "path_busy", "{panel}");
+    let agent = fixture
+        .call(
+            "files_write",
+            json!({ "path": "up.txt", "content": "agent", "expectedVersion": crate::crypto::sha256_hex(b"") }),
+        )
+        .await;
+    assert_eq!(error_tag(&agent), "McpFileBusyError");
+    drop(sender);
+    let installed = tokio::time::timeout(Duration::from_secs(10), upload)
+        .await
+        .expect("the upload ends")
+        .unwrap();
+    assert_eq!(status(installed), 200);
+    assert_eq!(fixture.read("up.txt").as_deref(), Some("upload"));
+    // Once it installed, the file is anyone's again.
+    let saved = fixture
+        .workspace
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": "up.txt", "contents": "panel" }),
+        )
+        .await;
+    assert!(saved.is_ok(), "{saved:?}");
     fixture.shutdown().await;
 }
