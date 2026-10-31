@@ -5413,7 +5413,6 @@ fixed with a failing-first test, one commit each, and the reference updated to m
   example opens a tab first; a `webhook.test` body can carry `dropped`; minting a download URL
   writes no activity row.
 
-
 ## R implementation notes (2026-10-31)
 
 **Revision 4 (P1) is met.** The session-token verifier
