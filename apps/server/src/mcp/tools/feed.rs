@@ -645,6 +645,11 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Ask the person to change it in BiBCode.",
     ),
     (
+        "McpTrashStagedError",
+        "The system trash refused the entry, and something else took its name meanwhile, so it could not go back: it is kept in BiBCode's staging folder (stagedIn and stagedAt say where).",
+        "Tell the person where it is; BiBCode moves it back on the next delete or discard in that folder once the name is free.",
+    ),
+    (
         "McpTransferUnavailableError",
         "This BiBCode server has no transfer address yet: it is still starting.",
         "Retry in a moment.",

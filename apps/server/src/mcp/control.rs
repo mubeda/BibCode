@@ -1001,7 +1001,7 @@ pub(crate) fn invalid_argument(message: &str) -> Value {
 /// delete that stopped part-way, `leftAt` (a name, never a path), and for a write that failed
 /// after emptying its file, whether the old content was `restored`.
 const KEPT_ERROR_FIELDS: &[&str] = &[
-    "code", "blocked", "phase", "reason", "failure", "leftAt", "restored",
+    "code", "blocked", "phase", "reason", "failure", "leftAt", "restored", "stagedAt", "stagedIn",
 ];
 
 /// An RPC error as a typed tool failure.

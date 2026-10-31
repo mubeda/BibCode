@@ -177,7 +177,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "files_delete" => (
-            "Destructive: deletes a file or a folder with everything in it. It goes to the system trash unless permanent is true; if the trash cannot take it, it is left in place (trash_unavailable).",
+            "Destructive: deletes a file or a folder with everything in it. It goes to the system trash unless permanent is true; if the trash cannot take it, it is left in place (trash_unavailable), or, when its name was taken meanwhile, kept in BiBCode's staging folder (McpTrashStagedError says where).",
             object(
                 json!({
                     "threadId": thread,
@@ -259,6 +259,19 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         Some("trash_unavailable") => format!(
             "The system trash could not take {path}; it was left in place. Delete it with permanent: true only if the person asked for that."
         ),
+        Some("kept_in_staging") => {
+            let staged_at = error["stagedAt"].as_str().unwrap_or("bibcode-discard");
+            let place = if error["stagedIn"] == "git-dir" {
+                format!("in the repository's Git directory, at {staged_at}")
+            } else {
+                format!(
+                    "in BiBCode's data folder on the server, at {staged_at} in the trash holder for this folder"
+                )
+            };
+            format!(
+                "The system trash could not take {path}, and it could not be put back because something else now has its name. It is not deleted: it is {place}. Tell the person; they can move it back by hand, and BiBCode moves it back itself on the next delete or discard in this folder once {path} is free."
+            )
+        }
         Some("hard_linked") => format!(
             "{path} has more than one hard link, so writing it could change a file outside the thread's folder. Ask the person to change it in BiBCode."
         ),
@@ -309,7 +322,14 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         error.retain(|key, _| {
             matches!(
                 key.as_str(),
-                "_tag" | "failure" | "message" | "outcome" | "leftAt" | "restored"
+                "_tag"
+                    | "failure"
+                    | "message"
+                    | "outcome"
+                    | "leftAt"
+                    | "restored"
+                    | "stagedAt"
+                    | "stagedIn"
             )
         });
     }
@@ -318,6 +338,9 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
     }
     if failure["structuredContent"]["error"]["failure"] == "hard_linked" {
         failure["structuredContent"]["error"]["_tag"] = HARD_LINKED_TAG.into();
+    }
+    if failure["structuredContent"]["error"]["failure"] == "kept_in_staging" {
+        failure["structuredContent"]["error"]["_tag"] = TRASH_STAGED_TAG.into();
     }
     failure["structuredContent"]["error"]["message"] = message.clone().into();
     failure["content"] = json!([{ "type": "text", "text": message }]);
@@ -577,6 +600,9 @@ pub(crate) const PLATFORM_UNSUPPORTED_TAG: &str = "McpPlatformUnsupportedError";
 const BUSY_TAG: &str = "McpFileBusyError";
 /// A write refused because the file has more than one hard link.
 const HARD_LINKED_TAG: &str = "McpHardLinkedFileError";
+/// A trashed entry the trash refused that could not go back under its name: it is in
+/// BiBCode's staging folder.
+const TRASH_STAGED_TAG: &str = "McpTrashStagedError";
 
 /// The base a transfer URL is built on: the address this server is bound to, which the local
 /// relay and `bibcode thread` reach. Remote OAuth sessions (slice R) get their own origin here.

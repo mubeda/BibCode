@@ -49,11 +49,17 @@ struct TestTrash {
     folder: PathBuf,
     available: AtomicBool,
     count: AtomicUsize,
+    /// When set, a file is put at this path (the entry's own name) before the trash refuses.
+    take_name: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl FileTrash for TestTrash {
     fn trash<'a>(&'a self, path: PathBuf, _: &'a CancellationToken) -> FileTrashFuture<'a> {
         Box::pin(async move {
+            if let Some(name) = self.take_name.lock().unwrap().take() {
+                std::fs::write(name, "took the name").unwrap();
+                return Err(TrashUnavailable);
+            }
             if !self.available.load(Ordering::SeqCst) {
                 return Err(TrashUnavailable);
             }
@@ -92,6 +98,7 @@ async fn fixture() -> Fixture {
         folder: folders[2].path().to_path_buf(),
         available: AtomicBool::new(true),
         count: AtomicUsize::new(0),
+        take_name: std::sync::Mutex::new(None),
     });
     let access = TransferAccess::new(vec![9_u8; 32]);
     let workspace = WorkspaceRpc::with_dependencies(
@@ -556,6 +563,48 @@ async fn a_delete_goes_to_the_trash_unless_permanent_and_never_falls_back() {
     assert_eq!(structured(&retried)["trashed"], false);
     assert!(fixture.folder.join("kept.txt").exists());
     assert_eq!(fixture.trash.count.load(Ordering::SeqCst), 1);
+    fixture.shutdown().await;
+}
+
+/// A trash that refuses an entry whose name was taken meanwhile leaves it in BiBCode's staging
+/// folder: `files_delete` says so and where, never that it was left in place, and names no
+/// host path (#139 X5 round 5).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_delete_the_trash_refused_after_its_name_was_taken_says_where_the_file_is() {
+    let fixture = fixture().await;
+    fixture.write("stranded.txt", "old");
+    *fixture.trash.take_name.lock().unwrap() = Some(fixture.folder.join("stranded.txt"));
+
+    let refused = fixture
+        .call("files_delete", json!({ "path": "stranded.txt" }))
+        .await;
+
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error_tag(&refused), "McpTrashStagedError");
+    assert_eq!(error["failure"], "kept_in_staging");
+    assert_eq!(error["stagedIn"], "state-dir");
+    let staged_at = error["stagedAt"].as_str().expect("stagedAt");
+    assert!(
+        staged_at.starts_with("bibcode-discard/") && staged_at.ends_with("/stranded.txt"),
+        "{staged_at}"
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains(staged_at), "{message}");
+    assert!(message.contains("stranded.txt"), "{message}");
+    assert!(
+        !message.contains(&*fixture.folder.to_string_lossy()) && !message.contains("/var/"),
+        "no host path: {message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.folder.join("stranded.txt")).unwrap(),
+        "took the name"
+    );
+    assert!(
+        crate::mcp::tools::feed::ERRORS
+            .iter()
+            .any(|(tag, _, _)| *tag == "McpTrashStagedError")
+    );
     fixture.shutdown().await;
 }
 
