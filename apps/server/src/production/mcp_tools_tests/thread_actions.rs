@@ -683,6 +683,55 @@ async fn revert_meets_the_ceiling_of_the_thread() {
     harness.shutdown().await;
 }
 
+/// A turn whose checkpoint was not captured (`missing`) or was given up (`error`) is never a
+/// revert target, even when its ref exists: the revert is refused, typed, before any command,
+/// and the files stay as they are.
+#[tokio::test]
+async fn revert_to_an_uncaptured_turn_is_refused_even_with_its_ref() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    let checkout = checkpointed_checkout(&harness, &thread_id).await;
+    for (turn_count, status) in [(3, "missing"), (4, "error")] {
+        std::fs::write(checkout.path().join("tracked.txt"), format!("{status}\n")).unwrap();
+        capture_checkpoint(checkout.path(), &thread_id, turn_count)
+            .await
+            .unwrap();
+        harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.turn.diff.complete", "commandId": format!("diff-{turn_count}"),
+                "threadId": thread_id, "turnId": format!("turn-{turn_count}"),
+                "checkpointTurnCount": turn_count,
+                "checkpointRef": checkpoint_ref(&thread_id, turn_count), "status": status,
+                "files": [], "assistantMessageId": null,
+                "completedAt": CREATED_AT, "createdAt": CREATED_AT,
+            })))
+            .await
+            .unwrap();
+        let refused = harness
+            .call(
+                &agent,
+                "revert_thread_to_turn",
+                json!({ "threadId": thread_id, "turnCount": turn_count }),
+            )
+            .await;
+        assert_eq!(error_tag(&refused), "McpCheckpointRevertError", "{refused}");
+        assert!(
+            refused["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no captured checkpoint"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(checkout.path().join("tracked.txt")).unwrap(),
+        "error\n"
+    );
+    harness.shutdown().await;
+}
+
 /// A turn whose checkpoint was never captured (`missing`) has no diff to read: without a
 /// `turnCount`, `get_turn_diff` reads the latest captured turn, and a thread with none says so.
 #[tokio::test]

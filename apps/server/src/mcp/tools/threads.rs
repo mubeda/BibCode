@@ -991,6 +991,21 @@ impl ToolCall<'_> {
                     "turnCount is at most {latest}, this thread's latest turn with a checkpoint"
                 )));
             }
+            // The effects worker refuses it too; refused here, nothing is requested.
+            if turn_count > 0
+                && checkpoint_status(self.control.repositories(), &thread_id, turn_count)
+                    .await
+                    .map_err(storage_failure)?
+                    .as_deref()
+                    != Some("ready")
+            {
+                return Err(typed_tool_failure(
+                    "McpCheckpointRevertError",
+                    &crate::production::orchestration_effects::uncaptured_checkpoint_detail(
+                        turn_count,
+                    ),
+                ));
+            }
             Ok(vec![json!({
                 "type": "thread.checkpoint.revert",
                 "commandId": Uuid::new_v4().to_string(),
@@ -1467,6 +1482,18 @@ async fn latest_checkpoint(
                 .map_err(Into::into)
         })
         .await
+}
+
+/// The status of turn `turn_count`'s checkpoint on `thread_id`, if the turn has one.
+async fn checkpoint_status(
+    repositories: &Repositories,
+    thread_id: &str,
+    turn_count: i64,
+) -> crate::persistence::Result<Option<String>> {
+    Ok(repositories
+        .get_checkpoint(thread_id.to_owned(), turn_count)
+        .await?
+        .map(|checkpoint| checkpoint.status))
 }
 
 /// The first outcome the effects worker recorded on `thread_id` after event `after` for revert

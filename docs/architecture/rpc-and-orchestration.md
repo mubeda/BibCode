@@ -877,11 +877,15 @@ turn's number, ref, status and changed files.
    ends. `ready` requires ref `n - 1`; without it, and after a failed capture,
    the turn stays `missing` with a `checkpoint.capture.failed` activity, and
    the next turn start writes ref `n` if it is still missing. A hold still
-   pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds) marks
-   the turn's checkpoint stale and is released, with a warning and a
-   `checkpoint.capture.failed` activity: the worker never captures or records
-   that turn `ready`, and no later baseline writes its ref, so a revert to it
-   is refused. The stale mark lives in memory.
+   pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds) gives
+   the capture up: the turn's checkpoint is recorded `error` (terminal: no
+   later record of it changes that) before the hold is released, with a
+   warning and one `checkpoint.capture.failed` activity. The worker never
+   captures or records that turn `ready`, and no later baseline writes its
+   ref, across restarts too. Expiry and completion decide once per turn under
+   the hold lock (`claim_checkpoint_completion`): a turn ends `ready` or
+   `error`, never both. An `error` checkpoint does not change the turn's own
+   state.
 4. **Restart.** Startup reconciliation records a turn the restart cut off as
    `missing`, without a capture, when the thread already has a recorded
    checkpoint, so the numbers stay dense and a revert's provider rewind
@@ -3304,7 +3308,10 @@ the work. A provider cannot undo a rewind, so the effect orders the steps to
 keep a failure from leaving the files and the conversation out of step:
 
 1. It checks that the workspace is a Git repository and that the target
-   checkpoint ref (or `HEAD`, for turn 0) resolves.
+   checkpoint is `ready` and its ref resolves (turn 0: ref 0, or `HEAD`). A
+   turn whose checkpoint was not captured (`missing`) or was given up
+   (`error`) is refused: "Turn n has no captured checkpoint (its capture
+   failed or timed out), so the thread cannot be reverted to it."
 2. It asks the provider to drop the newer turns. If the session was suspended
    while idle, the supervisor first reopens it with the launch a new message
    would use: the thread's provider, modes and saved resume cursor. One case

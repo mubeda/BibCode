@@ -704,8 +704,9 @@ function checkpointStatusToTurnState(
   switch (status) {
     case "ready":
       return "completed";
+    // A checkpoint given up (`error`) says its capture is unusable, not that the turn failed.
     case "error":
-      return "error";
+      return "completed";
     case "missing":
       return "completed";
   }

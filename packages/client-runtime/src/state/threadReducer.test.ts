@@ -1817,7 +1817,8 @@ describe("applyThreadDetailEvent", () => {
         kind: "updated",
         thread: {
           checkpoints: [{ turnId: "turn-1" }, { turnId: "turn-2" }, { turnId: "turn-3" }],
-          latestTurn: { state: "error" },
+          // An `error` checkpoint (its capture given up) does not fail the turn.
+          latestTurn: { state: "completed" },
         },
       });
     });

@@ -1194,11 +1194,17 @@ async fn ensure_baseline(
         baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
     // A latest turn whose capture went stale has no end state: the checkout now may hold the next
     // turn's edits, so it does not stand in for that turn's checkpoint.
+    // Recorded `error` durably; in memory first, while that record is being written.
     let latest_went_stale = turns
         .iter()
         .filter(|turn| turn.checkpoint_turn_count == Some(turn_count))
-        .filter_map(|turn| turn.turn_id.as_deref())
-        .any(|turn_id| engine.checkpoint_is_stale(thread_id, turn_id));
+        .any(|turn| {
+            turn.checkpoint_status.as_deref() == Some("error")
+                || turn
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| engine.checkpoint_is_stale(thread_id, turn_id))
+        });
     if latest_went_stale {
         return Ok(());
     }
@@ -1335,7 +1341,7 @@ pub(crate) async fn record_turn_end(
     let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new()).await;
     match (&recorded, hold) {
         (Err(_), Some(_)) => engine.release_checkpoint_hold(thread_id, turn_id),
-        (Ok(()), Some(id)) => expire_stale_hold(engine, thread_id, turn_id, turn_count, id),
+        (Ok(()), Some(id)) => expire_stale_hold(engine, &checkpoint, id),
         _ => {}
     }
     recorded
@@ -1359,17 +1365,17 @@ async fn in_git_checkout(checkout: Option<&Path>) -> bool {
 /// the turn's checkpoint is marked stale (never recorded `ready`, and the next turn's baseline
 /// does not stand in for it), the stale record is logged and shown, and the thread's turns go.
 /// A hung Git therefore never holds a thread for good.
-fn expire_stale_hold(
-    engine: &OrchestrationEngine,
-    thread_id: &str,
-    turn_id: &str,
-    turn_count: i64,
-    id: u64,
-) {
+fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, id: u64) {
     let Some(limit) = engine.checkpoint_hold_limit() else {
         return;
     };
-    let (engine, thread_id, turn_id) = (engine.clone(), thread_id.to_owned(), turn_id.to_owned());
+    let (engine, thread_id, turn_id, turn_count, completed_at) = (
+        engine.clone(),
+        ended.thread_id.to_owned(),
+        ended.turn_id.to_owned(),
+        ended.turn_count,
+        ended.completed_at.to_owned(),
+    );
     let shutdown = engine.shutdown_signal();
     tokio::spawn(async move {
         tokio::select! {
@@ -1384,6 +1390,21 @@ fn expire_stale_hold(
             turn_count,
             "a turn's checkpoint was not captured in time; it is recorded stale and the thread's turns go on"
         );
+        // Recorded durably (`error`, which no capture overwrites) before the thread's turns go,
+        // so a restart cannot forget it and let a later checkout stand in for this turn.
+        let checkpoint = TurnCheckpoint {
+            thread_id: &thread_id,
+            turn_id: &turn_id,
+            turn_count,
+            assistant_message_id: None,
+            completed_at: &completed_at,
+        };
+        if let Err(error) =
+            dispatch_turn_checkpoint(&engine, &checkpoint, "error", Vec::new()).await
+        {
+            tracing::warn!(%thread_id, turn_count, %error, "a stale turn checkpoint could not be recorded");
+        }
+        engine.release_checkpoint_hold(&thread_id, &turn_id);
         let created_at = now_iso();
         let _ = engine
             .dispatch(OrchestrationCommand::ThreadActivityAppend {
@@ -1497,9 +1518,10 @@ async fn record_checkpoint(
         )
         .await?;
     }
-    // Its hold expired while Git ran: the thread's next turn may have edited the checkout, so
-    // this capture is not the turn's end state.
-    if engine.checkpoint_is_stale(thread_id, turn_id) {
+    // One decision against the hold's expiry: claimed, this capture is recorded and the expiry
+    // can no longer fire; lost, the hold expired while Git ran, the thread's next turn may have
+    // edited the checkout, and this capture is not the turn's end state.
+    if !engine.claim_checkpoint_completion(thread_id, turn_id) {
         delete_ref(cwd, Path::new("git"), &target_ref, cancellation).await?;
         return Err(stale());
     }
@@ -1641,15 +1663,20 @@ async fn plan_revert(
     let target_ref = if turn_count == 0 {
         checkpoint_ref(thread_id, 0)
     } else {
-        checkpoints
+        let target = checkpoints
             .iter()
             .find(|checkpoint| checkpoint.checkpoint_turn_count == turn_count)
-            .map(|checkpoint| checkpoint.checkpoint_ref.clone())
             .ok_or_else(|| {
                 OrchestrationEffectsError::Effect(format!(
                     "Checkpoint ref for turn {turn_count} is unavailable in read model."
                 ))
-            })?
+            })?;
+        // Only a captured checkpoint is the turn's end state. A ref of a turn not captured
+        // (`missing`) or given up (`error`) may hold a later checkout, so it is never restored.
+        if target.status != "ready" {
+            return Err(uncaptured_checkpoint(turn_count));
+        }
+        target.checkpoint_ref.clone()
     };
     // The provider rewind cannot be undone, so it runs before any file is touched and only once
     // the checkpoint is known to resolve. A refused rewind then changes nothing.
@@ -1690,6 +1717,19 @@ async fn plan_revert(
         rewind_key,
         request: event.event.command_id.clone(),
     })
+}
+
+/// The revert refusal for a turn whose checkpoint was never captured.
+fn uncaptured_checkpoint(turn_count: i64) -> OrchestrationEffectsError {
+    OrchestrationEffectsError::Effect(uncaptured_checkpoint_detail(turn_count))
+}
+
+/// Why a turn whose checkpoint was never captured (its capture failed or timed out) cannot be
+/// reverted to. Shared with MCP's check before the revert is requested.
+pub(crate) fn uncaptured_checkpoint_detail(turn_count: i64) -> String {
+    format!(
+        "Turn {turn_count} has no captured checkpoint (its capture failed or timed out), so the thread cannot be reverted to it. Revert to an earlier turn."
+    )
 }
 
 fn missing_checkpoint(turn_count: i64) -> OrchestrationEffectsError {
