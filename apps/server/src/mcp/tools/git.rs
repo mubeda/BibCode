@@ -19,6 +19,7 @@
 //! commits.
 
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
@@ -51,6 +52,8 @@ const PUBLISH_INTENT: &str = "ui.publishIntent";
 const SOURCE_CONTROL: Option<McpCapability> = Some(McpCapability::SourceControl);
 const RUN_OPERATION: &str = "gitManager.runOperation";
 const RUN: &[&str] = &[RUN_OPERATION];
+/// The branch tools also move the thread's recorded branch with the checkout.
+const CHECKOUT: &[&str] = &[RUN_OPERATION, "orchestration.dispatchCommand"];
 /// The longest branch name or revision a tool takes.
 const MOST_NAME_CHARS: usize = 255;
 pub(crate) const PARTIAL_TAG: &str = "McpPartialOutcomeError";
@@ -108,10 +111,10 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec::client("git_pull", OPERATE, RUN)
         .open_world()
         .in_set(SOURCE_CONTROL),
-    ToolSpec::client("git_create_branch", OPERATE, RUN).in_set(SOURCE_CONTROL),
-    ToolSpec::client("git_switch_branch", OPERATE, RUN).in_set(SOURCE_CONTROL),
+    ToolSpec::client("git_create_branch", OPERATE, CHECKOUT).in_set(SOURCE_CONTROL),
+    ToolSpec::client("git_switch_branch", OPERATE, CHECKOUT).in_set(SOURCE_CONTROL),
     // With `deleteRemote` it reaches the remote too.
-    ToolSpec::client("git_delete_branch", OPERATE, RUN)
+    ToolSpec::client("git_delete_branch", OPERATE, CHECKOUT)
         .destroys()
         .open_world()
         .in_set(SOURCE_CONTROL),
@@ -403,6 +406,29 @@ async fn finish(call: &ToolCall<'_>, thread_id: &str, result: ToolResult) -> Too
         Err(_) => Value::Null,
     };
     Ok(tool_result(content, &[("/status/files", Cut::Back)]))
+}
+
+/// [`finish`] for the tools that move or remove a branch: the thread's recorded branch follows
+/// the folder's checkout, as it does after the Source Control panel's own switch, so a label
+/// never names a branch the folder left or one that is gone. Best effort: the Git work is done.
+async fn finish_checkout(call: &ToolCall<'_>, thread_id: &str, result: ToolResult) -> ToolResult {
+    let finished = finish(call, thread_id, result).await?;
+    if let Some(branch) = finished["structuredContent"]["status"]["branch"].as_str()
+        && let Ok(thread) = call.thread(thread_id).await
+        && thread.branch.as_deref() != Some(branch)
+    {
+        let update = json!({
+            "type": "thread.meta.update", "commandId": Uuid::new_v4().to_string(),
+            "threadId": thread_id, "branch": branch,
+        });
+        if let Err(failure) = call.dispatch(update).await {
+            tracing::warn!(
+                error = failure["structuredContent"]["error"]["_tag"].as_str(),
+                "the thread's branch did not follow an agent's checkout"
+            );
+        }
+    }
+    Ok(finished)
 }
 
 /// The folder's branch, upstream, ahead/behind and changed files, as `git_status` returns
@@ -821,7 +847,7 @@ async fn create_branch(call: &ToolCall<'_>) -> ToolResult {
             Ok(done)
         })
         .await;
-    finish(call, &thread_id, result).await
+    finish_checkout(call, &thread_id, result).await
 }
 
 async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
@@ -875,7 +901,7 @@ async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
             }
         })
         .await;
-    finish(call, &thread_id, result).await
+    finish_checkout(call, &thread_id, result).await
 }
 
 async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
@@ -951,7 +977,7 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             }
         })
         .await;
-    finish(call, &thread_id, result).await
+    finish_checkout(call, &thread_id, result).await
 }
 
 /// The local branch is gone and the remote one is not, or may not be (`unknown`, when the
