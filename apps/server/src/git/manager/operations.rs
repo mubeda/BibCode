@@ -1135,6 +1135,51 @@ fn blocked_reason_for_operation(
         .cloned()
 }
 
+/// Refuses a remote or branch a sync command would read as an option: `git fetch`, `pull` and
+/// `push` take them as operands with no `--` (`git pull` passes its remote on to `git fetch`
+/// without one), and Git accepts a configured remote such as `--all` (#139 slice G).
+fn refuse_option_like_operands(
+    operation: &str,
+    request: &GitManagerOperationRequest,
+) -> Result<(), GitManagerOperationError> {
+    let operands = match request {
+        GitManagerOperationRequest::Fetch { remote, .. }
+        | GitManagerOperationRequest::Pull { remote, .. }
+        | GitManagerOperationRequest::RemoteBranchDelete { remote, .. } => vec![remote.as_str()],
+        GitManagerOperationRequest::Push {
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        }
+        | GitManagerOperationRequest::PublishBranch {
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        }
+        | GitManagerOperationRequest::ForcePush {
+            remote,
+            local_branch,
+            remote_branch,
+            ..
+        } => [Some(remote), Some(local_branch), remote_branch.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if operands.iter().any(|operand| operand.starts_with('-')) {
+        return Err(operation_error(
+            operation,
+            "invalid-request",
+            "A remote or branch name may not start with '-'.",
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_branch_or_sync_operation(
     repository: &GitRepository,
     snapshot: &GitManagerRefsSnapshot,
@@ -1142,6 +1187,7 @@ async fn execute_branch_or_sync_operation(
     cancellation: &CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
+    refuse_option_like_operands(operation, request)?;
     let outputs = match request {
         GitManagerOperationRequest::BranchCreate {
             cwd,

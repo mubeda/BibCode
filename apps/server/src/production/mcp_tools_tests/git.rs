@@ -402,6 +402,66 @@ async fn fetch_pull_and_revert_follow_the_remote() {
     fixture.harness.shutdown().await;
 }
 
+/// Git accepts a configured remote named like an option; neither the tools' implicit choice
+/// nor the handler, for any caller, may pass it to Git where it would be read as one.
+#[tokio::test]
+async fn a_configured_remote_named_like_an_option_is_never_passed_to_git() {
+    let fixture = fixture().await;
+    let url = fixture.remote.to_string_lossy().into_owned();
+    fixture.git(&["remote", "remove", "origin"]);
+    fixture.git(&["config", "remote.--all.url", &url]);
+    fixture.git(&[
+        "config",
+        "remote.--all.fetch",
+        "+refs/heads/*:refs/remotes/--all/*",
+    ]);
+    // The sole remote is the implicit choice.
+    for tool in ["git_fetch", "git_pull", "git_push"] {
+        let refused = fixture.call(tool, json!({})).await;
+        assert_eq!(
+            error_tag(&refused),
+            "McpInvalidArgumentError",
+            "{tool} {refused}"
+        );
+    }
+    // As the upstream's remote too.
+    fixture.git(&["config", "branch.main.remote", "--all"]);
+    fixture.git(&["config", "branch.main.merge", "refs/heads/main"]);
+    fixture.git(&["config", "remote.origin.url", &url]);
+    for tool in ["git_fetch", "git_push"] {
+        let refused = fixture.call(tool, json!({})).await;
+        assert_eq!(
+            error_tag(&refused),
+            "McpInvalidArgumentError",
+            "{tool} {refused}"
+        );
+    }
+
+    let registry = fixture.harness.control.registry();
+    let (cwd, project) = (fixture.repo.to_string_lossy().into_owned(), "p1");
+    for payload in [
+        json!({ "_tag": "fetch", "cwd": cwd, "projectId": project, "remote": "--all" }),
+        json!({ "_tag": "pull", "cwd": cwd, "projectId": project, "remote": "--all" }),
+        json!({ "_tag": "push", "cwd": cwd, "projectId": project, "remote": "--all", "localBranch": "main", "remoteBranch": null, "pushTags": false }),
+        json!({ "_tag": "push", "cwd": cwd, "projectId": project, "remote": "origin", "localBranch": "--all", "remoteBranch": null, "pushTags": false }),
+        json!({ "_tag": "publish-branch", "cwd": cwd, "projectId": project, "remote": "--all", "localBranch": "main", "remoteBranch": null, "pushTags": false }),
+        json!({ "_tag": "force-push", "cwd": cwd, "projectId": project, "remote": "--all", "localBranch": "main", "remoteBranch": null, "pushTags": false }),
+    ] {
+        let refused = registry
+            .invoke_local_stream(
+                "gitManager.runOperation",
+                payload.clone(),
+                fixture.context(),
+                CancellationToken::new(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("an option-like name is refused");
+        assert_eq!(refused["code"], "invalid-request", "{payload} {refused}");
+    }
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn discard_trashes_files_or_reports_that_the_trash_cannot_take_them() {
     let fixture = fixture().await;

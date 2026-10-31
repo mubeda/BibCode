@@ -395,13 +395,17 @@ fn revision(call: &ToolCall<'_>, key: &str) -> Result<Option<String>, Value> {
     }
 }
 
+/// Whether `remote` is a remote name Git reads as nothing else: a branch-name shape (no
+/// leading '-', so never an option) without a '/'.
+fn is_remote_name(remote: &str) -> bool {
+    is_branch_name(remote) && !remote.contains('/')
+}
+
 /// A remote argument's shape; whether the repository has it is checked against its refs.
 fn remote_name(call: &ToolCall<'_>, key: &str) -> Result<Option<String>, Value> {
     match call.string(key)? {
         None => Ok(None),
-        Some(remote) if is_branch_name(remote) && !remote.contains('/') => {
-            Ok(Some(remote.to_owned()))
-        }
+        Some(remote) if is_remote_name(remote) => Ok(Some(remote.to_owned())),
         Some(_) => Err(invalid_argument(&format!(
             "{key} must be the name of one of this repository's remotes"
         ))),
@@ -458,7 +462,9 @@ fn upstream(refs: &Value, branch: &str) -> Result<Option<(String, String)>, Valu
 }
 
 /// The remote to use: the one named, which the repository must have, else the upstream's,
-/// else `origin`, else the only remote.
+/// else `origin`, else the only remote. A remote chosen for the agent passes the same shape
+/// check as a named one: Git accepts a configured remote such as `--all`, which a command
+/// would read as an option.
 fn choose_remote(
     refs: &Value,
     named: Option<String>,
@@ -479,7 +485,7 @@ fn choose_remote(
             )))
         };
     }
-    upstream_remote
+    let chosen = upstream_remote
         .map(str::to_owned)
         .or_else(|| known.contains(&"origin").then(|| "origin".to_owned()))
         .or_else(|| (known.len() == 1).then(|| known[0].to_owned()))
@@ -489,7 +495,14 @@ fn choose_remote(
             } else {
                 "name the remote: this repository has several and none is origin"
             })
-        })
+        })?;
+    if is_remote_name(&chosen) {
+        Ok(chosen)
+    } else {
+        Err(invalid_argument(
+            "this repository's remote has a name a Git command could misread; rename it, or name another remote",
+        ))
+    }
 }
 
 /// Runs one `gitManager.runOperation` to its end and returns its operation and message.
