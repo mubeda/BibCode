@@ -99,6 +99,28 @@ describe("McpAgentsPanel", () => {
     expect(h.revoke).toHaveBeenCalledWith("s-1");
   });
 
+  it("offers Stop for an agent with running turns, revoked or not", async () => {
+    h.clients = [client()];
+    h.active = [
+      { clientId: "s-1", label: "Claude Code", lastCallAt: null, running: true, runningTurns: 1 },
+      { clientId: "s-2", label: "Codex", lastCallAt: null, running: true, runningTurns: 3 },
+    ];
+    const container = await render();
+    expect(container.textContent).toContain("1 turn running");
+    // Revoked, so not in Authorized clients, but its turns still run.
+    expect(container.textContent).toContain("Codex");
+    expect(container.textContent).toContain("Revoked · 3 turns running");
+    const stops = [...container.querySelectorAll("button")].filter(
+      (entry) => entry.textContent === "Stop",
+    );
+    expect(stops).toHaveLength(2);
+    const revokedRow = [...container.querySelectorAll("li")].find((row) =>
+      row.textContent?.includes("Codex"),
+    );
+    await act(async () => button(revokedRow!, "Stop").click());
+    expect(h.stop).toHaveBeenCalledWith("s-2");
+  });
+
   it("hands a taken-over agent back to the level it had", async () => {
     h.clients = [client({ mcpAccess: "read-only", mcpAccessHandBack: "full-access" })];
     const container = await render();

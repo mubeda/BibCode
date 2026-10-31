@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -40,8 +41,13 @@ export const McpActiveClient = Schema.Struct({
   clientId: TrimmedNonEmptyString,
   label: Schema.NullOr(Schema.String),
   lastCallAt: Schema.NullOr(IsoDateTime),
-  /** A call or owned mutation is in flight now. */
+  /** A call, owned mutation or attributed turn is in flight now. */
   running: Schema.Boolean,
+  /**
+   * Running turns whose latest user message this agent sent. Such an agent stays active
+   * however long ago it last called, revoked or not, so Stop stays in reach.
+   */
+  runningTurns: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
 });
 export type McpActiveClient = typeof McpActiveClient.Type;
 

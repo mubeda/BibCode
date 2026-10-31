@@ -99,19 +99,54 @@ function McpAgentList({
     }
     return calls;
   }, [active, rows]);
-  if (clients.length === 0) {
+  const runningTurns = useMemo(
+    () => new Map(active.map((entry) => [entry.clientId, entry.runningTurns] as const)),
+    [active],
+  );
+  // A revoked agent is no authorized client, but its turns may still run: list it so Stop
+  // stays in reach.
+  const revokedRunning = active.filter(
+    (entry) =>
+      entry.runningTurns > 0 && !clients.some((client) => client.sessionId === entry.clientId),
+  );
+  if (clients.length === 0 && revokedRunning.length === 0) {
     return (
       <p className="pb-3.5 text-xs text-muted-foreground">
         No agent is authorized. Copy a command above into your agent to connect one.
       </p>
     );
   }
+  const stopButton = (clientId: string) =>
+    canManage && (runningTurns.get(clientId) ?? 0) > 0 ? (
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={actions.pendingClientId === clientId}
+        onClick={() => void actions.stop(clientId)}
+      >
+        Stop
+      </Button>
+    ) : null;
   return (
     <ul className="divide-y divide-border/60 pb-1" aria-label="Authorized agents">
+      {revokedRunning.map((entry) => (
+        <li key={entry.clientId} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2">
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[13px] text-foreground">
+              {entry.label?.trim() || "MCP agent"}
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Revoked · {turnsText(entry.runningTurns)}
+            </div>
+          </div>
+          {stopButton(entry.clientId)}
+        </li>
+      ))}
       {clients.map((client) => {
         const handBack = takenOverLevel(client);
         const busy = actions.pendingClientId === client.sessionId;
         const label = client.client.label?.trim() || "MCP agent";
+        const turns = runningTurns.get(client.sessionId) ?? 0;
         return (
           <li key={client.sessionId} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2">
             <div className="min-w-0 flex-1">
@@ -122,10 +157,12 @@ function McpAgentList({
                 {handBack !== null
                   ? `Taken over (was ${accessLabel(handBack)})`
                   : accessLabel(client.mcpAccess)}
+                {turns > 0 ? ` · ${turnsText(turns)}` : ""}
               </div>
             </div>
             {canManage ? (
               <div className="flex shrink-0 items-center gap-1.5">
+                {stopButton(client.sessionId)}
                 {handBack !== null ? (
                   <Button
                     size="sm"
@@ -165,6 +202,10 @@ function McpAgentList({
       })}
     </ul>
   );
+}
+
+function turnsText(turns: number): string {
+  return turns === 1 ? "1 turn running" : `${turns} turns running`;
 }
 
 /** A row's outcome in plain words; the typed tag stays in the tooltip. */
