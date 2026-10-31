@@ -4281,3 +4281,126 @@ reads, so the server derives it rather than trusting a client:
 - **New error tag** `McpSourceThreadNotOwnedError`, beside X4's `McpNotSameWorktreeError` and
   `McpNotAHostThreadError`: X3's `feed::ERRORS` (not on this branch) must list all three
   when the branches combine.
+
+## X6 (clone) implementation notes (2026-10-31)
+
+X6 was implemented on `claude/v0131-139-x6`, from the batch tip `8d400e20df` (slice 1, the
+CLI, F0, wave 1, D, T, X2, X1 and their review fixes). It adds `mcp/tools/clone.rs`
+(`clone_repository`, `clone_status`, `cancel_clone` in the Workspace set),
+`git/clone_policy.rs`, and `production/mcp_tools_tests/clone.rs`, and changes
+`git/repository.rs`, `production/clone_operations.rs` and `production/git_vcs.rs`. One
+registration line each went into `mcp/tools/mod.rs`, `control::FAMILIES`,
+`mcp_tools_tests/mod.rs` and `git/mod.rs` (`pub(crate) mod clone_policy`). No contract,
+migration, RPC method, scope or `latency.rs` entry changed.
+
+**Revision 4 requirements:**
+
+- **LFS smudge off.** Every agent clone runs with `GIT_LFS_SKIP_SMUDGE=1` and
+  `-c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false`. Git treats an
+  empty driver command as no filter, so LFS files stay pointer files and a global
+  `filter.lfs.required=true` no longer fails the clone. The test
+  (`lfs_smudge_never_contacts_the_lfsconfig_endpoint`, `cfg(unix)`) clones a repository with
+  an LFS-tracked pointer and a `.lfsconfig` whose `lfs.url` names a counting local endpoint,
+  under a test global configuration whose smudge filter, like `git-lfs`, reads that URL and
+  contacts it with `curl`. It was seen failing (one connection) with the four settings
+  removed.
+- **HTTPS only.** SSH, `git+ssh://`, the scp-like `host:path`, `git://`, `file://`, a bare
+  path, `ext::`, `<transport>::` and `http://` are refused as `clone_url_refused` with "over
+  HTTPS only" before Git or DNS run. The unit test checks each transport is refused for
+  being one: the first version passed with `ssh://` allowed, because its cases carried a
+  user and the credentials rule refused them first; the cases now include user-less SSH
+  URLs, and the test and the integration test were seen failing with `ssh://` admitted.
+  **Follow-up: pinned SSH.** SSH resolves the host again after any check, so an agent SSH
+  clone needs a pinned connection (for example `ssh -o HostKeyAlias=<host>` to the checked
+  address through `core.sshCommand`, with `ProxyCommand`, `ProxyJump` and a replaced `ssh`
+  refused as the design's SSH section says) before it can be allowed.
+
+**Drift found:**
+
+- **`project.create` does not refuse a registered root.** The design cites `engine.rs:3958`;
+  that check is `project.meta-update`'s. For `project.create`, `process_envelope` answers a
+  workspace root that a live project already has with that project's id (an accepted
+  receipt, `DispatchResult.projectId`). Registration reads `projectId` from the dispatch
+  result, and `created` says whether it is the frozen id.
+- **A refusal needs no new contract shape.** `vcs.clone` declares `GitCommandError` and
+  `GitCloneOperationError` (whose reasons are a closed set), so a policy refusal is a
+  `GitCommandError` with an extra `reason` (`clone_url_refused`, `clone_host_refused`,
+  `clone_host_unresolved`, `clone_git_too_old`, `clone_destination_refused`); the schema
+  ignores the extra field. `sourceControl.cloneRepository` carries the same `reason` on its
+  `SourceControlRepositoryError`. The design's SSH bullets are superseded by Revision 4.
+- **The destination rule holds at the RPC too.** "Destination inside the allowed root" is by
+  construction for the tool, but an agent can call `vcs.clone` with any `parentDir`. For an
+  `mcp-client` principal, both handlers require the canonical parent to be the folder that
+  holds a live project (`clone_destination_refused`), using `GitVcsRpcServices`'
+  `repositories` (present in production; without it every agent clone is refused).
+  `sourceControl.cloneRepository` no longer creates the parent folder for an agent before
+  that check.
+- **`clone_status` reads by replay, not SQL alone.** A `running` row is live only while this
+  process holds its claim, which only `outcome.rs` sees (X5's file this wave). The tool
+  stores the arguments it keyed `recorded` with, and `clone_status` replays them through
+  `recorded` with an already-cancelled wait: a held claim answers `running`, a settled row
+  its outcome, an unowned `running` row `McpOutcomeUnknownError` (`restarted`). The row
+  exists, so the replay never runs work. Rows are per session, so after `bibcode mcp`
+  restarts (a new credential) the old `cloneId` is `McpCloneNotFoundError`; the old
+  session's revocation has stopped that clone anyway.
+- **`cancel_clone` needs its own token.** The live controls' token fires only on their four
+  sources. The task's stop token is a child of it, kept in a process-wide map by session and
+  `cloneId` (`McpControl` has no slot, and `control.rs` is not X6's). The task races
+  `vcs.clone` against it and drops the call at once, rather than waiting out `run`'s 10 s
+  grace. A live control replaces the work's unknown answer with its own reason;
+  `cancel_clone`'s keeps `reason: "cancelled"` and a clone-specific message.
+- **The activity row says `success` for a running clone.** X1's `settle` polls only after
+  `McpCancelledError`, and `clone_repository` answers a clone past its wait as
+  `{ state: "running", cloneId }`, so the row records the call's answer with the `cloneId`
+  target; the clone's final outcome is `clone_status`. Follow-up: an activity row per
+  settled clone.
+- **Joining shares the starter's Git.** The plan rides on the `CloneRequest`, so an agent
+  whose check passed and that joins a person's running clone of the same URL waits on that
+  unpinned clone; a person who joins an agent's clone shares its pinned one. A refused agent
+  never reaches admission, so it cannot join anything.
+- **Redirects.** With `http.followRedirects=false`, curl's 3xx reaches Git as
+  "returned error: 30x"; the transfer appends "BiBCode does not follow redirects for an
+  agent. Clone the address it moved to." to that detail.
+
+**Choices made while implementing:**
+
+- **The URL must be written as the parser writes it** (case aside): no percent-encoding,
+  unicode or numeric IPv4 host, default port, trailing dot or whitespace. Then the host the
+  policy resolves and pins is exactly the host curl uses (curl lowercases host cache ids,
+  so the parser's lowercase host matches). Both the original and the `insteadOf`-rewritten
+  host are checked and pinned, so a rewrite that only `ls-remote` or only `clone` applied
+  still meets a pinned, public host. Every resolved address is pinned
+  (`host:port:a,[b]`); an IP-literal host needs no pin.
+- **`GIT_ALLOW_PROTOCOL=https`** is set beside `protocol.allow=never`, since Git lets the
+  variable override the configuration.
+- **Addresses** are checked by hand (CGNAT, unique-local and the IPv4-compatible `::/96` are
+  not stable `std` methods): loopback, private, link-local, CGNAT, `0/8`, multicast,
+  broadcast, `240/4`, `fc00::/7`, `fe80::/10`, `fec0::/10`, and mapped or compatible forms.
+- **Git version.** `http.curloptResolve` is in Git 2.37.0's release notes (checked in the
+  installed `RelNotes/2.37.0.adoc`); an older or unreadable version is `clone_git_too_old`.
+- **The tool does not pre-check the URL.** A refusal comes from `vcs.clone` and is the
+  recorded `failed` outcome, so the fixture policy (below) reaches the tool path too.
+- **Results.** Done: `{ state: "done", cloneId, path, project: { projectId, created,
+  defaultThreadId } | null }`. The default title is the folder name.
+- **Tests without the network.** `ClonePolicy` takes a `HostResolver`; tests use a map.
+  `FixtureAllowance` (test only) adds environment (a test `GIT_CONFIG_GLOBAL`) to every Git
+  command the policy runs and, with `admit_local`, admits `http://` and loopback, so a
+  dumb-HTTP fixture at `http://fixture.invalid:<port>/repo.git` stands in for a public HTTPS
+  host. `.invalid` resolves only through the map, so a clone that reaches the fixture went
+  through the pinned address. The strict tests (`admit_local: false`) use the same
+  environment for `insteadOf` rewrites. `clone_repository`'s 50 s wait is shortened per
+  test through a task-local.
+
+**Tests:** `git::clone_policy::tests` (URL shapes, option-like folder names, the address
+list, the plan's settings and pin, refused and unresolved hosts, the fixture allowance) and
+`production::mcp_tools_tests::clone`: a clone beside the project through the pinned address
+that registers it; a keyed retry that replays, and later requests that reuse the finished
+clone without contacting the server and find or create one project; a destination holding
+other files refused and left alone; a redirect not followed; LFS; refused transports, hosts
+and rewrites through the tool, refusals on `vcs.clone` and `sourceControl.cloneRepository`
+called directly (and outside the projects folder), and a person's `file://` clone outside it
+still working; a clone past the wait that answers `running` and later its project;
+`cancel_clone`, revocation and the off switch each stopping the agent's clone and removing
+its folder; and cancelling an agent clone that joined a person's leaving the person's to
+finish. Take over and Stop reach the same live-controls token (X1) and are not tested again
+here.
