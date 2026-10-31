@@ -10,11 +10,18 @@
 //! be one the repository has. Every result ends with a fresh summary of the folder's Git
 //! status. Git output is never returned on success, and nothing a tool names (a path, a
 //! branch, a message) is logged.
+//!
+//! Slice X7 adds the reads (`git_diff`, `git_log`, `git_refs`), which return bounded,
+//! untrusted text through the panel's `gitManager.*` reads, and the commit message tools:
+//! `git_generate_commit_message` (the deterministic `vcs.generateCommitMessage` line) and
+//! `git_set_commit_message`, which only suggests a message to the Source Control panel through
+//! a `commitMessage` UI intent. A suggestion never replaces what a person typed and never
+//! commits.
 
 use serde_json::{Value, json};
 
 use crate::{
-    auth::SCOPE_ORCHESTRATION_OPERATE,
+    auth::{SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     git::manager::operations::is_branch_name,
     mcp::{
         control::{
@@ -22,12 +29,25 @@ use crate::{
             ToolResult, ToolSpec, invalid_argument, object_schema,
         },
         outcome::{Owned, outcome_unknown},
-        protocol::{Cut, tool_result, typed_tool_failure},
+        protocol::{Cut, fit_list, tool_result, typed_tool_failure},
         target::validate_paths,
+        tools::threads::diff_page,
     },
+    production::ui_intents_rpc::{MOST_COMMIT_MESSAGE_CHARS, check_commit_message},
 };
 
 const OPERATE: &str = SCOPE_ORCHESTRATION_OPERATE;
+const READ: &str = SCOPE_ORCHESTRATION_READ;
+/// The most patch characters one `git_diff` page returns.
+const DIFF_PAGE_CHARS: usize = 16_000;
+/// Commits `git_log` returns unless `limit` says otherwise, and the most it takes.
+const DEFAULT_LOG_LIMIT: i64 = 20;
+const MOST_LOG_LIMIT: i64 = 100;
+/// The most characters of a commit's body, and of its changed files, `git_log` returns.
+const MOST_BODY_CHARS: usize = 2_000;
+const MOST_SUBJECT_CHARS: usize = 1_000;
+const MOST_CHANGED_FILES: usize = 50;
+const PUBLISH_INTENT: &str = "ui.publishIntent";
 const SOURCE_CONTROL: Option<McpCapability> = Some(McpCapability::SourceControl);
 const RUN_OPERATION: &str = "gitManager.runOperation";
 const RUN: &[&str] = &[RUN_OPERATION];
@@ -39,10 +59,34 @@ pub(crate) const PARTIAL_TAG: &str = "McpPartialOutcomeError";
 /// method it runs; the reads it also makes (`gitManager.getRefs` to resolve a branch's
 /// upstream, `vcs.refreshStatus` for the summary) need the read scope its credential holds.
 pub(crate) const TOOLS: &[ToolSpec] = &[
+    // The reads (slice X7). `git_log` also reads `gitManager.getRefs` to resolve its ref.
+    ToolSpec::client("git_diff", READ, &["gitManager.getDiff"])
+        .reads()
+        .in_set(SOURCE_CONTROL),
+    ToolSpec::client("git_log", READ, &["gitManager.getCommits"])
+        .reads()
+        .in_set(SOURCE_CONTROL),
+    ToolSpec::client(
+        "git_refs",
+        READ,
+        &["gitManager.getRefs", "gitManager.getStashes"],
+    )
+    .reads()
+    .in_set(SOURCE_CONTROL),
     // Neither is idempotent: each acts on the file's state at call time.
     ToolSpec::client("git_stage", OPERATE, &["vcs.stageFiles"]).in_set(SOURCE_CONTROL),
     ToolSpec::client("git_unstage", OPERATE, &["vcs.unstageFiles"]).in_set(SOURCE_CONTROL),
     ToolSpec::client("git_commit", OPERATE, &["gitManager.commit"]).in_set(SOURCE_CONTROL),
+    // Changes nothing, but its method is registered as a mutation, so it needs operate.
+    ToolSpec::client(
+        "git_generate_commit_message",
+        OPERATE,
+        &["vcs.generateCommitMessage"],
+    )
+    .repeats_safely()
+    .in_set(SOURCE_CONTROL),
+    // A suggestion to the Source Control panel; a repeat offers it again.
+    ToolSpec::client("git_set_commit_message", OPERATE, &[PUBLISH_INTENT]).in_set(SOURCE_CONTROL),
     ToolSpec::client("git_undo_commit", OPERATE, &["gitManager.undoCommit"])
         .destroys()
         .in_set(SOURCE_CONTROL),
@@ -93,9 +137,14 @@ fn call<'a>(
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         match name {
+            "git_diff" => diff(call).await,
+            "git_log" => log(call).await,
+            "git_refs" => list_refs(call).await,
             "git_stage" => index(call, Index::Stage).await,
             "git_unstage" => index(call, Index::Unstage).await,
             "git_commit" => commit(call).await,
+            "git_generate_commit_message" => generate_commit_message(call).await,
+            "git_set_commit_message" => set_commit_message(call).await,
             "git_undo_commit" => undo_commit(call).await,
             "git_revert_commit" => revert_commit(call).await,
             "git_push" => push(call, false).await,
@@ -137,6 +186,48 @@ fn tool_text(name: &str) -> (&'static str, Value) {
     let branch = |description: &str| json!({ "type": "string", "description": description });
     let object = object_schema;
     match name {
+        "git_diff" => (
+            "One file's changes in the thread's folder against HEAD, as a patch, at most 16000 characters a page; nextCursor reads the next page. staged true shows only what is staged; otherwise the working tree, staged changes included. An untracked file reads as added. A file too large to show returns its kind (large-text or unrenderable) and byteLength without content. git_status lists the changed files.",
+            object(
+                json!({
+                    "threadId": thread,
+                    "path": { "type": "string", "description": "A literal file path relative to the thread's folder." },
+                    "staged": { "type": "boolean", "description": "Only what is staged. Off unless set." },
+                    "cursor": { "type": "string", "description": "nextCursor of the previous page." },
+                }),
+                &["threadId", "path"],
+            ),
+        ),
+        "git_log" => (
+            "Commits reachable from ref (HEAD unless set), newest first: sha, parents, branches and tags pointing at it, subject, body (cut at 2000 characters, with bodyChars), author, committer, times in milliseconds and up to 50 changed files (with changedFileCount). nextCursor reads older commits from the same tip, even after the branch moves.",
+            object(
+                json!({
+                    "threadId": thread,
+                    "ref": { "type": "string", "description": "HEAD, a local or remote branch (origin/main), a tag, or a full commit sha. HEAD unless set." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MOST_LOG_LIMIT, "description": "Commits per page; 20 unless set." },
+                    "cursor": { "type": "string", "description": "nextCursor of the previous page." },
+                }),
+                &["threadId"],
+            ),
+        ),
+        "git_refs" => (
+            "The repository's refs in the thread's folder: the current branch (or detached sha), whether it is dirty, the default branch, remotes, local and remote branches with upstream, ahead and behind, tags, stashes with their changed files, an operation in progress, and conflicted paths.",
+            object(json!({ "threadId": thread }), &["threadId"]),
+        ),
+        "git_generate_commit_message" => (
+            "A plain commit message line for the thread's changes: \"Update <paths>\" for the paths named, else for the first changed file of what is staged (or of the working tree when nothing is staged). It is deterministic and reads no content into prose; a message you write from git_diff is usually better. Nothing is committed.",
+            object(json!({ "threadId": thread, "paths": paths }), &["threadId"]),
+        ),
+        "git_set_commit_message" => (
+            "Suggests a commit message to the person in the Source Control panel of the thread's folder. An empty message box is filled, labelled as yours; text the person typed is never replaced, and they are offered yours to use or dismiss. BiBCode keeps the last suggestion per folder for 24 hours. It never commits; use git_commit for that.",
+            object(
+                json!({
+                    "threadId": thread,
+                    "message": { "type": "string", "maxLength": MOST_COMMIT_MESSAGE_CHARS, "description": "The suggested message: the summary line, then a blank line and the body. Tabs and line breaks are the only control characters allowed." },
+                }),
+                &["threadId", "message"],
+            ),
+        ),
         "git_stage" => (
             "Stages files or folders in the thread's folder (git add) and returns the folder's Git status.",
             object(
@@ -945,4 +1036,337 @@ async fn discard(call: &ToolCall<'_>) -> ToolResult {
         })
         .await;
     finish(call, &thread_id, result).await
+}
+
+/// The thread's folder for a read or a suggestion, resolved now: neither records anything.
+async fn current_folder(call: &ToolCall<'_>, thread_id: &str) -> Result<String, Value> {
+    Ok(call.target(thread_id).await?.cwd)
+}
+
+/// A `file:offset` cursor a paged patch returned.
+fn patch_cursor(cursor: &str) -> Result<(usize, usize), Value> {
+    cursor
+        .split_once(':')
+        .and_then(|(file, offset)| Some((file.parse().ok()?, offset.parse().ok()?)))
+        .ok_or_else(|| invalid_argument("cursor is not one this tool returned"))
+}
+
+/// The patch of `getDiff`'s output: what follows Git's raw header (`--patch-with-raw -z`,
+/// NUL-separated), from the first `diff --git` that starts a line.
+fn patch_text(output: &str) -> &str {
+    let mut from = 0;
+    while let Some(found) = output[from..].find("diff --git ") {
+        let at = from + found;
+        if at == 0 || matches!(output.as_bytes()[at - 1], b'\n' | b'\0') {
+            return &output[at..];
+        }
+        from = at + 1;
+    }
+    ""
+}
+
+async fn diff(call: &ToolCall<'_>) -> ToolResult {
+    let thread_id = thread_id(call, &["threadId", "path", "staged", "cursor"])?;
+    let path = call.required("path")?.to_owned();
+    let staged = call.boolean("staged")?.unwrap_or(false);
+    let (file_index, offset) = match call.string("cursor")? {
+        None => (0, 0),
+        Some(cursor) => patch_cursor(cursor)?,
+    };
+    let cwd = current_folder(call, &thread_id).await?;
+    let path = checked_paths(vec![path], &cwd)
+        .await?
+        .pop()
+        .ok_or_else(|| invalid_argument("path is required"))?;
+    let diff = call
+        .invoke(
+            "gitManager.getDiff",
+            json!({
+                "cwd": cwd,
+                "source": { "_tag": "working-tree", "path": path, "staged": staged },
+            }),
+        )
+        .await?;
+    // Only a patch is returned. A file too large to show is named by its kind and size; an
+    // image's bytes, which the panel draws, are never returned.
+    let kind = diff["_tag"]
+        .as_str()
+        .filter(|kind| matches!(*kind, "patch" | "large-text"))
+        .unwrap_or("unrenderable");
+    let (patch, next_cursor) = if kind == "patch" {
+        let page = diff_page(
+            patch_text(diff["patch"].as_str().unwrap_or_default()),
+            file_index,
+            offset,
+            DIFF_PAGE_CHARS,
+        );
+        (Value::String(page.patch), page.next_cursor.into())
+    } else {
+        (Value::Null, Value::Null)
+    };
+    Ok(tool_result(
+        json!({
+            "threadId": thread_id,
+            "path": path,
+            "staged": staged,
+            "kind": kind,
+            "byteLength": diff.get("byteLength"),
+            "patch": patch,
+            "nextCursor": next_cursor,
+        }),
+        &[],
+    ))
+}
+
+/// Whether `value` is a full commit id, as `gitManager.getCommits` takes it.
+fn is_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A `sha:offset` cursor `git_log` returned.
+fn log_cursor(cursor: &str) -> Result<(String, usize), Value> {
+    cursor
+        .split_once(':')
+        .filter(|(tip, _)| is_object_id(tip))
+        .and_then(|(tip, offset)| Some((tip.to_ascii_lowercase(), offset.parse().ok()?)))
+        .ok_or_else(|| invalid_argument("cursor is not one this tool returned"))
+}
+
+/// The commit `reference` names in the folder's refs: HEAD, a local or remote branch, a tag
+/// (peeled), or a full sha. `None` when HEAD names no commit yet.
+async fn resolve_ref(
+    call: &ToolCall<'_>,
+    cwd: &str,
+    reference: &str,
+) -> Result<Option<String>, Value> {
+    if is_object_id(reference) {
+        return Ok(Some(reference.to_ascii_lowercase()));
+    }
+    let refs = call
+        .invoke("gitManager.getRefs", json!({ "cwd": cwd }))
+        .await?;
+    let tip = |key: &str, name: &str| {
+        refs[key].as_array().and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(name))
+                .and_then(|entry| entry["tipSha"].as_str())
+                .map(str::to_owned)
+        })
+    };
+    if reference == "HEAD" {
+        return Ok(match refs["detachedSha"].as_str() {
+            Some(sha) => Some(sha.to_owned()),
+            None => refs["headRef"]
+                .as_str()
+                .and_then(|head| tip("localBranches", head)),
+        });
+    }
+    ["localBranches", "remoteBranches", "tags"]
+        .into_iter()
+        .find_map(|key| tip(key, reference))
+        .map(Some)
+        .ok_or_else(|| {
+            invalid_argument(&format!(
+                "there is no branch, tag or full commit sha {reference}; git_refs lists them"
+            ))
+        })
+}
+
+/// The first `most` characters of `text`.
+fn cut(text: &str, most: usize) -> String {
+    text.chars().take(most).collect()
+}
+
+/// One commit as `git_log` returns it: the message and the file list bounded.
+fn log_entry(commit: &Value) -> Value {
+    let subject = commit["subject"].as_str().unwrap_or_default();
+    let body = commit["body"].as_str().unwrap_or_default();
+    let files = commit["changedFiles"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    json!({
+        "sha": commit.get("sha"),
+        "shortSha": commit.get("shortSha"),
+        "parents": commit.get("parents"),
+        "decorations": commit.get("decorations"),
+        "subject": cut(subject, MOST_SUBJECT_CHARS),
+        "body": cut(body, MOST_BODY_CHARS),
+        "bodyChars": body.chars().count(),
+        "authorName": commit.get("authorName"),
+        "authorEmail": commit.get("authorEmail"),
+        "authoredAtMs": commit.get("authoredAtMs"),
+        "committerName": commit.get("committerName"),
+        "committerEmail": commit.get("committerEmail"),
+        "committedAtMs": commit.get("committedAtMs"),
+        "changedFiles": &files[..files.len().min(MOST_CHANGED_FILES)],
+        "changedFileCount": files.len(),
+    })
+}
+
+async fn log(call: &ToolCall<'_>) -> ToolResult {
+    let thread_id = thread_id(call, &["threadId", "ref", "limit", "cursor"])?;
+    let reference = revision(call, "ref")?.unwrap_or_else(|| "HEAD".to_owned());
+    let limit = match call.integer("limit")? {
+        None => DEFAULT_LOG_LIMIT,
+        Some(limit) if (1..=MOST_LOG_LIMIT).contains(&limit) => limit,
+        Some(_) => return Err(invalid_argument("limit is 1 to 100")),
+    };
+    let cursor = call.string("cursor")?.map(log_cursor).transpose()?;
+    let cwd = current_folder(call, &thread_id).await?;
+    // A cursor keeps paging from the tip the first page resolved, so a moved branch skips
+    // nothing and repeats nothing.
+    let (tip, offset) = match cursor {
+        Some(cursor) => cursor,
+        None => match resolve_ref(call, &cwd, &reference).await? {
+            Some(tip) => (tip, 0),
+            None => {
+                return Ok(tool_result(
+                    json!({ "threadId": thread_id, "ref": reference, "commits": [], "nextCursor": null }),
+                    &[],
+                ));
+            }
+        },
+    };
+    let page = call
+        .invoke(
+            "gitManager.getCommits",
+            json!({ "cwd": cwd, "pinnedTips": [tip], "offset": offset, "limit": limit }),
+        )
+        .await?;
+    let commits: Vec<Value> = page["commits"]
+        .as_array()
+        .map(|commits| commits.iter().map(log_entry).collect())
+        .unwrap_or_default();
+    let mut content = json!({
+        "threadId": thread_id,
+        "ref": reference,
+        "tip": tip,
+        "commits": commits,
+        "nextCursor": null,
+    });
+    // Fit the page first, then point the cursor after the last commit kept.
+    let dropped = fit_list(&mut content, "/commits", Cut::Back, 1);
+    let kept = content["commits"].as_array().map_or(0, Vec::len);
+    if dropped > 0 || !page["nextOffset"].is_null() {
+        content["nextCursor"] = format!("{tip}:{}", offset + kept).into();
+    }
+    Ok(tool_result(content, &[]))
+}
+
+/// One branch or tag as `git_refs` returns it, without the panel's guard reasons.
+fn ref_entry(entry: &Value) -> Value {
+    json!({
+        "name": entry.get("name"),
+        "tipSha": entry.get("tipSha"),
+        "upstream": entry.get("upstream"),
+        "ahead": entry.get("ahead"),
+        "behind": entry.get("behind"),
+        "current": entry.get("current"),
+        "isDefault": entry.get("isDefault"),
+        "worktreePath": entry.get("worktreePath"),
+    })
+}
+
+fn ref_entries(refs: &Value, key: &str) -> Vec<Value> {
+    refs[key]
+        .as_array()
+        .map(|entries| entries.iter().map(ref_entry).collect())
+        .unwrap_or_default()
+}
+
+async fn list_refs(call: &ToolCall<'_>) -> ToolResult {
+    let thread_id = thread_id(call, &["threadId"])?;
+    let cwd = current_folder(call, &thread_id).await?;
+    let refs = call
+        .invoke("gitManager.getRefs", json!({ "cwd": cwd }))
+        .await?;
+    let stashes = call
+        .invoke("gitManager.getStashes", json!({ "cwd": cwd }))
+        .await?;
+    let stashes: Vec<Value> = stashes
+        .as_array()
+        .map(|stashes| {
+            stashes
+                .iter()
+                .map(|stash| {
+                    json!({
+                        "index": stash.get("index"),
+                        "sha": stash.get("sha"),
+                        "message": stash.get("message"),
+                        "committedAtMs": stash.get("committedAtMs"),
+                        "files": stash.get("files"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(tool_result(
+        json!({
+            "threadId": thread_id,
+            "headRef": refs.get("headRef"),
+            "detachedSha": refs.get("detachedSha"),
+            "isDirty": refs.get("isDirty"),
+            "defaultBranch": refs.get("defaultBranch"),
+            "remotes": refs.get("remotes"),
+            "localBranches": ref_entries(&refs, "localBranches"),
+            "remoteBranches": ref_entries(&refs, "remoteBranches"),
+            "tags": ref_entries(&refs, "tags"),
+            "stashes": stashes,
+            "inProgressOperation": refs.get("inProgressOperation"),
+            "conflictedPaths": refs.get("conflictedPaths"),
+        }),
+        &[
+            ("/tags", Cut::Back),
+            ("/remoteBranches", Cut::Back),
+            ("/stashes", Cut::Back),
+            ("/localBranches", Cut::Back),
+            ("/conflictedPaths", Cut::Back),
+        ],
+    ))
+}
+
+async fn generate_commit_message(call: &ToolCall<'_>) -> ToolResult {
+    let thread_id = thread_id(call, &["threadId", "paths"])?;
+    let paths = match call.arguments.get("paths") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(string_list(call, "paths")?),
+    };
+    let cwd = current_folder(call, &thread_id).await?;
+    let paths = match paths {
+        Some(paths) => Some(checked_paths(paths, &cwd).await?),
+        None => None,
+    };
+    let generated = call
+        .invoke(
+            "vcs.generateCommitMessage",
+            json!({ "cwd": cwd, "filePaths": paths }),
+        )
+        .await?;
+    Ok(tool_result(
+        json!({ "threadId": thread_id, "message": generated.get("message") }),
+        &[],
+    ))
+}
+
+async fn set_commit_message(call: &ToolCall<'_>) -> ToolResult {
+    let thread_id = thread_id(call, &["threadId", "message"])?;
+    let message = call.required("message")?.to_owned();
+    check_commit_message(&message).map_err(invalid_argument)?;
+    let cwd = current_folder(call, &thread_id).await?;
+    let published = call
+        .invoke(
+            PUBLISH_INTENT,
+            json!({ "kind": "commitMessage", "threadId": thread_id, "cwd": cwd, "message": message }),
+        )
+        .await?;
+    Ok(tool_result(
+        json!({
+            "threadId": thread_id,
+            "intentId": published.get("intentId"),
+            "subscribers": published.get("subscribers"),
+        }),
+        &[],
+    ))
 }

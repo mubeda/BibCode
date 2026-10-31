@@ -24,11 +24,11 @@ use crate::{
         git_manager_rpc::{GitManagerRpcServices, register_git_manager_rpc},
         git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
     },
-    rpc::RpcSessionContext,
+    rpc::{RpcRegistry, RpcSessionContext},
     worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
 
-const THREAD: &str = "git-thread";
+pub(super) const THREAD: &str = "git-thread";
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -70,11 +70,11 @@ impl FileTrash for TestTrash {
     }
 }
 
-struct Fixture {
-    harness: Harness,
-    agent: ClientPrincipal,
+pub(super) struct Fixture {
+    pub(super) harness: Harness,
+    pub(super) agent: ClientPrincipal,
     /// The thread's folder: a clone whose `origin` is `remote`.
-    repo: PathBuf,
+    pub(super) repo: PathBuf,
     remote: PathBuf,
     trash: Arc<TestTrash>,
     _folders: [tempfile::TempDir; 3],
@@ -82,6 +82,11 @@ struct Fixture {
 
 /// A thread whose worktree is a repository with one pushed commit (`a.txt`) on `main`.
 async fn fixture() -> Fixture {
+    fixture_with(|_| {}).await
+}
+
+/// [`fixture`] whose registry also holds the methods `register` adds (slice X7's UI intents).
+pub(super) async fn fixture_with(register: impl FnOnce(&mut RpcRegistry)) -> Fixture {
     let folders = [
         tempfile::tempdir().expect("repository"),
         tempfile::tempdir().expect("remote"),
@@ -158,6 +163,7 @@ async fn fixture() -> Fixture {
     let harness = Harness::with_methods(move |registry| {
         register_git_vcs_rpc(registry, vcs);
         register_git_manager_rpc(registry, manager);
+        register(registry);
     })
     .await;
     harness
@@ -183,7 +189,7 @@ async fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    async fn call(&self, tool: &str, mut arguments: Value) -> Value {
+    pub(super) async fn call(&self, tool: &str, mut arguments: Value) -> Value {
         arguments["threadId"] = THREAD.into();
         self.harness.call(&self.agent, tool, arguments).await
     }
@@ -204,7 +210,7 @@ impl Fixture {
         tokio::spawn(async move { control.call(&agent, tool, &arguments, None, token).await })
     }
 
-    fn write(&self, path: &str, text: &str) {
+    pub(super) fn write(&self, path: &str, text: &str) {
         let path = self.repo.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
@@ -214,7 +220,7 @@ impl Fixture {
         std::fs::read_to_string(self.repo.join(path)).ok()
     }
 
-    fn git(&self, args: &[&str]) -> String {
+    pub(super) fn git(&self, args: &[&str]) -> String {
         git(&self.repo, args)
     }
 

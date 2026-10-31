@@ -1777,16 +1777,16 @@ pub(crate) async fn read_pending_requests(
         .await
 }
 
-struct DiffPage {
+pub(crate) struct DiffPage {
     files: Vec<Value>,
-    patch: String,
-    next_cursor: Option<String>,
+    pub(crate) patch: String,
+    pub(crate) next_cursor: Option<String>,
 }
 
 /// The patch of `patch` from file `file_index`, character `offset`, at most `budget`
 /// characters, and the files it holds. `nextCursor` names where the next page starts, so every
-/// patch line can be read.
-fn diff_page(patch: &str, file_index: usize, offset: usize, budget: usize) -> DiffPage {
+/// patch line can be read. `git_diff` (slice X7) pages its patch here too.
+pub(crate) fn diff_page(patch: &str, file_index: usize, offset: usize, budget: usize) -> DiffPage {
     let mut sections: Vec<&str> = Vec::new();
     let mut start = 0;
     for (at, _) in patch.match_indices("diff --git ") {

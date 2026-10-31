@@ -10,7 +10,11 @@
 //! thread and its path (C5) before it publishes; the handler repeats the shape checks.
 //!
 //! Each kind keeps its own retention. A `focus` intent expires after 60 seconds, at most 16
-//! pending per thread. Slice X7 adds `commitMessage`, the last one per folder for 24 hours.
+//! pending per thread. A `commitMessage` intent (slice X7, `git_set_commit_message`) is the last
+//! one per folder, kept for 24 hours apart from the `focus` intents, so a Source Control panel
+//! opened later still offers it and no flood of `focus` intents evicts it. The tool resolves the
+//! folder from the thread; the handler has no projection to check it against, which is
+//! acceptable for advice that a panel labels with the agent and never applies over a draft.
 
 use std::{
     path::{Component, Path},
@@ -45,6 +49,14 @@ pub(crate) const SURFACES: &[&str] = &["thread", "files", "sourceControl", "diff
 pub(crate) const PATH_SURFACES: &[&str] = &["files", "diff"];
 /// `PROJECT_ENTRY_PATH_MAX_LENGTH` in `packages/contracts/src/project.ts`.
 const MOST_PATH_CHARS: usize = 512;
+/// How long a `commitMessage` intent stays pending.
+pub(crate) const COMMIT_MESSAGE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest suggested commit message, in characters.
+pub(crate) const MOST_COMMIT_MESSAGE_CHARS: usize = 8_000;
+/// Folders with a pending `commitMessage` intent; past it the oldest is dropped.
+pub(crate) const MOST_COMMIT_MESSAGES: usize = 64;
+/// The longest folder a `commitMessage` intent names.
+const MOST_CWD_CHARS: usize = 4_096;
 const STREAM_CAPACITY: usize = 64;
 const INTENT_CAPACITY: usize = 128;
 
@@ -56,12 +68,20 @@ pub(crate) struct UiIntents {
 
 struct Shared {
     pending: Mutex<Vec<Pending>>,
+    /// The last `commitMessage` intent per folder, oldest first.
+    messages: Mutex<Vec<Message>>,
     published: broadcast::Sender<Value>,
 }
 
 struct Pending {
     thread_id: String,
     client_id: String,
+    expires: Instant,
+    intent: Value,
+}
+
+struct Message {
+    cwd: String,
     expires: Instant,
     intent: Value,
 }
@@ -78,21 +98,29 @@ impl UiIntents {
         Self {
             shared: Arc::new(Shared {
                 pending: Mutex::new(Vec::new()),
+                messages: Mutex::new(Vec::new()),
                 published: broadcast::channel(INTENT_CAPACITY).0,
             }),
         }
     }
 
-    /// The newest [`SNAPSHOT_INTENTS`] intents still pending, oldest first; expired ones are
+    /// The newest [`SNAPSHOT_INTENTS`] `focus` intents still pending, oldest first, then every
+    /// pending `commitMessage` intent (at most [`MOST_COMMIT_MESSAGES`]); expired ones are
     /// dropped. One server is one environment, so this is the subscriber's environment.
     pub(crate) fn snapshot(&self) -> Vec<Value> {
-        let mut pending = self.lock();
-        prune(&mut pending);
-        let skip = pending.len().saturating_sub(SNAPSHOT_INTENTS);
-        pending[skip..]
-            .iter()
-            .map(|entry| entry.intent.clone())
-            .collect()
+        let mut snapshot: Vec<Value> = {
+            let mut pending = self.lock();
+            prune(&mut pending);
+            let skip = pending.len().saturating_sub(SNAPSHOT_INTENTS);
+            pending[skip..]
+                .iter()
+                .map(|entry| entry.intent.clone())
+                .collect()
+        };
+        let mut messages = self.lock_messages();
+        prune_messages(&mut messages);
+        snapshot.extend(messages.iter().map(|entry| entry.intent.clone()));
+        snapshot
     }
 
     #[cfg(test)]
@@ -176,9 +204,54 @@ impl UiIntents {
         Ok((intent, self.shared.published.receiver_count()))
     }
 
+    /// Publishes a suggested commit message for folder `cwd`, replacing the folder's earlier
+    /// one, and returns it with the number of subscribed clients. It stays pending for
+    /// [`COMMIT_MESSAGE_TTL`]; past [`MOST_COMMIT_MESSAGES`] folders the oldest is dropped. The
+    /// caller has checked `message` ([`check_commit_message`]).
+    pub(crate) fn publish_commit_message(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+        message: &str,
+        actor: Value,
+    ) -> (Value, usize) {
+        let now = time::OffsetDateTime::now_utc();
+        let intent = json!({
+            "kind": "commitMessage",
+            "intentId": Uuid::new_v4().to_string(),
+            "threadId": thread_id,
+            "cwd": cwd,
+            "message": message,
+            "actor": actor,
+            "createdAt": iso(now),
+            "expiresAt": iso(now + COMMIT_MESSAGE_TTL),
+        });
+        {
+            let mut messages = self.lock_messages();
+            prune_messages(&mut messages);
+            messages.retain(|entry| entry.cwd != cwd);
+            messages.push(Message {
+                cwd: cwd.to_owned(),
+                expires: Instant::now() + COMMIT_MESSAGE_TTL,
+                intent: intent.clone(),
+            });
+            let excess = messages.len().saturating_sub(MOST_COMMIT_MESSAGES);
+            messages.drain(..excess);
+        }
+        let _ = self.shared.published.send(intent.clone());
+        (intent, self.shared.published.receiver_count())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Pending>> {
         self.shared
             .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_messages(&self) -> std::sync::MutexGuard<'_, Vec<Message>> {
+        self.shared
+            .messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -187,6 +260,31 @@ impl UiIntents {
 fn prune(pending: &mut Vec<Pending>) {
     let now = Instant::now();
     pending.retain(|entry| entry.expires > now);
+}
+
+fn prune_messages(messages: &mut Vec<Message>) {
+    let now = Instant::now();
+    messages.retain(|entry| entry.expires > now);
+}
+
+/// Why `message` cannot be a suggested commit message, if it cannot: it must hold text, at
+/// most [`MOST_COMMIT_MESSAGE_CHARS`] characters, and no control character but a tab or a line
+/// break. A person reads it in the Source Control panel, so nothing in it may hide or redraw
+/// what they see there.
+pub(crate) fn check_commit_message(message: &str) -> Result<(), &'static str> {
+    if message.trim().is_empty() {
+        return Err("message must hold text");
+    }
+    if message.chars().count() > MOST_COMMIT_MESSAGE_CHARS {
+        return Err("message is at most 8000 characters");
+    }
+    if message
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("message may not contain control characters other than tabs and line breaks");
+    }
+    Ok(())
 }
 
 fn iso(at: time::OffsetDateTime) -> String {
@@ -198,13 +296,41 @@ fn refusal(reason: &str, message: &str) -> Value {
     json!({ "_tag": "UiIntentError", "reason": reason, "message": message })
 }
 
+/// `ui.publishIntent`'s input: a `focus` intent unless `kind` says otherwise.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PublishInput {
+    Focus(FocusInput),
+    CommitMessage(CommitMessageInput),
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PublishInput {
+struct FocusInput {
     thread_id: String,
     surface: String,
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommitMessageInput {
+    thread_id: String,
+    cwd: String,
+    message: String,
+}
+
+impl PublishInput {
+    /// Reads the input, taking an input without `kind` as a `focus` intent (slice X4's shape).
+    fn read(mut payload: Value) -> Result<Self, serde_json::Error> {
+        if let Some(object) = payload.as_object_mut() {
+            object
+                .entry("kind")
+                .or_insert_with(|| Value::String("focus".to_owned()));
+        }
+        serde_json::from_value(payload)
+    }
 }
 
 /// Registers `ui.publishIntent` and `subscribeUiIntents` on `intents`.
@@ -233,8 +359,14 @@ async fn publish_intent(
             "Only an outside agent's MCP session publishes UI suggestions.",
         ));
     };
-    let input: PublishInput = serde_json::from_value(payload)
-        .map_err(|error| refusal("invalid", &format!("Invalid UI intent: {error}")))?;
+    let input = match PublishInput::read(payload)
+        .map_err(|error| refusal("invalid", &format!("Invalid UI intent: {error}")))?
+    {
+        PublishInput::Focus(input) => input,
+        PublishInput::CommitMessage(input) => {
+            return publish_commit_message(intents, input, actor);
+        }
+    };
     if input.thread_id.trim().is_empty() {
         return Err(refusal("invalid", "threadId is required."));
     }
@@ -258,6 +390,27 @@ async fn publish_intent(
     }
     let (intent, subscribers) =
         intents.publish_focus(&input.thread_id, &input.surface, path, actor)?;
+    Ok(json!({ "intentId": intent["intentId"], "subscribers": subscribers }))
+}
+
+fn publish_commit_message(
+    intents: &UiIntents,
+    input: CommitMessageInput,
+    actor: Value,
+) -> Result<Value, Value> {
+    if input.thread_id.trim().is_empty() {
+        return Err(refusal("invalid", "threadId is required."));
+    }
+    if input.cwd.is_empty()
+        || input.cwd.chars().count() > MOST_CWD_CHARS
+        || input.cwd.contains('\0')
+        || !Path::new(&input.cwd).is_absolute()
+    {
+        return Err(refusal("invalid", "cwd is the thread's absolute folder."));
+    }
+    check_commit_message(&input.message).map_err(|reason| refusal("invalid", reason))?;
+    let (intent, subscribers) =
+        intents.publish_commit_message(&input.thread_id, &input.cwd, &input.message, actor);
     Ok(json!({ "intentId": intent["intentId"], "subscribers": subscribers }))
 }
 
@@ -426,6 +579,110 @@ mod tests {
         assert_eq!(next[0]["type"], "intent");
         assert_eq!(next[0]["intent"]["intentId"], second["intentId"]);
         cancellation.cancel();
+    }
+
+    fn messages(intents: &UiIntents) -> Vec<Value> {
+        intents
+            .snapshot()
+            .into_iter()
+            .filter(|intent| intent["kind"] == "commitMessage")
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_message_is_the_last_one_per_folder_for_24_hours() {
+        let intents = UiIntents::new();
+        let (first, _) = intents.publish_commit_message("t1", "/repo/a", "First", actor());
+        assert_eq!(first["kind"], "commitMessage");
+        assert_eq!(first["cwd"], "/repo/a");
+        assert_eq!(first["message"], "First");
+        intents.publish_commit_message("t2", "/repo/b", "Other folder", actor());
+        let hour = Duration::from_secs(3_600);
+        tokio::time::advance(hour).await;
+        let (replaced, _) = intents.publish_commit_message("t1", "/repo/a", "Second", actor());
+        let kept = messages(&intents);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0]["message"], "Other folder");
+        assert_eq!(kept[1]["intentId"], replaced["intentId"]);
+        // Focus limits never count it.
+        assert_eq!(intents.len(), 0);
+        tokio::time::advance(COMMIT_MESSAGE_TTL - hour - Duration::from_millis(1)).await;
+        assert_eq!(messages(&intents).len(), 2);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let kept = messages(&intents);
+        assert_eq!(kept.len(), 1, "the other folder's expired after 24 hours");
+        assert_eq!(kept[0]["message"], "Second");
+        tokio::time::advance(hour).await;
+        assert!(messages(&intents).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_focus_intents_never_evicts_a_commit_message() {
+        let intents = UiIntents::new();
+        let (kept, _) = intents.publish_commit_message("t1", "/repo", "Keep me", actor());
+        for client in 0..5 {
+            for thread in 0..MOST_PENDING_PER_CLIENT {
+                intents
+                    .publish_focus(
+                        &format!("t{client}-{thread}"),
+                        "thread",
+                        None,
+                        agent(client),
+                    )
+                    .unwrap();
+            }
+        }
+        let snapshot = intents.snapshot();
+        assert_eq!(snapshot.len(), SNAPSHOT_INTENTS + 1);
+        assert_eq!(snapshot.last().unwrap()["intentId"], kept["intentId"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_most_64_folders_keep_a_commit_message() {
+        let intents = UiIntents::new();
+        for folder in 0..=MOST_COMMIT_MESSAGES {
+            intents.publish_commit_message("t1", &format!("/repo/{folder}"), "Message", actor());
+        }
+        let kept = messages(&intents);
+        assert_eq!(kept.len(), MOST_COMMIT_MESSAGES);
+        assert_eq!(kept[0]["cwd"], "/repo/1", "the oldest folder was dropped");
+    }
+
+    #[test]
+    fn a_commit_message_holds_bounded_visible_text() {
+        assert!(check_commit_message("Fix it\n\n\tDetails\r\n").is_ok());
+        assert!(check_commit_message(&"x".repeat(MOST_COMMIT_MESSAGE_CHARS)).is_ok());
+        for refused in [
+            String::new(),
+            " \n\t".to_owned(),
+            "x".repeat(MOST_COMMIT_MESSAGE_CHARS + 1),
+            "escape \u{1b}[2J".to_owned(),
+            "nul\0".to_owned(),
+        ] {
+            assert!(check_commit_message(&refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn an_input_without_kind_is_a_focus_intent_and_kinds_keep_their_own_fields() {
+        assert!(matches!(
+            PublishInput::read(json!({ "threadId": "t1", "surface": "thread" })),
+            Ok(PublishInput::Focus(_))
+        ));
+        assert!(matches!(
+            PublishInput::read(
+                json!({ "kind": "commitMessage", "threadId": "t1", "cwd": "/repo", "message": "Fix" })
+            ),
+            Ok(PublishInput::CommitMessage(_))
+        ));
+        for refused in [
+            json!({ "kind": "commitMessage", "threadId": "t1", "surface": "thread" }),
+            json!({ "threadId": "t1", "cwd": "/repo", "message": "Fix" }),
+            json!({ "kind": "terminal", "threadId": "t1" }),
+            json!({ "kind": "commitMessage", "threadId": "t1", "cwd": "/repo", "message": "Fix", "extra": 1 }),
+        ] {
+            assert!(PublishInput::read(refused.clone()).is_err(), "{refused}");
+        }
     }
 
     #[tokio::test]
