@@ -856,6 +856,44 @@ async fn a_retry_whose_upload_expired_is_a_typed_error() {
     harness.shutdown().await;
 }
 
+/// A call the engine rejects releases the uploads it staged, so repeating it does not fill the
+/// session's upload quota until the uploads expire.
+#[tokio::test]
+async fn a_rejected_call_releases_its_uploads() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    for key in [None, Some("rejected-start")] {
+        let mut arguments = basic_start();
+        arguments["providerInstanceId"] = json!("no-such-provider");
+        arguments["attachments"] = json!([attachment("notes.txt", "text/plain", b"hello")]);
+        if let Some(key) = key {
+            arguments["clientRequestId"] = json!(key);
+        }
+        let refused = harness.call(&agent, "start_thread", arguments).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(staged_files(&harness), 0, "{key:?}: {refused}");
+    }
+    harness.shutdown().await;
+}
+
+/// Two calls with one clientRequestId each stage their attachments, and only one call's commands
+/// are stored. The other call's uploads are released.
+#[tokio::test]
+async fn uploads_that_lose_the_stored_request_race_are_released() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let mut arguments = basic_start();
+    arguments["attachments"] = json!([attachment("notes.txt", "text/plain", b"hello")]);
+    arguments["clientRequestId"] = json!("raced");
+    let (first, second) = tokio::join!(
+        harness.call(&agent, "start_thread", arguments.clone()),
+        harness.call(&agent, "start_thread", arguments),
+    );
+    assert_eq!(structured(&first), structured(&second));
+    assert_eq!(staged_files(&harness), 0);
+    harness.shutdown().await;
+}
+
 /// The upload service's quota bounds what an agent can park, and its refusal comes back typed.
 #[tokio::test]
 async fn the_upload_quota_error_comes_back_typed() {

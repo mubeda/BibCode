@@ -564,6 +564,7 @@ impl ToolCall<'_> {
         };
         // A retry with a known clientRequestId dispatches the stored commands instead, so a
         // default that changed since then does not change what it replays.
+        let staged_uploads = StagedUploads::default();
         let fresh = async || {
             let ceiling = self.control.effective_ceiling(self.principal);
             let runtime_mode = asked_mode.unwrap_or(ceiling);
@@ -602,7 +603,7 @@ impl ToolCall<'_> {
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
                 .map_or_else(|| title_from(prompt), str::to_owned);
-            let staged = self.stage(&attachments).await?;
+            let staged = self.stage(&attachments, &staged_uploads).await?;
             let created_at = now_iso();
             let thread_id = Uuid::new_v4().to_string();
             Ok(vec![json!({
@@ -634,14 +635,14 @@ impl ToolCall<'_> {
                 "createdAt": created_at,
             })])
         };
-        let commands = self.commands("start_thread", None, fresh).await?;
-        let command = commands
+        let commands = self.commands("start_thread", None, fresh).await;
+        self.release_unowned(staged_uploads, commands.as_deref().ok())
+            .await;
+        let command = commands?
             .into_iter()
             .next()
             .ok_or_else(|| storage_failure("a stored start_thread request has no command"))?;
-        self.dispatch(command.clone())
-            .await
-            .map_err(upload_expired)?;
+        self.dispatch_turn(&command).await?;
         Ok(tool_result(
             json!({
                 "threadId": command["threadId"],
@@ -666,10 +667,11 @@ impl ToolCall<'_> {
             Some("steer") => true,
             Some(_) => return Err(invalid_argument("mode is queue or steer")),
         };
+        let staged_uploads = StagedUploads::default();
         let fresh = async || {
             let thread = self.thread(thread_id).await?;
             self.check_thread_mode(&thread.runtime_mode)?;
-            let staged = self.stage(&attachments).await?;
+            let staged = self.stage(&attachments, &staged_uploads).await?;
             let created_at = now_iso();
             let message_id = Uuid::new_v4().to_string();
             let mut fresh = vec![json!({
@@ -693,14 +695,14 @@ impl ToolCall<'_> {
             }
             Ok(fresh)
         };
-        let commands = self
-            .commands("send_message", Some(thread_id), fresh)
-            .await?;
-        let mut commands = commands.into_iter();
+        let commands = self.commands("send_message", Some(thread_id), fresh).await;
+        self.release_unowned(staged_uploads, commands.as_deref().ok())
+            .await;
+        let mut commands = commands?.into_iter();
         let start = commands
             .next()
             .ok_or_else(|| storage_failure("a stored send_message request has no command"))?;
-        self.dispatch(start.clone()).await.map_err(upload_expired)?;
+        self.dispatch_turn(&start).await?;
         let mut steered = None;
         if let Some(steer) = commands.next() {
             steered = Some(match self.dispatch(steer).await {
@@ -1149,20 +1151,83 @@ impl ToolCall<'_> {
 
     /// Stages each attachment through the upload service under this call's session, which
     /// owns the uploads, and returns the message attachments that name them. Its quota bounds
-    /// what an agent can park. A failure cancels the uploads this call began.
-    async fn stage(&self, attachments: &[Attachment]) -> Result<Vec<Value>, Value> {
+    /// what an agent can park. A failure cancels the uploads this call began; otherwise their
+    /// ids are added to `record`, for [`Self::release_unowned`].
+    async fn stage(
+        &self,
+        attachments: &[Attachment],
+        record: &StagedUploads,
+    ) -> Result<Vec<Value>, Value> {
         let mut staged = Vec::with_capacity(attachments.len());
         for attachment in attachments {
             if let Err(failure) = self.stage_one(attachment, &mut staged).await {
-                for upload in &staged {
-                    let _ = self
-                        .invoke("uploads.cancel", json!({ "uploadId": upload["uploadId"] }))
-                        .await;
-                }
+                self.cancel_uploads(
+                    staged
+                        .iter()
+                        .filter_map(|upload| upload["uploadId"].as_str()),
+                )
+                .await;
                 return Err(failure);
             }
         }
+        record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(
+                staged
+                    .iter()
+                    .filter_map(|upload| upload["uploadId"].as_str().map(str::to_owned)),
+            );
         Ok(staged)
+    }
+
+    /// Cancels uploads this call staged that none of `commands` names: the call failed after
+    /// staging them, or another call with the same clientRequestId stored its commands first.
+    async fn release_unowned(&self, staged: StagedUploads, commands: Option<&[Value]>) {
+        let staged = staged
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owned: Vec<&str> = commands
+            .into_iter()
+            .flatten()
+            .flat_map(upload_ids)
+            .collect();
+        self.cancel_uploads(
+            staged
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !owned.contains(id)),
+        )
+        .await;
+    }
+
+    /// Dispatches turn start `command`. When the engine did not admit it (no receipt, or a
+    /// rejected one), nothing will bind its uploads, so they are cancelled instead of holding the
+    /// session's quota until they expire; a retry with the same clientRequestId then gets
+    /// `McpAttachmentExpiredError`. An admitted turn has already consumed them.
+    async fn dispatch_turn(&self, command: &Value) -> Result<Value, Value> {
+        let failure = match self.dispatch(command.clone()).await {
+            Ok(dispatched) => return Ok(dispatched),
+            Err(failure) => failure,
+        };
+        let receipt = self
+            .control
+            .repositories()
+            .get_command_receipt(command["commandId"].as_str().unwrap_or_default().to_owned())
+            .await;
+        if receipt.is_ok_and(|receipt| receipt.is_none_or(|receipt| receipt.status == "rejected")) {
+            self.cancel_uploads(upload_ids(command)).await;
+        }
+        Err(upload_expired(failure))
+    }
+
+    /// Cancels staged uploads; one already consumed or expired is not found, which is fine.
+    async fn cancel_uploads(&self, upload_ids: impl Iterator<Item = &str>) {
+        for upload_id in upload_ids {
+            let _ = self
+                .invoke("uploads.cancel", json!({ "uploadId": upload_id }))
+                .await;
+        }
     }
 
     async fn stage_one(
@@ -1359,6 +1424,19 @@ fn upload_expired(failure: Value) -> Value {
         );
     }
     failure
+}
+
+/// Upload ids a call staged, kept outside its `fresh` step so the ones no stored command names
+/// can be released.
+type StagedUploads = std::sync::Mutex<Vec<String>>;
+
+/// The staged upload ids turn start `command` names.
+fn upload_ids(command: &Value) -> impl Iterator<Item = &str> {
+    command["message"]["attachments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|attachment| attachment["uploadId"].as_str())
 }
 
 /// The highest turn count with a checkpoint on `thread_id`.
