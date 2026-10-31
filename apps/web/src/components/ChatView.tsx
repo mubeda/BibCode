@@ -424,6 +424,16 @@ const SENT_ROW_LANDING_MAX_MS = 2_000;
 const SENT_ROW_LANDING_ATTEMPTS = 20;
 const SENT_ROW_LANDING_ATTEMPT_MS = 1_000;
 /**
+ * The sent row's glide eases toward the row's offset: each frame covers the share of the remaining
+ * distance that time constant gives the time since the last frame, and at least the minimum step.
+ * It settles where it is after the longest glide, as the native glide did on its 750 ms timer,
+ * however few frames a busy webview paints, or after the most frames when frames come at once.
+ */
+const SENT_ROW_GLIDE_TIME_CONSTANT_MS = 90;
+const SENT_ROW_GLIDE_MIN_STEP = 0.2;
+const SENT_ROW_GLIDE_MAX_MS = 500;
+const SENT_ROW_GLIDE_MAX_FRAMES = 60;
+/**
  * How long after a scroll key LegendList keeps no content position, so its own scrolls do not
  * cancel the key's native scroll: WebKit started that scroll up to 816 ms after the keydown on
  * the macOS x64 runners (#207).
@@ -435,6 +445,25 @@ interface CancellableTimelineList {
   readonly cancelScrollRequests?: () => void;
 }
 
+/**
+ * How far the timeline must scroll for the sent row to rest at its offset: measured on screen once
+ * the row is mounted, and from LegendList's position for its row until then.
+ */
+function measureSentRowGlide(
+  list: LegendListRef,
+  scrollNode: HTMLElement,
+  messageId: MessageId,
+  anchorIndex: number,
+): number | null {
+  const measured = measureSentRowLanding(scrollNode, messageId);
+  if (measured !== undefined) {
+    return measured ?? 0;
+  }
+  const top = list.getState().positionAtIndex(anchorIndex);
+  return typeof top === "number" && Number.isFinite(top)
+    ? top - CHAT_LIST_ANCHOR_OFFSET - scrollNode.scrollTop
+    : null;
+}
 /**
  * How far the timeline must scroll for the sent row `messageId` to rest at its offset, measured
  * on screen: null within a pixel of it, undefined when the row is not mounted.
@@ -3515,6 +3544,7 @@ function ChatViewContent(props: ChatViewProps) {
     readonly userScrollGeneration: number;
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
+  const timelineGlideFrameRef = useRef<number | null>(null);
   const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
   // Whether the timeline follows its end, as state so LegendList stops keeping the list at its
   // end once the reader scrolls away: otherwise a change in the bottom region's height (the
@@ -3551,6 +3581,11 @@ function ChatViewContent(props: ChatViewProps) {
     if (anchorScrollRestoreFrameRef.current !== null) {
       cancelAnimationFrame(anchorScrollRestoreFrameRef.current);
       anchorScrollRestoreFrameRef.current = null;
+    }
+    // The glide stops where it is, and nothing scrolls the timeline after the reader's own input.
+    if (timelineGlideFrameRef.current !== null) {
+      cancelAnimationFrame(timelineGlideFrameRef.current);
+      timelineGlideFrameRef.current = null;
     }
     // The browser scrolls for a key only after the keydown, and a scroll LegendList makes before
     // then, such as holding the row below a streamed reply in place as it grows, cancels the
@@ -3785,28 +3820,48 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return;
         }
+        // The glide is ChatView's own, one instant scroll per frame toward the row's offset,
+        // measured again each frame. A browser's smooth scroll runs off the page's thread, where
+        // a scroll key's takeover cannot stop it: WebKit finished it over the stop, and on macOS
+        // arm64 that also cancelled the key's own scroll. LegendList also held the growth of a
+        // row above as an offset for an animated scroll, which a later scroll left behind (#214).
+        // A scroll the list still holds, such as an earlier row's landing waiting for rows to
+        // settle, would otherwise run over the glide.
+        (list as CancellableTimelineList).cancelScrollRequests?.();
         const scrollNode = list.getScrollableNode();
-        let finished = false;
-        const finishAnimatedPositioning = () => {
-          if (finished) {
+        const animates = timelineScrollAnimates();
+        const startedAt = performance.now();
+        let lastFrameAt = startedAt;
+        const glide = (frame: number) => {
+          timelineGlideFrameRef.current = null;
+          if (positionedTimelineAnchorRef.current !== messageId || legendListRef.current !== list) {
             return;
           }
-          finished = true;
-          window.clearTimeout(fallbackTimer);
-          scrollNode.removeEventListener("scrollend", finishAnimatedPositioning);
-          if (positionedTimelineAnchorRef.current !== messageId) {
+          const delta = measureSentRowGlide(list, scrollNode, messageId, anchorIndex);
+          const now = performance.now();
+          const step = animates
+            ? Math.max(
+                SENT_ROW_GLIDE_MIN_STEP,
+                1 - Math.exp(-(now - lastFrameAt) / SENT_ROW_GLIDE_TIME_CONSTANT_MS),
+              )
+            : 1;
+          lastFrameAt = now;
+          if (
+            delta !== null &&
+            Math.abs(delta) > 1 &&
+            frame < SENT_ROW_GLIDE_MAX_FRAMES &&
+            now - startedAt < SENT_ROW_GLIDE_MAX_MS
+          ) {
+            // Content the scroll cannot reach yet, such as end space the list has still to lay
+            // out, clamps it; the next frame tries again from where it got to.
+            const move = Math.abs(delta * step) < 1 ? delta : delta * step;
+            scrollNode.scrollTop = Math.max(0, Math.round(scrollNode.scrollTop + move));
+            timelineGlideFrameRef.current = requestAnimationFrame(() => glide(frame + 1));
             return;
           }
           settleSentTimelineRowRef.current(messageId);
         };
-        const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
-        scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
-        void list.scrollToIndex({
-          index: anchorIndex,
-          animated: true,
-          viewPosition: 0,
-          viewOffset: CHAT_LIST_ANCHOR_OFFSET,
-        });
+        glide(0);
       });
     };
     requestAnimationFrame(() => positionAnchor(12));
