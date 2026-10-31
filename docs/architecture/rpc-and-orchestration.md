@@ -3557,10 +3557,13 @@ instead of failing the call.
   tag the MCP layer returns with its meaning and fix. A unit test scans `mcp/**` and
   `rpc/session.rs` and fails on an `Mcp…Error` literal the table lacks.
 - **`changes_since`** reads `Repositories::read_change_feed` in one SQLite transaction: at
-  most 5,000 events after the cursor's sequence (a thread's through its stream index), of
-  which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
+  most 5,000 events after the cursor's sequence (a thread's through its stream index),
+  stopped before the event whose transition-type payload would bring the bytes SQLite parses
+  past 4 MiB (`octet_length` reads each size from the record header; the first event is
+  always kept), of which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
   `thread.session-set` and the approval and input `thread.activity-appended` events come
-  back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`;
+  back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`
+  (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`);
   and the `mcp_activity` rows after the cursor's activity id. A session update reads the
   status and turn of the thread's previous session update, so it maps to `turn.started`,
   `turn.completed`, `turn.interrupted`, `turn.failed` or `session.status`, or to nothing.
