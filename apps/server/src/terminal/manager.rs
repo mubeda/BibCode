@@ -361,12 +361,16 @@ impl TerminalSessionIdentity {
         self.generation.cancellation.clone()
     }
 
-    pub(super) async fn write_input(
+    /// Queues one ordered input frame for the process, under the publication lock and
+    /// without waiting for the write. The queueing happens in the same poll that returns, so
+    /// a caller that drops this future before it is ready has queued nothing; the returned
+    /// write is dropped with its handle unless the writer has started it.
+    pub(super) async fn enqueue_input(
         &self,
         data: &str,
         cancelled: &CancellationToken,
         connection_closed: &CancellationToken,
-    ) -> Result<(), TerminalError> {
+    ) -> Result<super::writer::PendingWrite, TerminalError> {
         let _publication = tokio::select! {
             biased;
             () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
@@ -395,19 +399,7 @@ impl TerminalSessionIdentity {
             });
         }
         drop(session);
-        // The write stays inside this poll: `PreparedTerminalInput::write` runs this again
-        // when its admission is replaced, so a write handed to another thread and abandoned
-        // here would send the frame twice. `block_in_place` instead hands this worker's other
-        // tasks to another thread while a child that reads no input holds the write.
-        let write = || self.process.write(data).map_err(TerminalError::Io);
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime)
-                if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-            {
-                tokio::task::block_in_place(write)
-            }
-            _ => write(),
-        }
+        self.generation.writer.enqueue(&self.process, data, true)
     }
 }
 
@@ -1190,8 +1182,9 @@ struct SessionGeneration {
     cancellation: CancellationToken,
     publication: Mutex<()>,
     startup: Arc<Mutex<()>>,
-    /// Orders unary `write`s, which run on blocking threads; held until the bytes are in.
-    unary_writes: Arc<Mutex<()>>,
+    /// The process's input queue: unary and ordered writes are enqueued under `publication`
+    /// and written by the writer's own thread, outside it.
+    writer: super::writer::TerminalWriter,
     output_started: std::sync::atomic::AtomicBool,
     output_stop: CancellationToken,
     output_completed: CancellationToken,
@@ -1215,7 +1208,7 @@ impl SessionGeneration {
             cancellation: CancellationToken::new(),
             publication: Mutex::new(()),
             startup: Arc::new(Mutex::new(())),
-            unary_writes: Arc::new(Mutex::new(())),
+            writer: super::writer::TerminalWriter::default(),
             output_started: std::sync::atomic::AtomicBool::new(false),
             output_stop: CancellationToken::new(),
             output_completed: CancellationToken::new(),
@@ -3370,7 +3363,7 @@ impl TerminalManager {
         };
         let session = self.require_session(thread_id, terminal_id).await?;
         let generation = session.lock().await.generation.clone();
-        let (process, writes) = {
+        let mut pending = {
             let _publication = generation.publication.lock().await;
             let (process, status) = {
                 let session = session.lock().await;
@@ -3388,25 +3381,13 @@ impl TerminalManager {
                     terminal_id: terminal_id.to_owned(),
                 });
             }
-            (
-                process.ok_or_else(not_running)?,
-                generation.unary_writes.clone(),
-            )
+            // Queued without waiting; the writer's thread writes it outside this lock, after
+            // any input queued before it. Dropping this future leaves the write queued.
+            generation
+                .writer
+                .enqueue(&process.ok_or_else(not_running)?, data, false)?
         };
-        // A PTY write blocks while the child reads no input. It runs on a blocking thread,
-        // outside the publication lock, so neither a runtime worker nor the terminal's output
-        // waits for it. The generation's write lock, taken in order and held by the blocking
-        // thread until the bytes are in, keeps unary writes ordered; dropping this future
-        // leaves the write to finish, and the next one waits behind it.
-        let writing = writes.lock_owned().await;
-        let data = data.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let _writing = writing;
-            process.write(&data)
-        })
-        .await
-        .map_err(|error| TerminalError::Io(error.to_string()))?
-        .map_err(TerminalError::Io)
+        pending.wait().await
     }
 
     pub async fn resize(
@@ -8624,6 +8605,195 @@ mod tests {
         ));
         assert!(backend.latest().writes().is_empty());
         manager.shutdown().await;
+    }
+
+    /// Runs `future` on the runtime and tells, from the test thread, whether it finished
+    /// within `seconds`.
+    fn finishes_within<F>(seconds: u64, future: F) -> bool
+    where
+        F: std::future::Future + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            future.await;
+            let _ = sender.send(());
+        });
+        receiver.recv_timeout(Duration::from_secs(seconds)).is_ok()
+    }
+
+    /// A unary (MCP) write the child never reads holds the terminal's input; typing in the
+    /// same terminal queues behind it, while output publication and close go on (#139 slice
+    /// T review, round 3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_unary_write_never_blocks_typing_publication_or_close() {
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write("thread", "term", "stuck").await }
+        });
+        gate.wait_entered();
+        tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                ordered_write(
+                    &manager, connection, "thread", "term", &input_id, 0, "typed",
+                )
+                .await
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let clearing = manager.clone();
+        assert!(
+            finishes_within(2, async move { clearing.clear("thread", "term").await }),
+            "typing behind a stuck write holds the publication lock"
+        );
+        let closing = manager.clone();
+        assert!(
+            finishes_within(
+                5,
+                async move { closing.close("thread", Some("term")).await }
+            ),
+            "a stuck write blocks close"
+        );
+        gate.open();
+        manager.shutdown().await;
+    }
+
+    /// Typing queued behind a stuck write is dropped when the input session loses its
+    /// admission, so it never reaches the program later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_typing_is_dropped_when_its_admission_is_lost() {
+        let (_root, backend, manager, connection, closed, _input_id) =
+            ordered_input_fixture().await;
+        let lost = CancellationToken::new();
+        let lease = manager
+            .begin_input(
+                connection,
+                closed,
+                "thread",
+                "term",
+                1,
+                Some(super::super::input::TerminalInputAdmission::new(
+                    lost.clone(),
+                    (),
+                    None,
+                )),
+            )
+            .await
+            .expect("admitted lease");
+        let gate = Arc::new(WriteGate::default());
+        *backend.latest().write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write("thread", "term", "stuck").await }
+        });
+        gate.wait_entered();
+        let typing = tokio::spawn({
+            let manager = manager.clone();
+            let input_id = lease.input_id.clone();
+            async move {
+                ordered_write(
+                    &manager, connection, "thread", "term", &input_id, 0, "typed",
+                )
+                .await
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        lost.cancel();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(typing.await.unwrap().is_err());
+        });
+        // The frame fails at once, without waiting for the stuck write to drain.
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)), Ok(true));
+        gate.open();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(backend.latest().writes(), ["stuck"]);
+        manager.shutdown().await;
+    }
+
+    /// PTY writes run on terminal writer threads, never Tokio's blocking pool, so stuck
+    /// terminals cannot use it up.
+    #[test]
+    fn stuck_terminal_writes_never_take_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut gates = Vec::new();
+        let (_root, manager) = runtime.block_on(async {
+            let (root, backend, manager, gate) = gated_terminal().await;
+            gates.push(OpenOnDrop(gate.clone()));
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread",
+                    "other",
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+            let other = Arc::new(WriteGate::default());
+            *backend.latest().write_gate.lock().unwrap() = Some(other.clone());
+            gates.push(OpenOnDrop(other));
+            for terminal in ["term", "other"] {
+                let manager = manager.clone();
+                tokio::spawn(async move { manager.write("thread", terminal, "stuck").await });
+            }
+            (root, manager)
+        });
+        for gate in &gates {
+            gate.0.wait_entered();
+        }
+        let free = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(|| ())).await
+        });
+        assert!(free.is_ok(), "stuck terminal writes hold the blocking pool");
+        drop(gates);
+        runtime.block_on(manager.shutdown());
+    }
+
+    /// A terminal whose program reads no input refuses input past its queue's bound instead
+    /// of holding it without limit.
+    #[tokio::test]
+    async fn a_terminal_refuses_input_past_its_queue_bound() {
+        let process = Arc::new(HistoryTestPty::with_identity(7));
+        let gate = Arc::new(WriteGate::default());
+        *process.write_gate.lock().unwrap() = Some(gate.clone());
+        let _open = OpenOnDrop(gate.clone());
+        let process: Arc<dyn PtyProcess> = process;
+        let writer = super::super::writer::TerminalWriter::default();
+        let chunk = "z".repeat(64 * 1024);
+        let mut pending = Vec::new();
+        for _ in 0..super::super::writer::MOST_QUEUED_INPUT_BYTES / chunk.len() {
+            pending.push(
+                writer
+                    .enqueue(&process, &chunk, false)
+                    .expect("within the bound"),
+            );
+        }
+        assert!(matches!(
+            writer.enqueue(&process, &chunk, false),
+            Err(TerminalError::Io(_))
+        ));
+        gate.open();
+        for mut write in pending {
+            write.wait().await.expect("written once the program reads");
+        }
+        writer
+            .enqueue(&process, "after", false)
+            .expect("room again")
+            .wait()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -29,8 +29,12 @@ pub(crate) struct TerminalHistory {
     epoch: u64,
 }
 
-/// Hands out history epochs; never reused while the process runs.
-static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Hands out history epochs. It starts at a random value, so another server lifetime (a
+/// restart, which reopens terminal ids) never hands out the epochs of this one.
+static NEXT_EPOCH: std::sync::LazyLock<std::sync::atomic::AtomicU64> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicU64::new(uuid::Uuid::new_v4().as_u64_pair().0)
+    });
 
 /// A position in one history's output: its epoch and a byte offset into everything it was
 /// ever given. Written `<epoch>:<offset>`.
@@ -689,6 +693,36 @@ mod tests {
         let window = history.read_window(history.at(1_000), 100);
         assert!(window.dropped);
         assert_eq!((window.start, window.text.as_str()), (0, "fresh"));
+    }
+
+    /// Two server lifetimes never hand out the same epoch, so a cursor kept across a restart
+    /// cannot match a reopened terminal's history (#139 slice T review, round 3). Each phase
+    /// runs in a process of its own and writes its first epoch to a file.
+    #[test]
+    fn epochs_differ_across_server_lifetimes() {
+        const NAME: &str = "terminal::history::tests::epochs_differ_across_server_lifetimes";
+        const FILE: &str = "BIBCODE_TEST_EPOCH_FILE";
+        for phase in ["first", "second"] {
+            if let Some(child) = crate::test_support::reexec::enter(NAME, phase) {
+                let epoch = TerminalHistory::new(1).at(0).epoch;
+                std::fs::write(std::env::var(FILE).expect("epoch file"), epoch.to_string())
+                    .expect("epoch written");
+                child.complete();
+                return;
+            }
+        }
+        let directory = tempfile::tempdir().expect("epoch directory");
+        let epochs: Vec<String> = ["first", "second"]
+            .into_iter()
+            .map(|phase| {
+                let file = directory.path().join(phase);
+                crate::test_support::reexec::run(NAME, phase, None, |command| {
+                    command.env(FILE, &file);
+                });
+                std::fs::read_to_string(file).expect("epoch read")
+            })
+            .collect();
+        assert_ne!(epochs[0], epochs[1]);
     }
 
     #[test]
