@@ -953,7 +953,8 @@ fn dropped_key(endpoint_id: &str) -> String {
 }
 
 /// Deliveries an endpoint lost to a full queue and has not been told about yet: their count,
-/// the range of change-feed cursors they carried, and the earliest finding `lastSeen`. The
+/// the range of change-feed cursors they cover (`from_cursor` is the position just before the
+/// first, `to_cursor` the last one's own), and the earliest finding `lastSeen`. The
 /// next delivery to the endpoint carries it as `dropped`, and it is cleared once one arrives.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -978,11 +979,25 @@ fn cursor_order(cursor: &str) -> Option<(i64, i64)> {
     Some((sequence.parse().ok()?, activity.parse().ok()?))
 }
 
+/// The cursor to resume `changes_since` from so that the entry `cursor` follows. The feed
+/// reads strictly after the cursor it is given and an entry's cursor is the position just
+/// after it, so a resume from the entry's own cursor would skip it. Each component moves back
+/// by one, which can only repeat one entry already delivered (events carry stable ids); a
+/// cursor of another shape is kept, as it can only be a hand-made test value.
+fn before(cursor: &str) -> String {
+    match cursor_order(cursor) {
+        Some((sequence, activity)) => {
+            format!("v1.{}.{}", (sequence - 1).max(0), (activity - 1).max(0))
+        }
+        None => cursor.to_owned(),
+    }
+}
+
 impl Dropped {
     fn add(&mut self, cursor: Option<&str>, last_seen: Option<&str>) {
         self.merge(&Self {
             count: 1,
-            from_cursor: cursor.map(str::to_owned),
+            from_cursor: cursor.map(before),
             to_cursor: cursor.map(str::to_owned),
             since_last_seen: last_seen.map(str::to_owned),
         });
