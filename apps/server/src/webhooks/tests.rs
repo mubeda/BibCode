@@ -779,11 +779,13 @@ async fn disabling_an_endpoint_stops_its_request_in_flight_and_its_queue() {
             .all(|delivery| delivery["state"] == "abandoned")
     })
     .await;
+    // The second event of the first turn may or may not have been queued before it was off.
+    let queued = harness.deliveries(&endpoint).await.len();
     harness.turn("thread-1", "turn-2").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(harness.receiver.received().len(), 1);
     // Nothing new is queued for a disabled endpoint.
-    assert_eq!(harness.deliveries(&endpoint).await.len(), 2);
+    assert_eq!(harness.deliveries(&endpoint).await.len(), queued);
     harness.webhooks.shutdown().await;
 }
 
@@ -804,6 +806,10 @@ async fn turning_webhooks_off_abandons_the_queue_and_starts_from_now_when_turned
     .await;
     harness.turn("thread-1", "turn-1").await;
     wait_for_requests(&harness.receiver, 1).await;
+    eventually("both events queued", async || {
+        harness.deliveries(&endpoint).await.len() == 2
+    })
+    .await;
     harness.enabled.send_replace(false);
     eventually("the queue to be abandoned", async || {
         harness
@@ -1148,6 +1154,58 @@ async fn send_test_redeliver_rotate_and_delete() {
             .unwrap()
             .is_none()
     );
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_environment_writes_nothing_between_passes() {
+    let harness = Harness::new().await;
+    harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    eventually("the feed position", async || {
+        harness
+            .webhooks
+            .store()
+            .position(store::FEED_POSITION)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    // Let the first passes settle (the findings position, the first prune).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let changes = || async {
+        harness
+            .database
+            .call(|connection| Ok(connection.total_changes()))
+            .await
+            .unwrap()
+    };
+    let before = changes().await;
+    // About ten passes at the test's 30 ms poll.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(changes().await, before);
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_secret_is_never_sent_unsigned() {
+    let harness = Harness::new().await;
+    harness.enabled.send_replace(true);
+    let (endpoint, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    std::fs::remove_file(
+        harness
+            .secrets_dir
+            .path()
+            .join(format!("webhook-{endpoint}.bin")),
+    )
+    .unwrap();
+    let sent = harness
+        .call("sendTest", json!({ "id": endpoint }))
+        .await
+        .unwrap();
+    assert_eq!(sent["delivery"]["state"], "failed");
+    assert_eq!(sent["delivery"]["lastError"], "secret_missing");
+    assert!(harness.receiver.received().is_empty());
     harness.webhooks.shutdown().await;
 }
 
