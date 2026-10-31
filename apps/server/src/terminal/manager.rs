@@ -1224,6 +1224,9 @@ impl SessionGeneration {
         self.invalidated
             .store(true, std::sync::atomic::Ordering::Release);
         self.cancellation.cancel();
+        // Close, exit, restart and shutdown all end here: the input writer's thread and its
+        // hold on the process go now, not after its idle timeout.
+        self.writer.stop();
     }
 
     fn is_invalidated(&self) -> bool {
@@ -8759,6 +8762,58 @@ mod tests {
         assert!(free.is_ok(), "stuck terminal writes hold the blocking pool");
         drop(gates);
         runtime.block_on(manager.shutdown());
+    }
+
+    /// Close and shutdown stop a terminal's input writer at once, so its thread and its hold
+    /// on the process go with the terminal instead of after the idle timeout (#139 slice T
+    /// review, round 4).
+    #[tokio::test]
+    async fn close_and_shutdown_stop_the_input_writer_at_once() {
+        let (root, _backend, manager, gate) = gated_terminal().await;
+        gate.open();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "other",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let mut generations = Vec::new();
+        for terminal in ["term", "other"] {
+            manager.write("thread", terminal, "ls\n").await.unwrap();
+            let generation = manager
+                .require_session("thread", terminal)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .generation
+                .clone();
+            assert!(generation.writer.thread_alive(), "{terminal}");
+            generations.push(generation);
+        }
+        let stopped = |generation: Arc<SessionGeneration>| async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while generation.writer.thread_alive() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+        manager.close("thread", Some("term")).await.unwrap();
+        assert!(
+            stopped(generations[0].clone()).await,
+            "close kept the writer"
+        );
+        manager.shutdown().await;
+        assert!(
+            stopped(generations[1].clone()).await,
+            "shutdown kept the writer"
+        );
     }
 
     /// A terminal whose program reads no input refuses input past its queue's bound instead

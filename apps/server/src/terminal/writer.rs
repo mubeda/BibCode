@@ -10,7 +10,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -39,6 +39,19 @@ pub(crate) struct TerminalWriter {
     /// so a retiring thread that finds its queue empty under it can never miss one.
     queue: Arc<Mutex<Option<mpsc::Sender<Job>>>>,
     queued: Arc<AtomicUsize>,
+    /// Whether a writer thread runs; it clears this as it exits.
+    alive: Arc<AtomicBool>,
+    /// Set by [`Self::stop`]: no input is written or queued after it.
+    stopped: Arc<AtomicBool>,
+}
+
+/// Clears the writer's `alive` flag however its thread ends.
+struct Alive(Arc<AtomicBool>);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for TerminalWriter {
@@ -96,6 +109,9 @@ impl TerminalWriter {
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(TerminalError::PublicationCancelled);
+        }
         if self.queued.load(Ordering::Acquire) + length > MOST_QUEUED_INPUT_BYTES {
             return Err(TerminalError::Io(
                 "the terminal's program is not reading its input, and its input queue is full"
@@ -130,11 +146,41 @@ impl TerminalWriter {
         let (sender, receiver) = mpsc::channel::<Job>();
         let queue = Arc::clone(&self.queue);
         let queued = Arc::clone(&self.queued);
+        let stopped = Arc::clone(&self.stopped);
+        self.alive.store(true, Ordering::Release);
+        let alive = Alive(Arc::clone(&self.alive));
         std::thread::Builder::new()
             .name("terminal-input".to_owned())
-            .spawn(move || drain(&*process, &receiver, &queue, &queued))
-            .map_err(|error| TerminalError::Io(format!("no terminal input writer: {error}")))?;
+            .spawn(move || {
+                let _alive = alive;
+                drain(&*process, &receiver, &queue, &queued, &stopped);
+            })
+            .map_err(|error| {
+                self.alive.store(false, Ordering::Release);
+                TerminalError::Io(format!("no terminal input writer: {error}"))
+            })?;
         Ok(sender)
+    }
+
+    /// Stops the writer for good, when its process's terminal ends (close, exit, restart or
+    /// shutdown). Input still queued is answered as cancelled, later input is refused, and
+    /// the thread, with its hold on the process, ends as soon as any write in the kernel
+    /// returns; the process's end makes that write fail. Nothing waits for it, so a write
+    /// stuck in the kernel leaves only a detached thread.
+    pub(crate) fn stop(&self) {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stopped.store(true, Ordering::Release);
+        // The only sender outside the thread: dropping it disconnects the thread's queue.
+        *queue = None;
+    }
+
+    /// Whether a writer thread is running.
+    #[cfg(test)]
+    pub(crate) fn thread_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
@@ -143,6 +189,7 @@ fn drain(
     receiver: &mpsc::Receiver<Job>,
     queue: &Mutex<Option<mpsc::Sender<Job>>>,
     queued: &AtomicUsize,
+    stopped: &AtomicBool,
 ) {
     loop {
         let job = match receiver.recv_timeout(IDLE) {
@@ -162,7 +209,7 @@ fn drain(
                 }
             }
         };
-        let result = if job.cancel.is_cancelled() {
+        let result = if job.cancel.is_cancelled() || stopped.load(Ordering::Acquire) {
             Err(TerminalError::PublicationCancelled)
         } else {
             process.write(&job.data).map_err(TerminalError::Io)
