@@ -3,6 +3,7 @@
 //! registers it.
 
 pub(crate) mod diagnostics;
+pub(crate) mod feed;
 pub(crate) mod git;
 pub(crate) mod previews;
 pub(crate) mod pull_requests;

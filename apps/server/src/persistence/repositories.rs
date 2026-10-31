@@ -166,6 +166,30 @@ impl Repositories {
         }
     }
 
+    /// The newest event sequence, and the newest agent activity id ever assigned (pruned rows
+    /// included): the position `changes_since` starts from without a cursor.
+    pub async fn change_feed_heads(&self) -> Result<(i64, i64)> {
+        self.database
+            .call(|connection| change_feed_heads(connection))
+            .await
+    }
+
+    /// The content-free read behind `changes_since` (#139 slice X3), in one snapshot: at most
+    /// `scan_limit` events after `after_sequence` (only `thread_id`'s when set), of which those
+    /// that are transitions come back with ids, enums and timestamps extracted in SQL, and up
+    /// to `activity_limit` agent activity rows after `after_activity`. No payload text is read
+    /// into memory.
+    pub async fn read_change_feed(&self, query: ChangeFeedQuery) -> Result<ChangeFeedRead> {
+        self.database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let read = read_change_feed(&transaction, &query)?;
+                transaction.commit()?;
+                Ok(read)
+            })
+            .await
+    }
+
     pub async fn max_event_sequence(&self) -> Result<i64> {
         self.database
             .call(|connection| {
@@ -2868,6 +2892,213 @@ fn decode_json(value: String, _column: &str) -> rusqlite::Result<Value> {
 }
 fn decode_optional_json(value: Option<String>, column: &str) -> rusqlite::Result<Option<Value>> {
     value.map(|value| decode_json(value, column)).transpose()
+}
+
+/// What `changes_since` asks [`Repositories::read_change_feed`] for.
+#[derive(Clone, Debug)]
+pub struct ChangeFeedQuery {
+    pub after_sequence: i64,
+    pub after_activity: i64,
+    pub thread_id: Option<String>,
+    pub scan_limit: usize,
+    pub activity_limit: usize,
+}
+
+/// One event that may be a `changes_since` transition: ids, enums and timestamps only.
+#[derive(Clone, Debug, Default)]
+pub struct TransitionRow {
+    pub sequence: i64,
+    pub event_type: String,
+    pub thread_id: String,
+    pub occurred_at: String,
+    /// `thread.created`: the thread's kind (`panel` for a chat panel).
+    pub thread_kind: Option<String>,
+    /// `thread.session-set`: the session's status and active turn, and those of the thread's
+    /// session update before it.
+    pub status: Option<String>,
+    pub turn_id: Option<String>,
+    pub previous_status: Option<String>,
+    pub previous_turn_id: Option<String>,
+    /// `thread.activity-appended`: the approval or input activity's kind and request id.
+    pub activity_kind: Option<String>,
+    pub request_id: Option<String>,
+    /// The event's `metadata.actor` as JSON (slice X1), when an outside agent planned it.
+    pub actor_json: Option<String>,
+}
+
+/// One `mcp_activity` row (slice X1): ids, an outcome tag and a target of ids and counts.
+#[derive(Clone, Debug)]
+pub struct ActivityChangeRow {
+    pub activity_id: i64,
+    pub occurred_at: String,
+    pub session_id: String,
+    pub label: Option<String>,
+    pub tool: String,
+    pub thread_id: Option<String>,
+    pub outcome: String,
+    pub target_json: String,
+}
+
+/// One snapshot of both logs after a `changes_since` cursor.
+#[derive(Clone, Debug)]
+pub struct ChangeFeedRead {
+    /// The scanned events that may be transitions, in sequence order.
+    pub transitions: Vec<TransitionRow>,
+    /// How many events were scanned, and the last one's sequence (the cursor's when none).
+    pub scanned: usize,
+    pub scanned_to: i64,
+    /// Activity rows after the cursor, in id order.
+    pub activity: Vec<ActivityChangeRow>,
+    /// The oldest activity row kept, if any.
+    pub oldest_activity: Option<i64>,
+    /// [`Repositories::change_feed_heads`] in the same snapshot.
+    pub event_head: i64,
+    pub activity_head: i64,
+}
+
+/// The events `changes_since` maps, and the approval and input activities among
+/// `thread.activity-appended`.
+const TRANSITION_FILTER: &str = "e.aggregate_kind = 'thread' AND (e.event_type IN ('thread.created', 'thread.archived', 'thread.turn-start-requested', 'thread.session-set') OR (e.event_type = 'thread.activity-appended' AND json_extract(e.payload_json, '$.activity.kind') IN ('approval.requested', 'approval.resolved', 'approval.expired', 'user-input.requested', 'user-input.resolved', 'user-input.expired')))";
+
+/// The transition fields, extracted in SQL. A session update also reads the status and turn
+/// of the thread's session update before it, through the stream's index.
+const TRANSITION_COLUMNS: &str = "e.sequence, e.event_type, e.stream_id, e.occurred_at, \
+    CASE WHEN e.event_type = 'thread.created' THEN json_extract(e.payload_json, '$.kind') END, \
+    CASE WHEN e.event_type = 'thread.session-set' THEN json_extract(e.payload_json, '$.session.status') END, \
+    CASE WHEN e.event_type = 'thread.session-set' THEN json_extract(e.payload_json, '$.session.activeTurnId') END, \
+    CASE WHEN e.event_type = 'thread.session-set' THEN (SELECT json_array(json_extract(p.payload_json, '$.session.status'), json_extract(p.payload_json, '$.session.activeTurnId')) FROM orchestration_events AS p WHERE p.aggregate_kind = 'thread' AND p.stream_id = e.stream_id AND p.sequence < e.sequence AND p.event_type = 'thread.session-set' ORDER BY p.sequence DESC LIMIT 1) END, \
+    CASE WHEN e.event_type = 'thread.activity-appended' THEN json_extract(e.payload_json, '$.activity.kind') END, \
+    CASE WHEN e.event_type = 'thread.activity-appended' THEN COALESCE(json_extract(e.payload_json, '$.activity.payload.requestId'), json_extract(e.metadata_json, '$.requestId')) END, \
+    json_extract(e.metadata_json, '$.actor')";
+
+fn change_feed_heads(connection: &Connection) -> Result<(i64, i64)> {
+    Ok(connection.query_row(
+        "SELECT (SELECT COALESCE(MAX(sequence), 0) FROM orchestration_events), \
+           MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'mcp_activity'), 0), \
+               COALESCE((SELECT MAX(activity_id) FROM mcp_activity), 0))",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<ChangeFeedRead> {
+    let (event_head, activity_head) = change_feed_heads(connection)?;
+    let scan_limit = i64::try_from(query.scan_limit).unwrap_or(i64::MAX);
+    let thread = query.thread_id.as_deref();
+    // The scanned window: a thread's events through its stream index, or every event.
+    let (scanned, scanned_to): (i64, Option<i64>) = match thread {
+        Some(thread_id) => connection.query_row(
+            "SELECT COUNT(*), MAX(sequence) FROM (SELECT sequence FROM orchestration_events \
+             WHERE aggregate_kind = 'thread' AND stream_id = ?1 AND sequence > ?2 \
+             ORDER BY sequence LIMIT ?3)",
+            params![thread_id, query.after_sequence, scan_limit],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?,
+        None => connection.query_row(
+            "SELECT COUNT(*), MAX(sequence) FROM (SELECT sequence FROM orchestration_events \
+             WHERE sequence > ?1 ORDER BY sequence LIMIT ?2)",
+            params![query.after_sequence, scan_limit],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?,
+    };
+    let scanned_to = scanned_to.unwrap_or(query.after_sequence);
+    let transitions = {
+        // A thread's window is read through its stream index, not the whole range.
+        let stream = if thread.is_some() {
+            "e.stream_id = ?3 AND"
+        } else {
+            "?3 IS NULL AND"
+        };
+        let sql = format!(
+            "SELECT {TRANSITION_COLUMNS} FROM orchestration_events AS e \
+             WHERE {stream} e.sequence > ?1 AND e.sequence <= ?2 AND {TRANSITION_FILTER} \
+             ORDER BY e.sequence"
+        );
+        let mut statement = connection.prepare_cached(&sql)?;
+        statement
+            .query_map(
+                params![query.after_sequence, scanned_to, thread],
+                decode_transition,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let activity_limit = i64::try_from(query.activity_limit).unwrap_or(i64::MAX);
+    let activity = {
+        let mut statement = connection.prepare_cached(
+            "SELECT activity_id, occurred_at, session_id, label, tool, thread_id, outcome, target_json \
+             FROM mcp_activity WHERE activity_id > ?1 AND (?2 IS NULL OR thread_id = ?2) \
+             ORDER BY activity_id LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![query.after_activity, thread, activity_limit],
+                |row| {
+                    Ok(ActivityChangeRow {
+                        activity_id: row.get(0)?,
+                        occurred_at: row.get(1)?,
+                        session_id: row.get(2)?,
+                        label: row.get(3)?,
+                        tool: row.get(4)?,
+                        thread_id: row.get(5)?,
+                        outcome: row.get(6)?,
+                        target_json: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let oldest_activity =
+        connection.query_row("SELECT MIN(activity_id) FROM mcp_activity", [], |row| {
+            row.get(0)
+        })?;
+    Ok(ChangeFeedRead {
+        transitions,
+        scanned: usize::try_from(scanned).unwrap_or(0),
+        scanned_to,
+        activity,
+        oldest_activity,
+        event_head,
+        activity_head,
+    })
+}
+
+/// A column as text, or `None` for null or any other type: a hand-edited payload never fails
+/// the read.
+fn text_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Text(text) => std::str::from_utf8(text).ok().map(str::to_owned),
+        _ => None,
+    })
+}
+
+fn decode_transition(row: &Row<'_>) -> rusqlite::Result<TransitionRow> {
+    let previous: Option<Vec<Option<String>>> = text_column(row, 7)?
+        .and_then(|previous| serde_json::from_str::<Vec<Value>>(&previous).ok())
+        .map(|previous| {
+            previous
+                .into_iter()
+                .map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        });
+    let previous_field = |index: usize| {
+        previous
+            .as_ref()
+            .and_then(|previous| previous.get(index).cloned().flatten())
+    };
+    Ok(TransitionRow {
+        sequence: row.get(0)?,
+        event_type: row.get(1)?,
+        thread_id: row.get(2)?,
+        occurred_at: row.get(3)?,
+        thread_kind: text_column(row, 4)?,
+        status: text_column(row, 5)?,
+        turn_id: text_column(row, 6)?,
+        previous_status: previous_field(0),
+        previous_turn_id: previous_field(1),
+        activity_kind: text_column(row, 8)?,
+        request_id: text_column(row, 9)?,
+        actor_json: text_column(row, 10)?,
+    })
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
