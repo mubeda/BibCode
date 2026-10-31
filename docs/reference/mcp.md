@@ -975,7 +975,7 @@ Lists BiBCode projects (with their folders) and their threads, newest first, wit
 
 **Errors:** none specific beyond the common ones (a bad cursor is `McpInvalidArgumentError`).
 
-**Notes:** The first call (no cursors) returns both lists. Page projects and threads with their own cursors; a call with both cursors continues both. The description of this tool mentions a `queued` status, but thread summaries never carry it (see the status list above).
+**Notes:** The first call (no cursors) returns both lists. Page projects and threads with their own cursors; a call with both cursors continues both. Thread summaries never carry `queued` or `completed`; only `wait_for_thread` returns them (see the status list above).
 
 #### `list_providers_and_models`
 
