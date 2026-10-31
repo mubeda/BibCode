@@ -635,6 +635,71 @@ async fn a_refused_remote_delete_is_a_partial_outcome_that_replays_and_recovers(
     fixture.harness.shutdown().await;
 }
 
+/// Marks the fixture's thread deleted, as deleting it in BiBCode does.
+async fn delete_thread(fixture: &Fixture) {
+    fixture
+        .harness
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE projection_threads SET deleted_at = ? WHERE thread_id = ?",
+                [CREATED_AT, THREAD],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+/// A keyed retry returns its recorded outcome after the thread is deleted: the folder is
+/// resolved inside the recorded work, never before the outcome is read. The status summary is
+/// then null, since the thread no longer names a folder. A partial branch delete keeps the
+/// remote target its recovery needs.
+#[tokio::test]
+async fn a_recorded_outcome_is_returned_after_its_thread_is_deleted() {
+    let fixture = fixture().await;
+    fixture.write("b.txt", "b\n");
+    structured(
+        &fixture
+            .call("git_stage", json!({ "paths": ["b.txt"] }))
+            .await,
+    );
+    let commit = json!({ "summary": "Add b", "clientRequestId": "commit-then-delete" });
+    let committed = fixture.call("git_commit", commit.clone()).await;
+    let sha = structured(&committed)["sha"].clone();
+    assert!(sha.is_string(), "{committed}");
+    publish_feature(&fixture).await;
+    fixture.remote_git(&["config", "receive.denyDeletes", "true"]);
+    let delete = json!({ "name": "feature", "deleteRemote": true, "clientRequestId": "partial-then-delete" });
+    let partial = fixture.call("git_delete_branch", delete.clone()).await;
+    assert_eq!(error_tag(&partial), "McpPartialOutcomeError");
+    let outcome = error(&partial).clone();
+
+    delete_thread(&fixture).await;
+
+    let again = fixture.call("git_commit", commit).await;
+    assert_eq!(structured(&again)["sha"], sha, "{again}");
+    assert_eq!(structured(&again)["status"], Value::Null);
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "2");
+    let again = fixture.call("git_delete_branch", delete).await;
+    assert_eq!(error(&again), &outcome, "{again}");
+    assert_eq!(
+        error(&again)["recovery"]["arguments"],
+        json!({ "remote": "origin", "branch": "feature" })
+    );
+
+    // A new call on the deleted thread is refused.
+    let refused = fixture
+        .call(
+            "git_commit",
+            json!({ "summary": "Again", "clientRequestId": "after-delete" }),
+        )
+        .await;
+    assert_eq!(error_tag(&refused), "McpThreadNotFoundError");
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_dirty_switch_is_blocked_with_its_reason_and_stash_carries_the_changes() {
     let fixture = fixture().await;

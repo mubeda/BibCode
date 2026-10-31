@@ -3256,6 +3256,20 @@ confirmed in source and fixed test-first:
   retry after the thread is deleted answers `McpThreadNotFoundError`. Codex raised this for
   P only; moving it needs `finish`'s status read to handle a missing folder.
 
+**Review round 3 (Codex P2, `claude/v0131-139-r3`).** Two findings for G, both confirmed in
+source and fixed test-first:
+
+- **Keyed retry after thread deletion** (the item above). `place()` is gone: each tool checks
+  its arguments, and its recorded work resolves the folder (`Owned::target`, through `folder`),
+  as P does. The stored payload is the arguments with `threadId`, never `cwd`. `git_discard`
+  and `git_stage`/`git_unstage` check their paths inside the work too, since that needs the
+  folder. `finish` reads the status from the thread's current folder, and gives `status: null`
+  when the thread is gone. A keyed retry of `git_commit` and of a partial `git_delete_branch`
+  now returns the stored outcome, recovery target included. A new call on the deleted thread
+  is still `McpThreadNotFoundError`, now recorded `failed` under its key, as P's is. The
+  reorder changes one more thing: a call with a missing argument on a deleted thread now
+  reports the argument, where it used to report the thread.
+
 ## P (pull request tools) implementation notes (2026-10-30)
 
 Slice P was implemented on `claude/v0131-139-p`, from `claude/v0131-139-f0`. It adds

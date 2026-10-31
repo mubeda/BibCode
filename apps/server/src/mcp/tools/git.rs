@@ -287,31 +287,30 @@ fn tool_text(name: &str) -> (&'static str, Value) {
     }
 }
 
-/// Where a tool works: the thread, its folder and its project.
-struct Place {
-    thread_id: String,
-    cwd: String,
-    project_id: String,
+/// Checks that only `known` arguments are given and returns the thread id. The thread's
+/// folder is resolved inside the recorded work ([`folder`]), so a keyed retry returns its
+/// stored outcome even after the thread is deleted.
+fn thread_id(call: &ToolCall<'_>, known: &[&str]) -> Result<String, Value> {
+    call.only(known)?;
+    Ok(call.required("threadId")?.to_owned())
 }
 
-/// Checks that only `known` arguments are given and resolves the thread's folder.
-async fn place(call: &ToolCall<'_>, known: &[&str]) -> Result<Place, Value> {
-    call.only(known)?;
-    let thread_id = call.required("threadId")?.to_owned();
-    let target = call.target(&thread_id).await?;
-    Ok(Place {
-        thread_id,
-        cwd: target.cwd,
-        project_id: target.project_id,
-    })
+/// The folder thread `thread_id` works in and its project, resolved when the work runs.
+async fn folder(owned: &Owned, thread_id: &str) -> Result<(String, String), Value> {
+    let target = owned.target(thread_id).await?;
+    Ok((target.cwd, target.project_id))
 }
 
 /// The tool result: the work's outcome, the thread, and a fresh Git status summary. The status
-/// is read again on a retry that returns a stored outcome, so it is always current.
-async fn finish(call: &ToolCall<'_>, place: &Place, result: ToolResult) -> ToolResult {
+/// is read again on a retry that returns a stored outcome, so it is always current; it is
+/// `null` when the thread no longer names a folder.
+async fn finish(call: &ToolCall<'_>, thread_id: &str, result: ToolResult) -> ToolResult {
     let mut content = result?;
-    content["threadId"] = place.thread_id.clone().into();
-    content["status"] = status(call, &place.cwd).await;
+    content["threadId"] = thread_id.into();
+    content["status"] = match call.target(thread_id).await {
+        Ok(target) => status(call, &target.cwd).await,
+        Err(_) => Value::Null,
+    };
     Ok(tool_result(content, &[("/status/files", Cut::Back)]))
 }
 
@@ -352,8 +351,7 @@ fn string_list(call: &ToolCall<'_>, key: &str) -> Result<Vec<String>, Value> {
 }
 
 /// `paths`, checked against the thread's folder off the runtime (it reads the file system).
-async fn checked_paths(call: &ToolCall<'_>, cwd: &str) -> Result<Vec<String>, Value> {
-    let paths = string_list(call, "paths")?;
+async fn checked_paths(paths: Vec<String>, cwd: &str) -> Result<Vec<String>, Value> {
     let cwd = std::path::PathBuf::from(cwd);
     tokio::task::spawn_blocking(move || validate_paths(&cwd, &paths))
         .await
@@ -521,54 +519,63 @@ enum Index {
 }
 
 async fn index(call: &ToolCall<'_>, which: Index) -> ToolResult {
-    let place = place(call, &["threadId", "paths"]).await?;
-    let paths = checked_paths(call, &place.cwd).await?;
+    let thread_id = thread_id(call, &["threadId", "paths"])?;
+    let paths = string_list(call, "paths")?;
     let (tool, method, key) = match which {
         Index::Stage => ("git_stage", "vcs.stageFiles", "staged"),
         Index::Unstage => ("git_unstage", "vcs.unstageFiles", "unstaged"),
     };
-    let payload = json!({ "cwd": place.cwd, "filePaths": paths });
-    let sent = payload.clone();
+    let payload = json!({ "threadId": thread_id, "paths": paths });
+    let thread = thread_id.clone();
     let result = call
         .recorded(tool, &payload, move |owned| async move {
-            owned.invoke(method, sent).await?;
+            let (cwd, _) = folder(&owned, &thread).await?;
+            let paths = checked_paths(paths, &cwd).await?;
+            owned
+                .invoke(method, json!({ "cwd": cwd, "filePaths": paths }))
+                .await?;
             let mut done = json!({});
             done[key] = paths.into();
             Ok(done)
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn commit(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(
+    let thread_id = thread_id(
         call,
         &["threadId", "summary", "description", "clientRequestId"],
-    )
-    .await?;
+    )?;
     let summary = call.required("summary")?.trim().to_owned();
     let description = call.string("description")?.unwrap_or_default().to_owned();
-    let payload = json!({
-        "cwd": place.cwd, "summary": summary, "description": description,
-        "amend": false, "noVerify": false, "signoff": false, "allowEmpty": false, "coAuthors": [],
-    });
-    let sent = payload.clone();
+    let payload = json!({ "threadId": thread_id, "summary": summary, "description": description });
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_commit", &payload, move |owned| async move {
+            let (cwd, _) = folder(&owned, &thread).await?;
+            let sent = json!({
+                "cwd": cwd, "summary": summary, "description": description,
+                "amend": false, "noVerify": false, "signoff": false, "allowEmpty": false,
+                "coAuthors": [],
+            });
             let commit = owned.invoke("gitManager.commit", sent).await?;
             Ok(json!({ "sha": commit.get("sha"), "empty": commit.get("empty") }))
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn undo_commit(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "clientRequestId"]).await?;
-    let payload = json!({ "cwd": place.cwd });
-    let sent = payload.clone();
+    let thread_id = thread_id(call, &["threadId", "clientRequestId"])?;
+    let payload = json!({ "threadId": thread_id });
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_undo_commit", &payload, move |owned| async move {
-            let undone = owned.invoke("gitManager.undoCommit", sent).await?;
+            let (cwd, _) = folder(&owned, &thread).await?;
+            let undone = owned
+                .invoke("gitManager.undoCommit", json!({ "cwd": cwd }))
+                .await?;
             Ok(json!({
                 "summary": undone.get("summary"),
                 "description": undone.get("description"),
@@ -576,25 +583,29 @@ async fn undo_commit(call: &ToolCall<'_>) -> ToolResult {
             }))
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn revert_commit(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "sha", "clientRequestId"]).await?;
+    let thread_id = thread_id(call, &["threadId", "sha", "clientRequestId"])?;
     let sha = revision(call, "sha")?.ok_or_else(|| invalid_argument("sha is required"))?;
-    let payload =
-        json!({ "_tag": "revert", "cwd": place.cwd, "projectId": place.project_id, "sha": sha });
-    let sent = payload.clone();
+    let payload = json!({ "threadId": thread_id, "sha": sha });
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_revert_commit", &payload, move |owned| async move {
-            operate(&owned, sent).await
+            let (cwd, project_id) = folder(&owned, &thread).await?;
+            operate(
+                &owned,
+                json!({ "_tag": "revert", "cwd": cwd, "projectId": project_id, "sha": sha }),
+            )
+            .await
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn push(call: &ToolCall<'_>, force: bool) -> ToolResult {
-    let place = place(
+    let thread_id = thread_id(
         call,
         &[
             "threadId",
@@ -604,22 +615,22 @@ async fn push(call: &ToolCall<'_>, force: bool) -> ToolResult {
             "pushTags",
             "clientRequestId",
         ],
-    )
-    .await?;
+    )?;
     let remote = remote_name(call, "remote")?;
     let branch = branch_name(call, "branch")?;
     let remote_branch = branch_name(call, "remoteBranch")?;
     let push_tags = call.boolean("pushTags")?.unwrap_or(false);
     let tool = if force { "git_force_push" } else { "git_push" };
-    let (cwd, project_id) = (place.cwd.clone(), place.project_id.clone());
-    // The branch, remote and kind of push are resolved when the work runs; the row keeps what
-    // was asked.
+    // The folder, branch, remote and kind of push are resolved when the work runs; the row
+    // keeps what was asked.
     let payload = json!({
-        "cwd": cwd, "remote": remote, "branch": branch, "remoteBranch": remote_branch,
+        "threadId": thread_id, "remote": remote, "branch": branch, "remoteBranch": remote_branch,
         "pushTags": push_tags, "force": force,
     });
+    let thread = thread_id.clone();
     let result = call
         .recorded(tool, &payload, move |owned| async move {
+            let (cwd, project_id) = folder(&owned, &thread).await?;
             let refs = refs(&owned, &cwd).await?;
             let branch = match branch {
                 Some(branch) => branch,
@@ -655,7 +666,7 @@ async fn push(call: &ToolCall<'_>, force: bool) -> ToolResult {
             Ok(done)
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 #[derive(Clone, Copy)]
@@ -673,12 +684,13 @@ async fn sync(call: &ToolCall<'_>, which: Sync) -> ToolResult {
             &["threadId", "remote", "clientRequestId"],
         ),
     };
-    let place = place(call, known).await?;
+    let thread_id = thread_id(call, known)?;
     let remote = remote_name(call, "remote")?;
-    let (cwd, project_id) = (place.cwd.clone(), place.project_id.clone());
-    let payload = json!({ "cwd": cwd, "remote": remote, "operation": kind });
+    let payload = json!({ "threadId": thread_id, "remote": remote, "operation": kind });
+    let thread = thread_id.clone();
     let result = call
         .recorded(tool, &payload, move |owned| async move {
+            let (cwd, project_id) = folder(&owned, &thread).await?;
             let refs = refs(&owned, &cwd).await?;
             let upstream = match refs["headRef"].as_str() {
                 Some(branch) => upstream(&refs, branch)?,
@@ -694,41 +706,46 @@ async fn sync(call: &ToolCall<'_>, which: Sync) -> ToolResult {
             Ok(done)
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn create_branch(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "name", "startPoint", "checkout"]).await?;
+    let thread_id = thread_id(call, &["threadId", "name", "startPoint", "checkout"])?;
     let name = required_branch(call, "name")?;
     let start_point = revision(call, "startPoint")?;
     let checkout = call.boolean("checkout")?.unwrap_or(true);
     let payload = json!({
-        "_tag": "branch-create", "cwd": place.cwd, "projectId": place.project_id,
-        "name": name, "startPoint": start_point, "checkout": checkout,
+        "threadId": thread_id, "name": name, "startPoint": start_point, "checkout": checkout,
     });
-    let sent = payload.clone();
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_create_branch", &payload, move |owned| async move {
+            let (cwd, project_id) = folder(&owned, &thread).await?;
+            let sent = json!({
+                "_tag": "branch-create", "cwd": cwd, "projectId": project_id,
+                "name": name, "startPoint": start_point, "checkout": checkout,
+            });
             let mut done = operate(&owned, sent).await?;
             done["branch"] = name.into();
             Ok(done)
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "name", "carryChanges"]).await?;
+    let thread_id = thread_id(call, &["threadId", "name", "carryChanges"])?;
     let name = required_branch(call, "name")?;
     let carry = match call.string("carryChanges")? {
         None => None,
         Some(carry @ ("stash" | "bring")) => Some(carry.to_owned()),
         Some(_) => return Err(invalid_argument("carryChanges is stash or bring")),
     };
-    let (cwd, project_id) = (place.cwd.clone(), place.project_id.clone());
-    let payload = json!({ "cwd": cwd, "name": name, "carryChanges": carry });
+    let payload = json!({ "threadId": thread_id, "name": name, "carryChanges": carry });
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_switch_branch", &payload, move |owned| async move {
+            let (cwd, project_id) = folder(&owned, &thread).await?;
             // As the Source Control panel does: stash with untracked files, then a plain
             // checkout. A clean folder has nothing to stash.
             let mut stashed = false;
@@ -767,11 +784,11 @@ async fn switch_branch(call: &ToolCall<'_>) -> ToolResult {
             }
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(
+    let thread_id = thread_id(
         call,
         &[
             "threadId",
@@ -780,16 +797,17 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             "deleteRemote",
             "clientRequestId",
         ],
-    )
-    .await?;
+    )?;
     let name = required_branch(call, "name")?;
     let force = call.boolean("force")?.unwrap_or(false);
     let delete_remote = call.boolean("deleteRemote")?.unwrap_or(false);
-    let (cwd, project_id) = (place.cwd.clone(), place.project_id.clone());
-    let payload =
-        json!({ "cwd": cwd, "name": name, "force": force, "deleteRemote": delete_remote });
+    let payload = json!({
+        "threadId": thread_id, "name": name, "force": force, "deleteRemote": delete_remote,
+    });
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_delete_branch", &payload, move |owned| async move {
+            let (cwd, project_id) = folder(&owned, &thread).await?;
             // The upstream is resolved before anything is deleted: afterwards it is gone.
             let target = if delete_remote {
                 let refs = refs(&owned, &cwd).await?;
@@ -842,7 +860,7 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             }
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 /// The local branch is gone and the remote one is not, or may not be (`unknown`, when the
@@ -881,20 +899,22 @@ fn partial(remote: &str, remote_branch: &str, failure: &Value, unknown: bool) ->
 }
 
 async fn delete_remote_branch(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "remote", "branch", "clientRequestId"]).await?;
+    let thread_id = thread_id(call, &["threadId", "remote", "branch", "clientRequestId"])?;
     let remote =
         remote_name(call, "remote")?.ok_or_else(|| invalid_argument("remote is required"))?;
     let branch = required_branch(call, "branch")?;
-    let payload = json!({
-        "_tag": "remote-branch-delete", "cwd": place.cwd, "projectId": place.project_id,
-        "remote": remote, "branch": branch,
-    });
-    let sent = payload.clone();
+    let payload = json!({ "threadId": thread_id, "remote": remote, "branch": branch });
+    let thread = thread_id.clone();
     let result = call
         .recorded(
             "git_delete_remote_branch",
             &payload,
             move |owned| async move {
+                let (cwd, project_id) = folder(&owned, &thread).await?;
+                let sent = json!({
+                    "_tag": "remote-branch-delete", "cwd": cwd, "projectId": project_id,
+                    "remote": remote, "branch": branch,
+                });
                 let mut done = operate(&owned, sent).await?;
                 done["remote"] = remote.into();
                 done["branch"] = branch.into();
@@ -902,17 +922,20 @@ async fn delete_remote_branch(call: &ToolCall<'_>) -> ToolResult {
             },
         )
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }
 
 async fn discard(call: &ToolCall<'_>) -> ToolResult {
-    let place = place(call, &["threadId", "paths", "permanent", "clientRequestId"]).await?;
-    let paths = checked_paths(call, &place.cwd).await?;
+    let thread_id = thread_id(call, &["threadId", "paths", "permanent", "clientRequestId"])?;
+    let paths = string_list(call, "paths")?;
     let permanent = call.boolean("permanent")?.unwrap_or(false);
-    let payload = json!({ "cwd": place.cwd, "paths": paths, "permitPermanent": permanent });
-    let sent = payload.clone();
+    let payload = json!({ "threadId": thread_id, "paths": paths, "permitPermanent": permanent });
+    let thread = thread_id.clone();
     let result = call
         .recorded("git_discard", &payload, move |owned| async move {
+            let (cwd, _) = folder(&owned, &thread).await?;
+            let paths = checked_paths(paths, &cwd).await?;
+            let sent = json!({ "cwd": cwd, "paths": paths, "permitPermanent": permanent });
             let discarded = owned.invoke("gitManager.discard", sent).await?;
             Ok(json!({
                 "trashed": discarded.get("trashed"),
@@ -921,5 +944,5 @@ async fn discard(call: &ToolCall<'_>) -> ToolResult {
             }))
         })
         .await;
-    finish(call, &place, result).await
+    finish(call, &thread_id, result).await
 }

@@ -116,7 +116,8 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   those characters cannot be named over MCP.
 - **Retries.** Every tool but `git_stage`, `git_unstage`, `git_fetch`, `git_create_branch`
   and `git_switch_branch` takes a `clientRequestId`. A retry with it returns the first
-  call's outcome without running Git again. If BiBCode cannot tell whether the call ran
+  call's outcome without running Git again, even after the thread was deleted. If BiBCode
+  cannot tell whether the call ran
   (MCP was turned off or read-only mid-push, the agent was revoked, or BiBCode stopped), the
   answer is `McpOutcomeUnknownError`: check `git_status`, then retry with a new id.
 - **Deleting a branch with its remote** is two steps. If the remote step fails, the local
@@ -124,7 +125,8 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   `git_delete_remote_branch` call that finishes it. If the remote step stopped before it
   reported, the partial says `remote: "unknown"`: run `git_fetch` and finish only if the
   remote branch is still there.
-- **Results** end with the folder's Git status. A refused operation returns its `code` and,
+- **Results** end with the folder's Git status (`null` once the thread is deleted). A
+  refused operation returns its `code` and,
   when a guard refused it, its `blocked` reason, such as uncommitted changes.
 - **Discard** lists every file it kept in `trashUnavailable`: one the trash could not take,
   or, with `permanent`, an ignored file that permanent deletion leaves in place. A file whose
