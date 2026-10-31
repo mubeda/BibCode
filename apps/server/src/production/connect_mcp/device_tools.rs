@@ -25,10 +25,11 @@ const SCREENSHOT_MAX_WIDTH: u32 = 1080;
 /// The tools are on only while `DeviceManager::enabled` is true, the same gate the `device.*`
 /// RPC methods use.
 ///
-/// There is no per-call permission check, by invariant: a valid provider MCP credential is
-/// issued only by `provider_runtime` when it launches a thread's provider, so holding the
-/// credential is the operate grant, exactly as for the `preview_*` tools. If MCP credentials
-/// are ever issued to lower-privileged principals, both tool families need a scope check.
+/// There is no permission check here. A valid provider MCP credential is issued only by
+/// `provider_runtime` when it launches a thread's provider, so holding the credential is the
+/// operate grant, exactly as for the `preview_*` tools. An outside agent reaches this through
+/// its client twin (`mcp::tools::previews`), which `McpControl` checks per call for scope,
+/// capability set and ceiling before it builds the scope.
 /// The refusals of another thread's device keep tasks apart; they are not access control.
 #[derive(Clone)]
 pub struct DeviceTools {
