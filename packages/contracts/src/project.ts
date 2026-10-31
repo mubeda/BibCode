@@ -207,6 +207,9 @@ export const ProjectFileFailure = Schema.Literals([
   // The trash refused an entry and its name was taken meanwhile, so it could not go back: it is
   // in BiBCode's staging folder, at `stagedAt` under the folder `stagedIn` names.
   "kept_in_staging",
+  // The path is, or resolves into, Git's own metadata (a `.git` component in any letter case, or
+  // the checkout's Git directory or common directory), which the Files panel and tools never touch.
+  "git_metadata",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
