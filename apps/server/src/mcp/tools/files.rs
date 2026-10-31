@@ -259,6 +259,18 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         Some("trash_unavailable") => format!(
             "The system trash could not take {path}; it was left in place. Delete it with permanent: true only if the person asked for that."
         ),
+        Some("hard_linked") => format!(
+            "{path} has more than one hard link, so writing it could change a file outside the thread's folder. Ask the person to change it in BiBCode."
+        ),
+        Some("write_failed") => {
+            if error["restored"] == true {
+                format!("Writing {path} failed; its old content was put back.")
+            } else {
+                format!(
+                    "Writing {path} failed after it was emptied, and its old content could not be put back. Tell the person."
+                )
+            }
+        }
         Some("path_busy") => format!(
             "{path} is being written or uploaded by someone else through BiBCode right now. Try again when that ends."
         ),
@@ -297,12 +309,15 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         error.retain(|key, _| {
             matches!(
                 key.as_str(),
-                "_tag" | "failure" | "message" | "outcome" | "leftAt"
+                "_tag" | "failure" | "message" | "outcome" | "leftAt" | "restored"
             )
         });
     }
     if failure["structuredContent"]["error"]["failure"] == "path_busy" {
         failure["structuredContent"]["error"]["_tag"] = BUSY_TAG.into();
+    }
+    if failure["structuredContent"]["error"]["failure"] == "hard_linked" {
+        failure["structuredContent"]["error"]["_tag"] = HARD_LINKED_TAG.into();
     }
     failure["structuredContent"]["error"]["message"] = message.clone().into();
     failure["content"] = json!([{ "type": "text", "text": message }]);
@@ -464,7 +479,7 @@ async fn write(call: &ToolCall<'_>) -> ToolResult {
     let written = call
         .invoke(
             "projects.writeFileIfUnchanged",
-            json!({ "cwd": place.cwd, "relativePath": path, "contents": content, "precondition": precondition }),
+            json!({ "cwd": place.cwd, "relativePath": path, "contents": content, "precondition": precondition, "singleLinkOnly": true }),
         )
         .await
         .map_err(|failure| file_failure(failure, &path))?;
@@ -560,6 +575,8 @@ pub(crate) const PLATFORM_UNSUPPORTED_TAG: &str = "McpPlatformUnsupportedError";
 /// A write refused because another BiBCode writer (an upload, or a write that did not end in
 /// time) holds the file.
 const BUSY_TAG: &str = "McpFileBusyError";
+/// A write refused because the file has more than one hard link.
+const HARD_LINKED_TAG: &str = "McpHardLinkedFileError";
 
 /// The base a transfer URL is built on: the address this server is bound to, which the local
 /// relay and `bibcode thread` reach. Remote OAuth sessions (slice R) get their own origin here.
