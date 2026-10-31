@@ -3581,11 +3581,11 @@ instead of failing the call.
 
 `mcp::tools::clone` is in the `workspace` set.
 
-| Tool               | Maps to                                                                                 | Scope   |
-| ------------------ | --------------------------------------------------------------------------------------- | ------- |
-| `clone_repository` | one owned mutation: `vcs.clone` (no `detach`), then `project.create` with frozen ids    | operate |
-| `clone_status`     | the clone's `mcp_tool_requests` row, read by replaying its key through `recorded`       | read    |
-| `cancel_clone`     | fires the clone task's stop token, then waits up to 15 s for the row to settle          | operate |
+| Tool               | Maps to                                                                              | Scope   |
+| ------------------ | ------------------------------------------------------------------------------------ | ------- |
+| `clone_repository` | one owned mutation: `vcs.clone` (no `detach`), then `project.create` with frozen ids | operate |
+| `clone_status`     | the clone's `mcp_tool_requests` row, read by replaying its key through `recorded`    | read    |
+| `cancel_clone`     | fires the clone task's stop token, then waits up to 15 s for the row to settle       | operate |
 
 - **Always owned.** `clone_repository` runs through `ToolCall::recorded` with the agent's
   `clientRequestId` or a minted `clone-<uuid>`; that key is the `cloneId`, returned at the
@@ -3622,8 +3622,9 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   forms included (`clone_host_refused`, or `clone_host_unresolved`);
 - Git runs with `protocol.allow=never`, `protocol.https.allow=always`,
   `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false`, one
-  `http.curloptResolve=<host>:<port>:<addresses>` per named host, an empty and optional
-  `filter.lfs` smudge and process, and `GIT_LFS_SKIP_SMUDGE=1`.
+  `http.curloptResolve=<host>:<port>:<first address>` per named host, an empty and
+  optional `filter.lfs` smudge and process, `GIT_LFS_SKIP_SMUDGE=1` and
+  `submodule.recurse=false`.
 
 A refusal is a `GitCommandError` with a `reason` (`vcs.clone`), or a
 `SourceControlRepositoryError` with one (`sourceControl.cloneRepository`). A person's clone

@@ -547,7 +547,8 @@ async fn agents_clone_over_https_from_public_hosts_only() {
         ..Options::default()
     })
     .await;
-    let bare = format!("file://{}", fixture.bare.display());
+    // A plain path, which Git clones from on every platform.
+    let bare = fixture.bare.display().to_string();
     for (url, expected) in [
         // Revision 4: every transport but HTTPS, SSH included.
         (
@@ -563,6 +564,7 @@ async fn agents_clone_over_https_from_public_hosts_only() {
             "git://public.example.com/owner/repo.git",
             "clone_url_refused",
         ),
+        ("file:///srv/repo.git", "clone_url_refused"),
         (bare.as_str(), "clone_url_refused"),
         ("ext::sh -c touch% /tmp/bibcode-x6", "clone_url_refused"),
         (

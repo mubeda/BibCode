@@ -342,10 +342,10 @@ at read-only.
 An agent can clone a repository into the folder that holds one of your projects, beside
 it, and add the clone as a project. These tools are in the **Workspace** set.
 
-| Tool               | What it does                                                                                                     |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `clone_repository` | Clones an `https://` URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)    |
-| `clone_status`     | How a clone this connection started is going: `running`, the finished folder and project, or why it failed       |
+| Tool               | What it does                                                                                                    |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `clone_repository` | Clones an `https://` URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)   |
+| `clone_status`     | How a clone this connection started is going: `running`, the finished folder and project, or why it failed      |
 | `cancel_clone`     | Stops a clone this connection started and removes its folder; a clone you started that the agent joined goes on |
 
 - **HTTPS from public hosts only.** The URL must start with `https://`, with no user name or
