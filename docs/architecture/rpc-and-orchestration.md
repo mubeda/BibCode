@@ -3425,6 +3425,36 @@ closes before `action_finished` is `unknown`. When the edit lands and the draft
 change does not, `update_pull_request` records `McpPartialOutcomeError` naming what
 changed. The merge is destructive, so it writes the `MCP destructive tool` line.
 
+### Terminal tools
+
+`mcp::tools::terminals` is the `terminals` set. Every tool needs `terminal:operate`
+(minted only while the set is on at Full access), the set on, and an effective ceiling
+of Full access, which the family checks on every call, the reads included. The runtime
+attaches the `TerminalManager` to `McpControl` (`attach_terminals`).
+
+| Tool              | Maps to                                                                                         | Hints       |
+| ----------------- | ----------------------------------------------------------------------------------------------- | ----------- |
+| `terminal_list`   | `TerminalManager::thread_sessions` (memory)                                                     | read-only   |
+| `terminal_open`   | `terminal.open` with a server-minted `mcp-<uuid>` id, the thread's `cwd`, no `command` or `env` | —           |
+| `terminal_write`  | `terminal.write`, after a status check (an exited terminal is `McpTerminalExitedError`)         | destructive |
+| `terminal_read`   | `TerminalManager::read_history`: `TerminalHistory::read_window` or `tail` (memory)              | read-only   |
+| `terminal_resize` | `terminal.resize` without a size claim                                                          | idempotent  |
+| `terminal_close`  | `terminal.close` for one terminal                                                               | destructive |
+
+- **Cursor.** `TerminalHistory` counts every byte ever pushed (`total_bytes_written`,
+  kept across `clear`). A cursor is a byte offset into that count; one older than the
+  retained 1 MiB, or past the end (a restarted session), reads from the oldest retained
+  byte with `dropped: true`. Without `raw`, CSI, OSC and other escape sequences are
+  removed after the raw window is read, and an escape cut at the page's end moves
+  `nextCursor` back so the next page reads it whole.
+- **Writes.** `terminal.write` is the unordered unary path: MCP has no WebSocket
+  connection to scope the ordered input lease to. Writes to one terminal take a
+  per-terminal lock in the tool layer. Keyed `terminal_open` and `terminal_write` run
+  through `ToolCall::recorded`; a write's stored payload keeps its length, not its data.
+- **Lifetime.** A terminal an agent opened is the thread's terminal: the UI adopts it
+  through `subscribeTerminalMetadata`, and it outlives the MCP session.
+- **Content.** Terminal input and output never reach a log line or a profiler record.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop

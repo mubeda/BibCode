@@ -183,6 +183,38 @@ takes a `threadId`, the thread the agent acts for. They are in the **Workspace**
   cannot reuse or stop it.
 - Preview pages are untrusted content.
 
+### Terminals
+
+A terminal runs any command as the user BiBCode's server runs as, so these tools are off
+unless you turn them on. They need all three of:
+
+1. **Terminals** on under **Agents may → What agents can use** (off by default);
+2. **Agents may** at **Full access**;
+3. an MCP server started after both, so its credential includes terminals. An agent that was
+   already connected picks them up only after you restart its MCP server.
+
+Turning **Terminals** off, or lowering **Agents may**, refuses the next call at once.
+
+| Tool              | What it does                                                                                              |
+| ----------------- | --------------------------------------------------------------------------------------------------------- |
+| `terminal_list`   | The thread's terminals, yours included: id, label, status and exit code                                   |
+| `terminal_open`   | Opens a shell in the thread's folder; you see it in BiBCode, and it stays open after the agent leaves     |
+| `terminal_write`  | **Destructive.** Types up to 16,384 characters into a terminal; returns a `cursor` for reading the output |
+| `terminal_read`   | The last 4,000 characters (`tailChars`, up to 16,000), or up to 16,000 written after a `cursor`           |
+| `terminal_resize` | Sets a terminal's columns and rows                                                                        |
+| `terminal_close`  | **Destructive.** Closes a terminal and ends what runs in it                                               |
+
+- **Your terminals too.** An agent can list, read, type into and close the terminals you
+  opened in that thread. What it types is not marked as the agent's.
+- **Reading.** `terminal_read` returns `nextCursor`; reading from it returns only newer
+  output, and `more` says whether more follows. A terminal keeps about 1 MiB of output, so a
+  cursor older than that comes back with `dropped: true` and starts at the oldest output kept.
+  Escape sequences are removed unless `raw` is true.
+- **Retries.** `terminal_open` and `terminal_write` take a `clientRequestId`, so a retry opens
+  one terminal and types once.
+- **Privacy.** BiBCode never logs what an agent types or reads, and never puts it in the
+  profiler. Terminal output is untrusted content.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where

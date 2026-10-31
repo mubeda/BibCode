@@ -3384,3 +3384,79 @@ and `tabId` kept from the page); no host, typed, both with and without the servi
 agents' separate tabs through a real broker and a fake UI host; read-only and the Workspace
 set turned off; device twins without `DeviceTools`; and, on unix with the fake SDK,
 `device_list` on and off and a close refused for another thread (`DeviceBusyError`).
+
+## T (terminals) implementation notes (2026-10-30)
+
+Slice T was implemented on `claude/v0131-139-t`, from the batch tip `1d4eda69bd` (slice 1, the
+CLI, F0, wave 1 with its review fixes, and slice D). It adds `mcp/tools/terminals.rs` (six
+tools in the Terminals set) and `mcp_tools_tests/terminals.rs`, changes `terminal/history.rs`
+and `terminal/manager.rs`, and adds the **What agents can use** switches and the MCP copy to
+`AgentIntegrationsSection.tsx`.
+
+**Drift found:**
+
+- **`McpControl` could not reach the terminals.** The list and read tools need the
+  `TerminalManager`, which has no RPC for either. As slice D did for previews, `Inner` gained
+  a `OnceLock<TerminalServices>` with `attach_terminals` and `terminals()` (`mcp/control.rs`,
+  next to `previews`), and `production/runtime.rs` attaches the manager right after
+  `McpControl::new` (two lines). Without it the tools answer `McpTerminalsUnavailableError`.
+  The per-terminal write locks live in that attached struct, not in a `static`.
+- **Lowering the ceiling refuses but does not hide.** `McpControl::tools()` hides a tool only
+  when its set is off, or a mutating one at read-only; hiding the terminal tools below Full
+  access, or for a credential without `terminal:operate`, needs a per-family list hook in
+  `control.rs` (as D noted for its read twins). The family refuses every call below Full
+  access itself, the two reads included, with `McpAccessCeilingError` naming **Agents may**
+  (and, for a connection started below Full access, saying to restart its MCP server). A
+  credential without the scope gets the generic `McpScopeError`.
+- **`terminal.close` has no `deleteHistory`.** `TerminalClosePayload` takes `threadId` and
+  `terminalId` only, and closing removes the session with its history. `terminal_close` sends
+  those two; a closed terminal then answers `McpTerminalNotFoundError`. A terminal whose
+  process ended by itself stays readable, with `status: "exited"` and its `exitCode`.
+- **Silent handlers.** `TerminalManager::write` returns success for an exited session, and
+  `resize` for an unknown one. `terminal_write` reads the status first and answers
+  `McpTerminalExitedError` (with `exitCode`); `terminal_write`, `terminal_resize` and
+  `terminal_close` answer `McpTerminalNotFoundError` for a terminal the thread does not have.
+- **Capability labels.** `McpCapability::label()` (used in `McpCapabilityDisabledError`) says
+  "Workspace" and "Source control", but the switches the design names are **Threads and
+  worktrees** and **Source Control and pull requests**. `label()` was not changed, because
+  F0's foundation test pins "Source control"; slice Z should align the two.
+
+**Choices made while implementing:**
+
+- **History.** `total_bytes_written` counts every pushed byte and survives `clear`, so a
+  cleared terminal never reuses an old cursor. Beside the design's
+  `read_window(from, max_chars)` there is `tail(max_chars)` for a read without a cursor. A
+  cursor past the end (a restarted session's new history) is `dropped` too and starts at the
+  oldest retained byte; one inside a character starts at the next character.
+- **Read result.** `{ text, nextCursor, dropped, more, status, exitCode }`: `more` (added) says
+  whether output past `nextCursor` exists. `nextCursor` is a decimal string. `cursor` and
+  `tailChars` together are refused. A page whose escaped text does not fit the 80,000-character
+  result (a page full of control characters) is halved, down to 500 characters.
+- **Stripping.** Besides CSI and OSC, DCS, SOS, PM and APC strings and two-byte escapes
+  (`ESC 7`, `ESC ( B`) are removed. An escape cut at the page's end is left for the next page,
+  with `nextCursor` before it, unless it starts the page.
+- **Write result.** `terminal_write` returns `cursor`, the output offset just before its data
+  went in, so `terminal_read { cursor }` shows what the command printed.
+- **Recorded rows.** `terminal_open` mints `mcp-<uuid>` before `recorded`, so a keyed retry
+  answers with the same terminal. A keyed write stores `{ threadId, terminalId, chars }`, never
+  the data; the arguments' digest still binds a retry to the same data.
+- **Resize and close** are not recorded and run inline (`ToolCall::invoke`). Resize sends no
+  size claim, as an older client does.
+- **Defaults.** `terminal_open` uses the handler's 120 × 30 unless `cols` and `rows` (1 to
+  1,000 and 1 to 500) are given.
+- **UI.** The group sits under **Agents may**. A switch shows the stored value; Terminals is
+  disabled with "Set Agents may to Full access first." below Full access, and every switch with
+  the row above's reason ("Turn on MCP server first.", or the older-server and connecting
+  reasons). A reset sets all five to their defaults. The access description keeps its restart
+  sentence after the design's new text, because it is still true. The Terminals description
+  keeps the design's "or after a remote agent reauthorizes", which becomes reachable with R.
+
+**Tests.** History windows, the dropped and past-the-end cursors, and the tail are unit tests
+in `history.rs`; `manager.rs` tests the per-thread list and the read. The tool tests run the
+real `terminal.*` handlers on an echoing fake PTY, and one on a real `/bin/sh` (`cfg(unix)`):
+`echo $((40+2))` is read back as `42`, and a read from the cursor holds only the next
+command's output. The log-and-profiler test runs in its own process with a captured `TRACE`
+subscriber and a running profiler, and finds no canary from the input, the output, a refused
+write or a write to a missing terminal. The interleaving test passes without the tool's lock,
+since the manager already serializes a terminal's writes (its publication lock, and the PTY
+writer's lock); the lock keeps the guarantee in the tool layer, as the design asks.
