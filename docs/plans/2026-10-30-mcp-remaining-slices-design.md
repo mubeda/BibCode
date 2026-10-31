@@ -4475,6 +4475,71 @@ its folder; and cancelling an agent clone that joined a person's leaving the per
 finish. Take over and Stop reach the same live-controls token (X1) and are not tested again
 here.
 
+**Codex review fixes (review round 2, 2026-10-31).** All six P2s were confirmed in source and
+fixed test-first on `claude/v0131-139-x6` with new commits; each new test was seen failing
+before its fix.
+
+- **Isolated configuration (findings 1, 2, 4).** The generic `-c http.*` keys lost to the
+  person's URL-specific `http.<url>.*` settings, and a configured or inherited proxy resolved
+  the host itself. Every Git command of an agent clone (the `ls-remote --get-url` rewrite
+  read and the clone) now runs with `GIT_CONFIG_GLOBAL` set to the null device,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_PARAMETERS` empty and `GIT_CONFIG_COUNT=0`, so no
+  global or system rewrite, credential helper, proxy, URL-specific setting, hook, fsmonitor
+  or filter driver applies. The proxy variables (`http_proxy`, `https_proxy`, `all_proxy`
+  and their upper-case forms) are empty and `NO_PROXY=*`, and `-c http.proxy=` (which makes
+  Git set an empty `CURLOPT_PROXY`, turning the environment's proxy off too),
+  `-c core.fsmonitor=false` and `-c core.hooksPath=<null device>` cover what a repository's
+  own configuration could still set. A filter a repository's `.gitattributes` names has no
+  driver, so its files are checked out as they are. Global `insteadOf` rewrites no longer
+  apply; one the clone folder's enclosing repository configures still does, and the
+  rewritten URL is still checked and pinned. The trade-offs, now in the user doc: an agent's
+  clone uses no proxy (on a network that reaches the internet only through one, the person
+  clones in BiBCode), and no credential helper, so it reaches public repositories only.
+  Tests: the person's `HOME` in a temporary folder holds each hostile setting.
+  `the_persons_proxy_and_rewrites_never_reach_an_agent_clone` (a URL-specific proxy, a
+  global rewrite to a missing repository, and `http_proxy`/`all_proxy` listeners) failed
+  with the configured proxy used before any fix and, with only `GIT_CONFIG_GLOBAL` removed
+  again, with the rewrite applied; `an_inherited_proxy_never_carries_an_agent_clone` failed with the
+  inherited proxy used;
+  `a_url_specific_setting_cannot_turn_redirects_back_on` failed with the clone done through
+  the redirect; `the_persons_hooks_fsmonitor_and_filters_never_run_for_an_agent_clone` (a
+  `post-checkout` hook through `core.hooksPath`, an fsmonitor and a required `filter.evil`
+  smudge, each touching a marker) failed with the isolation removed: the filter and the hook
+  ran. The fsmonitor marker never fired either way, since a clone does not query it, so
+  `core.fsmonitor=false` is defense in depth for later commands. The test seam changed
+  with it: `FixtureAllowance.environment` is now what the server inherited (a test `HOME`,
+  a proxy), applied before the isolation, and the strict test's rewrites moved into the
+  projects folder's own repository configuration.
+- **Global reachability (finding 3).** `is_public` now refuses every range the IANA IPv4 and
+  IPv6 special-purpose registries mark not globally reachable (`0/8`, `10/8`, `100.64/10`,
+  `127/8`, `169.254/16`, `172.16/12`, `192.0.0/24`, `192.0.2/24`, `192.88.99/24`,
+  `192.168/16`, `198.18/15`, `198.51.100/24`, `203.0.113/24`, `240/4` with broadcast), IPv4
+  multicast, and for IPv6 everything outside `2000::/3` (so `::/8` with the
+  IPv4-compatible and -translated forms, `64:ff9b:1::/48`, `100::/64`, `fc00::/7`,
+  `fe80::/10`, `fec0::/10`, `ff00::/8`), plus `2001::/23` (with Teredo), `2001:db8::/32`,
+  `3fff::/20` and `5f00::/16`. Mapped, NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`)
+  addresses are judged by the IPv4 address they embed. The few globally reachable anycast
+  blocks inside `192.0.0/24` and `2001::/23` are refused too. The unit test names a sample
+  address in each range; it failed on `192.0.0.1` before the fix.
+- **`vcs.cancelClone` (finding 5).** A clone records the agent session that started it
+  (`CloneRequest.owner`, kept on the runtime's entry; a joiner keeps the starter's). For an
+  `mcp-client` principal `vcs.cancelClone` uses `CloneRuntime::cancel_as_agent`, which
+  refuses a live clone the agent did not start with `clone_not_owned` and leaves it running;
+  with no live clone it answers `{ cancelled: false }` as before. A person's call is
+  unchanged (`cancel`). The joined-clone test failed with the person's clone cancelled.
+- **Detached agent clones (finding 6).** `vcs.clone` refuses `detach: true` for an agent
+  principal (`clone_detach_refused`) before anything starts, so an agent's direct clone ends
+  with its call; a long clone goes through `clone_repository`, which owns it under the live
+  controls. `an_agent_may_not_detach_a_clone_and_cancels_only_its_own` failed with the
+  detached clone started; its second half checks an agent still cancels its own direct
+  clone.
+- **Redirect tests.** The redirect fixtures now point at the target server by address: a
+  redirect to `fixture.invalid` would fail to resolve whether or not it was followed, so
+  the earlier `a_redirect_is_not_followed` proved the ban only through its message.
+- **New error tags for X3's table.** `McpCloneNotFoundError` and `McpCloneRefusedError`
+  belong in `feed::ERRORS` (`mcp/tools/feed.rs`, not on this branch); the coordinator adds
+  them when combining.
+
 ## X5 implementation notes (2026-10-31)
 
 X5 was implemented on `claude/v0131-139-x5`, from the batch tip `8d400e20df` (slice 1, the

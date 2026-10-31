@@ -3621,16 +3621,27 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
 - the URL is `https://`, written as the URL parser would write it, without user
   information, and the folder name does not start with `-` (`clone_url_refused`);
 - Git is 2.37 or later, for `http.curloptResolve` (`clone_git_too_old`);
-- `git ls-remote --get-url -- <url>` gives the URL after `insteadOf`, which must pass the
-  same checks;
-- every address of the original and the rewritten host is public: not loopback, private,
-  link-local, CGNAT, unique-local, multicast, unspecified, broadcast or reserved, mapped
-  forms included (`clone_host_refused`, or `clone_host_unresolved`);
+- every Git command of the clone runs with an isolated configuration:
+  `GIT_CONFIG_GLOBAL` is the null device, `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_PARAMETERS` empty, `GIT_CONFIG_COUNT=0`, every proxy variable empty and
+  `NO_PROXY=*`, so none of the person's rewrites, credentials, proxies, URL-specific
+  `http.<url>.*` settings, hooks, fsmonitor or filter drivers apply;
+- `git ls-remote --get-url -- <url>` gives the URL after any `insteadOf` left (the clone
+  folder's enclosing repository), which must pass the same checks;
+- every address of the original and the rewritten host is globally reachable: no range the
+  IANA special-purpose registries mark otherwise, no multicast, no IPv6 outside `2000::/3`,
+  and mapped, NAT64 and 6to4 addresses judged by the IPv4 address they embed
+  (`clone_host_refused`, or `clone_host_unresolved`);
 - Git runs with `protocol.allow=never`, `protocol.https.allow=always`,
   `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false`, one
-  `http.curloptResolve=<host>:<port>:<first address>` per named host, an empty and
-  optional `filter.lfs` smudge and process, `GIT_LFS_SKIP_SMUDGE=1` and
-  `submodule.recurse=false`.
+  `http.curloptResolve=<host>:<port>:<first address>` per named host, `http.proxy=`,
+  `core.hooksPath` and `core.fsmonitor` off, an empty and optional `filter.lfs` smudge and
+  process, `GIT_LFS_SKIP_SMUDGE=1` and `submodule.recurse=false`.
+
+For an agent principal `vcs.clone` also refuses `detach: true` (`clone_detach_refused`): a
+long clone goes through `clone_repository`, which owns it. A clone records the agent session
+that started it, and `vcs.cancelClone` from an agent cancels only such a clone
+(`clone_not_owned` otherwise); a person's `vcs.cancelClone` is unchanged.
 
 A refusal is a `GitCommandError` with a `reason` (`vcs.clone`), or a
 `SourceControlRepositoryError` with one (`sourceControl.cloneRepository`). A person's clone
