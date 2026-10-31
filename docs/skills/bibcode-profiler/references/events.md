@@ -68,10 +68,11 @@ An outside agent's `profiler_events` and `profiler_crash` on BiBCode's own
 `/mcp` return each event with these envelope fields and only the payload fields
 its kind lists below; an event of an unlisted kind keeps its envelope only.
 A `clientId`, and the id in a `client:<clientId>` source, becomes an opaque
-`h` and 12 hex characters that match across events and findings;
+`h` and 12 hex characters of HMAC-SHA-256 under a secret the server draws at
+start, matching across events and findings until the server restarts;
 `correlationId` and `appVersion`, which the client chooses, are left out; a
 client batch's `capabilities` keep the known values; and a panic's `location`
-keeps a relative path or its file name. Adding a kind or a field here means
+and each frame's `module` keep a relative path or the file name. Adding a kind or a field here means
 adding it to `event_fields` in `apps/server/src/mcp/tools/diagnostics.rs` too.
 
 ## Events
