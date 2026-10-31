@@ -3505,6 +3505,34 @@ test-first; these supersede the notes above where they differ.
   a pre-restart cursor is dropped; an escape longer than a page is skipped whole; an escape
   still arriving keeps the cursor.
 
+**Codex review fixes (round 3, 2026-10-31).** These supersede round 2's write paths.
+
+- **P1, a stuck MCP write could still freeze publication (verified).** Round 2's ordered path
+  held the publication lock while its `block_in_place` write waited for the PTY. Both paths now
+  go through a per-process `terminal/writer.rs` `TerminalWriter`: the caller checks the session
+  and enqueues under the publication lock without waiting, and the writer's own thread writes
+  the queue in order outside it. A stuck write therefore blocks only the writes queued behind
+  it; output publication, exit handling, `clear` and `close` go on. The ordered frame is
+  queued in the poll that returns, so an admission replacement before it retries and one
+  after it only changes whose loss is watched: no frame is queued twice. Loss of the current
+  admission, or dropping the frame's call, drops a queued frame the writer has not started; a
+  unary write stays queued when its call is dropped (the MCP timeout's "it may still go in").
+- **P2, timed-out writes could exhaust the blocking pool (verified).** PTY writes no longer
+  use `spawn_blocking`. A process with input has one `terminal-input` thread, which retires
+  after 30 s idle, and at most 1 MiB queued or in flight; past that a write is refused at once
+  ("its input queue is full", `TerminalError::Io`). A stuck terminal holds one thread and one
+  bounded queue; the number of terminals is not bounded here.
+- **P3, epochs collided across server restarts (verified).** The epoch counter starts at a
+  random 64-bit value per server lifetime, so a reopened terminal id after a restart no longer
+  matches a kept cursor.
+- **Refuted, as the coordinator decided:** rejecting the round-1 decimal cursors needs no
+  compatibility path, since the terminal tools are unreleased.
+- **Tests.** Manager: a stuck unary write, then typing on the same terminal, while `clear` and
+  `close` finish; queued typing is dropped when its admission is lost, without waiting for the
+  stuck write; two stuck terminals leave a one-thread blocking pool free; a writer refuses
+  input past 1 MiB and takes it again once drained. History: two processes' first epochs
+  differ (each phase re-executes the test in a process of its own).
+
 ## X2 (diagnostics tools) implementation notes (2026-10-30)
 
 X2 was implemented on `claude/v0131-139-x2`, from the batch tip `1d4eda69bd` (slice 1, the
