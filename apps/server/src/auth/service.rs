@@ -1850,9 +1850,11 @@ impl AuthService {
     }
 
     /// **Stop** (#139, slice X1): revokes an outside agent, which ends its calls and owned
-    /// mutations, then tells the MCP service to interrupt the turns it is running. Only a
-    /// session this call revoked is announced, so a plain revocation (the `bibcode thread`
-    /// CLI revokes its own credential on the way out) never interrupts anything.
+    /// mutations, then tells the MCP service to interrupt the turns it is running, also for an
+    /// agent revoked earlier. `false` for an unknown session, or one revoked earlier that was
+    /// not an outside agent's. Only Stop
+    /// announces, so a plain revocation (the `bibcode thread` CLI revokes its own credential
+    /// on the way out) never interrupts anything.
     pub async fn stop_client(
         &self,
         current_session_id: &str,
@@ -1861,10 +1863,27 @@ impl AuthService {
         let revoked = self
             .revoke_client(current_session_id, target_session_id)
             .await?;
-        if revoked {
+        // An agent revoked earlier (Revoke, then Stop) may still be running turns; Stop
+        // interrupts them too. Only a session that was an outside agent's is stopped.
+        let stopped = revoked || self.was_revoked_mcp_client(target_session_id).await?;
+        if stopped {
             let _ = self.mcp_stops.send(target_session_id.to_owned());
         }
-        Ok(revoked)
+        Ok(stopped)
+    }
+
+    /// Whether `session_id` is an outside agent's session that has been revoked.
+    async fn was_revoked_mcp_client(&self, session_id: &str) -> Result<bool, AuthError> {
+        let Some(repositories) = &self.repositories else {
+            return Ok(false);
+        };
+        let session = repositories
+            .get_auth_session(session_id.to_owned())
+            .await
+            .map_err(|error| AuthError::Internal(error.to_string()))?;
+        Ok(session.is_some_and(|session| {
+            session.subject == MCP_CLIENT_SUBJECT && session.revoked_at.is_some()
+        }))
     }
 
     /// The outside agents a person stopped, as their session ids.
