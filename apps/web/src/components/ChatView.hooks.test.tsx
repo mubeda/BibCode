@@ -1276,8 +1276,15 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     for (const request of held) request.resolve();
     held = [];
   };
+  let scrollTop = options.scroll ?? 0;
   const scrollNode = {
-    scrollTop: options.scroll ?? 0,
+    /** As a scroller does, it clamps a scroll to the content it has laid out. */
+    get scrollTop() {
+      return scrollTop;
+    },
+    set scrollTop(value: number) {
+      scrollTop = Math.min(value, maxScroll);
+    },
     scrollHeight: options.scrollHeight ?? 10_000,
     clientHeight: options.clientHeight ?? options.scrollLength ?? 50,
     listeners: scrollNodeListeners,
@@ -1429,6 +1436,33 @@ async function sendFittingReply(options: FakeLegendListOptions = {}) {
   const sent = await sendTallReply({ scrollLength: 600, sentRowContentTop: 200, ...options });
   sent.list.sentRowMessageId = sent.messageId;
   return sent;
+}
+
+/**
+ * Holds animation frames, so a test steps the sent row's glide and the passes after it: `step`
+ * runs the frames queued so far, `run` runs frames until none is left, and `release` runs them
+ * at once again, as the other tests do.
+ */
+function holdFrames() {
+  const frames: Array<() => void> = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+    frames.push(() => callback(0));
+    return frames.length;
+  });
+  return {
+    step(count = 1) {
+      for (let frame = 0; frame < count && frames.length > 0; frame += 1) frames.shift()!();
+    },
+    run() {
+      for (let frame = 0; frame < 500 && frames.length > 0; frame += 1) frames.shift()!();
+    },
+    release() {
+      vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+        callback(0);
+        return 1;
+      });
+    },
+  };
 }
 
 /** Lets the promise callbacks a landing chains run. */
@@ -2013,30 +2047,34 @@ describe("ChatView effects (captured and run manually)", () => {
 
   it("reveals a reply that grew past the timeline while its sent row was gliding", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    const frames = holdFrames();
 
     onAnchorReady(messageId, 2);
+    frames.step(4);
     expect(list.calls.scrollToOffset).toEqual([]);
-    list.scrollNode.fire("scrollend");
+    frames.run();
 
-    // The glide settles where it ended, then the end the reply grew to comes into view.
+    // The glide settles where it ended, with the sent row 16 px below the top, then the end the
+    // reply grew to comes into view.
     expect(list.calls.scrollToOffset).toEqual([
-      { offset: 0, animated: false },
+      { offset: 184, animated: false },
       { offset: 216, animated: false },
     ]);
+    frames.release();
     for (const cleanup of cleanups) cleanup();
   });
 
   it("follows the end again when a follow was clamped to a lagging content height", async () => {
-    // The scroller has laid out only 100 px of the 216 the turn's end needs.
+    // The scroller has laid out only 100 px of the 216 the turn's end needs, so the glide stops
+    // there too.
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
       laggingMaxScroll: 100,
     });
 
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
 
     expect(list.calls.scrollToOffset).toEqual([
-      { offset: 0, animated: false },
+      { offset: 100, animated: false },
       { offset: 216, animated: false },
       { offset: 216, animated: false },
     ]);
@@ -2053,10 +2091,9 @@ describe("ChatView effects (captured and run manually)", () => {
     wheel = () => list.scrollNode.fire("wheel");
 
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
 
     expect(list.calls.scrollToOffset).toEqual([
-      { offset: 0, animated: false },
+      { offset: 100, animated: false },
       { offset: 216, animated: false },
     ]);
     expect(list.scrollNode.scrollTop).toBe(100);
@@ -2072,11 +2109,12 @@ describe("ChatView effects (captured and run manually)", () => {
     positionNext = () => onAnchorReady(MessageId.make("later-send"), 3);
 
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
 
+    // The later row's glide settles where it ends; nothing follows the earlier turn's end again.
     expect(list.calls.scrollToOffset).toEqual([
-      { offset: 0, animated: false },
+      { offset: 100, animated: false },
       { offset: 216, animated: false },
+      { offset: 284, animated: false },
     ]);
     for (const cleanup of cleanups) cleanup();
   });
@@ -2276,8 +2314,9 @@ describe("ChatView effects (captured and run manually)", () => {
       scrollHeight: 400,
       clientHeight: 200,
     });
+    const frames = holdFrames();
     onAnchorReady(messageId, 2);
-    list.scrollNode.scrollTop = 50;
+    frames.step(4);
 
     // A press on Copy code, which WebKit does not focus, leaves focus on the body; the
     // browser then scrolls the timeline with the key.
@@ -2285,7 +2324,8 @@ describe("ChatView effects (captured and run manually)", () => {
     fireDocument("pointerdown", { target: copyCode });
     list.scrollNode.fire("pointerdown", { target: copyCode });
     fireDocument("keydown", pageKey("PageUp"));
-    list.scrollNode.fire("scrollend");
+    frames.run();
+    frames.release();
 
     expect(list.calls.scrollToOffset).toEqual([]);
     for (const cleanup of cleanups) cleanup();
@@ -2361,7 +2401,7 @@ describe("ChatView effects (captured and run manually)", () => {
   it("positions a sent row once and keeps a released one where the reader left it", () => {
     seedConnectedServerThread(makeThreadWithEarlierTurn());
     renderServerRoute();
-    const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
+    const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4, rowSize: 100 });
     const cleanups = runEffects();
     const timeline = capturedProps("messagesTimeline");
     const messageId = MessageId.make("anchor-message");
@@ -2372,31 +2412,29 @@ describe("ChatView effects (captured and run manually)", () => {
     const onAnchorSizeChanged = timeline["onAnchorSizeChanged"] as (messageId: MessageId) => void;
 
     onAnchorReady(messageId, 2);
-    expect(list.calls.scrollToIndex).toEqual([
-      { index: 2, animated: true, viewPosition: 0, viewOffset: 16 },
-    ]);
-    list.scrollNode.fire("scrollend");
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 24, animated: false }]);
+    // The row glides to rest 16 px below the top, and settles there.
+    expect(list.scrollNode.scrollTop).toBe(184);
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
 
     // The reader scrolls away. LegendList reports the row ready again as the anchored end space
     // changes size, once per delivery, and the row neither glides nor pins over the reader.
     list.scrollNode.fire("wheel");
+    list.scrollNode.scrollTop = 24;
     onAnchorReady(messageId, 2);
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    expect(list.calls.scrollToIndex).toHaveLength(1);
+    expect(list.scrollNode.scrollTop).toBe(24);
     expect(list.calls.scrollToOffset).toHaveLength(1);
 
     // It goes on holding the reader's place as the tail changes size.
     onAnchorSizeChanged(messageId);
     expect(list.calls.scrollToOffset).toEqual([
-      { offset: 24, animated: false },
+      { offset: 184, animated: false },
       { offset: 24, animated: false },
     ]);
 
     // A row the reader never released positions itself.
     onAnchorReady(MessageId.make("next-send"), 3);
-    expect(list.calls.scrollToIndex).toHaveLength(2);
+    expect(list.scrollNode.scrollTop).toBe(284);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2422,20 +2460,105 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("glides a sent row into place frame by frame, with no native smooth scroll", async () => {
+    // WebKit runs a smooth scroll off the page's thread and can finish it after a scroll key,
+    // over the takeover's stop, which on macOS arm64 also cancels the key's own scroll (#214).
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    onAnchorReady(messageId, 2);
+    const tops: number[] = [];
+    for (let frame = 0; frame < 60 && frames.length > 0; frame += 1) {
+      frames.shift()!();
+      tops.push(list.scrollNode.scrollTop);
+    }
+
+    expect(list.calls.scrollToIndex).toEqual([]);
+    // The row's 184 px offset is reached over several frames, each one closer, never past it.
+    expect(new Set(tops).size).toBeGreaterThan(4);
+    expect(tops.every((top, index) => index === 0 || top >= tops[index - 1]!)).toBe(true);
+    expect(Math.max(...tops)).toBe(184);
+    expect(tops.at(-1)).toBe(184);
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      callback(0);
+      return 1;
+    });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("settles the glide after 500 ms however few frames a busy webview paints", async () => {
+    // The native glide settled on its 750 ms timer. A webview painting 5 frames a second must
+    // not hold following back for its 60 frames: the reply would go on unfollowed.
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    // The scroller has laid out only 100 px, so the glide cannot reach the row's 184 px.
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 100,
+    });
+    const frames = holdFrames();
+    onAnchorReady(messageId, 2);
+    frames.step(2);
+    expect(list.scrollNode.scrollTop).toBeGreaterThan(0);
+    expect(list.calls.scrollToOffset).toEqual([]);
+
+    for (let frame = 0; frame < 3; frame += 1) {
+      now += 200;
+      frames.step();
+    }
+
+    // Settled at 600 ms: the landing measures the row and asks the list for its offset.
+    expect(list.calls.scrollToOffset[0]).toEqual({ offset: 184, animated: false });
+    frames.release();
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops the glide at a scroll key, and nothing scrolls the timeline after the key", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+    onAnchorReady(messageId, 2);
+    for (let frame = 0; frame < 4; frame += 1) frames.shift()?.();
+    const atKey = list.scrollNode.scrollTop;
+    expect(atKey).toBeGreaterThan(0);
+    expect(atKey).toBeLessThan(184);
+
+    fireDocument("keydown", timelineKey("PageUp", ["button"]));
+    for (let frame = 0; frame < 60 && frames.length > 0; frame += 1) frames.shift()!();
+
+    expect(list.scrollNode.scrollTop).toBe(atKey);
+    expect(list.calls.scrollToIndex).toEqual([]);
+    expect(list.calls.scrollToOffset).toEqual([]);
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      callback(0);
+      return 1;
+    });
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("stops following when the reader scrolls the timeline with the keyboard mid-glide", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
       scrollHeight: 400,
       clientHeight: 200,
     });
+    const frames = holdFrames();
     onAnchorReady(messageId, 2);
-    list.scrollNode.scrollTop = 50;
+    frames.step(4);
+    const atKey = list.scrollNode.scrollTop;
 
     fireDocument("keydown", timelineKey("ArrowUp", ["button"]));
-    list.scrollNode.fire("scrollend");
+    frames.run();
+    frames.release();
 
-    // The settle neither pins the reader nor follows the turn's end over them.
+    // Nothing settles, pins the reader or follows the turn's end over them.
     expect(list.calls.scrollToOffset).toEqual([]);
-    expect(list.scrollNode.scrollTop).toBe(50);
+    expect(list.scrollNode.scrollTop).toBe(atKey);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2479,10 +2602,12 @@ describe("ChatView effects (captured and run manually)", () => {
       const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
       onAnchorReady(messageId, 2);
       const before = h.setStateCalls.length;
+      // The glide withdrew what the list held when it started.
+      const withdrawn = list.calls.cancelScrollRequests;
 
       list.scrollNode.fire(takeover, { target: { closest: () => null } });
 
-      expect(list.calls.cancelScrollRequests, takeover).toBe(1);
+      expect(list.calls.cancelScrollRequests, takeover).toBe(withdrawn + 1);
       expect(
         h.setStateCalls
           .slice(before)
@@ -2571,27 +2696,32 @@ describe("ChatView effects (captured and run manually)", () => {
       });
       onAnchorReady(messageId, 2);
       list.scrollNode.scrollTop = scrollTop;
+      const withdrawn = list.calls.cancelScrollRequests;
 
       fireDocument("keydown", timelineKey(key, matches));
       list.scrollNode.fire("scrollend");
 
       // Following goes on: nothing is withdrawn, and the settle follows the reply's end.
-      expect(list.calls.cancelScrollRequests, key).toBe(0);
+      expect(list.calls.cancelScrollRequests, key).toBe(withdrawn);
       expect(list.calls.scrollToOffset.at(-1), key).toEqual({ offset: 216, animated: false });
       for (const cleanup of cleanups) cleanup();
     }
   });
 
   it("lands a sent row that stopped short at its offset, measured on screen", async () => {
-    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    // The scroller has laid out 172 px, so the glide stops 12 px short of 184, where the row
+    // rests 16 px below the top, until the content catches up.
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 172,
+    });
     onAnchorReady(messageId, 2);
-    // The glide stopped 12 px short of 184, where the row rests 16 px below the top.
-    list.scrollNode.scrollTop = 172;
-
-    list.scrollNode.fire("scrollend");
+    expect(list.scrollNode.scrollTop).toBe(172);
     await flushPromises();
 
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 184, animated: false },
+      { offset: 184, animated: false },
+    ]);
     expect(list.scrollNode.scrollTop).toBe(184);
     for (const cleanup of cleanups) cleanup();
   });
@@ -2808,12 +2938,13 @@ describe("ChatView effects (captured and run manually)", () => {
     list.scrollNode.scrollTop = 50;
     list.scrollNode.fire("scrollend");
     expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    const withdrawn = list.calls.cancelScrollRequests;
 
     fireDocument("keydown", timelineKey("ArrowUp"));
     list.runDeferred();
     await flushPromises();
 
-    expect(list.calls.cancelScrollRequests).toBe(1);
+    expect(list.calls.cancelScrollRequests).toBe(withdrawn + 1);
     expect(list.scrollNode.scrollTop).toBe(50);
     expect(list.calls.scrollToOffset).toHaveLength(1);
     for (const cleanup of cleanups) cleanup();
@@ -2824,17 +2955,22 @@ describe("ChatView effects (captured and run manually)", () => {
       deferScrolls: true,
     });
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
+    expect(list.scrollNode.scrollTop).toBe(184);
 
     onAnchorReady(MessageId.make("later-send"), 3);
     await flushPromises();
+    const later = list.scrollNode.scrollTop;
     list.runDeferred();
     await flushPromises();
 
-    // The later row's glide replaced the landing, and nothing lands the earlier row again.
-    expect(list.calls.scrollToIndex).toHaveLength(2);
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
-    expect(list.scrollNode.scrollTop).toBe(0);
+    // The later row's glide withdrew the held landing and settles where it ends, and nothing
+    // lands the earlier row again.
+    expect(later).toBe(284);
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 184, animated: false },
+      { offset: 284, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(284);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2843,14 +2979,14 @@ describe("ChatView effects (captured and run manually)", () => {
       deferScrolls: true,
     });
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
     expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 216, animated: false });
+    const withdrawn = list.calls.cancelScrollRequests;
 
     list.scrollNode.fire("wheel");
     list.runDeferred();
 
-    expect(list.calls.cancelScrollRequests).toBe(1);
-    expect(list.scrollNode.scrollTop).toBe(0);
+    expect(list.calls.cancelScrollRequests).toBe(withdrawn + 1);
+    expect(list.scrollNode.scrollTop).toBe(184);
     for (const cleanup of cleanups) cleanup();
   });
 
