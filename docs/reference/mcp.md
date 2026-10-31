@@ -1547,7 +1547,7 @@ Reverts a thread to its checkpoint after turn `turnCount` (0 means before its fi
 **Errors:**
 
 - `McpTurnRunningError`: a turn is running on the thread. Stop it with `interrupt_turn`, then revert.
-- `McpCheckpointRevertError`: the revert failed (the message has the detail), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
+- `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
 - `McpInvalidArgumentError`: `turnCount` is above the latest turn that has a checkpoint.
 - `McpAccessCeilingError`: the thread runs above this connection's limit.
 - `McpThreadNotFoundError`, `OrchestrationDispatchCommandError`.

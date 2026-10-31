@@ -6048,6 +6048,44 @@ Four findings on the two commits, all fixed:
 The legacy ref 0 refresh also no longer counts the starting turn's own number, so a legacy
 thread's fast first turn still refreshes ref 0 instead of diffing against the old one.
 
+### Codex review round 4 (2026-10-31)
+
+Findings 1, 2 and 4 of round 3 confirmed closed, with no bypass path. Two new ones, fixed:
+
+- **P1 (release-blocking), a stale checkpoint could become a revert target after a restart.**
+  The stale mark lived only in memory, so after a restart the next baseline could write the
+  stale turn's ref from a later checkout, and revert accepted a ref whatever its row said.
+  Fixed in three places:
+  - Staleness is durable: on expiry the turn's checkpoint is recorded with the contract's
+    existing `error` status before the thread's turns go. The projector makes `error`
+    terminal: a later record of the same checkpoint (`missing` or `ready`) keeps it `error`.
+    `capture_missing_checkpoint` already skips anything not `missing`, and `ensure_baseline`
+    skips a latest turn whose row is `error` (or, before that record lands, marked in memory).
+    No contract change: `error` was in `OrchestrationCheckpointStatus` and unused. Its meaning
+    changes from "the turn failed" to "the capture was given up", so the projector and
+    `threadReducer.ts` no longer turn an `error` checkpoint into an `error` turn; the turn keeps
+    the state its session gave it.
+  - Revert restores only a target whose row is `ready` and whose ref resolves (turn 0 keeps
+    ref 0 or `HEAD`). A `missing` or `error` row is refused before the provider rewinds, with
+    "Turn n has no captured checkpoint (its capture failed or timed out), so the thread
+    cannot be reverted to it." The app shows it as the `checkpoint.revert.failed` activity;
+    MCP `revert_thread_to_turn` refuses it up front as `McpCheckpointRevertError`, nothing
+    requested.
+  - Tests: `a_stale_turn_is_never_a_revert_target_after_a_restart` (rebuilds the engine from
+    its database after the expiry, replays a `missing` record, starts the next turn and asks
+    for the revert: the row stays `error`, no ref is written, the files and the provider are
+    untouched) and `revert_to_an_uncaptured_turn_is_refused_even_with_its_ref` (MCP, with the
+    ref present for a `missing` and an `error` turn). The restart test first exposed that a
+    later record could overwrite `error`, which the projector now prevents.
+- **P2, expiry could report failure for a valid capture.** Expiry and completion now make one
+  decision per turn under the hold lock: after its capture the worker claims the turn
+  (`claim_checkpoint_completion`, which takes the hold over from its expiry; the worker releases it after the record), and the expiry marks it stale only
+  while its hold is still current. The expiry keeps the hold until its `error` record is
+  written. A turn therefore ends either stale (`error`, one `checkpoint.capture.failed`
+  activity) or `ready` with no failure activity, never both. Test:
+  `an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready` (the worker is held
+  in its workspace refresh, after the claim, past the limit).
+
 ### Tests
 
 - Red first, then green: the three integration tests above; `threadReducer` keeps an

@@ -2819,7 +2819,7 @@ impl OrchestrationEngine {
             .turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        holds.0 = holds.0.wrapping_add(1);
+        holds.0 = holds.0.wrapping_add(1).max(1);
         let id = holds.0;
         holds
             .1
@@ -2834,33 +2834,52 @@ impl OrchestrationEngine {
     }
 
     /// Gives up hold `id` of `turn_id` before the worker captured the turn: marks the turn's
-    /// checkpoint stale, then releases the hold. Returns `false`, changing nothing, when the hold
-    /// is already gone (the worker finished, or the thread was deleted).
+    /// checkpoint stale and keeps the hold, which the caller releases once the stale checkpoint
+    /// is recorded. Returns `false`, changing nothing, when the hold is already gone (the worker
+    /// claimed the capture, or the thread was deleted).
     pub(crate) fn expire_checkpoint_hold(&self, thread_id: &str, turn_id: &str, id: u64) -> bool {
         let key = (thread_id.to_owned(), turn_id.to_owned());
-        let expired = {
-            let mut holds = self
-                .checkpoint_holds
-                .turns
+        let holds = self
+            .checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Decided under the hold lock, against `claim_checkpoint_completion`: one of the two wins.
+        // The hold stays until the caller has recorded the stale checkpoint durably.
+        let current = holds.1.get(&key) == Some(&id);
+        if current {
+            self.checkpoint_holds
+                .stale
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let current = holds.1.get(&key) == Some(&id);
-            if current {
-                // Marked before the release, so the worker never records it `ready` once the
-                // thread's next turn may run.
-                self.checkpoint_holds
-                    .stale
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(key.clone());
-                holds.1.remove(&key);
-            }
-            current
-        };
-        if expired {
-            self.wake_turn_delivery();
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
         }
-        expired
+        current
+    }
+
+    /// The worker captured `turn_id`'s checkout and will record it `ready`: unless its hold has
+    /// already expired (it is stale), takes the hold over from its expiry, which can then no
+    /// longer fire. The hold itself stays until the worker releases it, after the record.
+    /// Returns whether the capture may be recorded. One atomic decision against
+    /// `expire_checkpoint_hold`: a turn ends either `ready` or stale, never both.
+    pub(crate) fn claim_checkpoint_completion(&self, thread_id: &str, turn_id: &str) -> bool {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let mut holds = self
+            .checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale = self
+            .checkpoint_holds
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key);
+        if !stale && let Some(id) = holds.1.get_mut(&key) {
+            // Hold ids start at 1, so no expiry owns id 0.
+            *id = 0;
+        }
+        !stale
     }
 
     /// Whether `turn_id`'s hold expired before the worker captured it.
@@ -8038,17 +8057,24 @@ fn apply_turns_projector_tx(
             let turn_id = required_str(payload, "turnId")?;
             let completed_at = required_str(payload, "completedAt")?;
             let running = transaction.query_row("SELECT 1 FROM projection_thread_sessions WHERE thread_id = ? AND status = 'running' AND active_turn_id = ?", params![thread_id, turn_id], |_| Ok(())).optional()?.is_some();
-            let status = required_str(payload, "status")?;
-            let next_state = if running {
-                "running"
-            } else if status == "error" {
-                "error"
-            } else {
-                "completed"
-            };
+            // A checkpoint's status says whether its capture is usable (`error`: given up, never
+            // restored), not how the turn went: the turn keeps the state its session gave it.
+            let next_state = if running { "running" } else { "completed" };
             let checkpoint_turn_count = required_i64(payload, "checkpointTurnCount")?;
+            // `error` is terminal: a turn's checkpoint given up stays so, whatever record of the
+            // same checkpoint follows, so nothing can make it a capture or a revert target again.
+            let given_up = transaction.query_row("SELECT 1 FROM projection_turns WHERE thread_id = ? AND turn_id = ? AND checkpoint_turn_count = ? AND checkpoint_status = 'error'", params![thread_id, turn_id, checkpoint_turn_count], |_| Ok(())).optional()?.is_some();
+            let status = if given_up {
+                "error".to_owned()
+            } else {
+                required_str(payload, "status")?
+            };
             transaction.execute("UPDATE projection_turns SET checkpoint_turn_count = NULL, checkpoint_ref = NULL, checkpoint_status = NULL, checkpoint_files_json = '[]' WHERE thread_id = ? AND turn_id <> ? AND checkpoint_turn_count = ?", params![thread_id, turn_id, checkpoint_turn_count])?;
-            let files = json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?;
+            let files = if given_up {
+                "[]".to_owned()
+            } else {
+                json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?
+            };
             // A turn its session ended interrupted or failed keeps that state, and an event that
             // names no answer keeps the one the turn already has.
             let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
