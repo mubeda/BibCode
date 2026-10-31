@@ -2803,7 +2803,8 @@ fn migration_061(transaction: &Transaction<'_>) -> Result<()> {
            consecutive_failures INTEGER NOT NULL DEFAULT 0,
            disabled_reason TEXT,
            created_at TEXT NOT NULL,
-           updated_at TEXT NOT NULL
+           updated_at TEXT NOT NULL,
+           revision INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS webhook_deliveries (
            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2819,7 +2820,8 @@ fn migration_061(transaction: &Transaction<'_>) -> Result<()> {
            last_error TEXT,
            latency_ms INTEGER,
            created_at TEXT NOT NULL,
-           updated_at TEXT NOT NULL
+           updated_at TEXT NOT NULL,
+           endpoint_revision INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
            ON webhook_deliveries(state, next_attempt_ms);
@@ -2830,6 +2832,23 @@ fn migration_061(transaction: &Transaction<'_>) -> Result<()> {
            value TEXT NOT NULL
          );",
     )?;
+    ensure_webhook_revisions(transaction)
+}
+
+/// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
+/// before it was released. A development store that ran the earlier 61 gets them here: the
+/// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
+pub(crate) fn ensure_webhook_revisions(transaction: &Transaction<'_>) -> Result<()> {
+    for (table, column) in [
+        ("webhook_endpoints", "revision"),
+        ("webhook_deliveries", "endpoint_revision"),
+    ] {
+        if table_exists(transaction, table)? && !table_has_column(transaction, table, column)? {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -3089,10 +3108,44 @@ mod tests {
             "INSERT INTO webhook_state (key, value) VALUES ('feed', 'v1.0.0')",
             [],
         )?;
+        let revisions: (i64, i64) = connection.query_row(
+            "SELECT (SELECT revision FROM webhook_endpoints WHERE endpoint_id = 'w'), \
+                    (SELECT endpoint_revision FROM webhook_deliveries WHERE delivery_id = 'd')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(revisions, (0, 0));
         // Running it again changes nothing.
         let transaction = connection.transaction()?;
         super::migration_061(&transaction)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_ran_the_earlier_061_gains_the_revisions() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, None)?;
+        // The shape of the first, unreleased 61.
+        connection.execute_batch(
+            "ALTER TABLE webhook_endpoints DROP COLUMN revision; \
+             ALTER TABLE webhook_deliveries DROP COLUMN endpoint_revision;",
+        )?;
+        connection.execute(
+            "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', 't', 't')",
+            [],
+        )?;
+        let transaction = connection.transaction()?;
+        super::ensure_webhook_revisions(&transaction)?;
+        super::ensure_webhook_revisions(&transaction)?;
+        transaction.commit()?;
+        let revision: i64 = connection.query_row(
+            "SELECT revision FROM webhook_endpoints WHERE endpoint_id = 'w'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(revision, 0);
+        connection.prepare("SELECT endpoint_revision FROM webhook_deliveries LIMIT 0")?;
         Ok(())
     }
 

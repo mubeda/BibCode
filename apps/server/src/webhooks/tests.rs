@@ -1523,7 +1523,7 @@ fn queued(endpoint: &store::Endpoint, cursors: &[&str], tag: &str) -> Vec<store:
             event_type: events::THREAD_STATUS_CHANGED.to_owned(),
             body: json!({ "id": format!("ev_{tag}_{cursor}"), "type": events::THREAD_STATUS_CHANGED, "cursor": cursor })
                 .to_string(),
-            addressed: Some(endpoint.fence()),
+            addressed: Some(endpoint.revision),
         })
         .collect()
 }
@@ -1694,6 +1694,102 @@ async fn endpoints_held_by_manual_sends_neither_block_a_ready_one_nor_spin_the_l
     for send in sends {
         send.await.unwrap().unwrap();
     }
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_and_its_undo_still_fence_off_what_was_chosen_before_them() {
+    let harness = Harness::new_timed(Timing {
+        poll: Duration::from_secs(60),
+        ..Timing::default()
+    })
+    .await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let store = harness.webhooks.store();
+    let snapshot = store.endpoint(&id).await.unwrap().unwrap();
+    let edit = |url: String| json!({ "id": id, "name": "CI", "url": url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] });
+    // A → B → A: the settings read the same as the snapshot's, but they were edited.
+    harness
+        .call("upsert", edit(format!("{}/b", harness.receiver.url)))
+        .await
+        .unwrap();
+    harness
+        .call("upsert", edit(harness.receiver.url.clone()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    store
+        .enqueue(queued(&snapshot, &["v1.1.0"], "stale"), Vec::new(), 0)
+        .await
+        .unwrap();
+    assert!(harness.deliveries(&id).await.is_empty());
+    harness.webhooks.shutdown().await;
+}
+
+/// A test event built from a read of the endpoint, with an edit landing before it takes the
+/// endpoint's lock and token: it is refused, never sent to the edited URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manual_send_built_before_an_edit_is_refused() {
+    let harness = Harness::new().await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let turn = harness.webhooks.send_lock(&id).lock_owned().await;
+    let webhooks = harness.webhooks.clone();
+    let payload = json!({ "id": id });
+    let send = tokio::spawn(async move { webhooks.send_test(payload).await });
+    eventually("the test event read and stored", async || {
+        harness.deliveries(&id).await.len() == 1
+    })
+    .await;
+    harness
+        .call(
+            "upsert",
+            json!({ "id": id, "name": "CI", "url": format!("{}/moved", harness.receiver.url), "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] }),
+        )
+        .await
+        .unwrap();
+    drop(turn);
+    let refused = send.await.unwrap().unwrap_err();
+    assert_eq!(refused["reason"], "endpoint_changed", "{refused}");
+    assert!(harness.receiver.received().is_empty());
+    let log = harness.deliveries(&id).await;
+    assert_eq!(log[0]["state"], "abandoned");
+    assert_eq!(log[0]["lastError"], "endpoint_changed");
+    harness.webhooks.shutdown().await;
+}
+
+/// An acknowledgement held up across webhooks off and on never erases a batch recorded
+/// after it: batch numbers are never reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acknowledgement_paused_across_off_and_on_keeps_a_newer_drop() {
+    let harness = Harness::new_timed(Timing {
+        poll: Duration::from_secs(60),
+        max_pending: 1,
+        ..Timing::default()
+    })
+    .await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let store = harness.webhooks.store();
+    let endpoint = store.endpoint(&id).await.unwrap().unwrap();
+    store
+        .enqueue(queued(&endpoint, &["v1.1.0", "v1.2.0"], "a"), Vec::new(), 0)
+        .await
+        .unwrap();
+    // A request announced this batch and got its 2xx; its acknowledgement is held up.
+    let (announced, _) = store.dropped(&id).await.unwrap().unwrap();
+    // Webhooks off, then on, and a new drop.
+    harness.webhooks.turned_off().await;
+    store
+        .enqueue(queued(&endpoint, &["v1.3.0", "v1.4.0"], "b"), Vec::new(), 0)
+        .await
+        .unwrap();
+    store.acknowledge_dropped(&id, announced).await.unwrap();
+    let (_, pending) = store
+        .dropped(&id)
+        .await
+        .unwrap()
+        .expect("the newer drop stays");
+    assert_eq!(pending.from_cursor.as_deref(), Some("v1.3.0"));
     harness.webhooks.shutdown().await;
 }
 

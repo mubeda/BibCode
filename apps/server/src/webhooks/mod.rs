@@ -349,28 +349,8 @@ impl Webhooks {
         }
     }
 
-    /// Sends one delivery once, after the endpoint's request in flight, and returns what
-    /// happened, without recording it (a test event and a redelivery).
-    async fn attempt(
-        &self,
-        endpoint: &Endpoint,
-        delivery_id: &str,
-        event_type: &str,
-        body: &str,
-        cancel: &CancellationToken,
-    ) -> Attempt {
-        let Some(_turn) = self.take_turn(&endpoint.id, cancel).await else {
-            return Attempt {
-                status: None,
-                failure: Some(Failure::Cancelled),
-                latency_ms: 0,
-            };
-        };
-        self.attempt_holding_turn(endpoint, delivery_id, event_type, body, cancel)
-            .await
-    }
-
-    /// [`attempt`](Self::attempt) for a caller that holds the endpoint's send lock. It adds
+    /// Sends one delivery once for a caller that holds the endpoint's send lock, and returns
+    /// what happened without recording it. It adds
     /// `dropped` to the body while the endpoint has drop batches it was not told about, and a
     /// 2xx acknowledges exactly the batches it carried.
     async fn attempt_holding_turn(
@@ -481,14 +461,14 @@ impl Webhooks {
                 None => return,
             },
         };
-        match self.inner.store.delivery(&delivery.delivery_id).await {
-            Ok(Some(current)) if current.state == store::PENDING => {}
+        let stamped = match self.inner.store.delivery(&delivery.delivery_id).await {
+            Ok(Some(current)) if current.state == store::PENDING => current.endpoint_revision,
             Ok(_) => return,
             Err(error) => {
                 tracing::warn!(%error, "could not read a webhook delivery");
                 return;
             }
-        }
+        };
         let endpoint = match self.inner.store.endpoint(&delivery.endpoint_id).await {
             Ok(Some(endpoint)) if endpoint.enabled => endpoint,
             Ok(_) => return,
@@ -497,6 +477,18 @@ impl Webhooks {
                 return;
             }
         };
+        // Queued under another revision: never sent to this one.
+        if stamped != endpoint.revision {
+            if let Err(error) = self
+                .inner
+                .store
+                .abandon_delivery(&delivery.delivery_id, store::ENDPOINT_CHANGED)
+                .await
+            {
+                tracing::warn!(%error, "could not abandon a stale webhook delivery");
+            }
+            return;
+        }
         let attempt = self
             .attempt_holding_turn(
                 &endpoint,
@@ -772,7 +764,7 @@ impl Webhooks {
                     event_id: event.id.clone(),
                     event_type: event.event_type.to_owned(),
                     body: event.body(&self.inner.environment_id),
-                    addressed: Some(endpoint.fence()),
+                    addressed: Some(endpoint.revision),
                 });
             }
         }
@@ -863,6 +855,9 @@ async fn run(webhooks: Webhooks) {
     let mut in_flight: JoinSet<String> = JoinSet::new();
     let mut busy: HashSet<String> = HashSet::new();
     let mut last_prune: Option<tokio::time::Instant> = None;
+    if let Err(error) = inner.store.ensure_revisions().await {
+        tracing::warn!(%error, "could not add the webhook revision columns");
+    }
     match inner.store.fail_interrupted_sends().await {
         Ok(0) => {}
         Ok(interrupted) => tracing::warn!(
