@@ -3825,16 +3825,19 @@ Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
   fresh snapshot).
 - **Commit message suggestions** (slice X7). `ui.publishIntent` takes `kind`, `focus`
   unless set; `kind: "commitMessage"` takes `{ threadId, cwd, message }` and publishes
-  `{ kind: "commitMessage", intentId, sequence, threadId, cwd, message, actor, createdAt,
-  expiresAt }`. These live apart from the `focus` intents: the last one per `cwd` for 24
-  hours, at most 64 folders (the oldest dropped first), outside the per-thread and per-agent
-  limits, and every snapshot carries all of them after the newest 64 `focus` intents.
-  `sequence` rises with every publish (at least the clock in milliseconds, so it keeps rising
-  across a restart); it is taken, the folder updated and the intent broadcast under one
-  lock. The handler trusts the `cwd` the tool resolved from the thread; it has no projection
-  to check it against, and the suggestion is advice a panel labels. The client runtime folds
-  each event at the time it arrived (Effect's `Clock`), drops expired intents, caps each
-  kind separately and keeps a folder's message with the highest `sequence`.
+  `{ kind: "commitMessage", intentId, bootId, sequence, threadId, cwd, message, actor,
+  createdAt, expiresAt, expiresInMs }`. These live apart from the `focus` intents: the last
+  one per `cwd` for 24 hours, at most 64 folders (the oldest dropped first), outside the
+  per-thread and per-agent limits, and every snapshot carries all of them after the newest 64
+  `focus` intents. `sequence` rises with every publish of one server process, whose random
+  `bootId` each message names; it is taken, the folder updated and the intent broadcast under
+  one lock. Every intent of either kind carries `expiresInMs`, the time it had left when sent
+  (recomputed per snapshot). The handler trusts the `cwd` the tool resolved from the thread;
+  it has no projection to check it against, and the suggestion is advice a panel labels. The
+  client runtime gives each intent a deadline on its own clock (arrival, read through
+  Effect's `Clock`, plus `expiresInMs`), drops intents past it, caps each kind separately,
+  and keeps a folder's newest message: the higher `sequence` within one boot, and a message
+  from another boot over anything it holds (one server serves one environment).
 - **Clients.** `UiIntentNotifier` (one per environment, outside the router) raises a
   non-modal toast per intent, **Agent <label> wants to show <surface>** with **Show**, and
   moves nothing until it is clicked; a hidden window raises it when shown again if it has
@@ -3846,10 +3849,12 @@ Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
   draft (**Message from Agent <label>**), or offers it beside text (**Use it**, **Dismiss**,
   then **Undo**), and remembers each intent id per folder in local storage, so a pending
   suggestion never refills the box after a commit cleared it. Applying a suggestion first
-  promotes the thread's draft from before folder drafts, in the same update, and reads the
-  saved state: a draft another tab saved with text is kept and the suggestion offered, and
-  the write changes only that folder. A suggestion past `expiresAt` is never applied, and a
-  shown one is hidden when it expires.
+  promotes the thread's draft from before folder drafts. It fills only when this tab's draft
+  and the saved one are both empty, and that fill writes only its folder's draft and record
+  into the saved state; otherwise the suggestion is offered and nothing is written (an
+  unhandled suggestion reads as offered). The panel applies each suggestion once while it is
+  mounted, never applies one past its local deadline, and hides a shown one when that
+  passes.
 
 ## Targeted Activity cancellation flow
 
