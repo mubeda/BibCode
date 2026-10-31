@@ -1748,14 +1748,29 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   Bearer, DPoP, and `wsTicket` authentication do not check `Origin`. The
   desktop app's `bibcode://app` origin gets no exception: it sends a bearer
   token with `credentials: "omit"` and never uses the cookie.
-- `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only from a loopback
-  socket peer, the same trust as `X-Forwarded-For`. From such a peer the first
+- `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only when the socket
+  peer is loopback **and** the raw `Host` is a loopback name or the address the
+  connection was accepted on (#139, slice R). From such a peer the first
   `X-Forwarded-Host` entry replaces `Host` before any handler runs, so the
   Origin rule, DPoP request URLs, and the preview gateway see the address the
-  browser used. Every other peer has both headers removed. A reverse proxy
-  must therefore run on the server's host and send `X-Forwarded-Host`. With
-  nginx's default `proxy_set_header Host $proxy_host`, a proxy that omits it
-  gets `403` on every cookie mutation and WebSocket.
+  browser used. Otherwise both headers are removed and `Host` is kept: a client
+  of the managed tunnel, whose `Host` is the public hostname, cannot turn it
+  into a loopback name with its own `X-Forwarded-Host`. A reverse proxy must
+  therefore run on the server's host, keep nginx's default
+  `proxy_set_header Host $proxy_host` (the loopback upstream), and overwrite
+  both forwarded headers. A proxy that omits `X-Forwarded-Host` gets `403` on
+  every cookie mutation and WebSocket; one that sends the public `Host` itself
+  loses `X-Forwarded-Proto`, so it serves no remote MCP sign-in.
+- The same layer classes each request once, before any route runs
+  (`RequestOrigin` in `http.rs`): **direct** (a loopback `Host` from a loopback
+  peer, or the accepted address, with no forwarded header; origin
+  `http://<Host>`), **managed tunnel** (a loopback socket and the managed
+  hostname in `Host`; origin `https://<managed hostname>`, fixed by the server),
+  **local proxy** (loopback peer and `Host` with `X-Forwarded-Host`; origin
+  `<X-Forwarded-Proto or http>://<X-Forwarded-Host>`), or **other** (anything
+  else, preview gateway hostnames included). The class also carries the
+  admission source key: the peer's /24 or /64 network (a loopback peer's last
+  `X-Forwarded-For` entry), or `tunnel`.
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently
@@ -1779,7 +1794,18 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   `orchestration:read orchestration:operate` implicitly and reaches only the
   `preview_*` and `device_*` tools. An **outside agent** presents an `mcp-client`
   session (see [Environment authentication](../cloud/environment-auth.md#outside-agents-over-mcp))
-  and reaches only the thread tools. Every other bearer gets 401. Each tool is
+  and reaches only the thread tools. Every other bearer gets 401.
+- `/mcp` checks each bearer's audience against the request's class (slice R):
+  a provider credential, and a relay or `bibcode thread` session (no
+  `mcp_resource`), only on a **direct** request; a remote OAuth session only
+  when the request's eligible origin plus `/mcp` is the resource its grant is
+  bound to. A token minted through one hostname therefore does not work through
+  another, and a tunnel hostname change needs a new sign-in (RFC 8707). A
+  request without an accepted credential gets 401; on an eligible origin it
+  carries `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp", scope="orchestration:read orchestration:operate"`,
+  for GET as for POST. An authenticated GET gets 405, and outside agents, which
+  are sessionless, get 405 on `DELETE`. A tool whose scope the credential lacks
+  is hidden from `tools/list` and refused with `McpScopeError` naming the scope. Each tool is
   registered in `mcp::control` with its principal kind and the required scope of
   the RPC method it maps to, and every call checks both before the handler runs;
   a call to the other kind's tool is a scope refusal.
@@ -1801,8 +1827,21 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   (the runtime guard is shared) leaves a record whose pid is alive and whose
   listener answers the proof, or does not answer within 2 s, and runs without
   MCP discovery; a record whose owner is gone is replaced. A remote
-  agent uses `ssh <host> bibcode mcp`. Remote Streamable HTTP for outside agents
-  needs MCP OAuth and is not served.
+  agent uses `ssh <host> bibcode mcp`, or remote Streamable HTTP with MCP OAuth.
+- **Remote Streamable HTTP with MCP OAuth** (slice R). BiBCode is the
+  authorization server for its own `/mcp` on an **eligible origin**: the managed
+  tunnel's, a local proxy's `https` one, or a direct loopback `http` one. Every
+  OAuth route answers 404 elsewhere, so a plain-HTTP LAN address keeps
+  `ssh <host> bibcode mcp`. The flow, the routes and the token lifetimes are in
+  [Environment authentication](../cloud/environment-auth.md#remote-mcp-oauth).
+  BiBCode Connect's managed tunnel gives an environment an HTTPS hostname, and
+  the Connect relay's own tokens never reach `/mcp`. A grant is approved in
+  BiBCode by a person with `access:write`, or on the host with
+  `bibcode mcp authorize`; the unauthenticated routes only create bounded,
+  expiring rows under per-client, per-source and global caps. Through the
+  managed tunnel the source key cannot be proven unforgeable, so a flood
+  through the tunnel can delay other tunnel sign-ins; it cannot grant access or
+  block direct, SSH or proxy requests, and turning MCP off ends it.
 - Emulator, adb, and scrcpy sockets listen on loopback only; BiBCode never
   passes `adb -a`.
 

@@ -39,7 +39,28 @@ For Codex, replace `claude mcp add` with `codex mcp add`. For a data root other 
 `--access read-only` (or `approval-required`, `auto-accept-edits`).
 
 Over SSH no tunnel is needed: `bibcode mcp` runs on the remote host and talks to that host's
-own loopback server. Remote MCP over HTTP is not supported yet.
+own loopback server.
+
+### A remote host over HTTPS
+
+An environment reachable over HTTPS (BiBCode Connect's managed tunnel, or a reverse proxy on
+the host) also serves MCP over HTTP with OAuth sign-in. The **Remote agents** row gives the URL
+and the commands:
+
+| Agent       | Command                                                      |
+| ----------- | ------------------------------------------------------------ |
+| Claude Code | `claude mcp add --transport http bibcode https://<host>/mcp` |
+| Codex       | `codex mcp add bibcode --url https://<host>/mcp`             |
+
+The agent opens a sign-in page that shows a code. Approve it under **Requests to connect** in
+the BiBCode app that manages that environment, after checking the code, or on the host with
+`bibcode mcp authorize <code>`. The agent then refreshes its one-hour access token by itself
+for as long as it is used (a grant lapses after 30 days unused). Each sign-in is bound to the
+address it used and to the access you approved, at most **Agents may**; terminals need a
+sign-in that asks for `terminal:operate` and your approval of them. A plain-HTTP address serves
+no sign-in: use SSH there. See [Remote Access](remote-access.md#remote-ai-tools-over-https)
+for the steps, and
+[Environment authentication](../cloud/environment-auth.md#remote-mcp-oauth) for the protocol.
 
 ## Tools
 

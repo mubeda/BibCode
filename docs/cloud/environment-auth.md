@@ -138,6 +138,54 @@ relay exchanges it at `/oauth/token` over loopback, after proving the listener
   and `/mcp` answers outside agents with `McpServerDisabledError`. No session is
   revoked, so turning it back on needs no new pairing.
 
+### Remote MCP OAuth
+
+Remote AI tools reach `/mcp` over HTTPS with MCP OAuth (#139, slice R). The
+routes serve only an eligible origin (see
+[Remote environments](../architecture/remote.md)) and answer 404 elsewhere.
+
+| Route                                                                                        | Purpose                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /.well-known/oauth-protected-resource/mcp`, `GET /.well-known/oauth-protected-resource` | RFC 9728 metadata: `resource` `<origin>/mcp`, `authorization_servers` `[<origin>]`, `scopes_supported` (`orchestration:read`, `orchestration:operate`, and `terminal:operate` while Terminals is on), `bearer_methods_supported` `["header"]`, `resource_name` the environment label                                                                                                                      |
+| `GET /.well-known/oauth-authorization-server`                                                | RFC 8414 metadata: `issuer` the origin itself, the three endpoints, `code` responses, the `authorization_code` and `refresh_token` grants, `S256` only, `none` client authentication, and `authorization_response_iss_parameter_supported`                                                                                                                                                                |
+| `POST /oauth/register`                                                                       | RFC 7591 registration of a public client: one to five redirect URIs, each `http` on `localhost`, `127.0.0.1` or `[::1]` (any port) or `https`, without a fragment; `client_name` up to 100 characters. 201 with `client_id`                                                                                                                                                                               |
+| `GET /oauth/authorize`                                                                       | Checks the client and redirect URI (an error page, never a redirect, when either is unknown), then `response_type=code`, `code_challenge_method=S256`, `resource` equal to `<origin>/mcp`, and the scopes (empty means the default pair, `offline_access` is ignored); later refusals redirect with `error`, `state` and `iss`. Records a pending authorization for 10 minutes and shows the consent page |
+| `GET /oauth/authorize/status?id=`                                                            | The consent page's own poll, readable only with the `HttpOnly`, `SameSite=Strict` cookie that page set: pending refreshes; approved redirects once with `code`, `state` and `iss`; denied redirects with `access_denied`                                                                                                                                                                                  |
+| `POST /oauth/token`                                                                          | `authorization_code` and `refresh_token` on an eligible origin; the RFC 8693 exchange above is unchanged on every origin                                                                                                                                                                                                                                                                                  |
+| `POST /api/auth/mcp-authorizations/approve`, `/deny`                                         | `access:write`: approve `{ id, access, terminals }` (access at most `mcpServerAccess`; terminals only when asked for, with Terminals on and Full access on both sides) or deny `{ id }`                                                                                                                                                                                                                   |
+
+- **Approval.** The consent page (server-rendered, no script,
+  `frame-ancestors 'none'` and `X-Frame-Options: DENY`) shows a code
+  `XXXX-XXXX` and tells the person to approve in BiBCode or run
+  `bibcode mcp authorize <code>` on the host. The pending list reaches BiBCode
+  clients on `subscribeAuthAccess` as the snapshot's optional
+  `pendingMcpAuthorizations`. Nothing on the unauthenticated routes grants
+  access by itself.
+- **Code.** Minted when the poll first sees the approval: single use, valid 60
+  seconds, PKCE `S256` verified, and bound to the client, the exact redirect URI
+  (port included), the resource and the approved scopes. Its exchange writes the
+  grant's `mcp-client` session (label `MCP · <client> (remote)`,
+  `mcp_resource` set, 30 days after its last refresh) in the same transaction
+  that marks it used. A second use revokes that session.
+- **Tokens.** The response is `{ access_token, token_type: "Bearer",
+  expires_in: 3600, refresh_token, scope }`. The access token is the session's
+  signed claims with `exp` one hour out (never past the grant); the verifier
+  checks the grant's expiry and the token's separately. Refresh tokens are
+  single use: a refresh rotates both tokens and moves the grant's expiry 30
+  days out, and any second use of a refresh token is `invalid_grant` and revokes
+  the whole grant. A refresh's `scope` may only narrow the grant, which then
+  stays narrowed. Refresh works while `enableMcpServer` is off; the code grant
+  does not.
+- **Admission.** Per client 2 pending authorizations; per source 8
+  registrations an hour and 4 pending authorizations (429 past either); global
+  64 never-approved clients and 64 pending authorizations, of which 16 are kept
+  for sources with none pending, evicting the oldest entry of the source with
+  the most. Never-approved clients go after a day, approved ones after 90 days
+  unused.
+- **Secrets.** Codes, refresh tokens and the status cookie are stored only as
+  SHA-256 hashes, compared in constant time, and never logged or recorded by the
+  profiler.
+
 ## Access administration
 
 Administrative sessions use the `/api/auth/pairing-*` and
@@ -159,9 +207,13 @@ pair again; old roles are not silently promoted to scopes.
 - DPoP-bound sessions verify the proof method, URL, key thumbprint, nonce when
   required, and access-token hash.
 
-This is not a general-purpose OAuth authorization server. The environment
-bootstrap token type, browser-session adapter, and WebSocket ticket are
-product-specific, and API failures use BiBCode's typed HTTP/RPC error schemas.
+- Remote MCP follows RFC 9728, RFC 8414, RFC 7591 (public clients), RFC 7636
+  (`S256` only), RFC 8707 and RFC 9207 (`iss` in authorization responses).
+
+This is an authorization server for `/mcp` only. The environment bootstrap
+token type, browser-session adapter, and WebSocket ticket are product-specific,
+and API failures other than the OAuth endpoints' use BiBCode's typed HTTP/RPC
+error schemas.
 
 ## Relay boundary
 
