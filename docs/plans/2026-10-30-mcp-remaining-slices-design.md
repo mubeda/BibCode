@@ -5290,3 +5290,72 @@ the round-three code:
   the receiver); both failed before the change (the edit returned at once). The round-4
   `a_manual_send_built_before_an_edit_is_refused` now queues the edit for the lock before the
   test event, since the edit waits for the lock the test holds.
+
+
+## Z (agent-facing reference and docs) implementation notes (2026-10-31)
+
+Z was written on `claude/v0131-139-z`, from `26b839ace6` (the batch tip with slice 1, the
+CLI, F0 and every slice but R). It is documentation plus one test; no runtime code changed.
+
+**Delivered:**
+
+- `docs/reference/mcp.md`: transports (stdio relay, desktop executable, SSH, WSL,
+  `bibcode thread`, the `/mcp` HTTP contract), protocol eras and headers, the credential,
+  access levels, tool sets and how a person grants them, calling conventions (results, the
+  80,000-character cap, errors and kept fields, order of checks, limits, the three retry
+  kinds, unknown-outcome reasons, live controls, cursors, waits and progress, path rules),
+  the safety model, a generated index of the 91 client tools, one entry per tool grouped by
+  family with a worked JSON-RPC call per family, and the error table generated from
+  `feed::ERRORS` (48 tags). The **Remote HTTP with OAuth** section is a stub with a
+  `TODO(R)` comment listing what R's writer fills.
+- `docs/reference/webhooks.md`: enabling and who may manage, the `webhooks.*` methods and
+  their rules, every event with its source and fields, the payload, headers and signature
+  with the `whsec_test` vector and Python and Node verifiers, outbound rules, retries,
+  ordering, auto-disable, revisions, dropped-delivery batches, and catch-up with its limits.
+- The drift test `mcp::reference_docs` (a unit test, since `FAMILIES`, `feed::ERRORS` and
+  `EVENT_TYPES` are crate-private): every client tool has a `` #### `name` `` heading in
+  `mcp.md` and no heading names an unregistered tool; every `ERRORS` tag is backticked in
+  `mcp.md`; every `EVENT_TYPES` entry and `webhook.test` is backticked in `webhooks.md`.
+- Links from `docs/README.md`, `docs/user/mcp.md` and `docs/user/webhooks.md`; the user
+  guide's "What it can and cannot do" now states the safety model (destructive tools at
+  every level above read-only, live controls, the set-name mismatch) and its stale "Not
+  available" list and credential bullet are fixed; `files_write`'s argument is named
+  `expectedVersion`.
+- `overview.md` gains an "Outside agents over MCP" section, and the device-tools paragraph no
+  longer says client credentials lack a scope check.
+- The slice-1 design carries superseded notes at its top, under its non-goals and on its
+  "Approvals?" answer; the decisions are not edited.
+- The runbooks gain smoke steps for a destructive tool, a terminal, the off switch mid-push,
+  Stop and Take over, a webhook delivery (cross-platform), and Take over, Stop and the
+  transfer URL limit over SSH. The remote OAuth step is a `TODO(R)` placeholder.
+- The `bibcode-mcp` skill's stale sections (approvals never over MCP, "What has no tool")
+  are rewritten to current behavior and point at the reference; eval 2 now expects an
+  approval answered after its summary is checked, eval 4 a plan read first and no
+  `discardChanges` without say-so, and evals 6 to 9 cover force-push, terminals off,
+  `changes_since` and an unknown outcome. The frontmatter is unchanged, so the stubs are too.
+
+**How the tool entries were written.** Five extraction passes read each family's specs,
+schemas and handlers and wrote its entries; a script then checked every entry's annotations
+and access line against the parsed `TOOLS` arrays (all 91 matched) before the page was
+assembled.
+
+**Not done:**
+
+- The skill was not rebuilt test-first: baselines without the skill were not re-recorded,
+  and evals 6 to 9 have no recorded run. The remote-host-over-HTTPS eval waits for R.
+- `docs/skills/bibcode-profiler/references/` needed no change: X2 and X8 updated it.
+
+**Gaps found in the code while documenting** (not fixed here):
+
+- `McpCapability::label()` says "Workspace" and "Source control" while the Settings switches
+  read "Threads and worktrees" and "Source Control and pull requests" (T's note); the
+  reference documents both.
+- `list_projects_and_threads`' description lists a `queued` thread status that a thread
+  summary never carries; only `wait_for_thread` returns it.
+- A full terminal input queue surfaces as `TerminalCwdStatError`, which looks like a
+  mis-mapped error code.
+- A `preview_evaluate` whose value is a bare string or number over 80,000 characters may
+  reach `tool_result`'s `content["truncated"] = true` on a non-object; not verified.
+- Device twin failures keep only `_tag` and `message`, dropping `kind`, `running`, `imageId`
+  and `state`.
+- A `files_read` of a missing path reports `operation_failed`, not `path_not_found`.
