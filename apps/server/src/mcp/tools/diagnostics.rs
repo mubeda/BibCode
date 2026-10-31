@@ -100,10 +100,7 @@ fn call<'a>(
                 call.profiler(profiler::status_content, project_findings)
                     .await
             }
-            "profiler_findings" => {
-                call.profiler(profiler::findings_content, project_findings)
-                    .await
-            }
+            "profiler_findings" => call.profiler(findings_page, |_| {}).await,
             "profiler_events" => {
                 call.profiler(profiler::events_content, project_events)
                     .await
@@ -613,6 +610,15 @@ const NESTED: &[(&str, &[&str])] = &[
 /// What a client batch may say it measures with.
 const CLIENT_CAPABILITIES: &[&str] = &["long-animation-frame", "heartbeat", "event", "memory"];
 
+/// `profiler_findings` with each finding projected before its page is fitted, so a page and
+/// its cursor always fit together.
+fn findings_page(
+    reader: &crate::diagnostics::profiler::reader::Reader,
+    arguments: &Map<String, Value>,
+) -> Result<(Value, profiler::Cuts), Refusal> {
+    profiler::findings_page(reader, arguments, project_finding)
+}
+
 fn project_findings(content: &mut Value) {
     if let Some(Value::Array(findings)) = content.get_mut("findings") {
         for finding in findings {
@@ -658,11 +664,19 @@ pub(crate) fn project_event(event: &Value) -> Value {
     if let Some(location) = projected.get("location").and_then(Value::as_str) {
         projected["location"] = relative_or_file_name(location).into();
     }
+    if let Some(Value::Array(frames)) = projected.get_mut("frames") {
+        for frame in frames {
+            if let Some(module) = frame.get("module").and_then(Value::as_str) {
+                frame["module"] = relative_or_file_name(module).into();
+            }
+        }
+    }
     if let Some(source) = projected.get("source") {
         projected["source"] = match source.as_str() {
             Some("server") => "server".into(),
             Some(source) => match source.strip_prefix("client:") {
-                Some(id) => format!("client:{}", opaque(id)).into(),
+                Some(id) => opaque(id)
+                    .map_or_else(|| "client".into(), |alias| format!("client:{alias}").into()),
                 None => "client".into(),
             },
             None => Value::Null,
@@ -935,8 +949,8 @@ pub(crate) fn project_finding(finding: &Value) -> Value {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|frame| frame.is_string())
-            .cloned()
+            .filter_map(Value::as_str)
+            .map(os_frame)
             .collect();
     }
     for field in ["stalls", "interactions"] {
@@ -955,7 +969,7 @@ pub(crate) fn project_finding(finding: &Value) -> Value {
             fields.remove(field);
         }
     }
-    for field in ["location", "exe", "rawRef"] {
+    for field in ["location", "exe", "rawRef", "module", "faultModule"] {
         if let Some(path) = evidence.get(field).and_then(Value::as_str) {
             evidence[field] = relative_or_file_name(path).into();
         }
@@ -969,7 +983,10 @@ pub(crate) fn project_finding(finding: &Value) -> Value {
 /// out (an id's shape says nothing of who chose it), and capabilities keep the known ones.
 fn clean_client_fields(record: &mut Value) {
     if let Some(client) = record.get("clientId") {
-        record["clientId"] = client.as_str().map_or(Value::Null, |id| opaque(id).into());
+        record["clientId"] = client
+            .as_str()
+            .and_then(opaque)
+            .map_or(Value::Null, Value::from);
     }
     if let Some(fields) = record.as_object_mut() {
         fields.remove("correlationId");
@@ -988,15 +1005,46 @@ fn clean_client_fields(record: &mut Value) {
     }
 }
 
-/// `h` and 12 hex characters of SHA-256 over a client-chosen id: stable, and never its text.
-fn opaque(id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
-    let hex: String = digest[..6]
+/// `h` and 12 hex characters of HMAC-SHA-256 over a client-chosen id, keyed with a random
+/// secret this server process draws once and never stores or returns. Hashing guesses of a
+/// guessable id cannot recover it, and one client keeps one alias for as long as this server
+/// runs (a restart gives it a new one). `None` if no random key could be drawn.
+fn opaque(id: &str) -> Option<String> {
+    use hmac::{Hmac, KeyInit as _, Mac};
+    use sha2::Sha256;
+    static KEY: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).ok().map(|()| key)
+    });
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_ref()?).ok()?;
+    mac.update(id.as_bytes());
+    let hex: String = mac.finalize().into_bytes()[..6]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("h{hex}")
+    Some(format!("h{hex}"))
+}
+
+/// An OS crash record's frame, `symbol (module + 0xoffset)` or `module + 0xoffset`, with its
+/// module (a path on this host, which may hold spaces) as a file name. A frame of another form
+/// is reduced like a path.
+fn os_frame(frame: &str) -> String {
+    let (symbol, site) = match frame
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" ("))
+    {
+        Some((symbol, site)) => (Some(symbol), site),
+        None => (None, frame),
+    };
+    let site = match site.rsplit_once(" + ") {
+        Some((module, offset)) => format!("{} + {offset}", relative_or_file_name(module)),
+        None => relative_or_file_name(site).to_owned(),
+    };
+    match symbol {
+        Some(symbol) => format!("{symbol} ({site})"),
+        None => site,
+    }
 }
 
 /// A relative path as it is; a rooted one (`/…`, `~/…`, `C:\…`) as its file name, with any
@@ -1013,6 +1061,69 @@ fn relative_or_file_name(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An OS crash record names modules by their paths on this host: a finding keeps their
+    /// file names only, in `module`, `faultModule` and each frame (#139, review round 3).
+    #[test]
+    fn a_crash_records_modules_and_frames_keep_file_names_only() {
+        let finding = json!({
+            "id": "crash.native-1", "kind": "crash.native", "count": 1,
+            "evidence": {
+                "source": "coredump",
+                "module": "/srv/private/libfoo.so",
+                "faultModule": "C:\\private\\bar.dll",
+                "frames": [
+                    "main (/srv/private/libfoo.so + 0x10)",
+                    "/srv/private/libfoo.so + 0x20",
+                    "foo::bar (bibcode + 0x30)",
+                    "C:\\private\\x.dll + 0x1",
+                    "/Users/someone/My App/lib.dylib + 0x5",
+                    "start (/Users/someone/My App/BiBCode + 0x6)",
+                ],
+            },
+        });
+
+        let evidence = project_finding(&finding)["evidence"].clone();
+
+        assert_eq!(evidence["module"], "libfoo.so");
+        assert_eq!(evidence["faultModule"], "bar.dll");
+        assert_eq!(
+            evidence["frames"],
+            json!([
+                "main (libfoo.so + 0x10)",
+                "libfoo.so + 0x20",
+                "foo::bar (bibcode + 0x30)",
+                "x.dll + 0x1",
+                "lib.dylib + 0x5",
+                "start (BiBCode + 0x6)",
+            ])
+        );
+        assert!(!evidence.to_string().contains("private"), "{evidence}");
+    }
+
+    /// A client's alias is keyed with a secret only this server holds, so hashing guesses of a
+    /// guessable id cannot recover it; within one server run it stays the same (#139, review
+    /// round 3).
+    #[test]
+    fn a_client_alias_is_keyed_not_a_plain_digest() {
+        use sha2::{Digest, Sha256};
+        let plain: String = Sha256::digest(b"client-1")[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let alias = opaque("client-1").expect("a random key");
+
+        assert_ne!(alias, format!("h{plain}"));
+        assert!(!alias.contains(&plain));
+        assert_eq!(
+            Some(alias.clone()),
+            opaque("client-1"),
+            "stable within a run"
+        );
+        assert_ne!(Some(alias.clone()), opaque("client-2"));
+        assert!(alias.len() == 13 && alias.starts_with('h'), "{alias}");
+    }
 
     /// A symbolicated frame's file is the build machine's path, which `redact_path` cannot
     /// clean: only a relative path or the file's name reaches an agent (#139, review round 2).
