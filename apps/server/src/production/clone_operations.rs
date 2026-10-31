@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        CloneLeaf, CloneReservation, GitCommandError, GitRepository, host_path_platform,
-        normalize_worktree_path_key,
+        CloneLeaf, CloneReservation, GitCommandError, GitRepository, clone_policy::ClonePlan,
+        host_path_platform, normalize_worktree_path_key,
     },
     maintenance::RpcPermit,
 };
@@ -94,6 +94,12 @@ pub(crate) struct CloneRequest {
     pub(crate) attach: bool,
     /// The caller leaving does not cancel a clone it started.
     pub(crate) detach: bool,
+    /// What Git runs with when an outside agent starts this clone (`git::clone_policy`):
+    /// HTTPS only, the checked addresses pinned, redirects and LFS smudge off. `None` for a
+    /// person's clone. A request that joins a running clone shares the starter's Git, so an
+    /// agent that joins a person's clone of the same URL (after its own check passed) waits on
+    /// that unpinned clone.
+    pub(crate) plan: Option<Arc<ClonePlan>>,
 }
 
 impl CloneRequest {
@@ -465,7 +471,8 @@ impl CloneRuntime {
         let transfer = {
             let reserved = Arc::clone(&reserved);
             let root = root.clone();
-            tokio::spawn(async move { reserved.transfer(&root).await })
+            let plan = request.plan.clone();
+            tokio::spawn(async move { reserved.transfer(plan.as_deref(), &root).await })
         };
         let transferred = transfer.await;
         #[cfg(test)]
@@ -914,6 +921,7 @@ mod tests {
             leaf: leaf(name),
             attach: false,
             detach: true,
+            plan: None,
         }
     }
 

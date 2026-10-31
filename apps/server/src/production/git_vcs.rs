@@ -18,10 +18,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        ChangeRequest, CreateWorktreeInput, GitCommandError, GitProcessRunner, GitRepository,
-        GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
+        ChangeRequest, CloneLeaf, CreateWorktreeInput, GitCommandError, GitProcessRunner,
+        GitRepository, GitStatusSummaryService, OutputPolicy, ProcessRequest, ProcessRunner,
         STATUS_SAFETY_INTERVAL, StatusBroadcaster, StatusReadFence, VcsStatusLocalResult,
-        VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf, validate_pathspecs,
+        VcsStatusRemoteResult, VcsStatusStreamEvent, clone_destination_leaf,
+        clone_policy::{
+            ClonePlan, ClonePolicy, CloneRefusal, DESTINATION_REFUSED, OUTSIDE_PROJECTS,
+        },
+        validate_pathspecs,
     },
     maintenance::RpcPermit,
     persistence::{Repositories, WorktreeRemovalReceipt},
@@ -250,6 +254,8 @@ pub struct GitVcsRpcServices {
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
     /// Server-owned clones, keyed by destination.
     clone_operations: CloneRuntime,
+    /// Where an outside agent's clone may go and what it runs with (#139 slice X6).
+    clone_policy: ClonePolicy,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -404,9 +410,30 @@ impl GitVcsRpcServices {
             repositories,
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
             clone_operations,
+            clone_policy: ClonePolicy::default(),
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
+    }
+
+    /// The handlers with `projects` as the registered projects an agent's clone must sit
+    /// beside, and `policy` in place of the system resolver.
+    #[cfg(test)]
+    pub(crate) fn for_agent_clones(
+        repository: Arc<GitRepository>,
+        projects: Repositories,
+        policy: ClonePolicy,
+    ) -> Self {
+        let (interval, _) = watch::channel(STATUS_SAFETY_INTERVAL);
+        let mut services = Self::with_repository_dependencies(
+            repository,
+            interval,
+            None,
+            Some(projects),
+            Arc::default(),
+        );
+        services.clone_policy = policy;
+        services
     }
 
     /// Pin discovery, repository lookup, and pull requests (including passive
@@ -918,6 +945,10 @@ impl GitVcsRpcServices {
                     .map_err(|error| {
                         vcs_error("vcs.clone", &input.parent_dir, &error.to_string())
                     })?;
+                // An outside agent is checked before it can start or join anything.
+                let plan = self
+                    .agent_clone_plan(&context, &input.url, &leaf, &parent_dir, &cancellation)
+                    .await?;
                 // The starter's permit rides with the clone, so an update drain names a
                 // detached clone until Git has stopped and its cleanup has finished.
                 let path = self
@@ -929,6 +960,7 @@ impl GitVcsRpcServices {
                             leaf,
                             attach: input.attach,
                             detach: input.detach,
+                            plan,
                         },
                         context.admission_permit(),
                         &cancellation,
@@ -992,7 +1024,7 @@ impl GitVcsRpcServices {
             "sourceControl.cloneRepository" => {
                 let input: CloneRepositoryInput =
                     decode(request.payload, "sourceControl.cloneRepository")?;
-                self.clone_source_repository(input, context.admission_permit(), &cancellation)
+                self.clone_source_repository(input, &context, &cancellation)
                     .await
             }
             _ => Err(request_error(
@@ -1731,12 +1763,69 @@ impl GitVcsRpcServices {
         .await
     }
 
+    /// For an outside agent's clone (#139 slice X6), the plan its Git runs with, once the clone
+    /// sits next to a registered project and its URL passes `clone_policy`. `None` for anyone
+    /// else: a person's clone is unchanged. The principal comes from the request's
+    /// credential, so an agent meets this on `vcs.clone` and `sourceControl.cloneRepository`
+    /// alike, with or without the `clone_repository` tool.
+    async fn agent_clone_plan(
+        &self,
+        context: &RpcSessionContext,
+        url: &str,
+        leaf: &CloneLeaf,
+        parent_dir: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Arc<ClonePlan>>, Value> {
+        if !is_agent(context) {
+            return Ok(None);
+        }
+        if !self.holds_a_project(parent_dir).await {
+            return Err(
+                CloneRefusal::new(DESTINATION_REFUSED, OUTSIDE_PROJECTS).into_error(parent_dir)
+            );
+        }
+        self.clone_policy
+            .plan(&self.repository, url, leaf, parent_dir, cancellation)
+            .await
+            .map(|plan| Some(Arc::new(plan)))
+    }
+
+    /// Whether `parent_dir` (canonical) is the folder that holds a registered project.
+    async fn holds_a_project(&self, parent_dir: &Path) -> bool {
+        let Some(repositories) = &self.repositories else {
+            return false;
+        };
+        let projects = match repositories.list_projects().await {
+            Ok(projects) => projects,
+            Err(error) => {
+                tracing::warn!(%error, "an agent clone could not read the projects");
+                return false;
+            }
+        };
+        for project in projects
+            .iter()
+            .filter(|project| project.deleted_at.is_none())
+        {
+            let Some(parent) = Path::new(&project.workspace_root).parent() else {
+                continue;
+            };
+            if resolve_host_directory(parent, false)
+                .await
+                .is_ok_and(|parent| parent == parent_dir)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     async fn clone_source_repository(
         &self,
         input: CloneRepositoryInput,
-        admission: Option<RpcPermit>,
+        context: &RpcSessionContext,
         cancellation: &CancellationToken,
     ) -> RpcResult {
+        let agent = is_agent(context);
         let remote_url = input
             .remote_url
             .or_else(|| input.repository.clone())
@@ -1763,15 +1852,33 @@ impl GitVcsRpcServices {
         let leaf = clone_destination_leaf(&remote_url, directory_name).map_err(|error| {
             source_control_error(&provider, "cloneRepository", &error.to_string())
         })?;
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            source_control_error(&provider, "cloneRepository", &error.to_string())
-        })?;
+        // An agent's clone goes only beside a registered project, whose folder exists, so it
+        // creates no folder before its check.
+        if !agent {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                source_control_error(&provider, "cloneRepository", &error.to_string())
+            })?;
+        }
         // Destination keys use the canonical parent, so a symlinked or `..` alias of a running
         // clone's folder joins it instead of meeting its half-written folder.
         let parent_dir = resolve_host_directory(parent, false)
             .await
             .map_err(|error| {
                 source_control_error(&provider, "cloneRepository", &error.to_string())
+            })?;
+        let plan = self
+            .agent_clone_plan(context, &remote_url, &leaf, &parent_dir, cancellation)
+            .await
+            .map_err(|error| {
+                let mut failure = source_control_error(
+                    &provider,
+                    "cloneRepository",
+                    error["detail"].as_str().unwrap_or("The clone was refused."),
+                );
+                if let Some(reason) = error.get("reason") {
+                    failure["reason"] = reason.clone();
+                }
+                failure
             })?;
         let cwd = self
             .clone_operations
@@ -1782,8 +1889,9 @@ impl GitVcsRpcServices {
                     leaf,
                     attach: false,
                     detach: false,
+                    plan,
                 },
-                admission,
+                context.admission_permit(),
                 cancellation,
             )
             .await
@@ -3265,6 +3373,13 @@ fn same_removal_path(left: &Path, right: &Path) -> bool {
     }
     key(left) == key(right)
 }
+/// Whether the request's credential is an outside agent's (`mcp-client`).
+fn is_agent(context: &RpcSessionContext) -> bool {
+    context
+        .principal()
+        .is_some_and(|principal| principal.subject == crate::auth::MCP_CLIENT_SUBJECT)
+}
+
 fn source_control_error(provider: &str, operation: &str, detail: &str) -> Value {
     json!({ "_tag": "SourceControlRepositoryError", "provider": provider, "operation": operation, "detail": detail })
 }
