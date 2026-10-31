@@ -383,8 +383,10 @@ BiBCode marks what an outside agent does, whoever is looking:
   two minutes, still has work running, or has a turn running that it started, with two
   buttons:
   - **Stop** revokes the agent, which ends its calls and the Git and pull request work it
-    started, and interrupts each running turn whose latest message it sent. Your own turns
-    are left alone. Stop also works on an agent you already revoked whose turns still run.
+    started, and interrupts each running turn it started. Your own turns, a compaction you
+    started included, are left alone. Stop also works on an agent you already revoked whose
+    turns still run. If a turn cannot be interrupted, or interrupting takes longer than ten
+    seconds, BiBCode says so; stop that turn from its thread.
   - **Take over** makes the agent read only: it can still read, every change it asks for is
     refused, and work it started stops. **Hand back** restores exactly the access it had.
 - **Settings → Agents → Agent integrations → Agents** lists each authorized agent with its

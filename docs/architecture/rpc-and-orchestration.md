@@ -3658,24 +3658,29 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   `pullRequest`, `worktreeKey`, `fileCount`, `cloneId`, `transferId`). A keyed call whose
   `clientRequestId` already has a live `mcp_tool_requests` row is a retry and records
   nothing; a keyed call cancelled while its owned mutation goes on is recorded once that
-  row settles. Rows are pruned past 7 days or 5,000 on insert, and past 7 days on every
-  read, which also filters by that cutoff, so retention holds while nothing is written. A
-  write failure is a `tracing::warn!` and never fails the call.
+  row settles. Rows are pruned past 7 days or 5,000 after each insert and past 7 days at
+  startup; reads only filter by that cutoff and never write, so an `access:read` subscriber
+  deletes nothing. A write failure is a `tracing::warn!` and never fails the call.
+- **Attributed turns.** A running turn belongs to the actor of the command that started
+  it: the user message it was started for (`projection_turns.pending_message_id`) carries
+  that actor. A turn started by no message, such as a compaction, belongs to no agent. The
+  lookup walks the partial index `idx_projection_turns_running` (migration 60), so it reads
+  running turns only.
 - **`subscribeMcpActivity`** (`access:read`, read stream) sends a snapshot of the newest
   200 rows and the active agents, then each new row and each change of who is active. An
   agent is active with a call in flight or in the last 2 minutes, an owned mutation
-  running, or a running turn whose latest sent user message carries its actor
-  (`runningTurns`, revoked or not, so Stop stays in reach). Streams read the running turns on
-  the snapshot and every 15 s re-check, which also drops a quiet agent.
+  running, or a running turn it started (`runningTurns`, revoked or not, so Stop stays in
+  reach). One task refreshes the running turns for every subscriber every 15 s while any
+  subscribes, and each refresh is also every stream's re-check that drops a quiet agent.
 - **Stop.** `POST /api/auth/clients/revoke` with `interruptTurns: true` revokes the session
-  (cancelling its calls and owned mutations) and announces it on a channel of its own;
-  `McpControl` then dispatches `thread.turn.interrupt` (`server:mcp-stop:…`, through the
-  dispatch RPC, so the provider is told) for each running turn whose latest sent user
-  message carries that actor. An `mcp-client` session revoked earlier is announced too, so
-  Stop after Revoke still interrupts; Stop answers `revoked: false` only for an unknown
-  session or a revoked one that was not an agent's, and the web reports that as a failure.
-  A plain revocation, such as the `bibcode thread` CLI revoking its own credential,
-  interrupts nothing.
+  (cancelling its calls and owned mutations), then waits up to 10 s while `McpControl`
+  dispatches `thread.turn.interrupt` (`server:mcp-stop:…`, through the dispatch RPC, so the
+  provider is told) for each running turn the agent started, and answers with
+  `interrupted`, `failed` and `timedOut` (the interrupts go on after that). An `mcp-client`
+  session revoked earlier is stopped too; `revoked: false` means an unknown session or a
+  revoked one that was not an agent's. The web reports `revoked: false`, any failure and a
+  timeout as a failed Stop. A plain revocation, such as the `bibcode thread` CLI revoking
+  its own credential, interrupts nothing.
 - **Take over.** `POST /api/auth/clients/mcp-access { sessionId, access }` (`access:write`)
   sets an `mcp-client` session's `mcp_access` to `read-only` and remembers the level it
   replaced in `auth_sessions.mcp_access_hand_back`; any other level must be exactly that

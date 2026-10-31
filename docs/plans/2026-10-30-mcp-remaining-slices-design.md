@@ -4407,3 +4407,30 @@ still working; a clone past the wait that answers `running` and later its projec
 its folder; and cancelling an agent clone that joined a person's leaving the person's to
 finish. Take over and Stop reach the same live-controls token (X1) and are not tested again
 here.
+
+**Codex review, round 3 (2026-10-31).** All four P2s were confirmed and fixed with a test each:
+
+- **Attribution by the turn's own start.** A running turn now belongs to the actor of the
+  user message it was started for (`projection_turns.pending_message_id`, which the engine
+  binds when the session reports the turn running), the same actor X1 stamped on the
+  command. A compaction turn has no such message, so stopping an agent no longer interrupts
+  a compaction a person started after the agent's message, and it keeps no agent active.
+- **Readers never write.** `recent()` only filters by the 7-day cutoff; pruning happens after
+  each insert and at startup (`McpActivity::prune_expired`, called by the runtime before the
+  stream is registered). Round 2's prune-on-read is gone.
+- **One indexed refresh for every subscriber.** Migration 60 now also creates the partial
+  index `idx_projection_turns_running` (`WHERE state = 'running'`); the lookup drives from it
+  (`CROSS JOIN` order) with primary-key lookups for the thread and message. Migration 60 is
+  unreleased, so it was amended rather than renumbered (X8 owns 61); a development store that
+  already ran the earlier 60 lacks the index and reads correctly but without it. One task per
+  `McpActivity` refreshes the running turns every 15 s while any stream subscribes (a `watch`
+  every stream reads), and stops after a refresh with no subscriber left.
+- **Stop answers with its interrupts.** The broadcast became a handler `McpControl`
+  registers on `AuthService` (`set_mcp_stop_handler`). `stop_client` runs it as a task, waits
+  up to `MCP_STOP_WAIT` (10 s), and returns `McpStopResult { revoked, interrupted, failed,
+  timed_out }`; the interrupts go on after a timeout. The revoke response carries
+  `interrupted`, `failed` and `timedOut` (optional in the contract), and the web reports any
+  failure or a timeout as a Stop that did not finish. In the test harness the provider has no
+  live session, so an interrupt the engine accepts is still refused at provider routing and
+  counts as failed, as `interrupt_turn` documents; a refused dispatch (maintenance holding RPC
+  admission closed) is tested as a failure that reaches nothing.
