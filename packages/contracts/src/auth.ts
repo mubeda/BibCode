@@ -266,6 +266,8 @@ export const AuthClientSession = Schema.Struct({
   mcpAccess: Schema.optionalKey(TrimmedNonEmptyString),
   /** Set while a person has taken the agent over: the level Hand back restores. */
   mcpAccessHandBack: Schema.optionalKey(TrimmedNonEmptyString),
+  /** The `<origin>/mcp` a remote OAuth grant is bound to (#139, slice R). */
+  mcpResource: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 

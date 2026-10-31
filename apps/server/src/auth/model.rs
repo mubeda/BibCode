@@ -273,6 +273,10 @@ pub struct ClientSessionView {
     /// The access a person's Take over replaced; set while the agent is taken over.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_access_hand_back: Option<String>,
+    /// The resource (`<origin>/mcp`) a remote OAuth grant is bound to: an HTTPS address this
+    /// server was reached on, which **Remote agents** shows when the app's own is not HTTPS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_resource: Option<String>,
 }
 
 /// A remote MCP authorization waiting for a person (#139, slice R), as the **Requests to
@@ -303,7 +307,7 @@ pub(crate) enum AuthAccessChange {
     PairingLinkRemoved {
         id: String,
     },
-    ClientUpserted(ClientSessionView),
+    ClientUpserted(Box<ClientSessionView>),
     ClientRemoved {
         session_id: String,
     },

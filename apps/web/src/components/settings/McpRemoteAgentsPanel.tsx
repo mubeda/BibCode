@@ -4,15 +4,18 @@ import type {
   EnvironmentId,
 } from "@bibcode/contracts";
 import type { McpServerAccess, UnifiedSettings } from "@bibcode/contracts/settings";
-import { CheckIcon, CopyIcon, InfoIcon, TriangleAlertIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, ExternalLinkIcon, InfoIcon, TriangleAlertIcon } from "lucide-react";
 import { useId, useState } from "react";
 
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
+import { readLocalApi } from "../../localApi";
 import { useEnvironmentHttpBaseUrl } from "../../state/environments";
+import { usePrimaryMcpClients } from "../../state/mcpActivity";
 import {
   approveMcpAuthorization,
   denyMcpAuthorization,
+  observedRemoteMcpUrl,
   remoteMcpUrl,
   requestedScopeText,
   usePrimaryMcpAuthorizations,
@@ -26,7 +29,9 @@ import { SettingsRow } from "./settingsLayout";
 export const REQUESTS_TO_CONNECT_ID = "mcp-requests-to-connect";
 
 const NO_HTTPS_MESSAGE =
-  "Remote agents need an HTTPS address. Use the launch command over SSH instead.";
+  "Remote agents need an HTTPS address: connect this environment through BiBCode Connect, or put an HTTPS reverse proxy on this computer in front of it.";
+const REVERSE_PROXY_DOCS_URL =
+  "https://github.com/mubeda/BibCode/blob/main/docs/user/remote-access.md#reverse-proxies";
 const SERVER_OFF_MESSAGE = "Turn on MCP server first.";
 const FULL_ACCESS_FIRST_MESSAGE = "Set Agents may to Full access first.";
 const LOOPBACK_WARNING = "Only approve if you just started this in an AI tool on that computer.";
@@ -64,22 +69,52 @@ export function McpRemoteAgentsPanel({
 }) {
   return (
     <>
-      <RemoteAgentsRow environmentId={environmentId} />
+      <RemoteAgentsRow environmentId={environmentId} isPrimary={isPrimary} />
       {isPrimary ? <RequestsToConnect environmentId={environmentId} /> : null}
     </>
   );
 }
 
-function RemoteAgentsRow({ environmentId }: { readonly environmentId: EnvironmentId }) {
-  const url = remoteMcpUrl(useEnvironmentHttpBaseUrl(environmentId));
+function RemoteAgentsRow({
+  environmentId,
+  isPrimary,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly isPrimary: boolean;
+}) {
+  const ownUrl = remoteMcpUrl(useEnvironmentHttpBaseUrl(environmentId));
+  // What the server saw, which only the primary environment's access stream holds.
+  const { requests } = usePrimaryMcpAuthorizations();
+  const clients = usePrimaryMcpClients();
+  const observedUrl = ownUrl === null && isPrimary ? observedRemoteMcpUrl(requests, clients) : null;
+  const url = ownUrl ?? observedUrl;
   const enabled = useEnvironmentSettings(environmentId, selectEnabled);
   if (url === null) {
-    return <SettingsRow title="Remote agents" description={NO_HTTPS_MESSAGE} />;
+    return (
+      <SettingsRow
+        title="Remote agents"
+        description={NO_HTTPS_MESSAGE}
+        control={
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={() => void readLocalApi()?.shell.openExternal(REVERSE_PROXY_DOCS_URL)}
+          >
+            <ExternalLinkIcon aria-hidden />
+            Reverse proxy setup
+          </Button>
+        }
+      />
+    );
   }
   return (
     <SettingsRow
       title="Remote agents"
-      description="AI tools on other computers connect to this address over HTTPS and sign in. You approve each sign-in here."
+      description={
+        observedUrl === null
+          ? "AI tools on other computers connect to this address over HTTPS and sign in. You approve each sign-in here."
+          : "AI tools on other computers reached this environment at this address, through a proxy or tunnel that BiBCode does not run; it works while that stays up. They sign in, and you approve each sign-in here."
+      }
       status={enabled ? null : <Reason text={SERVER_OFF_MESSAGE} />}
     >
       <div className="space-y-2 pt-2.5 pb-3.5">

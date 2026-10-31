@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 
+import * as DateTime from "effect/DateTime";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
@@ -14,6 +15,7 @@ const h = vi.hoisted(() => ({
     mcpCapabilities: { terminals: false },
   } as Record<string, unknown>,
   requests: [] as unknown[],
+  clients: [] as unknown[],
   canManage: true,
   copied: [] as string[],
   approve: vi.fn(async (..._args: unknown[]) => {}),
@@ -38,6 +40,10 @@ vi.mock("../../state/mcpAuthorizations", async (importOriginal) => {
     denyMcpAuthorization: h.deny,
   };
 });
+
+vi.mock("../../state/mcpActivity", () => ({
+  usePrimaryMcpClients: () => h.clients,
+}));
 
 vi.mock("../../hooks/useCopyToClipboard", () => ({
   useCopyToClipboard: () => ({
@@ -141,18 +147,57 @@ afterEach(() => {
     mcpCapabilities: { terminals: false },
   };
   h.requests = [];
+  h.clients = [];
   h.canManage = true;
   h.copied = [];
   vi.clearAllMocks();
 });
 
 describe("McpRemoteAgentsPanel", () => {
-  it("says remote agents need HTTPS on a plain HTTP address", async () => {
+  it("says how to get an HTTPS address on a plain HTTP address", async () => {
     h.baseUrl = "http://127.0.0.1:3773";
     const container = await render();
     expect(container.textContent).toContain(
-      "Remote agents need an HTTPS address. Use the launch command over SSH instead.",
+      "Remote agents need an HTTPS address: connect this environment through BiBCode Connect, or put an HTTPS reverse proxy on this computer in front of it.",
     );
+    expect(button(container, "Reverse proxy setup")).toBeTruthy();
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
+  });
+
+  // A proxy or tunnel BiBCode does not run (ngrok, say) is invisible to the app's own
+  // address; the server saw it on a request to connect, or on a remote agent's sign-in.
+  it("shows the HTTPS address a waiting request to connect arrived on", async () => {
+    h.baseUrl = "http://127.0.0.1:3773";
+    h.requests = [request({ origin: "https://abc.ngrok.example" })];
+    const container = await render();
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')?.textContent).toBe(
+      "https://abc.ngrok.example/mcp",
+    );
+    expect(container.textContent).toContain("through a proxy or tunnel that BiBCode does not run");
+  });
+
+  it("shows the address of a remote agent connected in the last ten minutes, and only then", async () => {
+    h.baseUrl = "http://127.0.0.1:3773";
+    const agent = (lastConnectedAt: number, connected: boolean) => ({
+      sessionId: "s-1",
+      subject: "mcp-client",
+      connected,
+      lastConnectedAt: DateTime.makeUnsafe(lastConnectedAt),
+      mcpResource: "https://abc.ngrok.example/mcp",
+    });
+    h.clients = [agent(Date.now() - 2 * 60_000, false)];
+    let container = await render();
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')?.textContent).toBe(
+      "https://abc.ngrok.example/mcp",
+    );
+    h.clients = [agent(Date.now() - 60 * 60_000, false)];
+    container = await render();
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
+    h.clients = [agent(Date.now() - 60 * 60_000, true)];
+    container = await render();
+    expect(container.querySelector('[aria-label="Remote MCP URL"]')).not.toBeNull();
+    // Another environment's row never shows this one's observations.
+    container = await render(false);
     expect(container.querySelector('[aria-label="Remote MCP URL"]')).toBeNull();
   });
 
