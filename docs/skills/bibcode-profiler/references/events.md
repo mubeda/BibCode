@@ -67,10 +67,12 @@ alone repeats across restarts. `profiler symbolicate` names a panic event as
 An outside agent's `profiler_events` and `profiler_crash` on BiBCode's own
 `/mcp` return each event with these envelope fields and only the payload fields
 its kind lists below; an event of an unlisted kind keeps its envelope only.
-`clientId`, `correlationId`, `envId` and `appVersion` are kept only when they
-are id-shaped, and a client batch's `capabilities` only when known. Adding a
-kind or a field here means adding it to `event_fields` in
-`apps/server/src/mcp/tools/diagnostics.rs` too.
+A `clientId`, and the id in a `client:<clientId>` source, becomes an opaque
+`h` and 12 hex characters that match across events and findings;
+`correlationId` and `appVersion`, which the client chooses, are left out; a
+client batch's `capabilities` keep the known values; and a panic's `location`
+keeps a relative path or its file name. Adding a kind or a field here means
+adding it to `event_fields` in `apps/server/src/mcp/tools/diagnostics.rs` too.
 
 ## Events
 

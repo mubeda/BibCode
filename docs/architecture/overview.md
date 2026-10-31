@@ -2012,16 +2012,25 @@ bounded memory, and works while the server is stopped.
   `profiler_findings` without `since` or `cursor` returns the newest findings;
   with either it returns them oldest first by `lastSeen` and id, `since`
   inclusive, with an opaque `nextCursor` while more remain, so a gap of any
-  size is caught up page by page.
+  size is caught up page by page. `lastSeen` is whole seconds and the book
+  keeps no position, so the cursor names the second its page ended in and marks
+  each finding read there by id and count; that second is read again, which
+  returns a finding written into it later or one that recurred in it.
 - **Profiler tools on `/mcp`.** Outside agents get `profiler_status`,
   `profiler_findings`, `profiler_events` and `profiler_crash` in the
   Diagnostics set (`mcp/tools/diagnostics.rs`, slice X2 of #139). They run the
   stdio handlers in process over the server's own profiler directory (the
   installed `ProfilerHandle`'s), in `spawn_blocking`, and take no RPC
-  admission. Events and crash records are projected: an event keeps its
-  envelope and the payload fields its kind documents in
-  [`events.md`](../skills/bibcode-profiler/references/events.md), client-chosen
-  ids only when id-shaped, and an undocumented kind its envelope only.
+  admission. Findings, events and crash records are projected: a finding keeps
+  its documented fields and its kind's evidence from
+  [`findings.md`](../skills/bibcode-profiler/references/findings.md), without
+  `title` or `summary`; an event keeps its envelope and the payload fields its
+  kind documents in
+  [`events.md`](../skills/bibcode-profiler/references/events.md), and an
+  undocumented kind its envelope only. A client's id becomes an opaque hash,
+  its correlation id and version are left out, worktree paths outside home are
+  left out, and source locations and frame files keep a relative path or a
+  file name.
   `profiler_symbolicate` stays on stdio. `git.stacked-action` records only a
   supported action name, or `unknown`, since the client chooses that text.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)

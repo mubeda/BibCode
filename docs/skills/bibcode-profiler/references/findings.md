@@ -64,6 +64,15 @@ Newer builds cite evidence by reference:
 Use them when present; otherwise place the finding by time and kind, as
 [triage.md](triage.md) shows.
 
+An outside agent's `profiler_status` and `profiler_findings` on BiBCode's own
+`/mcp` return each finding without `title` and `summary`, and with only the
+evidence fields its kind lists below plus the citations above. Free text
+(`exitDetail`, `journal`) is left out. A `clientId` becomes an opaque `h` and 12
+hex characters, a `worktree` or `path` outside home (not `~/…`) is left out, and
+`location`, `exe` and a path-shaped `rawRef` keep a relative path or the file
+name. Adding a kind or an evidence field here means adding it to
+`evidence_fields` in `apps/server/src/mcp/tools/diagnostics.rs` too.
+
 ## Crashes
 
 The previous-run kinds come from the clean-shutdown sentinel. On the next start

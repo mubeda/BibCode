@@ -3602,6 +3602,46 @@ on the stdio server (`a_cursor_catches_up_more_than_100_findings_oldest_first`: 
 ties on `lastSeen` broken by id) and over `/mcp` for its refusal. The git action and cursor
 tests were each seen failing before their fix.
 
+**Codex review fixes (review round 2, 2026-10-31).** All four P2s were confirmed in source
+and fixed test first; each new test was seen failing against the round-one code:
+
+- **Findings were returned unprojected.** Confirmed: a `client.stall` finding's evidence held
+  the batch's `clientId`, and a `git.stacked-action-failed` finding's `evidence.worktree` is
+  absolute outside home (`redact_path` only replaces home). `profiler_status` and
+  `profiler_findings` now project each finding (`project_finding`): its documented fields
+  without `title` and `summary` (prose that quotes paths, such as `Panic at <location>` and the
+  worktree audit's `<path> is …`), and only its kind's evidence fields from `findings.md`
+  (`evidence_fields`) plus `eventIds`, `crashId` and `crashIds`. Free text (`exitDetail`,
+  `journal`) is left out. A `worktree` or `path` is kept only inside home (`~/…`); `location`,
+  `exe` and a path-shaped `rawRef` keep a relative path or the file name. So the stdio equality
+  for these two tools no longer holds either: the test asserts `/mcp` equals the stdio findings,
+  each projected.
+- **Id-shaped client strings passed.** Confirmed: the shape check let `privateToken123`
+  through. `clientId`, here and in findings, becomes `h` and 12 hex characters of SHA-256 over
+  it, so one client still matches across events and findings and a `client:<clientId>` source
+  becomes `client:<hash>`. `correlationId` and `appVersion` are left out. `envId` is the
+  server's own and is kept.
+- **Frame files kept build paths.** Confirmed. A symbolicated frame's `file`, like a panic's
+  `location`, keeps a relative path (`apps/server/src/…`) or the file name of a rooted one
+  (`/…`, `~/…`, `C:\…`), with any `:line` kept.
+- **The cursor skipped same-second changes.** Confirmed: `lastSeen` is whole seconds
+  (`findings.rs` drops the nanoseconds) and the book keeps no durable position (the file is
+  rewritten on compaction, and `seq` is per writer session). The cursor is now
+  `<second>|<marks>`: the second its page ended in and a 12-hex SHA-256 mark of each finding's
+  id and count it returned in that second. The next page reads that second again and returns
+  any finding not marked, so a finding written into it later and a recurrence (a new count) both
+  come, and nothing already read repeats. Marks for that second carry over while pages keep
+  ending in it; a cursor is at most 16,384 characters (a mark for each of the book's 1,000
+  findings). The disk's own lag (a count persisted only at powers of two or a minute later) is
+  unchanged.
+
+Tests: `a_cursor_replays_its_last_second_and_returns_what_changed_in_it` (stdio: a new finding
+sorting before the page's last in the same second, and a recurrence of one read);
+`a_crash_frame_keeps_a_relative_path_or_the_file_name_only`; and the own-process store test,
+now with a client stall, a failing action outside home, a worktree path in home, a panic
+location, an id-shaped `clientId`, `correlationId` and `appVersion`, and those in a crash's
+`lastEvents`.
+
 ## X1 implementation notes (2026-10-31)
 
 X1 was implemented on `claude/v0131-139-x1`, from `1d4eda69bd` (slice 1, the CLI, F0, wave 1
