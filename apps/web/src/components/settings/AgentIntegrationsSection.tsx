@@ -173,7 +173,9 @@ function EnvironmentMcpServer({
   const [saveError, setSaveError] = useState<string | null>(null);
   const save = async (patch: McpSettingsPatch) => {
     setSaveError(null);
-    const result = await updateSettings(patch);
+    // A `ServerSettingsPatch`: the server merges a subset of `mcpCapabilities`, so a switch
+    // never overwrites another set's key. The updater is typed with whole values.
+    const result = await updateSettings(patch as Partial<UnifiedSettings>);
     if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
     const failure = squashAtomCommandFailure(result);
     const detail =
