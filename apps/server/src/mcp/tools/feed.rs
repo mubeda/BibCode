@@ -596,6 +596,26 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Use profiler_status for the newest crash ids.",
     ),
     (
+        "McpFileTooLargeError",
+        "The file is larger than 1 MiB, too large to read or write over MCP.",
+        "Get it with files_download instead.",
+    ),
+    (
+        "McpFileChangedError",
+        "The file changed since the page files_read continues was read, so the pages would mix two versions.",
+        "Read it again from offset 0.",
+    ),
+    (
+        "McpTransferUnavailableError",
+        "This BiBCode server has no transfer address yet: it is still starting.",
+        "Retry in a moment.",
+    ),
+    (
+        "McpPlatformUnsupportedError",
+        "Tools that change files (files_write, files_create, files_rename, files_delete, files_upload) are refused on this server's operating system, where BiBCode cannot hold a folder open while it works in it.",
+        "Read, list, search and download only; ask the person to make the change in BiBCode.",
+    ),
+    (
         "PreviewAutomationNoAvailableHostError",
         "No BiBCode window can show this thread's browser preview.",
         "Ask the person to open BiBCode on the thread, then try again.",

@@ -997,8 +997,9 @@ pub(crate) fn invalid_argument(message: &str) -> Value {
 }
 
 /// Fields of an RPC error a tool failure keeps beside its tag and message: the git manager's
-/// `code` and `blocked`, a stacked action's `phase`, a workspace error's `failure`.
-const KEPT_ERROR_FIELDS: &[&str] = &["code", "blocked", "phase", "reason", "failure"];
+/// `code` and `blocked`, a stacked action's `phase`, a workspace error's `failure` and, for a
+/// delete that stopped part-way, `leftAt` (a name, never a path).
+const KEPT_ERROR_FIELDS: &[&str] = &["code", "blocked", "phase", "reason", "failure", "leftAt"];
 
 /// An RPC error as a typed tool failure.
 pub(crate) fn rpc_failure(error: &Value) -> Value {
