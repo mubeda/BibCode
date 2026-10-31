@@ -350,11 +350,14 @@ it, and add the clone as a project. These tools are in the **Workspace** set.
 
 - **HTTPS from public hosts only.** The URL must start with `https://`, with no user name or
   token in it. SSH, `host:path`, `git://`, `file://` and other transports are refused, and so
-  is any host that resolves to a local or private network address, also after Git's own
-  `url.<base>.insteadOf` rewrites. Clone those in BiBCode yourself: your own clones are
-  unchanged. The address BiBCode checked is the one Git connects to, and a repository that
-  redirects elsewhere fails with a message naming the redirect; clone the address it moved
-  to. Behind an HTTP proxy, the proxy resolves the host itself.
+  is any host that does not resolve to a public internet address. Clone those in BiBCode
+  yourself: your own clones are unchanged. The address BiBCode checked is the one Git
+  connects to, and a repository that redirects elsewhere fails with a message naming the
+  redirect; clone the address it moved to.
+- **Your Git settings do not apply.** An agent's clone ignores your global and system Git
+  configuration (rewrites, credentials, proxies, hooks, filters and URL-specific settings)
+  and any proxy in the environment, so it reaches only public repositories directly. On a
+  network that allows the internet only through a proxy, clone in BiBCode yourself.
 - **No Git LFS downloads.** LFS files stay pointer files, because a repository's
   `.lfsconfig` could point the download at any host. Run `git lfs pull` in the clone
   yourself if you want them.
