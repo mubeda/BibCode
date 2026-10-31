@@ -386,10 +386,44 @@ async fn a_revoked_relay_is_told_so_and_never_mints_again() {
     let refused = relay.line().await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
     assert_eq!(refused["result"]["content"][0]["text"], REVOKED_MESSAGE);
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["_tag"], "McpCredentialRefusedError",
+        "a refused credential is a typed tool result (slice X3)"
+    );
     assert_eq!(mcp_links(root.path()).await, links, "401 never mints again");
     relay.close().await.expect("relay ends");
     server.shutdown();
     server.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn a_server_that_stopped_is_a_typed_tool_result_and_other_requests_an_error() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let mut relay = Running::start(options(root.path()));
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await;
+    assert!(relay.line().await["result"]["tools"].is_array());
+    server.shutdown();
+    server.join().await.expect("server joins");
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "read_thread", "arguments": { "threadId": "t" } } }))
+        .await;
+    let unreachable = relay.line().await;
+    assert_eq!(unreachable["id"], 2);
+    assert_eq!(unreachable["result"]["isError"], true, "{unreachable}");
+    assert_eq!(
+        unreachable["result"]["structuredContent"]["error"]["_tag"], "McpServerUnreachableError",
+        "{unreachable}"
+    );
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }))
+        .await;
+    let listed = relay.line().await;
+    assert_eq!(listed["id"], 3);
+    assert!(listed["error"]["message"].is_string(), "{listed}");
+    relay.close().await.expect("relay ends");
 }
 
 #[tokio::test]

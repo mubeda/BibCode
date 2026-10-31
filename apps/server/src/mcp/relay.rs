@@ -441,9 +441,21 @@ impl Relay {
             id.clone()
                 .map(|id| protocol::failure(id, error).to_string())
         };
+        // A tool call that cannot be delivered answers a typed tool result an agent can branch
+        // on (slice X3); any other request answers a JSON-RPC error.
+        let refused = |tag: &str, message: &str| {
+            if method.as_deref() == Some("tools/call") {
+                id.clone().map(|id| {
+                    json!({ "jsonrpc": "2.0", "id": id, "result": protocol::typed_tool_failure(tag, message) })
+                        .to_string()
+                })
+            } else {
+                failure(protocol::rpc_error(protocol::INTERNAL_ERROR, message))
+            }
+        };
         let token = match self.connection.token(|| agent_label(&message)).await {
             Ok(token) => token,
-            Err(error) => return failure(protocol::rpc_error(protocol::INTERNAL_ERROR, &error)),
+            Err(error) => return refused("McpSignInError", &error),
         };
         let legacy_version = self
             .legacy_version
@@ -453,18 +465,8 @@ impl Relay {
         let response = match self.connection.send(&message, &token, legacy_version).await {
             Sent::Response(response) => response,
             // Never re-mint: the user may have revoked this client on purpose.
-            Sent::Unauthorized => {
-                return id.map(|id| {
-                    if method.as_deref() == Some("tools/call") {
-                        json!({ "jsonrpc": "2.0", "id": id, "result": protocol::tool_failure(REVOKED_MESSAGE) }).to_string()
-                    } else {
-                        protocol::failure(id, protocol::rpc_error(protocol::INTERNAL_ERROR, REVOKED_MESSAGE)).to_string()
-                    }
-                });
-            }
-            Sent::Unreachable(error) => {
-                return failure(protocol::rpc_error(protocol::INTERNAL_ERROR, &error));
-            }
+            Sent::Unauthorized => return refused("McpCredentialRefusedError", REVOKED_MESSAGE),
+            Sent::Unreachable(error) => return refused("McpServerUnreachableError", &error),
         };
         id.as_ref()?;
         let streamed = response
