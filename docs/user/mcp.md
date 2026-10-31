@@ -291,14 +291,16 @@ These two belong to no set: they are always listed and work at read-only.
   - `thread.created`, `panel.created`, `thread.archived`;
   - `turn.requested`, `turn.started`, `turn.completed`, `turn.interrupted`, `turn.failed`,
     and `session.status` for any other change of the session's status;
-  - `approval.requested`, `approval.resolved`, `input.requested`, `input.resolved`, each
-    with its `requestId` (`status` is `resolved` or `expired`);
+  - `approval.requested`, `approval.resolved`, `input.requested`, `input.resolved`
+    (`status` is `resolved` or `expired`), each with its `requestId` when the provider's id
+    is a plain id (letters, digits, `_`, `.`, `:`, `-`, at most 128); otherwise
+    `list_pending_requests` names it;
   - `agent.call` for each change an outside agent made through MCP, with its `tool`, its
     outcome as `status`, and a `target` of ids (a commit, a pull request number, a file
     count).
 - **Nothing is missed.** Both logs are on disk and page by id, so a cursor still works after
-  a reconnect or a restart. One call scans at most 5,000 events and returns its position
-  even when none matched. `threadId` keeps one thread's changes; use one cursor per filter.
+  a reconnect or a restart. One call scans at most 5,000 events, and fewer when their
+  payloads are large, and returns its position even when none matched. `threadId` keeps one thread's changes; use one cursor per filter.
   Agent activity is kept for 7 days or 5,000 rows: an older cursor sets `activityDropped`.
 - **Not in the feed:** Git operations a person ran in the app, worktree and file changes, and
   profiler findings, which `profiler_findings` pages with its own cursor.

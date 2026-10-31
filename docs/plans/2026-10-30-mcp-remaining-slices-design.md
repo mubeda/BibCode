@@ -4126,6 +4126,32 @@ written to the file database while no server ran, read with the old cursor after
 `mcp::tools::feed::tests` covers the cursor's parsing, the session mapping and the error
 table scan; `mcp::relay::tests` the two typed relay failures.
 
+**Codex review round 2 (2026-10-31).** Both P2s were confirmed in source and fixed
+test-first on `claude/v0131-139-x3`:
+
+- **Provider text through `requestId`.** OpenCode passes its provider's request id through
+  unchanged, so a path or words in it reached `changes_since`, which needs no Workspace set.
+  An entry now carries `requestId` only when it matches `[A-Za-z0-9_.:-]{1,128}`; otherwise
+  it is left out and `list_pending_requests` (Workspace) names it, which is where
+  `answer_approval` takes its id from anyway. An alias was rejected: `answer_approval` would
+  need to resolve it, for ids that real providers do not produce. Test:
+  `a_request_id_that_is_not_a_plain_id_is_left_out` (a path with spaces).
+- **Bytes parsed per call.** Filtering by type alone does not bound it: tool output arrives
+  as `thread.activity-appended`, the same type as approvals, and the kind is inside the
+  payload. A lower window does not bound bytes either, and narrow columns need a migration.
+  The window is now also cut by bytes: each event in it costs its payload's
+  `octet_length` when its type is one of the five the read parses (0 otherwise), and the
+  window stops before the event that would pass 4 MiB (`feed::PARSE_BUDGET`); the first
+  event is always kept, so a call progresses past one larger payload. `octet_length` takes
+  the size from the record header, so the window itself reads no payload. `more` is true
+  when the budget cut the window. Test: `one_call_parses_a_bounded_number_of_payload_bytes`
+  (three 3 MiB tool payloads, one per call, then the approval behind them).
+- **Measured** (`measure_one_page_over_5000_large_events`, ignored; debug build, file
+  database, 5,000 activity events of 100 KiB, about 500 MB): unbounded (before) 598 ms on
+  the database worker for one page; bounded 31 ms reopened, 20 ms warm, scanning 40 events.
+  The worst left is one event larger than the budget, parsed alone in its call, plus one
+  small previous session update per session update in the window.
+
 ## X4 implementation notes (2026-10-31)
 
 X4 was implemented on `claude/v0131-139-x4`, from the batch tip `8d400e20df` (slice 1, the CLI,
