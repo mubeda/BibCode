@@ -85,6 +85,7 @@ import {
   EnvironmentAuthorizationError,
   EnvironmentRpcError,
 } from "./auth.ts";
+import { McpActivityError, McpActivityStreamEvent } from "./mcpActivity.ts";
 import {
   ActivityCancelSubtreeInput,
   ActivityDetailPage,
@@ -199,6 +200,7 @@ import {
   OrchestrationRpcSchemas,
   ProviderInteractionMode,
   RuntimeMode,
+  THREAD_PURPOSE_MAX_LENGTH,
 } from "./orchestration.ts";
 import {
   CommandId,
@@ -411,6 +413,10 @@ export const WorktreeCreateManagedInput = Schema.Struct({
   newRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   baseRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   threadDefaults: WorktreeThreadDefaults,
+  /** Why an outside agent creates it (#139, slice X1); shown with the agent's label. */
+  purpose: Schema.optional(
+    Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
+  ),
 });
 export type WorktreeCreateManagedInput = typeof WorktreeCreateManagedInput.Type;
 
@@ -420,6 +426,10 @@ export const WorktreeCreatePanelInput = Schema.Struct({
   threadId: ThreadId,
   title: TrimmedNonEmptyString,
   threadDefaults: WorktreeThreadDefaults,
+  /** Why an outside agent opens it (#139, slices X1 and X4). */
+  purpose: Schema.optional(
+    Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
+  ),
 });
 export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
 
@@ -679,6 +689,7 @@ export const WS_METHODS = {
   subscribeServerConfig: "subscribeServerConfig",
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
+  subscribeMcpActivity: "subscribeMcpActivity",
   subscribeActivity: "subscribeActivity",
   subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
   subscribeGitManagerSignal: "subscribeGitManagerSignal",
@@ -2022,6 +2033,14 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
   stream: true,
 });
 
+/** The agent activity log and who is active (#139, slice X1); needs `access:read`. */
+export const WsSubscribeMcpActivityRpc = Rpc.make(WS_METHODS.subscribeMcpActivity, {
+  payload: Schema.Struct({}),
+  success: McpActivityStreamEvent,
+  error: Schema.Union([McpActivityError, EnvironmentRpcError]),
+  stream: true,
+});
+
 export const WsActivityGetSnapshotRpc = Rpc.make(WS_METHODS.activityGetSnapshot, {
   payload: ActivityGetSnapshotInput,
   success: ActivitySnapshot,
@@ -2253,6 +2272,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
+  WsSubscribeMcpActivityRpc,
   WsActivityGetSnapshotRpc,
   WsActivityListRosterRpc,
   WsActivityListDetailRpc,

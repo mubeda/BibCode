@@ -1,0 +1,23 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "type": "row",
+      "row": {
+        "id": 6,
+        "occurredAt": "\"]LAOg8v.V",
+        "clientId": "😀",
+        "label": null,
+        "tool": "�",
+        "threadId": "a'nl^",
+        "outcome": "0",
+        "target": {
+          "sha": "�",
+          "worktreeKey": "",
+          "transferId": "\u0000"
+        }
+      }
+    }
+  ]
+}

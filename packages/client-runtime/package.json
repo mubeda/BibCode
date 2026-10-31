@@ -43,6 +43,10 @@
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
     },
+    "./state/mcpActivity": {
+      "types": "./src/state/mcpActivity.ts",
+      "default": "./src/state/mcpActivity.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"

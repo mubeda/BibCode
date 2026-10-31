@@ -21,6 +21,8 @@ import {
   AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
+  AuthSetMcpAccessInput,
+  AuthMcpAccessLevel,
   AuthRevokePairingLinkInput,
   AuthEnvironmentScope,
   AuthTokenExchangeRequest,
@@ -65,6 +67,7 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "scope_not_granted",
   "invalid_command",
   "invalid_pairing_offer",
+  "invalid_mcp_access",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -362,6 +365,13 @@ export const AuthClientSessionRevokeResult = Schema.Struct({
 });
 export type AuthClientSessionRevokeResult = typeof AuthClientSessionRevokeResult.Type;
 
+/** The agent's access after Take over or Hand back (#139, slice X1). */
+export const AuthMcpAccessResult = Schema.Struct({
+  sessionId: AuthSessionId,
+  access: AuthMcpAccessLevel,
+});
+export type AuthMcpAccessResult = typeof AuthMcpAccessResult.Type;
+
 export const AuthOtherClientSessionsRevokeResult = Schema.Struct({
   revokedCount: Schema.Finite,
 });
@@ -462,6 +472,14 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       payload: AuthRevokeClientSessionInput,
       success: AuthClientSessionRevokeResult,
       error: EnvironmentSessionRevokeErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("setMcpAccess", "/api/auth/clients/mcp-access", {
+      headers: OptionalBearerHeaders,
+      payload: AuthSetMcpAccessInput,
+      success: AuthMcpAccessResult,
+      error: EnvironmentPairingCredentialErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
