@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WebhookError",
-          "reason": "limit",
+          "reason": "webhooks_off",
           "message": "4294967295"
         }
       }
