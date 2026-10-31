@@ -13,6 +13,7 @@ pub use backup::{
 };
 pub(crate) use database::{CommitFence, CommitPermit};
 pub use database::{Database, PersistenceError, Result};
+pub(crate) use migrations::ensure_webhook_revisions;
 pub use migrations::{MIGRATIONS, Migration, apply_migrations, pending_migrations, run_migrations};
 pub use repositories::*;
 pub use state_files::{

@@ -48,6 +48,9 @@ pub(crate) struct Endpoint {
     pub(crate) disabled_reason: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    /// Bumped by every edit that changes where its deliveries go or which events it gets,
+    /// and by turning it off or on; each queued delivery is stamped with it.
+    pub(crate) revision: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +69,8 @@ pub(crate) struct Delivery {
     pub(crate) latency_ms: Option<i64>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    /// The endpoint's revision when this delivery was queued or built.
+    pub(crate) endpoint_revision: i64,
 }
 
 /// One delivery to queue.
@@ -76,29 +81,10 @@ pub(crate) struct NewDelivery {
     pub(crate) event_id: String,
     pub(crate) event_type: String,
     pub(crate) body: String,
-    /// The endpoint's destination and filters this delivery was chosen under; the enqueue
-    /// drops it when they changed since (`None` skips the check).
-    pub(crate) addressed: Option<Fence>,
-}
-
-/// What decides where an endpoint's deliveries go and which events it gets: its URL,
-/// project filter and event list. An edit that changes it abandons the endpoint's queue.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Fence {
-    pub(crate) url: String,
-    pub(crate) project_id: Option<String>,
-    pub(crate) event_types_json: String,
-}
-
-impl Endpoint {
-    pub(crate) fn fence(&self) -> Fence {
-        Fence {
-            url: self.url.clone(),
-            project_id: self.project_id.clone(),
-            event_types_json: serde_json::to_string(&self.event_types)
-                .unwrap_or_else(|_| "[]".to_owned()),
-        }
-    }
+    /// The endpoint revision this delivery was chosen or built under. The enqueue drops it
+    /// when the endpoint's revision moved since (`None` takes the current one unchecked), and
+    /// the row is stamped with it.
+    pub(crate) addressed: Option<i64>,
 }
 
 /// How an attempt left its delivery.
@@ -138,9 +124,10 @@ fn now_iso() -> String {
 }
 
 const ENDPOINT_COLUMNS: &str = "endpoint_id, name, url, enabled, event_types_json, project_id, \
-    paired_session_id, consecutive_failures, disabled_reason, created_at, updated_at";
+    paired_session_id, consecutive_failures, disabled_reason, created_at, updated_at, revision";
 const DELIVERY_COLUMNS: &str = "sequence, delivery_id, endpoint_id, event_id, event_type, body, \
-    state, attempts, next_attempt_ms, last_status, last_error, latency_ms, created_at, updated_at";
+    state, attempts, next_attempt_ms, last_status, last_error, latency_ms, created_at, updated_at, \
+    endpoint_revision";
 
 fn decode_endpoint(row: &Row<'_>) -> rusqlite::Result<Endpoint> {
     let event_types: String = row.get(4)?;
@@ -156,6 +143,7 @@ fn decode_endpoint(row: &Row<'_>) -> rusqlite::Result<Endpoint> {
         disabled_reason: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        revision: row.get(11)?,
     })
 }
 
@@ -175,6 +163,7 @@ fn decode_delivery(row: &Row<'_>) -> rusqlite::Result<Delivery> {
         latency_ms: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        endpoint_revision: row.get(14)?,
     })
 }
 
@@ -239,7 +228,7 @@ impl Store {
                     return Ok(Err(StoreError::Limit));
                 }
                 transaction.execute(
-                    &format!("INSERT INTO webhook_endpoints ({ENDPOINT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+                    &format!("INSERT INTO webhook_endpoints ({ENDPOINT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
                     params![
                         endpoint.id,
                         endpoint.name,
@@ -252,6 +241,7 @@ impl Store {
                         endpoint.disabled_reason,
                         endpoint.created_at,
                         endpoint.updated_at,
+                        endpoint.revision,
                     ],
                 )?;
                 transaction.commit()?;
@@ -287,11 +277,15 @@ impl Store {
                     || project_id != endpoint.project_id
                     || event_types != event_types_json;
                 let turned_on = was_enabled == 0 && endpoint.enabled;
+                // A new destination, filters, or on/off is a new revision: whatever was chosen
+                // or built under the old one is never sent.
+                let new_revision = readdressed || (was_enabled != 0) != endpoint.enabled;
                 transaction.execute(
                     "UPDATE webhook_endpoints SET name = ?2, url = ?3, enabled = ?4, event_types_json = ?5, \
                      project_id = ?6, paired_session_id = ?7, \
                      consecutive_failures = CASE WHEN ?8 THEN 0 ELSE consecutive_failures END, \
                      disabled_reason = CASE WHEN ?4 THEN NULL ELSE disabled_reason END, \
+                     revision = revision + CASE WHEN ?10 THEN 1 ELSE 0 END, \
                      updated_at = ?9 WHERE endpoint_id = ?1",
                     params![
                         endpoint.id,
@@ -303,6 +297,7 @@ impl Store {
                         endpoint.paired_session_id,
                         turned_on,
                         now_iso(),
+                        new_revision,
                     ],
                 )?;
                 if readdressed {
@@ -413,36 +408,31 @@ impl Store {
                 let transaction = connection.transaction()?;
                 let now = now_iso();
                 {
-                    // The endpoint as it is now, in this transaction: a delivery chosen under
-                    // settings an edit has since replaced is dropped here, since the edit
-                    // abandoned whatever was queued before it.
-                    let mut current: HashMap<String, Option<Fence>> = HashMap::new();
+                    // The endpoint's revision as it is now, in this transaction: a delivery
+                    // chosen under an earlier revision is dropped here, since the edit that
+                    // moved it abandoned whatever was queued before it (an edit and its undo
+                    // move it twice, so they are caught too).
+                    let mut current: HashMap<String, Option<i64>> = HashMap::new();
                     let mut read = transaction.prepare_cached(
-                        "SELECT url, project_id, event_types_json FROM webhook_endpoints WHERE endpoint_id = ?1 AND enabled = 1",
+                        "SELECT revision FROM webhook_endpoints WHERE endpoint_id = ?1 AND enabled = 1",
                     )?;
                     let mut insert = transaction.prepare_cached(
-                        "INSERT INTO webhook_deliveries (delivery_id, endpoint_id, event_id, event_type, body, state, attempts, next_attempt_ms, created_at, updated_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
+                        "INSERT INTO webhook_deliveries (delivery_id, endpoint_id, event_id, event_type, body, state, attempts, next_attempt_ms, created_at, updated_at, endpoint_revision) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7, ?8)",
                     )?;
                     for delivery in &deliveries {
-                        if let Some(addressed) = &delivery.addressed {
-                            if !current.contains_key(&delivery.endpoint_id) {
-                                let fence = read
-                                    .query_row(params![delivery.endpoint_id], |row| {
-                                        Ok(Fence {
-                                            url: row.get(0)?,
-                                            project_id: row.get(1)?,
-                                            event_types_json: row.get(2)?,
-                                        })
-                                    })
-                                    .optional()?;
-                                current.insert(delivery.endpoint_id.clone(), fence);
-                            }
-                            if current.get(&delivery.endpoint_id).and_then(Option::as_ref)
-                                != Some(addressed)
-                            {
-                                continue;
-                            }
+                        if !current.contains_key(&delivery.endpoint_id) {
+                            let revision = read
+                                .query_row(params![delivery.endpoint_id], |row| row.get(0))
+                                .optional()?;
+                            current.insert(delivery.endpoint_id.clone(), revision);
+                        }
+                        let Some(revision) = current.get(&delivery.endpoint_id).copied().flatten()
+                        else {
+                            continue;
+                        };
+                        if delivery.addressed.is_some_and(|addressed| addressed != revision) {
+                            continue;
                         }
                         insert.execute(params![
                             delivery.delivery_id,
@@ -452,6 +442,7 @@ impl Store {
                             delivery.body,
                             now_ms,
                             now,
+                            revision,
                         ])?;
                     }
                 }
@@ -698,8 +689,8 @@ impl Store {
             .call(move |connection| {
                 let now = now_iso();
                 connection.execute(
-                    "INSERT INTO webhook_deliveries (delivery_id, endpoint_id, event_id, event_type, body, state, attempts, next_attempt_ms, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'sending', 0, ?6, ?7, ?7)",
+                    "INSERT INTO webhook_deliveries (delivery_id, endpoint_id, event_id, event_type, body, state, attempts, next_attempt_ms, created_at, updated_at, endpoint_revision) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'sending', 0, ?6, ?7, ?7, ?8)",
                     params![
                         delivery.delivery_id,
                         delivery.endpoint_id,
@@ -708,6 +699,7 @@ impl Store {
                         delivery.body,
                         now_ms,
                         now,
+                        delivery.addressed.unwrap_or_default(),
                     ],
                 )?;
                 Ok(connection.query_row(
@@ -722,15 +714,31 @@ impl Store {
     }
 
     /// A send-now delivery dropped in flight (turned off, disabled or shut down).
-    pub(crate) async fn abandon_delivery(&self, delivery_id: &str) -> Result<()> {
+    pub(crate) async fn abandon_delivery(
+        &self,
+        delivery_id: &str,
+        reason: &'static str,
+    ) -> Result<()> {
         let delivery_id = delivery_id.to_owned();
         self.database
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE webhook_deliveries SET state = 'abandoned', last_error = 'cancelled', updated_at = ?2 \
+                    "UPDATE webhook_deliveries SET state = 'abandoned', last_error = ?3, updated_at = ?2 \
                      WHERE delivery_id = ?1 AND state IN ('pending', 'sending')",
-                    params![delivery_id, now_iso()],
+                    params![delivery_id, now_iso(), reason],
                 )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Adds the revision columns to a development store that ran the first migration 61.
+    pub(crate) async fn ensure_revisions(&self) -> Result<()> {
+        self.database
+            .call(|connection| {
+                let transaction = connection.transaction()?;
+                crate::persistence::ensure_webhook_revisions(&transaction)?;
+                transaction.commit()?;
                 Ok(())
             })
             .await
@@ -845,7 +853,12 @@ impl Store {
     pub(crate) async fn clear_positions(&self) -> Result<()> {
         self.database
             .call(|connection| {
-                connection.execute("DELETE FROM webhook_state", [])?;
+                // The drop counter stays: batch numbers are never reused, so an old
+                // acknowledgement can never match a newer batch.
+                connection.execute(
+                    "DELETE FROM webhook_state WHERE key != ?1",
+                    params![DROP_SEQ],
+                )?;
                 Ok(())
             })
             .await
@@ -1015,8 +1028,8 @@ fn abandon_pending(
 
 fn disable(transaction: &Transaction<'_>, id: &str, reason: &str) -> rusqlite::Result<bool> {
     let changed = transaction.execute(
-        "UPDATE webhook_endpoints SET enabled = 0, disabled_reason = ?2, updated_at = ?3 \
-         WHERE endpoint_id = ?1 AND enabled = 1",
+        "UPDATE webhook_endpoints SET enabled = 0, disabled_reason = ?2, updated_at = ?3, \
+         revision = revision + 1 WHERE endpoint_id = ?1 AND enabled = 1",
         params![id, reason, now_iso()],
     )?;
     abandon_pending(transaction, Some(id), None)?;

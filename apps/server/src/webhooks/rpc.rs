@@ -296,6 +296,7 @@ impl Webhooks {
                     disabled_reason: None,
                     created_at: now.clone(),
                     updated_at: now,
+                    revision: 0,
                 };
                 let secret = signing::generate_secret().map_err(storage)?;
                 self.inner
@@ -390,7 +391,7 @@ impl Webhooks {
             event_id: event.id.clone(),
             event_type: WEBHOOK_TEST.to_owned(),
             body: event.body(&self.inner.environment_id),
-            addressed: None,
+            addressed: Some(endpoint.revision),
         };
         self.send_now(&endpoint, delivery, false).await
     }
@@ -434,7 +435,7 @@ impl Webhooks {
             event_id: original.event_id,
             event_type: original.event_type,
             body: original.body,
-            addressed: None,
+            addressed: Some(endpoint.revision),
         };
         self.send_now(&endpoint, delivery, health).await
     }
@@ -450,24 +451,51 @@ impl Webhooks {
             .insert_sending(delivery, now_ms())
             .await
             .map_err(storage)?;
+        // The endpoint's turn, then its token, then a fresh read: an edit committed before
+        // the read is a new revision and refuses the send; one committed after it cancels
+        // the token. Waiting for the turn ends only at shutdown.
+        let turn = self.take_turn(&endpoint.id, &self.inner.shutdown).await;
         let cancel = self.endpoint_token(&endpoint.id);
-        let attempt = self
-            .attempt(
-                endpoint,
-                &delivery.delivery_id,
-                &delivery.event_type,
-                &delivery.body,
-                &cancel,
-            )
-            .await;
+        let current = self.store().endpoint(&endpoint.id).await.map_err(storage)?;
+        let current = match current {
+            Some(current) if current.revision == endpoint.revision => current,
+            _ => {
+                self.store()
+                    .abandon_delivery(&delivery.delivery_id, store::ENDPOINT_CHANGED)
+                    .await
+                    .map_err(storage)?;
+                self.wake();
+                return Err(refusal(
+                    "endpoint_changed",
+                    "The endpoint changed while this was being sent. Nothing was sent; try again.",
+                ));
+            }
+        };
+        let attempt = match turn {
+            Some(_turn) => {
+                self.attempt_holding_turn(
+                    &current,
+                    &delivery.delivery_id,
+                    &delivery.event_type,
+                    &delivery.body,
+                    &cancel,
+                )
+                .await
+            }
+            None => delivery::Attempt {
+                status: None,
+                failure: Some(delivery::Failure::Cancelled),
+                latency_ms: 0,
+            },
+        };
         if attempt.failure == Some(delivery::Failure::Cancelled) {
             self.store()
-                .abandon_delivery(&delivery.delivery_id)
+                .abandon_delivery(&delivery.delivery_id, "cancelled")
                 .await
                 .map_err(storage)?;
         } else {
             let record = self.record(&delivery, &attempt, health);
-            self.finish(endpoint, &delivery, &attempt, record).await;
+            self.finish(&current, &delivery, &attempt, record).await;
         }
         self.wake();
         let stored = self
