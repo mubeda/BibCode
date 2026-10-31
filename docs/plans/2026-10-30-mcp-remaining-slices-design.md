@@ -3344,6 +3344,38 @@ directly. The post-trash check detects it. Panel follow-ups:
 - After a permanent discard, the panel names any path still kept and says to remove it in a
   file manager. Until now a kept ignored file or linked-folder file closed the dialog silently.
 
+**Review round 4 (Codex, on the batch branch).** One P1 and two P2s, all confirmed by a test
+that failed first:
+
+- **P1: Git's metadata was a valid discard target** (predates round 3). The test moved
+  `.git/objects` into the trash.
+  - `validate_pathspecs`, shared by stage, unstage, stash, discard and partial staging, now
+    refuses a path whose first part is `.git` in any case. It already refused `./` and `..`,
+    and `Path` drops a trailing slash.
+  - `discard_paths` resolves the Git and common directories on every platform, and
+    `contain_discard_paths` refuses a path that resolves into either (for example through
+    a symlink to `.git`) or holds either.
+  - Test: `git_metadata_is_never_a_discard_target` covers `.git/objects`, `.git`, `.git/`,
+    `./.git/HEAD`, `.GIT/config`, a symlink to `.git`, staging `.git/config`, and a linked
+    worktree's `.git` file.
+- **P2: an existing `bibcode-discard` was reused unchecked.** It must now be owned by the
+  server's effective uid and have no group or other write bit. Otherwise it is not used,
+  and the entry counts as a trash refusal: kept on a trash request, and `permanent` still
+  works through `git clean`, which needs no staging. A fresh uniquely named folder was not
+  added, since it would leave a stray folder behind on every shared repository. Tests:
+  `a_staging_folder_others_can_write_is_never_used` (mode `0777`) and the pure rule
+  `is_private`, for another owner, which a test cannot create.
+- **P2: a crash could strand a discarded file.** Before the rename, `stage` writes
+  `<uuid>.origin` beside the holder (`0600`, `O_EXCL`), holding the checkout root, a NUL and
+  the relative path. It is removed with the holder once the entry is trashed or put back.
+  Each discard first runs `recover`: every record whose holder is not in this process's
+  in-flight set has its entry moved back, by the same no-follow descent from the root and
+  without replacing anything, when its place is free. Otherwise the entry stays and a
+  warning is logged. Empty holders are removed with their record. Status reads do not
+  recover, to keep this minimal. Test: `a_discard_restores_entries_a_crash_left_in_staging`
+  stops a discard while the trash holds its entry. The next discard restores the entry,
+  and a stranded entry whose place was taken stays staged.
+
 ## P (pull request tools) implementation notes (2026-10-30)
 
 Slice P was implemented on `claude/v0131-139-p`, from `claude/v0131-139-f0`. It adds
