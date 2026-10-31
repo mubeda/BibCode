@@ -82,6 +82,9 @@ vi.mock("./components/settings/UpdateServerDialog", () => ({
 vi.mock("./components/ServerReloadPrompt", () => ({
   ServerReloadPrompt: () => null,
 }));
+vi.mock("./components/UiIntentNotifier", () => ({
+  UiIntentNotifier: () => null,
+}));
 
 vi.mock("./components/preview/previewBridge", () => ({ previewBridge: null }));
 
