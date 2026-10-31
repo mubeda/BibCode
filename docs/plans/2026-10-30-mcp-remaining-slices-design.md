@@ -5291,7 +5291,6 @@ the round-three code:
   `a_manual_send_built_before_an_edit_is_refused` now queues the edit for the lock before the
   test event, since the edit waits for the lock the test holds.
 
-
 ## Z (agent-facing reference and docs) implementation notes (2026-10-31)
 
 Z was written on `claude/v0131-139-z`, from `26b839ace6` (the batch tip with slice 1, the
@@ -5388,3 +5387,28 @@ with a test that failed first (all three confirmed by disabling the fix):
   (`ProjectTrashStagingFolder`) on the delete error; RPC wire fixtures regenerated.
 - **Not closed:** the residual of (a): each of these checks still leaves the one system call
   after it.
+
+**Z follow-up fixes** (`claude/v0131-139-zfix`, 2026-10-31). Each gap above was checked and
+fixed with a failing-first test, one commit each, and the reference updated to match:
+
+- Bare value over the cap: real. `tool_result` indexed a bare string, number or array by key,
+  which panics in `serde_json`, so a `preview_evaluate` value over 80,000 characters could
+  panic the server. A non-object result over the cap is now the standard too-long note.
+- `files_read` of a missing path: real. The `realpath` failure was `operation_failed`;
+  `WorkspaceError::wire_failure` now maps a missing target to `path_not_found`.
+- Full terminal input queue: real. It is now `TerminalInputError` with `code: "capacity"`
+  (no contract change), and `terminal_write` returns the new `McpTerminalInputFullError`
+  (in `feed::ERRORS`), which says none of the write was taken. The 10-second no-answer path is
+  unchanged. The end-to-end MCP path is covered link by link, since filling 1 MiB through the
+  tool would take minutes of 10-second writes.
+- `list_projects_and_threads` description: the `queued` status is removed.
+- `McpCapabilityDisabledError` names the Settings switches (`Threads and worktrees`,
+  `Source Control and pull requests`).
+- Device failures: real, in two places (the twin built its failure from tag and message, and
+  `host_failure` rebuilt it). `kind`, `running`, `imageId` and `state` are kept when they are
+  short strings.
+- From the reference review: `dropped.fromCursor` is now the position just before the first
+  dropped event (each cursor component stepped back by one, so it may repeat one already
+  delivered entry), because `changes_since` reads strictly after its cursor; the preview
+  example opens a tab first; a `webhook.test` body can carry `dropped`; minting a download URL
+  writes no activity row.
