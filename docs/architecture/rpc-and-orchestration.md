@@ -3486,6 +3486,51 @@ The profiler tools take no RPC admission: they read files in process, as the std
 server does. A section of `diagnose_environment` that fails carries its error's tag
 instead of failing the call.
 
+### Actor attribution and agent activity
+
+Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
+
+- **Actor.** `principal_actor(context)` is `{ kind: "mcp-client", clientId, label }` for an
+  `mcp-client` principal (its session id and its Authorized clients label at dispatch time)
+  and `None` for any other. `orchestration.dispatchCommand`, `worktree.createManaged` and
+  `worktree.createPanel` attribute their `CommandAdmissionClaim` to it
+  (`attribute_to`), and `process_envelope` stamps `metadata.actor` on every event the command
+  plans. The actor never comes from the command, so a client cannot claim one: a public
+  command's `actor` or `metadata` is ignored. `infer_actor_kind` stores `actor_kind =
+  'mcp-client'` for such events, and `wire_event` already carries the metadata.
+- **Projections (migration 60).** `projection_thread_messages.actor_json` holds the actor of
+  a `role = 'user'` message, `projection_thread_messages.source_thread_id` a message's
+  `sourceThreadId` (a live thread of the same project, for X4's panel provenance), and
+  `projection_threads.requester_json` `{ actor, purpose }` for a thread an agent created
+  (a `thread.create` or `bootstrap.createThread` `purpose`, at most 200 characters, an
+  engine invariant). The thread stream's messages carry `actor` and `sourceThreadId`, the
+  shell's threads carry `requester`, and `read_thread` returns both.
+- **Activity rows.** `McpControl::call_in` records one `mcp_activity` row per call of a
+  non-read-only tool that reached its handler: time, session, label, tool, thread, outcome
+  (`success` or the error tag) and a target of ids and counts only (`sha`, `revertedSha`,
+  `pullRequest`, `worktreeKey`, `fileCount`, `cloneId`, `transferId`). A keyed call whose
+  `clientRequestId` already has a live `mcp_tool_requests` row is a retry and records
+  nothing; a keyed call cancelled while its owned mutation goes on is recorded once that
+  row settles. Rows are pruned past 7 days or 5,000 on insert. A write failure is a
+  `tracing::warn!` and never fails the call.
+- **`subscribeMcpActivity`** (`access:read`, read stream) sends a snapshot of the newest
+  200 rows and the active agents, then each new row and each change of who is active. An
+  agent is active with a call in flight or in the last 2 minutes, or an owned mutation
+  running; streams re-check every 15 s so a quiet agent drops off.
+- **Stop.** `POST /api/auth/clients/revoke` with `interruptTurns: true` revokes the session
+  (cancelling its calls and owned mutations) and announces it on a channel of its own;
+  `McpControl` then dispatches `thread.turn.interrupt` (`server:mcp-stop:…`, through the
+  dispatch RPC, so the provider is told) for each running turn whose latest sent user
+  message carries that actor. A plain revocation, such as the `bibcode thread` CLI revoking
+  its own credential, interrupts nothing.
+- **Take over.** `POST /api/auth/clients/mcp-access { sessionId, access }` (`access:write`)
+  sets an `mcp-client` session's `mcp_access` to `read-only` and remembers the level it
+  replaced in `auth_sessions.mcp_access_hand_back`; any other level must be exactly that
+  level (Hand back), so the route never raises an agent above its pairing. Either change
+  cancels the session's live tokens, so owned mutations stop (they record `revoked`), and
+  emits a `clientUpserted` access event; the client list carries `mcpAccess` and
+  `mcpAccessHandBack`. Every refusal is a 400 `invalid_mcp_access`.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop

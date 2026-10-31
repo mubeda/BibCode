@@ -248,6 +248,31 @@ set, and all but `refresh_providers` work at read-only.
 - `profiler_symbolicate` and symbol downloads stay on `bibcode profiler mcp`, and the server
   log and the diagnostics bundle stay in the app.
 
+### Who acted, Stop and Take over
+
+BiBCode marks what an outside agent does, whoever is looking:
+
+- **Agent · <name>** marks each message an agent sent, each thread or worktree it created
+  (the reason it gave, `purpose`, is in the tooltip), and each Source Control commit a recent
+  agent call made. The name is the agent's **Authorized clients** label when it acted.
+  `start_thread` and `create_worktree` take an optional `purpose` of at most 200 characters.
+  `read_thread` returns each message's `actor` and the thread's `requester`.
+- **The status bar** shows **Agent active · <name>** while an agent has made a call in the last
+  two minutes or still has work running, with two buttons:
+  - **Stop** revokes the agent, which ends its calls and the Git and pull request work it
+    started, and interrupts each running turn whose latest message it sent. Your own turns
+    are left alone.
+  - **Take over** makes the agent read only: it can still read, every change it asks for is
+    refused, and work it started stops. **Hand back** restores exactly the access it had.
+- **Settings → Agents → Agent integrations → Agents** lists each authorized agent with its
+  last call, tools and access, with **Take over** (or **Hand back**) and **Revoke**, and below
+  it **Agent activity**: what agents changed, newest first, as ids and counts only (a commit,
+  a pull request number, a file count), never paths, messages or output.
+- Revoke, unlike Stop, leaves running turns alone. None of these asks for confirmation: each
+  only stops an agent, and reconnecting or **Hand back** undoes it.
+- You can see and use these from the computer that runs the environment (the desktop app,
+  or a browser session that may manage access), as for **Authorized clients**.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
@@ -314,6 +339,8 @@ echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
   browser preview and device tools keep working.
 - **Revoke** one agent's row in **Authorized clients** to stop only that agent. It then asks
   you to restart its MCP server, which signs in again.
+- **Stop** and **Take over** (see [Who acted](#who-acted-stop-and-take-over)) stop one agent
+  from any screen.
 
 ## Troubleshooting
 
