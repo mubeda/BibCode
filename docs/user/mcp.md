@@ -301,6 +301,35 @@ These two belong to no set: they are always listed and work at read-only.
 - **Not in the feed:** Git operations a person ran in the app, worktree and file changes, and
   profiler findings, which `profiler_findings` pages with its own cursor.
 
+### Chat panels and UI suggestions
+
+A chat panel is a second thread beside a host thread, in the same folder, shown as a tab in
+every BiBCode window. These tools are in the **Workspace** set; only `list_chat_panels` works
+at read-only.
+
+| Tool                 | What it does                                                                                                         |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `create_chat_panel`  | Opens a panel on a host thread, never above **Agents may**; a retry with the same `clientRequestId` returns it again |
+| `list_chat_panels`   | A host thread's open panels, with each one's status, model, mode and the agent that opened it                        |
+| `send_panel_message` | Sends a message from one thread of a worktree to another, and the message shows where it came from                   |
+| `focus_ui`           | Suggests what you might look at: a thread, its files or one file, its Source Control panel, or its diff              |
+
+- **Panel messages stay in one worktree.** `send_panel_message` goes between a host thread
+  and its panels, or between two panels of one host; anything else is
+  `McpNotSameWorktreeError`. The message shows **From <panel title>** beside the agent's
+  chip, and `read_thread` returns its `sourceThreadId`. BiBCode accepts that origin only on
+  an agent's panel message, so nothing else can claim one. With `includeLastReply`, the
+  source thread's last reply is quoted after the text, at most 16,000 characters of it.
+- **Suggestions never move anything.** `focus_ui` raises a small notice in every BiBCode
+  window showing the environment, **Agent <name> wants to show <what>**, with **Show**.
+  Nothing changes until you click it, so a suggestion never takes focus while you type.
+  A notice goes away after 60 seconds, a window that was hidden shows it when you come back
+  if it is still pending, and at most 16 may wait per thread. The result says how many
+  windows were watching. `path` is a file relative to the thread's folder, for `files` and
+  `diff` only.
+- A panel an agent opened carries an **Agent** badge on its tab; its tooltip names the agent
+  and the reason it gave (`purpose`).
+
 ### Who acted, Stop and Take over
 
 BiBCode marks what an outside agent does, whoever is looking:
@@ -309,7 +338,8 @@ BiBCode marks what an outside agent does, whoever is looking:
   (the reason it gave, `purpose`, is in the tooltip), and each Source Control commit a recent
   agent call made. The name is the agent's **Authorized clients** label when it acted.
   `start_thread` and `create_worktree` take an optional `purpose` of at most 200 characters.
-  `read_thread` returns each message's `actor` and the thread's `requester`.
+  `read_thread` returns each message's `actor` (and `sourceThreadId` for a panel message)
+  and the thread's `requester`.
 - **The status bar** shows **Agent active · <name>** while an agent has made a call in the last
   two minutes, still has work running, or has a turn running that it started, with two
   buttons:
