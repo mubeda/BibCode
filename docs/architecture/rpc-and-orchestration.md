@@ -3392,7 +3392,17 @@ handlers, so creation and removal keep their command claims, generation checks,
   meets the current ceiling. The thread is resolved only for a new request, since a
   completed removal deletes it.
 - **Removal plan.** `remove_worktree` sends `planToken` and `expectedGeneration`
-  exactly as the agent passed them and never fetches a plan itself.
+  as the agent passed them and never fetches a plan itself. When `pruneImpact` does
+  not fit in the result (`pruneImpactCount` gives the total), the plan's token is
+  marked `partial-impact:`. `remove_worktree` strips the mark, and refuses
+  `confirmRepositoryWidePrune` with `McpPruneImpactTooLongError`, since the prune
+  would remove registrations the agent never saw.
+- **Handoff.** The removal RPC runs in a task of its own under `McpControl`'s
+  shutdown token, not the call's, so a call cancelled or dropped after the catalog
+  took the removal over does not stop it. `McpControl::call` writes the
+  `MCP destructive tool` line when the call is still waiting. Otherwise the task
+  writes the line when the removal ends; a close-then-`try_recv` on the waiting side
+  makes that exactly one line.
 
 ### Pull request tools
 
