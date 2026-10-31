@@ -32,6 +32,7 @@ const harness = vi.hoisted(() => ({
 }));
 
 vi.mock("./ProfilerRecordingSegment", () => ({ ProfilerRecordingSegment: () => null }));
+vi.mock("./McpAgentIndicator", () => ({ McpAgentIndicator: () => null }));
 
 vi.mock("../../state/environments", () => ({
   useEnvironment: () => null,

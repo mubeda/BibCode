@@ -325,6 +325,7 @@ import {
   WorkspaceCardTerminalIcon,
   WorkspaceCardTitleLine,
 } from "./sidebar/WorkspaceCard";
+import { AgentActorChip } from "./chat/AgentActorChip";
 import { useWorkspaceCardLookups } from "./sidebar/useWorkspaceCardLookups";
 import { EMPTY_CARD_PORTS, EMPTY_CARD_TERMINALS } from "./sidebar/workspaceCardLookups";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
@@ -1239,6 +1240,16 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           ) : undefined
         }
         trailing={trailing}
+        badge={
+          thread.requester ? (
+            <AgentActorChip
+              compact
+              label={thread.requester.actor.label}
+              purpose={thread.requester.purpose}
+              detail="An outside agent created this thread over MCP."
+            />
+          ) : undefined
+        }
       />
       {hasBranchLine ? (
         <WorkspaceCardBranchLine

@@ -26,6 +26,7 @@ import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import { DiagnosticsEnvironmentSelect, useDiagnosticsEnvironment } from "./diagnosticsEnvironment";
+import { McpAgentsPanel } from "./McpAgentsPanel";
 import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayout";
 
 const SERVER_TITLE = "MCP server";
@@ -140,6 +141,7 @@ export function AgentIntegrationsSection() {
         environment={environment}
         isPrimary={environment.environmentId === primaryEnvironment?.environmentId}
       />
+      {environment.environmentId === primaryEnvironment?.environmentId ? <McpAgentsPanel /> : null}
     </SettingsSection>
   );
 }

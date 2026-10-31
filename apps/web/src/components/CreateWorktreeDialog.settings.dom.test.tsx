@@ -149,6 +149,12 @@ vi.mock("~/state/query", () => ({
   }),
 }));
 vi.mock("~/state/vcs", () => ({ vcsEnvironment: { listRefs: () => ({ kind: "listRefs" }) } }));
+// Settings → Agents also shows the Agents panel; it reads the agent activity.
+vi.mock("~/state/mcpActivity", () => ({
+  usePrimaryMcpActivity: () => ({ rows: [], active: [], canManage: false, environmentId: null }),
+  usePrimaryMcpClients: () => [],
+  takenOverLevel: () => null,
+}));
 vi.mock("~/state/worktrees", () => ({ worktreeEnvironment: { createManaged: h.createManaged } }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
 vi.mock("~/centerPanelStore", () => ({
