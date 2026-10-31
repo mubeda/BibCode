@@ -5589,7 +5589,8 @@ server's argv as before and are explained there by a muted "Development build" n
   `error`, not an RPC failure.
 - `mcpClients.register { client }` runs `claude mcp add --scope user bibcode -- <argv…>` or
   `codex mcp add bibcode -- <argv…>` with the server's own `mcpLaunch.argv`. If the add fails
-  and the read command says `bibcode` already exists, it removes that entry
+  and the read command does not say `bibcode` is absent (it exists, or a stale entry fails
+  `claude mcp get`'s health check), it removes that entry
   (`claude mcp remove --scope user bibcode`, `codex mcp remove bibcode`) and adds again, so
   re-adding updates the entry instead of duplicating or refusing.
 - `mcpClients.unregister { client }` runs the remove command (for Claude without `--scope`,

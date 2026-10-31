@@ -156,7 +156,10 @@ impl Cli {
         if added.code == 0 {
             return Ok(());
         }
-        if !matches!(self.is_registered(cwd, &cancellation).await, Ok(true)) {
+        // Only a read that says the entry is absent ends here. An entry whose read fails (a
+        // stale path failing `claude mcp get`'s health check) is replaced like a healthy one,
+        // or nothing the person clicks would get them out.
+        if matches!(self.is_registered(cwd, &cancellation).await, Ok(false)) {
             return Err(self.failed("could not add BiBCode", &added));
         }
         let removed = self
