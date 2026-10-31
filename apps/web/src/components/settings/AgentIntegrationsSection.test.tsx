@@ -15,11 +15,16 @@ interface FakeEnvironment {
   serverConfig: { mcpLaunch?: { argv: ReadonlyArray<string> } | null } | null;
 }
 
+const DEFAULT_CAPABILITIES = {
+  workspace: true,
+  sourceControl: true,
+  files: true,
+  diagnostics: true,
+  terminals: false,
+};
+
 const h = vi.hoisted(() => ({
-  settings: { enableMcpServer: true, mcpServerAccess: "approval-required" } as Record<
-    string,
-    unknown
-  >,
+  settings: {} as Record<string, unknown>,
   updates: [] as Array<{ environmentId: string; patch: unknown }>,
   copied: [] as string[],
   environments: [] as FakeEnvironment[],
@@ -121,8 +126,36 @@ function environment(overrides: Partial<FakeEnvironment> = {}): FakeEnvironment 
   };
 }
 
+function settings(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    enableMcpServer: true,
+    mcpServerAccess: "approval-required",
+    mcpCapabilities: DEFAULT_CAPABILITIES,
+    ...overrides,
+  };
+}
+
+const CAPABILITY_SWITCHES = [
+  ["Threads and worktrees", "workspace"],
+  ["Source Control and pull requests", "sourceControl"],
+  ["Files", "files"],
+  ["Diagnostics", "diagnostics"],
+  ["Terminals", "terminals"],
+] as const;
+
+function capabilitySwitch(container: HTMLElement, label: string): HTMLButtonElement {
+  return container.querySelector<HTMLButtonElement>(`[role="switch"][aria-label="${label}"]`)!;
+}
+
+function describedText(container: HTMLElement, element: Element): string | null | undefined {
+  const describedBy = element.getAttribute("aria-describedby");
+  return describedBy === null
+    ? null
+    : container.querySelector(`[id="${describedBy}"]`)?.textContent;
+}
+
 beforeEach(() => {
-  h.settings = { enableMcpServer: true, mcpServerAccess: "approval-required" };
+  h.settings = settings();
   h.updates = [];
   h.copied = [];
   h.environments = [environment()];
@@ -143,7 +176,10 @@ describe("AgentIntegrationsSection", () => {
     expect(toggle.getAttribute("aria-checked")).toBe("true");
     expect(toggle.disabled).toBe(false);
     expect(container.textContent).toContain(
-      "Let AI tools on this computer, or over SSH, operate this environment's threads.",
+      "Let AI tools operate this environment: threads, worktrees, Git and pull requests.",
+    );
+    expect(container.textContent).toContain(
+      "At any level above Read only, agents can also answer approvals, remove worktrees, discard changes, force-push and merge pull requests.",
     );
     expect(container.querySelector('[aria-label="Agents may"]')?.textContent).toBe("Supervised");
     const command = container.querySelector('[aria-label="Launch command"]')?.textContent;
@@ -171,7 +207,7 @@ describe("AgentIntegrationsSection", () => {
     );
     expect(h.updates).toEqual([{ environmentId: "local", patch: { enableMcpServer: false } }]);
 
-    h.settings = { enableMcpServer: false, mcpServerAccess: "full-access" };
+    h.settings = settings({ enableMcpServer: false, mcpServerAccess: "full-access" });
     const off = await render();
     expect(off.textContent).toContain("Turn on MCP server first.");
     expect(off.querySelector('[data-value="full-access"]')?.getAttribute("data-disabled")).toBe(
@@ -221,6 +257,61 @@ describe("AgentIntegrationsSection", () => {
     h.environments = [environment(), environment({ environmentId: "remote", label: "Build box" })];
     const container = await render();
     expect(container.querySelector('[data-testid="environment-picker"]')).not.toBeNull();
+  });
+
+  it("writes each capability switch to its own key, without asking", async () => {
+    h.settings = settings({ mcpServerAccess: "full-access" });
+    const container = await render();
+    for (const [label] of CAPABILITY_SWITCHES) {
+      const toggle = capabilitySwitch(container, label);
+      expect(toggle.disabled, label).toBe(false);
+      await act(async () => toggle.click());
+    }
+    expect(h.updates).toEqual(
+      CAPABILITY_SWITCHES.map(([, key]) => ({
+        environmentId: "local",
+        patch: { mcpCapabilities: { [key]: !DEFAULT_CAPABILITIES[key] } },
+      })),
+    );
+    expect(capabilitySwitch(container, "Threads and worktrees").getAttribute("aria-checked")).toBe(
+      "true",
+    );
+    expect(capabilitySwitch(container, "Terminals").getAttribute("aria-checked")).toBe("false");
+    expect(container.textContent).toContain(
+      "Let MCP agents open terminals and run any command in this environment.",
+    );
+    expect(container.textContent).toContain("after their MCP server restarts");
+  });
+
+  it("disables Terminals below Full access and says why", async () => {
+    const container = await render();
+    const terminals = capabilitySwitch(container, "Terminals");
+    expect(terminals.disabled).toBe(true);
+    expect(describedText(container, terminals)).toBe("Set Agents may to Full access first.");
+    expect(capabilitySwitch(container, "Files").disabled).toBe(false);
+  });
+
+  it("disables every capability until the MCP server is on, and resets them to the defaults", async () => {
+    h.settings = settings({
+      enableMcpServer: false,
+      mcpServerAccess: "full-access",
+      mcpCapabilities: { ...DEFAULT_CAPABILITIES, files: false, terminals: true },
+    });
+    const container = await render();
+    for (const [label] of CAPABILITY_SWITCHES) {
+      const toggle = capabilitySwitch(container, label);
+      expect(toggle.disabled, label).toBe(true);
+      expect(describedText(container, toggle), label).toBe("Turn on MCP server first.");
+    }
+    expect(capabilitySwitch(container, "Terminals").getAttribute("aria-checked")).toBe("true");
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[aria-label="Reset agent capabilities to default"]')!
+        .click(),
+    );
+    expect(h.updates).toEqual([
+      { environmentId: "local", patch: { mcpCapabilities: DEFAULT_CAPABILITIES } },
+    ]);
   });
 
   it("quotes for the server host's own shell", () => {

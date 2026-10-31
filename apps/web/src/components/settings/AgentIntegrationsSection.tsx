@@ -1,6 +1,9 @@
 import type { EnvironmentId } from "@bibcode/contracts";
 import {
   DEFAULT_MCP_SERVER_ACCESS,
+  DEFAULT_SERVER_SETTINGS,
+  type McpCapabilities,
+  type McpCapabilitiesPatch,
   type McpServerAccess,
   type UnifiedSettings,
 } from "@bibcode/contracts/settings";
@@ -27,12 +30,48 @@ import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayo
 
 const SERVER_TITLE = "MCP server";
 const SERVER_DESCRIPTION =
-  "Let AI tools on this computer, or over SSH, operate this environment's threads.";
+  "Let AI tools operate this environment: threads, worktrees, Git and pull requests.";
 const ACCESS_TITLE = "Agents may";
 const ACCESS_DESCRIPTION =
-  "Threads an MCP agent starts or messages never run with more access than this. If you raise it, agents already connected keep their old limit until their MCP server restarts.";
+  "Threads an MCP agent starts or messages never run with more access than this. At any level above Read only, agents can also answer approvals, remove worktrees, discard changes, force-push and merge pull requests. If you raise it, agents already connected keep their old limit until their MCP server restarts.";
+const CAPABILITIES_TITLE = "What agents can use";
+const CAPABILITIES_DESCRIPTION =
+  "Turn whole sets of tools on or off for MCP agents. A change applies to their next call.";
 const OLDER_SERVER_MESSAGE = "Update this server to use outside agents.";
 const SERVER_OFF_MESSAGE = "Turn on MCP server first.";
+const FULL_ACCESS_FIRST_MESSAGE = "Set Agents may to Full access first.";
+
+/** The `mcpCapabilities` sets, in the order Settings lists them. */
+const MCP_CAPABILITY_OPTIONS: ReadonlyArray<{
+  readonly key: keyof McpCapabilities;
+  readonly label: string;
+  readonly description: string;
+}> = [
+  {
+    key: "workspace",
+    label: "Threads and worktrees",
+    description: "Threads, approvals, worktrees, and the browser and device previews.",
+  },
+  {
+    key: "sourceControl",
+    label: "Source Control and pull requests",
+    description: "Git status, commits, branches, pushes and pull requests.",
+  },
+  { key: "files", label: "Files", description: "Read and change files in a thread's folder." },
+  {
+    key: "diagnostics",
+    label: "Diagnostics",
+    description: "The profiler's findings and BiBCode's processes.",
+  },
+  {
+    key: "terminals",
+    label: "Terminals",
+    description:
+      "Let MCP agents open terminals and run any command in this environment. Agents pick this up only after their MCP server restarts, or after a remote agent reauthorizes.",
+  },
+];
+
+const DEFAULT_CAPABILITIES = DEFAULT_SERVER_SETTINGS.mcpCapabilities;
 
 /** The composer's labels for the runtime modes, and Read only for no operate tools at all. */
 export const MCP_ACCESS_OPTIONS: ReadonlyArray<{
@@ -47,6 +86,16 @@ export const MCP_ACCESS_OPTIONS: ReadonlyArray<{
 
 const selectEnabled = (settings: UnifiedSettings) => settings.enableMcpServer;
 const selectAccess = (settings: UnifiedSettings) => settings.mcpServerAccess;
+const selectCapabilities = (settings: UnifiedSettings) => settings.mcpCapabilities;
+
+type McpSettingsPatch = {
+  enableMcpServer?: boolean;
+  mcpServerAccess?: McpServerAccess;
+  mcpCapabilities?: McpCapabilitiesPatch;
+};
+
+const sameCapabilities = (left: McpCapabilities, right: McpCapabilities) =>
+  MCP_CAPABILITY_OPTIONS.every(({ key }) => left[key] === right[key]);
 
 /**
  * The shell the copied command runs in: the server's own host, whose executable path says
@@ -122,7 +171,7 @@ function EnvironmentMcpServer({
   const accessReason = serverReason ?? (enabled ? null : SERVER_OFF_MESSAGE);
   const accessLabel = MCP_ACCESS_OPTIONS.find((option) => option.value === access)?.label ?? access;
   const [saveError, setSaveError] = useState<string | null>(null);
-  const save = async (patch: { enableMcpServer?: boolean; mcpServerAccess?: McpServerAccess }) => {
+  const save = async (patch: McpSettingsPatch) => {
     setSaveError(null);
     const result = await updateSettings(patch);
     if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
@@ -215,10 +264,90 @@ function EnvironmentMcpServer({
           </Select>
         }
       />
+      <CapabilitiesRow
+        environmentId={environmentId}
+        reason={accessReason}
+        reasonId={accessReason === serverReason ? serverReasonId : accessReasonId}
+        fullAccess={access === "full-access"}
+        resettable={supported}
+        onChange={(patch) => void save({ mcpCapabilities: patch })}
+      />
       {supported && serverConfig?.mcpLaunch ? (
         <LaunchCommandRow argv={serverConfig.mcpLaunch.argv} isPrimary={isPrimary} label={label} />
       ) : null}
     </>
+  );
+}
+
+/**
+ * Agents may → What agents can use: one switch per `mcpCapabilities` set. Each switch writes
+ * only its own key and applies live, so none asks first.
+ */
+function CapabilitiesRow({
+  environmentId,
+  reason,
+  reasonId,
+  fullAccess,
+  resettable,
+  onChange,
+}: {
+  readonly environmentId: EnvironmentId;
+  /** Why every switch is disabled, shown on a row above under `reasonId`; `null` when not. */
+  readonly reason: string | null;
+  readonly reasonId: string;
+  readonly fullAccess: boolean;
+  readonly resettable: boolean;
+  readonly onChange: (patch: McpCapabilitiesPatch) => void;
+}) {
+  const capabilities = useEnvironmentSettings(environmentId, selectCapabilities);
+  const terminalsReasonId = useId();
+  return (
+    <SettingsRow
+      title={CAPABILITIES_TITLE}
+      description={CAPABILITIES_DESCRIPTION}
+      resetAction={
+        resettable && !sameCapabilities(capabilities, DEFAULT_CAPABILITIES) ? (
+          <SettingResetButton
+            label="agent capabilities"
+            onClick={() => onChange(DEFAULT_CAPABILITIES)}
+          />
+        ) : null
+      }
+    >
+      <ul className="divide-y divide-border/60 pb-1">
+        {MCP_CAPABILITY_OPTIONS.map((option) => {
+          const ownReason =
+            reason === null && option.key === "terminals" && !fullAccess
+              ? FULL_ACCESS_FIRST_MESSAGE
+              : null;
+          const describedBy =
+            reason !== null ? reasonId : ownReason !== null ? terminalsReasonId : undefined;
+          return (
+            <li
+              key={option.key}
+              className="flex items-center justify-between gap-3 py-2.5 first:pt-3"
+            >
+              <div className="min-w-0 space-y-0.5">
+                <div className="text-[13px] font-medium text-foreground">{option.label}</div>
+                <p className="text-xs text-muted-foreground">{option.description}</p>
+                {ownReason === null ? null : (
+                  <div className="pt-0.5 text-xs text-muted-foreground">
+                    <ReasonLine id={terminalsReasonId} text={ownReason} />
+                  </div>
+                )}
+              </div>
+              <Switch
+                checked={capabilities[option.key]}
+                disabled={reason !== null || ownReason !== null}
+                onCheckedChange={(checked) => onChange({ [option.key]: checked })}
+                aria-label={option.label}
+                aria-describedby={describedBy}
+              />
+            </li>
+          );
+        })}
+      </ul>
+    </SettingsRow>
   );
 }
 
