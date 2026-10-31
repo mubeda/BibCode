@@ -574,6 +574,8 @@ export const ServerSettings = Schema.Struct({
   enableProfiler: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   enableDevicePreviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   enableMcpServer: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  /** Outbound webhooks (#139, slice X8); off until a person turns them on. */
+  enableWebhooks: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   mcpServerAccess: McpServerAccess.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_MCP_SERVER_ACCESS)),
   ),
@@ -746,6 +748,7 @@ export const ServerSettingsPatch = Schema.Struct({
   enableProfiler: Schema.optionalKey(Schema.Boolean),
   enableDevicePreviews: Schema.optionalKey(Schema.Boolean),
   enableMcpServer: Schema.optionalKey(Schema.Boolean),
+  enableWebhooks: Schema.optionalKey(Schema.Boolean),
   mcpServerAccess: Schema.optionalKey(McpServerAccess),
   mcpCapabilities: Schema.optionalKey(McpCapabilitiesPatch),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
