@@ -2419,12 +2419,13 @@ pub async fn discard_paths(
         return Ok(outcome);
     }
     let tracked_to_unstage = tracked
-        .into_iter()
+        .iter()
         .filter(|tracked_path| {
             discarded_paths
                 .iter()
                 .any(|path| path_matches(path, tracked_path))
         })
+        .cloned()
         .collect::<Vec<_>>();
     repository
         .unstage_files(&request.cwd, &tracked_to_unstage, cancellation)
@@ -2439,6 +2440,24 @@ pub async fn discard_paths(
         repository
             .discard_files(&request.cwd, &outcome.permanently_discarded, cancellation)
             .await?;
+        // `git clean` (without `-x`) leaves ignored files. An untracked path still there was
+        // kept, so it is reported so; a tracked one is there again because it was restored.
+        let mut kept = Vec::new();
+        for path in &outcome.permanently_discarded {
+            if !tracked
+                .iter()
+                .any(|candidate| path_matches(path, candidate))
+                && tokio::fs::symlink_metadata(request.cwd.join(path))
+                    .await
+                    .is_ok()
+            {
+                kept.push(path.clone());
+            }
+        }
+        outcome
+            .permanently_discarded
+            .retain(|path| !kept.contains(path));
+        outcome.trash_unavailable.extend(kept);
     }
     Ok(outcome)
 }
@@ -3593,6 +3612,55 @@ mod tests {
         .expect("confirmed permanent discard succeeds");
         assert_eq!(permanent.permanently_discarded, ["untracked.txt"]);
         assert!(!fixture.path().join("untracked.txt").exists());
+    }
+
+    /// The permanent fallback (`git clean` without `-x`) leaves an ignored file in place, so it
+    /// is reported as kept, never as permanently discarded.
+    #[tokio::test]
+    async fn a_permanent_discard_never_reports_an_ignored_file_it_left_in_place() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
+        std::fs::write(fixture.path().join(".gitignore"), "*.log\n").expect("ignore file");
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", ".gitignore", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "changed\n").expect("change");
+        std::fs::write(fixture.path().join("untracked.txt"), "untracked\n").expect("untracked");
+        std::fs::write(fixture.path().join("ignored.log"), "ignored\n").expect("ignored");
+        std::fs::create_dir(fixture.path().join("logs")).expect("ignored folder");
+        std::fs::write(fixture.path().join("logs/only.log"), "ignored\n").expect("ignored");
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(UnavailableTrash),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec![
+                    "ignored.log".into(),
+                    "untracked.txt".into(),
+                    "tracked.txt".into(),
+                    "logs".into(),
+                ],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert_eq!(
+            outcome.permanently_discarded,
+            ["untracked.txt", "tracked.txt"]
+        );
+        assert_eq!(outcome.trash_unavailable, ["ignored.log", "logs"]);
+        assert!(fixture.path().join("ignored.log").exists());
+        assert!(fixture.path().join("logs/only.log").exists());
+        assert!(!fixture.path().join("untracked.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            "base\n"
+        );
     }
 
     #[tokio::test]

@@ -272,7 +272,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "git_discard" => (
-            "Destructive: discards the changes of files or folders, restoring tracked files and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in trashUnavailable, unless permanent is true.",
+            "Destructive: discards the changes of files or folders, restoring tracked files and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in trashUnavailable, unless permanent is true. An ignored file that permanent deletion leaves in place is listed there too.",
             object(
                 json!({
                     "threadId": thread,
