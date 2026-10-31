@@ -3568,7 +3568,8 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   'mcp-client'` for such events, and `wire_event` already carries the metadata.
 - **Projections (migration 60).** `projection_thread_messages.actor_json` holds the actor of
   a `role = 'user'` message, `projection_thread_messages.source_thread_id` a message's
-  `sourceThreadId` (a live thread of the same project, for X4's panel provenance), and
+  `sourceThreadId` (another thread of the target's worktree, set only by X4's panel
+  messages; see below), and
   `projection_threads.requester_json` `{ actor, purpose }` for a thread an agent created
   (a `thread.create` or `bootstrap.createThread` `purpose`, at most 200 characters, an
   engine invariant). The thread stream's messages carry `actor` and `sourceThreadId`, the
@@ -3604,6 +3605,44 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   cancels the session's live tokens, so owned mutations stop (they record `revoked`), and
   emits a `clientUpserted` access event; the client list carries `mcpAccess` and
   `mcpAccessHandBack`. Every refusal is a 400 `invalid_mcp_access`.
+
+### Chat panel and UI intent tools
+
+Slice X4 (`mcp::tools::panels`, Workspace set) adds four tools.
+
+| Tool                 | Maps to                                                                                                    | Scope   |
+| -------------------- | ---------------------------------------------------------------------------------------------------------- | ------- |
+| `create_chat_panel`  | `worktree.createPanel`, its `commandId` and `threadId` stored with the request so a retry replays by claim | operate |
+| `list_chat_panels`   | the `subscribeShell` builder: threads of kind `panel` whose `hostThreadId` is the host                     | read    |
+| `send_panel_message` | `thread.turn.start` (`queued: true`) with `message.sourceThreadId`, then `thread.turn.steer` for `steer`   | operate |
+| `focus_ui`           | `ui.publishIntent`, after the C5 check of `path` against the thread's folder                               | operate |
+
+- **Who may name a source thread.** `message.sourceThreadId` on `thread.turn.start` is
+  provenance a person reads ("From <panel>"), so the engine accepts it only when the
+  command's admission claim carries an `mcp-client` actor and the source is another live
+  thread of the target's worktree (the same host thread, or one hosts the other). A
+  person's client and an agent naming an unrelated thread are both refused as an invariant,
+  with nothing projected. MCP clients reach dispatch only through tools, and only
+  `send_panel_message` sets the field (after its own `McpNotSameWorktreeError` check);
+  `send_message` refuses an unknown argument.
+- **`includeLastReply`** appends the source's latest assistant message as a Markdown quote,
+  at most 16,000 characters with a note of where it was cut. Message and quote together stay
+  within the 120,000-character turn limit.
+- **UI intents** (`production::ui_intents_rpc`). `ui.publishIntent` (`orchestration:operate`,
+  unary) accepts only an `mcp-client` principal and stamps its actor; it repeats the shape
+  checks (`surface`, a relative literal `path` for `files` and `diff`). An intent
+  `{ kind: "focus", intentId, threadId, surface, path, actor, createdAt, expiresAt }` lives
+  in memory for 60 seconds, at most 16 pending per thread (`UiIntentError`, `reason:
+  "limit"`), and the result reports how many streams were subscribed.
+  `subscribeUiIntents` (`orchestration:read`, read stream) sends the pending intents and
+  then each new one (a lagging stream gets a fresh snapshot). The kind field lets slice X7
+  add `commitMessage` with its own retention.
+- **Clients.** `UiIntentNotifier` (one per environment, outside the router) raises a
+  non-modal toast per intent, **Agent <label> wants to show <surface>** with **Show**, and
+  moves nothing until it is clicked; a hidden window raises it when shown again if it has
+  not expired. **Show** routes to the thread (a panel's host, with the panel's tab active)
+  and opens the surface there. A chat panel tab an agent opened carries an **Agent** badge,
+  with the agent and purpose in its tooltip.
 
 ## Targeted Activity cancellation flow
 

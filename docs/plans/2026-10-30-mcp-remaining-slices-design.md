@@ -4061,3 +4061,107 @@ after pruning, also with every row gone; refused cursors and limits; and a trans
 written to the file database while no server ran, read with the old cursor after a restart.
 `mcp::tools::feed::tests` covers the cursor's parsing, the session mapping and the error
 table scan; `mcp::relay::tests` the two typed relay failures.
+
+## X4 implementation notes (2026-10-31)
+
+X4 was implemented on `claude/v0131-139-x4`, from the batch tip `8d400e20df` (slice 1, the CLI,
+F0, wave 1, D, T, X2, X1 and their review fixes). It adds `mcp/tools/panels.rs` (four tools in
+the Workspace set), `production/ui_intents_rpc.rs` (`ui.publishIntent` and
+`subscribeUiIntents`), `packages/contracts/src/uiIntents.ts`, the client-runtime fold
+(`state/uiIntents.ts`), `UiIntentNotifier.tsx`, `MessageProvenance.tsx`,
+`PanelTabAgentBadge.tsx` and `mcp_tools_tests/panels.rs`. No migration.
+
+**Who may set `sourceThreadId` (decided here, as X1 left it).** It is provenance a person
+reads, so the server derives it rather than trusting a client:
+
+- The engine accepts `message.sourceThreadId` on `thread.turn.start` only when the command's
+  admission claim carries an `mcp-client` actor (`plan_command` takes
+  `command_claim.actor().is_some()`), and only for another live thread of the target's
+  worktree: the same host thread, or one hosts the other. Same project is no longer enough,
+  and a thread cannot name itself. Anything else is an invariant (a rejected receipt), so
+  nothing is projected. This replaces X1's same-project rule in `engine.rs`.
+- A person's client therefore cannot claim a message came from a panel. MCP clients reach
+  dispatch only through tools; only `send_panel_message` sets the field, after its own
+  `McpNotSameWorktreeError` check, and `send_message` refuses the argument as unknown.
+- Test: `a_source_thread_named_outside_a_panel_message_never_persists` (a person's forged
+  value, an agent naming another worktree's thread, and an agent naming the target itself
+  are each refused with no user message stored). It failed with X1's rule.
+
+**Drift and verified facts:**
+
+- **`ui.publishIntent` needs an outside agent.** The design gives the intent a non-optional
+  `actor` and a toast that says "Agent <label>", so the handler refuses any principal that
+  is not `mcp-client` (`UiIntentError`, `reason: "actor"`). It repeats the shape checks
+  (surface, a relative literal path for `files` and `diff` only); the full C5 check against
+  the thread's folder runs in `focus_ui`, which has the thread's `cwd`.
+- **The intent carries `kind` and `expiresAt`** beside the design's fields:
+  `{ kind: "focus", intentId, threadId, surface, path, actor, createdAt, expiresAt }`. `kind`
+  is the union tag X7 extends; `expiresAt` lets a client that connects late, or a hidden
+  window shown again, offer a pending intent only for the time it has left.
+- **The stream sends a snapshot.** `subscribeUiIntents` starts with the pending intents, then
+  each new one; a stream that lags gets a fresh snapshot. Clients keep an intent once by id.
+  The subscriber count `focus_ui` returns is the broadcast's receiver count, so it counts
+  open streams (windows and environments connected), not people.
+- **Errors.** The 17th pending intent of a thread is `UiIntentError` with `reason: "limit"`,
+  passed through to the agent as that tag; a refused path or surface is
+  `McpInvalidArgumentError` from the tool.
+- **`create_chat_panel`** refuses a host that is itself a panel (`McpNotAHostThreadError`);
+  any other live thread may host, as in the UI. Its title is "Panel — <instanceId>" unless
+  set (the UI's is "Panel — <provider label>"). It stores `{ commandId, runtimeMode, payload }`
+  through `ToolCall::commands`, as `create_worktree` does, so a retry replays by claim.
+- **"Adopted by a second client"** is web behavior (`centerPanelAdoption.ts`, already
+  tested there). The server test proves what adoption reads: the shell lists the panel once
+  with `kind: "panel"`, its `hostThreadId` and the agent's `requester`.
+- **`includeLastReply`** quotes the source's newest non-empty assistant message as Markdown
+  (`> Last reply in “<title>”:`), at most 16,000 characters, then
+  `> … (cut at 16000 of N characters)`. Text and quote must fit the 120,000-character turn
+  limit together. The result's `quotedReply` says whether a reply was quoted.
+- **`read_thread`** now returns each message's `sourceThreadId`.
+- **Activity rows name no thread for two tools.** `McpControl::call_in` reads `threadId`
+  only, so `send_panel_message` (`fromThreadId`, `toThreadId`) and `create_chat_panel`
+  (`hostThreadId`) record a row with a null thread, and X3's feed sees none.
+  `mcp/activity.rs` is being changed by the X1 review fixes this wave, so this is left as a
+  follow-up (read `toThreadId` and `hostThreadId` too) rather than renaming the design's
+  arguments. `focus_ui` takes `threadId` and records it.
+- **Files touched beyond X4's rows:** `orchestration/engine.rs` (the rule above, at the
+  coordinator's request); `mcp/tools/threads.rs` (`thread_summary` made `pub(crate)`, and
+  `sourceThreadId` in `read_thread`); `production/runtime.rs` (X5's file this wave: the
+  intents service registration, four lines); `production/mod.rs`;
+  `mcp_tools_tests/worktrees.rs` (`worktree.createPanel` added to the forwarded methods);
+  `AppRoot.tsx` and its two tests (one mount line); `CenterPanelTabs.tsx` and its test (the
+  panel tab badge); `MessagesTimeline.tsx` (one import and one element, replacing X1's chip
+  line with `MessageProvenance`, which renders the chip and the source).
+- **Counts.** Methods 178 → 180, streams 28 → 29, stream shapes 88 → 90, typed failures
+  371 → 373, fixtures 495 → 499, schema fingerprints 459 → 463 (exporter, its test and
+  `tests/rpc_wire.rs`).
+
+**UI choices:**
+
+- **Toast.** `UiIntentNotifier` is mounted once outside the router, with one subscriber per
+  environment through the atom registry (no React state, so an intent re-renders nothing).
+  Copy: **Agent <label> wants to show** _a thread_, _files_ / _a file_, _Source Control_,
+  _the diff_ / _a file's diff_, with the thread title (and path) as the description and one
+  **Show** action. The toast's timeout is the intent's remaining time. An intent already
+  announced is never raised again in that window, also across remounts.
+- **Show** routes to the thread; for a chat panel it routes to the host and activates the
+  panel's tab, and opens right-panel surfaces on the host (files with a path open that file;
+  diff with a path selects it in Compare).
+- **Provenance.** `MessageProvenance` shows **From <panel title>** (or "From another thread"
+  when this client no longer has it) beside the **Agent · <label>** chip, as text.
+- **Panel tab chip.** A chat panel tab whose thread has a `requester` shows a small **Agent**
+  text badge (not a control, since it sits inside the tab's button; it has screen-reader text
+  naming the agent), and the tab's tooltip adds "Opened by Agent · <label>" and the purpose.
+  The tab bar has no environment, so the thread is found by id (`findThreadRef`); thread ids
+  are unique across environments.
+
+**Notes for X7** (adds `commitMessage` to `ui_intents_rpc.rs`):
+
+- Add the kind to `UiIntent` in `packages/contracts/src/uiIntents.ts` (the union already has
+  one member) and a `publish_commit_message` beside `publish_focus`, with its own retention
+  (last per `cwd`, 24 hours) in the same `pending` list or a second one; `pending()` feeds the
+  snapshot, so a panel opened later receives it.
+- `ui.publishIntent`'s input is `{ threadId, surface, path? }` today; give it a `kind`
+  discriminator (default `focus`) rather than a second method, or add
+  `ui.publishCommitMessage` if a separate scope or shape reads better, and move the counts.
+- `UiIntentNotifier` already skips any kind other than `focus`; the Source Control panel
+  folds `uiIntentsEnvironment.intents` for its own kind.
