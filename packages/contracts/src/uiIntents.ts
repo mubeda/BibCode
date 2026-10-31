@@ -45,6 +45,11 @@ export const UI_COMMIT_MESSAGE_MAX_LENGTH = 8_000;
 export const UiCommitMessageIntent = Schema.Struct({
   kind: Schema.Literal("commitMessage"),
   intentId: TrimmedNonEmptyString,
+  /**
+   * Rises with every commit message the server publishes (from the clock, so it keeps rising
+   * across a restart). A client keeps a folder's highest, whatever order they arrive in.
+   */
+  sequence: NonNegativeInt,
   threadId: ThreadId,
   /** The thread's folder, as the server resolved it. */
   cwd: TrimmedNonEmptyString,

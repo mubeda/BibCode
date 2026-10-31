@@ -18,7 +18,10 @@
 
 use std::{
     path::{Component, Path},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -70,6 +73,8 @@ struct Shared {
     pending: Mutex<Vec<Pending>>,
     /// The last `commitMessage` intent per folder, oldest first.
     messages: Mutex<Vec<Message>>,
+    /// The last `commitMessage` sequence, written only while `messages` is locked.
+    sequence: AtomicU64,
     published: broadcast::Sender<Value>,
 }
 
@@ -99,6 +104,7 @@ impl UiIntents {
             shared: Arc::new(Shared {
                 pending: Mutex::new(Vec::new()),
                 messages: Mutex::new(Vec::new()),
+                sequence: AtomicU64::new(0),
                 published: broadcast::channel(INTENT_CAPACITY).0,
             }),
         }
@@ -208,6 +214,11 @@ impl UiIntents {
     /// one, and returns it with the number of subscribed clients. It stays pending for
     /// [`COMMIT_MESSAGE_TTL`]; past [`MOST_COMMIT_MESSAGES`] folders the oldest is dropped. The
     /// caller has checked `message` ([`check_commit_message`]).
+    ///
+    /// Each one carries a `sequence` that rises with every publish: at least the clock in
+    /// milliseconds, so it keeps rising across a restart. The sequence is taken, the folder
+    /// updated and the intent broadcast under one lock, so concurrent publishers are announced
+    /// in the order the folder kept them, and a client keeps a folder's highest sequence.
     pub(crate) fn publish_commit_message(
         &self,
         thread_id: &str,
@@ -216,9 +227,19 @@ impl UiIntents {
         actor: Value,
     ) -> (Value, usize) {
         let now = time::OffsetDateTime::now_utc();
+        let mut messages = self.lock_messages();
+        let clock = u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
+        let sequence = self
+            .shared
+            .sequence
+            .load(Ordering::Relaxed)
+            .saturating_add(1)
+            .max(clock);
+        self.shared.sequence.store(sequence, Ordering::Relaxed);
         let intent = json!({
             "kind": "commitMessage",
             "intentId": Uuid::new_v4().to_string(),
+            "sequence": sequence,
             "threadId": thread_id,
             "cwd": cwd,
             "message": message,
@@ -226,19 +247,18 @@ impl UiIntents {
             "createdAt": iso(now),
             "expiresAt": iso(now + COMMIT_MESSAGE_TTL),
         });
-        {
-            let mut messages = self.lock_messages();
-            prune_messages(&mut messages);
-            messages.retain(|entry| entry.cwd != cwd);
-            messages.push(Message {
-                cwd: cwd.to_owned(),
-                expires: Instant::now() + COMMIT_MESSAGE_TTL,
-                intent: intent.clone(),
-            });
-            let excess = messages.len().saturating_sub(MOST_COMMIT_MESSAGES);
-            messages.drain(..excess);
-        }
+        prune_messages(&mut messages);
+        messages.retain(|entry| entry.cwd != cwd);
+        messages.push(Message {
+            cwd: cwd.to_owned(),
+            expires: Instant::now() + COMMIT_MESSAGE_TTL,
+            intent: intent.clone(),
+        });
+        let excess = messages.len().saturating_sub(MOST_COMMIT_MESSAGES);
+        messages.drain(..excess);
+        // Sending never waits, so it is done in the lock's order.
         let _ = self.shared.published.send(intent.clone());
+        drop(messages);
         (intent, self.shared.published.receiver_count())
     }
 
@@ -646,6 +666,52 @@ mod tests {
         let kept = messages(&intents);
         assert_eq!(kept.len(), MOST_COMMIT_MESSAGES);
         assert_eq!(kept[0]["cwd"], "/repo/1", "the oldest folder was dropped");
+    }
+
+    #[test]
+    fn interleaved_publishers_keep_and_announce_the_highest_sequence_last() {
+        let intents = UiIntents::new();
+        let mut stream = intents.subscribe();
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let intents = &intents;
+                scope.spawn(move || {
+                    for index in 0..25 {
+                        intents.publish_commit_message(
+                            "t1",
+                            "/repo",
+                            &format!("{writer}-{index}"),
+                            actor(),
+                        );
+                    }
+                });
+            }
+        });
+        let mut announced = Vec::new();
+        while let Ok(intent) = stream.try_recv() {
+            announced.push(intent["sequence"].as_u64().expect("a sequence"));
+        }
+        // Each publish has its own sequence, announced in the order the folder kept them.
+        // Fewer than the stream holds (128), so none is lost to lag.
+        assert_eq!(announced.len(), 4 * 25);
+        assert!(
+            announced.windows(2).all(|pair| pair[0] < pair[1]),
+            "{announced:?}"
+        );
+        let kept = messages(&intents);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["sequence"], *announced.last().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sequence_keeps_rising_across_a_restart() {
+        let before = UiIntents::new();
+        let (first, _) = before.publish_commit_message("t1", "/repo", "Before", actor());
+        // A restarted server starts from the clock, so its first sequence is still higher.
+        std::thread::sleep(Duration::from_millis(2));
+        let after = UiIntents::new();
+        let (second, _) = after.publish_commit_message("t1", "/repo", "After", actor());
+        assert!(second["sequence"].as_u64() > first["sequence"].as_u64());
     }
 
     #[test]
