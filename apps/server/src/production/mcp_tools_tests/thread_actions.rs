@@ -323,6 +323,19 @@ struct Rewinds {
     thread_id: String,
     cwd: PathBuf,
     elsewhere: PathBuf,
+    /// Runs in the provider rewind, after the revert was planned.
+    during_rewind: Option<Box<dyn Fn() -> BoxEffectFuture<'static, ()> + Send + Sync>>,
+}
+
+impl Rewinds {
+    fn new(thread_id: &str, cwd: &Path, elsewhere: &Path) -> Self {
+        Self {
+            thread_id: thread_id.to_owned(),
+            cwd: cwd.to_path_buf(),
+            elsewhere: elsewhere.to_path_buf(),
+            during_rewind: None,
+        }
+    }
 }
 
 impl OrchestrationEffectCallbacks for Rewinds {
@@ -345,7 +358,12 @@ impl OrchestrationEffectCallbacks for Rewinds {
         _turns: i64,
         _rewind_key: &'a str,
     ) -> BoxEffectFuture<'a, ProviderRewind> {
-        Box::pin(async { Ok(ProviderRewind::Rewound) })
+        Box::pin(async {
+            if let Some(during_rewind) = &self.during_rewind {
+                during_rewind().await?;
+            }
+            Ok(ProviderRewind::Rewound)
+        })
     }
 
     fn stop_provider<'a>(&'a self, _thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
@@ -432,11 +450,7 @@ async fn revert_thread_to_turn_restores_the_checkpoint_and_reports_failures() {
     let effects = OrchestrationEffects::start(
         harness.engine.clone(),
         Arc::new(crate::git::GitRepository::default()),
-        Arc::new(Rewinds {
-            thread_id: thread_id.clone(),
-            cwd: checkout.path().to_path_buf(),
-            elsewhere: elsewhere.path().to_path_buf(),
-        }),
+        Arc::new(Rewinds::new(&thread_id, checkout.path(), elsewhere.path())),
         EffectsOptions::default(),
     )
     .await
@@ -497,6 +511,94 @@ async fn revert_thread_to_turn_restores_the_checkpoint_and_reports_failures() {
         .await;
     assert_eq!(error_tag(&running), "McpTurnRunningError", "{running}");
 
+    effects.shutdown().await;
+    harness.shutdown().await;
+}
+
+/// Thread `thread_id`'s revert requests so far.
+async fn revert_requests(harness: &Harness, thread_id: &str) -> i64 {
+    let thread_id = thread_id.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM orchestration_events WHERE stream_id = ? AND event_type = 'thread.checkpoint-revert-requested'",
+                [thread_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+/// Each revert answers with its own outcome: one that finishes while a second waits behind it
+/// does not answer the second.
+#[tokio::test]
+async fn overlapping_reverts_each_get_their_own_outcome() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    let checkout = checkpointed_checkout(&harness, &thread_id).await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut rewinds = Rewinds::new(&thread_id, checkout.path(), elsewhere.path());
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    rewinds.during_rewind = Some(Box::new({
+        let (entered, release) = (entered.clone(), release.clone());
+        move || {
+            let (entered, release) = (entered.clone(), release.clone());
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        }
+    }));
+    let effects = OrchestrationEffects::start(
+        harness.engine.clone(),
+        Arc::new(crate::git::GitRepository::default()),
+        Arc::new(rewinds),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let first = harness.call(
+        &agent,
+        "revert_thread_to_turn",
+        json!({ "threadId": thread_id, "turnCount": 1 }),
+    );
+    // Asked while the first one rewinds, when turn 2 still has a checkpoint. Once the first has
+    // reverted to turn 1, the worker refuses it.
+    let second = async {
+        entered.notified().await;
+        harness
+            .call(
+                &agent,
+                "revert_thread_to_turn",
+                json!({ "threadId": thread_id, "turnCount": 2 }),
+            )
+            .await
+    };
+    let releaser = async {
+        while revert_requests(&harness, &thread_id).await < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        release.notify_one();
+    };
+    let (first, second, ()) = tokio::join!(first, second, releaser);
+    assert_eq!(structured(&first)["reverted"], true, "{first}");
+    assert_eq!(error_tag(&second), "McpCheckpointRevertError", "{second}");
+    assert!(
+        second["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds current turn count"),
+        "{second}"
+    );
     effects.shutdown().await;
     harness.shutdown().await;
 }
