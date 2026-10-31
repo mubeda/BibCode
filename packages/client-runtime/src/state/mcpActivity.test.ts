@@ -34,9 +34,7 @@ describe("applyMcpActivityEvent", () => {
 
     const active = applyMcpActivityEvent(added, {
       type: "active",
-      active: [
-        { clientId: "session-1", label: "Claude Code", lastCallAt: null, running: true },
-      ],
+      active: [{ clientId: "session-1", label: "Claude Code", lastCallAt: null, running: true }],
     });
     expect(active.rows).toBe(added.rows);
     expect(active.active[0]?.running).toBe(true);

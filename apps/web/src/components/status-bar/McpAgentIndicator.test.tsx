@@ -99,7 +99,9 @@ describe("McpAgentIndicator", () => {
 
   it("offers Hand back to the level it had once taken over", async () => {
     h.active = [{ clientId: "s-1", label: "Codex", lastCallAt: null, running: false }];
-    h.clients = [{ sessionId: "s-1", mcpAccess: "read-only", mcpAccessHandBack: "auto-accept-edits" }];
+    h.clients = [
+      { sessionId: "s-1", mcpAccess: "read-only", mcpAccessHandBack: "auto-accept-edits" },
+    ];
     const container = await render();
     expect(container.textContent).toContain("Taken over · Codex");
     await act(async () => button(container, "Hand back").click());

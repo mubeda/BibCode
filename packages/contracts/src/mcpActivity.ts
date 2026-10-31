@@ -66,12 +66,9 @@ export const McpActivityStreamEvent = Schema.Union([
 ]);
 export type McpActivityStreamEvent = typeof McpActivityStreamEvent.Type;
 
-export class McpActivityError extends Schema.TaggedError<McpActivityError>()(
-  "McpActivityError",
-  {
-    message: Schema.String,
-  },
-) {}
+export class McpActivityError extends Schema.TaggedError<McpActivityError>()("McpActivityError", {
+  message: Schema.String,
+}) {}
 
 /** How many rows the activity stream starts with. */
 export const MCP_ACTIVITY_RECENT_ROWS = 200;
