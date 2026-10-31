@@ -48,6 +48,20 @@ describe("transfer contracts", () => {
     ).toBe(1024);
   });
 
+  it("lets an upload mint bind overwrite, and leaves it unbound by default", () => {
+    expect(
+      decodeUploadInput({ cwd: "/repo", relativeDirectory: "", fileName: "a.txt" }).overwrite,
+    ).toBeUndefined();
+    expect(
+      decodeUploadInput({
+        cwd: "/repo",
+        relativeDirectory: "",
+        fileName: "a.txt",
+        overwrite: false,
+      }).overwrite,
+    ).toBe(false);
+  });
+
   it("requires the upload token to name one file", () => {
     // The token authorises exactly this name, so an absent or over-long name is refused before a
     // URL is ever minted.

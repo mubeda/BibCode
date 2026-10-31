@@ -24,6 +24,9 @@ export const ProjectCreateUploadUrlInput = Schema.Struct({
   // The one file the minted token authorises. The upload route takes the name from the token, so a
   // leaked URL can only write this file in this directory.
   fileName: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  // Binds whether the upload may replace an existing file into the token. Absent, the upload route
+  // decides by its `?overwrite=1`; bound to false, it refuses that flag.
+  overwrite: Schema.optional(Schema.Boolean),
 });
 export type ProjectCreateUploadUrlInput = typeof ProjectCreateUploadUrlInput.Type;
 

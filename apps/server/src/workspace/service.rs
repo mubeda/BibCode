@@ -678,7 +678,7 @@ impl WorkspaceService {
             place
                 .folder(false)?
                 .checked_path(&place.name)
-                .map_err(|error| place.fault("trash", error))
+                .map_err(|error| place.fault("open", error))
         })
         .await?;
         trash

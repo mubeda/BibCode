@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ProjectCreateEntryError,
   ProjectDeleteEntryError,
+  ProjectDeleteEntryInput,
   ProjectDuplicateEntryError,
   ProjectFileVersion,
   ProjectListEntriesInput,
@@ -23,6 +24,7 @@ const decodeListError = Schema.decodeUnknownSync(ProjectListEntriesError);
 const decodeCreateError = Schema.decodeUnknownSync(ProjectCreateEntryError);
 const decodeRenameError = Schema.decodeUnknownSync(ProjectRenameEntryError);
 const decodeDeleteError = Schema.decodeUnknownSync(ProjectDeleteEntryError);
+const decodeDeleteInput = Schema.decodeUnknownSync(ProjectDeleteEntryInput);
 const decodeDuplicateError = Schema.decodeUnknownSync(ProjectDuplicateEntryError);
 const decodeSearchError = Schema.decodeUnknownSync(ProjectSearchEntriesError);
 const decodeWriteError = Schema.decodeUnknownSync(ProjectWriteFileError);
@@ -117,6 +119,30 @@ describe("project RPC inputs", () => {
 
   it.each(["true", 1, null])("rejects the invalid refresh value %s", (refresh) => {
     expect(() => decodeListEntriesInput({ cwd: "/workspace", refresh })).toThrow();
+  });
+
+  it("deletes permanently unless a delete asks for the trash", () => {
+    expect(decodeDeleteInput({ cwd: "/workspace", relativePath: "a.txt" })).not.toHaveProperty(
+      "toTrash",
+    );
+    expect(
+      decodeDeleteInput({ cwd: "/workspace", relativePath: "a.txt", toTrash: true }).toTrash,
+    ).toBe(true);
+    expect(() =>
+      decodeDeleteInput({ cwd: "/workspace", relativePath: "a.txt", toTrash: "yes" }),
+    ).toThrow();
+  });
+
+  it("names a trash that could not take an entry", () => {
+    expect(
+      decodeDeleteError({
+        _tag: "ProjectDeleteEntryError",
+        cwd: "/workspace",
+        relativePath: "a.txt",
+        failure: "trash_unavailable",
+        message: "The system trash could not take it; it was left in place.",
+      }).failure,
+    ).toBe("trash_unavailable");
   });
 });
 
