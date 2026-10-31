@@ -643,8 +643,9 @@ application surface. Its unary methods are:
 server's trash. These refuse the whole call before anything moves:
 
 - a path whose folder resolves outside the checkout;
-- a path that starts with `.git` in any case. `validate_pathspecs` refuses this for
-  stage, unstage, stash and discard alike;
+- a path with a `.git` component in any case, anywhere in the path
+  (`git::names_git_metadata`). `validate_pathspecs` refuses this for stage, unstage,
+  stash and discard alike, and the Files tools share the predicate;
 - a path that resolves into, or holds, the Git directory or common directory.
 
 On macOS and Linux the trash takes a path and resolves it later, so each entry is
@@ -3721,6 +3722,20 @@ them, and can move, swap or write anything there at any moment.
   POSIX has no compare-and-swap on file contents, so a write between a guarded write's check
   and its write lands and is then overwritten. This is a documented residual.
 
+- **Git's own metadata.** Neither the Files tools nor the Files panel reach it: changing
+  `.git/config` or a hook would let an agent run a command through Git as the server's user.
+  `workspace::paths` refuses (`WorkspaceError::GitMetadata`, `git_metadata`) a target with a
+  `.git` component in any case (`git::names_git_metadata`, shared with `validate_pathspecs`),
+  checked lexically first and again on the canonical target, so a symlink into `.git` is
+  caught; and a canonical target in, or holding, the Git directory or common directory that a
+  `.git` file names below the root (`git::checkout_git_dirs`, read from the file system, no
+  `git` process; the workspace trash's holder uses it too). `canonical_existing_within`,
+  `safe_mutation_target` and `Place::new` all apply it, so every service operation, both
+  transfer mints and both transfer routes get it. Only a rename or delete of a symlink that
+  points into `.git` passes: it acts on the link. The `files_*` tools also refuse a `.git`
+  component up front (`McpInvalidArgumentError`) and map `git_metadata` to that tag. The
+  search index, which lists and searches for the panel and the tools, and the folder archive
+  skip every `.git` entry.
 - **Containment.** Paths pass `validate_paths` (C5) first. The workspace service then
   resolves the target's folder canonically and opens it from the canonical root one
   component at a time with `O_DIRECTORY | O_NOFOLLOW`, acting on the entry by name through

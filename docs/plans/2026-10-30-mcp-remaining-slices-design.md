@@ -5388,6 +5388,59 @@ with a test that failed first (all three confirmed by disabling the fix):
 - **Not closed:** the residual of (a): each of these checks still leaves the one system call
   after it.
 
+**Review round 6 (e2e, 2026-10-31).** The live end-to-end run found a P1: on a thread in a
+Git repository, `files_write {path: ".git/hooks/post-commit", createOnly: true}` created the
+hook, `files_read {path: ".git/config"}` returned the config and its version, and
+`files_delete` removed the hook. An agent with only the Files set could set
+`core.fsmonitor` or `core.hooksPath` and have Git run a command as the server's user on the
+next `git status`, with Terminals off and the ceiling at Supervised. Fixed on
+`claude/v0131-139-x5-git`, with tests that failed first (confirmed by disabling the
+predicate and the Git-directory check):
+
+- **One predicate, G's.** `git::names_git_metadata` (any component equal to `.git`, ignoring
+  case) now backs `validate_pathspecs` too. That makes G's check any-component instead of
+  first-component: a submodule's `sub/.git` file is a `gitdir:` link, and rewriting it would
+  point Git's submodule recursion at a folder an agent controls. Nothing legitimate discards
+  or stages a nested `.git`.
+- **The workspace refuses it for every caller.** `workspace::paths::refuse_git_metadata`
+  (`WorkspaceError::GitMetadata`, wire `git_metadata`) runs in `canonical_existing_within`
+  and `safe_mutation_target` (lexically first, then on the canonical target, which catches
+  `gitlink -> .git`) and in `Place::new`. It also refuses a canonical target in, or holding,
+  the Git directory or common directory a `.git` file names below the root
+  (`git::checkout_git_dirs`). The coordinator suggested reusing G's resolution: G's is
+  `git rev-parse` (`resolve_watch_roots`), a process per call, so the workspace reads the
+  `.git` entry and `commondir` the way Git does instead, and the trash holder now uses the
+  same function instead of its own parsing. A Git directory outside the root is already
+  outside containment. The upload mint and route check the folder and the file name
+  (a `.git` file is a `gitdir:` link), the download mint and route check the path, and the
+  transfer failure gains `git_metadata`.
+- **The tools refuse it as an argument.** `checked_path` and `files_upload`'s `fileName`
+  refuse a `.git` component up front, and a `git_metadata` answer from the workspace (a
+  symlink into `.git`) becomes `McpInvalidArgumentError` with a message that names the path
+  and points to the `git_*` tools. No new tag, so `feed::ERRORS` is unchanged.
+- **Listing, search and downloads.** The search index never inserts a path with a `.git`
+  component (it skipped only a root-level, lower-case `.git` before), and a folder's zip
+  leaves `.git` entries out; neither fails the call.
+- **The Files panel.** It lists through the same index, which already hid the root `.git`,
+  so refusing `.git` there changes nothing a person sees; a person's own Git work goes
+  through Source Control. Chosen: hide and refuse in the panel too.
+- **Allowed:** `.gitignore`, `.github/` and other names that only start with `.git`; renaming
+  or deleting a symlink that points into `.git` (only the link changes).
+- Tests: `no_files_tool_reads_or_changes_gits_own_metadata` (MCP, against a `git init`
+  folder: write, read, create, delete, rename into and out of, download and upload of
+  `.git/...`, `.GIT/config`, `./.git/HEAD`, `.git/`, and `gitlink/...`; `.gitignore` and
+  `.github/` still work; the listing has no `.git` entry),
+  `the_service_never_reads_or_changes_gits_own_metadata` (the panel's service),
+  `gits_own_metadata_is_refused_however_it_is_reached`,
+  `a_git_directory_a_git_file_names_inside_the_root_is_refused`,
+  `the_index_never_lists_gits_own_metadata`, `a_folder_download_leaves_out_gits_own_metadata`.
+- **Contracts:** `git_metadata` in `ProjectFileFailure` and `ProjectTransferError.failure`;
+  RPC wire fixtures regenerated.
+- **Residual:** a folder that the Git configuration names some other way (`GIT_DIR` in the
+  server's environment, `core.worktree`) is not recognized. A `.git` file whose `gitdir:` names
+  a folder inside the root is only covered while that `.git` file exists, and an agent cannot
+  create or change one.
+
 **Z follow-up fixes** (`claude/v0131-139-zfix`, 2026-10-31). Each gap above was checked and
 fixed with a failing-first test, one commit each, and the reference updated to match:
 
