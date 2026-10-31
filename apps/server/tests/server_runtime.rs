@@ -1298,6 +1298,7 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/auth/pairing-links/revoke"),
         ("GET", "/api/auth/clients"),
         ("POST", "/api/auth/clients/revoke"),
+        ("POST", "/api/auth/clients/mcp-access"),
         ("POST", "/api/auth/clients/revoke-others"),
         ("GET", "/api/orchestration/snapshot"),
         ("POST", "/api/orchestration/dispatch"),

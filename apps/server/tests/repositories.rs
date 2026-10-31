@@ -425,6 +425,7 @@ fn public_repository_api_inventory_is_explicit() {
         "revoke_pending_auth_sessions",
         "revoke_other_auth_sessions",
         "set_auth_session_last_connected_at",
+        "set_auth_session_mcp_access",
         "upsert_activity",
         "upsert_checkpoint",
         "upsert_checkpoint_diff_blob",
