@@ -65,6 +65,11 @@ export const WebhookEndpoint = Schema.Struct({
   disabledReason: Schema.NullOr(WebhookDisabledReason),
   pendingDeliveries: NonNegativeInt,
   lastDeliveryState: Schema.NullOr(WebhookDeliveryState),
+  /**
+   * Deliveries in the log that were dropped because 10,000 were already waiting. The next
+   * delivery to the endpoint names them (`dropped`) so the receiver can catch up.
+   */
+  droppedDeliveries: NonNegativeInt,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -80,8 +85,9 @@ export const WebhookDelivery = Schema.Struct({
   lastStatus: Schema.NullOr(Schema.Int),
   /**
    * Why the last attempt failed: `status` (see `lastStatus`), `timeout`, `connect`,
-   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `redirect`, `cancelled`, `queue_full`
-   * or `interrupted`.
+   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `redirect`, `cancelled`,
+   * `queue_full` (dropped: the queue was full), `endpoint_changed` (dropped: the endpoint's
+   * URL or filters changed while it waited) or `interrupted`.
    */
   lastError: Schema.NullOr(Schema.String),
   latencyMs: Schema.NullOr(NonNegativeInt),
@@ -151,8 +157,8 @@ export type WebhooksSendResult = typeof WebhooksSendResult.Type;
 
 export class WebhookError extends Schema.TaggedError<WebhookError>()("WebhookError", {
   /**
-   * `invalid`, `not_found`, `limit` (20 endpoints), `webhooks_off`, `endpoint_disabled` or
-   * `storage`.
+   * `invalid`, `not_found`, `limit` (20 endpoints), `webhooks_off`, `endpoint_disabled`,
+   * `queued` (a redelivery of a delivery still queued or being sent) or `storage`.
    */
   reason: Schema.Literals([
     "invalid",
@@ -160,6 +166,7 @@ export class WebhookError extends Schema.TaggedError<WebhookError>()("WebhookErr
     "limit",
     "webhooks_off",
     "endpoint_disabled",
+    "queued",
     "storage",
   ]),
   message: Schema.String,
