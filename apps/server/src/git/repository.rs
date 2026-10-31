@@ -77,6 +77,8 @@ struct GitExecutionOptions {
 struct GitExecutionInput {
     environment: Vec<(OsString, OsString)>,
     stdin: Option<Vec<u8>>,
+    /// Variables taken out of the inherited environment (an agent clone's).
+    removed: &'static [&'static str],
 }
 
 struct RewriteTempFiles {
@@ -104,6 +106,19 @@ pub(crate) trait GitProcessRunner: Send + Sync {
         request: ProcessRequest,
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a>;
+
+    /// [`Self::run`] with the variables `removed` names taken out of the inherited
+    /// environment (an agent clone's, `clone_policy`). A runner that starts no process
+    /// inherits nothing, so the default ignores them.
+    fn run_without_inherited<'a>(
+        &'a self,
+        request: ProcessRequest,
+        removed: &'static [&'static str],
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        let _ = removed;
+        self.run(request, cancellation)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,6 +141,20 @@ impl GitProcessRunner for ProcessRunner {
         cancellation: &'a CancellationToken,
     ) -> BoxGitProcessFuture<'a> {
         Box::pin(ProcessRunner::run(self, request, cancellation))
+    }
+
+    fn run_without_inherited<'a>(
+        &'a self,
+        request: ProcessRequest,
+        removed: &'static [&'static str],
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner::run_without_inherited(
+            self,
+            request,
+            removed,
+            cancellation,
+        ))
     }
 }
 
@@ -490,6 +519,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment: git_environment(),
                 stdin: Some(stdin),
+                removed: &[],
             },
             cancellation,
         )
@@ -536,6 +566,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment,
                 stdin: None,
+                removed: &[],
             },
             cancellation,
         )
@@ -558,25 +589,27 @@ impl GitRepository {
             .chain(args.iter().map(OsString::from))
             .collect::<Vec<_>>();
         let argument_count = args.len();
-        self.runner
-            .run(
-                ProcessRequest {
-                    operation: operation.to_owned(),
-                    command: PathBuf::from("git"),
-                    args,
-                    cwd: cwd.to_path_buf(),
-                    env: input.environment,
-                    stdin: input.stdin,
-                    timeout: self.command_timeout,
-                    max_output_bytes: options.max_output_bytes,
-                    output_policy: options.output_policy,
-                    append_truncation_marker: false,
-                    allow_non_zero_exit: options.allow_non_zero_exit,
-                },
-                cancellation,
-            )
-            .await
-            .map_err(|error| git_error(operation, cwd, argument_count, error))
+        let request = ProcessRequest {
+            operation: operation.to_owned(),
+            command: PathBuf::from("git"),
+            args,
+            cwd: cwd.to_path_buf(),
+            env: input.environment,
+            stdin: input.stdin,
+            timeout: self.command_timeout,
+            max_output_bytes: options.max_output_bytes,
+            output_policy: options.output_policy,
+            append_truncation_marker: false,
+            allow_non_zero_exit: options.allow_non_zero_exit,
+        };
+        let output = if input.removed.is_empty() {
+            self.runner.run(request, cancellation).await
+        } else {
+            self.runner
+                .run_without_inherited(request, input.removed, cancellation)
+                .await
+        };
+        output.map_err(|error| git_error(operation, cwd, argument_count, error))
     }
 
     pub(crate) async fn git_manager_resolve_tips(
@@ -629,6 +662,7 @@ impl GitRepository {
             GitExecutionInput {
                 environment: git_read_environment(),
                 stdin: Some(stdin),
+                removed: &[],
             },
             cancellation,
         )
@@ -5223,12 +5257,13 @@ impl GitRepository {
         cwd: &Path,
         url: &str,
         environment: Vec<(OsString, OsString)>,
+        removed: &'static [&'static str],
         cancellation: &CancellationToken,
     ) -> Result<String, GitCommandError> {
         let mut command_environment = git_read_environment();
         command_environment.extend(environment);
         let output = self
-            .execute_with_environment(
+            .execute_with_environment_and_stdin(
                 "GitVcsDriver.cloneRemoteUrl",
                 cwd,
                 &[
@@ -5242,7 +5277,11 @@ impl GitRepository {
                     max_output_bytes: 64 * 1024,
                     output_policy: OutputPolicy::Error,
                 },
-                command_environment,
+                GitExecutionInput {
+                    environment: command_environment,
+                    stdin: None,
+                    removed,
+                },
                 cancellation,
             )
             .await?;
@@ -7446,8 +7485,10 @@ impl ReservedClone {
         if let Some(plan) = plan {
             environment.extend(plan.environment().iter().cloned());
         }
+        // A person's clone keeps the server's inherited environment.
+        let removed = plan.map_or(&[][..], ClonePlan::removed_environment);
         self.repository
-            .execute_with_environment(
+            .execute_with_environment_and_stdin(
                 CLONE_OPERATION,
                 &self.parent_dir,
                 &args,
@@ -7456,7 +7497,11 @@ impl ReservedClone {
                     max_output_bytes: DEFAULT_OUTPUT_LIMIT,
                     output_policy: OutputPolicy::Truncate,
                 },
-                environment,
+                GitExecutionInput {
+                    environment,
+                    stdin: None,
+                    removed,
+                },
                 cancellation,
             )
             .await
