@@ -16,6 +16,12 @@ export const McpClientRegistration = Schema.Struct({
   client: McpClientId,
   installed: Schema.Boolean,
   registered: Schema.Boolean,
+  /**
+   * Whether the entry runs this server's launch command: `false` after the app moved or the
+   * data root changed, `null` when it is not registered or the tool's entry cannot be read
+   * back. Settings offers Update for anything but `true`.
+   */
+  upToDate: Schema.NullOr(Schema.Boolean),
   /** Why the tool's configuration could not be read; `registered` is then unknown. */
   error: Schema.NullOr(Schema.String),
 });

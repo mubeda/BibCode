@@ -27,10 +27,17 @@ BiBCode adds itself on the computer the selected environment runs on, which is w
 agent has to run: for a remote environment, the tools on that host, not this computer. It
 uses the tool's own command where there is one (`claude mcp add --scope user`,
 `codex mcp add`) and otherwise changes only the `bibcode` entry of the tool's user config
-(`~/.cursor/mcp.json`, `~/.config/opencode/opencode.json`), keeping everything else in the
-file. A config file that is not plain JSON (for example one with comments) is left
-unchanged, and the line says so. A tool BiBCode cannot find on that host shows its button
-disabled with the reason. Adding again replaces the entry with the current command.
+(`~/.cursor/mcp.json`, OpenCode's `opencode.json`, or its `opencode.jsonc` when that already
+holds the entry), keeping everything else in the file. A config file that is not plain JSON
+(for example one with comments) is left unchanged, and the line says so; so is a config file
+that is a link to somewhere outside the tool's own folder. If another app saves the file
+while BiBCode is changing it, BiBCode reads it again rather than overwriting that save. A
+tool BiBCode cannot find on that host shows its button disabled with the reason.
+
+When an entry runs another command, for example after the app moved or its data folder
+changed, the line reads "Added to … (out of date)" with **Update**, which replaces the entry
+with the current command. If replacing a Claude Code entry fails, BiBCode puts the previous
+one back, or tells you what it removed and how to add it again.
 
 **Other MCP clients** (collapsed) holds the command and the standard `mcpServers` JSON for
 any other tool, with **Copy command** and **Copy MCP config**. They name the right

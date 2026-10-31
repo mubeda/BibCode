@@ -171,6 +171,7 @@ vi.mock("~/state/mcpClients", () => ({
         client,
         installed: client !== "cursor",
         registered: false,
+        upToDate: null,
         error: null,
       })),
     },

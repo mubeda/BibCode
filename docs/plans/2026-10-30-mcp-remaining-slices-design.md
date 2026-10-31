@@ -5702,3 +5702,47 @@ stays a separate row.
   not hidden, so the person learns why BiBCode cannot add itself there.
 - _Copy fallback kept._ Other MCP clients (Cursor, editors) have no CLI to call, so the
   command and the JSON stay available, collapsed.
+
+### Connect an agent: review round 2 (2026-10-31)
+
+Codex confirmed that the launch command never comes from the client, the scopes, that no MCP
+or provider credential reaches the methods, and the supervised runner and timeouts. It found
+five P2s, each now covered by a test that fails without its fix:
+
+- **OpenCode reads both `opencode.json` and `opencode.jsonc`.** Add wrote `opencode.json`
+  while an old `mcp.bibcode` in `opencode.jsonc` could still win (anomalyco/opencode#32447).
+  Every file OpenCode reads is now looked at, `.jsonc` through a read-only JSONC reader. A
+  change goes to the file that already holds `bibcode` (each, if both do), else to the first
+  that exists, else to a new `opencode.json`. A target with comments or trailing commas is
+  refused, naming that file. Test:
+  `opencode_changes_the_file_that_holds_the_entry_and_refuses_one_with_comments`.
+- **"Added" did not check the command.** The read now compares the stored command with this
+  server's launch argv: `upToDate` is `true`, `false` (after the app moved or the data root
+  changed) or `null` (the entry cannot be read back: `claude mcp get` lines without
+  `Command:`, `codex mcp get bibcode --json` that does not parse). Claude Code prints
+  `Command:` and the arguments joined by spaces, so the comparison is on the joined line.
+  Settings shows "Added to Codex (out of date)" or "…couldn't check which command it runs"
+  with **Update** (the same request as Add) next to **Remove**. Tests:
+  `an_entry_for_another_command_is_out_of_date_until_updated`,
+  `an_entry_that_cannot_be_read_back_is_registered_with_an_unknown_command`, and the web
+  test "offers Update for an entry that runs another command".
+- **Concurrent config edits.** A change keeps each file's bytes and modification time from
+  the read and checks them again just before the rename; if another program saved it
+  meanwhile, the change is redone from a fresh read, up to three times, then refused ("kept
+  changing while BiBCode was saving it"). BiBCode's own changes to one tool's files run one at
+  a time under a per-path lock. Tests:
+  `a_config_saved_by_another_program_meanwhile_is_read_again_not_overwritten`,
+  `concurrent_changes_by_bibcode_all_land`.
+- **Config symlinks.** A link whose target is outside the tool's folder (a dotfiles checkout)
+  is refused, naming both. Inside it, the target is replaced and the link kept; the new file
+  takes the old one's mode and owner. Extended attributes and ACLs are not kept, as for any
+  replaced file; writing in place would keep them but lose atomicity, so the smaller safe
+  option is the rename. Test: `a_linked_config_is_changed_only_inside_the_tools_folder`.
+- **A failed Claude replacement lost the entry.** The entry is read before it is removed;
+  if the new add fails, the old command is added back, and the message says so. Claude Code
+  joins arguments with spaces, so the old command is split back as `mcp` then
+  `--flag value` pairs (a value may hold spaces) and only when it joins back to the same
+  line. When it cannot be put back, the message names the removed command and how to add
+  BiBCode again. Codex's `mcp add` overwrites (`codex-rs/cli/src/mcp_cmd.rs` inserts by
+  name), so Codex never removes. Tests: `a_failed_claude_replacement_puts_the_previous_entry_back`,
+  `a_replacement_that_cannot_restore_says_what_was_removed_and_how_to_add_it`.

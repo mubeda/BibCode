@@ -141,12 +141,17 @@ tools:
 | Tool        | How BiBCode adds `bibcode`                                                                            |
 | ----------- | ----------------------------------------------------------------------------------------------------- |
 | Claude Code | `claude mcp add --scope user bibcode -- <command>` (read with `claude mcp get bibcode`)               |
-| Codex       | `codex mcp add bibcode -- <command>` (read with `codex mcp get bibcode`)                              |
+| Codex       | `codex mcp add bibcode -- <command>` (read with `codex mcp get bibcode --json`)                       |
 | Cursor      | the `mcpServers.bibcode` entry of `~/.cursor/mcp.json` (`command`, `args`)                            |
 | OpenCode    | the `mcp.bibcode` entry of `~/.config/opencode/opencode.json` (`type: "local"`, `command`, `enabled`) |
 
-**Remove** runs the tool's `mcp remove bibcode` or deletes only that entry. A config file that
-is not plain JSON is refused unchanged. These are the `mcpClients.*` RPC methods, which need
+OpenCode reads `opencode.json` and `opencode.jsonc` together, so both are checked and a
+change goes to the file that already holds `bibcode`. **Remove** runs the tool's
+`mcp remove bibcode` or deletes only that entry. A config file that is not plain JSON, or a
+link to a file outside the tool's folder, is refused unchanged; a file another program saves
+during the change is read again instead of overwritten. Each entry's command is compared with
+the environment's launch command, and an entry that differs shows as out of date with
+**Update**. These are the `mcpClients.*` RPC methods, which need
 `access:read` and `access:write`: an agent's own credential cannot call them. **Other MCP
 clients** shows the command and the `mcpServers` JSON to copy. A Windows update ends a
 desktop-hosted `mcp` process with the app; restart the MCP server in the agent.

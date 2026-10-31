@@ -139,6 +139,7 @@ vi.mock("../../state/use-atom-command", () => ({
           client: value.input.client,
           installed: true,
           registered: command === "register",
+          upToDate: command === "register" ? true : null,
           error: null,
         },
       });
@@ -264,7 +265,7 @@ function registration(
   client: (typeof ALL_CLIENTS)[number],
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return { client, installed: true, registered: false, error: null, ...overrides };
+  return { client, installed: true, registered: false, upToDate: null, error: null, ...overrides };
 }
 
 function buttonNamed(container: HTMLElement, text: string): HTMLButtonElement | undefined {
@@ -476,7 +477,7 @@ describe("AgentIntegrationsSection", () => {
       h.registrations = {
         clients: [
           registration("claude"),
-          registration("codex", { registered: true }),
+          registration("codex", { registered: true, upToDate: true }),
           registration("cursor"),
           registration("opencode"),
         ],
@@ -518,7 +519,10 @@ describe("AgentIntegrationsSection", () => {
       const busy = buttonNamed(clientLine(container, "Cursor"), "Adding…")!;
       expect(busy.disabled).toBe(true);
       await act(async () =>
-        finish({ _tag: "Success", value: registration("cursor", { registered: true }) }),
+        finish({
+          _tag: "Success",
+          value: registration("cursor", { registered: true, upToDate: true }),
+        }),
       );
       h.commandResult = null;
       await act(async () => buttonNamed(clientLine(container, "Cursor"), "Remove")!.click());
@@ -528,6 +532,35 @@ describe("AgentIntegrationsSection", () => {
         input: { client: "cursor" },
       });
       expect(buttonNamed(clientLine(container, "Cursor"), "Add to Cursor")).toBeDefined();
+    });
+
+    it("offers Update for an entry that runs another command, then shows it current", async () => {
+      h.registrations = {
+        clients: [
+          registration("claude"),
+          registration("codex", { registered: true, upToDate: false }),
+          registration("cursor", { registered: true, upToDate: null }),
+          registration("opencode"),
+        ],
+      };
+      const container = await render();
+      const codex = clientLine(container, "Codex");
+      expect(codex.textContent).toContain("Added to Codex (out of date)");
+      expect(buttonNamed(codex, "Remove")).toBeDefined();
+      expect(clientLine(container, "Cursor").textContent).toContain(
+        "Added to Cursor. BiBCode couldn't check which command it runs.",
+      );
+      expect(buttonNamed(clientLine(container, "Cursor"), "Update")).toBeDefined();
+
+      await act(async () => buttonNamed(codex, "Update")!.click());
+      expect(h.commands).toEqual([
+        { command: "register", environmentId: "local", input: { client: "codex" } },
+      ]);
+      const updated = clientLine(container, "Codex");
+      expect(updated.textContent).toContain("Added to Codex");
+      expect(updated.textContent).not.toContain("out of date");
+      expect(buttonNamed(updated, "Update")).toBeUndefined();
+      expect(buttonNamed(updated, "Remove")).toBeDefined();
     });
 
     it("disables a tool that is not installed and says where it is missing", async () => {
