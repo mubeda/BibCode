@@ -2666,11 +2666,17 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md))
   oldest first, at most eight endpoints at once; retries after 30 s, 2, 5, 10 and 15
   minutes on a timeout, connection error, unresolved host, 5xx or 429; 10 failed
   deliveries in a row disable the endpoint; at most 10,000 pending, oldest abandoned
-  past that (`queue_full`), recorded per endpoint in `webhook_state` and announced as
-  `dropped` on its next delivery; finished rows kept 7 days, 1,000 per endpoint. The
-  loop sleeps until the earliest due head of an endpoint with nothing in flight, or the
-  poll. A new URL, project or event list abandons the endpoint's queue
-  (`endpoint_changed`); a redelivery of a queued delivery is refused.
+  past that (`queue_full`), recorded per endpoint in `webhook_state` as numbered drop
+  batches, announced as `dropped` on its next delivery and acknowledged batch by batch
+  by a 2xx; finished rows kept 7 days, 1,000 per endpoint. A slot goes only to an
+  endpoint whose send lock is free (a test event or redelivery holding it wakes the
+  loop when done); with every slot taken the loop waits for a completion, otherwise
+  until the earliest due head of an endpoint that is free, or the poll. A new URL,
+  project or event list abandons the endpoint's queue (`endpoint_changed`) in its
+  transaction; the enqueue drops a delivery chosen under other settings (a fence on
+  the URL, project and event list, checked in the enqueue's transaction), and the
+  dispatcher re-reads a picked row under the endpoint's lock and token before sending.
+  A redelivery of a queued delivery is refused.
 - **Outbound trust boundary.** HTTPS only; every resolved address must be public by
   `git::clone_policy::is_public` (shared with agent clones); the client connects to
   the checked addresses only (reqwest's resolve override, every other name refused),
