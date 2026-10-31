@@ -15,13 +15,13 @@
 //! - **Git's own rewrites first.** `git ls-remote --get-url` expands `url.<base>.insteadOf`
 //!   without contacting the remote; the expanded URL must pass the same checks.
 //! - **Resolved, checked, pinned.** Every address of each host must be public, and
-//!   `http.curloptResolve` pins curl to those addresses, so DNS cannot move the host after the
-//!   check. Redirects are not followed, and `protocol.allow` admits HTTPS alone, also through
+//!   `http.curloptResolve` pins curl to the first of them, so DNS cannot move the host after
+//!   the check. Redirects are not followed, and `protocol.allow` admits HTTPS alone, also through
 //!   `GIT_ALLOW_PROTOCOL`, which a rewrite to `file:` or `ext::` meets too.
 //! - **LFS smudge off.** A repository's `.lfsconfig` can point `lfs.url` at any host, and the
 //!   smudge filter downloads from it outside Git's protocol and curl settings, so agent clones
 //!   run with `GIT_LFS_SKIP_SMUDGE=1` and an empty, optional `lfs` filter: LFS files stay
-//!   pointer files.
+//!   pointer files. Submodules are not cloned (`submodule.recurse=false`).
 //!
 //! A configured HTTP proxy resolves the name itself, so behind one the check covers the local
 //! answer only (a stated residual risk).
@@ -353,6 +353,8 @@ impl ClonePolicy {
                 "filter.lfs.smudge=",
                 "filter.lfs.process=",
                 "filter.lfs.required=false",
+                // Never into submodules, whose hosts this policy has not checked.
+                "submodule.recurse=false",
             ])
             .flat_map(|setting| ["-c".to_owned(), setting.to_owned()])
             .collect();
@@ -365,15 +367,13 @@ impl ClonePolicy {
                 .addresses(&target, cancellation)
                 .await
                 .map_err(refused)?;
-            if let Host::Domain(name) = &target.host {
-                let pinned = addresses
-                    .iter()
-                    .map(|address| match address {
-                        IpAddr::V4(address) => address.to_string(),
-                        IpAddr::V6(address) => format!("[{address}]"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
+            // One address: curl before 7.59 skips a comma list it cannot parse, and would then
+            // resolve the name again.
+            if let (Host::Domain(name), Some(address)) = (&target.host, addresses.first()) {
+                let pinned = match address {
+                    IpAddr::V4(address) => address.to_string(),
+                    IpAddr::V6(address) => format!("[{address}]"),
+                };
                 arguments.push("-c".to_owned());
                 arguments.push(format!(
                     "http.curloptResolve={name}:{}:{pinned}",
@@ -616,7 +616,8 @@ pub(crate) mod tests {
             "filter.lfs.smudge=",
             "filter.lfs.process=",
             "filter.lfs.required=false",
-            "http.curloptResolve=github.com:443:140.82.112.3,[2606:4700::1111]",
+            "submodule.recurse=false",
+            "http.curloptResolve=github.com:443:140.82.112.3",
         ] {
             assert!(settings.contains(&expected), "{expected} in {settings:?}");
         }
@@ -628,6 +629,15 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert!(environment.contains(&("GIT_LFS_SKIP_SMUDGE", "1")));
         assert!(environment.contains(&("GIT_ALLOW_PROTOCOL", "https")));
+
+        let policy = ClonePolicy::new(resolver(&[("v6.example.com", "2606:4700::1111")]));
+        let v6 = super::tests::plan(&policy, "https://v6.example.com/owner/repo.git")
+            .await
+            .expect("a public host");
+        assert!(
+            v6.arguments()
+                .contains(&"http.curloptResolve=v6.example.com:443:[2606:4700::1111]".to_owned())
+        );
     }
 
     #[tokio::test]

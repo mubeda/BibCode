@@ -4369,8 +4369,11 @@ migration, RPC method, scope or `latency.rs` entry changed.
   policy resolves and pins is exactly the host curl uses (curl lowercases host cache ids,
   so the parser's lowercase host matches). Both the original and the `insteadOf`-rewritten
   host are checked and pinned, so a rewrite that only `ls-remote` or only `clone` applied
-  still meets a pinned, public host. Every resolved address is pinned
-  (`host:port:a,[b]`); an IP-literal host needs no pin.
+  still meets a pinned, public host. Every resolved address must be public, and the first
+  is pinned (`host:port:a`, IPv6 in brackets): curl before 7.59 skips a comma-separated
+  list it cannot parse and would resolve the name again. An IP-literal host needs no pin.
+- **`submodule.recurse=false`** is set too, so no submodule host the policy did not check
+  is contacted, whatever the person's configuration says.
 - **`GIT_ALLOW_PROTOCOL=https`** is set beside `protocol.allow=never`, since Git lets the
   variable override the configuration.
 - **Addresses** are checked by hand (CGNAT, unique-local and the IPv4-compatible `::/96` are
