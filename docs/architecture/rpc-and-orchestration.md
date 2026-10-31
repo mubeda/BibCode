@@ -3699,6 +3699,18 @@ waits on that unpinned clone.
 | `files_download` | `projects.createDownloadUrl`, on the transfer base                           | read    |
 | `files_upload`   | `projects.createUploadUrl` with `overwrite` bound, on the transfer base      | operate |
 
+**Threat model.** Other processes work in the same folder, the provider's own agent among
+them, and can move, swap or write anything there at any moment.
+
+- (a) **Containment, guaranteed.** No operation touches anything outside the workspace or
+  follows a swapped link, whatever any concurrent process does.
+- (b) **BiBCode's own writers are serialized, guaranteed.** An agent's `files_*` call and a
+  person's Files-panel save or upload of the same path never race: both go through this
+  server and take the same per-path lock.
+- (c) **Not guaranteed:** atomicity against an editor outside BiBCode writing the same file.
+  POSIX has no compare-and-swap on file contents, so a write between a guarded write's check
+  and its write lands and is then overwritten. This is a documented residual.
+
 - **Containment.** Paths pass `validate_paths` (C5) first. The workspace service then
   resolves the target's folder canonically and opens it from the canonical root one
   component at a time with `O_DIRECTORY | O_NOFOLLOW`, acting on the entry by name through
@@ -3708,18 +3720,31 @@ waits on that unpinned clone.
   `O_DIRECTORY | O_NOFOLLOW` and must have the device and inode recorded when it was
   validated (`beneath::Root`). Before each mutating call a held folder must still be under
   the root (`Dir::contained`: `..` walked by handle to the root's identity), and a rename is
-  checked again after and undone if either folder left. A folder's recursive removal renames
-  it through the handle to a fresh name first, restores what is left with a no-replace rename
-  if it stops, and reports where (`partially_removed`, `leftAt`); the trash, which takes a
-  path, re-checks the folder just before the call. Folder downloads walk and open each entry
-  through no-follow handles (`archive_body_from`).
+  checked again after and undone if either folder left. Each folder a walk creates is made
+  only while its parent is under the root, checked before and after `mkdirat`, and removed
+  through the parent's handle if the parent moved out. A folder's permanent removal renames
+  it through the handle to a fresh name, opens that name by handle, empties it with `openat`
+  and `unlinkat`, and removes the name only while it is still that folder, so a folder put at
+  the parked name survives; if it stops, what is left goes back with a no-replace rename and
+  the caller learns where (`partially_removed`, `leftAt`). The trash, which takes a path,
+  re-checks the folder just before the call. Folder downloads walk and open each entry
+  through no-follow handles (`archive_body_from`) and enforce the entry and size limits while
+  the zip streams.
+- **One writer per path.** `PathLocks` (in the workspace service, shared with the upload
+  route) serializes a guarded or plain write and an upload of one path, keyed by its
+  canonical path. An upload holds it from its reservation to its install; a write arriving
+  meanwhile is refused at once (`path_busy`, `McpFileBusyError` for agents), and a write
+  waits at most 10 seconds for another write.
+- **Writes in place.** `projects.writeFileIfUnchanged` with `missing` creates with `O_EXCL`;
+  with a `version` it opens the file `O_RDWR | O_NOFOLLOW` through the re-validated folder,
+  checks its identity and content through that descriptor, then truncates and writes it, so
+  the file keeps its inode, links, owner, permissions, ACLs and extended attributes.
 - **No replacement by surprise.** `projects.renameEntry`, an upload without `overwrite` and a
-  delete's restore use the kernel's no-replace rename (`renameat2(RENAME_NOREPLACE)`,
-  `renameatx_np(RENAME_EXCL)`). `projects.writeFileIfUnchanged` with `missing` creates with
-  `O_EXCL`; with a `version` it writes a sibling, re-checks the file is the one hashed
-  (identity and content), and renames the sibling over it, keeping the permissions. An upload
-  replaces or removes its name only while it is still its own empty reservation
-  (`Dir::remove_own`).
+  delete's restore use one no-replace rename (`beneath::rename_no_replace`, shared with
+  Source Control's discard staging): `renameat2(RENAME_NOREPLACE)` or
+  `renameatx_np(RENAME_EXCL)`, and on a file system without the flag a hard link and unlink
+  for a file and a refusal for a folder. An upload replaces or removes its name only while it
+  is still its own empty reservation (`Dir::remove_own`).
 - **Windows.** `std` has no `*at` calls there, so every operation re-checks its folder and
   works by path, as the Files panel did before; the MCP tools that change files answer
   `McpPlatformUnsupportedError` instead of running with that race.
