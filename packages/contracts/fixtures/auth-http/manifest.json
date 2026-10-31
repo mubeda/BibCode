@@ -434,7 +434,7 @@
           "status": 200,
           "contentType": "application/json",
           "schema": "Arrays",
-          "fingerprint": "c9fe18e31cf1570d437e7321e54b378be3f32cb431c035ab7b5e6deb698647e8"
+          "fingerprint": "377faaea4e8c90897e6b85d8938e8064b9bef04bf4b3b98824e50eef6585e6c8"
         }
       ],
       "errors": [
@@ -845,8 +845,8 @@
     "AuthBrowserSessionRequest": "aeec10c72954f1f7b024490382a636f97429ff553c1fe750e56b6f877cde4efc",
     "AuthBrowserSessionResult": "cf18b5119c2299b8229155cbac7b91420cc4f78b3388c8b52f49bd41c210695a",
     "AuthCancelPairingOfferInput": "8ffaba0f361906631ae7bc607d89f6e10cb4d2f4088eaf58885f0dd96f3b46c7",
-    "AuthClientSession": "fdee2b92d74629069ad08ca4f1b2b5b8ab48c5b8ac605e278392c056bae6e1d1",
-    "AuthClientSessionList": "555bbbf7832875539efecaba72f602407b15a457adace31a5ff2d29f1c127a72",
+    "AuthClientSession": "01fcd8025c62d7b2aa2d42480e16422a3534123a5029eb5e70b44347d7a6a5dd",
+    "AuthClientSessionList": "d5fc3ddf563319ddf2d4f2d298d3879741b97433dbf664cd61ec8d219a73be42",
     "AuthClientSessionRevokeResult": "12efa4f9a8f30851c7f7c2852cb70f4b34b2abe7edfb60fb196c5c2649dc0df5",
     "AuthCreatePairingCredentialInput": "b8f85a332e94fa7eda743ea40c53f04b27d7b30a3a75ded568378b319f3e2536",
     "AuthCreatePairingOfferInput": "4c73c59a5bb1488ad08a6a2154634c002a62b5daad2ddd418773f1b56c3cd80f",
