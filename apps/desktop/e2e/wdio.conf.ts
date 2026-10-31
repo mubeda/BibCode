@@ -145,7 +145,7 @@ export const config = {
   mochaOpts: {
     ui: "bdd",
     // [DEBUG-k64r]
-    ...(process.env.BIBCODE_E2E_GREP ? { grep: process.env.BIBCODE_E2E_GREP } : {}),
+    ...(process.env.BIBCODE_E2E_GREP ? { grep: new RegExp(process.env.BIBCODE_E2E_GREP) } : {}),
     timeout: 120_000,
   },
   before: async () => {
