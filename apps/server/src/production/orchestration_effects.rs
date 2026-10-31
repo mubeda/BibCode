@@ -137,13 +137,23 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 #[derive(Clone, Copy, Debug)]
 pub struct EffectsOptions {
     pub queue_capacity: usize,
+    /// How long an ended turn holds its thread's turn deliveries for its checkpoint. A capture
+    /// still pending then is given up as stale, so a hung Git never holds a thread for good.
+    pub checkpoint_hold_limit: Duration,
 }
 
 impl Default for EffectsOptions {
     fn default() -> Self {
-        Self { queue_capacity: 64 }
+        Self {
+            queue_capacity: 64,
+            checkpoint_hold_limit: CHECKPOINT_HOLD_LIMIT,
+        }
     }
 }
+
+/// Longer than a capture's Git calls take in a large checkout, short enough that a worker that
+/// never answers does not hold a thread's turns for long.
+const CHECKPOINT_HOLD_LIMIT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Error)]
 pub enum OrchestrationEffectsError {
@@ -469,8 +479,8 @@ impl OrchestrationEffects {
         let (sender, receiver) = mpsc::channel(options.queue_capacity.max(1));
 
         install_project_command_effects(&engine);
-        // The worker below records turn checkpoints, so a turn's end may hold its queue.
-        engine.set_checkpoint_holds_enabled(true);
+        // The worker below records turn checkpoints, so a turn's end may hold its thread's turns.
+        engine.set_checkpoint_hold_limit(Some(options.checkpoint_hold_limit));
         engine.set_bootstrap_effects(Arc::new(ProductionBootstrapEffects {
             repositories: engine.repositories(),
             repository: repository.clone(),
@@ -519,8 +529,8 @@ impl OrchestrationEffects {
         if let Some(worker) = self.worker.lock().await.take() {
             let _ = worker.await;
         }
-        // Nothing records checkpoints any more: no queue waits for one.
-        self.engine.set_checkpoint_holds_enabled(false);
+        // Nothing records checkpoints any more: no turn waits for one.
+        self.engine.set_checkpoint_hold_limit(None);
         self.identity_tasks.close();
         self.identity_tasks.wait().await;
         self.compaction_tasks.close();
@@ -1162,22 +1172,36 @@ async fn ensure_baseline(
     if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
         return Ok(());
     }
-    // Its turns get checkpoint numbers from now on (`record_turn_end`).
-    engine.note_checkpointed_thread(thread_id);
     // One read of the thread's turns, so the number and the history it is judged by agree even
     // when a turn's end is recorded meanwhile.
     let turns = engine
         .repositories()
         .list_turns_by_thread(thread_id.to_owned())
         .await?;
+    let starting_message = event.event.payload.get("messageId").and_then(Value::as_str);
+    // The baseline is the checkpoint of the turns before the starting one. That turn may already
+    // have ended and been numbered (it was fast, or the worker is behind); its number is not this
+    // baseline's.
     let turn_count = turns
         .iter()
+        .filter(|turn| {
+            starting_message.is_none() || turn.pending_message_id.as_deref() != starting_message
+        })
         .filter_map(|turn| turn.checkpoint_turn_count)
         .max()
         .unwrap_or(0);
-    let starting_message = event.event.payload.get("messageId").and_then(Value::as_str);
     let stale_first_baseline =
         baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
+    // A latest turn whose capture went stale has no end state: the checkout now may hold the next
+    // turn's edits, so it does not stand in for that turn's checkpoint.
+    let latest_went_stale = turns
+        .iter()
+        .filter(|turn| turn.checkpoint_turn_count == Some(turn_count))
+        .filter_map(|turn| turn.turn_id.as_deref())
+        .any(|turn_id| engine.checkpoint_is_stale(thread_id, turn_id));
+    if latest_went_stale {
+        return Ok(());
+    }
     let reference = checkpoint_ref(thread_id, turn_count);
     if stale_first_baseline || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
         capture_checkpoint_with_cancellation(
@@ -1195,9 +1219,10 @@ async fn ensure_baseline(
 /// Whether a thread with no recorded checkpoint already ran turns before the one
 /// `starting_message` starts, and no other turn runs now. Its ref 0 was captured before the
 /// first of those turns (they predate turn checkpoints), so the checkout as it is now is the
-/// baseline of the turn that starts. If that turn is already running (the worker is behind),
-/// the checkout is captured as a first turn's baseline would be: the same window, never an old
-/// ref 0. Once any turn has a number, the thread has checkpoints and its ref 0 stands.
+/// baseline of the turn that starts. If that turn is already running, or already ended (the
+/// worker is behind), the checkout is captured as a first turn's baseline would be: the same
+/// window, never an old ref 0. Once an earlier turn has a number, the thread has checkpoints and
+/// its ref 0 stands.
 fn had_turns_before_checkpoints(
     turns: &[crate::persistence::ProjectionTurn],
     starting_message: Option<&str>,
@@ -1207,6 +1232,7 @@ fn had_turns_before_checkpoints(
     };
     turns
         .iter()
+        .filter(earlier)
         .all(|turn| turn.checkpoint_turn_count.is_none())
         && !turns
             .iter()
@@ -1270,6 +1296,7 @@ pub(crate) async fn record_turn_end(
     turn_id: &str,
     completed_at: &str,
     end: TurnEnd,
+    checkout: Option<&Path>,
 ) -> Result<(), OrchestrationEffectsError> {
     let repositories = engine.repositories();
     if repositories
@@ -1285,28 +1312,100 @@ pub(crate) async fn record_turn_end(
         .into_iter()
         .map(|checkpoint| checkpoint.checkpoint_turn_count)
         .max();
-    // Only a thread with checkpoints, or one the worker found in a Git checkout when a turn
-    // started, numbers its turns: a turn outside Git has nothing to diff or revert to.
+    // Only a thread with checkpoints, or (live) a turn that ran in a Git checkout, is numbered:
+    // a turn outside Git has nothing to diff or revert to. Read from the checkout itself, so the
+    // number never waits for the effects worker.
     let checkpointed =
-        latest.is_some() || (end == TurnEnd::Live && engine.thread_is_checkpointed(thread_id));
+        latest.is_some() || (end == TurnEnd::Live && in_git_checkout(checkout).await);
     if !checkpointed {
         return Ok(());
     }
-    if end == TurnEnd::Live {
-        engine.hold_promotion_for_checkpoint(thread_id, turn_id);
-    }
+    let turn_count = latest.unwrap_or(0) + 1;
+    let hold = match end {
+        TurnEnd::Live => engine.hold_turns_for_checkpoint(thread_id, turn_id),
+        TurnEnd::CutOff => None,
+    };
     let checkpoint = TurnCheckpoint {
         thread_id,
         turn_id,
-        turn_count: latest.unwrap_or(0) + 1,
+        turn_count,
         assistant_message_id: None,
         completed_at,
     };
     let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new()).await;
-    if recorded.is_err() {
-        engine.release_checkpoint_hold(thread_id, turn_id);
+    match (&recorded, hold) {
+        (Err(_), Some(_)) => engine.release_checkpoint_hold(thread_id, turn_id),
+        (Ok(()), Some(id)) => expire_stale_hold(engine, thread_id, turn_id, turn_count, id),
+        _ => {}
     }
     recorded
+}
+
+/// Whether `checkout` lies in a Git work tree: it or a directory above it has a `.git`.
+async fn in_git_checkout(checkout: Option<&Path>) -> bool {
+    let Some(checkout) = checkout.map(Path::to_path_buf) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        checkout
+            .ancestors()
+            .any(|directory| directory.join(".git").exists())
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Gives up hold `id` of an ended turn once the hold limit passes with its capture still pending:
+/// the turn's checkpoint is marked stale (never recorded `ready`, and the next turn's baseline
+/// does not stand in for it), the stale record is logged and shown, and the thread's turns go.
+/// A hung Git therefore never holds a thread for good.
+fn expire_stale_hold(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    turn_id: &str,
+    turn_count: i64,
+    id: u64,
+) {
+    let Some(limit) = engine.checkpoint_hold_limit() else {
+        return;
+    };
+    let (engine, thread_id, turn_id) = (engine.clone(), thread_id.to_owned(), turn_id.to_owned());
+    let shutdown = engine.shutdown_signal();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep(limit) => {}
+            () = shutdown.cancelled() => return,
+        }
+        if !engine.expire_checkpoint_hold(&thread_id, &turn_id, id) {
+            return;
+        }
+        tracing::warn!(
+            %thread_id,
+            turn_count,
+            "a turn's checkpoint was not captured in time; it is recorded stale and the thread's turns go on"
+        );
+        let created_at = now_iso();
+        let _ = engine
+            .dispatch(OrchestrationCommand::ThreadActivityAppend {
+                command_id: server_id("checkpoint-capture-stale"),
+                thread_id: thread_id.clone(),
+                activity: ActivityInput {
+                    id: Uuid::new_v4().to_string(),
+                    tone: "error".to_owned(),
+                    kind: "checkpoint.capture.failed".to_owned(),
+                    summary: "Checkpoint capture failed".to_owned(),
+                    payload: json!({
+                        "turnCount": turn_count,
+                        "detail": "The checkpoint was not captured in time, so this turn's changes cannot be shown or reverted to."
+                    }),
+                    turn_id: Some(turn_id),
+                    sequence: None,
+                    created_at: created_at.clone(),
+                },
+                created_at,
+            })
+            .await;
+    });
 }
 
 /// Captures the checkpoint of a turn recorded `missing` and records it `ready`. A checkpoint ref
@@ -1380,6 +1479,14 @@ async fn record_checkpoint(
         ..
     } = *checkpoint;
     let target_ref = checkpoint_ref(thread_id, turn_count);
+    let stale = || {
+        OrchestrationEffectsError::Effect(format!(
+            "The checkpoint of turn {turn_count} was not captured in time, so its changes cannot be shown or reverted to."
+        ))
+    };
+    if engine.checkpoint_is_stale(thread_id, turn_id) {
+        return Err(stale());
+    }
     if recapture || !has_ref(cwd, Path::new("git"), &target_ref, cancellation).await? {
         capture_checkpoint_with_cancellation(
             cwd,
@@ -1390,6 +1497,12 @@ async fn record_checkpoint(
         )
         .await?;
     }
+    // Its hold expired while Git ran: the thread's next turn may have edited the checkout, so
+    // this capture is not the turn's end state.
+    if engine.checkpoint_is_stale(thread_id, turn_id) {
+        delete_ref(cwd, Path::new("git"), &target_ref, cancellation).await?;
+        return Err(stale());
+    }
     // Only the displayed status reads it; the checkpoint itself is captured.
     if callbacks.refresh_workspace(cwd).await.is_err() {
         tracing::warn!(
@@ -1399,12 +1512,17 @@ async fn record_checkpoint(
         );
     }
 
+    // `ready` means the turn's diff can be read. Without the turn before's checkpoint (its
+    // baseline capture failed) it cannot, so the turn stays `missing`; its own ref, kept, is the
+    // next turn's baseline.
     let from_ref = checkpoint_ref(thread_id, turn_count.saturating_sub(1));
-    let files = if has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
-        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?
-    } else {
-        Vec::new()
-    };
+    if !has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
+        return Err(OrchestrationEffectsError::Effect(format!(
+            "The checkpoint before turn {turn_count} is missing, so this turn's changes cannot be shown."
+        )));
+    }
+    let files =
+        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?;
     dispatch_turn_checkpoint(engine, checkpoint, "ready", files).await?;
     engine
         .dispatch(OrchestrationCommand::ThreadActivityAppend {
@@ -2291,8 +2409,8 @@ mod tests {
     }
 
     /// Ref 0 is captured again only for a thread whose earlier turns predate checkpoints: never
-    /// once any turn has a number (a short first turn's end can be recorded before the worker
-    /// handles its start), and never while another turn runs.
+    /// once an earlier turn has a number, never for a new thread's own first turn (it can end and
+    /// be numbered before the worker handles its start), and never while another turn runs.
     #[test]
     fn only_turns_before_checkpoints_refresh_ref_zero() {
         let turn = |turn_id: &str, message: &str, state: &str, number: Option<i64>| {
@@ -2334,9 +2452,14 @@ mod tests {
             &[old.clone(), turn("new", "m-new", "running", None)],
             starting
         ));
-        // ... but not once a turn has a number, nor while another turn runs.
-        assert!(!had_turns_before_checkpoints(
+        // ... and when the new turn already ended and was numbered (the worker is behind).
+        assert!(had_turns_before_checkpoints(
             &[old.clone(), turn("new", "m-new", "completed", Some(1))],
+            starting
+        ));
+        // ... but not once an earlier turn has a number, nor while another turn runs.
+        assert!(!had_turns_before_checkpoints(
+            &[old.clone(), turn("prior", "m-prior", "completed", Some(1))],
             starting
         ));
         assert!(!had_turns_before_checkpoints(
@@ -2378,12 +2501,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::CutOff)
+        record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::CutOff, None)
             .await
             .unwrap();
         assert_eq!(numbers().await, []);
-        // Nor is a live turn of a thread the worker never found in a Git checkout.
-        record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::Live)
+        // Nor is a live turn outside a Git checkout.
+        record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::Live, None)
             .await
             .unwrap();
         assert_eq!(numbers().await, []);
@@ -2397,12 +2520,12 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..2 {
-            record_turn_end(&engine, "t", "turn-2", AT, TurnEnd::CutOff)
+            record_turn_end(&engine, "t", "turn-2", AT, TurnEnd::CutOff, None)
                 .await
                 .unwrap();
         }
         // Recording a turn already recorded `ready` changes nothing.
-        record_turn_end(&engine, "t", "turn-1", AT, TurnEnd::CutOff)
+        record_turn_end(&engine, "t", "turn-1", AT, TurnEnd::CutOff, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2413,10 +2536,10 @@ mod tests {
             ]
         );
         // No effects worker records checkpoints here, so a live end holds no queue.
-        record_turn_end(&engine, "t", "turn-3", AT, TurnEnd::Live)
+        record_turn_end(&engine, "t", "turn-3", AT, TurnEnd::Live, None)
             .await
             .unwrap();
-        assert!(!engine.promotion_held_for_checkpoint("t"));
+        assert!(!engine.turns_held_for_checkpoint("t"));
         assert_eq!(numbers().await.len(), 3);
         engine.shutdown().await;
     }

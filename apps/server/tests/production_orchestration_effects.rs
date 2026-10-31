@@ -1419,7 +1419,10 @@ async fn thread_deletion_attempts_provider_and_terminal_cleanup_independently() 
         engine.clone(),
         Arc::new(GitRepository::default()),
         callbacks.clone(),
-        EffectsOptions { queue_capacity: 1 },
+        EffectsOptions {
+            queue_capacity: 1,
+            ..EffectsOptions::default()
+        },
     )
     .await
     .unwrap();

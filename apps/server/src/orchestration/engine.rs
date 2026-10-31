@@ -1996,20 +1996,17 @@ pub struct OrchestrationEngine {
     test_hooks: TestHooks,
 }
 
-/// How long a queued follow-up waits for its thread's turn checkpoint before it goes anyway:
-/// longer than a capture takes in a large checkout, short enough that a worker that never
-/// answers does not hold the queue for good.
-const CHECKPOINT_HOLD_LIMIT: Duration = Duration::from_secs(120);
-
 /// Ended turns the effects worker has yet to checkpoint, by thread and turn, each with the id of
-/// the hold that owns it. Holds are taken only while the effects worker runs (`enabled`).
+/// the hold that owns it. Holds are taken only while the effects worker runs (`limit` is set).
 #[derive(Clone, Default)]
 struct CheckpointHolds {
-    enabled: Arc<AtomicBool>,
+    /// How long a hold lasts before its capture is given up as stale; `None` while no effects
+    /// worker runs.
+    limit: Arc<StdMutex<Option<Duration>>>,
     turns: Arc<StdMutex<HeldTurns>>,
-    /// Threads the effects worker found in a Git checkout when a turn started (it captured or
-    /// found their baseline): their turns get checkpoint numbers.
-    checkpointed_threads: Arc<StdMutex<HashSet<String>>>,
+    /// Ended turns whose hold expired before the worker captured them, by thread and turn: their
+    /// checkpoint is never recorded `ready`, and the next turn's baseline does not stand in for it.
+    stale: Arc<StdMutex<HashSet<(String, String)>>>,
 }
 
 /// The last hold id given out, and each held `(thread, turn)` with its hold's id.
@@ -2787,87 +2784,102 @@ impl OrchestrationEngine {
             .contains_key(thread_id)
     }
 
-    /// Lets turn checkpoints hold queue promotion (the effects worker that records them runs), or
-    /// stops them, releasing every hold.
-    pub(crate) fn set_checkpoint_holds_enabled(&self, enabled: bool) {
-        self.checkpoint_holds
-            .enabled
-            .store(enabled, Ordering::Release);
-        if !enabled {
+    /// Lets an ended turn hold its thread's turn deliveries until the effects worker has
+    /// checkpointed it, for at most `limit` (the effects worker that records checkpoints runs), or
+    /// with `None` stops that, releasing every hold.
+    pub(crate) fn set_checkpoint_hold_limit(&self, limit: Option<Duration>) {
+        *self
+            .checkpoint_holds
+            .limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limit;
+        if limit.is_none() {
             self.release_checkpoint_holds(|_| true);
         }
     }
 
-    /// Holds the thread's automatic queue promotion until the effects worker has recorded the
-    /// checkpoint of `turn_id`, which just ended, so a queued follow-up cannot edit the checkout
-    /// before it is captured. Taken before the turn's session settles; released by the worker
-    /// for that turn only, or after [`CHECKPOINT_HOLD_LIMIT`]. Nothing is held while the worker
-    /// does not run.
-    pub(crate) fn hold_promotion_for_checkpoint(&self, thread_id: &str, turn_id: &str) {
-        if !self.checkpoint_holds.enabled.load(Ordering::Acquire) {
-            return;
-        }
+    /// How long an ended turn holds its thread's deliveries, or `None` while no effects worker
+    /// runs.
+    pub(crate) fn checkpoint_hold_limit(&self) -> Option<Duration> {
+        *self
+            .checkpoint_holds
+            .limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Holds every turn delivery of the thread (a direct start, Send now, a queued follow-up, a
+    /// steer) until the effects worker has recorded the checkpoint of `turn_id`, which just ended,
+    /// so no turn can edit the checkout before it is captured. Taken before the turn's session
+    /// settles. Returns the hold's id, or `None` (nothing held) while no effects worker runs.
+    pub(crate) fn hold_turns_for_checkpoint(&self, thread_id: &str, turn_id: &str) -> Option<u64> {
+        self.checkpoint_hold_limit()?;
+        let mut holds = self
+            .checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds.0 = holds.0.wrapping_add(1);
+        let id = holds.0;
+        holds
+            .1
+            .insert((thread_id.to_owned(), turn_id.to_owned()), id);
+        Some(id)
+    }
+
+    /// The effects worker is done with the checkpoint of `turn_id`: once no other ended turn of
+    /// the thread waits for one, its turns may be delivered again.
+    pub(crate) fn release_checkpoint_hold(&self, thread_id: &str, turn_id: &str) {
+        self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
+    }
+
+    /// Gives up hold `id` of `turn_id` before the worker captured the turn: marks the turn's
+    /// checkpoint stale, then releases the hold. Returns `false`, changing nothing, when the hold
+    /// is already gone (the worker finished, or the thread was deleted).
+    pub(crate) fn expire_checkpoint_hold(&self, thread_id: &str, turn_id: &str, id: u64) -> bool {
         let key = (thread_id.to_owned(), turn_id.to_owned());
-        let id = {
+        let expired = {
             let mut holds = self
                 .checkpoint_holds
                 .turns
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            holds.0 = holds.0.wrapping_add(1);
-            let id = holds.0;
-            holds.1.insert(key.clone(), id);
-            id
+            let current = holds.1.get(&key) == Some(&id);
+            if current {
+                // Marked before the release, so the worker never records it `ready` once the
+                // thread's next turn may run.
+                self.checkpoint_holds
+                    .stale
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key.clone());
+                holds.1.remove(&key);
+            }
+            current
         };
-        let engine = self.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep(CHECKPOINT_HOLD_LIMIT) => {}
-                () = engine.shutdown.cancelled() => return,
-            }
-            if engine.release_checkpoint_holds(|(held, held_id)| *held == key && *held_id == id) {
-                tracing::warn!(
-                    thread_id = %key.0,
-                    "a queued follow-up stopped waiting for its thread's turn checkpoint"
-                );
-            }
-        });
+        if expired {
+            self.wake_turn_delivery();
+        }
+        expired
     }
 
-    /// The effects worker is done with the checkpoint of `turn_id`: once no other ended turn of
-    /// the thread waits for one, its queued messages may be promoted again.
-    pub(crate) fn release_checkpoint_hold(&self, thread_id: &str, turn_id: &str) {
-        self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
+    /// Whether `turn_id`'s hold expired before the worker captured it.
+    pub(crate) fn checkpoint_is_stale(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.checkpoint_holds
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(thread_id.to_owned(), turn_id.to_owned()))
     }
 
-    /// Forgets a deleted thread: releases its checkpoint holds.
+    /// Forgets a deleted thread: releases its checkpoint holds and stale marks.
     pub(crate) fn release_thread_checkpoint_holds(&self, thread_id: &str) {
         self.release_checkpoint_holds(|((thread, _), _)| thread == thread_id);
         self.checkpoint_holds
-            .checkpointed_threads
+            .stale
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(thread_id);
-    }
-
-    /// The effects worker found the thread in a Git checkout as a turn started: its turns get
-    /// checkpoint numbers from now on.
-    pub(crate) fn note_checkpointed_thread(&self, thread_id: &str) {
-        self.checkpoint_holds
-            .checkpointed_threads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(thread_id.to_owned());
-    }
-
-    /// Whether the effects worker found the thread in a Git checkout as a turn started, since
-    /// this server started.
-    pub(crate) fn thread_is_checkpointed(&self, thread_id: &str) -> bool {
-        self.checkpoint_holds
-            .checkpointed_threads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(thread_id)
+            .retain(|(thread, _)| thread != thread_id);
     }
 
     /// Releases the holds `matches` picks, waking delivery. Returns whether any was released.
@@ -2891,8 +2903,8 @@ impl OrchestrationEngine {
         released
     }
 
-    /// Whether the thread's automatic queue promotion waits for an ended turn's checkpoint.
-    pub(crate) fn promotion_held_for_checkpoint(&self, thread_id: &str) -> bool {
+    /// Whether the thread's turn deliveries wait for an ended turn's checkpoint.
+    pub(crate) fn turns_held_for_checkpoint(&self, thread_id: &str) -> bool {
         self.checkpoint_holds
             .turns
             .lock()
@@ -2900,6 +2912,11 @@ impl OrchestrationEngine {
             .1
             .keys()
             .any(|(thread, _)| thread == thread_id)
+    }
+
+    /// Cancelled when the engine shuts down, for tasks that must not outlive it.
+    pub(crate) fn shutdown_signal(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Where the event pump reports a compaction's tagged turn to the compaction effect.

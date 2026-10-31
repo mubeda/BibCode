@@ -1315,6 +1315,10 @@ struct SupervisorEffectsCallbacks {
     engine: OrchestrationEngine,
     settings: TempDir,
     workspace: PathBuf,
+    /// The effects worker's next workspace lookup waits for `workspace_release`: the worker is
+    /// behind.
+    hold_workspace: std::sync::atomic::AtomicBool,
+    workspace_release: tokio::sync::Notify,
 }
 
 fn supervisor_effects(
@@ -1327,6 +1331,8 @@ fn supervisor_effects(
         engine: engine.clone(),
         settings: TempDir::new().unwrap(),
         workspace: workspace.to_path_buf(),
+        hold_workspace: std::sync::atomic::AtomicBool::new(false),
+        workspace_release: tokio::sync::Notify::new(),
     })
 }
 
@@ -1335,7 +1341,12 @@ impl OrchestrationEffectCallbacks for SupervisorEffectsCallbacks {
         &'a self,
         _thread_id: &'a str,
     ) -> BoxEffectFuture<'a, Option<PathBuf>> {
-        Box::pin(async move { Ok(Some(self.workspace.clone())) })
+        Box::pin(async move {
+            if self.hold_workspace.swap(false, Ordering::SeqCst) {
+                self.workspace_release.notified().await;
+            }
+            Ok(Some(self.workspace.clone()))
+        })
     }
 
     fn rollback_provider<'a>(
@@ -11658,6 +11669,7 @@ struct CheckpointedSession {
     supervisor: Arc<ProviderRuntimeSupervisor>,
     events_tx: mpsc::Sender<ProviderEvent>,
     effects: OrchestrationEffects,
+    callbacks: Arc<SupervisorEffectsCallbacks>,
 }
 
 impl CheckpointedSession {
@@ -11684,10 +11696,11 @@ impl CheckpointedSession {
         let mut provider_launch = launch();
         provider_launch.cwd = workspace.to_path_buf();
         supervisor.launch(provider_launch).await.unwrap();
+        let callbacks = supervisor_effects(&supervisor, &engine, workspace);
         let effects = OrchestrationEffects::start(
             engine.clone(),
             Arc::new(GitRepository::default()),
-            supervisor_effects(&supervisor, &engine, workspace),
+            callbacks.clone(),
             EffectsOptions::default(),
         )
         .await
@@ -11698,6 +11711,7 @@ impl CheckpointedSession {
             supervisor,
             events_tx,
             effects,
+            callbacks,
         }
     }
 
@@ -11705,6 +11719,14 @@ impl CheckpointedSession {
     /// into `tracked.txt` of `workspace`, answers, and the turn ends in `state`. Returns the
     /// provider's turn id.
     async fn run_turn(&self, workspace: &Path, index: i64, contents: &str, state: &str) -> String {
+        self.start_turn(index).await;
+        // The turn's baseline is the checkpoint of the turn before it.
+        wait_for_checkpoint_ref(workspace, index - 1).await;
+        self.finish_turn(workspace, index, contents, state).await
+    }
+
+    /// Starts turn `index` with the provider.
+    async fn start_turn(&self, index: i64) {
         let start = OrchestrationCommand::ThreadTurnStart {
             command_id: format!("turn-start-{index}"),
             thread_id: "t1".to_owned(),
@@ -11726,8 +11748,17 @@ impl CheckpointedSession {
         };
         self.engine.dispatch(start.clone()).await.unwrap();
         self.supervisor.handle_orchestration(start).await.unwrap();
-        // The turn's baseline is the checkpoint of the turn before it.
-        wait_for_checkpoint_ref(workspace, index - 1).await;
+    }
+
+    /// Lets turn `index`'s agent write `contents` into `tracked.txt`, answer, and end the turn in
+    /// `state`. Returns the provider's turn id.
+    async fn finish_turn(
+        &self,
+        workspace: &Path,
+        index: i64,
+        contents: &str,
+        state: &str,
+    ) -> String {
         std::fs::write(workspace.join("tracked.txt"), contents).unwrap();
         let turn_id = format!("provider-turn-{index}");
         self.provider_event(
@@ -11903,6 +11934,112 @@ async fn a_completed_turn_records_its_checkpoint_and_turn_diff() {
     handle.shutdown();
     handle.join().await.unwrap();
     delivery.shutdown().await;
+    session.shutdown().await;
+}
+
+/// A turn that ends before the effects worker has even handled its start (a fast turn, a busy
+/// worker) is still numbered when it ends, from the checkout itself, then captured once the
+/// worker catches up. Its baseline is captured late, which is the turn-start baseline's own
+/// window, so only the numbering and the capture are asserted here.
+#[tokio::test]
+async fn a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_captured() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    session
+        .callbacks
+        .hold_workspace
+        .store(true, Ordering::SeqCst);
+
+    session.start_turn(1).await;
+    let turn_id = session
+        .finish_turn(repository.path(), 1, "fast\n", "completed")
+        .await;
+    let numbered = timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+        loop {
+            if let Some(checkpoint) = session
+                .engine
+                .repositories()
+                .get_checkpoint("t1".to_owned(), 1)
+                .await
+                .unwrap()
+            {
+                return checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the turn is numbered while the worker is still behind");
+    assert_eq!(numbered.turn_id, turn_id);
+    assert_eq!(numbered.status, "missing");
+
+    session.callbacks.workspace_release.notify_one();
+    let checkpoint = session.ready_checkpoint(1).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    session.shutdown().await;
+}
+
+/// A turn whose baseline (ref 0) could not be captured is never recorded `ready`: its diff could
+/// not be read. Its own end state is still captured, so the next turn's diff is.
+#[tokio::test]
+async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    // Git cannot write ref 0 while its lock file exists.
+    let baseline_lock = repository.path().join(".git").join(format!(
+        "{}.lock",
+        orchestration_effects::checkpoint_ref("t1", 0)
+    ));
+    std::fs::create_dir_all(baseline_lock.parent().unwrap()).unwrap();
+    std::fs::write(&baseline_lock, "").unwrap();
+
+    session.start_turn(1).await;
+    let turn_id = session
+        .finish_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+        loop {
+            let failed = load_snapshot(&session.engine.repositories())
+                .await
+                .unwrap()
+                .activities
+                .iter()
+                .any(|activity| {
+                    activity.kind == "checkpoint.capture.failed"
+                        && activity.turn_id.as_deref() == Some(turn_id.as_str())
+                });
+            if failed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the turn's checkpoint is reported unreadable");
+    let checkpoint = session
+        .engine
+        .repositories()
+        .get_checkpoint("t1".to_owned(), 1)
+        .await
+        .unwrap()
+        .expect("checkpoint 1");
+    assert_eq!(checkpoint.status, "missing");
+    let reference = |turn_count| orchestration_effects::checkpoint_ref("t1", turn_count);
+    assert!(!git_succeeds(
+        repository.path(),
+        &["rev-parse", "--verify", "--quiet", &reference(0)]
+    ));
+    assert!(git_succeeds(
+        repository.path(),
+        &["rev-parse", "--verify", "--quiet", &reference(1)]
+    ));
+
+    std::fs::remove_file(&baseline_lock).unwrap();
+    session
+        .run_turn(repository.path(), 2, "two\n", "completed")
+        .await;
+    let next = session.ready_checkpoint(2).await;
+    assert_eq!(next.files[0]["path"], "tracked.txt");
     session.shutdown().await;
 }
 

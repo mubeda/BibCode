@@ -5831,27 +5831,30 @@ Provider ingestion records a turn's end; the effects worker captures it.
    whether or not the capture ever happens. A record that cannot be written fails the
    `turn.completed` projection before the session settles, as a failed session write would,
    so a turn is never settled without its number. Only a thread with a recorded checkpoint,
-   or one whose turn start the worker found in a Git checkout (an in-memory note set by
-   `ensure_baseline`), is numbered, so a project outside Git gets no checkpoint rows, revert
-   buttons or Diff panel turns, as before. Residual: a thread's very first turn that ends
-   before the worker has handled its start gets no number.
+   or a live turn whose checkout lies in a Git work tree (it or a directory above it has a
+   `.git`, read from the provider's working directory at the turn's end), is numbered: the
+   number never waits for the effects worker, and a project outside Git gets no checkpoint
+   rows, revert buttons or Diff panel turns, as before.
 2. Before dispatching that record it takes a **checkpoint hold** for that turn
-   (`OrchestrationEngine::hold_promotion_for_checkpoint(thread, turn)`, beside
-   `AskRecoveryHold`). `promote_settled_threads` holds a thread's queue while any of its ended
-   turns is held, so a queued follow-up is not promoted until the effects worker has captured
-   the checkout as each turn left it. Holds are taken only while `OrchestrationEffects` runs
-   (it enables them at start and disables them, releasing every hold, at shutdown), a deleted
-   thread's holds are released, and each expires after 120 s with a warning, so a worker that
-   never answers cannot hold a queue for good. Expiry wakes delivery.
+   (`OrchestrationEngine::hold_turns_for_checkpoint(thread, turn)`). Turn delivery holds every
+   turn of the thread while any of its ended turns is held, so no turn reaches the provider
+   until the effects worker has captured the checkout as each ended turn left it. Holds are
+   taken only while `OrchestrationEffects` runs (it sets the limit at start and clears it,
+   releasing every hold, at shutdown), and a deleted thread's holds are released. A hold that
+   outlives `EffectsOptions::checkpoint_hold_limit` (120 s) marks its turn's checkpoint
+   **stale** and is released (Round 3, below), so a hung Git never jams the thread.
 3. The effects worker handles the `missing` event in the existing arm
    (`capture_missing_checkpoint` → `record_checkpoint`): captures `ref(n)` unless it already
    exists, diffs it against `ref(n-1)`, records `ready` with the files and the turn's own
    assistant message id (the record carries none; the projector keeps the turn's), and
    releases that turn's hold on every exit (a drop guard), including no workspace, not a Git
-   checkout, already recorded and failure. A failed capture stays `missing`, with the
-   existing `checkpoint.capture.failed` activity; the next turn's `ensure_baseline` then sees
-   number `n` and writes `ref(n)` at that turn's start, so turn `n`'s diff (read by explicit
-   number) holds its changes and anything changed before the next turn started.
+   checkout, already recorded and failure. `ready` requires `ref(n-1)`: without it (the
+   baseline capture failed) the turn's diff cannot be read, so it stays `missing` with a
+   `checkpoint.capture.failed` activity, and its own ref, kept, is the next turn's baseline. A
+   failed capture also stays `missing`; the next turn's `ensure_baseline` then writes `ref(n)`
+   at that turn's start, so turn `n`'s diff (read by explicit number) holds its changes and
+   anything changed before the next turn started. A stale turn is never captured or recorded
+   `ready`, and no later baseline writes its ref.
 4. Startup reconciliation (`reconcile_abandoned_provider_session`) records a turn a restart
    cut off the same way, as `TurnEnd::CutOff`: number only, no hold (the worker is not
    running yet), and only when the thread already has a recorded checkpoint. Before any, the
@@ -5900,15 +5903,15 @@ The capture runs on the sequential effects worker, through `run_git` → `Proces
 cancelled at shutdown. Staying on the worker orders it before the thread's next baseline and
 before any revert of the same checkout. Git is a child process, so no event loop is blocked;
 the worker is: a slow capture in a large checkout delays other threads' effects, as the
-turn-start baseline already does. With the hold, it delays only the same thread's queued
-follow-up, and at most until the hold expires. A per-checkout worker with a total capture
-deadline would let independent checkouts proceed; deferred, as it changes revert ordering
-across the worker.
+turn-start baseline already does. With the hold, it delays only the same thread's next turn,
+and at most until the hold expires. A per-checkout worker with a total capture deadline would
+let independent checkouts proceed; deferred, as it changes revert ordering across the worker.
 
-Residual: a message the person sends directly (not queued) is not held. They type it after
-seeing the turn end, so the capture has normally finished; if the worker is behind, that
-turn's early edits can land in the previous turn's checkpoint, the window the turn-start
-baseline already has.
+Residual, inherent to the design: a turn's baseline (`ref(n)` when it is missing, and ref 0
+for a thread's first turn) is captured by the worker when it handles the turn's start, while
+the provider may already be running that turn, so its earliest edits can land in the
+baseline. The hold closes this window for every turn after a captured one, whose baseline is
+the previous turn's own capture.
 
 ### Restart and idempotency
 
@@ -5999,6 +6002,51 @@ After round 2, the advisor's review found that a project outside Git would have 
 `missing` row per turn (and with it revert buttons and Diff panel turns that could only fail).
 Fixed by numbering only threads with a recorded checkpoint or a Git baseline (step 1). Each
 hold's expiry timer also stops with the engine.
+
+### Codex review round 3 (2026-10-31)
+
+Four findings on the two commits, all fixed:
+
+- **P1, a fast first turn could end unnumbered.** The live-end gate waited for the worker's
+  in-memory note from `ensure_baseline`. Now the gate reads the checkout itself (a `.git` in
+  the provider's working directory or above), so numbering is durable at turn end whatever
+  the worker has done. `ensure_baseline` numbers its baseline from the turns before the
+  starting one, so a late baseline is ref 0, not the number the fast turn already took.
+  Test: `a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_captured`
+  (the worker is held before the turn starts; failed on the round-2 code).
+- **P1, direct starts and Send now bypassed the hold.** The hold is now checked where every
+  turn is delivered, `TurnDeliveryService`'s candidate selection (and again at claim), not
+  only in automatic promotion. Start paths found, all gated there:
+  - automatic promotion of a queued follow-up (`promote_settled_threads`, also checked there);
+  - a direct start, `orchestration.dispatchCommand` `thread.turn.start` without `queued`
+    (the composer), which is written to the outbox as `pending`;
+  - **Send now**, `thread.turn.promote`, which turns a queued row `pending`;
+  - a steer, `thread.turn.steer`, delivered by the same service;
+  - MCP `send_message`, `start_thread` and the panel-message tools, which dispatch
+    `thread.turn.start` through `orchestration.dispatchCommand`, so the same outbox;
+  - delivery retries and restart recovery, which re-select `pending` rows the same way.
+    No production path hands a turn to the provider supervisor outside the delivery service:
+    `orchestration.dispatchCommand` always sends `thread.turn.start` through
+    `dispatch_turn_command` (the durable outbox), so `route_orchestration_command`'s turn-start
+    arm is reached only from tests. Test:
+    `direct_starts_and_send_now_wait_for_the_ended_turns_checkpoint` (fails with the gate
+    removed).
+- **P1, a hold could expire before a backlogged capture finished.** On expiry the turn's
+  checkpoint is marked stale before the hold is released: a `tracing::warn!` names the thread
+  and turn number, a `checkpoint.capture.failed` activity records it, and the thread's turns
+  go on. The worker then never captures or records that turn `ready` (it checks before Git
+  runs and again after, deleting a ref written meanwhile), and the next baseline does not
+  write its ref, so revert to it is refused rather than wrong. The stale mark is in memory;
+  after a restart the next baseline would write that ref (residual). Test:
+  `an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_thread` (fails
+  without the stale mark).
+- **P2, `ready` without ref 0.** `ensure_baseline` no longer marks anything before its
+  capture, and `record_checkpoint` records `ready` only when `ref(n-1)` exists. Test:
+  `a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is` (ref 0's lock file makes
+  the baseline capture fail; failed on the round-2 code).
+
+The legacy ref 0 refresh also no longer counts the starting turn's own number, so a legacy
+thread's fast first turn still refreshes ref 0 instead of diffing against the old one.
 
 ### Tests
 

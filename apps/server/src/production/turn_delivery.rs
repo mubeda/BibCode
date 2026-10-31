@@ -1032,6 +1032,12 @@ async fn fill_available_slots(
         if engine.thread_turns_reserved(&row.thread_id) {
             continue;
         }
+        // The thread's last turn ended and the effects worker has yet to checkpoint it: no turn
+        // of the thread (a direct start, Send now, a promoted follow-up, a steer) may edit the
+        // checkout first. The capture, or its expiry, wakes delivery. The claim repeats this check.
+        if engine.turns_held_for_checkpoint(&row.thread_id) {
+            continue;
+        }
         if row.mode == TurnDeliveryMode::Start
             && engine
                 .repositories()
@@ -1227,7 +1233,7 @@ async fn promote_settled_threads(
             // A resumed session still reading the asks its provider kept (#187).
             || engine.promotion_held_for_ask_recovery(&head.thread_id)
             // The effects worker has yet to checkpoint the turn that just ended.
-            || engine.promotion_held_for_checkpoint(&head.thread_id)
+            || engine.turns_held_for_checkpoint(&head.thread_id)
             || !repositories
                 .can_promote_queued_provider_turn(
                     head.thread_id.clone(),
@@ -1390,6 +1396,11 @@ async fn prepare_claim_and_deliver(
                 return Err("provider delivery claim cancelled".to_owned());
             }
         };
+        // Selected before the thread's last turn ended: wait for that turn's checkpoint, whose
+        // capture, or expiry, wakes delivery again.
+        if engine.turns_held_for_checkpoint(&row.thread_id) {
+            return Ok(DeliveryTaskOutcome::Finished);
+        }
         let claimed = engine
             .repositories()
             .claim_provider_turn(row.command_id, now())
