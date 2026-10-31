@@ -263,6 +263,42 @@ set, and all but `refresh_providers` work at read-only.
 - `profiler_symbolicate` and symbol downloads stay on `bibcode profiler mcp`, and the server
   log and the diagnostics bundle stay in the app.
 
+### What changed, and this server
+
+These two belong to no set: they are always listed and work at read-only.
+
+| Tool                  | What it does                                                                                                                                                                      |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `server_capabilities` | Server version, MCP protocol versions, `toolsVersion`, the agent's effective ceiling, the sets that are on, its scopes, and every error type with what it means and what fixes it |
+| `changes_since`       | What changed since a cursor, as ids and states only, from BiBCode's event log and the agent activity log                                                                          |
+
+- **`toolsVersion`** is a hash of the tools this agent can see now. When it changes (a set
+  turned off, a lower ceiling), list the tools again.
+- **Errors.** Every failure is a tool result with an error type (`_tag`), such as
+  `McpServerDisabledError`, `McpCapabilityDisabledError`, `McpScopeError`, `McpBusyError`,
+  `McpOutcomeUnknownError`, `idempotency_conflict` or `McpPartialOutcomeError`.
+  `server_capabilities` lists them all. Through `bibcode mcp`, a revoked credential is
+  `McpCredentialRefusedError` and a server that stopped is `McpServerUnreachableError`; a
+  remote HTTP client gets a 401 for a refused credential.
+- **Following changes.** Call `changes_since` once without a cursor: it returns where the
+  logs are now and no entries. Pass each call's `cursor` to the next, and call again at once
+  while `more` is true. An entry is `{ cursor, at, kind, threadId, status, requestId,
+  actor }`, never text:
+  - `thread.created`, `panel.created`, `thread.archived`;
+  - `turn.requested`, `turn.started`, `turn.completed`, `turn.interrupted`, `turn.failed`,
+    and `session.status` for any other change of the session's status;
+  - `approval.requested`, `approval.resolved`, `input.requested`, `input.resolved`, each
+    with its `requestId` (`status` is `resolved` or `expired`);
+  - `agent.call` for each change an outside agent made through MCP, with its `tool`, its
+    outcome as `status`, and a `target` of ids (a commit, a pull request number, a file
+    count).
+- **Nothing is missed.** Both logs are on disk and page by id, so a cursor still works after
+  a reconnect or a restart. One call scans at most 5,000 events and returns its position
+  even when none matched. `threadId` keeps one thread's changes; use one cursor per filter.
+  Agent activity is kept for 7 days or 5,000 rows: an older cursor sets `activityDropped`.
+- **Not in the feed:** Git operations a person ran in the app, worktree and file changes, and
+  profiler findings, which `profiler_findings` pages with its own cursor.
+
 ### Who acted, Stop and Take over
 
 BiBCode marks what an outside agent does, whoever is looking:

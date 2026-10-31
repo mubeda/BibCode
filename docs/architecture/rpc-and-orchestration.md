@@ -3523,6 +3523,34 @@ The profiler tools take no RPC admission: they read files in process, as the std
 server does. A section of `diagnose_environment` that fails carries its error's tag
 instead of failing the call.
 
+### Feed tools
+
+`mcp::tools::feed` holds the two tools of no capability set (slice X3). Both need
+`orchestration:read`, call no RPC, and are listed at every ceiling.
+
+- **`server_capabilities`** returns `CARGO_PKG_VERSION` (as `serverInfo` does), the MCP
+  `protocol::VERSIONS`, the remote protocol window, `toolsVersion` (the first 8 bytes of
+  the SHA-256 of `McpControl::tools(principal)`, hex), the effective ceiling, the
+  `mcpCapabilities` sets, the credential's scopes, and `feed::ERRORS`, the table of every
+  tag the MCP layer returns with its meaning and fix. A unit test scans `mcp/**` and
+  `rpc/session.rs` and fails on an `Mcp…Error` literal the table lacks.
+- **`changes_since`** reads `Repositories::read_change_feed` in one SQLite transaction: at
+  most 5,000 events after the cursor's sequence (a thread's through its stream index), of
+  which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
+  `thread.session-set` and the approval and input `thread.activity-appended` events come
+  back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`;
+  and the `mcp_activity` rows after the cursor's activity id. A session update reads the
+  status and turn of the thread's previous session update, so it maps to `turn.started`,
+  `turn.completed`, `turn.interrupted`, `turn.failed` or `session.status`, or to nothing.
+  The cursor is `v1.<sequence>.<activityId>`; a page lists event entries first, then
+  activity entries, each with the cursor just after it, so cursors increase strictly and
+  nothing written in the same second is skipped. `activityDropped` compares the cursor
+  with the oldest activity row, or with `sqlite_sequence` once every row is pruned.
+- **The stdio relay** answers a `tools/call` whose credential is refused with
+  `McpCredentialRefusedError`, one it cannot deliver with `McpServerUnreachableError`, and
+  one it cannot sign in for with `McpSignInError`, each a typed tool result; other requests
+  keep their JSON-RPC errors.
+
 ### Actor attribution and agent activity
 
 Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.

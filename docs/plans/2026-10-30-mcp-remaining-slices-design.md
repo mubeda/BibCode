@@ -3903,3 +3903,106 @@ with a test that failed first:
   later subscriber never sees older rows even when nothing was written; a periodic sweep was
   not needed.
 - **Not changed:** the forged `sourceThreadId` finding is X4's (see the APIs above).
+
+## X3 implementation notes (2026-10-31)
+
+X3 was implemented on `claude/v0131-139-x3`, from the batch tip `8d400e20df` (slice 1, the
+CLI, F0, wave 1, D, T, X2, X1 and their review fixes). It adds `mcp/tools/feed.rs`
+(`server_capabilities`, `changes_since` and the error table), the transition read in
+`persistence/repositories.rs` (`change_feed_heads`, `read_change_feed`) and
+`production/mcp_tools_tests/feed.rs`, with one registration line each in
+`mcp/tools/mod.rs`, `control::FAMILIES` and `mcp_tools_tests/mod.rs`. No contract,
+migration, RPC method or `latency.rs` entry changed.
+
+**The relay check (the section's "verify … and fix it here if not").** Slice 1's relay did
+not: a `tools/call` refused with 401 answered an untyped `tool_failure(REVOKED_MESSAGE)`, and
+one it could not deliver answered a JSON-RPC `INTERNAL_ERROR`, not a tool result. `relay.rs`
+(outside X3's row, by the section's own instruction) now answers a `tools/call` with
+`McpCredentialRefusedError` (401), `McpServerUnreachableError` (no server after one
+rediscovery) or `McpSignInError` (minting or the token exchange failed), each a typed tool
+result with the same message as before; every other request keeps its JSON-RPC error.
+`mcp/relay/tests.rs` asserts the tag on the existing revocation test and adds a server that
+stopped mid-session. A remote HTTP client still gets the 401 itself; the table says so.
+
+**Drift and choices the design left open:**
+
+- **Version source.** `server_capabilities` reads `CARGO_PKG_VERSION` (as `serverInfo` and
+  `ServerConfig::server_version`'s default do), `protocol::VERSIONS` and the remote protocol
+  constants, not the environment descriptor: `McpControl` holds no `ServerConfig`, and
+  `server.getConfig` carries paths and `mcpLaunch`. The values are the descriptor's own.
+- **`toolsVersion`** is the first 8 bytes, in hex, of the SHA-256 of the principal's
+  `tools/list` array, so a ceiling, capability or tool change moves it.
+- **The error table** (`feed::ERRORS`) holds every `Mcp…Error` tag the MCP layer writes, plus
+  `idempotency_conflict`, `UpdateMaintenanceActiveError`, and the three preview and device
+  tags slice D names; `otherErrors` says any other tag is the operation's own error. A unit
+  test scans `mcp/**` and `rpc/session.rs` for `"Mcp…Error"` literals and fails on one the
+  table lacks (`McpEndpointProofError` and `McpActivityError` are no tool results). **For the
+  combiner:** X4, X5 and X6 add families under `mcp/tools/` in this wave; any new
+  `Mcp…Error` tag they write fails
+  `mcp::tools::feed::tests::the_error_table_holds_every_tag_the_mcp_sources_return` until it
+  gets a row in `ERRORS`.
+- **Entry shape.** Beyond `{ cursor, at, kind, threadId?, status?, requestId?, actor? }`, an
+  agent-activity entry carries `tool` and `target` (X1's ids-and-counts target). Both are ids,
+  never text; without them an `agent.call` entry could not say what ran.
+- **Kinds.** One entry per event at most, so every entry has a cursor of its own:
+
+  | Event                                                      | Entry                                                                           |
+  | ---------------------------------------------------------- | ------------------------------------------------------------------------------- |
+  | `thread.created` (`kind: panel`)                           | `thread.created` (`panel.created`)                                              |
+  | `thread.archived`                                          | `thread.archived`                                                               |
+  | `thread.turn-start-requested`                              | `turn.requested` (added: the event a message carries its actor on)              |
+  | `thread.session-set` running with a new `activeTurnId`     | `turn.started`, `status: running`                                               |
+  | `thread.session-set` leaving running                       | `turn.failed` (error), `turn.interrupted`, else `turn.completed`; `status` kept |
+  | other `thread.session-set` whose status changed            | `session.status`                                                                |
+  | `approval.requested` / `.resolved` / `.expired` activity   | `approval.requested` / `approval.resolved` (`status: resolved` or `expired`)    |
+  | `user-input.requested` / `.resolved` / `.expired` activity | `input.requested` / `input.resolved` (the same)                                 |
+  | an `mcp_activity` row                                      | `agent.call` with `tool`, `target`, `status` (the outcome tag) and `actor`      |
+
+  A session update reads the thread's previous session update (`json_array` of its status and
+  turn, through the stream index) in the same query, which is what makes start and end
+  stateless per row. A compaction's own turn is reported as a turn too. Thread deletion and
+  unarchive are not in the design's list and are not reported.
+
+- **Content stays in SQLite.** The read selects `sequence`, `event_type`, `stream_id`,
+  `occurred_at` and `json_extract`ed ids and enums only; payload text never reaches Rust.
+  `requestId` is kept up to 256 characters without control characters, and an actor keeps its
+  `kind`, `clientId` and `label`.
+- **Paging.** A page lists the scanned window's transitions first, then activity rows, each
+  entry with the cursor just after it (`v1.<sequence>.<activityId>`), so cursors increase
+  strictly, componentwise. Every event of the window examined, the page cursor's sequence is
+  the window's last (progress even with no match); a page cut by `limit` or by the 80,000
+  characters (`fit_list`, at least one entry) ends at its last entry. `more` is true then, or
+  when the window hit 5,000 events. Interleaving the two logs by time was rejected:
+  `occurred_at` is not monotonic in `sequence`, so a time merge would break the cursor order.
+- **Filter.** `threadId` scans that thread's events through `idx_orch_events_stream_sequence`
+  (up to 5,000 of them) and its activity rows. The description says to keep one cursor per
+  filter, since a filtered cursor's sequence can pass other threads' events.
+- **`activityDropped`** is `cursor.activityId + 1 < MIN(activity_id)`, or, when every row is
+  pruned, `cursor.activityId < sqlite_sequence.seq` for `mcp_activity` (AUTOINCREMENT keeps
+  it). It looks at the whole table, also under a filter.
+- **A cursor ahead of either head** (from another database) is `McpInvalidArgumentError`, as
+  is a malformed one; the message says to start again without a cursor.
+- **`foundation.rs`** (`a_capability_set_turned_off_hides_and_refuses_its_tools_live`) asserted
+  that only Diagnostics tools remain with Workspace and Source control off; it now allows the
+  tools of no set too.
+
+**For X8.** A webhook payload carries the entry's `cursor`; a receiver that missed deliveries
+calls `changes_since { cursor }` with the last one it has and repeats while `more` is true.
+`profiler.finding` is not in this feed: X2's `profiler_findings { since }` cursor covers it.
+An entry's `kind`, `threadId`, `status`, `requestId` and `actor` are the webhook's natural
+event fields.
+
+**For X7.** Source Control reads are not in the feed (no durable record). Its commit
+message tools add no kinds here.
+
+**Tests** (written first; all failed against a stub family and the old relay):
+`production::mcp_tools_tests::feed` covers listing and calls at read-only with every set off;
+the capabilities (versions, ceiling, sets, scopes, error rows, `toolsVersion` stable and
+moved by a set or the ceiling); no cursor starting from now; a full agent turn and an
+approval whose prompt, reply, summary and purpose markers never appear, with strictly
+increasing cursors, resumable from any entry's cursor and through `limit: 2` pages; the
+`threadId` filter on both logs; the 5,000-event scan returning its progress; `activityDropped`
+after pruning, also with every row gone; refused cursors and limits; and a transition
+written to the file database while no server ran, read with the old cursor after a restart.
+`mcp::tools::feed::tests` covers the cursor's parsing, the session mapping and the error
+table scan; `mcp::relay::tests` the two typed relay failures.
