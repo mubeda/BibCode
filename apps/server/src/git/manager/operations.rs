@@ -2683,7 +2683,7 @@ mod discard_staging {
         ffi::{CStr, CString, OsStr},
         io::{self, Read, Write},
         os::{
-            fd::{AsRawFd, FromRawFd, OwnedFd},
+            fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
             unix::{ffi::OsStrExt, fs::OpenOptionsExt},
         },
         path::{Component, Path, PathBuf},
@@ -3165,88 +3165,16 @@ mod discard_staging {
         unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
     }
 
-    #[cfg(target_os = "linux")]
+    /// Renames `from_name` in `from` to `to_name` in `to`, never over an existing entry: the
+    /// workspace's shared no-replace rename, which falls back to a hard link where the file
+    /// system lacks the kernel's flag, and refuses a folder there (it then stays staged).
     fn rename_no_replace(
         from: &OwnedFd,
         from_name: &CStr,
         to: &OwnedFd,
         to_name: &CStr,
     ) -> io::Result<()> {
-        // SAFETY: both descriptors are open folders and both names are NUL-terminated.
-        let renamed = unsafe {
-            libc::renameat2(
-                from.as_raw_fd(),
-                from_name.as_ptr(),
-                to.as_raw_fd(),
-                to_name.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if renamed != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn rename_no_replace(
-        from: &OwnedFd,
-        from_name: &CStr,
-        to: &OwnedFd,
-        to_name: &CStr,
-    ) -> io::Result<()> {
-        // SAFETY: both descriptors are open folders and both names are NUL-terminated.
-        let renamed = unsafe {
-            libc::renameatx_np(
-                from.as_raw_fd(),
-                from_name.as_ptr(),
-                to.as_raw_fd(),
-                to_name.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        };
-        if renamed != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// Without an atomic no-replace rename, checks first; another unix has no native trash, so
-    /// every staged entry comes back here.
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    fn rename_no_replace(
-        from: &OwnedFd,
-        from_name: &CStr,
-        to: &OwnedFd,
-        to_name: &CStr,
-    ) -> io::Result<()> {
-        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `to` is an open descriptor, `to_name` is NUL-terminated and `status` is
-        // writable.
-        if unsafe {
-            libc::fstatat(
-                to.as_raw_fd(),
-                to_name.as_ptr(),
-                status.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-        {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
-        // SAFETY: both descriptors are open folders and both names are NUL-terminated.
-        if unsafe {
-            libc::renameat(
-                from.as_raw_fd(),
-                from_name.as_ptr(),
-                to.as_raw_fd(),
-                to_name.as_ptr(),
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        crate::workspace::beneath::rename_no_replace(from.as_fd(), from_name, to.as_fd(), to_name)
     }
 }
 
