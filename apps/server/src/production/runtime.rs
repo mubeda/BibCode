@@ -234,6 +234,7 @@ impl ProductionRuntime {
                 })
             }),
             self.mcp_control.clone(),
+            self.workspace.path_locks(),
         )
     }
 

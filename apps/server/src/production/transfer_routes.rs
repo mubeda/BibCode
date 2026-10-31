@@ -29,6 +29,7 @@ use crate::production::http_routes::{
     TransferUploadHttpOutcome,
 };
 use crate::transfer::{self, TransferAccess, TransferClaims};
+use crate::workspace::PathLocks;
 use crate::workspace::beneath::{Dir, Open, Root};
 use crate::workspace::paths;
 
@@ -202,7 +203,15 @@ fn downloads(
                     // A zip is produced as it streams, so its length is unknown until the
                     // last entry: the archive response stays chunked.
                     content_length: None,
-                    body: transfer::archive::archive_body_from(plan, folder, label),
+                    body: transfer::archive::archive_body_from(
+                        plan,
+                        folder,
+                        label,
+                        transfer::archive::ArchiveLimits {
+                            max_entries,
+                            max_bytes,
+                        },
+                    ),
                 }
             } else {
                 // Opened through a handle on its folder, never by a path that could have
@@ -350,29 +359,46 @@ pub fn upload_handler(
     access: TransferAccess,
     on_uploaded: UploadedCallback,
 ) -> TransferUploadHandler {
-    uploads(access, on_uploaded, None)
+    uploads(access, on_uploaded, None, PathLocks::default())
 }
 
 /// [`upload_handler`] that also serves the tokens outside agents mint, under `mcp`'s live
-/// controls.
+/// controls, and takes each upload's path in `locks`, the workspace service's, so no other
+/// BiBCode writer of that path runs while it does.
 #[must_use]
-pub fn upload_handler_with_mcp(
+pub(crate) fn upload_handler_with_mcp(
     access: TransferAccess,
     on_uploaded: UploadedCallback,
     mcp: McpControl,
+    locks: PathLocks,
 ) -> TransferUploadHandler {
-    uploads(access, on_uploaded, Some(mcp))
+    uploads(access, on_uploaded, Some(mcp), locks)
+}
+
+/// The tag of an upload refused because another BiBCode writer holds its path.
+const BUSY_TAG: &str = "TransferBusyError";
+
+fn busy() -> HttpRouteError {
+    HttpRouteError::new(
+        StatusCode::CONFLICT,
+        json!({
+            "_tag": BUSY_TAG,
+            "message": "Another BiBCode write or upload of this file is in progress; try again when it ends."
+        }),
+    )
 }
 
 fn uploads(
     access: TransferAccess,
     on_uploaded: UploadedCallback,
     mcp: Option<McpControl>,
+    locks: PathLocks,
 ) -> TransferUploadHandler {
     Arc::new(move |token, requested_name, overwrite, body, _context| {
         let access = access.clone();
         let on_uploaded = on_uploaded.clone();
         let mcp = mcp.clone();
+        let locks = locks.clone();
         Box::pin(async move {
             let Some(TransferClaims::Upload {
                 root,
@@ -428,6 +454,14 @@ fn uploads(
                     .await
                     .map_err(|_| not_found())?
                     .1
+            };
+            // The path is this upload's from its reservation to its install: a Files-panel
+            // save or `files_write` of it meanwhile is refused (`path_busy`).
+            let Ok(_held) = locks.lock_upload(&directory.join(&file_name)).await else {
+                if let Some(finish) = finish.as_mut() {
+                    finish.pending = BUSY_TAG;
+                }
+                return Err(busy());
             };
             let written = transfer::upload::write_upload(
                 &canonical_root,

@@ -17,6 +17,7 @@ pub use rpc::{
 #[allow(unused_imports)]
 pub use search::{EntryKind, SearchLimits, SearchResult, WorkspaceEntry, WorkspaceSearchIndex};
 #[allow(unused_imports)]
+pub(crate) use service::PathLocks;
 pub use service::{ReadFileResult, WorkspaceService};
 #[allow(unused_imports)]
 pub use watcher::{

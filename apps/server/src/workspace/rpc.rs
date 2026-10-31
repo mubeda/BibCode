@@ -654,6 +654,12 @@ impl WorkspaceRpc {
         }
     }
 
+    /// The per-path locks the service's writes take; the upload route takes the same ones, so
+    /// a save and an upload of one file never run together.
+    pub(crate) fn path_locks(&self) -> super::PathLocks {
+        self.service.path_locks()
+    }
+
     /// How many full workspace scans have run.
     ///
     /// Concurrent listers of the same cold root must share one scan, and this is the value that

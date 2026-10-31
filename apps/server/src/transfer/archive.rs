@@ -117,7 +117,7 @@ pub async fn plan_archive_with_limits(
 /// archive whose limits were never checked. I/O failures during streaming fail the response
 /// body and are logged since the HTTP response has already begun.
 pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
-    archive_body_with(plan, root.clone(), move || {
+    archive_body_with(plan, root.clone(), ArchiveLimits::default(), move || {
         Root::new(&root).and_then(|validated| Dir::open(&validated, &root, false))
     })
 }
@@ -125,21 +125,28 @@ pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
 /// [`archive_body`] over a folder already held open (`workspace::beneath`): the archive reads
 /// it, and every folder and file under it, through handles opened without following a
 /// symlink, so a folder swapped for a symlink while the archive streams is skipped, never
-/// followed. `label` names the folder in logs only.
-pub(crate) fn archive_body_from(plan: ArchivePlan, folder: Dir, label: PathBuf) -> Body {
-    archive_body_with(plan, label, move || Ok(folder))
+/// followed. `limits` hold while it streams too: a tree that grew past them since it was
+/// planned fails the stream. `label` names the folder in logs only.
+pub(crate) fn archive_body_from(
+    plan: ArchivePlan,
+    folder: Dir,
+    label: PathBuf,
+    limits: ArchiveLimits,
+) -> Body {
+    archive_body_with(plan, label, limits, move || Ok(folder))
 }
 
 fn archive_body_with(
     plan: ArchivePlan,
     root: PathBuf,
+    limits: ArchiveLimits,
     folder: impl FnOnce() -> io::Result<Dir> + Send + 'static,
 ) -> Body {
     tracing::debug!(root = %root.display(), entries = plan.entries, bytes = plan.bytes, "streaming folder download");
     let (writer, reader) = tokio::io::duplex(64 * 1024);
     let producer = tokio::task::spawn_blocking(move || {
         folder()
-            .and_then(|folder| write_archive(&folder, SyncIoBridge::new(writer)))
+            .and_then(|folder| write_archive(&folder, limits, SyncIoBridge::new(writer)))
             .inspect_err(|error| {
                 tracing::warn!(root = %root.display(), %error, "folder download stream failed");
             })
@@ -157,11 +164,27 @@ fn archive_body_with(
     Body::from_stream(ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_BYTES).chain(completion))
 }
 
-fn write_archive<W: Write>(root: &Dir, sink: W) -> io::Result<()> {
+/// The stream's failure when the tree outgrew a limit after it was planned.
+fn over_limit(limit: &str) -> io::Error {
+    io::Error::other(format!(
+        "the folder grew past the download's {limit} limit while it streamed"
+    ))
+}
+
+fn write_archive<W: Write>(root: &Dir, limits: ArchiveLimits, sink: W) -> io::Result<()> {
     let mut zip = ZipWriter::new_stream(sink);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .large_file(true);
+    // Counted as the plan counts them: every folder and file added.
+    let (mut entries, mut bytes) = (0_usize, 0_u64);
+    let mut count = || {
+        entries += 1;
+        if entries > limits.max_entries {
+            return Err(over_limit("entry"));
+        }
+        Ok(())
+    };
     // Each folder is held open and its children reached by name through it.
     let mut stack: Vec<(Option<Dir>, String)> = vec![(None, String::new())];
     while let Some((folder, prefix)) = stack.pop() {
@@ -173,6 +196,7 @@ fn write_archive<W: Write>(root: &Dir, sink: W) -> io::Result<()> {
             match folder.kind(&child)? {
                 Kind::Directory => match folder.open_dir(&child) {
                     Ok(inner) => {
+                        count()?;
                         zip.add_directory(format!("{name}/"), options)?;
                         stack.push((Some(inner), format!("{name}/")));
                     }
@@ -190,9 +214,16 @@ fn write_archive<W: Write>(root: &Dir, sink: W) -> io::Result<()> {
                     if !file.metadata()?.is_file() {
                         continue;
                     }
+                    count()?;
                     zip.start_file(name, options)?;
-                    let mut file: File = file;
-                    io::copy(&mut file, &mut zip)?;
+                    // At most one byte past what is left, so growth is caught without reading
+                    // the rest of a file that grew.
+                    let left = limits.max_bytes.saturating_sub(bytes);
+                    let file: File = file;
+                    bytes += io::copy(&mut io::Read::take(file, left.saturating_add(1)), &mut zip)?;
+                    if bytes > limits.max_bytes {
+                        return Err(over_limit("size"));
+                    }
                 }
                 // Symlinks are never followed, and other entries (sockets, FIFOs, devices)
                 // do not belong in a folder download; see `plan_archive_with_limits`.
@@ -269,7 +300,7 @@ mod tests {
         std::fs::rename(root.join("moved/sub"), root.join("moved/sub.real")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("moved/sub")).unwrap();
 
-        let body = archive_body_from(plan, folder, root.join("folder"));
+        let body = archive_body_from(plan, folder, root.join("folder"), ArchiveLimits::default());
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut names: Vec<String> = (0..archive.len())
@@ -300,6 +331,45 @@ mod tests {
                 .await
                 .is_err(),
             "an archive producer failure must not be reported as a successful HTTP body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_outgrows_its_limits_after_planning_fails_the_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join("a.txt"), b"1234").unwrap();
+        let limits = ArchiveLimits {
+            max_entries: 2,
+            max_bytes: 8,
+        };
+        let stream = |limits: ArchiveLimits| {
+            let validated = Root::new(&root).unwrap();
+            let folder = Dir::open(&validated, &root, false).unwrap();
+            let plan = ArchivePlan {
+                entries: 1,
+                bytes: 4,
+            };
+            axum::body::to_bytes(
+                archive_body_from(plan, folder, root.clone(), limits),
+                usize::MAX,
+            )
+        };
+        assert!(stream(limits).await.is_ok());
+        // More bytes than planned: the file grew.
+        std::fs::write(root.join("a.txt"), b"123456789").unwrap();
+        assert!(
+            stream(limits).await.is_err(),
+            "the size limit holds while streaming"
+        );
+        // More entries than planned.
+        std::fs::write(root.join("a.txt"), b"1").unwrap();
+        for name in ["b.txt", "c.txt"] {
+            std::fs::write(root.join(name), b"1").unwrap();
+        }
+        assert!(
+            stream(limits).await.is_err(),
+            "the entry limit holds while streaming"
         );
     }
 
