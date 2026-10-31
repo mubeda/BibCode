@@ -3217,8 +3217,19 @@ view), or free scrolling.
   released row then only goes on holding the reader's place. A send names its
   row pending before the previous row stops being positioned, so a takeover
   releases the pending row first.
-- **Settling.** The glide settles on `scrollend` or after 750 ms, whichever
-  comes first. A turn taller than the view is pinned where it is and then
+- **Glide.** `ChatView` drives the sent row's glide itself: each frame it
+  measures the row on screen (or, until the row mounts, takes its position
+  from LegendList), scrolls the scroller a fifth of the way there at once,
+  and settles once the row is within 1 px or 36 frames (about 600 ms) have
+  passed; a scroll the content cannot take yet is clamped and tried again the
+  next frame. With reduced motion it lands in one step. A browser's smooth
+  scroll runs off the page's thread, where a takeover cannot stop it: WebKit
+  finished it after a scroll key, over the stop, and on macOS arm64 that also
+  cancelled the key's own scroll, while LegendList held a row's growth during
+  it as an offset that a later scroll left behind (#214). A takeover cancels the next frame, so nothing scrolls
+  the timeline after the reader's input, and a new glide withdraws what the
+  list still holds, such as an earlier row's landing.
+- **Settling.** A turn taller than the view is pinned where it is and then
   follows its end. A turn that fits lands its sent row by measuring the row
   on screen (`[data-message-id]` against the scroller's top), not from
   LegendList's positions. It stays unsettled, with following waiting, until
@@ -3227,7 +3238,7 @@ view), or free scrolling.
   layout have passed, so a landing clamped to content that had not caught up
   lands again, for up to 2 s and 20 landings. It then settles where it is. A
   turn that grows past the view meanwhile settles at once and follows its
-  end. A takeover, a later send (its glide replaces the landing)
+  end. A takeover, a later send (its glide withdraws the landing)
   or another thread (the timeline remounts, and LegendList drops its
   requests) ends the landing; only a takeover needs to withdraw it.
 - **Following without a new entry.** A follow pass runs two frames after new
