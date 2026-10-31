@@ -69,6 +69,8 @@ const h = await vi.hoisted(async () => {
     updateSettings: { key: "server.updateSettings" },
     createManaged: { key: "worktree.createManaged" },
     createWorktree: vi.fn(),
+    registerMcpClient: { key: "mcpClients.register" },
+    unregisterMcpClient: { key: "mcpClients.unregister" },
     settingsUpdates: [] as unknown[],
   };
 });
@@ -94,7 +96,8 @@ vi.mock("~/state/environments", () => ({
         environmentId: "local",
         label: "local",
         connection: { phase: "connected" },
-        serverConfig: null,
+        // Its launch command shows Agent integrations' Connect an agent row (#139).
+        serverConfig: { mcpLaunch: { argv: ["/usr/local/bin/bibcode", "mcp"] } },
       },
     ],
     isReady: true,
@@ -119,6 +122,7 @@ vi.mock("~/state/use-atom-command", () => ({
       };
     }
     if (command === h.createManaged) return h.createWorktree;
+    if (command === h.registerMcpClient || command === h.unregisterMcpClient) return vi.fn();
     throw new Error(`Unexpected atom command: ${JSON.stringify(command)}`);
   },
 }));
@@ -157,6 +161,22 @@ vi.mock("~/state/mcpActivity", () => ({
   usePrimaryMcpClients: () => [],
   usePrimaryAgentAccess: () => ({ environmentId: null, canRead: false, canManage: false }),
   takenOverLevel: () => null,
+}));
+// …and Connect an agent reads which AI tools on the host have BiBCode added.
+vi.mock("~/state/mcpClients", () => ({
+  mcpClientsEnvironment: { register: h.registerMcpClient, unregister: h.unregisterMcpClient },
+  useMcpClientRegistrations: () => ({
+    data: {
+      clients: ["claude", "codex", "cursor", "opencode"].map((client) => ({
+        client,
+        installed: client !== "cursor",
+        registered: false,
+        error: null,
+      })),
+    },
+    error: null,
+    refresh: vi.fn(),
+  }),
 }));
 // …and its header summarizes the webhook endpoints.
 vi.mock("~/state/webhooks", () => ({
@@ -273,6 +293,29 @@ describe("Settings Default Agent reaches Create Worktree (#185)", () => {
     await React.act(async () => root.unmount());
     container.remove();
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+  });
+
+  it("offers one-click Connect an agent in Settings → Agents, without a path on screen", async () => {
+    await React.act(async () =>
+      root.render(
+        <App dialogOpen={false} projectRef={scopeProjectRef(PRIMARY_ENVIRONMENT_ID, PROJECT_ID)} />,
+      ),
+    );
+    const settings = required<HTMLElement>(container, "[data-testid='settings']");
+    expect(settings.textContent).toContain("Connect an agent");
+    expect(settings.textContent).not.toContain("/usr/local/bin/bibcode");
+    const lines = [...settings.querySelectorAll<HTMLElement>("[data-mcp-client]")];
+    expect(lines.map((line) => line.getAttribute("aria-label"))).toEqual([
+      "Claude Code",
+      "Codex",
+      "Cursor",
+      "OpenCode",
+    ]);
+    const addCursor = [...lines[2]!.querySelectorAll("button")].find(
+      (button) => button.textContent === "Add to Cursor",
+    );
+    expect(addCursor?.disabled).toBe(true);
+    expect(lines[2]!.textContent).toContain("Cursor isn't installed on this computer.");
   });
 
   it.each([

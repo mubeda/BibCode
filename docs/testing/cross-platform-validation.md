@@ -1730,10 +1730,15 @@ mcp_tools_tests connect_mcp auth::service::tests::the_mcp` (`mcp::` includes the
 from `apps/web`.
 
 1. In **Settings → Agents → Agent integrations**, check that **MCP server** is on,
-   **Agents may** reads Supervised, and the launch command names this install's
-   executable and data root (`--dev-url` for a development build).
-2. Use **Copy for Claude Code**, run it, restart Claude Code, and ask it to start a
-   thread in the project, wait for it, and show the diff. Expect one
+   **Agents may** reads Supervised, **Connect an agent** lists Claude Code, Codex,
+   Cursor and OpenCode (a tool not on this host disabled with its reason), and
+   **Other MCP clients** shows a command naming this install's executable and data root
+   (`--dev-url` and the Development build note for a development build).
+2. Click **Add to Claude Code** (the line then reads "Added to Claude Code";
+   `claude mcp get bibcode` agrees), restart Claude Code, and ask it to start a
+   thread in the project, wait for it, and show the diff. Repeat **Add to Cursor** and
+   **Add to OpenCode** against configs that already list another server, and check the
+   other entries survive the add and **Remove**. Expect one
    **MCP · claude-code** row in **Authorized clients** while it runs, and none after
    the agent exits.
 3. Run Codex with its default timeouts and ask for a `wait_for_thread` at

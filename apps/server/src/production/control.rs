@@ -23,7 +23,7 @@ use crate::{
     persistence::{read_json, write_bytes_atomically, write_json_atomically},
     production::{
         agent_activity::AgentActivitySettingsHandler,
-        keybindings, provider_inventory,
+        keybindings, mcp_client_registration, provider_inventory,
         provider_maintenance::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
             provider_version_advanced, provider_version_regressed,
@@ -1899,6 +1899,25 @@ impl ProductionServerControl for NativeServerControl {
                     control.update_keybinding(method, payload).await
                 }
                 "server.getTraceDiagnostics" => Ok(control.trace_diagnostics()),
+                "mcpClients.getRegistrations" => {
+                    let settings = control.settings.read().await.clone();
+                    let host = mcp_client_registration::Host::current(&control.config.base_dir);
+                    Ok(
+                        mcp_client_registration::registrations(&settings, &host, &cancellation)
+                            .await,
+                    )
+                }
+                "mcpClients.register" => {
+                    let settings = control.settings.read().await.clone();
+                    let host = mcp_client_registration::Host::current(&control.config.base_dir);
+                    let launch = mcp_launch_argv(&control.config);
+                    mcp_client_registration::register(&settings, launch, payload, &host).await
+                }
+                "mcpClients.unregister" => {
+                    let settings = control.settings.read().await.clone();
+                    let host = mcp_client_registration::Host::current(&control.config.base_dir);
+                    mcp_client_registration::unregister(&settings, payload, &host).await
+                }
                 _ => Err(json!({
                     "_tag": "InvalidRequest",
                     "method": method,
@@ -2100,9 +2119,11 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
 /// and quotes it, so it never guesses a path, a root or a state. `null` when the executable is
 /// unknown.
 fn mcp_launch(config: &ServerConfig) -> Value {
-    let Ok(executable) = std::env::current_exe() else {
-        return Value::Null;
-    };
+    mcp_launch_argv(config).map_or(Value::Null, |argv| json!({ "argv": argv }))
+}
+
+fn mcp_launch_argv(config: &ServerConfig) -> Option<Vec<String>> {
+    let executable = std::env::current_exe().ok()?;
     let mut argv = vec![
         executable.to_string_lossy().into_owned(),
         "mcp".to_owned(),
@@ -2112,7 +2133,7 @@ fn mcp_launch(config: &ServerConfig) -> Value {
     if let Some(dev_url) = &config.dev_url {
         argv.extend(["--dev-url".to_owned(), dev_url.to_string()]);
     }
-    json!({ "argv": argv })
+    Some(argv)
 }
 
 fn webhooks_setting(settings: &Value) -> bool {

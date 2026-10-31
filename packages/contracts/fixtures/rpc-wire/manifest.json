@@ -158,6 +158,18 @@
       "mode": "unary"
     },
     {
+      "name": "mcpClients.getRegistrations",
+      "mode": "unary"
+    },
+    {
+      "name": "mcpClients.register",
+      "mode": "unary"
+    },
+    {
+      "name": "mcpClients.unregister",
+      "mode": "unary"
+    },
+    {
       "name": "orchestration.dispatchCommand",
       "mode": "unary"
     },
@@ -908,6 +920,12 @@
     "typed-failures/gitManager__stagePartial-00.json",
     "typed-failures/gitManager__undoCommit-00.json",
     "typed-failures/gitManager__unstagePartial-00.json",
+    "typed-failures/mcpClients__getRegistrations-00.json",
+    "typed-failures/mcpClients__getRegistrations-01.json",
+    "typed-failures/mcpClients__register-00.json",
+    "typed-failures/mcpClients__register-01.json",
+    "typed-failures/mcpClients__unregister-00.json",
+    "typed-failures/mcpClients__unregister-01.json",
     "typed-failures/orchestration__dispatchCommand-00.json",
     "typed-failures/orchestration__dispatchCommand-01.json",
     "typed-failures/orchestration__dispatchCommand-02.json",
@@ -1312,6 +1330,12 @@
     "typed-failures/gitManager__stagePartial-00.json": "d5a39daf7ea7879fb6386bc2c2639a790ab6a9d69b9dcf4c24aa162ef4b6c3af",
     "typed-failures/gitManager__undoCommit-00.json": "d5a39daf7ea7879fb6386bc2c2639a790ab6a9d69b9dcf4c24aa162ef4b6c3af",
     "typed-failures/gitManager__unstagePartial-00.json": "d5a39daf7ea7879fb6386bc2c2639a790ab6a9d69b9dcf4c24aa162ef4b6c3af",
+    "typed-failures/mcpClients__getRegistrations-00.json": "64935c908fd715aa461725a9737c209daba7372b6225b375f3e337e78d4496e8",
+    "typed-failures/mcpClients__getRegistrations-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/mcpClients__register-00.json": "64935c908fd715aa461725a9737c209daba7372b6225b375f3e337e78d4496e8",
+    "typed-failures/mcpClients__register-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/mcpClients__unregister-00.json": "64935c908fd715aa461725a9737c209daba7372b6225b375f3e337e78d4496e8",
+    "typed-failures/mcpClients__unregister-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/orchestration__dispatchCommand-00.json": "e793ffa450f71306e3e9d249a627d7d46ca09d140749f2f5fbe2c9b2bd95a7e5",
     "typed-failures/orchestration__dispatchCommand-01.json": "907dbc8f2b582206a6078a5159fba190d03e201fb1e71ca2aa6d61a081596fd6",
     "typed-failures/orchestration__dispatchCommand-02.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
@@ -1903,6 +1927,12 @@
     "typed-failures/git__resolvePullRequest-01.json",
     "typed-failures/git__resolvePullRequest-02.json",
     "typed-failures/git__resolvePullRequest-03.json",
+    "typed-failures/mcpClients__getRegistrations-00.json",
+    "typed-failures/mcpClients__getRegistrations-01.json",
+    "typed-failures/mcpClients__register-00.json",
+    "typed-failures/mcpClients__register-01.json",
+    "typed-failures/mcpClients__unregister-00.json",
+    "typed-failures/mcpClients__unregister-01.json",
     "typed-failures/orchestration__dispatchCommand-00.json",
     "typed-failures/orchestration__dispatchCommand-01.json",
     "typed-failures/orchestration__dispatchCommand-02.json",

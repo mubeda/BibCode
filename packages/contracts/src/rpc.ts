@@ -87,6 +87,13 @@ import {
 } from "./auth.ts";
 import { McpActivityError, McpActivityStreamEvent } from "./mcpActivity.ts";
 import {
+  McpClientRegistration,
+  McpClientRegistrationError,
+  McpClientsChangeInput,
+  McpClientsGetRegistrationsInput,
+  McpClientsGetRegistrationsResult,
+} from "./mcpClients.ts";
+import {
   UiIntentError,
   UiIntentStreamEvent,
   UiPublishIntentInput,
@@ -695,6 +702,11 @@ export const WS_METHODS = {
   webhooksRotateSecret: "webhooks.rotateSecret",
   webhooksSendTest: "webhooks.sendTest",
   webhooksRedeliver: "webhooks.redeliver",
+
+  // Connect an agent: add BiBCode to Claude Code or Codex on the server's host (#139)
+  mcpClientsGetRegistrations: "mcpClients.getRegistrations",
+  mcpClientsRegister: "mcpClients.register",
+  mcpClientsUnregister: "mcpClients.unregister",
 
   // Remote updater methods
   updaterActiveWork: "updater.activeWork",
@@ -2141,6 +2153,27 @@ export const WsWebhooksRedeliverRpc = Rpc.make(WS_METHODS.webhooksRedeliver, {
   error: Schema.Union([WebhookError, EnvironmentRpcError]),
 });
 
+/** Whether Claude Code and Codex on the server's host have `bibcode` added. `access:read`. */
+export const WsMcpClientsGetRegistrationsRpc = Rpc.make(WS_METHODS.mcpClientsGetRegistrations, {
+  payload: McpClientsGetRegistrationsInput,
+  success: McpClientsGetRegistrationsResult,
+  error: Schema.Union([McpClientRegistrationError, EnvironmentRpcError]),
+});
+
+/** Adds `bibcode` to that tool with the server's launch command, replacing an old entry. `access:write`. */
+export const WsMcpClientsRegisterRpc = Rpc.make(WS_METHODS.mcpClientsRegister, {
+  payload: McpClientsChangeInput,
+  success: McpClientRegistration,
+  error: Schema.Union([McpClientRegistrationError, EnvironmentRpcError]),
+});
+
+/** Removes `bibcode` from that tool; already gone is success. `access:write`. */
+export const WsMcpClientsUnregisterRpc = Rpc.make(WS_METHODS.mcpClientsUnregister, {
+  payload: McpClientsChangeInput,
+  success: McpClientRegistration,
+  error: Schema.Union([McpClientRegistrationError, EnvironmentRpcError]),
+});
+
 export const WsActivityGetSnapshotRpc = Rpc.make(WS_METHODS.activityGetSnapshot, {
   payload: ActivityGetSnapshotInput,
   success: ActivitySnapshot,
@@ -2382,6 +2415,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsWebhooksRotateSecretRpc,
   WsWebhooksSendTestRpc,
   WsWebhooksRedeliverRpc,
+  WsMcpClientsGetRegistrationsRpc,
+  WsMcpClientsRegisterRpc,
+  WsMcpClientsUnregisterRpc,
   WsActivityGetSnapshotRpc,
   WsActivityListRosterRpc,
   WsActivityListDetailRpc,

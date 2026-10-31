@@ -495,6 +495,10 @@ fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalSe
         "server.updateProvider",
         "server.updateSettings",
         "server.upsertKeybinding",
+        // Connect an agent (#139): add BiBCode to Claude Code or Codex on this host.
+        "mcpClients.getRegistrations",
+        "mcpClients.register",
+        "mcpClients.unregister",
     ] {
         let control = services.control.clone();
         registry.register_unary(method, move |request, cancellation| {

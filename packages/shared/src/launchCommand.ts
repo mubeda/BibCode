@@ -73,8 +73,3 @@ export function sshLaunchArgv(
 export function wslLaunchArgv(distro: string, argv: ReadonlyArray<string>): ReadonlyArray<string> {
   return ["wsl.exe", "-d", distro, "--exec", ...argv];
 }
-
-/** The agent registration commands, for the harness's own CLI. */
-export function agentRegistrationCommand(agent: "claude" | "codex", launch: string): string {
-  return `${agent} mcp add bibcode -- ${launch}`;
-}

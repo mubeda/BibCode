@@ -18,12 +18,24 @@ versions, access levels and the safety model. Point an agent at it.
    connected, pick one.
 2. Leave **MCP server** on (it is on by default), and choose what **Agents may** do: Read
    only, Supervised (the default), Auto-accept edits, or Full access.
-3. Under **Launch command**, use **Copy for Claude Code** or **Copy for Codex** and run the
-   copied command in a terminal. It adds an MCP server named `bibcode` to that agent.
+3. Under **Connect an agent**, click **Add to Claude Code**, **Add to Codex**, **Add to
+   Cursor** or **Add to OpenCode**. BiBCode adds an MCP server named `bibcode` to that tool
+   and the line then reads "Added to …" with **Remove** to take it out again.
 4. Restart the agent so it loads the new server.
 
-The copied command already names the right executable, data root and, for a development
-build, its dev state. Without the Settings page, register it by hand:
+BiBCode adds itself on the computer the selected environment runs on, which is where the
+agent has to run: for a remote environment, the tools on that host, not this computer. It
+uses the tool's own command where there is one (`claude mcp add --scope user`,
+`codex mcp add`) and otherwise changes only the `bibcode` entry of the tool's user config
+(`~/.cursor/mcp.json`, `~/.config/opencode/opencode.json`), keeping everything else in the
+file. A config file that is not plain JSON (for example one with comments) is left
+unchanged, and the line says so. A tool BiBCode cannot find on that host shows its button
+disabled with the reason. Adding again replaces the entry with the current command.
+
+**Other MCP clients** (collapsed) holds the command and the standard `mcpServers` JSON for
+any other tool, with **Copy command** and **Copy MCP config**. They name the right
+executable, data root and, for a development build, its dev state. Without the Settings
+page, register it by hand:
 
 | BiBCode runs as         | Command to add                                                                               |
 | ----------------------- | -------------------------------------------------------------------------------------------- |

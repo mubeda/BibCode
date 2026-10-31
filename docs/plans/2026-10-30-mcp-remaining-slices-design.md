@@ -5555,3 +5555,96 @@ the live controls, and three P2s, each fixed with a failing-first test:
 
 Residual: the server still cannot prove that a proxy overwrote `X-Forwarded-For`; an
 unrecipe'd proxy only lets its callers crowd the `proxy` class, never another class.
+
+## Connect an agent: one-click registration (2026-10-31)
+
+The user reviewed Settings → Agents → Agent integrations → MCP and rejected the **Launch
+command** row: a wall of raw text (in a development build, four wrapped lines of paths)
+followed by three small copy buttons. Copy-then-paste was itself the wrong model: the person
+wants Claude Code or Codex to know about BiBCode, not a command to run.
+
+**Design.** The row becomes **Connect an agent**. Each supported tool (Claude Code, Codex,
+Cursor, OpenCode; not Gemini) gets a line with its state and one action:
+
+| State                               | Line shows                                          | Action                                               |
+| ----------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
+| CLI not found on the server's host  | "Codex isn't installed on this computer." (or host) | **Add to Codex**, disabled, described by that reason |
+| Installed, `bibcode` not registered | nothing extra                                       | **Add to Codex**                                     |
+| Registered                          | "Added to Codex" with a check                       | **Remove**                                           |
+| Busy                                | "Adding…" / "Removing…" on the button               | disabled                                             |
+| Failed                              | what the CLI said, and how to fix it                | the same action again                                |
+
+No confirmation: the change is one entry named `bibcode` in that tool's own config, and
+**Remove** undoes it. The raw command and the standard `mcpServers` JSON move into a
+collapsed **Other MCP clients** disclosure, which shows `…/<executable> mcp …` (full path in
+the tooltip) and copies the full value. Development-only flags (`--dev-url`) come from the
+server's argv as before and are explained there by a muted "Development build" note.
+
+**Server.** Three typed RPC methods, dispatched by `NativeServerControl`:
+
+- `mcpClients.getRegistrations` → `{ clients: [{ client, installed, registered, error }] }`
+  for `claude` and `codex`, read in parallel with each CLI's own read command:
+  `claude mcp get bibcode` and `codex mcp get bibcode`. Exit 0 is registered; a non-zero
+  exit whose output says "No MCP server named" is not; anything else is that client's
+  `error`, not an RPC failure.
+- `mcpClients.register { client }` runs `claude mcp add --scope user bibcode -- <argv…>` or
+  `codex mcp add bibcode -- <argv…>` with the server's own `mcpLaunch.argv`. If the add fails
+  and the read command says `bibcode` already exists, it removes that entry
+  (`claude mcp remove --scope user bibcode`, `codex mcp remove bibcode`) and adds again, so
+  re-adding updates the entry instead of duplicating or refusing.
+- `mcpClients.unregister { client }` runs the remove command (for Claude without `--scope`,
+  so an entry in any scope goes). An entry that is already gone is success.
+
+**Cursor and OpenCode: config files.** Checked on this machine without changing anything:
+`cursor-agent mcp --help` offers `login`, `list`, `list-tools`, `enable` and `disable` but no
+add or remove, and `opencode mcp add` (1.19.5) takes `--url` for a remote server and asks
+interactively for a local one, with no remove. So BiBCode edits their documented user
+config: Cursor's `~/.cursor/mcp.json` (`mcpServers.bibcode = { command, args }`) and
+OpenCode's `$XDG_CONFIG_HOME/opencode/opencode.json`, else `~/.config/opencode/` (an existing
+`opencode.jsonc` is used when there is no `.json`; `mcp.bibcode = { type: "local", command:
+[...], enabled: true }`, per opencode.ai/docs/mcp-servers and /docs/config). The edit parses
+the file into an order-keeping tree, changes only `bibcode`, and replaces the file with a
+temporary file in the same folder, the old file's mode and a rename (through a symlink to
+its target). There is no JSONC parser in the server, so a file with comments, or any file
+that is not plain JSON, or whose MCP section is not an object, is refused unchanged
+(`invalid_config`) with a message that names the file; stripping comments would lose them.
+Cursor counts as installed when its CLI (the `cursor` provider's `cursor-agent`) is found or
+`~/.cursor` exists; OpenCode when the `opencode` provider's CLI is found. BiBCode creates a
+config folder only for a tool it found (OpenCode's `~/.config/opencode` may not exist yet).
+
+The CLI is found the way the provider probes find it: the provider instance's `binaryPath`
+(else `claude`/`codex`) and its environment, through `maintenance_target`,
+`resolve_provider_executable_with_environment` and `prepare_provider_launch`. Every command
+runs through the supervised `git::ProcessRunner` (timeouts: 45 s for a read, 20 s for a
+change), in the home directory so the reads and changes see the same scopes. Errors are
+`McpClientRegistrationError { reason, message }` with `reason` one of `invalid`,
+`not_installed`, `unsupported` (no launch command), `invalid_config`, `failed` (the CLI's
+own words, first lines, trimmed) and `timed_out`. The read reports all four tools, in that
+order, in parallel.
+
+**Scopes.** `getRegistrations` needs `access:read`; `register` and `unregister` need
+`access:write`. They change the person's tool configuration, so an outside agent's
+`mcp-client` session, which never holds `access:*`, cannot call them. All three are
+long-running for the profiler: `claude mcp get` health-checks the entry it finds, which
+starts `bibcode mcp` and connects it back to this server.
+
+**Remote environments register on the remote host.** The server runs the CLI on its own
+host, which is where `bibcode mcp` must run and where that environment's agents run. For a
+remote environment the row says so ("on Build box's host"); Claude Code on this computer is
+not touched. Agents on other computers keep using **Remote agents** (HTTPS and OAuth), which
+stays a separate row.
+
+**Trade-offs.**
+
+- _CLI read vs config file._ Reading `~/.claude.json` or `~/.codex/config.toml` directly
+  would be instant and would not start a relay, but would couple BiBCode to two private file
+  formats and their scope rules. The CLI's own command follows each tool's rules exactly; the
+  cost is a slower read. The status is read when the row opens and after each change, never
+  on a timer.
+- _Add-then-replace vs remove-then-add._ Removing first would be one code path, but a failed
+  add after it leaves the person without the entry they had. Adding first keeps the old
+  entry whenever the new one cannot be written.
+- _Both rows always visible._ A CLI that is not installed is shown disabled with the reason,
+  not hidden, so the person learns why BiBCode cannot add itself there.
+- _Copy fallback kept._ Other MCP clients (Cursor, editors) have no CLI to call, so the
+  command and the JSON stay available, collapsed.
