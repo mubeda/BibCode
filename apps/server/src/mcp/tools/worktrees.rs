@@ -32,6 +32,8 @@ const REMOVE: &str = "worktree.remove";
 const DETACH: &str = "worktree.removeFromBibCode";
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MOST_LIST_LIMIT: usize = 200;
+/// Starts the `planToken` of a plan whose `pruneImpact` did not fit in the result.
+const PARTIAL_IMPACT: &str = "partial-impact:";
 
 /// The worktree tools, in the order `tools/list` shows them.
 pub(crate) const TOOLS: &[ToolSpec] = &[
@@ -107,7 +109,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
             ),
         ),
         "get_worktree_removal_plan" => (
-            "What removing a worktree would do: trackedChangeCount and untrackedFileCount (removing the folder loses them), availability, whether Git has it locked, and the other stale worktrees a removal would prune. Pass its planToken and generation to remove_worktree, after telling the person what will be lost.",
+            "What removing a worktree would do: trackedChangeCount and untrackedFileCount (removing the folder loses them), availability, whether Git has it locked, and the other stale worktrees a removal would prune (pruneImpact, pruneImpactCount in all; when they do not all fit, truncated is set and remove_worktree refuses confirmRepositoryWidePrune). Pass its planToken and generation to remove_worktree, after telling the person what will be lost.",
             object(json!({ "threadId": host }), &["threadId"]),
         ),
         "remove_worktree" => (
@@ -119,7 +121,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
                     "planToken": { "type": "string", "description": "From get_worktree_removal_plan; required for delete and cleanup." },
                     "expectedGeneration": { "type": "integer", "minimum": 0, "description": "The plan's generation; required for delete and cleanup." },
                     "discardChanges": { "type": "boolean", "description": "Delete even with uncommitted changes, losing them. Off unless set." },
-                    "confirmRepositoryWidePrune": { "type": "boolean", "description": "Also prune the other stale worktrees the plan lists (pruneImpact). Off unless set." },
+                    "confirmRepositoryWidePrune": { "type": "boolean", "description": "Also prune the other stale worktrees the plan lists (pruneImpact). Off unless set; refused when the plan could not list them all." },
                     "clientRequestId": request_id,
                 }),
                 &["threadId", "mode"],
@@ -379,7 +381,14 @@ impl ToolCall<'_> {
             )
             .await?;
         plan["threadId"] = thread_id.into();
-        Ok(tool_result(plan, &[("/pruneImpact", Cut::Back)]))
+        plan["pruneImpactCount"] = plan["pruneImpact"].as_array().map_or(0, Vec::len).into();
+        // A confirmed prune removes every registration the token covers, so a plan that cannot
+        // show them all marks its token, and remove_worktree refuses to prune with it.
+        if fit_list(&mut plan, "/pruneImpact", Cut::Back, 0) > 0 {
+            let token = plan["planToken"].as_str().unwrap_or_default();
+            plan["planToken"] = format!("{PARTIAL_IMPACT}{token}").into();
+        }
+        Ok(tool_result(plan, &[]))
     }
 
     async fn remove_worktree(&self) -> ToolResult {
@@ -404,7 +413,17 @@ impl ToolCall<'_> {
         let prune = self.boolean("confirmRepositoryWidePrune")?.unwrap_or(false);
         let plan = match git_mode {
             Some(_) => Some((
-                self.required("planToken")?,
+                {
+                    let token = self.required("planToken")?;
+                    let shown = token.strip_prefix(PARTIAL_IMPACT);
+                    if prune && shown.is_some() {
+                        return Err(typed_tool_failure(
+                            "McpPruneImpactTooLongError",
+                            "This plan's pruneImpact was too long to show in full, so confirmRepositoryWidePrune would prune worktrees you have not seen. Remove the worktree without it, or ask the person to remove it in BiBCode, which shows every worktree the prune affects.",
+                        ));
+                    }
+                    shown.unwrap_or(token)
+                },
                 self.integer("expectedGeneration")?.ok_or_else(|| {
                     invalid_argument(
                         "expectedGeneration is required: pass the generation get_worktree_removal_plan returned",
