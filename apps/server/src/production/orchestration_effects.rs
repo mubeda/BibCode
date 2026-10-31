@@ -441,6 +441,7 @@ fn bootstrap_process_error(error: ProcessError) -> String {
 }
 
 pub struct OrchestrationEffects {
+    engine: OrchestrationEngine,
     cancellation: CancellationToken,
     /// Identity reconciles run off the sequential worker so a slow `git` read never delays turn
     /// baselines; shutdown cancels and drains them.
@@ -468,6 +469,8 @@ impl OrchestrationEffects {
         let (sender, receiver) = mpsc::channel(options.queue_capacity.max(1));
 
         install_project_command_effects(&engine);
+        // The worker below records turn checkpoints, so a turn's end may hold its queue.
+        engine.set_checkpoint_holds_enabled(true);
         engine.set_bootstrap_effects(Arc::new(ProductionBootstrapEffects {
             repositories: engine.repositories(),
             repository: repository.clone(),
@@ -491,7 +494,7 @@ impl OrchestrationEffects {
             cancellation.clone(),
         ));
         let producer = tokio::spawn(run_producer(
-            engine,
+            engine.clone(),
             sender,
             cancellation.clone(),
             subscription,
@@ -499,6 +502,7 @@ impl OrchestrationEffects {
         ));
 
         Ok(Self {
+            engine,
             cancellation,
             identity_tasks,
             compaction_tasks,
@@ -515,6 +519,8 @@ impl OrchestrationEffects {
         if let Some(worker) = self.worker.lock().await.take() {
             let _ = worker.await;
         }
+        // Nothing records checkpoints any more: no queue waits for one.
+        self.engine.set_checkpoint_holds_enabled(false);
         self.identity_tasks.close();
         self.identity_tasks.wait().await;
         self.compaction_tasks.close();
@@ -1023,14 +1029,23 @@ async fn process_event(
 ) -> Result<(), OrchestrationEffectsError> {
     match event.event.event_type.as_str() {
         "thread.turn-start-requested" => {
-            ensure_baseline(engine, callbacks, event, cancellation).await
+            ensure_baseline(engine, callbacks, event, Baseline::TurnStart, cancellation).await
         }
         "thread.message-sent" if needs_turn_baseline(event) => {
-            ensure_baseline(engine, callbacks, event, cancellation).await
+            ensure_baseline(engine, callbacks, event, Baseline::Message, cancellation).await
         }
         "thread.turn-diff-completed"
             if event.event.payload.get("status").and_then(Value::as_str) == Some("missing") =>
         {
+            // However it ends, this turn no longer holds the thread's queued messages.
+            let payload = &event.event.payload;
+            let _release = event_thread_id(event)
+                .zip(payload.get("turnId").and_then(Value::as_str))
+                .map(|(thread_id, turn_id)| CheckpointHoldRelease {
+                    engine,
+                    thread_id,
+                    turn_id,
+                });
             capture_missing_checkpoint(engine, callbacks, event, cancellation).await
         }
         // Reached only without a thread id: the worker runs a revert with its thread reserved.
@@ -1041,6 +1056,9 @@ async fn process_event(
             ))
         }
         "thread.deleted" => {
+            if let Some(thread_id) = event_thread_id(event) {
+                engine.release_thread_checkpoint_holds(thread_id);
+            }
             cleanup_deleted_thread(callbacks, event).await;
             Ok(())
         }
@@ -1119,10 +1137,20 @@ fn needs_turn_baseline(event: &OrchestrationEvent) -> bool {
             != Some(true)
 }
 
+/// What asked for a turn's baseline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Baseline {
+    /// The turn starts now.
+    TurnStart,
+    /// A user message was sent. A queued one is sent while another turn may still run.
+    Message,
+}
+
 async fn ensure_baseline(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
     event: &OrchestrationEvent,
+    baseline: Baseline,
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     let Some(thread_id) = event.event.payload.get("threadId").and_then(Value::as_str) else {
@@ -1134,16 +1162,21 @@ async fn ensure_baseline(
     if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
         return Ok(());
     }
-    let turn_count = engine
+    let checkpoints = engine
         .repositories()
         .list_checkpoints_by_thread(thread_id.to_owned())
-        .await?
-        .into_iter()
+        .await?;
+    let turn_count = checkpoints
+        .iter()
         .map(|checkpoint| checkpoint.checkpoint_turn_count)
         .max()
         .unwrap_or(0);
+    let starting_message = event.event.payload.get("messageId").and_then(Value::as_str);
+    let stale_first_baseline = baseline == Baseline::TurnStart
+        && checkpoints.is_empty()
+        && had_turns_before_checkpoints(engine, thread_id, starting_message).await?;
     let reference = checkpoint_ref(thread_id, turn_count);
-    if !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
+    if stale_first_baseline || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
         capture_checkpoint_with_cancellation(
             &cwd,
             Path::new("git"),
@@ -1156,6 +1189,118 @@ async fn ensure_baseline(
     Ok(())
 }
 
+/// Whether a thread with no recorded checkpoint already ran turns, and no turn other than the
+/// one `starting_message` starts runs now. Its ref 0 was captured before the first of those
+/// turns (they predate turn checkpoints), so the checkout as it is now is the baseline of the
+/// turn that starts. If that turn is already running (the worker is behind), the checkout is
+/// captured as a first turn's baseline would be: the same window, never an old ref 0.
+async fn had_turns_before_checkpoints(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    starting_message: Option<&str>,
+) -> Result<bool, OrchestrationEffectsError> {
+    let turns = engine
+        .repositories()
+        .list_turns_by_thread(thread_id.to_owned())
+        .await?;
+    let another_turn_runs = turns.iter().any(|turn| {
+        turn.turn_id.is_some()
+            && turn.state == "running"
+            && turn.pending_message_id.as_deref() != starting_message
+    });
+    Ok(!another_turn_runs
+        && turns
+            .iter()
+            .any(|turn| turn.turn_id.is_some() && turn.state != "running"))
+}
+
+/// A turn's checkpoint, as the read model records it.
+struct TurnCheckpoint<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
+    turn_count: i64,
+    /// The turn's own answer, if it has one.
+    assistant_message_id: Option<String>,
+    completed_at: &'a str,
+}
+
+/// Releases a turn's checkpoint hold when dropped.
+struct CheckpointHoldRelease<'a> {
+    engine: &'a OrchestrationEngine,
+    thread_id: &'a str,
+    turn_id: &'a str,
+}
+
+impl Drop for CheckpointHoldRelease<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .release_checkpoint_hold(self.thread_id, self.turn_id);
+    }
+}
+
+/// How a turn ended, for its checkpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    /// The provider ended it: the checkout is as it left it.
+    Live,
+    /// A server restart cut it off: the checkout is no longer as it left it.
+    CutOff,
+}
+
+/// Records that turn `turn_id` of `thread_id` ended, before its session settles: its checkpoint
+/// number, `missing` until the effects worker captures the checkout (the `missing` event it
+/// handles next). The number is the next after the thread's recorded turns, so the numbers stay
+/// dense and the provider rewind a revert derives from them stays aligned with the turns, even
+/// when the capture never happens. A turn that already has a number is left alone: a repeated
+/// end never asks for a second capture, which could store a later checkout as this turn's. A
+/// live end holds the thread's queued messages until the capture, so a follow-up cannot edit the
+/// checkout first. A cut-off turn is numbered only after a recorded one: before any, the next
+/// turn's baseline starts the thread's checkpoints after it. A compaction's own turn is not a
+/// turn of the thread; callers never pass one. An error leaves the turn unnumbered and is the
+/// caller's, so a turn's end is never settled without its number.
+pub(crate) async fn record_turn_end(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    turn_id: &str,
+    completed_at: &str,
+    end: TurnEnd,
+) -> Result<(), OrchestrationEffectsError> {
+    let repositories = engine.repositories();
+    if repositories
+        .get_turn_by_id(thread_id.to_owned(), turn_id.to_owned())
+        .await?
+        .is_some_and(|turn| turn.checkpoint_turn_count.is_some())
+    {
+        return Ok(());
+    }
+    let latest = repositories
+        .list_checkpoints_by_thread(thread_id.to_owned())
+        .await?
+        .into_iter()
+        .map(|checkpoint| checkpoint.checkpoint_turn_count)
+        .max();
+    if end == TurnEnd::CutOff && latest.is_none() {
+        return Ok(());
+    }
+    if end == TurnEnd::Live {
+        engine.hold_promotion_for_checkpoint(thread_id, turn_id);
+    }
+    let checkpoint = TurnCheckpoint {
+        thread_id,
+        turn_id,
+        turn_count: latest.unwrap_or(0) + 1,
+        assistant_message_id: None,
+        completed_at,
+    };
+    let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new()).await;
+    if recorded.is_err() {
+        engine.release_checkpoint_hold(thread_id, turn_id);
+    }
+    recorded
+}
+
+/// Captures the checkpoint of a turn recorded `missing` and records it `ready`. A checkpoint ref
+/// that exists by now is kept, never overwritten with a later checkout.
 async fn capture_missing_checkpoint(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
@@ -1190,53 +1335,67 @@ async fn capture_missing_checkpoint(
     {
         return Ok(());
     }
-
-    let target_ref = checkpoint_ref(thread_id, turn_count);
-    capture_checkpoint_with_cancellation(
-        &cwd,
-        Path::new("git"),
+    let checkpoint = TurnCheckpoint {
         thread_id,
+        turn_id,
         turn_count,
-        cancellation,
-    )
-    .await?;
-    callbacks
-        .refresh_workspace(&cwd)
-        .await
-        .map_err(OrchestrationEffectsError::Effect)?;
+        assistant_message_id: payload
+            .get("assistantMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| existing.and_then(|turn| turn.assistant_message_id)),
+        completed_at: payload
+            .get("completedAt")
+            .and_then(Value::as_str)
+            .unwrap_or(&event.event.occurred_at),
+    };
+    record_checkpoint(engine, callbacks, &cwd, &checkpoint, false, cancellation).await
+}
+
+/// Captures the checkout as `checkpoint`'s ref (when `recapture`, or when the ref is missing),
+/// then records the checkpoint `ready` with the files changed since the turn before it.
+async fn record_checkpoint(
+    engine: &OrchestrationEngine,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    cwd: &Path,
+    checkpoint: &TurnCheckpoint<'_>,
+    recapture: bool,
+    cancellation: &CancellationToken,
+) -> Result<(), OrchestrationEffectsError> {
+    let TurnCheckpoint {
+        thread_id,
+        turn_id,
+        turn_count,
+        completed_at,
+        ..
+    } = *checkpoint;
+    let target_ref = checkpoint_ref(thread_id, turn_count);
+    if recapture || !has_ref(cwd, Path::new("git"), &target_ref, cancellation).await? {
+        capture_checkpoint_with_cancellation(
+            cwd,
+            Path::new("git"),
+            thread_id,
+            turn_count,
+            cancellation,
+        )
+        .await?;
+    }
+    // Only the displayed status reads it; the checkpoint itself is captured.
+    if callbacks.refresh_workspace(cwd).await.is_err() {
+        tracing::warn!(
+            thread_id,
+            turn_count,
+            "the workspace status was not refreshed after a checkpoint"
+        );
+    }
 
     let from_ref = checkpoint_ref(thread_id, turn_count.saturating_sub(1));
-    let files = if has_ref(&cwd, Path::new("git"), &from_ref, cancellation).await? {
-        diff_file_summaries(&cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?
+    let files = if has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
+        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?
     } else {
         Vec::new()
     };
-    let completed_at = payload
-        .get("completedAt")
-        .and_then(Value::as_str)
-        .unwrap_or(&event.event.occurred_at)
-        .to_owned();
-    let assistant_message_id = payload
-        .get("assistantMessageId")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| Some(format!("assistant:{turn_id}")));
-
-    engine
-        .dispatch(OrchestrationCommand::ThreadTurnDiffComplete {
-            command_id: server_id("checkpoint-turn-diff-complete"),
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            checkpoint_turn_count: turn_count,
-            checkpoint_ref: target_ref,
-            status: "ready".to_owned(),
-            files: Value::Array(files),
-            assistant_message_id,
-            completed_at: completed_at.clone(),
-            created_at: completed_at.clone(),
-        })
-        .await
-        .map_err(|error| OrchestrationEffectsError::Effect(error.to_string()))?;
+    dispatch_turn_checkpoint(engine, checkpoint, "ready", files).await?;
     engine
         .dispatch(OrchestrationCommand::ThreadActivityAppend {
             command_id: server_id("checkpoint-captured-activity"),
@@ -1249,13 +1408,37 @@ async fn capture_missing_checkpoint(
                 payload: json!({"turnCount":turn_count,"status":"ready"}),
                 turn_id: Some(turn_id.to_owned()),
                 sequence: None,
-                created_at: completed_at.clone(),
+                created_at: completed_at.to_owned(),
             },
-            created_at: completed_at,
+            created_at: completed_at.to_owned(),
         })
         .await
         .map_err(|error| OrchestrationEffectsError::Effect(error.to_string()))?;
     Ok(())
+}
+
+async fn dispatch_turn_checkpoint(
+    engine: &OrchestrationEngine,
+    checkpoint: &TurnCheckpoint<'_>,
+    status: &str,
+    files: Vec<Value>,
+) -> Result<(), OrchestrationEffectsError> {
+    engine
+        .dispatch(OrchestrationCommand::ThreadTurnDiffComplete {
+            command_id: server_id("checkpoint-turn-diff-complete"),
+            thread_id: checkpoint.thread_id.to_owned(),
+            turn_id: checkpoint.turn_id.to_owned(),
+            checkpoint_turn_count: checkpoint.turn_count,
+            checkpoint_ref: checkpoint_ref(checkpoint.thread_id, checkpoint.turn_count),
+            status: status.to_owned(),
+            files: Value::Array(files),
+            assistant_message_id: checkpoint.assistant_message_id.clone(),
+            completed_at: checkpoint.completed_at.to_owned(),
+            created_at: checkpoint.completed_at.to_owned(),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| OrchestrationEffectsError::Effect(error.to_string()))
 }
 
 /// A revert that passed its checks, with what its rewind and restore need. Planned while the
@@ -2094,6 +2277,77 @@ mod tests {
                 (json!("live"), true),
             ]
         );
+        engine.shutdown().await;
+    }
+
+    /// A turn a restart cut off keeps its place among the recorded turns, `missing`, so a revert
+    /// across it rewinds the provider by every turn. Before any recorded turn it is not numbered:
+    /// the next turn's baseline starts the thread's checkpoints after it.
+    #[tokio::test]
+    async fn a_cut_off_turn_is_numbered_only_after_a_recorded_turn() {
+        const AT: &str = "2026-10-31T00:00:00Z";
+        let engine = empty_event_log().await;
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"thread","threadId":"t","projectId":"p","title":"T","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap();
+        }
+        let repositories = engine.repositories();
+        let numbers = || async {
+            repositories
+                .list_checkpoints_by_thread("t".to_owned())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|checkpoint| {
+                    (
+                        checkpoint.turn_id,
+                        checkpoint.checkpoint_turn_count,
+                        checkpoint.status,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        record_turn_end(&engine, "t", "turn-0", AT, TurnEnd::CutOff)
+            .await
+            .unwrap();
+        assert_eq!(numbers().await, []);
+
+        engine
+            .dispatch(serde_json::from_value(json!({
+                "type":"thread.turn.diff.complete","commandId":"diff-1","threadId":"t","turnId":"turn-1",
+                "checkpointTurnCount":1,"checkpointRef":checkpoint_ref("t", 1),"status":"ready",
+                "files":[],"assistantMessageId":null,"completedAt":AT,"createdAt":AT
+            })).unwrap())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            record_turn_end(&engine, "t", "turn-2", AT, TurnEnd::CutOff)
+                .await
+                .unwrap();
+        }
+        // Recording a turn already recorded `ready` changes nothing.
+        record_turn_end(&engine, "t", "turn-1", AT, TurnEnd::CutOff)
+            .await
+            .unwrap();
+        assert_eq!(
+            numbers().await,
+            [
+                ("turn-1".to_owned(), 1, "ready".to_owned()),
+                ("turn-2".to_owned(), 2, "missing".to_owned()),
+            ]
+        );
+        // No effects worker records checkpoints here, so a live end holds no queue.
+        record_turn_end(&engine, "t", "turn-3", AT, TurnEnd::Live)
+            .await
+            .unwrap();
+        assert!(!engine.promotion_held_for_checkpoint("t"));
+        assert_eq!(numbers().await.len(), 3);
         engine.shutdown().await;
     }
 

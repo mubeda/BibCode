@@ -683,6 +683,30 @@ async fn revert_meets_the_ceiling_of_the_thread() {
     harness.shutdown().await;
 }
 
+/// A turn whose checkpoint was never captured (`missing`) has no diff to read: without a
+/// `turnCount`, `get_turn_diff` reads the latest captured turn, and a thread with none says so.
+#[tokio::test]
+async fn get_turn_diff_reads_only_captured_turns() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.turn.diff.complete", "commandId": "diff-1",
+            "threadId": thread_id, "turnId": "turn-1", "checkpointTurnCount": 1,
+            "checkpointRef": checkpoint_ref(&thread_id, 1), "status": "missing", "files": [],
+            "assistantMessageId": null, "completedAt": CREATED_AT, "createdAt": CREATED_AT,
+        })))
+        .await
+        .unwrap();
+    let diff = harness
+        .call(&agent, "get_turn_diff", json!({ "threadId": thread_id }))
+        .await;
+    assert_eq!(error_tag(&diff), "McpNoTurnDiffError", "{diff}");
+    harness.shutdown().await;
+}
+
 fn attachment(name: &str, mime_type: &str, bytes: &[u8]) -> Value {
     json!({ "name": name, "mimeType": mime_type, "data": STANDARD.encode(bytes) })
 }

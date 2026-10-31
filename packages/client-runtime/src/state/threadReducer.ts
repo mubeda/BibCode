@@ -547,16 +547,23 @@ export function applyThreadDetailEvent(
       const diffTurnStillRunning =
         thread.session?.status === "running" &&
         thread.session.activeTurnId === event.payload.turnId;
+      // A turn its session ended interrupted or failed keeps that state, and a checkpoint
+      // that names no answer keeps the one the turn already has.
+      const sameTurn =
+        thread.latestTurn?.turnId === event.payload.turnId ? thread.latestTurn : null;
       const latestTurn =
-        !diffTurnStillRunning &&
-        (thread.latestTurn === null || thread.latestTurn.turnId === event.payload.turnId)
+        !diffTurnStillRunning && (thread.latestTurn === null || sameTurn !== null)
           ? {
               turnId: event.payload.turnId,
-              state: checkpointStatusToTurnState(event.payload.status),
+              state:
+                sameTurn?.state === "interrupted" || sameTurn?.state === "error"
+                  ? sameTurn.state
+                  : checkpointStatusToTurnState(event.payload.status),
               requestedAt: thread.latestTurn?.requestedAt ?? event.payload.completedAt,
               startedAt: thread.latestTurn?.startedAt ?? event.payload.completedAt,
               completedAt: event.payload.completedAt,
-              assistantMessageId: event.payload.assistantMessageId,
+              assistantMessageId:
+                event.payload.assistantMessageId ?? sameTurn?.assistantMessageId ?? null,
             }
           : thread.latestTurn;
 

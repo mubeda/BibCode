@@ -982,7 +982,7 @@ impl ToolCall<'_> {
                     "A turn is running on this thread. Stop it with interrupt_turn, then revert.",
                 ));
             }
-            let latest = latest_checkpoint(self.control.repositories(), &thread_id)
+            let latest = latest_checkpoint(self.control.repositories(), &thread_id, false)
                 .await
                 .map_err(storage_failure)?
                 .unwrap_or(0);
@@ -1346,7 +1346,7 @@ impl ToolCall<'_> {
         let turn_count = match self.integer("turnCount")? {
             Some(count) if count >= 1 => count,
             Some(_) => return Err(invalid_argument("turnCount starts at 1")),
-            None => latest_checkpoint(self.control.repositories(), &thread_id)
+            None => latest_checkpoint(self.control.repositories(), &thread_id, true)
                 .await
                 .map_err(storage_failure)?
                 .ok_or_else(|| {
@@ -1447,10 +1447,12 @@ fn upload_ids(command: &Value) -> impl Iterator<Item = &str> {
         .filter_map(|attachment| attachment["uploadId"].as_str())
 }
 
-/// The highest turn count with a checkpoint on `thread_id`.
+/// The highest turn count with a checkpoint on `thread_id`: any recorded one (what a revert
+/// counts from), or only a captured one when `captured` (what has a diff to read).
 async fn latest_checkpoint(
     repositories: &Repositories,
     thread_id: &str,
+    captured: bool,
 ) -> crate::persistence::Result<Option<i64>> {
     let thread_id = thread_id.to_owned();
     repositories
@@ -1458,8 +1460,8 @@ async fn latest_checkpoint(
         .call(move |connection| {
             connection
                 .query_row(
-                    "SELECT MAX(checkpoint_turn_count) FROM projection_turns WHERE thread_id = ?",
-                    [thread_id],
+                    "SELECT MAX(checkpoint_turn_count) FROM projection_turns WHERE thread_id = ? AND (? = 0 OR checkpoint_status = 'ready')",
+                    params![thread_id, captured],
                     |row| row.get::<_, Option<i64>>(0),
                 )
                 .map_err(Into::into)
