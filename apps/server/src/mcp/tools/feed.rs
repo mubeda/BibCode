@@ -506,6 +506,16 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Name a panel this agent opened or last drove, or omit the source.",
     ),
     (
+        "McpFileTooLargeError",
+        "The file is larger than 1 MiB, or binary, so files_read can't return it as text.",
+        "Use files_download for its contents.",
+    ),
+    (
+        "McpTransferUnavailableError",
+        "This server has no transfer address yet, so it can't mint a download or upload URL.",
+        "Try again in a moment.",
+    ),
+    (
         "McpProjectNotFoundError",
         "No project has this id, or the thread's project is gone.",
         "Use list_projects_and_threads to find it.",
