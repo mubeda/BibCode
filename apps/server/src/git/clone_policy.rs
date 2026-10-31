@@ -87,7 +87,8 @@ pub(crate) trait HostResolver: Send + Sync {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a>;
 }
 
-struct SystemResolver;
+/// The system resolver, bounded to 10 seconds; also the webhook dispatcher's (slice X8).
+pub(crate) struct SystemResolver;
 
 impl HostResolver for SystemResolver {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {

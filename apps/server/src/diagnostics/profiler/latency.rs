@@ -193,6 +193,10 @@ pub fn is_long_running(method: &str) -> bool {
             // 1 s on an external program.
             | "review.listDiffTools"
             | "review.openDiffTool"
+            // Wait on a person's webhook endpoint: a lookup and a request of up to 10 s
+            // (#139 slice X8).
+            | "webhooks.sendTest"
+            | "webhooks.redeliver"
     )
 }
 
@@ -1229,6 +1233,19 @@ mod tests {
         // Preparing an AI Terminal runs its provider's probe, a shim's manager and codesign.
         assert!(is_long_running("terminal.open"));
         assert!(!is_long_running("terminal.writeInput"));
+        // A test event or a redelivery waits on the person's endpoint (up to 10 s); the rest
+        // of the webhook methods read and write the store only.
+        assert!(is_long_running("webhooks.sendTest"));
+        assert!(is_long_running("webhooks.redeliver"));
+        for method in [
+            "webhooks.list",
+            "webhooks.listDeliveries",
+            "webhooks.upsert",
+            "webhooks.delete",
+            "webhooks.rotateSecret",
+        ] {
+            assert!(!is_long_running(method), "{method}");
+        }
     }
 
     #[test]

@@ -196,6 +196,14 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "server.downloadDiagnosticLogs" => Some(SCOPE_DIAGNOSTICS_READ),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" | "subscribeMcpActivity" => Some(SCOPE_ACCESS_READ),
+        // Outbound webhooks (#139 slice X8): settings an outside agent's `mcp-client` session,
+        // which never holds `access:*`, cannot read or change.
+        "webhooks.list" | "webhooks.listDeliveries" => Some(SCOPE_ACCESS_READ),
+        "webhooks.upsert"
+        | "webhooks.delete"
+        | "webhooks.rotateSecret"
+        | "webhooks.sendTest"
+        | "webhooks.redeliver" => Some(SCOPE_ACCESS_WRITE),
         // Two-tier policy: a pending-pairing session confirms its OWN
         // delivery through the session capability gate (which bypasses this
         // scope, since standard device grants do not carry access scopes);
@@ -296,6 +304,33 @@ mod tests {
             required_scope("auth.confirmPairing"),
             Some(SCOPE_ACCESS_WRITE)
         );
+        // Webhooks are access settings: an outside agent's credential reaches none of them.
+        for method in ["webhooks.list", "webhooks.listDeliveries"] {
+            assert_eq!(required_scope(method), Some(SCOPE_ACCESS_READ), "{method}");
+        }
+        for method in [
+            "webhooks.upsert",
+            "webhooks.delete",
+            "webhooks.rotateSecret",
+            "webhooks.sendTest",
+            "webhooks.redeliver",
+        ] {
+            assert_eq!(required_scope(method), Some(SCOPE_ACCESS_WRITE), "{method}");
+        }
+        for method in ACTIVE_RPC_METHODS
+            .iter()
+            .filter(|method| method.name.starts_with("webhooks."))
+        {
+            let scope = required_scope(method.name).expect("a scope");
+            assert!(
+                !super::super::model::scope_satisfies(
+                    super::super::model::MCP_CLIENT_SCOPES,
+                    scope
+                ),
+                "{}",
+                method.name
+            );
+        }
         assert_eq!(
             required_scope("updater.status"),
             Some(SCOPE_ORCHESTRATION_READ)

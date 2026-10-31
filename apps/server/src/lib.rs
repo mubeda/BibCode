@@ -47,6 +47,7 @@ pub mod terminal;
 pub mod text_generation;
 pub mod transfer;
 pub mod vcs;
+pub(crate) mod webhooks;
 pub mod workspace;
 pub mod worktree_catalog;
 
