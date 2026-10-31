@@ -125,7 +125,8 @@ the same handlers as the Source Control panel. They belong to the **Source contr
 - **Results** end with the folder's Git status. A refused operation returns its `code` and,
   when a guard refused it, its `blocked` reason, such as uncommitted changes.
 - **Discard** lists every file it kept in `trashUnavailable`: one the trash could not take,
-  or, with `permanent`, an ignored file that permanent deletion leaves in place.
+  or, with `permanent`, an ignored file that permanent deletion leaves in place. A file whose
+  folder turns into a symlink to somewhere else before the trash takes it is kept too.
 
 ### Pull requests
 
