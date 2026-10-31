@@ -3489,7 +3489,10 @@ attaches the `TerminalManager` to `McpControl` (`attach_terminals`).
   session and enqueues under the publication lock without waiting (an ended process is
   `TerminalNotRunningError`), and one `terminal-input` thread of the writer's own, not
   Tokio's blocking pool, writes the queue in order outside that lock. The queue holds at
-  most 1 MiB queued or in flight per process, and the thread retires after 30 s idle.
+  most 1 MiB queued or in flight per process. The thread retires after 30 s idle, and
+  close, exit, restart and shutdown stop it at once (`SessionGeneration::invalidate`)
+  without waiting for a write stuck in the kernel. OSC color replies go to a PTY-level
+  reply thread, so the output reader never waits on the PTY writer.
   An ordered frame is queued once, in the poll that returns, so a replaced admission
   never queues it twice; loss of its admission, or dropping the call, drops it unless
   the writer started it. Writes to one terminal also take a per-terminal lock in the

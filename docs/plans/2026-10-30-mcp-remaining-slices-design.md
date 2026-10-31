@@ -4039,3 +4039,25 @@ one second, half read, all recurring twice), `a_large_page_keeps_its_cursor_and_
 (899 small findings building a long cursor, 100 large ones in the same second, one of 90,000
 characters), `a_crash_records_modules_and_frames_keep_file_names_only` and
 `a_client_alias_is_keyed_not_a_plain_digest`.
+
+**Codex review fixes (round 4, 2026-10-31).**
+
+- **An OSC color query could stall output behind a stuck write (verified).** The PTY reader
+  answered OSC color queries itself, through the PTY writer mutex that a stuck input write
+  holds. Replies now go to a `bibcode-pty-osc-<pid>` thread over a bounded channel (16
+  replies; one that does not fit is dropped, which only leaves the provider on its default
+  theme). The reader never waits on the writer, and the thread ends with the reader at the end
+  of the output. Replies do not go through the manager's `TerminalWriter`: the responder is a
+  `PortablePtyBackend` detail below the manager, and a reply's order against queued input does
+  not matter.
+- **Close and shutdown kept idle writer threads and PTY handles (verified).** The writer thread
+  held the queue that held its own sender, so only the 30 s idle timeout ended it.
+  `TerminalWriter::stop` now drops the only sender outside the thread and refuses later input;
+  input still queued is answered as cancelled, and the thread ends, releasing the process,
+  once any write in the kernel returns, which the process's end makes fail.
+  `SessionGeneration::invalidate` calls it, so close, exit, restart and shutdown all stop the
+  writer. Nothing waits for the thread, so a write stuck in the kernel leaves only a detached
+  thread and never holds up shutdown.
+- **Tests.** PTY: with the writer held, the output after an OSC color query is still
+  published, and the reply goes in once the writer is free. Manager: close and shutdown each
+  end a terminal's writer thread within 2 s.
