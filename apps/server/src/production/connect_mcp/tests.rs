@@ -3182,6 +3182,10 @@ async fn each_bearer_is_accepted_only_where_it_belongs() {
     tools.shutdown().await;
 }
 
+const OAUTH_SIGN_IN_REQUIRED: &str = "This MCP server needs an MCP OAuth sign-in: read the resource_metadata URL in WWW-Authenticate to find the authorization server.";
+const PROVIDER_CREDENTIAL_REQUIRED: &str =
+    "A valid provider-scoped MCP bearer credential is required.";
+
 /// The 401 names the protected resource metadata on an eligible origin, for POST and GET
 /// alike; an authenticated GET is 405, and an outside agent has no session to DELETE.
 #[tokio::test]
@@ -3202,6 +3206,13 @@ async fn the_challenge_names_the_metadata_on_an_eligible_origin_only() {
         assert_eq!(
             challenged.headers["www-authenticate"],
             "Bearer resource_metadata=\"http://127.0.0.1:43123/.well-known/oauth-protected-resource/mcp\", scope=\"orchestration:read orchestration:operate\""
+        );
+        // An outside agent without a credential needs an MCP OAuth sign-in, not a provider's.
+        assert_eq!(challenged.body["error"], "invalid_mcp_credential");
+        assert_eq!(
+            challenged.body["message"], OAUTH_SIGN_IN_REQUIRED,
+            "{}",
+            challenged.body
         );
         let tunnel = error(
             service
@@ -3235,7 +3246,29 @@ async fn the_challenge_names_the_metadata_on_an_eligible_origin_only() {
                 .await,
         );
         assert_eq!(lan.headers["www-authenticate"], "Bearer");
+        assert_eq!(lan.body["message"], PROVIDER_CREDENTIAL_REQUIRED);
     }
+    // A provider's credential arriving through the tunnel is a provider failure: it keeps the
+    // provider wording.
+    let provider = service
+        .issue_mcp_credential("one", "one", "provider")
+        .await
+        .unwrap();
+    let refused = error(
+        service
+            .mcp(
+                Method::POST,
+                ping(),
+                arriving(
+                    authorization(&provider),
+                    crate::RequestClass::ManagedTunnel,
+                    "https://env-1.connect.example",
+                ),
+            )
+            .await,
+    );
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(refused.body["message"], PROVIDER_CREDENTIAL_REQUIRED);
     assert_eq!(
         error(
             service

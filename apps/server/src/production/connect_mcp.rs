@@ -294,8 +294,19 @@ impl ConnectMcpError {
 
     /// The 401 `/mcp` answers a request without a credential it accepts. On an origin that
     /// serves remote MCP's OAuth (slice R) it names the protected resource metadata, so a
-    /// client's discovery finds the authorization server; elsewhere it stays plain `Bearer`.
+    /// client's discovery finds the authorization server, and says a sign-in is needed;
+    /// elsewhere it stays plain `Bearer` with the provider wording.
     fn mcp_unauthorized(context: &RouteContext) -> Self {
+        let mut error = Self::mcp_provider_unauthorized(context);
+        if context.origin.eligible_origin().is_some() {
+            error.body["message"] = "This MCP server needs an MCP OAuth sign-in: read the resource_metadata URL in WWW-Authenticate to find the authorization server.".into();
+        }
+        error
+    }
+
+    /// [`Self::mcp_unauthorized`] for a provider's credential refused for how it arrived: the
+    /// same challenge, with the provider wording, since no sign-in would help.
+    fn mcp_provider_unauthorized(context: &RouteContext) -> Self {
         let mut error = Self::invalid_mcp_credential();
         if let Some(origin) = context.origin.eligible_origin() {
             error.headers.insert(
@@ -1192,7 +1203,13 @@ impl ConnectMcpService {
         };
         match provider_scope {
             Some(Some(scope)) => return Ok(McpPrincipal::Provider(scope)),
-            Some(None) => return Err(refused()),
+            Some(None) => {
+                tracing::warn!(
+                    class = ?context.origin.class,
+                    "an MCP credential was refused for how the request arrived"
+                );
+                return Err(ConnectMcpError::mcp_provider_unauthorized(context));
+            }
             None => {}
         }
         let Some(control) = &self.control else {
