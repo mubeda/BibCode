@@ -134,7 +134,7 @@ describe("McpAgentsPanel", () => {
     ];
     const container = await render();
     expect(container.textContent).toContain("git_commit · commit abcdef1");
-    expect(container.textContent).toContain("McpOutcomeUnknownError");
+    expect(container.textContent).toContain("Outcome unknown");
     expect(container.querySelectorAll("button")).toHaveLength(0);
   });
 

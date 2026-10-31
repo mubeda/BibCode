@@ -22,7 +22,11 @@ function accessLabel(access: string | undefined): string {
 
 function scopeSummary(scopes: ReadonlyArray<string>): string {
   const parts = [
-    scopes.includes("orchestration:operate") ? "operate" : scopes.includes("orchestration:read") ? "read" : null,
+    scopes.includes("orchestration:operate")
+      ? "operate"
+      : scopes.includes("orchestration:read")
+        ? "read"
+        : null,
     scopes.includes("terminal:operate") ? "terminals" : null,
   ].filter((part) => part !== null);
   return parts.length === 0 ? "No tools" : parts.join(", ");
@@ -163,12 +167,26 @@ function McpAgentList({
   );
 }
 
+/** A row's outcome in plain words; the typed tag stays in the tooltip. */
+export function outcomeText(outcome: string): string {
+  if (outcome === "success") return "Done";
+  if (outcome === "McpOutcomeUnknownError") return "Outcome unknown";
+  if (outcome === "McpCancelledError") return "Cancelled";
+  return "Failed";
+}
+
 function McpActivityList({ rows }: { readonly rows: ReadonlyArray<McpActivityRow> }) {
   if (rows.length === 0) {
-    return <p className="pb-3.5 text-xs text-muted-foreground">No agent has changed anything yet.</p>;
+    return (
+      <p className="pb-3.5 text-xs text-muted-foreground">No agent has changed anything yet.</p>
+    );
   }
   return (
-    <ol className="max-h-72 divide-y divide-border/60 overflow-auto pb-1" aria-label="Agent activity">
+    <ol
+      data-text-surface
+      className="max-h-72 divide-y divide-border/60 overflow-auto pb-1"
+      aria-label="Agent activity"
+    >
       {rows.slice(0, ACTIVITY_SHOWN).map((row) => {
         const target = activityTargetText(row);
         return (
@@ -181,9 +199,10 @@ function McpActivityList({ rows }: { readonly rows: ReadonlyArray<McpActivityRow
               {target !== null ? ` · ${target}` : ""}
             </span>
             <span
+              title={row.outcome === "success" ? undefined : row.outcome}
               className={`ms-auto shrink-0 ${row.outcome === "success" ? "text-muted-foreground" : "text-destructive-foreground"}`}
             >
-              {row.outcome === "success" ? "Done" : row.outcome}
+              {outcomeText(row.outcome)}
             </span>
           </li>
         );
@@ -191,4 +210,3 @@ function McpActivityList({ rows }: { readonly rows: ReadonlyArray<McpActivityRow
     </ol>
   );
 }
-

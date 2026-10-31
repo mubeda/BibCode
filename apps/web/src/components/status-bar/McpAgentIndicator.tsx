@@ -41,7 +41,8 @@ export const McpAgentIndicator = memo(function McpAgentIndicator() {
             className={`size-1.5 shrink-0 rounded-full ${agent.running ? "bg-info" : "bg-muted-foreground/60"}`}
           />
           <span className="truncate">
-            {handBack !== null ? "Taken over" : "Agent active"} · {agent.label?.trim() || "MCP agent"}
+            {handBack !== null ? "Taken over" : "Agent active"} ·{" "}
+            {agent.label?.trim() || "MCP agent"}
             {others.length > 0 ? ` +${others.length}` : ""}
           </span>
         </TooltipTrigger>
