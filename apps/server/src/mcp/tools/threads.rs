@@ -1547,7 +1547,7 @@ pub(crate) fn derive_status(
     }
 }
 
-fn thread_summary(thread: &Value) -> Value {
+pub(crate) fn thread_summary(thread: &Value) -> Value {
     let session_status = thread["session"]["status"].as_str();
     let turn_state = thread["latestTurn"]["state"].as_str();
     json!({
@@ -1630,7 +1630,7 @@ pub(crate) async fn read_message_page(
                 .unwrap_or(Value::Null);
             let (at, id) = before.unwrap_or_else(|| ("\u{10ffff}".to_owned(), String::new()));
             let mut statement = connection.prepare_cached(
-                "SELECT message_id, role, turn_id, substr(text, 1, ?), length(text), is_streaming, created_at, actor_json FROM projection_thread_messages
+                "SELECT message_id, role, turn_id, substr(text, 1, ?), length(text), is_streaming, created_at, actor_json, source_thread_id FROM projection_thread_messages
                  WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND message_id < ?))
                    AND COALESCE(delivery_state, '') <> 'queued'
                  ORDER BY created_at DESC, message_id DESC LIMIT ?",
@@ -1653,6 +1653,10 @@ pub(crate) async fn read_message_page(
                         .and_then(|actor| serde_json::from_str::<Value>(&actor).ok())
                     {
                         message["actor"] = actor;
+                    }
+                    // The panel it came from (slice X4).
+                    if let Some(source) = row.get::<_, Option<String>>(8)? {
+                        message["sourceThreadId"] = source.into();
                     }
                     Ok(message)
                 })?

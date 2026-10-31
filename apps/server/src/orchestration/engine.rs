@@ -144,8 +144,9 @@ pub struct ThreadMessageInput {
     pub role: String,
     pub text: String,
     pub attachments: Vec<Value>,
-    /// The thread this message came from (a chat panel's provenance, slice X4); it must be a
-    /// live thread of the same project.
+    /// The thread this message came from (a chat panel's provenance, slice X4). Only a command
+    /// whose claim carries an outside agent's actor may set it, and the source must be another
+    /// live thread of the target's worktree.
     #[serde(
         rename = "sourceThreadId",
         default,
@@ -3487,6 +3488,7 @@ async fn process_envelope(
         &command,
         &prepared_worktree,
         &occurred_at,
+        command_claim.actor().is_some(),
     )
     .await
     {
@@ -3923,6 +3925,7 @@ async fn plan_command(
     command: &OrchestrationCommand,
     prepared_worktree: &PreparedWorktreeCommand,
     occurred_at: &str,
+    from_agent: bool,
 ) -> Result<Vec<NewOrchestrationEvent>, OrchestrationError> {
     let metadata = Value::Object(Default::default());
     match command {
@@ -4688,17 +4691,36 @@ async fn plan_command(
                     );
                 }
             }
-            if let Some(source_thread_id) = &message.source_thread_id
-                && !model.threads.get(source_thread_id).is_some_and(|source| {
-                    source.deleted_at.is_none() && source.project_id == thread.project_id
-                })
-            {
-                return invariant(
-                    command,
-                    format!(
-                        "Source thread '{source_thread_id}' is not a live thread of this project."
-                    ),
-                );
+            // Provenance (#139, slice X4): only an outside agent's panel message names its
+            // source, so the claim must carry the server-stamped actor, and the source must
+            // share the target's worktree (the same host thread, or one hosts the other).
+            if let Some(source_thread_id) = &message.source_thread_id {
+                if !from_agent {
+                    return invariant(
+                        command,
+                        "Only an outside agent's panel message may name a source thread."
+                            .to_owned(),
+                    );
+                }
+                let host_of = |id: &str, state: &ThreadState| {
+                    state
+                        .host_thread_id
+                        .clone()
+                        .unwrap_or_else(|| id.to_owned())
+                };
+                let shares_worktree = source_thread_id != thread_id
+                    && model.threads.get(source_thread_id).is_some_and(|source| {
+                        source.deleted_at.is_none()
+                            && host_of(source_thread_id, source) == host_of(thread_id, &thread)
+                    });
+                if !shares_worktree {
+                    return invariant(
+                        command,
+                        format!(
+                            "Source thread '{source_thread_id}' is not another thread of this thread's worktree."
+                        ),
+                    );
+                }
             }
             let mut user_payload = json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at});
             insert_optional(

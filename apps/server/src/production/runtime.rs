@@ -730,6 +730,10 @@ impl ProductionRuntime {
         );
         let mcp_activity = crate::mcp::activity::McpActivity::new(repositories.database().clone());
         crate::mcp::activity::register_mcp_activity_rpc(&mut registry, mcp_activity.clone());
+        crate::production::ui_intents_rpc::register_ui_intents_rpc(
+            &mut registry,
+            crate::production::ui_intents_rpc::UiIntents::new(),
+        );
         finalize_rpc_registry(&registry, &control)?;
         let mcp_control = crate::mcp::control::McpControl::new_with_activity(
             registry.clone(),
