@@ -347,14 +347,19 @@ async fn focus_ui_raises_an_intent_for_subscribers_and_moves_nothing() {
     .await;
     let (agent, _) = harness.agent(McpAccess::FullAccess).await;
     let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    // The events this agent's commands planned: every command it dispatches carries its actor
+    // (slice X1). The server's own background work for the started turn (turn delivery) has
+    // no actor, so it never moves this count.
+    let session_id = agent.principal.session_id.clone();
     let events = async || {
+        let session_id = session_id.clone();
         harness
             .repositories
             .database()
-            .call(|connection| {
+            .call(move |connection| {
                 Ok(connection.query_row(
-                    "SELECT COUNT(*) FROM orchestration_events",
-                    [],
+                    "SELECT COUNT(*) FROM orchestration_events WHERE json_extract(metadata_json, '$.actor.clientId') = ?",
+                    [session_id],
                     |row| row.get::<_, i64>(0),
                 )?)
             })
@@ -362,6 +367,7 @@ async fn focus_ui_raises_an_intent_for_subscribers_and_moves_nothing() {
             .unwrap()
     };
     let before = events().await;
+    assert!(before > 0, "start_thread's events carry the agent's actor");
     let mut client = intents.subscribe();
 
     let focused = harness
@@ -383,7 +389,7 @@ async fn focus_ui_raises_an_intent_for_subscribers_and_moves_nothing() {
         intent["actor"]["clientId"],
         agent.principal.session_id.as_str()
     );
-    // Advice only: no command ran.
+    // Advice only: the agent dispatched no command.
     assert_eq!(events().await, before);
 
     for (arguments, tag) in [
