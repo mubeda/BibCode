@@ -523,6 +523,131 @@ async fn create_rename_list_and_search_work_in_the_threads_folder() {
     fixture.shutdown().await;
 }
 
+/// Git's own metadata is out of reach of every Files tool (#139 X5 review round 6, found
+/// end to end): writing `.git/config` or a hook makes Git run a command as the server's user.
+/// `.git` in any letter case, after `./`, and through a symlink is refused as an argument;
+/// `.gitignore` and `.github/` are ordinary files.
+#[cfg(unix)]
+#[tokio::test]
+async fn no_files_tool_reads_or_changes_gits_own_metadata() {
+    let fixture = fixture().await;
+    let initialized = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&fixture.folder)
+        .status()
+        .expect("git runs");
+    assert!(initialized.success());
+    std::os::unix::fs::symlink(".git", fixture.folder.join("gitlink")).unwrap();
+    let config = fixture.read(".git/config").expect("a Git config");
+    let refused = |result: &Value, what: &str| {
+        assert_eq!(
+            error_tag(result),
+            "McpInvalidArgumentError",
+            "{what}: {result}"
+        );
+        let message = result["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(message.contains("Git's own metadata"), "{what}: {message}");
+    };
+
+    for (tool, arguments) in [
+        (
+            "files_write",
+            json!({ "path": ".git/hooks/post-commit", "content": "#!/bin/sh\n", "createOnly": true }),
+        ),
+        ("files_read", json!({ "path": ".git/config" })),
+        ("files_read", json!({ "path": ".GIT/config" })),
+        ("files_read", json!({ "path": "./.git/HEAD" })),
+        ("files_read", json!({ "path": ".git/" })),
+        ("files_read", json!({ "path": "gitlink/config" })),
+        (
+            "files_write",
+            json!({ "path": "gitlink/hooks/post-commit", "content": "#!/bin/sh\n", "createOnly": true }),
+        ),
+        (
+            "files_create",
+            json!({ "path": ".git/hooks/x", "kind": "file" }),
+        ),
+        (
+            "files_delete",
+            json!({ "path": ".git/description", "permanent": true }),
+        ),
+        ("files_delete", json!({ "path": ".git", "permanent": true })),
+        (
+            "files_rename",
+            json!({ "from": ".git/description", "to": "description.txt" }),
+        ),
+        ("files_download", json!({ "path": ".git" })),
+        ("files_download", json!({ "path": "gitlink/config" })),
+        (
+            "files_upload",
+            json!({ "directory": ".git/hooks", "fileName": "post-commit" }),
+        ),
+        (
+            "files_upload",
+            json!({ "directory": "", "fileName": ".git" }),
+        ),
+        (
+            "files_upload",
+            json!({ "directory": "gitlink", "fileName": "config" }),
+        ),
+    ] {
+        let result = fixture.call(tool, arguments.clone()).await;
+        refused(&result, &format!("{tool} {arguments}"));
+    }
+    fixture.write("notes.txt", "x");
+    let into = fixture
+        .call(
+            "files_rename",
+            json!({ "from": "notes.txt", "to": ".git/hooks/post-commit" }),
+        )
+        .await;
+    refused(&into, "rename into .git");
+    assert!(fixture.read("notes.txt").is_some());
+    assert!(!fixture.folder.join(".git/hooks/post-commit").exists());
+    assert!(fixture.folder.join(".git/description").exists());
+    assert_eq!(fixture.read(".git/config").unwrap(), config);
+
+    // `.gitignore` and `.github/` are ordinary files.
+    for path in [".gitignore", ".github/workflows/ci.yml"] {
+        let written = fixture
+            .call(
+                "files_write",
+                json!({ "path": path, "content": "x\n", "createOnly": true }),
+            )
+            .await;
+        assert!(written["isError"] != true, "{path}: {written}");
+        let read = fixture.call("files_read", json!({ "path": path })).await;
+        assert!(read["isError"] != true, "{path}: {read}");
+    }
+    // The link itself may go; what it names stays.
+    let unlinked = fixture
+        .call(
+            "files_delete",
+            json!({ "path": "gitlink", "permanent": true }),
+        )
+        .await;
+    assert!(unlinked["isError"] != true, "{unlinked}");
+    assert_eq!(fixture.read(".git/config").unwrap(), config);
+
+    let listed = fixture.call("files_list", json!({})).await;
+    let paths: Vec<_> = structured(&listed)["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        !paths
+            .iter()
+            .any(|path| crate::git::names_git_metadata(std::path::Path::new(path))),
+        "{paths:?}"
+    );
+    assert!(paths.contains(&".gitignore".to_owned()), "{paths:?}");
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_delete_goes_to_the_trash_unless_permanent_and_never_falls_back() {
     let fixture = fixture().await;

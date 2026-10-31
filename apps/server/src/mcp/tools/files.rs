@@ -235,7 +235,18 @@ async fn checked_path(call: &ToolCall<'_>, cwd: &str, key: &str) -> Result<Strin
     let mut checked = tokio::task::spawn_blocking(move || validate_paths(&cwd, &[path]))
         .await
         .map_err(|_| invalid_argument("the path could not be checked; try again"))??;
-    Ok(checked.remove(0))
+    let checked = checked.remove(0);
+    if crate::git::names_git_metadata(std::path::Path::new(&checked)) {
+        return Err(invalid_argument(&git_metadata_message(&checked)));
+    }
+    Ok(checked)
+}
+
+/// Why a path into Git's own metadata is refused, and what to use instead.
+fn git_metadata_message(path: &str) -> String {
+    format!(
+        "{path} is Git's own metadata (.git, in any letter case, or the repository's Git directory). The Files tools never read or change it; use the git_* tools for repository state."
+    )
 }
 
 /// A workspace RPC failure as the agent can act on it, naming `path` as the agent gave it and
@@ -259,6 +270,7 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
         Some("trash_unavailable") => format!(
             "The system trash could not take {path}; it was left in place. Delete it with permanent: true only if the person asked for that."
         ),
+        Some("git_metadata") => git_metadata_message(path),
         Some("kept_in_staging") => {
             let staged_at = error["stagedAt"].as_str().unwrap_or("bibcode-discard");
             let place = if error["stagedIn"] == "git-dir" {
@@ -338,6 +350,10 @@ fn file_failure(mut failure: Value, path: &str) -> Value {
     }
     if failure["structuredContent"]["error"]["failure"] == "hard_linked" {
         failure["structuredContent"]["error"]["_tag"] = HARD_LINKED_TAG.into();
+    }
+    // Refused as an argument, whatever RPC answered: the path resolved into Git's metadata.
+    if failure["structuredContent"]["error"]["failure"] == "git_metadata" {
+        failure["structuredContent"]["error"]["_tag"] = "McpInvalidArgumentError".into();
     }
     if failure["structuredContent"]["error"]["failure"] == "kept_in_staging" {
         failure["structuredContent"]["error"]["_tag"] = TRASH_STAGED_TAG.into();
@@ -669,6 +685,9 @@ async fn upload(call: &ToolCall<'_>) -> ToolResult {
         return Err(invalid_argument(
             &crate::transfer::upload::upload_file_name_rule(),
         ));
+    }
+    if crate::git::names_git_metadata(std::path::Path::new(&file_name)) {
+        return Err(invalid_argument(&git_metadata_message(&file_name)));
     }
     let overwrite = call.boolean("overwrite")?.unwrap_or(false);
     let base = transfer_base(call)?;
