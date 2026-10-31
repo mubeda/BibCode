@@ -3883,3 +3883,23 @@ threads), `mcp::activity::tests` (the stream's snapshot, row and active events; 
 targets keep ids only), migration 60, and web tests for the chip, the status-bar indicator,
 the Agents panel, the commit labels and the reducer's actor. The tests were written with the
 code, not each one failing first.
+
+**Codex review, round 2 (2026-10-31).** All three P2s were confirmed in source and fixed, each
+with a test that failed first:
+
+- **Stop after Revoke.** `stop_client` announced only a session it revoked itself, so Revoke
+  then Stop answered `revoked: false` and interrupted nothing, and the web called that
+  success. It now also announces an `mcp-client` session revoked earlier (read from
+  `auth_sessions`), and answers `false` only for an unknown session or a revoked one that was
+  not an agent's; `stopMcpAgent` throws on `false`, so the toast says the stop did not happen.
+- **A long turn lost its Stop.** `active` ended two minutes after the last call. An agent with
+  a running turn whose latest sent user message carries its actor is now active, revoked or
+  not, with `McpActiveClient.runningTurns` (contract, decoding default 0). The query is shared
+  with Stop's (`attributed_running_turns`); streams run it on the snapshot and each 15 s
+  re-check and reuse it on presence changes. The indicator keeps Stop (and drops Take over for
+  a revoked agent), and the Agents list shows Stop for agents with running turns and lists a
+  revoked one as **Revoked** with Stop only.
+- **Idle retention.** `recent()` now deletes rows past 7 days and filters by that cutoff, so a
+  later subscriber never sees older rows even when nothing was written; a periodic sweep was
+  not needed.
+- **Not changed:** the forged `sourceThreadId` finding is X4's (see the APIs above).

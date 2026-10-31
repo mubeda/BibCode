@@ -273,16 +273,19 @@ BiBCode marks what an outside agent does, whoever is looking:
   `start_thread` and `create_worktree` take an optional `purpose` of at most 200 characters.
   `read_thread` returns each message's `actor` and the thread's `requester`.
 - **The status bar** shows **Agent active · <name>** while an agent has made a call in the last
-  two minutes or still has work running, with two buttons:
+  two minutes, still has work running, or has a turn running that it started, with two
+  buttons:
   - **Stop** revokes the agent, which ends its calls and the Git and pull request work it
     started, and interrupts each running turn whose latest message it sent. Your own turns
-    are left alone.
+    are left alone. Stop also works on an agent you already revoked whose turns still run.
   - **Take over** makes the agent read only: it can still read, every change it asks for is
     refused, and work it started stops. **Hand back** restores exactly the access it had.
 - **Settings → Agents → Agent integrations → Agents** lists each authorized agent with its
-  last call, tools and access, with **Take over** (or **Hand back**) and **Revoke**, and below
-  it **Agent activity**: what agents changed, newest first, as ids and counts only (a commit,
-  a pull request number, a file count), never paths, messages or output.
+  last call, tools and access, with **Take over** (or **Hand back**) and **Revoke**, and
+  **Stop** while it has turns running (a revoked agent with running turns is listed as
+  **Revoked**, with Stop). Below it, **Agent activity** shows what agents changed in the last
+  seven days, newest first, as ids and counts only (a commit, a pull request number, a file
+  count), never paths, messages or output.
 - Revoke, unlike Stop, leaves running turns alone. None of these asks for confirmation: each
   only stops an agent, and reconnecting or **Hand back** undoes it.
 - You can see and use these from the computer that runs the environment (the desktop app,
