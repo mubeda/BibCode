@@ -659,8 +659,9 @@ first staged by folder handle:
    checkout operation can reach it. `bibcode-discard` must be owned by the
    server's user and writable by no group or other user. Otherwise it is not
    used: the entry counts as a trash refusal. Before the rename, an origin record
-   `<uuid>.origin` (the checkout root, a NUL, and the entry's path) is written
-   beside the holder.
+   `<uuid>.origin` is written beside the holder. It holds only the entry's path
+   below the worktree root Git reports for this Git directory; the root itself is
+   never stored.
 3. Before the trash runs, the staged path, resolved by string, must name the
    folders (from the Git directory down) and the entry BiBCode holds, by device and
    inode. After a trash that answered success, the entry must be gone from the held
@@ -670,8 +671,11 @@ first staged by folder handle:
    record are removed once the entry is trashed or back.
 5. Each discard first recovers what a crash left behind. A record whose holder still
    holds its entry, and that no discard in this process is using, has the entry moved
-   back the same way, from the checkout root down, when its place is free. Otherwise
+   back the same way, from the worktree root down, when its place is free. Otherwise
    the entry stays and a warning is logged. A record whose holder is empty is removed.
+   Records are not trusted. One whose path has anything but plain parts (a root, `.`
+   or `..`), a NUL, or starts with `.git` is ignored. Its path is opened without
+   following a link, so it can only restore into the checkout.
 
 A folder that is a link keeps its entry in `trashUnavailable`, also under
 `permitPermanent`. Any other staging failure, such as a Git directory on another
