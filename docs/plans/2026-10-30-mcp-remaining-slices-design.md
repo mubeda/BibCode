@@ -4259,3 +4259,25 @@ reads, so the server derives it rather than trusting a client:
   `ui.publishCommitMessage` if a separate scope or shape reads better, and move the counts.
 - `UiIntentNotifier` already skips any kind other than `focus`; the Source Control panel
   folds `uiIntentsEnvironment.intents` for its own kind.
+
+**Codex review round 2 (2026-10-31).** Both P2s were verified and fixed test-first.
+
+- **A panel message could speak as another agent's panel.** `send_panel_message` checked
+  only that `fromThreadId` shares the target's worktree, so agent B could send its own text
+  labelled "From <agent A's panel>". The tool now also requires that the calling agent owns
+  the source: its session is the thread's `requester` (it opened it), or its actor sent the
+  thread's latest user message (it drives it). Otherwise `McpSourceThreadNotOwnedError`, and
+  nothing is stored. A person's thread, which has neither, is never an agent's source.
+  `a_panel_message_comes_only_from_a_thread_the_calling_agent_opened_or_last_drove` failed
+  before the check (B's message was stored) and covers A's own panel and a thread B drives.
+  A `bibcode thread` run mints a credential per run, so a panel one run opened is not the
+  next run's source until that run sends it a message.
+- **Pending intents had no server-wide bound.** Beside 16 per thread, an agent credential
+  may hold 64 pending intents (`UiIntentError`, `reason: "limit"`), and the server holds at
+  most 256, dropping the oldest first. A subscriber's snapshot carries the newest 64 (the
+  client keeps 64); one server is one environment, so the snapshot is already that
+  environment's. Tests: `one_credential_holds_at_most_64_pending_intents_across_threads` and
+  `the_server_holds_at_most_256_pending_intents_and_snapshots_the_newest_64`.
+- **New error tag** `McpSourceThreadNotOwnedError`, beside X4's `McpNotSameWorktreeError` and
+  `McpNotAHostThreadError`: X3's `feed::ERRORS` (not on this branch) must list all three
+  when the branches combine.
