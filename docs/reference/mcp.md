@@ -3573,7 +3573,21 @@ Stops a running device. A device another thread started is refused; ask the pers
 
 #### Example: browser and device previews
 
-Navigate the session's preview tab to a dev server on port 5173, then read the answer.
+Open a preview tab, navigate it to a dev server on port 5173, then read the answer. A fresh
+session has no tab, so `preview_navigate` needs a `preview_open` before it (or a `tabId` from
+`preview_status`).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "method": "tools/call",
+  "params": { "name": "preview_open", "arguments": { "threadId": "thr_8f2c1a" } }
+}
+```
+
+The result is the `preview_status` object of the new tab; its `tabId` (here `tab-3`) is the
+session's current tab from now on.
 
 ```json
 {
