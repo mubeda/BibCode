@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::TransferError;
 use crate::workspace::WorkspaceError;
-use crate::workspace::beneath::{self, Dir, Kind, Open};
+use crate::workspace::beneath::{self, Dir, Identity, Kind, Open, Replace, Root};
 
 /// Distinguishes partial files written by this process, so two concurrent uploads of the same
 /// name never share one.
@@ -191,16 +191,19 @@ where
         let (root, folder, target) = (root.to_path_buf(), directory.to_path_buf(), target.clone());
         Arc::new(
             blocking(&target.clone(), move || {
-                Dir::open(&root, &folder, false)
+                Root::new(&root)
+                    .and_then(|validated| Dir::open(&validated, &folder, false))
                     .map_err(|error| fault("open", &root, &target, error))
             })
             .await?,
         )
     };
-    let remove = |name: OsString| {
+    // Removes only a file this upload created and nobody has replaced (or, for the
+    // reservation, written to) since.
+    let remove_own = |name: OsString, id: Option<Identity>, empty: bool| {
         let dir = Arc::clone(&dir);
         async move {
-            let _ = tokio::task::spawn_blocking(move || dir.remove_file(&name)).await;
+            let _ = tokio::task::spawn_blocking(move || dir.remove_own(&name, id, empty)).await;
         }
     };
     // The directory guard runs in both modes and before any reservation: a directory is never
@@ -224,8 +227,10 @@ where
         _ if !overwrite => return Err(TransferError::EntryExists { path: target }),
         _ => {}
     }
-    let reserved = if overwrite {
-        false
+    // The reservation's identity, so the upload later replaces or removes it only while it is
+    // still that empty file.
+    let reservation: Option<Option<Identity>> = if overwrite {
+        None
     } else {
         let (dir, name, root, path) = (
             Arc::clone(&dir),
@@ -234,11 +239,10 @@ where
             target.clone(),
         );
         // Closed at once: a rename over a handle this process still holds fails on Windows.
-        blocking(&target, move || {
+        let id = blocking(&target, move || {
             match dir.open_file(&name, Open::CreateNew) {
                 Ok(file) => {
-                    drop(file);
-                    Ok(())
+                    Identity::of(&file).map_err(|error| fault("reserve", &root, &path, error))
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -250,10 +254,11 @@ where
             }
         })
         .await?;
-        true
+        Some(id)
     };
     let partial_name = OsString::from(partial_file_name(name));
     let partial = directory.join(&partial_name);
+    let mut partial_id = None;
     let outcome: Result<(), TransferError> = async {
         let file = {
             let (dir, partial_name, root, partial) = (
@@ -268,6 +273,8 @@ where
             })
             .await?
         };
+        partial_id = Identity::of(&file)
+            .map_err(|error| TransferError::operation("create", &partial, error))?;
         let mut file = tokio::fs::File::from_std(file);
         let mut written: u64 = 0;
         loop {
@@ -296,26 +303,44 @@ where
         if cancellation.is_cancelled() {
             return Err(TransferError::Cancelled);
         }
-        let (dir, partial_name, name, root, partial) = (
+        let (dir, partial_name, name, root, partial, target) = (
             Arc::clone(&dir),
             partial_name.clone(),
             name_os.clone(),
             root.to_path_buf(),
             partial.clone(),
+            target.clone(),
         );
         blocking(&partial.clone(), move || {
-            dir.rename(&partial_name, &dir, &name)
-                .map_err(|error| fault("rename", &root, &partial, error))
+            let exists = || TransferError::EntryExists {
+                path: target.clone(),
+            };
+            let replace = match reservation {
+                // Overwrite was asked for: replace whatever is there now.
+                None => Replace::Allowed,
+                // Only while the name is still this upload's empty reservation: anything a
+                // person wrote there since stays, and the upload answers that it exists.
+                Some(id) => {
+                    if !dir.remove_own(&name, id, true) {
+                        return Err(exists());
+                    }
+                    Replace::Never
+                }
+            };
+            match dir.rename(&partial_name, &dir, &name, replace) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+                other => other.map_err(|error| fault("rename", &root, &partial, error)),
+            }
         })
         .await
     }
     .await;
     if let Err(error) = outcome {
-        remove(partial_name).await;
-        if reserved {
-            // Only a reservation this call created is removed; an existing file the caller
-            // asked to overwrite keeps its contents.
-            remove(name_os).await;
+        remove_own(partial_name, partial_id, false).await;
+        if let Some(id) = reservation {
+            // Only a reservation this call created, still empty and still the same file; an
+            // existing file the caller asked to overwrite keeps its contents.
+            remove_own(name_os, id, true).await;
         }
         return Err(error);
     }
@@ -491,6 +516,80 @@ mod tests {
             std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
             "old"
         );
+    }
+
+    /// Starts a no-overwrite upload of `a.txt` whose body waits, lets `meanwhile` act on the
+    /// name once the reservation exists, then ends the body (or cancels the upload).
+    async fn upload_while(
+        meanwhile: impl FnOnce(&Path),
+        cancel: bool,
+    ) -> (tempfile::TempDir, Result<PathBuf, TransferError>) {
+        let temp = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(Ok(Bytes::from_static(b"agent"))).unwrap();
+        let receiver = tokio_stream::wrappers::UnboundedReceiverStream::new(receiver);
+        let upload = {
+            let (directory, token) = (temp.path().to_path_buf(), token.clone());
+            tokio::spawn(async move {
+                write_upload(
+                    &directory, &directory, "a.txt", false, 1024, receiver, &token,
+                )
+                .await
+            })
+        };
+        let target = temp.path().join("a.txt");
+        while !target.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        meanwhile(&target);
+        if cancel {
+            token.cancel();
+        }
+        drop(sender);
+        (temp, upload.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_no_overwrite_upload_never_replaces_or_removes_a_file_written_during_it() {
+        // Replaced by a new file of the same name while the body streamed.
+        let replace = |target: &Path| {
+            std::fs::remove_file(target).unwrap();
+            std::fs::write(target, "person").unwrap();
+        };
+        let (temp, result) = upload_while(replace, false).await;
+        assert!(
+            matches!(result, Err(TransferError::EntryExists { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "person"
+        );
+        assert_eq!(entries(temp.path()), ["a.txt"]);
+        // Written into the reservation itself.
+        let fill = |target: &Path| std::fs::write(target, "person").unwrap();
+        let (temp, result) = upload_while(fill, false).await;
+        assert!(
+            matches!(result, Err(TransferError::EntryExists { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "person"
+        );
+        // A cancelled upload never removes what someone else wrote.
+        let (temp, result) = upload_while(replace, true).await;
+        assert!(
+            matches!(result, Err(TransferError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "person"
+        );
+        assert_eq!(entries(temp.path()), ["a.txt"]);
     }
 
     #[cfg(unix)]

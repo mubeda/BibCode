@@ -42,6 +42,18 @@ pub enum WorkspaceError {
     },
     #[error("the system trash could not take {path}; it was left in place", path = .path.display())]
     TrashUnavailable { path: PathBuf },
+    #[error(
+        "deleting {path} stopped part-way ({reason}); what is left is at {left_at}",
+        path = .path.display(),
+        left_at = .left_at.display()
+    )]
+    PartiallyRemoved {
+        path: PathBuf,
+        /// Where what is left now is: the entry's own path when it could be put back, else
+        /// the hidden name it was parked under.
+        left_at: PathBuf,
+        reason: String,
+    },
     #[error("workspace operation was cancelled")]
     Cancelled,
     #[error("invalid request: {0}")]
@@ -74,6 +86,7 @@ impl WorkspaceError {
             Self::FileChangedOnDisk { .. } => "file_changed_on_disk",
             Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
             Self::TrashUnavailable { .. } => "trash_unavailable",
+            Self::PartiallyRemoved { .. } => "partially_removed",
             _ => "operation_failed",
         }
     }
@@ -109,6 +122,13 @@ impl WorkspaceError {
             | Self::FileMissingOnDisk { path }
             | Self::TrashUnavailable { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+            }
+            Self::PartiallyRemoved { path, left_at, .. } => {
+                object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
+                // The name, in the entry's own folder, under which what is left now sits.
+                if let Some(name) = left_at.file_name() {
+                    object.insert("leftAt".to_owned(), json!(name.to_string_lossy()));
+                }
             }
             Self::Operation {
                 operation, path, ..

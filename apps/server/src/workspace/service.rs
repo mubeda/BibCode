@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::crypto::{lowercase_hex, sha256_hex};
 
-use super::beneath::{self, Dir, Kind, Open};
+use super::beneath::{self, Dir, Identity, Kind, Open, Removal, Replace, Root};
 use super::entries::{self, BrowseResult};
 use super::paths::{
     canonical_existing_within, normalize_root, resolve_relative, safe_mutation_target,
@@ -23,6 +23,23 @@ const READ_LIMIT_BYTES: usize = 1024 * 1024;
 const VERSION_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLICATE_LIMIT: usize = 1000;
 const DEFAULT_MAX_CONCURRENT_OPERATIONS: usize = 32;
+/// The tail of the sibling a version-checked write is written to before it replaces the file.
+const WRITE_PARTIAL_SUFFIX: &str = "bibcode-write.part";
+
+/// How [`WorkspaceService::write_target`] writes.
+enum WriteMode {
+    /// Truncate and write in place (`projects.writeFile`, which has no precondition).
+    InPlace,
+    /// The file must not exist: created exclusively.
+    CreateNew,
+    /// The file must still be the one hashed (`id`) with content `version`; it is replaced by
+    /// a sibling that keeps its permissions.
+    Replace {
+        version: String,
+        id: Option<Identity>,
+        permissions: std::fs::Permissions,
+    },
+}
 
 #[cfg(test)]
 pub(crate) type WorkspaceWriteHookFuture<'a> =
@@ -105,6 +122,9 @@ enum ScannedFile {
         version: String,
         byte_length: u64,
         binary: bool,
+        /// The file that was hashed, so a write can tell it is still the same file.
+        id: Option<Identity>,
+        permissions: std::fs::Permissions,
     },
 }
 
@@ -112,7 +132,7 @@ enum ScannedFile {
 /// operation can reach it through a held folder handle ([`Dir`]) rather than by path.
 #[derive(Clone)]
 struct Place {
-    root: PathBuf,
+    root: Root,
     target: PathBuf,
     folder: PathBuf,
     name: OsString,
@@ -120,7 +140,8 @@ struct Place {
 
 impl Place {
     /// `target` (canonical, under the canonical `root`), split into its folder and name. The
-    /// root itself is not a file any operation here can address.
+    /// root itself is not a file any operation here can address. The root's identity is
+    /// recorded now, as part of the check, so a root replaced later is refused.
     fn new(root: PathBuf, target: PathBuf) -> Result<Self, WorkspaceError> {
         let split = (target != root)
             .then(|| target.parent().zip(target.file_name()))
@@ -129,6 +150,13 @@ impl Place {
         let Some((folder, name)) = split else {
             return Err(WorkspaceError::NotFile { path: target });
         };
+        let root = Root::new(&root).map_err(|error| {
+            if beneath::is_escape(&error) {
+                WorkspaceError::RootNotDirectory { path: root.clone() }
+            } else {
+                WorkspaceError::operation("stat", &root, error)
+            }
+        })?;
         Ok(Self {
             root,
             target,
@@ -142,7 +170,7 @@ impl Place {
     fn fault(&self, operation: &'static str, error: std::io::Error) -> WorkspaceError {
         if beneath::is_escape(&error) {
             WorkspaceError::ResolvedPathOutsideRoot {
-                root: self.root.clone(),
+                root: self.root.path().to_path_buf(),
                 resolved_path: self.target.clone(),
             }
         } else {
@@ -224,6 +252,10 @@ fn scan_file_blocking(place: &Place) -> Result<ScannedFile, WorkspaceError> {
         }
         Err(error) => return Err(error),
     };
+    let metadata = file
+        .metadata()
+        .map_err(|error| place.fault("stat", error))?;
+    let id = Identity::of(&file).map_err(|error| place.fault("stat", error))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; VERSION_SCAN_CHUNK_BYTES];
     let mut byte_length = 0_u64;
@@ -247,6 +279,8 @@ fn scan_file_blocking(place: &Place) -> Result<ScannedFile, WorkspaceError> {
         version: lowercase_hex(&hasher.finalize()),
         byte_length,
         binary,
+        id,
+        permissions: metadata.permissions(),
     })
 }
 
@@ -485,7 +519,8 @@ impl WorkspaceService {
         let (place, normalized) = self.mutation_place(root, relative_path).await?;
         let _path_lock = self.path_locks.lock(&place.target).await;
         self.containment_checked(&place.target).await?;
-        self.write_target(place, normalized, contents).await
+        self.write_target(place, normalized, contents, WriteMode::InPlace)
+            .await
     }
 
     /// Writes only when the file on disk is still the state the caller's contents were based on.
@@ -505,7 +540,7 @@ impl WorkspaceService {
         let _path_lock = self.path_locks.lock(&place.target).await;
         self.containment_checked(&place.target).await?;
         let target = place.target.clone();
-        match (precondition, scan_file(place.clone()).await?) {
+        let mode = match (precondition, scan_file(place.clone()).await?) {
             (WritePrecondition::Version { .. }, ScannedFile::Missing) => {
                 return Err(WorkspaceError::FileMissingOnDisk { path: target });
             }
@@ -518,23 +553,38 @@ impl WorkspaceService {
             (WritePrecondition::Missing, ScannedFile::Present { .. }) => {
                 return Err(WorkspaceError::FileChangedOnDisk { path: target });
             }
-            _ => {}
-        }
+            (WritePrecondition::Missing, ScannedFile::Missing) => WriteMode::CreateNew,
+            (
+                WritePrecondition::Version { version },
+                ScannedFile::Present {
+                    id, permissions, ..
+                },
+            ) => WriteMode::Replace {
+                version: version.clone(),
+                id,
+                permissions,
+            },
+        };
         #[cfg(test)]
         if let Some(hook) = &self.write_hook {
             hook.after_precondition_check(&target).await?;
         }
-        self.write_target(place, normalized, contents).await
+        self.write_target(place, normalized, contents, mode).await
     }
 
-    /// Writes in place through the folder's handle, creating missing folders. The target is
-    /// canonical, so a write to a symlink inside the root writes the file it names, as before;
-    /// a symlink found at the name now (a dangling one, or a swap) is refused.
+    /// Writes through the folder's handle, creating missing folders. The target is canonical,
+    /// so a write to a symlink inside the root writes the file it names, as before; a symlink
+    /// found at the name now (a dangling one, or a swap) is refused.
+    ///
+    /// A guarded write never truncates a file that changed after its check: `CreateNew`
+    /// creates exclusively, and `Replace` writes a sibling, checks the file is still the one
+    /// hashed with the same content, and renames the sibling over it.
     async fn write_target(
         &self,
         place: Place,
         normalized: String,
         contents: &str,
+        mode: WriteMode,
     ) -> Result<WriteFileOutcome, WorkspaceError> {
         let target = place.target.clone();
         let bytes = contents.as_bytes().to_vec();
@@ -545,11 +595,69 @@ impl WorkspaceService {
                 .kind(&place.name)
                 .map_err(|error| place.fault("exists", error))?
                 != Kind::Missing;
-            let mut file = dir
-                .open_file(&place.name, Open::Write)
-                .map_err(|error| place.fault("write-file", error))?;
-            file.write_all(&bytes)
-                .map_err(|error| place.fault("write-file", error))?;
+            let changed = || WorkspaceError::FileChangedOnDisk {
+                path: place.target.clone(),
+            };
+            match mode {
+                WriteMode::InPlace => {
+                    let mut file = dir
+                        .open_file(&place.name, Open::Write)
+                        .map_err(|error| place.fault("write-file", error))?;
+                    file.write_all(&bytes)
+                        .map_err(|error| place.fault("write-file", error))?;
+                }
+                WriteMode::CreateNew => {
+                    let mut file = match dir.open_file(&place.name, Open::CreateNew) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(changed());
+                        }
+                        Err(error) => return Err(place.fault("write-file", error)),
+                    };
+                    file.write_all(&bytes)
+                        .map_err(|error| place.fault("write-file", error))?;
+                }
+                WriteMode::Replace {
+                    version,
+                    id,
+                    permissions,
+                } => {
+                    let sibling =
+                        OsString::from(crate::transfer::upload::partial_transfer_file_name(
+                            &place.name.to_string_lossy(),
+                            WRITE_PARTIAL_SUFFIX,
+                        ));
+                    let mut file = dir
+                        .open_file(&sibling, Open::CreateNew)
+                        .map_err(|error| place.fault("write-file", error))?;
+                    let sibling_id =
+                        Identity::of(&file).map_err(|error| place.fault("write-file", error))?;
+                    let written = file
+                        .set_permissions(permissions)
+                        .and_then(|()| file.write_all(&bytes))
+                        .and_then(|()| file.sync_all());
+                    drop(file);
+                    let discard = || dir.remove_own(&sibling, sibling_id, false);
+                    if let Err(error) = written {
+                        discard();
+                        return Err(place.fault("write-file", error));
+                    }
+                    // Still the file that was hashed, with the content that was hashed.
+                    let unchanged = matches!(
+                        scan_file_blocking(&place),
+                        Ok(ScannedFile::Present { version: now, id: now_id, .. })
+                            if now == version && now_id == id
+                    );
+                    if !unchanged {
+                        discard();
+                        return Err(changed());
+                    }
+                    if let Err(error) = dir.rename(&sibling, &dir, &place.name, Replace::Allowed) {
+                        discard();
+                        return Err(place.fault("write-file", error));
+                    }
+                }
+            }
             Ok((target_existed, parent_existed))
         })
         .await?;
@@ -618,9 +726,15 @@ impl WorkspaceService {
             }
             let from_dir = from.folder(false)?;
             let to_dir = to.folder(true)?;
-            from_dir
-                .rename(&from.name, &to_dir, &to.name)
-                .map_err(|error| from.fault("rename", error))
+            // No-replace: a destination created after the check above is never overwritten.
+            match from_dir.rename(&from.name, &to_dir, &to.name, Replace::Never) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(WorkspaceError::AlreadyExists {
+                        path: to.target.clone(),
+                    })
+                }
+                other => other.map_err(|error| from.fault("rename", error)),
+            }
         })
         .await?;
         Ok(normalized)
@@ -643,15 +757,24 @@ impl WorkspaceService {
                 .kind(&place.name)
                 .map_err(|error| place.fault("stat", error))?
             {
-                Kind::Missing => {
-                    return Err(WorkspaceError::NotFound {
-                        path: place.target.clone(),
-                    });
-                }
-                Kind::Directory => dir.remove_dir_all(&place.name),
-                _ => dir.remove_file(&place.name),
+                Kind::Missing => Err(WorkspaceError::NotFound {
+                    path: place.target.clone(),
+                }),
+                Kind::Directory => match dir.remove_dir_all(&place.name) {
+                    Ok(()) => Ok(()),
+                    Err(Removal::Untouched(error)) => Err(place.fault("remove", error)),
+                    Err(Removal::Partial { error, left_at }) => {
+                        Err(WorkspaceError::PartiallyRemoved {
+                            path: place.target.clone(),
+                            left_at: place.folder.join(left_at),
+                            reason: error.to_string(),
+                        })
+                    }
+                },
+                _ => dir
+                    .remove_file(&place.name)
+                    .map_err(|error| place.fault("remove", error)),
             }
-            .map_err(|error| place.fault("remove", error))
         })
         .await?;
         Ok(normalized)
@@ -1207,6 +1330,72 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// Writes `contents` to the target the moment a guarded write's precondition held: a
+    /// person saving the same file in that window.
+    struct WriteAfterPreconditionCheck {
+        contents: &'static str,
+    }
+
+    impl WorkspaceWriteHook for WriteAfterPreconditionCheck {
+        fn after_write<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn after_precondition_check<'a>(
+            &'a self,
+            target: &'a Path,
+        ) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async move {
+                std::fs::write(target, self.contents).unwrap();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guarded_write_never_replaces_a_save_that_lands_after_its_check() {
+        let root = TempDir::new().unwrap();
+        let service = || {
+            WorkspaceService::default().with_write_hook_for_test(Arc::new(
+                WriteAfterPreconditionCheck { contents: "person" },
+            ))
+        };
+        // createOnly: the file appeared after the absence check.
+        let created = service()
+            .write_file_if_unchanged(root.path(), "new.txt", "agent", &WritePrecondition::Missing)
+            .await;
+        assert!(
+            matches!(created, Err(WorkspaceError::FileChangedOnDisk { .. })),
+            "{:?}",
+            created.map(|_| ())
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
+            "person"
+        );
+        // A version-checked write: the file changed in place after the version matched.
+        std::fs::write(root.path().join("base.txt"), "base").unwrap();
+        let replaced = service()
+            .write_file_if_unchanged(
+                root.path(),
+                "base.txt",
+                "agent",
+                &WritePrecondition::Version {
+                    version: sha256_hex(b"base"),
+                },
+            )
+            .await;
+        assert!(
+            matches!(replaced, Err(WorkspaceError::FileChangedOnDisk { .. })),
+            "{:?}",
+            replaced.map(|_| ())
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("base.txt")).unwrap(),
+            "person"
+        );
     }
 
     #[cfg(unix)]
