@@ -911,13 +911,18 @@ async fn a_capability_set_turned_off_hides_and_refuses_its_tools_live() {
     );
     settings.capabilities.workspace = false;
     harness.settings.send_replace(settings);
-    // Only the sets still on are listed: Diagnostics, on by default (slice X2), and the
-    // tools of no set (slice X3).
+    // Only the sets still on are listed: Diagnostics and Files, on by default (X2, X5), and
+    // the tools of no set (X3).
     assert!(listed(&harness, &agent).iter().all(|name| {
         crate::mcp::control::tool_spec(crate::mcp::control::PrincipalKind::Client, name)
             .is_some_and(|spec| {
-                spec.capability
-                    .is_none_or(|set| set == crate::mcp::control::McpCapability::Diagnostics)
+                spec.capability.is_none_or(|set| {
+                    matches!(
+                        set,
+                        crate::mcp::control::McpCapability::Diagnostics
+                            | crate::mcp::control::McpCapability::Files
+                    )
+                })
             })
     }));
     let refused = harness

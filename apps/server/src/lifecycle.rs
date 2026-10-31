@@ -322,6 +322,10 @@ impl ServerRuntime {
                 );
                 // A port-0 start learns its port only here.
                 runtime.preview_tunnels().set_own_port(local_addr.port());
+                // The MCP Files tools' transfer URLs (#139 X5) point here.
+                runtime
+                    .mcp_control()
+                    .attach_transfer_base(local_http_base(local_addr));
                 let jwt = PersistentJwtCodec::open(state_directory.join("environment-jwt.json"))
                     .await
                     .map_err(|error| ServerError::ProductionInitialize(error.to_string()))?;
