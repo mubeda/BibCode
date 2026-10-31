@@ -3269,6 +3269,42 @@ source and fixed test-first:
   is still `McpThreadNotFoundError`, now recorded `failed` under its key, as P's is. The
   reorder changes one more thing: a call with a missing argument on a deleted thread now
   reports the argument, where it used to report the thread.
+- **Discard containment still raced the trash.** A folder swapped for an outside symlink after
+  the re-check, but before the native trash resolved the path, sent the outside file to the
+  trash. A test hook in the move window reproduced it. The window is now closed on unix, and
+  the change uses only `libc`, already a unix dependency. `move_to_trash` opens the canonical
+  checkout with `O_DIRECTORY|O_NOFOLLOW`, then opens each folder of the path with `openat`
+  under the same flags, so a link is never entered. It then `renameat`s the entry by that
+  handle into a new `0700` folder `<git_dir>/bibcode-discard/<uuid>/`, created and opened the
+  same way, and the trash takes only that staged path. Git never writes there, so a branch
+  switch or pull cannot plant a link in it. After the trash, the holder folder is removed.
+  When the trash refuses the entry, it is renamed back with `renameat2(RENAME_NOREPLACE)` on
+  Linux or `renameatx_np(RENAME_EXCL)` on macOS, never over a file created meanwhile; then it
+  stays staged, is logged without its path, and is reported in `trashUnavailable`. Outcomes:
+  - a folder that is a link, or not a folder (`ELOOP`, `ENOTDIR`), keeps the entry and lists
+    it in `trashUnavailable`, also under `permanent`;
+  - any other staging failure (`EXDEV` across file systems, a missing entry) is treated like
+    a trash refusal, so `permanent` still removes the entry through `git clean`, which hands
+    no path to an outside program.
+
+  The brief said to report a failed rename in `trashUnavailable` and do nothing else. Doing
+  only that would have stopped the Source Control panel's permanent discard wherever the Git
+  directory sits on another file system, so only the link cases skip the permanent path.
+  On Windows (no handle-based Recycle Bin call in the existing dependencies), the move keeps
+  the canonical-path re-check and also refuses when a folder on the path is a reparse point
+  (symlink or junction) at move time. The window left there is the PowerShell call resolving
+  the path. Neither `cargo check --target x86_64-pc-windows-msvc` nor a Windows run was
+  possible here (aws-lc-sys needs the MSVC headers), so CI's Windows job is the first to
+  build it. Trade-offs:
+  - **Put Back** in the macOS or Linux trash returns a file to the staging folder;
+  - a crash between staging and trashing leaves the entry there;
+  - a path through a symlinked folder that stays inside the checkout is now kept, not
+    trashed. Git does not track paths beyond a symlink anyway.
+
+  Tests: `a_folder_swapped_for_an_outside_symlink_inside_the_move_window_is_never_followed`
+  (failed first: the outside file was trashed) and
+  `a_refused_entry_never_goes_back_over_a_file_created_meanwhile`. The existing discard tests
+  and the `git_manager` and MCP Git suites pass unchanged.
 
 ## P (pull request tools) implementation notes (2026-10-30)
 

@@ -130,7 +130,10 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   when a guard refused it, its `blocked` reason, such as uncommitted changes.
 - **Discard** lists every file it kept in `trashUnavailable`: one the trash could not take,
   or, with `permanent`, an ignored file that permanent deletion leaves in place. A file whose
-  folder turns into a symlink to somewhere else before the trash takes it is kept too.
+  folder is, or turns into, a symlink is kept too, whatever `permanent` says. On macOS and
+  Linux, BiBCode first moves each file into a folder of its own in the repository's Git
+  directory (`bibcode-discard`), and the trash takes it from there, so **Put Back** in the
+  Trash returns it to that folder, not to the checkout.
 
 ### Pull requests
 
