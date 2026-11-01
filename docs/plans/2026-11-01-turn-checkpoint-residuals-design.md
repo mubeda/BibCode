@@ -1,10 +1,10 @@
 # Turn Checkpoint Residuals (#234, #235, #236)
 
-Status: Proposed 2026-11-01, revised the same day after a Codex review (REVISE, three P2
-defects in the #234 retry lifecycle; see "Review findings" at the end). It needs approval
-before implementation. It covers three residuals the PR #213 review accepted. Verified at
-`9c8799b80` (`origin/main`, v0.14.0), and line references are to that commit. Paths are
-under `apps/server/src/` unless they name another package.
+Status: Approved 2026-11-01 (Codex review, 3 rounds)
+
+It covers three residuals the PR #213 review accepted. Verified at `9c8799b80`
+(`origin/main`, v0.14.0), and line references are to that commit. Paths are under
+`apps/server/src/` unless they name another package.
 
 Implementation order: #235 (the `diffAvailable` flag), then the trusted-baseline rule that
 #236 and #234 share, then #234's hold and revert guards. The three can share one branch.
