@@ -1429,8 +1429,10 @@ export default function SourceControlPanel({
             if (!open) setPendingPullRequest(null);
           }}
           onSettled={(result) => {
-            if (result.commit.status === "created") {
-              draft.clear(pendingPullRequest.commitInput?.commitMessage ?? draft.message);
+            // Clear only the text this commit sent; with none sent, a draft typed since stays.
+            const submitted = pendingPullRequest.commitInput?.commitMessage;
+            if (result.commit.status === "created" && submitted !== undefined) {
+              draft.clear(submitted);
             }
             reloadCommits();
           }}

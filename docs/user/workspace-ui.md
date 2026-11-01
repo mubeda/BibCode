@@ -1003,7 +1003,8 @@ each other. When tabs write different messages for one checkout, the newest stay
 box and the others (up to five, oldest dropped after that) are listed under it, each with
 **Use** and **Dismiss**; no text any tab wrote leaves storage until someone uses,
 dismisses or commits it. A commit clears only the message it sent, and only if the box
-still holds it. The selected worktree is intentionally session-only and resets to the main checkout
+still holds it. Web Storage has no cross-window lock, so two saves landing in the same
+instant can still lose one version. The selected worktree is intentionally session-only and resets to the main checkout
 after a reload. Evicted or hidden projects retain no mounted panel or live Git
 Manager subscription.
 
