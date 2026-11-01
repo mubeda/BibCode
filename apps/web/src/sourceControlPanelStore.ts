@@ -214,6 +214,7 @@ function saveMessage(
   local: SourceControlDraft | undefined,
   message: string,
 ): SourceControlDraft {
+  // shortcut: read-then-write is not atomic across windows; a save landing in that gap can still lose one version; upgrade to navigator.locks if users hit it
   const stored = readDraft(cwdKey);
   const theirs = stored?.message ?? "";
   const unseen = theirs.trim() !== "" && theirs !== message && theirs !== (local?.message ?? "");
@@ -250,6 +251,7 @@ function clearSubmitted(
   cwdKey: string,
   submitted: string,
 ): Record<string, SourceControlDraft> {
+  // shortcut: read-then-write is not atomic across windows; a save landing in that gap can still lose one version; upgrade to navigator.locks if users hit it
   const stored = readDraft(cwdKey);
   if (stored !== undefined && stored.message.trim() === submitted.trim()) {
     const alternates = stored.alternates ?? [];
