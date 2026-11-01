@@ -763,7 +763,8 @@ vp run test:ui:desktop
 For a change to the timeline's item types (`resolveTimelineItemType`) or to how
 LegendList estimates rows, also run `chat-huge-thread-scroll.e2e.ts`
 (`BIBCODE_E2E_SPEC=./specs/chat-huge-thread-scroll.e2e.ts`). A Claude prompt
-containing `[[long-reply]]` makes the fixture answer with 1,000 paragraphs. The
+containing `[[long-reply]]` makes the fixture stream 1,000 paragraphs in ten
+deltas, so each long reply crosses length buckets while it renders. The
 spec builds 84 short turns and then 4 long ones in a Claude panel, reopens the
 thread at its end, pages up from the composer, and sets the scroller to the top.
 It asserts that the timeline stays mounted, the first turn shows, and neither the

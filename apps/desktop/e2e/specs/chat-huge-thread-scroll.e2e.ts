@@ -15,7 +15,8 @@ import {
  * unmeasured row from measured rows of its item type, so if every assistant reply shared one
  * type, the long replies measured first would place each short one far too tall. Scrolling up,
  * each short row that mounted and measured would shrink the list and pull the next one in within
- * the same layout pass, until React threw "Maximum update depth exceeded" (#185).
+ * the same layout pass, until React threw "Maximum update depth exceeded" (#185). The long
+ * replies stream in deltas, so each crosses length buckets while the list measures it.
  */
 const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
 const projectPath = process.env.BIBCODE_E2E_PROJECT_PATH;

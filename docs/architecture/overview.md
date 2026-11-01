@@ -3272,9 +3272,12 @@ view), or free scrolling.
   long ones. With one type for every reply, scrolling up past short replies
   placed at a long reply's average shrank the list on each measurement and
   pulled the next row in within the same layout pass, until React threw
-  "Maximum update depth exceeded" (#228). A streaming reply that changes bucket
-  keeps its container: the type only selects a container for a row that needs
-  a new one.
+  "Maximum update depth exceeded" (#228). A row keeps the first type it
+  resolves to while it stays in the list (`createStickyTimelineItemType`):
+  LegendList moves a measured row's size into a new type's average without
+  counting it there, so a streaming reply crossing a bucket would inflate that
+  bucket's estimate. A reply streamed live is measured anyway; history loads
+  with its full text and takes its own bucket.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
