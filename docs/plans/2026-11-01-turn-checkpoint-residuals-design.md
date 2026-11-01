@@ -1,12 +1,13 @@
 # Turn Checkpoint Residuals (#234, #235, #236)
 
-Status: Proposed 2026-11-01. It needs approval before implementation. It covers three
-residuals the PR #213 review accepted. Verified at `9c8799b80` (`origin/main`, v0.14.0),
-and line references are to that commit. Paths are under `apps/server/src/` unless they
-name another package.
+Status: Proposed 2026-11-01, revised the same day after a Codex review (REVISE, three P2
+defects in the #234 retry lifecycle; see "Review findings" at the end). It needs approval
+before implementation. It covers three residuals the PR #213 review accepted. Verified at
+`9c8799b80` (`origin/main`, v0.14.0), and line references are to that commit. Paths are
+under `apps/server/src/` unless they name another package.
 
-Implementation order: #235, then #236 (which relies on #235 to keep the next turn
-revertible), then #234. The three can share one branch.
+Implementation order: #235 (the `diffAvailable` flag), then the trusted-baseline rule that
+#236 and #234 share, then #234's hold and revert guards. The three can share one branch.
 
 ## Shared vocabulary
 
@@ -15,6 +16,10 @@ revertible), then #234. The three can share one branch.
   `n - 1..n` is turn `n`'s change. A one-turn patch needs this.
 - Today `ready` means both, `missing` means neither (or not yet), and `error` means given
   up for good (terminal in the projector, `orchestration/engine.rs:8064-8071`).
+- **Trusted baseline** (new, shared by #236 and #234): ref 0, or ref `n` of a `ready` row.
+  Ref `n >= 1` is then written only by turn `n`'s own capture, while turn `n`'s hold keeps
+  every later turn out of the checkout. That is the only time the checkout is known to be
+  turn `n`'s end state. Turn-start baselines write ref 0 only.
 
 ---
 
@@ -55,7 +60,10 @@ revertible), then #234. The three can share one branch.
 ### Recommendation: B
 
 - `record_checkpoint`: when the baseline is unusable (`:1565-1576`), record `ready` with
-  `files: []` and `diffAvailable: false` instead of returning `Err`. Append the
+  `files: []` and `diffAvailable: false` instead of returning `Err`. Unusable means the
+  trusted-baseline rule fails: `n - 1 >= 1` and row `n - 1` is not `ready` (`missing` or
+  `error`; this replaces today's `previous_given_up` check), or ref `n - 1` does not
+  resolve. Append the
   `checkpoint.captured` activity with tone `warning` and the detail "The checkpoint before
   turn n is missing, so this turn's changes cannot be shown. You can still revert to it."
   A turn whose own capture failed still returns `Err` and stays `missing`.
@@ -138,45 +146,46 @@ revertible), then #234. The three can share one branch.
 
 ### Options
 
-| Option                                                                                             | Trade-off                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A. Retry the delete with a bound (for example 3 tries, 100 ms apart)                               | Covers a transient ref lock. A lock held longer, or a Git failure that is not transient, still leaves the leftover. It reduces the hole but does not close it.                                                                                                                                                                                                                                                                                           |
-| B. Mark the number in memory (as with the stale set) so the next baseline overwrites ref `n`       | A restart loses the mark, which is the #234 problem again. Overwriting from a `missing` row without a mark is not safe either: a queued `thread.message-sent` baseline (`Baseline::Message`) can run while turn `n + 1` runs, and it would overwrite the baseline of the running turn.                                                                                                                                                                   |
-| C. Give the turn up durably: when the capture and the delete both fail, record turn `n` as `error` | Reuses the existing terminal state, with no new state and no persisted-shape change, and it survives a restart. `ensure_baseline` already skips an `error` latest turn (`:1198-1210`), and `record_checkpoint` already refuses an `error` previous turn as a baseline (`:1566-1572`). With #235, turn `n + 1` is then `ready` without a diff, so it can still be reverted to. Turn `n + 1` loses its diff only when Git failed twice on the same number. |
+| Option                                                                                             | Trade-off                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Retry the delete with a bound (for example 3 tries, 100 ms apart)                               | Covers a transient ref lock. A lock held longer, or a Git failure that is not transient, still leaves the leftover. It reduces the hole but does not close it.                                                                                                                                                                              |
+| B. Mark the number in memory (as with the stale set) so the next baseline overwrites ref `n`       | A restart loses the mark, which is the #234 problem again. Overwriting from a `missing` row is not safe either: the baseline runs on the effects worker, unordered with the delivery of the turn it is for (see #234), so it can capture that turn's edits.                                                                                 |
+| C. Give the turn up durably: when the capture and the delete both fail, record turn `n` as `error` | The first revision's choice. It needs a claim against the hold's expiry and a second record, and that record can fail on its own (a residual the first revision accepted).                                                                                                                                                                  |
+| D. Trust only a `ready` predecessor (the trusted-baseline rule)                                    | The row that is already written is the durable mark: a capture that failed leaves row `n` `missing`, so turn `n + 1`'s capture never reads ref `n`, leftover or not. No new state, record, claim or failure mode. The same rule closes #234 (see there). With #235, turn `n + 1` is `ready` without a diff, so it can still be reverted to. |
 
-### Recommendation: C, without a retry
+### Recommendation: D
 
-- When `capture_checkpoint_with_cancellation` fails and `delete_ref` also fails,
-  `record_checkpoint` first calls `claim_checkpoint_completion`. If the claim is lost, the
-  expiry already writes `error`. If the claim is won, it dispatches
-  `dispatch_turn_checkpoint(.., "error", [])` before returning the capture error. The
-  claim keeps the expiry from also writing `error` and appending a second activity. The
-  record is written before the hold guard is dropped (`:1052-1059`), so no later turn
-  starts first.
-- If that `error` dispatch itself fails (the database is failing as well), the turn
-  stays `missing`. Log it with `tracing::warn!`. This residual needs two Git failures and
-  a database failure together, so it is accepted.
-- A delete that fails because of cancellation (shutdown) is treated the same way. This
-  is conservative: the next turn loses its diff but stays revertible.
-- The retry from option A is not needed for correctness. Add it later only if transient
-  locks turn out to be common.
+- `record_checkpoint` uses the trusted-baseline rule for ref `n - 1` (the #235 bullet
+  above). A leftover ref `n` behind a `missing` or `error` row is never a baseline.
+- `ensure_baseline` writes ref 0 only (#234, rule 1), so no baseline overwrites or keeps a
+  leftover as a diff start.
+- The failed delete keeps its `tracing::warn!`. The leftover stays in Git until a revert or
+  a later capture of number `n` replaces it, as today. It is harmless, because nothing
+  reads it.
+- Turn `n + 1` loses its diff whenever turn `n`'s capture did not complete, not only after
+  two Git failures. That is #234's trade-off, stated there.
 
 ### Tests (acceptance)
 
-- New: `a_failed_capture_whose_leftover_ref_cannot_be_deleted_is_given_up` in
+- New: `a_failed_capture_whose_leftover_ref_cannot_be_deleted_is_never_a_baseline` in
   `production/turn_delivery_queue_tests.rs`, using `RevertFixture`.
   - Setup: plant a leftover ref 3 (`capture_checkpoint` of `"leftover\n"`), then create
     `<git dir>/<checkpoint_ref("t", 3)>.lock`. This makes both the capture's
     `update-ref` and the `update-ref -d` fail, which is the "ref lock held across both
     steps" the issue asks for. End turn 3.
-  - Assert: row 3 is `error`, and there is one `checkpoint.capture.failed` activity.
-  - Then remove the lock and run turn 4. Assert: ref 3 still resolves to the leftover
-    (no baseline rewrote it). Row 4 is `ready` with `diffAvailable: false`. The
+  - Assert: row 3 is `missing`, and there is one `checkpoint.capture.failed` activity.
+  - Then remove the lock and run turn 4 (start, edit, end). Assert: ref 3 still resolves
+    to the leftover. Row 4 is `ready` with `diffAvailable: false`. The
     `orchestration.diff` 3..4 is refused. A revert to 4 is accepted, and a revert to 3 is
     refused.
 - Guard, new:
-  `a_failed_capture_without_a_leftover_stays_missing_and_the_next_baseline_writes_its_ref`.
-  It proves that the common single failure keeps today's recovery.
+  `a_failed_capture_leaves_its_ref_unwritten_and_the_next_turn_revertible_without_a_diff`.
+  Turn 3's capture fails without a leftover. Then turn 4 starts after its edits are
+  already in the checkout. Sync on the worker with `other_thread_gets_its_baseline`, so
+  turn 4's baseline event has been handled. Assert that ref 3 does not resolve. Then end
+  turn 4 and assert that row 4 is `ready` with `diffAvailable: false` and that a revert
+  to 4 restores its files. This replaces the first revision's guard, which asserted that
+  the next baseline writes ref 3.
 
 ---
 
@@ -186,45 +195,95 @@ revertible), then #234. The three can share one branch.
 
 - `expire_stale_hold` (`orchestration_effects.rs:1368-1430`) marks the turn stale in
   memory through `expire_checkpoint_hold` (`orchestration/engine.rs:2840-2858`). It then
-  writes `error` (`orchestration_effects.rs:1402-1406`). On failure it only logs a
+  writes `error` once (`orchestration_effects.rs:1402-1406`). On failure it only logs a
   warning, and then releases the hold anyway (`:1407`).
-- The stale set lives only in memory (`engine.rs:2886-2892`). After a restart, the row is
-  `missing` and nothing remembers the give-up. If the worker had not yet run turn
-  `n + 1`'s baseline, `ensure_baseline` (`orchestration_effects.rs:1195-1221`) can write
-  ref `n` from a checkout that already holds turn `n + 1`'s edits. Turn `n + 1`'s patch
-  then misses those edits. Revert is still safe, because row `n` is never `ready`.
+- The capture worker also releases the hold however its capture ends:
+  `CheckpointHoldRelease` is taken at `:1050-1058` and releases on drop (`:1270-1275`).
+  That includes the stale error it returns at entry (`:1507-1509`) or after a lost claim
+  (`:1539-1551`). So the release can come before the expiry's write lands, even today
+  (review finding 1).
+- `ensure_baseline` (`:1159-1221`) writes ref `n` (the latest number) when it is absent,
+  unless row `n` is `error` or stale in memory (`:1195-1210`). It runs on the effects
+  worker (`:1041-1045`). Delivery checks only the hold before it claims and sends the turn
+  (`production/turn_delivery.rs:1399-1415`), so nothing orders a baseline before the turn
+  it is for. A baseline that writes ref `n >= 1` can therefore capture the next turn's
+  edits whenever the worker is behind. Three cases reach it:
+  - a restart, which loses the stale marks (review finding 2);
+  - an ordinary failed capture, with no restart;
+  - a turn cut off by a restart, whose ref the next baseline is meant to capture
+    (`production/provider_runtime.rs:2787-2790`).
+- A revert does not consult holds (`plan_revert`, `:1643-1711`). `thread.reverted` deletes
+  the rows above the target (`orchestration/engine.rs:8103-8110`). A later
+  `thread.turn-diff-completed` for a deleted turn inserts its row again
+  (`orchestration/engine.rs:8080-8100`, `TURN_UPSERT_SQL`). That brings back a reverted
+  turn and raises the thread's current number, which a later revert's provider rewind
+  counts (`orchestration_effects.rs:1684-1733`). Only the expiry writes records from
+  outside the serial worker, so today the window is one dispatch. A retry loop would make
+  it unbounded (review finding 3).
+- History is not replayed across a restart. The effects producer starts at the log head
+  (`:473-476`, `:548-549`), so a `missing` row whose capture had not completed is never
+  captured later.
 
 ### Options
 
-| Option                                                                                                                      | Trade-off                                                                                                                                                                                                                                                                                                                                        |
-| --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| A. Bounded retry, then release (today's behavior after N tries)                                                             | Shrinks the window but keeps the hole: "released but not durable" is still reachable.                                                                                                                                                                                                                                                            |
-| B. Persist the stale mark somewhere else (a file or another table)                                                          | Adds a second source of truth. It fails in the same situation as the first, because it uses the same disk and database.                                                                                                                                                                                                                          |
-| C. Keep the hold until `error` is durable: retry with capped backoff, and stop only on success, shutdown or thread deletion | Never releases a thread whose give-up is not durable. A restart before success leaves the row `missing`, but no turn ran since the expiry, so the checkout at restart is still the one turn `n` left. The next baseline writes ref `n` exactly as it does after an ordinary failed capture, and that ref is a correct baseline for turn `n + 1`. |
+| Option                                                                                                   | Trade-off                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. Bounded retry, then release (today's behavior after N tries)                                          | Shrinks the window but keeps the hole: "released but not durable" is still reachable.                                                                                                                                                                                                                                                                                                      |
+| B. Persist the stale mark somewhere else (a file or another table)                                       | Adds a second source of truth. It fails in the same situation as the first, because it uses the same disk and database.                                                                                                                                                                                                                                                                    |
+| C. Keep the hold until `error` is durable (retry with capped backoff)                                    | The first revision's choice. The review found three defects: the worker still releases the hold early (finding 1); a restart is not safe, because the baseline is not ordered before delivery (finding 2); a pending retry brings back a turn that a revert removed (finding 3). Fixing all three needs a transfer of release ownership, delivery fencing and revert-aware retries.        |
+| D. Fence delivery behind its baseline                                                                    | Fixes the baseline race for every ref, ref 0 included, and keeps diffs after an incomplete capture. But it puts Git calls on the turn-start path (or makes delivery wait on a watermark of the effects worker, which is serial across all threads, so one hung Git would delay every thread). It also moves baseline ownership out of the worker. Larger, and it costs turn-start latency. |
+| E. Make durability unnecessary: baselines write ref 0 only, and captures trust only `ready` predecessors | Deletes the permission that a `missing` row granted, instead of making the `error` record durable. No retry, no new state, and a restart cannot change the outcome. Cost: the turn after an incomplete capture has no diff (below).                                                                                                                                                        |
 
-### Recommendation: C
+### Recommendation: E
 
-The issue asks whether holding forever on a failing database is worse than releasing.
-It is not. A turn delivery needs the same database: its claim and its events are
-database writes, so releasing does not move the thread forward while the database fails.
-When the database recovers, the next retry succeeds within one backoff interval and
-releases the thread. The thread stays held until a restart only when that one command
-fails deterministically, and the restart clears the hold safely, as argued above.
+The defect behind #234 is that a `missing` row let a baseline write ref `n` later, from a
+checkout that might already hold the next turn's edits. Remove that permission, and the
+`error` record no longer has to be durable for correctness:
 
-- In `expire_stale_hold`, after `expire_checkpoint_hold` returns `true`, retry the
-  `error` dispatch in a loop with backoff starting at 1 s, doubling, capped at 30 s.
-  - Exit on success, then release and append the activity as today.
-  - Exit on `shutdown.cancelled()` without a release: the effects shutdown already
-    releases every hold (`engine.rs:2790-2799`).
-  - Exit when the hold is gone (the thread was deleted, `orchestration_effects.rs:1068-1071`).
-    This needs a small `OrchestrationEngine::holds_checkpoint(thread, turn)` accessor
-    next to `checkpoint_is_stale`.
-- Log the first failure with `tracing::warn!` and include the attempt count. Log every
-  tenth failure with `tracing::error!`, so a stuck thread is visible in the native log
-  without flooding it.
-- Acceptance takes the documented-trade-off branch of the issue. After a restart, the
-  next baseline does write ref `n`. That is safe because no turn ran after the expiry.
-  Record this in `docs/architecture/rpc-and-orchestration.md` (Turn checkpoints, step 3).
+1. **Baselines write ref 0 only.** `ensure_baseline` returns once `turn_count >= 1`. The
+   `latest_went_stale` block (`:1195-1210`) and its `error` and stale checks are deleted.
+   Ref 0 (a thread's first turn, or the thread whose turns predate checkpoints) is
+   unchanged.
+2. **Captures trust only `ready` predecessors** (the trusted-baseline rule, shared with
+   #235 and #236).
+3. **The expiry writes `error` once**, as today, with no retry or loop. On failure it logs
+   `tracing::warn!` (thread id, turn number and error) and the row stays `missing`. That
+   is now safe:
+   - a revert refuses it (`plan_revert` accepts only `ready`);
+   - it is never a baseline (rule 2), and no baseline writes its ref (rule 1);
+   - it is never captured later, because the stale mark blocks the worker before a
+     restart, and history is not replayed after one.
+     The `error` record and its activity remain the user-visible record when the database
+     accepts them.
+4. **A stale turn's hold is released only by its expiry task**, after its single write
+   attempt. `CheckpointHoldRelease::drop` skips the release when
+   `engine.checkpoint_is_stale(thread, turn)`. `expire_checkpoint_hold` sets the mark
+   under the hold lock before it returns `true`, and the task then always reaches its
+   release. Thread deletion (`:1068-1071`) and effects shutdown (`engine.rs:2790-2799`)
+   still release every hold. This resolves finding 1 as the review suggests, although
+   rule 3 already makes an early release harmless for baselines. Rule 5 needs it.
+5. **A revert waits out the hold.** `plan_revert` refuses while
+   `engine.turns_held_for_checkpoint(thread)`, with
+   `checkpoint_record_pending_detail()`: "The last turn's checkpoint is still being
+   recorded. Try the revert again in a moment." Every checkpoint record of a turn lands
+   before its hold is released: the worker records before its guard drops, and the expiry
+   by rule 4. So no record can land after a revert and bring a row back. The serial worker
+   already orders a revert after the thread's earlier captures (`:858-920`), so the
+   refusal is reachable only while an expiry's write is in flight. MCP's preflight needs
+   no change, because it reports the effects refusal.
+
+Trade-off, recorded in `docs/architecture/rpc-and-orchestration.md` (Turn checkpoints):
+the turn after one whose capture did not complete (it failed, timed out or was cut off by
+a restart) is `ready` without a diff (#235). It is still revertible. It does not get a
+diff from a late baseline that may contain its own edits. Today that diff depends on a
+race and can be wrong. Option D is the follow-up if diffs after incomplete captures, or
+the same race on ref 0, turn out to matter.
+
+The issue asks whether holding forever on a failing database is worse than releasing. It
+no longer has to choose: the thread is released after one write attempt, and nothing is
+lost if that attempt fails. Acceptance takes the test branch of the issue: the
+`error` write fails, the server restarts, and the next baseline never writes that turn's
+ref.
 
 ### Tests (acceptance)
 
@@ -235,44 +294,94 @@ following the existing precedent (`production/mcp_tools_tests/foundation.rs:1130
 projection abort fails `dispatch` without degrading the engine. If it degrades the
 engine, inject the failure at the command decider instead.
 
-- New: `a_stale_record_that_cannot_be_written_keeps_the_thread_held_until_it_is` in
+- New: `an_unwritten_stale_record_releases_the_thread_and_never_becomes_a_baseline` in
   `production/turn_delivery_queue_tests.rs`. Use a 200 ms hold limit, a hung capture
-  (`hold_workspace`) and the trigger. Assert that the queued follow-up is not received
-  for 2.5 s (the limit plus two retries). Then drop the trigger and assert that row 3
-  becomes `error`, the follow-up is received, and there is one
-  `checkpoint.capture.failed` activity.
-- New: `a_restart_while_the_stale_record_cannot_be_written_lets_no_later_turn_into_the_baseline`,
-  modeled on `a_stale_turn_is_never_a_revert_target_after_a_restart`
-  (`turn_delivery_queue_tests.rs:1587`). Restart with the trigger in place. Assert that
-  the follow-up was never delivered before the restart, and that row 3 is `missing`
-  after it. Assert that the next baseline's ref 3 holds `"three\n"` (turn 3's checkout,
-  with no later turn's edits), and that a revert to 3 is refused.
-- New: `deleting_a_thread_ends_its_stale_record_retry`. Delete the thread while the
-  trigger fails, and assert that the hold is gone and another thread's delivery is not
-  affected.
-- Kept: `an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_thread`
-  (`:1389`) and `an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready`
-  (`:1529`).
+  (`hold_workspace`) and the trigger.
+  - Assert that the queued follow-up is received after the expiry, and that row 3 is
+    `missing`.
+  - Then resume the hung capture while the trigger is still installed (the review's
+    "resume the capture while the write still fails"). Sync with
+    `other_thread_gets_its_baseline`. Assert that row 3 is still `missing` and that ref 3
+    does not resolve.
+  - Write `"four\n"` and end turn 4. Assert that ref 3 still does not resolve, that row 4
+    is `ready` with `diffAvailable: false`, that a revert to 3 is refused ("no captured
+    checkpoint"), and that a revert to 4 restores `"four\n"`.
+- New: `a_restart_after_an_unwritten_stale_record_never_writes_that_turns_ref`, modeled on
+  `a_stale_turn_is_never_a_revert_target_after_a_restart`
+  (`turn_delivery_queue_tests.rs:1587`).
+  - Restart with the trigger in place. Assert that row 3 is `missing` and that the engine
+    has no stale mark.
+  - Write `"four\n"` before turn 4's `thread.turn.start` is dispatched. The checkout then
+    already holds turn 4's edits when its baseline event is handled, which is the order
+    of a delivery that beats its baseline (finding 2).
+  - Sync with `other_thread_gets_its_baseline`. Assert that ref 3 does not resolve.
+  - End turn 4. Assert that row 4 is `ready` with `diffAvailable: false`, and that a
+    revert to 3 is refused.
+- New: `a_stale_captures_worker_leaves_the_hold_to_its_expiry`. Use a long hold limit, so
+  the real expiry does not fire.
+  - Take a hold with `engine.hold_turns_for_checkpoint("t", "turn-3")`, and mark it stale
+    with `engine.expire_checkpoint_hold(.., id)`. This is the expiry with its write still
+    pending, by construction.
+  - Dispatch the `missing` record and sync on the worker. Assert that
+    `turns_held_for_checkpoint("t")` is still true and that the queued follow-up is not
+    received.
+  - Then `release_checkpoint_hold`, and assert that the follow-up is received.
+- New: `a_revert_is_refused_while_a_stale_record_holds_the_thread`. Use the same setup
+  with a ready turn 2.
+  - Request a revert to 2. Assert one `checkpoint.revert.failed` with the pending-record
+    detail, that row 3 still exists, and that the provider was not rewound.
+  - Write the `error` record and release the hold, as the expiry does. Then revert to 2
+    again, and assert that it succeeds and that row 3 is gone. This test covers finding 3.
+- Kept:
+  - `an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_thread`
+    (`:1389`);
+  - `an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready` (`:1529`);
+  - `a_stale_turn_is_never_a_revert_target_after_a_restart` (`:1587`). Update its
+    comment: the baseline does not write ref 3 because ref 3 has a number, not because the
+    row is `error`.
+- Dropped from the first revision:
+  `a_stale_record_that_cannot_be_written_keeps_the_thread_held_until_it_is` and
+  `deleting_a_thread_ends_its_stale_record_retry` (there is no retry).
 
 ---
 
 ## Documentation and coverage for the implementation
 
 - `docs/architecture/rpc-and-orchestration.md`:
-  - Turn checkpoints, step 3: `ready` means capture valid, with `diffAvailable`; a double
-    Git failure gives the turn up; the stale record is retried and the trade-off is
-    stated.
+  - Turn checkpoints, step 1: a turn start writes ref 0 only; it never writes a numbered
+    ref.
+  - Step 3:
+    - `ready` means capture valid, with `diffAvailable`;
+    - ref `n - 1` is a diff start only from a `ready` row, or ref 0;
+    - the turn after an incomplete capture has no diff (the trade-off);
+    - the expiry writes `error` once, and a stale turn's hold is released only by its
+      expiry.
+  - Step 4: the next baseline no longer captures a cut-off turn's ref. Also update the
+    comment at `production/provider_runtime.rs:2787-2790`.
   - Turn patches, step 0: the start of a one-turn range is trusted only with
     `diffAvailable`.
-  - Checkpoint revert, step 1: a `ready` turn without a diff can be reverted to.
+  - Checkpoint revert, step 1: a `ready` turn without a diff can be reverted to, and a
+    revert is refused while a checkpoint hold stands.
 - `docs/reference/mcp.md`: the new `get_turn_diff` refusal.
 - `docs/testing/`: review it. No commands or targets change, so the runbooks are expected
   to stay accurate.
 - Profiler: no new child process, RPC method, removal path or binary mode. New failures
-  are logged with `tracing::warn!` or `tracing::error!` at the effects boundary, and no
-  profiler event or finding changes.
+  are logged with `tracing::warn!` at the effects boundary, and no profiler event or
+  finding changes.
 - Residual risks:
-  - #236's give-up is lost when its own `error` write also fails.
+  - The turn after an incomplete capture has no diff (#234 trade-off).
+  - The ref 0 baseline still runs on the effects worker, unordered with the first turn's
+    delivery. This race existed before this change and is not changed by it. Option D is
+    the fix, and it should get its own issue.
   - Old `missing` rows that are really captured without a baseline are not backfilled.
-    They stay refused, as they are today.
+    They stay refused, as they are today. An old `missing` predecessor whose ref a
+    baseline wrote under the old rule is no longer a diff start.
   - Migration id 63 may collide with another v0.15 slice.
+
+## Review findings (Codex, first revision)
+
+| Finding                                                              | Verified against source                                                                                                      | Resolution                                                                                                                                                                                    |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. The capture worker releases the hold before the record is durable | Yes: `orchestration_effects.rs:1050-1058`, `:1270-1275`, `:1507-1509`, `:1539-1551`. It also happens today, without a retry. | Rule 4: a stale turn's hold is released only by its expiry. Rules 1-3 make a release before durability harmless for baselines. Test: `a_stale_captures_worker_leaves_the_hold_to_its_expiry`. |
+| 2. A restart does not guarantee a safe baseline                      | Yes: `turn_delivery.rs:1399-1415` against `orchestration_effects.rs:1041-1045`. Also reachable without a restart (see #234). | Rule 1: no baseline writes a numbered ref, so ordering cannot matter. Test: `a_restart_after_an_unwritten_stale_record_never_writes_that_turns_ref`, with the edits in the checkout first.    |
+| 3. A pending retry brings back a turn that a revert removed          | Yes: `engine.rs:8080-8100`, `:8103-8110`. The window is one dispatch today.                                                  | No retry exists any more. Rules 4-5 make every record land before the release, and a revert waits for the release. Test: `a_revert_is_refused_while_a_stale_record_holds_the_thread`.         |
