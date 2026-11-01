@@ -1,12 +1,20 @@
 import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
-import type { EnvironmentId, ScopedProjectRef } from "@bibcode/contracts";
-import type { SelectedLineRange } from "@pierre/diffs";
+import type {
+  EnvironmentId,
+  ResolvedKeybindingsConfig,
+  ScopedProjectRef,
+} from "@bibcode/contracts";
+import type { FileDiffMetadata, SelectedLineRange } from "@pierre/diffs";
+import { ChevronDownIcon, ChevronUpIcon } from "lucide-react";
 import {
   lazy,
   memo,
+  type Ref,
   Suspense,
   useCallback,
+  useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -15,6 +23,8 @@ import {
 
 import { DraftId } from "~/composerDraftStore";
 import { useTheme } from "~/hooks/useTheme";
+import { diffChangeShortcutLabel } from "~/keybindings";
+import { listChangeTargets } from "~/lib/diffCompareModel";
 import {
   buildFileDiffRenderKey,
   getRenderablePatch,
@@ -30,7 +40,12 @@ import {
   type SerializedGitManagerLineSelection,
   useGitManagerStore,
 } from "../../../gitManagerStore";
-import { AnnotatableCodeView } from "../../diffs/AnnotatableCodeView";
+import {
+  AnnotatableCodeView,
+  type AnnotatableCodeViewHandle,
+} from "../../diffs/AnnotatableCodeView";
+import { ChangeNavigationButton } from "../../diffs/ChangeNavigationButton";
+import { type ChangeStep, resolveChangeStep } from "./changeNavigation.logic";
 import { GitManagerPartialDiscardDialog } from "../staging/GitManagerPartialDiscardDialog";
 import { GitManagerStagingGutter } from "../staging/GitManagerStagingGutter";
 import { groupContiguousRuns, resolveSelectedRangeIndices } from "../staging/gitManagerHunkModel";
@@ -128,6 +143,24 @@ function restoreSelection(
   return selection;
 }
 
+/** Moves the diff to the next (+1) or previous (-1) change, continuing into the adjacent file. */
+export interface GitManagerDiffPaneHandle {
+  readonly goToChange: (direction: 1 | -1) => void;
+}
+
+/** What the pane needs to step through the changes of a list of files, not just its own. */
+export interface GitManagerDiffNavigation {
+  /** The file's place among the files the list shows. */
+  readonly fileIndex: number;
+  readonly fileCount: number;
+  readonly keybindings: ResolvedKeybindingsConfig;
+  /** Set while this file was entered by a step from a neighbour: it lands on that edge. */
+  readonly arrival: "first" | "last" | null;
+  readonly paneRef: Ref<GitManagerDiffPaneHandle>;
+  /** Asks for the next (+1) or previous (-1) file of the list, to be entered at its edge. */
+  readonly onStepFile: (direction: 1 | -1) => void;
+}
+
 export interface GitManagerDiffPaneProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly projectRef: ScopedProjectRef;
@@ -136,6 +169,7 @@ export interface GitManagerDiffPaneProps {
   readonly mutationBusy: boolean;
   readonly partialStagingDisabledReason: string | null;
   readonly whitespaceHidden?: boolean;
+  readonly navigation?: GitManagerDiffNavigation;
 }
 
 export const GitManagerDiffPane = memo(function GitManagerDiffPane({
@@ -146,6 +180,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
   mutationBusy,
   partialStagingDisabledReason,
   whitespaceHidden = false,
+  navigation,
 }: GitManagerDiffPaneProps) {
   const { environmentId, cwd } = scope;
   const { resolvedTheme } = useTheme();
@@ -228,6 +263,73 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           ],
     [fileDiff],
   );
+  // Where Next and Previous change go. The position belongs to one patch: a rebuilt diff
+  // (another area, a staged line) starts again before its first change, or at the edge a step
+  // from the neighbouring file entered at.
+  const changeTargets = useMemo(
+    () => (fileDiff === null ? [] : listChangeTargets(fileDiff)),
+    [fileDiff],
+  );
+  const arrival = navigation?.arrival ?? null;
+  const [visit, setVisit] = useState<{
+    readonly fileDiff: FileDiffMetadata | null;
+    readonly index: number;
+  }>({ fileDiff: null, index: -1 });
+  const changeIndex =
+    visit.fileDiff === fileDiff
+      ? visit.index
+      : arrival === null || changeTargets.length === 0
+        ? -1
+        : arrival === "first"
+          ? 0
+          : changeTargets.length - 1;
+  const [viewer, setViewer] = useState<AnnotatableCodeViewHandle | null>(null);
+  const diffSettled = !(diffQuery.isPending && diff === null);
+  const scrollToChange = (index: number) => {
+    const target = changeTargets[index];
+    if (target === undefined) return;
+    viewer?.scrollTo({
+      type: "line",
+      id: codeViewFiles[0]?.fileKey ?? path,
+      lineNumber: target.lineNumber,
+      side: target.side,
+      align: "center",
+    });
+  };
+  const stepFor = (direction: 1 | -1): ChangeStep =>
+    navigation === undefined
+      ? { kind: "stop" }
+      : resolveChangeStep({
+          fileIndex: navigation.fileIndex,
+          fileCount: navigation.fileCount,
+          changeIndex,
+          changeCount: changeTargets.length,
+          direction,
+        });
+  const stepChange = (direction: 1 | -1) => {
+    const step = stepFor(direction);
+    if (step.kind === "change") {
+      setVisit({ fileDiff, index: step.index });
+      scrollToChange(step.index);
+    } else if (step.kind === "file") {
+      navigation?.onStepFile(direction);
+    }
+  };
+  useImperativeHandle(navigation?.paneRef, () => ({ goToChange: stepChange }));
+  // A step into this file lands on its first or last change once the diff is on screen, once.
+  // A file with no change to land on (binary, too large, failed) passes the step on.
+  const onStepFile = navigation?.onStepFile;
+  const arrivedRef = useRef(false);
+  useEffect(() => {
+    if (arrival === null || !diffSettled || arrivedRef.current || !onStepFile) return;
+    if (changeTargets.length === 0) {
+      arrivedRef.current = true;
+      onStepFile(arrival === "first" ? 1 : -1);
+    } else if (viewer !== null) {
+      arrivedRef.current = true;
+      scrollToChange(changeIndex);
+    }
+  });
   const codeViewOptions = useMemo(
     () => ({
       collapsed: false,
@@ -353,6 +455,28 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
     >
       <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border px-2">
         <span className="min-w-0 flex-1 truncate font-mono text-xs">{path}</span>
+        {navigation === undefined ? null : (
+          <>
+            <ChangeNavigationButton
+              disabled={stepFor(-1).kind === "stop"}
+              disabledReason="This is the first change in the list."
+              label="Previous change"
+              shortcut={diffChangeShortcutLabel(navigation.keybindings, "diff.previousChange")}
+              onClick={() => stepChange(-1)}
+            >
+              <ChevronUpIcon aria-hidden="true" className="size-3.5" />
+            </ChangeNavigationButton>
+            <ChangeNavigationButton
+              disabled={stepFor(1).kind === "stop"}
+              disabledReason="This is the last change in the list."
+              label="Next change"
+              shortcut={diffChangeShortcutLabel(navigation.keybindings, "diff.nextChange")}
+              onClick={() => stepChange(1)}
+            >
+              <ChevronDownIcon aria-hidden="true" className="size-3.5" />
+            </ChangeNavigationButton>
+          </>
+        )}
         {availableAreas.includes("unstaged") ? (
           <button
             aria-pressed={activeArea === "unstaged"}
@@ -428,6 +552,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
                     renderHeaderPrefix={renderHeaderPrefix}
                     sectionId={`git-manager-staging:${activeArea}:${path}`}
                     sectionTitle={`${activeArea === "staged" ? "Staged" : "Unstaged"} ${path}`}
+                    viewerRef={setViewer}
                     selectedLines={disabledReason === null ? rendererSelection : null}
                     onLineSelectionEnd={handleRendererSelectionEnd}
                     onSelectedLinesChange={setRendererSelection}
