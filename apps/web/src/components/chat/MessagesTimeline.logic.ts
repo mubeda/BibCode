@@ -73,14 +73,16 @@ export function resolveTimelineItemType(item: MessagesTimelineRow): string {
 }
 
 /**
- * The item type LegendList sees: the first type a row resolves to, kept while the row stays.
+ * The item type LegendList sees: the first type a row resolves to, for the life of the list.
  * LegendList moves a measured row's size into its new type's average without counting it there,
- * so a streaming reply that crossed a bucket would inflate that bucket's estimate for every
- * unmeasured row (#228). A reply measured live needs no estimate; history loads with its text.
+ * and keeps a row's measured size after the row leaves the data (a folded turn), so a row whose
+ * type changed while it streamed, or after it came back, would inflate that type's estimate for
+ * every unmeasured row (#228). The map is never pruned: `MessagesTimeline` is keyed by thread, so
+ * a new thread drops it with the list's measurements, and it holds one short string per row.
  */
-export function createStickyTimelineItemType() {
+export function createStickyTimelineItemType(): (item: MessagesTimelineRow) => string {
   const types = new Map<string, string>();
-  const resolve = (item: MessagesTimelineRow): string => {
+  return (item) => {
     let type = types.get(item.id);
     if (type === undefined) {
       type = resolveTimelineItemType(item);
@@ -88,15 +90,6 @@ export function createStickyTimelineItemType() {
     }
     return type;
   };
-  /** Forgets rows that left, once the map holds more types than there are rows. */
-  const retain = (rows: readonly MessagesTimelineRow[]): void => {
-    if (types.size <= rows.length) return;
-    const ids = new Set(rows.map((row) => row.id));
-    for (const id of types.keys()) {
-      if (!ids.has(id)) types.delete(id);
-    }
-  };
-  return { resolve, retain };
 }
 
 export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boolean | undefined {

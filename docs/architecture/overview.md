@@ -3273,11 +3273,13 @@ view), or free scrolling.
   placed at a long reply's average shrank the list on each measurement and
   pulled the next row in within the same layout pass, until React threw
   "Maximum update depth exceeded" (#228). A row keeps the first type it
-  resolves to while it stays in the list (`createStickyTimelineItemType`):
-  LegendList moves a measured row's size into a new type's average without
-  counting it there, so a streaming reply crossing a bucket would inflate that
-  bucket's estimate. A reply streamed live is measured anyway; history loads
-  with its full text and takes its own bucket.
+  resolves to for the life of the timeline (`createStickyTimelineItemType`),
+  even after it leaves the rows, as a folded turn's rows do: LegendList keeps a
+  row's measured size and moves it into a new type's average without counting
+  it there, so a streaming reply crossing a bucket, or a folded row coming back
+  under another one, would inflate that bucket's estimate. The timeline is
+  keyed by thread, so a new thread starts both afresh. A reply streamed live is
+  measured anyway; history loads with its full text and takes its own bucket.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
