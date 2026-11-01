@@ -410,6 +410,33 @@ describe("remote phase receipt retention boundaries", () => {
       await fixture.dispose();
     }
   });
+  it("surfaces the driver's pairing-offer failure when no credential receipt exists", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      const message =
+        "Remote verification pairing offer could not be generated (share UI found=true, clicked=false).";
+      // The spec traces this line, then throws before any receipt is written.
+      fixture.runCommand.mockImplementation(async () => {
+        await NodeFS.promises.writeFile(
+          NodePath.join(fixture.evidenceDirectory, "remote-credential-trace.log"),
+          `${JSON.stringify({ step: "pairing-offer", widened: false, message })}
+`,
+        );
+        return { exitCode: 1, stdout: "fixture-private-returned-token", stderr: "" };
+      });
+      const error = await fixture.runPhase().catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).toContain(message);
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain(message);
+      expect(log).not.toContain("fixture-private-returned-token");
+    } finally {
+      await fixture.dispose();
+    }
+  });
   it.each(["returned", "thrown"])(
     "refuses final copies after a %s remote phase failure without a bootstrap receipt",
     async (kind) => {
@@ -1482,6 +1509,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       expect(spec).toContain('step: "share-ui"');
       expect(spec).toContain('step: "credentials"');
       expect(spec).toContain("pairing offer could not be generated");
+      expect(spec).toContain('step: "pairing-offer"');
       expect(spec).not.toContain("bootstrap unavailable");
       expect(spec).toContain("[redacted]");
       expect(spec).not.toContain("bridge.installUpdate()");
