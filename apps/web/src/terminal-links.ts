@@ -48,7 +48,7 @@ const FILE_PATH_PATTERN =
 // carries the path without it. A quoted path with no `./`, `~/` or drive prefix must end in a
 // file extension, so quoted prose like "see a/b c" stays unlinked.
 const QUOTED_FILE_PATH_PATTERN =
-  /(?<q>["'`])(?<link>(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)(?:(?!\k<q>)[^<>\r\n])+|[A-Za-z0-9._-][A-Za-z0-9._ -]*[\\/](?:(?!\k<q>)[^<>\r\n])*\.[A-Za-z][A-Za-z0-9]{0,9}(?::\d+){0,2})(?:(?<suffix>\k<q>(?::\d+){1,2})|\k<q>)/g;
+  /(?<q>["'`])(?<link>(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)(?:(?!\k<q>)[^<>\r\n])+|[A-Za-z0-9._-][A-Za-z0-9._ -]*[\\/](?:(?!\k<q>)[^<>\r\n])*\.[A-Za-z][A-Za-z0-9]*(?::\d+){0,2})(?:(?<suffix>\k<q>(?::\d+){1,2})|\k<q>)/g;
 const FILE_URL_PATTERN = /file:\/\/[^\s"'`<>]+/g;
 // Whole delimiter-bounded tokens only: a prefix or suffix of a longer name would open a different
 // file. The leading delimiter is consumed (not a lookbehind, which older macOS WebKit rejects) and
