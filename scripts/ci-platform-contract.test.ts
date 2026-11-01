@@ -95,6 +95,17 @@ describe("cross-platform CI contract", () => {
     }
   });
 
+  it("builds test binaries without debug info in CI and release preflight", () => {
+    for (const [path, job] of [
+      [CI_WORKFLOW_PATH, "test"],
+      [RELEASE_WORKFLOW_PATH, "preflight"],
+    ] as const) {
+      const { workflow } = readWorkflow(path);
+
+      expect(requireJob(workflow, job).env?.CARGO_PROFILE_TEST_DEBUG).toBe("0");
+    }
+  });
+
   it("uses default Rust harness threads in standard package and CI commands", () => {
     const serverPackage = JSON.parse(NodeFS.readFileSync(SERVER_PACKAGE_JSON_PATH, "utf8")) as {
       readonly scripts: Record<string, string>;
