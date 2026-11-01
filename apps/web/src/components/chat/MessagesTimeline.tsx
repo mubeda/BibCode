@@ -101,6 +101,7 @@ import {
   TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  resolveTimelineItemType,
   resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMaintainVisibleContentPosition,
   resolveTimelineMinimapHasPersistentGutter,
@@ -702,7 +703,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   ref={handleListRef}
                   data={rows}
                   keyExtractor={keyExtractor}
-                  getItemType={getItemType}
+                  getItemType={resolveTimelineItemType}
                   renderItem={renderItem}
                   estimatedItemSize={90}
                   initialScrollAtEnd
@@ -867,10 +868,6 @@ function useStableAnchorCallbacks(
 
 function keyExtractor(item: MessagesTimelineRow) {
   return item.id;
-}
-
-function getItemType(item: MessagesTimelineRow) {
-  return item.kind === "message" ? `message:${item.message.role}` : item.kind;
 }
 
 interface TimelineMinimapItem {

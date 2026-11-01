@@ -61,6 +61,17 @@ export function resolveTimelineMaintainVisibleContentPosition(
   return nativeScrollPending ? TIMELINE_KEEPS_NO_CONTENT_POSITION : TIMELINE_KEEPS_CONTENT_POSITION;
 }
 
+/**
+ * LegendList estimates an unmeasured row from measured rows of the same type, so message rows are
+ * bucketed by text length (up to 2,000 characters, then one bucket per doubling): a short reply
+ * never takes its estimate from a very long one, which looped the list while scrolling up (#228).
+ */
+export function resolveTimelineItemType(item: MessagesTimelineRow): string {
+  if (item.kind !== "message") return item.kind;
+  const lengthBucket = Math.max(0, Math.floor(Math.log2(item.message.text.length / 1000)));
+  return `message:${item.message.role}:${lengthBucket}`;
+}
+
 export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boolean | undefined {
   return state?.isNearEnd ?? state?.isAtEnd;
 }

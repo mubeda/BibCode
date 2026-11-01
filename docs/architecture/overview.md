@@ -3265,6 +3265,16 @@ anchoring a sent turn (the sent row glides to `CHAT_LIST_ANCHOR_OFFSET`, 16 px
 below the top, and the turn's end is revealed as the reply grows past the
 view), or free scrolling.
 
+- **Row estimates.** LegendList places a row it has not measured at the
+  average measured size of rows of its item type. `resolveTimelineItemType`
+  buckets message rows by role and text length (up to 2,000 characters, then
+  one bucket per doubling), so a short reply never takes its estimate from very
+  long ones. With one type for every reply, scrolling up past short replies
+  placed at a long reply's average shrank the list on each measurement and
+  pulled the next row in within the same layout pass, until React threw
+  "Maximum update depth exceeded" (#228). A streaming reply that changes bucket
+  keeps its container: the type only selects a container for a row that needs
+  a new one.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
