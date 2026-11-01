@@ -12216,6 +12216,93 @@ async fn reverting_to_a_recorded_turn_restores_its_files() {
     session.shutdown().await;
 }
 
+/// A reverted turn's ref that Git could not delete (its lock was held) is never taken for the
+/// turn that reuses its number: that turn's checkpoint, diff and revert are its own.
+#[tokio::test]
+async fn a_ref_a_revert_could_not_delete_is_never_the_next_turns_checkpoint() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    let git_show = |turn_count: i64| {
+        git(
+            repository.path(),
+            &[
+                "show",
+                &format!(
+                    "{}:tracked.txt",
+                    orchestration_effects::checkpoint_ref("t1", turn_count)
+                ),
+            ],
+        )
+    };
+    session
+        .run_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    session.ready_checkpoint(1).await;
+    session
+        .run_turn(repository.path(), 2, "old two\n", "completed")
+        .await;
+    session.ready_checkpoint(2).await;
+
+    // The revert to turn 1 cannot delete turn 2's ref.
+    let lock = repository.path().join(".git").join(format!(
+        "{}.lock",
+        orchestration_effects::checkpoint_ref("t1", 2)
+    ));
+    std::fs::write(&lock, "").unwrap();
+    let mut events = session.engine.subscribe_events();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert-locked", "threadId":"t1",
+                "turnCount":1, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted"
+    })
+    .await;
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(git_show(2), "old two", "the old ref was left behind");
+
+    // The next turn reuses number 2 (the driver reports its third turn id).
+    let turn_id = session
+        .run_turn(repository.path(), 3, "new two\n", "completed")
+        .await;
+    let checkpoint = session.ready_checkpoint(2).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    assert_eq!(git_show(2), "new two");
+    assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
+
+    // Reverting to it restores the new turn's files, not the old ones.
+    std::fs::write(repository.path().join("tracked.txt"), "scratch\n").unwrap();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert-new", "threadId":"t1",
+                "turnCount":2, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted" && event.event.payload["turnCount"] == 2
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "new two\n"
+    );
+    session.shutdown().await;
+}
+
 #[tokio::test]
 async fn checkpoint_rpc_rewinds_the_provider_once_before_restoring_files() {
     let repository = initialize_repository();

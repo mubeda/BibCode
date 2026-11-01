@@ -1429,8 +1429,8 @@ fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, i
     });
 }
 
-/// Captures the checkpoint of a turn recorded `missing` and records it `ready`. A checkpoint ref
-/// that exists by now is kept, never overwritten with a later checkout.
+/// Captures the checkpoint of a turn recorded `missing` and records it `ready`. A turn already
+/// `ready`, or given up (`error`), is left alone: its ref is never written again.
 async fn capture_missing_checkpoint(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
@@ -1479,17 +1479,16 @@ async fn capture_missing_checkpoint(
             .and_then(Value::as_str)
             .unwrap_or(&event.event.occurred_at),
     };
-    record_checkpoint(engine, callbacks, &cwd, &checkpoint, false, cancellation).await
+    record_checkpoint(engine, callbacks, &cwd, &checkpoint, cancellation).await
 }
 
-/// Captures the checkout as `checkpoint`'s ref (when `recapture`, or when the ref is missing),
-/// then records the checkpoint `ready` with the files changed since the turn before it.
+/// Captures the checkout as `checkpoint`'s ref, then records the checkpoint `ready` with the
+/// files changed since the turn before it.
 async fn record_checkpoint(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
     cwd: &Path,
     checkpoint: &TurnCheckpoint<'_>,
-    recapture: bool,
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     let TurnCheckpoint {
@@ -1508,15 +1507,31 @@ async fn record_checkpoint(
     if engine.checkpoint_is_stale(thread_id, turn_id) {
         return Err(stale());
     }
-    if recapture || !has_ref(cwd, Path::new("git"), &target_ref, cancellation).await? {
-        capture_checkpoint_with_cancellation(
-            cwd,
-            Path::new("git"),
-            thread_id,
-            turn_count,
-            cancellation,
-        )
-        .await?;
+    // Always written, replacing whatever ref has this number: only a `missing` row gets here, and
+    // a ref already there is a leftover (a reverted turn's ref that Git could not delete), never
+    // this turn's end state. The hold keeps every later turn, and its baseline, behind this
+    // capture. A capture that fails takes such a leftover away, so the next turn's baseline
+    // writes the ref afresh instead of keeping it.
+    if let Err(error) = capture_checkpoint_with_cancellation(
+        cwd,
+        Path::new("git"),
+        thread_id,
+        turn_count,
+        cancellation,
+    )
+    .await
+    {
+        if delete_ref(cwd, Path::new("git"), &target_ref, cancellation)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                thread_id,
+                turn_count,
+                "an uncaptured turn's checkpoint ref could not be deleted"
+            );
+        }
+        return Err(error);
     }
     // One decision against the hold's expiry: claimed, this capture is recorded and the expiry
     // can no longer fire; lost, the hold expired while Git ran, the thread's next turn may have
@@ -1545,9 +1560,16 @@ async fn record_checkpoint(
 
     // `ready` means the turn's diff can be read. Without the turn before's checkpoint (its
     // baseline capture failed) it cannot, so the turn stays `missing`; its own ref, kept, is the
-    // next turn's baseline.
+    // next turn's baseline. Nor can it from the ref of a turn given up (`error`): that ref, if
+    // one was left behind, is no turn's end state, and no baseline replaced it.
     let from_ref = checkpoint_ref(thread_id, turn_count.saturating_sub(1));
-    if !has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
+    let previous_given_up = turn_count > 1
+        && engine
+            .repositories()
+            .get_checkpoint(thread_id.to_owned(), turn_count - 1)
+            .await?
+            .is_some_and(|previous| previous.status == "error");
+    if previous_given_up || !has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
         return Err(OrchestrationEffectsError::Effect(format!(
             "The checkpoint before turn {turn_count} is missing, so this turn's changes cannot be shown."
         )));

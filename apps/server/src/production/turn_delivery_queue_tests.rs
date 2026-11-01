@@ -1444,6 +1444,70 @@ async fn an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_t
     fixture.shutdown().await;
 }
 
+/// A stale capture's ref that Git could not delete stays behind its `error` row. The next
+/// turn's capture is never read against it: that turn is not `ready`, so it is neither a diff
+/// nor a revert target.
+#[tokio::test]
+async fn a_stale_captures_leftover_ref_never_makes_the_next_turn_ready() {
+    use crate::production::orchestration_effects::{
+        TurnEnd, capture_checkpoint, checkpoint_ref, record_turn_end,
+    };
+    let mut fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    // Turn 3 was given up, and its ref was left behind.
+    std::fs::write(cwd.join("tracked.txt"), "stale three\n").unwrap();
+    capture_checkpoint(&cwd, "t", 3).await.unwrap();
+    engine
+        .dispatch(command(json!({
+            "type":"thread.turn.diff.complete", "commandId":"diff-stale-3", "threadId":"t",
+            "turnId":"turn-3", "checkpointTurnCount":3, "checkpointRef":checkpoint_ref("t", 3),
+            "status":"error", "files":[], "assistantMessageId":null,
+            "completedAt":TIME, "createdAt":TIME
+        })))
+        .await
+        .unwrap();
+
+    std::fs::write(cwd.join("tracked.txt"), "four\n").unwrap();
+    record_turn_end(&engine, "t", "turn-4", TIME, TurnEnd::Live, Some(&cwd))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while capture_failures(&engine, "turn-4").await == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("turn 4's checkpoint is reported unreadable");
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 4)
+        .await
+        .unwrap()
+        .expect("checkpoint 4");
+    assert_eq!(checkpoint.status, "missing");
+
+    engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":"revert-4", "threadId":"t", "turnCount":4, "createdAt":TIME}))).await.unwrap();
+    let refused = fixture
+        .event("thread.activity-appended", |payload| {
+            payload["activity"]["kind"] == "checkpoint.revert.failed"
+        })
+        .await;
+    assert!(
+        refused.event.payload["activity"]["payload"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no captured checkpoint"),
+        "{}",
+        refused.event.payload
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        "four\n"
+    );
+    fixture.shutdown().await;
+}
+
 /// The `checkpoint.capture.failed` activities of `turn_id` on thread `t`.
 async fn capture_failures(engine: &OrchestrationEngine, turn_id: &str) -> usize {
     crate::orchestration::load_snapshot(&engine.repositories())

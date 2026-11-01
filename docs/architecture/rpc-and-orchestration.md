@@ -871,10 +871,13 @@ turn's number, ref, status and changed files.
    the capture. Holds exist only while the effects worker runs, and a deleted
    thread's holds are released.
 3. **Capture.** The worker handles the `missing` record: it captures ref `n`
-   (never overwriting one that exists), diffs it against ref `n - 1`, records
-   `ready` with the changed files and the turn's own answer id, appends a
-   `checkpoint.captured` activity, and releases that turn's hold however it
-   ends. `ready` requires ref `n - 1`; without it, and after a failed capture,
+   (always written: a ref already there is a leftover a revert could not
+   delete; a capture that fails deletes it), diffs it against ref `n - 1`,
+   records `ready` with the changed files and the turn's own answer id, appends
+   a `checkpoint.captured` activity, and releases that turn's hold however it
+   ends. A `ready` or `error` row is never captured again. `ready` requires
+   ref `n - 1`, and turn `n - 1` not given up (`error`); without them, and
+   after a failed capture,
    the turn stays `missing` with a `checkpoint.capture.failed` activity, and
    the next turn start writes ref `n` if it is still missing. A hold still
    pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds) gives
