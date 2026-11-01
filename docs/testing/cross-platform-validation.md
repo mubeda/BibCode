@@ -1102,6 +1102,12 @@ shutdown result, and evidence artifact location in the execution report.
 
 ### Grant-driven remote sharing
 
+The seeded remote-install lane mints its credential only through the **Another
+device** offer. If the share UI never enables **Generate pairing offer** or the
+server never widens, the lane fails with "pairing offer could not be generated"
+and does not fall back to the desktop bootstrap token, which the widening
+restart revokes (it would surface only as a coordinator 401).
+
 When pairing-offer generation, grant reach metadata, desktop exposure, or
 client revocation changes, validate the complete ceremony on every supported
 native desktop: **Another device** widens before minting and shows one pairing

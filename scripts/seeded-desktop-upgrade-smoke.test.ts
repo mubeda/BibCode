@@ -1481,6 +1481,8 @@ describe("seeded packaged desktop upgrade harness", () => {
       expect(spec).toContain("remote-credential-trace.log");
       expect(spec).toContain('step: "share-ui"');
       expect(spec).toContain('step: "credentials"');
+      expect(spec).toContain("pairing offer could not be generated");
+      expect(spec).not.toContain("bootstrap unavailable");
       expect(spec).toContain("[redacted]");
       expect(spec).not.toContain("bridge.installUpdate()");
     } finally {
@@ -2102,7 +2104,10 @@ describe("seeded packaged desktop upgrade harness", () => {
       ]),
     ).toThrow("The candidate could not inspect primary project data: database is locked");
     expect(verify([primary])).toThrow(
-      `primary healthy, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+      `primary healthy, issue: none, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+    );
+    expect(verify([{ ...primary, issue: "generation 3 rejected" }])).toThrow(
+      "primary healthy, issue: generation 3 rejected, 0 listed",
     );
     expect(verify(undefined)).toThrow(
       /^The protected update did not retain a verified pre-update backup\.$/,
