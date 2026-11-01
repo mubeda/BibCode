@@ -23,8 +23,8 @@ export default defineRule({
       // Text next to other children is a separator, not a placeholder.
       const alone = children.length === 1;
       for (const child of children) {
-        const text = (child as { value?: unknown }).value;
-        if (child.type !== "JSXText" || typeof text !== "string" || !text.includes(EM_DASH)) {
+        const { type, value: text } = child as unknown as { type: string; value?: unknown };
+        if (type !== "JSXText" || typeof text !== "string" || !text.includes(EM_DASH)) {
           continue;
         }
         if (!(alone && isPlaceholder(text))) context.report({ node: child, message: MESSAGE });
