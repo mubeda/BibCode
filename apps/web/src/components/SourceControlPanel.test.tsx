@@ -1125,7 +1125,7 @@ describe("SourceControlPanel", () => {
       }),
     );
     expect(testState.runAction.mock.calls[0]?.[0]).not.toHaveProperty("filePaths");
-    expect(testState.clearDraft).toHaveBeenCalledWith();
+    expect(testState.clearDraft).toHaveBeenCalledWith("Panel message");
     expect(testState.toast.add).toHaveBeenCalledWith(expect.objectContaining({ type: "loading" }));
     expect(testState.toast.update).toHaveBeenCalledWith(
       "toast-1",

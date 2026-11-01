@@ -153,6 +153,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
     const effectiveSummary = summary.trim() || placeholderSummary || "Empty commit";
     submittingRef.current = true;
     setIsSubmitting(true);
+    const submittedDraft = message;
     try {
       await onCommit({
         message: buildCommitMessage({
@@ -168,7 +169,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
         allowEmpty,
         amend: isAmending,
       });
-      clearDraft();
+      clearDraft(submittedDraft);
       setCoAuthors([]);
       setCoAuthorInput("");
       setIsAmending(false);
@@ -185,6 +186,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
     description,
     enabled,
     isAmending,
+    message,
     noVerify,
     onCommit,
     placeholderSummary,
