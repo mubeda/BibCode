@@ -103,6 +103,12 @@ describe("extractTerminalLinks", () => {
     ['"C:\\My Dir\\report!"', ["C:\\My Dir\\report!"]],
     ['"C:\\My Dir\\notes."', ["C:\\My Dir\\notes."]],
     ['"./my dir/a(b)"', ["./my dir/a(b)"]],
+    ['"My Project\\src\\index.ts:12"', ["My Project\\src\\index.ts:12"]],
+    ['"my dir/a.ts"', ["my dir/a.ts"]],
+    ['"C:\\Users\\Jane Doe\\p\\i.ts":12:7', ['C:\\Users\\Jane Doe\\p\\i.ts":12:7']],
+    ["'./a b.ts':3", ["./a b.ts':3"]],
+    ['"and/or maybe" ok', ["and/or"]],
+    ['"a b c" and "d e f"', []],
     ["src/index.ts:12", ["src/index.ts:12"]],
     // Prompts, ratios, versions and prose in quotes must not become links.
     ["PS C:\\>", []],
@@ -121,6 +127,9 @@ describe("extractTerminalLinks", () => {
     ["\"a/ 'a/ `a\\ ".repeat(1_000)],
     [`"C:\\${" ".repeat(10_000)}`],
     [`"a/${"b ".repeat(5_000)}`],
+    ['"a a '.repeat(3_000)],
+    [`"${"a ".repeat(5_000)}`],
+    [`"${"a ".repeat(5_000)}/`],
   ])("scans a long pathological line in linear time", (line) => {
     const startedAt = performance.now();
     extractTerminalLinks(line);
@@ -392,6 +401,10 @@ describe("resolvePathLinkTarget", () => {
     ["~/src/a\\b.ts", "/Users/alice/p", "/Users/alice/src/a\\b.ts"],
     ["~/src/a\\b.ts", "C:\\Users\\alice\\p", "C:\\Users\\alice\\src\\a\\b.ts"],
     ["./src/a.ts", "/repo", "/repo/./src/a.ts"],
+    // The closing quote of a quoted path is dropped when a :line:col suffix follows it.
+    ['C:\\Users\\Jane Doe\\p\\i.ts":12:7', "C:\\repo", "C:\\Users\\Jane Doe\\p\\i.ts:12:7"],
+    ["./a b.ts':3", "/repo", "/repo/./a b.ts:3"],
+    ["My Project\\src\\index.ts:12", "C:\\repo", "C:\\repo\\My Project\\src\\index.ts:12"],
   ])("resolves %s against %s", (raw, cwd, expected) => {
     expect(resolvePathLinkTarget(raw, cwd)).toBe(expected);
   });
