@@ -13,8 +13,8 @@ pub(crate) use input::{InputReadmissionScope, TerminalInputAdmission};
 pub(crate) use manager::MAX_PREPARATION_EXECUTION_BUDGET;
 pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
-    AttachmentItem, SubprocessInspection, TerminalAttachment, TerminalError, TerminalEventReceiver,
-    TerminalManager, TerminalManagerOptions, TerminalMetadataAttachment,
+    AttachmentItem, SubprocessInspection, SubprocessInspections, TerminalAttachment, TerminalError,
+    TerminalEventReceiver, TerminalManager, TerminalManagerOptions, TerminalMetadataAttachment,
     TerminalSubprocessInspector, WorktreeRemovalGuard,
 };
 pub use model::{

@@ -838,6 +838,17 @@ The preview panel's local-server suggestions come from
 listening ports every second, but it sends the list only on subscribe and when
 the servers change; `scannedAt` is the time of the scan that was sent (#168).
 
+A terminal's running-command indicator (`hasRunningSubprocess` and the child
+label) comes from one manager-wide activity tick, not a poll per terminal. Each
+tick (1 s by default, off at zero) takes one process-table snapshot for every
+terminal that needs a sample and skips the snapshot when none does. A terminal
+with a running child is sampled every tick, so the indicator clears within a
+tick of the child's exit. A childless terminal is quiet after two unchanged
+samples with no input or output; input, output, a resize or an attach samples
+it on the next tick, and a quiet terminal is still sampled every 30 ticks, so a
+child that starts and prints nothing is reported within about 30 s (#232).
+`Activity` is published only when the sample changes.
+
 When WSL-only mode is selected, that intent is authoritative even if an older
 persisted document has a stale disabled-backend flag. WSL planning and primary
 startup fail closed as a tagged `wsl-primary-unavailable` desktop state. The
