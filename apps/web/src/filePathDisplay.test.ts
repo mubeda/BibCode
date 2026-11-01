@@ -12,6 +12,10 @@ describe("formatWorkspaceRelativePath", () => {
     ).toBe("bibcode/apps/web/src/session-logic.ts:501");
   });
 
+  it("keeps a trailing apostrophe in the file name", () => {
+    expect(formatWorkspaceRelativePath("/repo/notes':12", "/repo")).toBe("repo/notes':12");
+  });
+
   it("prefixes relative paths with the workspace root label", () => {
     expect(
       formatWorkspaceRelativePath(

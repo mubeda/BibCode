@@ -136,6 +136,17 @@ describe("extractTerminalLinks", () => {
     expect(performance.now() - startedAt).toBeLessThan(500);
   });
 
+  it("targets the quoted path without its closing quote when :line follows the quote", () => {
+    const [match] = extractTerminalLinks('"C:\\Users\\Jane Doe\\p\\i.ts":12:7');
+    expect(match?.target).toBe("C:\\Users\\Jane Doe\\p\\i.ts:12:7");
+    expect(resolvePathLinkTarget(match?.target ?? "", "C:\\repo")).toBe(
+      "C:\\Users\\Jane Doe\\p\\i.ts:12:7",
+    );
+    const [single] = extractTerminalLinks("'./a b.ts':3");
+    expect(single?.target).toBe("./a b.ts:3");
+    expect(extractTerminalLinks('"C:\\a b\\c.ts:3"')[0]?.target).toBeUndefined();
+  });
+
   it("reports ranges that exclude the surrounding quotes", () => {
     expect(extractTerminalLinks('x "C:\\a b\\c.ts" y')).toEqual([
       { kind: "path", text: "C:\\a b\\c.ts", start: 3, end: 14 },
@@ -401,9 +412,6 @@ describe("resolvePathLinkTarget", () => {
     ["~/src/a\\b.ts", "/Users/alice/p", "/Users/alice/src/a\\b.ts"],
     ["~/src/a\\b.ts", "C:\\Users\\alice\\p", "C:\\Users\\alice\\src\\a\\b.ts"],
     ["./src/a.ts", "/repo", "/repo/./src/a.ts"],
-    // The closing quote of a quoted path is dropped when a :line:col suffix follows it.
-    ['C:\\Users\\Jane Doe\\p\\i.ts":12:7', "C:\\repo", "C:\\Users\\Jane Doe\\p\\i.ts:12:7"],
-    ["./a b.ts':3", "/repo", "/repo/./a b.ts:3"],
     ["My Project\\src\\index.ts:12", "C:\\repo", "C:\\repo\\My Project\\src\\index.ts:12"],
   ])("resolves %s against %s", (raw, cwd, expected) => {
     expect(resolvePathLinkTarget(raw, cwd)).toBe(expected);
