@@ -68,6 +68,7 @@ import {
   type RemoteInstallEvidence,
   runSeededDesktopUpgradeSmoke,
   type SeededDesktopUpgradeSmokeInput,
+  type SeededUpgradeObservationAfter,
 } from "./seeded-desktop-upgrade-smoke.ts";
 
 const absolute = (...parts: ReadonlyArray<string>): string =>
@@ -1415,6 +1416,39 @@ describe("seeded packaged desktop upgrade harness", () => {
     }
   });
 
+  it("keeps only the redacted unlisted-backup lines from a lane's server log", async () => {
+    const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "upgrade-evidence-"));
+    try {
+      const layout = createSeededUpgradeRunLayout(root, "inventory-test");
+      const logs = NodePath.join(layout.protectedBaseline.dataRoot, "userdata", "logs");
+      await NodeFS.promises.mkdir(logs, { recursive: true });
+      await NodeFS.promises.mkdir(layout.protectedBaseline.evidenceDirectory, { recursive: true });
+      await NodeFS.promises.writeFile(
+        NodePath.join(logs, "server.log"),
+        [
+          "INFO unrelated line with fixture-private-token",
+          `WARN project-data backup generation was not listed entry=ad47 reason=io error at ${layout.protectedBaseline.dataRoot}/backups`,
+        ].join("\n"),
+      );
+      const artifactDirectory = NodePath.join(root, "artifact");
+      await copyBoundedEvidence({
+        artifactDirectory,
+        layout,
+        requestLogPath: NodePath.join(root, "missing-requests.jsonl"),
+        secrets: ["fixture-private-token"],
+      });
+      const inventory = await NodeFS.promises.readFile(
+        NodePath.join(artifactDirectory, "protected-baseline-backup-inventory.log"),
+        "utf8",
+      );
+      expect(inventory).toContain("entry=ad47 reason=io error at [REDACTED]/backups");
+      expect(inventory).not.toContain("unrelated");
+      expect(inventory).not.toContain(layout.protectedBaseline.dataRoot);
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("generates a syntactically valid isolated remote-install phase", async () => {
     const directory = await NodeFS.promises.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "bibcode-remote-spec-"),
@@ -2024,6 +2058,55 @@ describe("seeded packaged desktop upgrade harness", () => {
         "0.3.11",
       ),
     ).toThrow(/pre-update backup/);
+  });
+
+  it("names why the candidate listed no pre-update backup", () => {
+    const storageInstanceId = "8a8c318a-e2c3-4f78-a61c-3ba53b0a10af";
+    const before = {
+      appVersion: "0.3.10",
+      effectiveRoot: absolute("work", "data"),
+      projectId: "project-seeded",
+      projectIds: ["project-seeded"],
+      storageInstanceId,
+    } as const;
+    const after = {
+      appVersion: "0.3.11",
+      effectiveRoot: before.effectiveRoot,
+      projectIds: ["project-seeded"],
+      storageInstanceId,
+      preUpdateBackups: [],
+    } as const;
+    const primary = {
+      environmentId: "primary",
+      status: "healthy",
+      issue: null,
+      storageInstanceId,
+      backupCount: 0,
+    } as const;
+    const verify =
+      (projectDataStatuses: SeededUpgradeObservationAfter["projectDataStatuses"]) => () =>
+        verifySeededUpgradeOutcome(
+          "remote-install",
+          before,
+          { ...after, projectDataStatuses },
+          "0.3.11",
+        );
+
+    expect(verify([{ ...primary, environmentId: "wsl:Ubuntu" }])).toThrow(
+      "The candidate reported no primary project-data status (environments: wsl:Ubuntu).",
+    );
+    expect(verify([])).toThrow(/no primary project-data status \(environments: none\)/);
+    expect(
+      verify([
+        { ...primary, status: "unavailable", issue: "database is locked", storageInstanceId: null },
+      ]),
+    ).toThrow("The candidate could not inspect primary project data: database is locked");
+    expect(verify([primary])).toThrow(
+      `primary healthy, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+    );
+    expect(verify(undefined)).toThrow(
+      /^The protected update did not retain a verified pre-update backup\.$/,
+    );
   });
 
   it("polls readiness and restart conditions under a deterministic timeout", async () => {

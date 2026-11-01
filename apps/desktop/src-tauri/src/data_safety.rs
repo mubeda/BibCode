@@ -190,6 +190,14 @@ fn desktop_status(
         | StoreInspectionStatus::UnsafeDatabaseState
         | StoreInspectionStatus::RecoveryIncomplete => "recovery-required",
     };
+    for issue in &inspection.backup_issues {
+        tracing::warn!(
+            environment_id = %environment_id,
+            entry = %issue.entry_name,
+            reason = %issue.message,
+            "project-data backup generation was not listed"
+        );
+    }
     DesktopProjectDataEnvironmentStatus {
         environment_id,
         label,
@@ -1137,5 +1145,64 @@ mod tests {
             .await
             .expect("backends should stop");
         isolated.complete();
+    }
+
+    #[test]
+    fn logs_backup_generations_the_inventory_did_not_list() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let inspection = StoreInspection {
+            classification: StoreInspectionStatus::Existing,
+            storage_instance_id: None,
+            backups: Vec::new(),
+            backup_issues: vec![persistence::BackupInventoryIssue {
+                entry_name: "ad47c147-c731-4f2d-aaee-c205a710fc38".to_owned(),
+                message: "manifest size or checksum does not match database".to_owned(),
+            }],
+            requested_root: std::path::PathBuf::from("/data"),
+            effective_root: std::path::PathBuf::from("/data"),
+            is_filesystem_alias: false,
+            issue: None,
+        };
+
+        let status = tracing::subscriber::with_default(subscriber, || {
+            desktop_status("primary".to_owned(), "Local".to_owned(), None, inspection)
+        });
+
+        assert_eq!(status.status, "healthy");
+        assert!(status.backups.is_empty());
+        let log = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("log is UTF-8");
+        assert!(log.contains("WARN"), "{log}");
+        assert!(
+            log.contains("project-data backup generation was not listed"),
+            "{log}"
+        );
+        assert!(
+            log.contains("entry=ad47c147-c731-4f2d-aaee-c205a710fc38"),
+            "{log}"
+        );
+        assert!(
+            log.contains("reason=manifest size or checksum does not match database"),
+            "{log}"
+        );
     }
 }
