@@ -10,7 +10,7 @@
           "_tag": "ProjectTransferError",
           "cwd": "so!%2Byp",
           "relativePath": "-1",
-          "failure": "outside_root",
+          "failure": "not_configured",
           "message": "__proto__"
         }
       }

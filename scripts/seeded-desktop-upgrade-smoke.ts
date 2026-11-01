@@ -85,6 +85,16 @@ export interface SeededUpgradeObservationAfter {
     readonly storageInstanceId: string;
     readonly trigger: string;
   }>;
+  /** Absent when the bridge has no project-data status method. */
+  readonly projectDataStatuses?:
+    | ReadonlyArray<{
+        readonly environmentId: string;
+        readonly status: string;
+        readonly issue: string | null;
+        readonly storageInstanceId: string | null;
+        readonly backupCount: number;
+      }>
+    | undefined;
 }
 
 export class SeededDesktopUpgradeSmokeError extends Error {
@@ -591,8 +601,25 @@ async function observe(seed) {
     socket.close();
     let effectiveRoot = parameters.expectedDataRoot;
     let preUpdateBackups = [];
+    let projectDataStatuses;
     if (typeof bridge.getProjectDataStatuses === "function") {
-      const statuses = await bridge.getProjectDataStatuses();
+      let statuses = await bridge.getProjectDataStatuses();
+      // A restarted candidate can list primary late or fail one inspection; a healthy
+      // primary with no backups is final, so waiting never hides a lost backup. The
+      // 8 s bound keeps the whole observation inside the 30 s WebDriver script limit.
+      for (let attempt = 0; !seed && attempt < 8; attempt += 1) {
+        const current = statuses.find((status) => status.environmentId === "primary");
+        if (current && current.status !== "unavailable") break;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        statuses = await bridge.getProjectDataStatuses();
+      }
+      projectDataStatuses = statuses.map((status) => ({
+        environmentId: status.environmentId,
+        status: status.status,
+        issue: status.issue ?? null,
+        storageInstanceId: status.storageInstanceId ?? null,
+        backupCount: Array.isArray(status.backups) ? status.backups.length : 0,
+      }));
       const primary = statuses.find((status) => status.environmentId === "primary");
       if (primary) {
         if (typeof primary.effectiveRoot === "string") effectiveRoot = primary.effectiveRoot;
@@ -615,6 +642,7 @@ async function observe(seed) {
       storageInstanceId:
         typeof descriptor?.storageInstanceId === "string" ? descriptor.storageInstanceId : null,
       preUpdateBackups,
+      projectDataStatuses,
     };
   }, {
     expectedDataRoot: input.expectedDataRoot,
@@ -668,7 +696,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     let clicked = false;
     let widened = false;
     try {
-      await browser.waitUntil(async () => browser.execute(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Generate pairing offer")), { timeout: 30000, interval: 100 });
+      await browser.waitUntil(async () => browser.execute(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Generate pairing offer" && !button.disabled)), { timeout: 30000, interval: 100 });
       found = true;
       clicked = await browser.execute(() => {
         const button = [...document.querySelectorAll("button")].find((entry) => entry.textContent?.trim() === "Generate pairing offer");
@@ -973,8 +1001,24 @@ export function verifySeededUpgradeOutcome(
         backup.storageInstanceId === before.storageInstanceId && backup.trigger === "pre-update",
     )
   ) {
+    const statuses = after.projectDataStatuses;
+    const primary = statuses?.find((status) => status.environmentId === "primary");
+    if (statuses !== undefined && primary === undefined) {
+      throw new SeededDesktopUpgradeSmokeError(
+        `The candidate reported no primary project-data status (environments: ${
+          statuses.map((status) => status.environmentId).join(", ") || "none"
+        }).`,
+      );
+    }
+    if (primary?.status === "unavailable") {
+      throw new SeededDesktopUpgradeSmokeError(
+        `The candidate could not inspect primary project data: ${primary.issue ?? "no issue reported"}`,
+      );
+    }
     throw new SeededDesktopUpgradeSmokeError(
-      "The protected update did not retain a verified pre-update backup.",
+      primary === undefined
+        ? "The protected update did not retain a verified pre-update backup."
+        : `The protected update did not retain a verified pre-update backup (primary ${primary.status}, ${primary.backupCount} listed for storage ${primary.storageInstanceId ?? "unknown"}; rejected generations, if any, are in ${lane}-backup-inventory.log).`,
     );
   }
 }
@@ -2057,7 +2101,8 @@ const buildPackagedApplication = async (input: {
     inherit: true,
     // Each seeded package has its own cold Cargo output. Intel needs more than 45 minutes, and
     // the capacity-constrained Apple silicon runners have taken 43 minutes for one build.
-    timeoutMs: (input.platform === "mac" ? 90 : 45) * 60_000,
+    // Windows x64 took 43 minutes to compile one release build, then ran out of time bundling.
+    timeoutMs: (input.platform === "mac" ? 90 : input.platform === "win" ? 60 : 45) * 60_000,
   });
 };
 
@@ -2629,6 +2674,23 @@ const copyBoundedEvidence = async (input: {
       );
     }
     if (withheld || !NodeFS.existsSync(layout.dataRoot)) continue;
+    const serverLog = NodePath.join(layout.dataRoot, "userdata", "logs", "server.log");
+    if (NodeFS.existsSync(serverLog)) {
+      const unlisted = (await NodeFS.promises.readFile(serverLog, "utf8"))
+        .split("\n")
+        .filter((line) => line.includes("project-data backup generation was not listed"))
+        .join("\n");
+      if (unlisted.length > 0) {
+        await NodeFS.promises.writeFile(
+          NodePath.join(input.artifactDirectory, `${lane}-backup-inventory.log`),
+          redactAndBoundUpgradeEvidence(unlisted, {
+            maxBytes: 32 * 1024,
+            roots: [layout.dataRoot],
+            secrets: input.secrets,
+          }),
+        );
+      }
+    }
     const tree = (await walkFiles(layout.dataRoot))
       .map((path) => NodePath.relative(layout.dataRoot, path))
       .slice(0, 1_000)

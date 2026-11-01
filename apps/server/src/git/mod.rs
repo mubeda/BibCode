@@ -1,4 +1,5 @@
 mod broadcaster;
+pub(crate) mod clone_policy;
 mod fetch_owner;
 pub mod manager;
 mod model;
@@ -17,9 +18,13 @@ pub use manager::graph::{
     COMMIT_PAGE_SIZE, GitManagerCommitEntry, GitManagerCommitPage, GitManagerGraphError,
     MAX_DIFF_BUFFER_SIZE, MAX_DIFF_LINE_CHARACTERS, MAX_PINNED_TIPS, MAX_REASONABLE_DIFF_SIZE,
 };
+#[cfg(unix)]
+pub(crate) use manager::operations::Moved;
+#[cfg(unix)]
+pub(crate) use manager::operations::trash_by_staging;
 pub use manager::operations::{
     CoAuthor, CommitRequest, DiscardError, DiscardOutcome, DiscardRequest, FileTrash,
-    FileTrashFuture, NativeFileTrash, TrashUnavailable, UndoCommitDraft,
+    FileTrashFuture, NativeFileTrash, TrashUnavailable, UndoCommitDraft, without_verbatim_prefix,
 };
 pub use manager::refs::{
     GitManagerBlockedReason, GitManagerInProgressKind, GitManagerInProgressOperation,
@@ -44,7 +49,9 @@ pub use repository::{
 pub(crate) use repository::{CloneLeaf, CloneReservation, clone_destination_leaf};
 pub(crate) use repository::{NETWORK_TRANSFER_STALLED, reports_stalled_transfer};
 #[allow(unused_imports)]
-pub(crate) use repository::{StatusObservation, validate_pathspecs};
+pub(crate) use repository::{
+    StatusObservation, checkout_git_dirs, names_git_metadata, validate_pathspecs,
+};
 pub use status_owner::StatusMutationGuard;
 pub(crate) use status_owner::{STATUS_SAFETY_INTERVAL, StatusReadFence};
 pub use summary::GitStatusSummaryService;

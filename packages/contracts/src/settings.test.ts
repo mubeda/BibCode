@@ -175,6 +175,51 @@ describe("ServerSettings device previews", () => {
   });
 });
 
+describe("ServerSettings webhooks", () => {
+  it("defaults enableWebhooks to off and accepts a boolean patch only", () => {
+    expect(DEFAULT_SERVER_SETTINGS.enableWebhooks).toBe(false);
+    expect(decodeServerSettingsPatch({ enableWebhooks: true })).toEqual({
+      enableWebhooks: true,
+    });
+    expect(() => decodeServerSettingsPatch({ enableWebhooks: "yes" })).toThrow();
+  });
+});
+
+describe("ServerSettings MCP server", () => {
+  it("defaults on and Supervised, and an older document decodes to the defaults", () => {
+    expect(DEFAULT_SERVER_SETTINGS.enableMcpServer).toBe(true);
+    expect(DEFAULT_SERVER_SETTINGS.mcpServerAccess).toBe("approval-required");
+    expect(
+      decodeServerSettingsPatch({ enableMcpServer: false, mcpServerAccess: "read-only" }),
+    ).toEqual({ enableMcpServer: false, mcpServerAccess: "read-only" });
+  });
+
+  it("rejects an unknown access level", () => {
+    expect(() => decodeServerSettingsPatch({ mcpServerAccess: "everything" })).toThrow();
+  });
+
+  it("turns every capability set on but terminals, and fills a partial document", () => {
+    expect(DEFAULT_SERVER_SETTINGS.mcpCapabilities).toEqual({
+      workspace: true,
+      sourceControl: true,
+      files: true,
+      diagnostics: true,
+      terminals: false,
+    });
+    expect(decodeServerSettings({ mcpCapabilities: { files: false } }).mcpCapabilities).toEqual({
+      ...DEFAULT_SERVER_SETTINGS.mcpCapabilities,
+      files: false,
+    });
+  });
+
+  it("patches any subset of the capability sets and rejects a non-boolean one", () => {
+    expect(decodeServerSettingsPatch({ mcpCapabilities: { terminals: true } })).toEqual({
+      mcpCapabilities: { terminals: true },
+    });
+    expect(() => decodeServerSettingsPatch({ mcpCapabilities: { terminals: "yes" } })).toThrow();
+  });
+});
+
 describe("ServerSettings profiler", () => {
   it("defaults off and patches the toggle", () => {
     expect(decodeServerSettings({}).enableProfiler).toBe(false);

@@ -43,6 +43,24 @@ export function resolveTimelineMaintainScrollAtEnd(input: {
   return input.anchored || !input.followsEnd ? false : TIMELINE_MAINTAIN_SCROLL_AT_END;
 }
 
+/**
+ * A row that changes size above the first visible one, such as a Mermaid diagram replacing its
+ * source, keeps the line the reader reads in place.
+ */
+const TIMELINE_KEEPS_CONTENT_POSITION = { data: true, size: true };
+const TIMELINE_KEEPS_NO_CONTENT_POSITION = { data: false, size: false };
+
+/**
+ * What LegendList keeps in place as rows arrive or change size. Nothing while a scroll key's
+ * native scroll may still be about to start: each scroll LegendList makes to hold a row in place,
+ * as it does for the row below a streamed reply that grows, cancels that scroll in WebKit (#207).
+ */
+export function resolveTimelineMaintainVisibleContentPosition(
+  nativeScrollPending: boolean,
+): typeof TIMELINE_KEEPS_CONTENT_POSITION {
+  return nativeScrollPending ? TIMELINE_KEEPS_NO_CONTENT_POSITION : TIMELINE_KEEPS_CONTENT_POSITION;
+}
+
 export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boolean | undefined {
   return state?.isNearEnd ?? state?.isAtEnd;
 }
@@ -1035,16 +1053,25 @@ export function deriveMessagesTimelineRows(
   }
 
   if (input.isWorking) {
+    // The last message so far is the answer only while nothing of the turn came after it: a
+    // tool call or an approval request after it means the turn is still working, or waiting
+    // on a person, not on the provider to close it.
+    const answerIndex =
+      unsettledTurnId === null
+        ? -1
+        : timelineEntries.findIndex(
+            (entry) =>
+              entry.kind === "message" &&
+              entry.message.role === "assistant" &&
+              entry.message.turnId === unsettledTurnId &&
+              !entry.message.streaming &&
+              terminalAssistantMessageIds.has(entry.message.id),
+          );
     const answerDelivered =
-      unsettledTurnId !== null &&
-      timelineEntries.some(
-        (entry) =>
-          entry.kind === "message" &&
-          entry.message.role === "assistant" &&
-          entry.message.turnId === unsettledTurnId &&
-          !entry.message.streaming &&
-          terminalAssistantMessageIds.has(entry.message.id),
-      );
+      answerIndex >= 0 &&
+      !timelineEntries
+        .slice(answerIndex + 1)
+        .some((entry) => entry.kind === "work" && entry.entry.turnId === unsettledTurnId);
     nextRows.push({
       kind: "working",
       id: "working-indicator-row",

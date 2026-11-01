@@ -204,6 +204,8 @@ export function WorkspaceCardTitleLine(props: {
   readonly renameInput?: ReactNode;
   /** Archive/Confirm, or the ⌘ jump label while the modifier is held. */
   readonly trailing?: ReactNode;
+  /** A marker after the title, such as who created the thread. */
+  readonly badge?: ReactNode;
 }) {
   const flags = [props.unread ? "unread" : null, props.pinned ? "pinned" : null]
     .filter((flag) => flag !== null)
@@ -244,6 +246,7 @@ export function WorkspaceCardTitleLine(props: {
           primary
         </span>
       ) : null}
+      {props.badge}
       {props.pinned ? (
         <PinIcon
           aria-hidden

@@ -647,8 +647,7 @@ fn scan_directories(
                 continue;
             };
             let relative = to_posix(relative);
-            if relative == ".git"
-                || relative.starts_with(".git/")
+            if crate::git::names_git_metadata(Path::new(&relative))
                 || ignored_directories.iter().any(|ignored| {
                     relative == *ignored || relative.starts_with(&format!("{ignored}/"))
                 })
@@ -820,6 +819,10 @@ impl BoundedEntries {
         ignored: bool,
         limits: SearchLimits,
     ) -> bool {
+        // Git's own metadata (any `.git`, a nested repository's included) is never listed.
+        if crate::git::names_git_metadata(Path::new(&path)) {
+            return false;
+        }
         // A listed directory keeps a second copy of its path for the sweep (`listed_directories`,
         // then the snapshot's `directories`), which the memory bound must count too.
         let entry_bytes = path
@@ -979,7 +982,9 @@ fn read_ignore_rules(root: &Path) -> HashSet<String> {
 
 fn should_ignore(relative: &str, is_directory: bool, rules: &HashSet<String>) -> bool {
     let first = relative.split('/').next().unwrap_or(relative);
-    if matches!(first, ".git" | "node_modules" | ".convex") {
+    if matches!(first, "node_modules" | ".convex")
+        || crate::git::names_git_metadata(Path::new(relative))
+    {
         return true;
     }
     rules.iter().any(|rule| {
@@ -1902,6 +1907,40 @@ mod tests {
         let snapshot_truncated = snapshot_limited.list(Some(200)).await;
         assert_eq!(snapshot_truncated.entries.len(), 2);
         assert!(snapshot_truncated.truncated);
+    }
+
+    /// No `.git` (a nested repository's included, in any letter case) is listed or searched;
+    /// `.github` and `.gitignore` are (#139 X5 review round 6).
+    #[tokio::test]
+    async fn the_index_never_lists_gits_own_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("vendor/lib/.git/hooks")).unwrap();
+        std::fs::write(root.path().join("vendor/lib/.git/config"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("docs/.Git")).unwrap();
+        std::fs::write(root.path().join("docs/.Git/HEAD"), "").unwrap();
+        std::fs::create_dir_all(root.path().join(".github")).unwrap();
+        std::fs::write(root.path().join(".github/ci.yml"), "").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "").unwrap();
+        std::fs::write(root.path().join("vendor/lib/a.rs"), "").unwrap();
+
+        let index = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+        index.refresh(CancellationToken::new()).await.unwrap();
+        let listed = index.list(None).await;
+        let paths: Vec<_> = listed
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(
+            !paths
+                .iter()
+                .any(|path| crate::git::names_git_metadata(Path::new(path))),
+            "{paths:?}"
+        );
+        for kept in [".github/ci.yml", ".gitignore", "vendor/lib/a.rs"] {
+            assert!(paths.contains(&kept), "{kept}: {paths:?}");
+        }
+        assert!(index.search("config", 10).await.entries.is_empty());
     }
 
     #[tokio::test]

@@ -294,6 +294,18 @@ impl ProcessRunner {
         })
     }
 
+    /// [`Self::run`] with nothing inherited (`env_clear`): the child gets `request.env` only.
+    /// An outside agent's clone passes back an allowlist of the server's variables
+    /// (`git::clone_policy`).
+    pub(crate) async fn run_cleared(
+        &self,
+        request: ProcessRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_with_environment(request, cancellation, EnvironmentInheritance::Cleared)
+            .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn run_with_clean_environment_for_test(
         &self,

@@ -283,6 +283,8 @@ struct DriverState {
     rollback_observations: Vec<(i64, Option<String>)>,
     rollback_workspace: Option<PathBuf>,
     rollback_error: Option<String>,
+    /// The turn ids `send` reports, in order; `provider-turn-1` once they run out.
+    sent_turn_ids: VecDeque<String>,
     agent_activity_transitions: Vec<bool>,
     agent_activity_results: VecDeque<Result<(), ProviderRuntimeError>>,
     targeted_activity_cancellations: usize,
@@ -356,7 +358,12 @@ impl ProviderDriver for FakeDriver {
             let mut state = self.state.lock().unwrap();
             state.sends.push(text);
             state.sent_attachments.push(attachments);
-            Ok(Some("provider-turn-1".to_owned()))
+            Ok(Some(
+                state
+                    .sent_turn_ids
+                    .pop_front()
+                    .unwrap_or_else(|| "provider-turn-1".to_owned()),
+            ))
         })
     }
 
@@ -1308,6 +1315,10 @@ struct SupervisorEffectsCallbacks {
     engine: OrchestrationEngine,
     settings: TempDir,
     workspace: PathBuf,
+    /// The effects worker's next workspace lookup waits for `workspace_release`: the worker is
+    /// behind.
+    hold_workspace: std::sync::atomic::AtomicBool,
+    workspace_release: tokio::sync::Notify,
 }
 
 fn supervisor_effects(
@@ -1320,6 +1331,8 @@ fn supervisor_effects(
         engine: engine.clone(),
         settings: TempDir::new().unwrap(),
         workspace: workspace.to_path_buf(),
+        hold_workspace: std::sync::atomic::AtomicBool::new(false),
+        workspace_release: tokio::sync::Notify::new(),
     })
 }
 
@@ -1328,7 +1341,12 @@ impl OrchestrationEffectCallbacks for SupervisorEffectsCallbacks {
         &'a self,
         _thread_id: &'a str,
     ) -> BoxEffectFuture<'a, Option<PathBuf>> {
-        Box::pin(async move { Ok(Some(self.workspace.clone())) })
+        Box::pin(async move {
+            if self.hold_workspace.swap(false, Ordering::SeqCst) {
+                self.workspace_release.notified().await;
+            }
+            Ok(Some(self.workspace.clone()))
+        })
     }
 
     fn rollback_provider<'a>(
@@ -2581,6 +2599,8 @@ fn thread_message(
         delivery_mode: None,
         delivery_held: None,
         resend_of_message_id: None,
+        actor: None,
+        source_thread_id: None,
         created_at: created_at.to_owned(),
         updated_at: created_at.to_owned(),
     }
@@ -6099,6 +6119,7 @@ async fn routes_orchestration_commands_and_persists_resume_state() {
                 role: "user".to_owned(),
                 text: "hello".to_owned(),
                 attachments: vec![],
+                source_thread_id: None,
             },
             model_selection: None,
             title_seed: None,
@@ -7686,6 +7707,7 @@ async fn unexpected_provider_stream_end_settles_partial_turn_as_failed() {
             role: "user".to_owned(),
             text: "hello".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,
@@ -7847,6 +7869,7 @@ async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion
                 role: "user".to_owned(),
                 text: "hello".to_owned(),
                 attachments: vec![],
+                source_thread_id: None,
             },
             model_selection: None,
             title_seed: None,
@@ -11605,6 +11628,681 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
 
 /// The provider rewinds before any file is restored: a rewind cannot be undone, so it runs
 /// first, and the files follow only once it succeeded.
+/// An engine whose project `p1` lives in `workspace`, with thread `t1` working in the project's
+/// own folder (no worktree), as the turn-diff read and the revert resolve it.
+async fn engine_in_workspace(workspace: &Path) -> OrchestrationEngine {
+    let database = Database::open_in_memory().await.unwrap();
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .unwrap();
+    for command in [
+        json!({
+            "type":"project.create", "commandId":"project", "projectId":"p1", "title":"Project",
+            "workspaceRoot":workspace, "createdAt":NOW
+        }),
+        json!({
+            "type":"thread.create", "commandId":"thread", "threadId":"t1", "projectId":"p1",
+            "title":"Thread", "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "branch":null, "worktreePath":null, "createdAt":NOW
+        }),
+    ] {
+        engine
+            .dispatch(serde_json::from_value(command).unwrap())
+            .await
+            .unwrap();
+    }
+    engine
+}
+
+/// A fake provider session of `t1` in `workspace`, with the effects worker that records its
+/// checkpoints.
+struct CheckpointedSession {
+    engine: OrchestrationEngine,
+    state: Arc<StdMutex<DriverState>>,
+    supervisor: Arc<ProviderRuntimeSupervisor>,
+    events_tx: mpsc::Sender<ProviderEvent>,
+    effects: OrchestrationEffects,
+    callbacks: Arc<SupervisorEffectsCallbacks>,
+}
+
+impl CheckpointedSession {
+    async fn start(workspace: &Path) -> Self {
+        let engine = engine_in_workspace(workspace).await;
+        let state = Arc::new(StdMutex::new(DriverState {
+            rollback_workspace: Some(workspace.to_path_buf()),
+            // Each turn is the provider's own, as `run_turn` names them.
+            sent_turn_ids: (1..=4)
+                .map(|index| format!("provider-turn-{index}"))
+                .collect(),
+            ..DriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(FakeFactory {
+                state: state.clone(),
+                events: StdMutex::new(VecDeque::from([events_rx])),
+            }),
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        ));
+        let mut provider_launch = launch();
+        provider_launch.cwd = workspace.to_path_buf();
+        supervisor.launch(provider_launch).await.unwrap();
+        let callbacks = supervisor_effects(&supervisor, &engine, workspace);
+        let effects = OrchestrationEffects::start(
+            engine.clone(),
+            Arc::new(GitRepository::default()),
+            callbacks.clone(),
+            EffectsOptions::default(),
+        )
+        .await
+        .unwrap();
+        Self {
+            engine,
+            state,
+            supervisor,
+            events_tx,
+            effects,
+            callbacks,
+        }
+    }
+
+    /// Runs turn `index` the way a provider does: the turn starts, the agent writes `contents`
+    /// into `tracked.txt` of `workspace`, answers, and the turn ends in `state`. Returns the
+    /// provider's turn id.
+    async fn run_turn(&self, workspace: &Path, index: i64, contents: &str, state: &str) -> String {
+        self.start_turn(index).await;
+        // The turn's baseline is the checkpoint of the turn before it.
+        wait_for_checkpoint_ref(workspace, index - 1).await;
+        self.finish_turn(workspace, index, contents, state).await
+    }
+
+    /// Starts turn `index` with the provider.
+    async fn start_turn(&self, index: i64) {
+        let start = OrchestrationCommand::ThreadTurnStart {
+            command_id: format!("turn-start-{index}"),
+            thread_id: "t1".to_owned(),
+            message: ThreadMessageInput {
+                message_id: format!("user-{index}"),
+                role: "user".to_owned(),
+                text: format!("change it ({index})"),
+                attachments: vec![],
+                source_thread_id: None,
+            },
+            model_selection: None,
+            title_seed: None,
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            bootstrap: None,
+            source_proposed_plan: None,
+            queued: None,
+            created_at: NOW.to_owned(),
+        };
+        self.engine.dispatch(start.clone()).await.unwrap();
+        self.supervisor.handle_orchestration(start).await.unwrap();
+    }
+
+    /// Lets turn `index`'s agent write `contents` into `tracked.txt`, answer, and end the turn in
+    /// `state`. Returns the provider's turn id.
+    async fn finish_turn(
+        &self,
+        workspace: &Path,
+        index: i64,
+        contents: &str,
+        state: &str,
+    ) -> String {
+        std::fs::write(workspace.join("tracked.txt"), contents).unwrap();
+        let turn_id = format!("provider-turn-{index}");
+        self.provider_event(
+            &turn_id,
+            index,
+            "content.delta",
+            json!({"streamKind":"assistant_text","delta":"Done."}),
+        )
+        .await;
+        if state == "interrupted" {
+            // The person stops the turn; the provider then ends it interrupted.
+            timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+                while !self
+                    .engine
+                    .repositories()
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .is_some_and(|session| {
+                        session.status == "running"
+                            && session.active_turn_id.as_deref() == Some(turn_id.as_str())
+                    })
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the turn runs");
+            let interrupt: OrchestrationCommand = serde_json::from_value(json!({
+                "type":"thread.turn.interrupt", "commandId":format!("interrupt-{index}"),
+                "threadId":"t1", "turnId":turn_id, "createdAt":NOW
+            }))
+            .unwrap();
+            self.engine.dispatch(interrupt.clone()).await.unwrap();
+            self.supervisor
+                .handle_orchestration(interrupt)
+                .await
+                .unwrap();
+        }
+        self.provider_event(&turn_id, index, "turn.completed", json!({"state":state}))
+            .await;
+        turn_id
+    }
+
+    async fn provider_event(&self, turn_id: &str, index: i64, event_type: &str, payload: Value) {
+        self.events_tx
+            .send(ProviderEvent {
+                native_event_id: None,
+                event_type: event_type.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some(turn_id.to_owned()),
+                item_id: Some(format!("assistant-{index}")),
+                request_id: None,
+                payload,
+                activity: Vec::new(),
+                activity_controls: Default::default(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Waits until turn `turn_count`'s checkpoint is recorded `ready`, and returns it.
+    async fn ready_checkpoint(
+        &self,
+        turn_count: i64,
+    ) -> bibcode_server::persistence::ProjectionCheckpoint {
+        timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+            loop {
+                if let Some(checkpoint) = self
+                    .engine
+                    .repositories()
+                    .get_checkpoint("t1".to_owned(), turn_count)
+                    .await
+                    .unwrap()
+                    .filter(|checkpoint| checkpoint.status == "ready")
+                {
+                    return checkpoint;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("turn {turn_count}'s checkpoint was never recorded"))
+    }
+
+    async fn shutdown(self) {
+        self.effects.shutdown().await;
+        self.supervisor.shutdown().await.unwrap();
+        self.engine.shutdown().await;
+    }
+}
+
+async fn wait_for_checkpoint_ref(workspace: &Path, turn_count: i64) {
+    let reference = orchestration_effects::checkpoint_ref("t1", turn_count);
+    timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+        while !git_succeeds(workspace, &["rev-parse", "--verify", "--quiet", &reference]) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("checkpoint ref of turn {turn_count} was never captured"));
+}
+
+/// A turn that changes files records its checkpoint when it ends, with the files it changed,
+/// and the turn-diff read (what the Diff panel and MCP `get_turn_diff` call) returns its patch.
+#[tokio::test]
+async fn a_completed_turn_records_its_checkpoint_and_turn_diff() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+
+    let turn_id = session
+        .run_turn(repository.path(), 1, "changed by the agent\n", "completed")
+        .await;
+    let checkpoint = session.ready_checkpoint(1).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    assert_eq!(
+        checkpoint.checkpoint_ref,
+        orchestration_effects::checkpoint_ref("t1", 1)
+    );
+    let files = checkpoint.files.as_array().unwrap();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0]["path"], "tracked.txt");
+    let turn = session
+        .engine
+        .repositories()
+        .get_turn_by_id("t1".to_owned(), turn_id.clone())
+        .await
+        .unwrap()
+        .expect("the turn is projected");
+    assert_eq!(turn.state, "completed");
+    // The checkpoint names the turn's own answer, not a made-up id.
+    let assistant_message_id = turn.assistant_message_id.expect("the turn has its answer");
+    assert_ne!(assistant_message_id, format!("assistant:{turn_id}"));
+    assert_eq!(
+        checkpoint.assistant_message_id.as_deref(),
+        Some(assistant_message_id.as_str())
+    );
+
+    let settings = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        session.engine.clone(),
+        session.supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        session.engine.clone(),
+        session.supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+        attachment_upload_registry(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    let diff = tagged_rpc_request(
+        &mut socket,
+        "1",
+        "orchestration.getTurnDiff",
+        json!({"threadId":"t1","fromTurnCount":0,"toTurnCount":1}),
+    )
+    .await
+    .expect("the turn's diff is readable");
+    let patch = diff["diff"].as_str().unwrap();
+    assert!(patch.contains("-baseline"), "{patch}");
+    assert!(patch.contains("+changed by the agent"), "{patch}");
+
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+    delivery.shutdown().await;
+    session.shutdown().await;
+}
+
+/// The turn-diff reads (the Diff panel's turn and full-thread patches) show only captured
+/// turns, as revert restores only them: a turn whose checkpoint was given up (`error`) is
+/// refused even when a ref of it exists, with the revert-like wording, and the captured turn
+/// before it still reads.
+#[tokio::test]
+async fn a_turn_diff_of_an_uncaptured_turn_is_refused_even_with_its_ref() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    session
+        .run_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    session.ready_checkpoint(1).await;
+    // Turn 2's capture was given up, but a ref of it was left behind.
+    std::fs::write(repository.path().join("tracked.txt"), "later\n").unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 2)
+        .await
+        .unwrap();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.turn.diff.complete", "commandId":"diff-stale", "threadId":"t1",
+                "turnId":"provider-turn-2", "checkpointTurnCount":2,
+                "checkpointRef":orchestration_effects::checkpoint_ref("t1", 2),
+                "status":"error", "files":[], "assistantMessageId":null,
+                "completedAt":NOW, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let settings = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        session.engine.clone(),
+        session.supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        session.engine.clone(),
+        session.supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+        attachment_upload_registry(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    for (id, tag, payload) in [
+        (
+            "1",
+            "orchestration.getTurnDiff",
+            json!({"threadId":"t1","fromTurnCount":1,"toTurnCount":2}),
+        ),
+        (
+            "2",
+            "orchestration.getFullThreadDiff",
+            json!({"threadId":"t1","toTurnCount":2}),
+        ),
+    ] {
+        let refused = tagged_rpc_request(&mut socket, id, tag, payload)
+            .await
+            .expect_err("an uncaptured turn has no diff");
+        assert_eq!(
+            refused[0]["error"]["message"],
+            "Turn 2 has no captured checkpoint (its capture failed or timed out), so its changes cannot be shown.",
+            "{refused}"
+        );
+    }
+    let captured = tagged_rpc_request(
+        &mut socket,
+        "3",
+        "orchestration.getFullThreadDiff",
+        json!({"threadId":"t1","toTurnCount":1}),
+    )
+    .await
+    .expect("the captured turn still reads");
+    assert!(
+        captured["diff"].as_str().unwrap().contains("+one"),
+        "{captured}"
+    );
+
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+    delivery.shutdown().await;
+    session.shutdown().await;
+}
+
+/// A turn that ends before the effects worker has even handled its start (a fast turn, a busy
+/// worker) is still numbered when it ends, from the checkout itself, then captured once the
+/// worker catches up. Its baseline is captured late, which is the turn-start baseline's own
+/// window, so only the numbering and the capture are asserted here.
+#[tokio::test]
+async fn a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_captured() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    session
+        .callbacks
+        .hold_workspace
+        .store(true, Ordering::SeqCst);
+
+    session.start_turn(1).await;
+    let turn_id = session
+        .finish_turn(repository.path(), 1, "fast\n", "completed")
+        .await;
+    let numbered = timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+        loop {
+            if let Some(checkpoint) = session
+                .engine
+                .repositories()
+                .get_checkpoint("t1".to_owned(), 1)
+                .await
+                .unwrap()
+            {
+                return checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the turn is numbered while the worker is still behind");
+    assert_eq!(numbered.turn_id, turn_id);
+    assert_eq!(numbered.status, "missing");
+
+    session.callbacks.workspace_release.notify_one();
+    let checkpoint = session.ready_checkpoint(1).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    session.shutdown().await;
+}
+
+/// A turn whose baseline (ref 0) could not be captured is never recorded `ready`: its diff could
+/// not be read. Its own end state is still captured, so the next turn's diff is.
+#[tokio::test]
+async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    // Git cannot write ref 0 while its lock file exists.
+    let baseline_lock = repository.path().join(".git").join(format!(
+        "{}.lock",
+        orchestration_effects::checkpoint_ref("t1", 0)
+    ));
+    std::fs::create_dir_all(baseline_lock.parent().unwrap()).unwrap();
+    std::fs::write(&baseline_lock, "").unwrap();
+
+    session.start_turn(1).await;
+    let turn_id = session
+        .finish_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
+        loop {
+            let failed = load_snapshot(&session.engine.repositories())
+                .await
+                .unwrap()
+                .activities
+                .iter()
+                .any(|activity| {
+                    activity.kind == "checkpoint.capture.failed"
+                        && activity.turn_id.as_deref() == Some(turn_id.as_str())
+                });
+            if failed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the turn's checkpoint is reported unreadable");
+    let checkpoint = session
+        .engine
+        .repositories()
+        .get_checkpoint("t1".to_owned(), 1)
+        .await
+        .unwrap()
+        .expect("checkpoint 1");
+    assert_eq!(checkpoint.status, "missing");
+    let reference = |turn_count| orchestration_effects::checkpoint_ref("t1", turn_count);
+    assert!(!git_succeeds(
+        repository.path(),
+        &["rev-parse", "--verify", "--quiet", &reference(0)]
+    ));
+    assert!(git_succeeds(
+        repository.path(),
+        &["rev-parse", "--verify", "--quiet", &reference(1)]
+    ));
+
+    std::fs::remove_file(&baseline_lock).unwrap();
+    session
+        .run_turn(repository.path(), 2, "two\n", "completed")
+        .await;
+    let next = session.ready_checkpoint(2).await;
+    assert_eq!(next.files[0]["path"], "tracked.txt");
+    session.shutdown().await;
+}
+
+/// A turn that ends interrupted or failed still records what it changed, and keeps the state
+/// its session gave it.
+#[tokio::test]
+async fn an_interrupted_or_failed_turn_records_its_checkpoint_and_keeps_its_state() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+
+    let interrupted = session
+        .run_turn(repository.path(), 1, "half done\n", "interrupted")
+        .await;
+    session.ready_checkpoint(1).await;
+    let failed = session
+        .run_turn(repository.path(), 2, "broken\n", "failed")
+        .await;
+    session.ready_checkpoint(2).await;
+
+    for (turn_id, expected) in [(interrupted, "interrupted"), (failed, "error")] {
+        let turn = session
+            .engine
+            .repositories()
+            .get_turn_by_id("t1".to_owned(), turn_id)
+            .await
+            .unwrap()
+            .expect("the turn is projected");
+        assert_eq!(turn.state, expected);
+    }
+    session.shutdown().await;
+}
+
+/// Reverting to a recorded turn restores that turn's files and rewinds the provider by the
+/// turns after it.
+#[tokio::test]
+async fn reverting_to_a_recorded_turn_restores_its_files() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    session
+        .run_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    session.ready_checkpoint(1).await;
+    session
+        .run_turn(repository.path(), 2, "two\n", "completed")
+        .await;
+    session.ready_checkpoint(2).await;
+
+    let mut events = session.engine.subscribe_events();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert", "threadId":"t1",
+                "turnCount":1, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted"
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "one\n"
+    );
+    assert_eq!(session.state.lock().unwrap().rollbacks, [1]);
+    assert!(!git_succeeds(
+        repository.path(),
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &orchestration_effects::checkpoint_ref("t1", 2),
+        ]
+    ));
+    session.shutdown().await;
+}
+
+/// A reverted turn's ref that Git could not delete (its lock was held) is never taken for the
+/// turn that reuses its number: that turn's checkpoint, diff and revert are its own.
+#[tokio::test]
+async fn a_ref_a_revert_could_not_delete_is_never_the_next_turns_checkpoint() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    let git_show = |turn_count: i64| {
+        git(
+            repository.path(),
+            &[
+                "show",
+                &format!(
+                    "{}:tracked.txt",
+                    orchestration_effects::checkpoint_ref("t1", turn_count)
+                ),
+            ],
+        )
+    };
+    session
+        .run_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    session.ready_checkpoint(1).await;
+    session
+        .run_turn(repository.path(), 2, "old two\n", "completed")
+        .await;
+    session.ready_checkpoint(2).await;
+
+    // The revert to turn 1 cannot delete turn 2's ref.
+    let lock = repository.path().join(".git").join(format!(
+        "{}.lock",
+        orchestration_effects::checkpoint_ref("t1", 2)
+    ));
+    std::fs::write(&lock, "").unwrap();
+    let mut events = session.engine.subscribe_events();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert-locked", "threadId":"t1",
+                "turnCount":1, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted"
+    })
+    .await;
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(git_show(2), "old two", "the old ref was left behind");
+
+    // The next turn reuses number 2 (the driver reports its third turn id).
+    let turn_id = session
+        .run_turn(repository.path(), 3, "new two\n", "completed")
+        .await;
+    let checkpoint = session.ready_checkpoint(2).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    assert_eq!(git_show(2), "new two");
+    assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
+
+    // Reverting to it restores the new turn's files, not the old ones.
+    std::fs::write(repository.path().join("tracked.txt"), "scratch\n").unwrap();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert-new", "threadId":"t1",
+                "turnCount":2, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted" && event.event.payload["turnCount"] == 2
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "new two\n"
+    );
+    session.shutdown().await;
+}
+
 #[tokio::test]
 async fn checkpoint_rpc_rewinds_the_provider_once_before_restoring_files() {
     let repository = initialize_repository();
@@ -12401,6 +13099,56 @@ async fn checkpoint_revert_on_an_old_codex_restores_nothing_and_asks_for_an_upda
     engine.shutdown().await;
 }
 
+/// A turn a restart cut off keeps its place after the thread's recorded turns, `missing` (the
+/// checkout after a restart is not where it ended), so a revert across it still rewinds the
+/// provider by every turn. Reconciling again records nothing more.
+#[tokio::test]
+async fn restart_reconciliation_numbers_the_cut_off_turn_after_the_recorded_ones() {
+    let engine = engine().await;
+    for command in [
+        json!({"type":"thread.turn.diff.complete","commandId":"diff-1","threadId":"t1","turnId":"provider-turn-1","checkpointTurnCount":1,"checkpointRef":orchestration_effects::checkpoint_ref("t1", 1),"status":"ready","files":[],"assistantMessageId":null,"completedAt":NOW,"createdAt":NOW}),
+        json!({"type":"thread.session.set","commandId":"cut-off-session","threadId":"t1","session":{"threadId":"t1","status":"running","providerName":"codex","providerInstanceId":"codex","runtimeMode":"full-access","activeTurnId":"provider-turn-2","lastError":null,"updatedAt":NOW},"createdAt":NOW}),
+    ] {
+        engine
+            .dispatch(serde_json::from_value(command).unwrap())
+            .await
+            .unwrap();
+    }
+    engine
+        .repositories()
+        .upsert_provider_session_runtime(persisted_runtime("t1", "running", NOW))
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .expect("startup reconciliation");
+    }
+    let checkpoints = engine
+        .repositories()
+        .list_checkpoints_by_thread("t1".to_owned())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|checkpoint| {
+            (
+                checkpoint.turn_id,
+                checkpoint.checkpoint_turn_count,
+                checkpoint.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoints,
+        [
+            ("provider-turn-1".to_owned(), 1, "ready".to_owned()),
+            ("provider-turn-2".to_owned(), 2, "missing".to_owned()),
+        ]
+    );
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn restart_reconciliation_settles_a_persisted_partial_assistant_message() {
     let state = TempDir::new().expect("state directory");
@@ -12939,6 +13687,7 @@ async fn first_turn_autostarts_the_projected_native_provider() {
             role: "user".to_owned(),
             text: "start natively".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,
@@ -13192,6 +13941,7 @@ async fn projects_distinct_provider_messages_and_settles_the_completed_turn() {
             role: "user".to_owned(),
             text: "hello".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,
@@ -13403,6 +14153,7 @@ async fn unidentified_provider_chunks_share_one_settled_turn_message() {
             role: "user".to_owned(),
             text: "hello".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,
@@ -13521,6 +14272,7 @@ async fn completion_without_assistant_text_does_not_create_a_message() {
             role: "user".to_owned(),
             text: "hello".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,
@@ -13624,6 +14376,7 @@ async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
                 role: "user".to_owned(),
                 text: "hello".to_owned(),
                 attachments: vec![],
+                source_thread_id: None,
             },
             model_selection: None,
             title_seed: None,
@@ -13775,6 +14528,7 @@ async fn project_terminal_with_completion_failures(
             role: "user".to_owned(),
             text: "hello".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,
@@ -14034,6 +14788,7 @@ async fn failed_provider_completion_clears_running_state_and_preserves_the_error
             role: "user".to_owned(),
             text: "fail".to_owned(),
             attachments: vec![],
+            source_thread_id: None,
         },
         model_selection: None,
         title_seed: None,

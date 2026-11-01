@@ -64,6 +64,19 @@ Newer builds cite evidence by reference:
 Use them when present; otherwise place the finding by time and kind, as
 [triage.md](triage.md) shows.
 
+An outside agent's `profiler_status` and `profiler_findings` on BiBCode's own
+`/mcp` return each finding without `title` and `summary`, and with only the
+evidence fields its kind lists below plus the citations above. Free text
+(`exitDetail`, `journal`, and a `crash.panic` finding's `message`) is left out. A `clientId` becomes an opaque `h` and 12
+hex characters, keyed with a secret the server draws at start, so it matches
+the events' alias until the server restarts. A `worktree` or `path` outside home
+(not `~/…`) is left out, and `location`, `exe`, `module`, `faultModule`, a
+path-shaped `rawRef` and the module in each of `frames` keep a relative path or
+the file name. A finding too large to return alone comes with
+`evidenceOmitted: true` and no `evidence`. Adding a kind or an evidence field
+here means adding it to `evidence_fields` in
+`apps/server/src/mcp/tools/diagnostics.rs` too.
+
 ## Crashes
 
 The previous-run kinds come from the clean-shutdown sentinel. On the next start
@@ -346,8 +359,12 @@ work, commit message generation, `worktree.remove`, provider checks such as
 `server.getProviderCapabilities` on a cold cache and `server.updateSettings`
 (which re-probes providers, running OpenCode's `--version`), `terminal.open` (an AI
 Terminal's preparation runs its provider's probe, a mise shim's `which` and `env`,
-and `codesign` for a new Claude build), and similar external or
-filesystem work) never raise `rpc.slow`; their hang budget is 300 s. Builds
+and `codesign` for a new Claude build), MCP tool calls that wait
+(`mcp.wait_for_thread`, `mcp.preview_*`, `mcp.device_*`, and any `mcp.*` tool
+whose RPC method is long-running), a webhook test event or redelivery
+(`webhooks.sendTest`, `webhooks.redeliver`, which wait on a person's endpoint), and
+similar external or filesystem work) never
+raise `rpc.slow`; their hang budget is 300 s. Builds
 through v0.9.2 raised it for `server.getProviderCapabilities` (#107).
 
 ### rpc.slow
@@ -494,7 +511,8 @@ The remaining kinds come from the read-only scan in
   that cancelled. Builds through v0.10.2 recorded no stacked-action outcome at
   all: the stream reports a failure as an `action_failed` item and then ends
   successfully, so `rpc.histogram` showed only `first-item` (#158).
-- **Fingerprint:** `[action, phase, reason, operation]`. `phase` is `branch`,
+- **Fingerprint:** `[action, phase, reason, operation]`. `action` is a supported
+  action name, or `unknown` for any other, as in the event. `phase` is `branch`,
   `commit`, `push`, `pr`, or `preflight` before the first step. `reason` is
   `git-failed`, `provider-failed` or `internal`. `operation` is the failing Git
   operation's tag, such as `GitVcsDriver.pushCurrentBranch`, or empty. No path:

@@ -325,6 +325,7 @@ import {
   WorkspaceCardTerminalIcon,
   WorkspaceCardTitleLine,
 } from "./sidebar/WorkspaceCard";
+import { AgentActorChip } from "./chat/AgentActorChip";
 import { useWorkspaceCardLookups } from "./sidebar/useWorkspaceCardLookups";
 import { EMPTY_CARD_PORTS, EMPTY_CARD_TERMINALS } from "./sidebar/workspaceCardLookups";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
@@ -1239,6 +1240,16 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           ) : undefined
         }
         trailing={trailing}
+        badge={
+          thread.requester ? (
+            <AgentActorChip
+              compact
+              label={thread.requester.actor.label}
+              purpose={thread.requester.purpose}
+              detail="An outside agent created this thread over MCP."
+            />
+          ) : undefined
+        }
       />
       {hasBranchLine ? (
         <WorkspaceCardBranchLine
@@ -2031,21 +2042,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       ),
     [project.memberProjects],
   );
-  const memberThreadCountByPhysicalKey = useMemo(() => {
-    const counts = new Map<string, number>(
-      project.memberProjects.map((member) => [member.physicalProjectKey, 0] as const),
-    );
-    for (const thread of projectThreads) {
-      const member = memberProjectByScopedKey.get(
-        scopedProjectKey(scopeProjectRef(thread.environmentId, thread.projectId)),
-      );
-      if (!member) {
-        continue;
-      }
-      counts.set(member.physicalProjectKey, (counts.get(member.physicalProjectKey) ?? 0) + 1);
-    }
-    return counts;
-  }, [memberProjectByScopedKey, project.memberProjects, projectThreads]);
 
   const workspaceStatuses = useMemo(
     () => createWorkspaceStatusLookup(projectThreads, threadLastVisitedAts),
@@ -2295,107 +2291,31 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
 
-      const memberProjectRef = scopeProjectRef(member.environmentId, member.id);
-      const memberThreadCount = memberThreadCountByPhysicalKey.get(member.physicalProjectKey) ?? 0;
-      if (memberThreadCount > 0) {
-        const warningToastId = toastManager.add(
-          stackedThreadToast({
-            type: "warning",
-            title: "Project is not empty",
-            description: "Delete all threads in this project before removing it.",
-            actionVariant: "destructive",
-            actionProps: {
-              children: "Delete anyway",
-              onClick: () => {
-                void (async () => {
-                  toastManager.close(warningToastId);
-                  await new Promise<void>((resolve) => {
-                    window.setTimeout(resolve, 180);
-                  });
-
-                  const latestProjectThreads = Array.from(
-                    sidebarThreadByKeyRef.current.values(),
-                  ).filter(
-                    (thread) =>
-                      thread.environmentId === memberProjectRef.environmentId &&
-                      thread.projectId === memberProjectRef.projectId,
-                  );
-                  const confirmed = await api.dialogs.confirm(
-                    latestProjectThreads.length > 0
-                      ? [
-                          `Remove project "${member.title}" and delete its ${latestProjectThreads.length} thread${
-                            latestProjectThreads.length === 1 ? "" : "s"
-                          }?`,
-                          `Path: ${member.workspaceRoot}`,
-                          ...(member.environmentLabel
-                            ? [`Environment: ${member.environmentLabel}`]
-                            : []),
-                          "This permanently clears conversation history for those threads.",
-                          "This removes only this project entry.",
-                          "This action cannot be undone.",
-                        ].join("\n")
-                      : [
-                          `Remove project "${member.title}"?`,
-                          `Path: ${member.workspaceRoot}`,
-                          ...(member.environmentLabel
-                            ? [`Environment: ${member.environmentLabel}`]
-                            : []),
-                          "This removes only this project entry.",
-                        ].join("\n"),
-                  );
-                  if (!confirmed) {
-                    return;
-                  }
-
-                  const result = await removeProject(member, { force: true });
-                  if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-                    const error = squashAtomCommandFailure(result);
-                    toastManager.add(
-                      stackedThreadToast({
-                        type: "error",
-                        title: `Failed to remove "${member.title}"`,
-                        description:
-                          error instanceof Error
-                            ? error.message
-                            : "Unknown error removing project.",
-                      }),
-                    );
-                  }
-                })().catch((error) => {
-                  const message =
-                    error instanceof Error ? error.message : "Unknown error removing project.";
-                  console.error("Failed to remove project", {
-                    projectId: member.id,
-                    environmentId: member.environmentId,
-                    ...safeErrorLogAttributes(error),
-                  });
-                  toastManager.add(
-                    stackedThreadToast({
-                      type: "error",
-                      title: `Failed to remove "${member.title}"`,
-                      description: message,
-                    }),
-                  );
-                });
-              },
-            },
-          }),
-        );
-        return;
-      }
-
+      // A project with threads is removed with them, so the confirm dialog says so; a
+      // destructive choice never waits in a toast that times out.
+      const threadCount = Array.from(sidebarThreadByKeyRef.current.values()).filter(
+        (thread) => thread.environmentId === member.environmentId && thread.projectId === member.id,
+      ).length;
       const message = [
-        `Remove project "${member.title}"?`,
+        threadCount > 0
+          ? `Remove project "${member.title}" and delete its ${threadCount} thread${
+              threadCount === 1 ? "" : "s"
+            }?`
+          : `Remove project "${member.title}"?`,
         `Path: ${member.workspaceRoot}`,
         ...(member.environmentLabel ? [`Environment: ${member.environmentLabel}`] : []),
+        ...(threadCount > 0
+          ? ["This permanently clears conversation history for those threads."]
+          : []),
         "This removes only this project entry.",
+        ...(threadCount > 0 ? ["This action cannot be undone."] : []),
       ].join("\n");
       const confirmed = await api.dialogs.confirm(message);
       if (!confirmed) {
         return;
       }
 
-      const result = await removeProject(member);
+      const result = await removeProject(member, threadCount > 0 ? { force: true } : {});
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         const message = error instanceof Error ? error.message : "Unknown error removing project.";
@@ -2413,7 +2333,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         );
       }
     },
-    [memberThreadCountByPhysicalKey, removeProject],
+    [removeProject],
   );
 
   const navigateToThread = useCallback(

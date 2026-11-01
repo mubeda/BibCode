@@ -13,20 +13,23 @@
         "commandId": "~y",
         "causationEventId": null,
         "correlationId": null,
-        "metadata": {},
+        "metadata": {
+          "providerTurnId": "toString"
+        },
         "type": "thread.session-set",
         "payload": {
-          "threadId": "toString",
+          "threadId": "0",
           "session": {
-            "threadId": "0",
-            "status": "interrupted",
-            "providerName": null,
-            "providerInstanceId": "N",
-            "runtimeMode": "full-access",
-            "activeTurnId": null,
-            "lastError": "prototype",
-            "updatedAt": "0"
-          }
+            "threadId": "%^N",
+            "status": "running",
+            "providerName": "8P<RX=^33{",
+            "providerInstanceId": "JDwPQo",
+            "runtimeMode": "auto-accept-edits",
+            "activeTurnId": "",
+            "lastError": "8",
+            "updatedAt": "bFM"
+          },
+          "compactionId": ""
         }
       }
     }

@@ -1,0 +1,34 @@
+[
+  {
+    "query": "hand this refactor to a BiBCode thread running Claude Opus and wait for it to finish, then show me the diff",
+    "should_trigger": true
+  },
+  {
+    "query": "connect codex to the bibcode server on my build box over ssh so it can start threads there",
+    "should_trigger": true
+  },
+  {
+    "query": "the BiBCode thread I started over MCP says awaiting_approval, what do I do",
+    "should_trigger": true
+  },
+  {
+    "query": "ask the BiBCode thread t-12 to also update the changelog, but don't interrupt what it's doing",
+    "should_trigger": true
+  },
+  {
+    "query": "add the BiBCode desktop app as an MCP server in Claude Code on my Windows machine",
+    "should_trigger": true
+  },
+  {
+    "query": "why did bibcode desktop crash last night? check the profiler",
+    "should_trigger": false
+  },
+  {
+    "query": "add a new MCP tool to the BiBCode server that lists worktrees, with tests",
+    "should_trigger": false
+  },
+  {
+    "query": "release BiBCode 0.13.1",
+    "should_trigger": false
+  }
+]

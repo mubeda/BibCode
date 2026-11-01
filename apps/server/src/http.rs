@@ -98,6 +98,23 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Get, "/api/auth/session"),
     route(RouteMethod::Post, "/api/auth/browser-session"),
     route(RouteMethod::Post, "/oauth/token"),
+    // Remote MCP's OAuth (slice R): unauthenticated, admitted per source, and served only on
+    // an eligible origin.
+    route(
+        RouteMethod::Get,
+        crate::auth::PROTECTED_RESOURCE_METADATA_PATH,
+    ),
+    route(
+        RouteMethod::Get,
+        crate::auth::PROTECTED_RESOURCE_ROOT_METADATA_PATH,
+    ),
+    route(
+        RouteMethod::Get,
+        crate::auth::AUTHORIZATION_SERVER_METADATA_PATH,
+    ),
+    route(RouteMethod::Post, "/oauth/register"),
+    route(RouteMethod::Get, "/oauth/authorize"),
+    route(RouteMethod::Get, "/oauth/authorize/status"),
     route(RouteMethod::Post, "/api/auth/websocket-ticket"),
     route(RouteMethod::Post, "/api/auth/pairing-token"),
     route(RouteMethod::Post, "/api/auth/pairing-offer"),
@@ -107,7 +124,11 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/auth/pairing-links/revoke"),
     route(RouteMethod::Get, "/api/auth/clients"),
     route(RouteMethod::Post, "/api/auth/clients/revoke"),
+    route(RouteMethod::Post, "/api/auth/clients/mcp-access"),
     route(RouteMethod::Post, "/api/auth/clients/revoke-others"),
+    // Approving or denying a remote MCP authorization needs `access:write` (slice R).
+    route(RouteMethod::Post, "/api/auth/mcp-authorizations/approve"),
+    route(RouteMethod::Post, "/api/auth/mcp-authorizations/deny"),
     route(RouteMethod::Get, "/api/orchestration/snapshot"),
     route(RouteMethod::Post, "/api/orchestration/dispatch"),
     route(RouteMethod::Post, "/api/connect/link-proof"),
@@ -132,8 +153,11 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, MAINTENANCE_UPDATE_COMMIT_PATH),
     route(RouteMethod::Post, MAINTENANCE_UPDATE_CANCEL_PATH),
     route(RouteMethod::Get, MAINTENANCE_UPDATE_STATUS_PATH),
+    route(RouteMethod::Get, "/mcp"),
     route(RouteMethod::Post, "/mcp"),
     route(RouteMethod::Delete, "/mcp"),
+    // Unauthenticated and loopback-only: reads no bearer (`mcp::endpoint`).
+    route(RouteMethod::Post, crate::mcp::endpoint::PROOF_PATH),
     route(RouteMethod::Get, "*"),
 ];
 
@@ -170,38 +194,251 @@ fn client_reach(connection: ConnectionInfo, headers: &HeaderMap) -> Option<Clien
 
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
 const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+const X_FORWARDED_FOR: &str = "x-forwarded-for";
 
-/// `X-Forwarded-Host` and `X-Forwarded-Proto` are trusted only from a loopback peer (a
-/// reverse proxy on this machine), like `X-Forwarded-For`. From such a peer the forwarded
-/// host becomes `Host`, so the Origin rule and the preview gateway see the address the
-/// browser used (nginx sends `Host: $proxy_host` by default). From any other peer, or an
-/// unknown one, both headers are dropped.
+/// How a request reached this server (#139, slice R), computed once per request before any
+/// route runs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RequestClass {
+    /// A loopback `Host` from a loopback peer, or the address this connection was accepted
+    /// on, with no forwarded header: a process on this host, or a client of the bound
+    /// address.
+    Direct,
+    /// BiBCode Connect's managed tunnel: a loopback socket and the managed hostname in
+    /// `Host`. Its origin is fixed by the server.
+    ManagedTunnel,
+    /// A reverse proxy on this host that overwrites the forwarded headers, as the nginx
+    /// recipe does: a loopback peer, a loopback `Host`, and `X-Forwarded-Host`.
+    LocalProxy,
+    /// Anything else, a preview gateway hostname included. Fails closed.
+    #[default]
+    Other,
+}
+
+/// The class, effective origin and admission source of a request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RequestOrigin {
+    pub class: RequestClass,
+    /// `scheme://host[:port]` as the client reached this server; `None` for [`RequestClass::Other`].
+    pub origin: Option<String>,
+    /// Who sent it, for the unauthenticated routes' admission: `<class>:<network>`. The
+    /// class is the request's own (`direct`, `proxy`, `tunnel`, `other`); the network is the
+    /// peer's /24 or /64, except behind a local proxy, where it is the last
+    /// `X-Forwarded-For` entry, which only the proxy vouches for.
+    pub source_key: String,
+}
+
+impl RequestOrigin {
+    /// A direct request to `origin` (`http://127.0.0.1:3773`), as a test or an in-process
+    /// caller reaches this server.
+    #[must_use]
+    pub fn direct(origin: impl Into<String>) -> Self {
+        Self {
+            class: RequestClass::Direct,
+            origin: Some(origin.into()),
+            source_key: "direct:loopback".to_owned(),
+        }
+    }
+
+    /// Whether the request came straight to this server, not through a tunnel or a proxy.
+    #[must_use]
+    pub fn is_direct(&self) -> bool {
+        self.class == RequestClass::Direct
+    }
+
+    /// The origin remote MCP's OAuth routes may serve: the managed tunnel's, a local proxy's
+    /// `https` one, or a direct loopback `http` one. `None` everywhere else.
+    #[must_use]
+    pub fn eligible_origin(&self) -> Option<&str> {
+        let origin = self.origin.as_deref()?;
+        let eligible = match self.class {
+            RequestClass::ManagedTunnel => true,
+            RequestClass::LocalProxy => origin.starts_with("https://"),
+            RequestClass::Direct => url::Url::parse(origin).is_ok_and(|url| {
+                url.scheme() == "http" && url.host_str().is_some_and(crate::auth::is_loopback_host)
+            }),
+            RequestClass::Other => false,
+        };
+        eligible.then_some(origin)
+    }
+}
+
+/// The forwarded-header rule (slice R), for every route: `X-Forwarded-Host` and
+/// `X-Forwarded-Proto` are honored only when the peer is loopback **and** the raw `Host` is
+/// a loopback name or the address the connection was accepted on. Otherwise both are
+/// removed and `Host` is kept, so a client of the managed tunnel cannot turn its `Host` into
+/// a loopback name. The nginx recipe (`Host: $proxy_host` and both headers overwritten) keeps
+/// working; a proxy that sends the public `Host` itself loses only the scheme.
 async fn trust_forwarded_headers(
+    State(gateway): State<Option<PreviewGateway>>,
     connection: ConnectionInfo,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let peer = connection.ok().map(|ConnectInfo(addrs)| addrs.peer.ip());
-    apply_forwarded_headers(request.headers_mut(), peer);
+    let addrs = connection.ok().map(|ConnectInfo(addrs)| addrs);
+    let origin = classify_request(
+        request.headers_mut(),
+        addrs.map(|addrs| addrs.peer.ip()),
+        addrs.and_then(|addrs| addrs.local),
+        |local_ip, host| {
+            gateway
+                .as_ref()
+                .and_then(|gateway| gateway.managed_hostname(local_ip, host))
+        },
+    );
+    request.extensions_mut().insert(origin);
     next.run(request).await
 }
 
-fn apply_forwarded_headers(headers: &mut HeaderMap, peer: Option<IpAddr>) {
-    if !peer.is_some_and(|peer| peer.to_canonical().is_loopback()) {
-        headers.remove(X_FORWARDED_HOST);
-        headers.remove(X_FORWARDED_PROTO);
-        return;
-    }
-    // A proxy chain appends; the first entry is the host the browser asked for.
-    let forwarded = headers
-        .get(X_FORWARDED_HOST)
+fn first_header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .and_then(|host| HeaderValue::from_str(host).ok());
-    if let Some(host) = forwarded {
+        .filter(|value| !value.is_empty())
+}
+
+/// Applies the forwarded-header rule to `headers` and classifies the request.
+fn classify_request(
+    headers: &mut HeaderMap,
+    peer: Option<IpAddr>,
+    local: Option<SocketAddr>,
+    managed_hostname: impl Fn(IpAddr, Option<&str>) -> Option<String>,
+) -> RequestOrigin {
+    let raw_host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let peer_loopback = peer.is_some_and(|peer| peer.to_canonical().is_loopback());
+    let host_is_loopback = raw_host.as_deref().is_some_and(authority_is_loopback);
+    let host_is_bound = raw_host
+        .as_deref()
+        .zip(local)
+        .is_some_and(|(host, local)| authority_is_address(host, local));
+    let forwarded =
+        headers.contains_key(X_FORWARDED_HOST) || headers.contains_key(X_FORWARDED_PROTO);
+    let honored = peer_loopback && (host_is_loopback || host_is_bound);
+    let peer_network = peer.map_or_else(|| "unknown".to_owned(), network_key);
+    if !honored {
+        headers.remove(X_FORWARDED_HOST);
+        headers.remove(X_FORWARDED_PROTO);
+    }
+    let forwarded_host = honored
+        .then(|| first_header_value(headers, X_FORWARDED_HOST))
+        .flatten()
+        .map(str::to_owned);
+    if let Some(host) = forwarded_host
+        .as_deref()
+        .and_then(|host| HeaderValue::from_str(host).ok())
+    {
+        // From such a peer the forwarded host becomes `Host`, so the Origin rule and the
+        // preview gateway see the address the browser used.
         headers.insert(HOST, host);
+    }
+    if let Some(host) = forwarded_host {
+        let scheme = match first_header_value(headers, X_FORWARDED_PROTO) {
+            Some(proto) if proto.eq_ignore_ascii_case("https") => "https",
+            _ => "http",
+        };
+        return RequestOrigin {
+            class: RequestClass::LocalProxy,
+            origin: normalized_origin(scheme, &host),
+            source_key: format!("proxy:{}", forwarded_for_network(headers)),
+        };
+    }
+    if !forwarded && ((peer_loopback && host_is_loopback) || host_is_bound) {
+        let origin = raw_host
+            .as_deref()
+            .and_then(|host| normalized_origin("http", host));
+        return RequestOrigin {
+            class: if origin.is_some() {
+                RequestClass::Direct
+            } else {
+                RequestClass::Other
+            },
+            origin,
+            source_key: format!("direct:{peer_network}"),
+        };
+    }
+    if let Some(local) = local
+        && let Some(hostname) = managed_hostname(local.ip(), raw_host.as_deref())
+    {
+        return RequestOrigin {
+            class: RequestClass::ManagedTunnel,
+            origin: normalized_origin("https", &hostname),
+            source_key: "tunnel:".to_owned(),
+        };
+    }
+    RequestOrigin {
+        class: RequestClass::Other,
+        origin: None,
+        source_key: format!("other:{peer_network}"),
+    }
+}
+
+/// `scheme://authority`, normalized (lower-case host, no default port); `None` for an
+/// authority that is not a plain host and port.
+fn normalized_origin(scheme: &str, authority: &str) -> Option<String> {
+    if authority.contains(['/', '?', '#', '@', ' ']) {
+        return None;
+    }
+    let url = url::Url::parse(&format!("{scheme}://{authority}")).ok()?;
+    url.host_str()?;
+    Some(url.origin().ascii_serialization())
+}
+
+fn authority_host(authority: &str) -> Option<String> {
+    let url = url::Url::parse(&format!("http://{authority}")).ok()?;
+    url.host_str().map(str::to_owned)
+}
+
+fn authority_is_loopback(authority: &str) -> bool {
+    authority_host(authority).is_some_and(|host| crate::auth::is_loopback_host(&host))
+}
+
+fn authority_is_address(authority: &str, address: SocketAddr) -> bool {
+    let Ok(url) = url::Url::parse(&format!("http://{authority}")) else {
+        return false;
+    };
+    let host_ip = match url.host() {
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip),
+        _ => return false,
+    };
+    host_ip.to_canonical() == address.ip().to_canonical()
+        && url.port_or_known_default() == Some(address.port())
+}
+
+/// The network behind a local proxy: the last `X-Forwarded-For` entry, which the documented
+/// recipe sets to the client's address. The server cannot prove that, so admission treats the
+/// `proxy` class as unproven (review round 2).
+fn forwarded_for_network(headers: &HeaderMap) -> String {
+    headers
+        .get(X_FORWARDED_FOR)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next_back())
+        .map(|entry| entry.trim().trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|entry| entry.parse::<IpAddr>().ok())
+        .map_or_else(|| "unknown".to_owned(), network_key)
+}
+
+/// An address's admission network: an IPv4 /24 or IPv6 /64, or `loopback` or `unspecified`.
+fn network_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        ip if ip.is_unspecified() => "unspecified".to_owned(),
+        ip if ip.is_loopback() => "loopback".to_owned(),
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            format!("v4:{}.{}.{}.0/24", octets[0], octets[1], octets[2])
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            format!(
+                "v6:{:x}:{:x}:{:x}:{:x}::/64",
+                segments[0], segments[1], segments[2], segments[3]
+            )
+        }
     }
 }
 
@@ -242,7 +479,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             state.admission_gate.clone(),
             request_admission,
         ))
-        .layer(middleware::from_fn(trust_forwarded_headers))
+        .layer(middleware::from_fn_with_state(
+            state.preview_gateway.clone(),
+            trust_forwarded_headers,
+        ))
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.preview_gateway.clone(),
@@ -1114,19 +1354,93 @@ mod tests {
             headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
             headers
         };
+        let local = Some("127.0.0.1:3773".parse().unwrap());
         for loopback in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
             let mut headers = forwarded();
-            apply_forwarded_headers(&mut headers, Some(loopback.parse().unwrap()));
+            let origin = classify_request(
+                &mut headers,
+                Some(loopback.parse().unwrap()),
+                local,
+                |_, _| None,
+            );
             assert_eq!(headers[HOST], "bibcode.example.test", "{loopback}");
             assert_eq!(headers[X_FORWARDED_PROTO], "https", "{loopback}");
+            assert_eq!(origin.class, RequestClass::LocalProxy, "{loopback}");
+            assert_eq!(
+                origin.eligible_origin(),
+                Some("https://bibcode.example.test")
+            );
         }
         for untrusted in [Some("192.168.1.9".parse().unwrap()), None] {
             let mut headers = forwarded();
-            apply_forwarded_headers(&mut headers, untrusted);
+            let origin = classify_request(&mut headers, untrusted, local, |_, _| None);
             assert_eq!(headers[HOST], "127.0.0.1:3773", "{untrusted:?}");
             assert!(!headers.contains_key(X_FORWARDED_HOST), "{untrusted:?}");
             assert!(!headers.contains_key(X_FORWARDED_PROTO), "{untrusted:?}");
+            assert_eq!(origin.eligible_origin(), None, "{untrusted:?}");
         }
+    }
+
+    /// Slice R: through the managed tunnel the raw `Host` is the public hostname, so a
+    /// client's `X-Forwarded-Host: 127.0.0.1` is dropped and its `Host` kept.
+    #[test]
+    fn a_tunnel_shaped_request_keeps_its_host_and_drops_injected_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("env-1.connect.example"));
+        headers.insert(X_FORWARDED_HOST, HeaderValue::from_static("127.0.0.1"));
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("http"));
+        let origin = classify_request(
+            &mut headers,
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1:3773".parse().unwrap()),
+            |local, host| {
+                (local.is_loopback() && host == Some("env-1.connect.example"))
+                    .then(|| "env-1.connect.example".to_owned())
+            },
+        );
+        assert_eq!(headers[HOST], "env-1.connect.example");
+        assert!(!headers.contains_key(X_FORWARDED_HOST));
+        assert!(!headers.contains_key(X_FORWARDED_PROTO));
+        assert_eq!(origin.class, RequestClass::ManagedTunnel);
+        assert_eq!(origin.source_key, "tunnel:");
+        assert_eq!(
+            origin.eligible_origin(),
+            Some("https://env-1.connect.example")
+        );
+    }
+
+    #[test]
+    fn requests_are_classed_direct_only_on_a_loopback_or_bound_host_without_forwarding() {
+        let classify = |host: &'static str, peer: &str, local: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(HOST, HeaderValue::from_static(host));
+            classify_request(
+                &mut headers,
+                Some(peer.parse().unwrap()),
+                Some(local.parse().unwrap()),
+                |_, _| None,
+            )
+        };
+        let local = classify("127.0.0.1:3773", "127.0.0.1", "127.0.0.1:3773");
+        assert_eq!(local.class, RequestClass::Direct);
+        assert_eq!(local.eligible_origin(), Some("http://127.0.0.1:3773"));
+        assert_eq!(
+            classify("localhost:3773", "::1", "[::1]:3773").eligible_origin(),
+            Some("http://localhost:3773")
+        );
+        // The bound LAN address is direct, but plain HTTP there serves no OAuth.
+        let lan = classify("192.168.1.5:3773", "192.168.1.9", "192.168.1.5:3773");
+        assert_eq!(lan.class, RequestClass::Direct);
+        assert_eq!(lan.eligible_origin(), None);
+        assert_eq!(lan.source_key, "direct:v4:192.168.1.0/24");
+        // A LAN peer naming a loopback host is not direct.
+        let spoofed = classify("127.0.0.1:3773", "192.168.1.9", "192.168.1.5:3773");
+        assert_eq!(spoofed.class, RequestClass::Other);
+        // Neither is a preview or any other hostname.
+        assert_eq!(
+            classify("preview-1.connect.example", "127.0.0.1", "127.0.0.1:3773").class,
+            RequestClass::Other
+        );
     }
 
     #[test]

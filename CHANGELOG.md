@@ -1,5 +1,37 @@
 # Changelog
 
+## [v0.14.0] - 2026-11-01
+
+BiBCode v0.14.0 lets outside AI agents operate BiBCode through its MCP server, locally or remotely, with a person always able to see, take over and stop what they do. Every turn now records a checkpoint again, so turn diffs and revert work. The timeline keeps its reading line during the sent-row glide, and Linux AppImage clones no longer load bundled libraries into Git. This release includes the changes since v0.13.0.
+
+### Agents through MCP
+
+- Claude Code, Codex, Cursor, OpenCode and other MCP clients can start and steer threads, answer questions and approvals, read turn diffs and revert, manage worktrees, branch, commit, push and pull, create, edit and merge pull requests on GitHub and GitLab, read and write project files, open terminals, drive the browser and device previews, open chat panels, and read diagnostics. (#139)
+- Settings → Agents → Agent integrations has **Connect an agent**, which adds BiBCode to Claude Code, Codex, Cursor or OpenCode in one click and removes it again. "Agents may" sets what agents can do: read only, approval required, or operate. (#139)
+- Work done by an agent is labeled "Agent · MCP" in the chat, the sidebar and the status bar. **Take over** pauses an agent's changes, **Hand back** returns control, and **Stop** ends its access. An agent's request to show a file waits until you click Show. (#139)
+- Remote agents can connect over HTTPS with OAuth. Each new client shows a consent code that you approve under Requests to connect, or with `bibcode mcp authorize`. Access lasts 30 days and can be revoked. (#139)
+- Outbound webhooks send signed thread, turn and approval events to an HTTPS address, with retries and a delivery history. (#139)
+- Agents can clone public HTTPS repositories. Internal hosts and SSH URLs are refused, and hooks never run. The Files tools never read or change `.git`, and refuse to change files on Windows for now. (#139)
+- `docs/reference/mcp.md` and `docs/reference/webhooks.md` describe every tool, argument and error, so an agent can work from the docs alone. (#139)
+
+### Chats and timeline
+
+- Every turn that ends in a Git checkout records a checkpoint again, so the Diff panel's turn list, turn diffs and revert have data. A queued message waits until the previous turn's checkpoint is saved, and a turn whose checkpoint could not be saved can't be diffed or reverted to. Turns from before this release start recording from their thread's next turn. (#139)
+- A scroll key pressed during the sent-row glide pages as asked, and no longer jumps the reading line. (#207, #214)
+- A finished reply no longer drops for a frame when its work log turns into "Worked for". (#208)
+
+### Linux and macOS
+
+- Clone from URL in a Linux AppImage no longer loads the bundled libraries into the system Git when `APPDIR` doesn't match the running AppDir. (#209)
+- The live Codex terminal Activity dock shows on macOS x64. (#192)
+- Claude Terminal status hooks now cover Claude Code 2.1.220 through 2.1.314.
+- Discarding to the trash on macOS no longer needs Finder automation and gives up after 10 seconds.
+
+### Known limitations
+
+- The MCP Files tools refuse to change files on Windows until handle-bound writes land (#216). Agent clones over SSH are refused (#217).
+- The macOS reconnect footprint still needs heap evidence. (#134)
+
 ## [v0.13.0] - 2026-10-28
 
 BiBCode v0.13.0 adds an Inbox for agent work, makes agent status more reliable, and moves Activity into each chat and AI Terminal. Chats keep drafts and their reading position through reconnects and streaming. Diagnostics can collect logs from a connected server, and a paired CLI can download a remote bundle while the desktop app is closed. This release includes the changes since v0.12.0.

@@ -40,6 +40,7 @@ describe("GitManagerDiscardDialog", () => {
           disposition="trash"
           isBusy={false}
           open
+          putBackRestoresInPlace={false}
           paths={paths}
           onConfirm={() => Promise.resolve()}
           onOpenChange={() => undefined}
@@ -50,7 +51,28 @@ describe("GitManagerDiscardDialog", () => {
     expect(document.body.textContent).toContain("src/file-10.ts");
     expect(document.body.textContent).not.toContain("src/file-11.ts");
     expect(document.body.textContent).toContain("and 2 more");
-    expect(document.body.textContent).toContain("OS trash");
+    expect(document.body.textContent).toContain("server's trash");
+  });
+
+  it("says Put Back will not return files only when the server stages them first", async () => {
+    const render = (putBackRestoresInPlace: boolean) =>
+      act(async () =>
+        root?.render(
+          <GitManagerDiscardDialog
+            disposition="trash"
+            isBusy={false}
+            open
+            paths={["src/file.ts"]}
+            putBackRestoresInPlace={putBackRestoresInPlace}
+            onConfirm={() => Promise.resolve()}
+            onOpenChange={() => undefined}
+          />,
+        ),
+      );
+    await render(false);
+    expect(document.body.textContent).toContain("Put Back won't return them here");
+    await render(true);
+    expect(document.body.textContent).not.toContain("Put Back");
   });
 
   it("runs confirm and keeps cancel free of mutations", async () => {
@@ -62,6 +84,7 @@ describe("GitManagerDiscardDialog", () => {
           disposition="permanent"
           isBusy={false}
           open
+          putBackRestoresInPlace={false}
           paths={["src/file.ts"]}
           onConfirm={onConfirm}
           onOpenChange={onOpenChange}

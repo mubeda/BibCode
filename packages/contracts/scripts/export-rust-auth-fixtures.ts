@@ -28,6 +28,9 @@ import {
   AuthShareStateResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
+  AuthSetMcpAccessInput,
+  AuthApproveMcpAuthorizationInput,
+  AuthDenyMcpAuthorizationInput,
   AuthRevokePairingLinkInput,
   AuthSessionState,
   AuthStandardClientScopes,
@@ -37,6 +40,8 @@ import {
 } from "../src/auth.ts";
 import {
   AuthClientSessionRevokeResult,
+  AuthMcpAccessResult,
+  AuthMcpAuthorizationDecisionResult,
   AuthOtherClientSessionsRevokeResult,
   AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
@@ -69,6 +74,9 @@ const authRouteNames = [
   "revokePairingLink",
   "clients",
   "revokeClient",
+  "setMcpAccess",
+  "approveMcpAuthorization",
+  "denyMcpAuthorization",
   "revokeOtherClients",
 ] as const;
 
@@ -194,6 +202,10 @@ const namedSchemas = {
   AuthClientSession,
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
+  AuthMcpAccessResult,
+  AuthApproveMcpAuthorizationInput,
+  AuthDenyMcpAuthorizationInput,
+  AuthMcpAuthorizationDecisionResult,
   AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
@@ -208,6 +220,7 @@ const namedSchemas = {
   AuthPairingLinkList,
   AuthPairingLinkRevokeResult,
   AuthRevokeClientSessionInput,
+  AuthSetMcpAccessInput,
   AuthRevokePairingLinkInput,
   AuthSessionState,
   AuthTokenExchangeRequest,
@@ -420,6 +433,30 @@ addJsonFixture("requests/client-revoke.json", AuthRevokeClientSessionInput, {
 addJsonFixture("responses/client-revoke.json", AuthClientSessionRevokeResult, {
   revoked: true,
 });
+addJsonFixture("requests/client-mcp-access.json", AuthSetMcpAccessInput, {
+  sessionId: otherSessionId,
+  access: "read-only",
+});
+addJsonFixture("responses/client-mcp-access.json", AuthMcpAccessResult, {
+  sessionId: otherSessionId,
+  access: "read-only",
+});
+addJsonFixture("requests/mcp-authorization-approve.json", AuthApproveMcpAuthorizationInput, {
+  id: "fixture-mcp-authorization",
+  access: "approval-required",
+  terminals: false,
+});
+addJsonFixture("responses/mcp-authorization-approve.json", AuthMcpAuthorizationDecisionResult, {
+  id: "fixture-mcp-authorization",
+  status: "approved",
+});
+addJsonFixture("requests/mcp-authorization-deny.json", AuthDenyMcpAuthorizationInput, {
+  id: "fixture-mcp-authorization",
+});
+addJsonFixture("responses/mcp-authorization-deny.json", AuthMcpAuthorizationDecisionResult, {
+  id: "fixture-mcp-authorization",
+  status: "denied",
+});
 addJsonFixture("responses/client-revoke-others.json", AuthOtherClientSessionsRevokeResult, {
   revokedCount: 1,
 });
@@ -494,6 +531,18 @@ const samples = {
   revokeClient: {
     request: "requests/client-revoke.json",
     success: "responses/client-revoke.json",
+  },
+  setMcpAccess: {
+    request: "requests/client-mcp-access.json",
+    success: "responses/client-mcp-access.json",
+  },
+  approveMcpAuthorization: {
+    request: "requests/mcp-authorization-approve.json",
+    success: "responses/mcp-authorization-approve.json",
+  },
+  denyMcpAuthorization: {
+    request: "requests/mcp-authorization-deny.json",
+    success: "responses/mcp-authorization-deny.json",
   },
   revokeOtherClients: { success: "responses/client-revoke-others.json" },
 } as const;

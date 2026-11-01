@@ -11,6 +11,9 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Provider setup](./providers/README.md)
 - [Remote access](./user/remote-access.md)
+- [Outside agents over MCP](./user/mcp.md)
+- [MCP reference for agents](./reference/mcp.md): everything another AI needs to operate
+  BiBCode over MCP
 - [Standalone server installation](./user/server-installation.md)
 - [Architecture overview](./architecture/overview.md)
 
@@ -20,6 +23,8 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Keybindings](./user/keybindings.md)
 - [Remote access](./user/remote-access.md)
+- [Outside agents over MCP](./user/mcp.md)
+- [Webhooks](./user/webhooks.md)
 - [Standalone server installation](./user/server-installation.md)
 - [Project data safety and recovery](./guides/project-data-recovery.md)
 - [Source control providers](./integrations/source-control-providers.md)
@@ -58,11 +63,15 @@ current behavior.
 - [Release process](./operations/release.md)
 - [Observability](./operations/observability.md)
 - [Effect.fn checklist](./operations/effect-fn-checklist.md)
+- [MCP reference](./reference/mcp.md): transports, access, every tool, the safety model
+  and every error type, for an AI operating BiBCode
+- [Webhooks reference](./reference/webhooks.md): events, payloads, signatures, retries and
+  catch-up, for a webhook receiver
 - [Encyclopedia](./reference/encyclopedia.md)
 - [Workspace layout](./reference/workspace-layout.md)
 - [Repository scripts](./reference/scripts.md)
 - [Repository skills](./skills/): the source of the agent skills
-  (`bibcode-profiler`, `bibcode-release`, `issue-delivery`) that the
+  (`bibcode-mcp`, `bibcode-profiler`, `bibcode-release`, `issue-delivery`) that the
   `.agents/skills/` and `.claude/skills/` stubs point to
 
 ## Historical material

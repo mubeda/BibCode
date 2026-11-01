@@ -1,0 +1,1151 @@
+//! Who acted, and what outside agents did (#139, slice X1).
+//!
+//! **Attribution.** The actor of a command comes from the authenticated principal only:
+//! [`principal_actor`] is `{ kind: "mcp-client", clientId, label }` for an `mcp-client`
+//! session and `None` for anyone else, and the dispatch handlers attribute the command's
+//! admission claim to it, so the engine stamps `metadata.actor` on every event it plans. No
+//! client input decides it.
+//!
+//! **Activity.** [`McpActivity`] keeps one content-free row per mutating tool call that ran
+//! work (`mcp_activity`: time, session, label, tool, thread, outcome tag, and a target of ids
+//! and counts), pruned past 7 days or 5,000 rows, and knows which clients are active: a call
+//! in flight or in the last 2 minutes, an owned mutation running, or a running turn whose
+//! latest user message it sent. `subscribeMcpActivity` streams the last 200 rows of the last
+//! 7 days, each new one, and the active clients.
+//!
+//! **Stop.** A person's Stop revokes the agent and announces it; [`watch_stops`] then
+//! interrupts each running turn whose latest user message that agent sent. A plain
+//! revocation interrupts nothing.
+
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use rusqlite::params;
+use serde_json::{Map, Value, json};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio_util::sync::CancellationToken;
+
+use super::control::{
+    Inner, McpControl, REQUEST_ROW_TTL_SECONDS, ToolCall, ToolSpec, invalid_argument, now_iso,
+};
+use crate::{
+    auth::{MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome},
+    orchestration::engine::MAX_THREAD_PURPOSE_CHARS,
+    persistence::Database,
+    rpc::{RpcRegistry, RpcSessionContext, RpcStreamChunk},
+};
+
+/// Rows the stream starts with.
+pub(crate) const RECENT_ROWS: i64 = 200;
+/// Rows kept, and for how long.
+const KEPT_ROWS: i64 = 5_000;
+const KEPT_DAYS: i64 = 7;
+/// A client counts as active this long after its last call.
+pub(crate) const ACTIVE_WINDOW: Duration = Duration::from_secs(120);
+/// How often a stream re-checks who is active, so a client that went quiet drops off.
+const ACTIVE_RECHECK: Duration = Duration::from_secs(15);
+/// How often a cancelled keyed call's owned work is checked for its outcome, and for how long.
+const OUTCOME_POLL: Duration = Duration::from_secs(2);
+const OUTCOME_WAIT: Duration = Duration::from_secs(35 * 60);
+const STREAM_CAPACITY: usize = 64;
+const ROW_CAPACITY: usize = 256;
+/// The longest id a target keeps.
+const MOST_ID_CHARS: usize = 128;
+
+/// Rows older than this instant are past the 7-day retention.
+fn retention_cutoff() -> String {
+    (time::OffsetDateTime::now_utc() - time::Duration::days(KEPT_DAYS))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// The actor of a command sent with `context`'s credential: an outside agent's session, with
+/// its Authorized clients label at dispatch time; `None` for anyone else.
+pub(crate) async fn principal_actor(context: &RpcSessionContext) -> Option<Value> {
+    let principal = context.principal()?;
+    if principal.subject != MCP_CLIENT_SUBJECT {
+        return None;
+    }
+    let label = context
+        .current_client_metadata()
+        .await
+        .and_then(|client| client.label);
+    Some(actor(&principal.session_id, label.as_deref()))
+}
+
+/// An outside agent as an actor.
+pub(crate) fn actor(client_id: &str, label: Option<&str>) -> Value {
+    json!({ "kind": "mcp-client", "clientId": client_id, "label": label })
+}
+
+/// The description of a tool's `purpose` argument.
+pub(crate) const PURPOSE: &str = "Optional: why you are creating it, in at most 200 characters. BiBCode shows it with your name on what you create.";
+
+impl ToolCall<'_> {
+    /// The optional `purpose` argument: at most 200 characters, blank as absent.
+    pub(crate) fn purpose(&self) -> Result<Option<String>, Value> {
+        let purpose = self
+            .string("purpose")?
+            .map(str::trim)
+            .filter(|purpose| !purpose.is_empty());
+        if purpose.is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS) {
+            return Err(invalid_argument(&format!(
+                "purpose is at most {MAX_THREAD_PURPOSE_CHARS} characters"
+            )));
+        }
+        Ok(purpose.map(str::to_owned))
+    }
+}
+
+/// The activity log and the active clients of one environment.
+#[derive(Clone)]
+pub struct McpActivity {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    database: Database,
+    rows: broadcast::Sender<Value>,
+    presence: Mutex<HashMap<String, Presence>>,
+    presence_changed: watch::Sender<u64>,
+    /// The running attributed turns, refreshed by one task for every subscriber while any
+    /// subscribes, with a version that counts refreshes (0: not read yet).
+    turns: watch::Sender<(u64, Arc<Vec<RunningTurn>>)>,
+    turn_refresh: Duration,
+    refreshing: AtomicBool,
+    turn_queries: AtomicUsize,
+}
+
+#[derive(Default)]
+struct Presence {
+    label: Option<String>,
+    calls: usize,
+    owned: usize,
+    last_call: Option<(Instant, String)>,
+}
+
+/// One row to record.
+pub(crate) struct NewActivity {
+    pub(crate) session_id: String,
+    pub(crate) label: Option<String>,
+    pub(crate) tool: String,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) outcome: String,
+    pub(crate) target: Value,
+}
+
+/// Holds a call's place among the active clients; dropping it ends the call.
+pub(crate) struct CallPresence {
+    activity: McpActivity,
+    session_id: String,
+}
+
+impl Drop for CallPresence {
+    fn drop(&mut self) {
+        self.activity.update(&self.session_id, |presence| {
+            presence.calls = presence.calls.saturating_sub(1);
+            presence.last_call = Some((Instant::now(), now_iso()));
+        });
+    }
+}
+
+impl McpActivity {
+    #[must_use]
+    pub fn new(database: Database) -> Self {
+        Self::with_turn_refresh(database, ACTIVE_RECHECK)
+    }
+
+    /// [`Self::new`] refreshing the running turns every `turn_refresh`.
+    #[must_use]
+    pub(crate) fn with_turn_refresh(database: Database, turn_refresh: Duration) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                database,
+                rows: broadcast::channel(ROW_CAPACITY).0,
+                presence: Mutex::new(HashMap::new()),
+                presence_changed: watch::channel(0).0,
+                turns: watch::channel((0, Arc::new(Vec::new()))).0,
+                turn_refresh,
+                refreshing: AtomicBool::new(false),
+                turn_queries: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// How many times the running turns were read.
+    #[cfg(test)]
+    pub(crate) fn turn_queries(&self) -> usize {
+        self.shared.turn_queries.load(Ordering::Acquire)
+    }
+
+    /// Starts the one task that refreshes the running turns for every subscriber, unless it
+    /// runs. It stops once no subscriber is left after a refresh.
+    fn ensure_turn_refresh(&self) {
+        if self
+            .shared
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let activity = self.clone();
+        tokio::spawn(async move {
+            let mut version = activity.shared.turns.borrow().0;
+            loop {
+                let turns = activity.running_turns().await;
+                version += 1;
+                activity
+                    .shared
+                    .turns
+                    .send_replace((version, Arc::new(turns)));
+                tokio::time::sleep(activity.shared.turn_refresh).await;
+                if activity.shared.turns.receiver_count() == 0 {
+                    activity.shared.refreshing.store(false, Ordering::Release);
+                    // A subscriber that arrived meanwhile restarts it unless it already did.
+                    if activity.shared.turns.receiver_count() == 0
+                        || activity
+                            .shared
+                            .refreshing
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Prunes rows past the 7-day retention: the server's own maintenance, run
+    /// at startup (and the write path prunes after each insert). Readers only filter.
+    pub(crate) async fn prune_expired(&self) {
+        let cutoff = retention_cutoff();
+        if let Err(error) = self
+            .shared
+            .database
+            .call(move |connection| {
+                connection.execute("DELETE FROM mcp_activity WHERE occurred_at < ?", [&cutoff])?;
+                Ok(())
+            })
+            .await
+        {
+            tracing::warn!(%error, "MCP activity could not prune old rows");
+        }
+    }
+
+    fn update(&self, session_id: &str, change: impl FnOnce(&mut Presence)) {
+        {
+            let mut presence = self
+                .shared
+                .presence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            change(presence.entry(session_id.to_owned()).or_default());
+        }
+        self.shared
+            .presence_changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// Marks a call of `session_id` in flight until the guard drops.
+    pub(crate) fn call_started(&self, session_id: &str, label: Option<String>) -> CallPresence {
+        self.update(session_id, |presence| {
+            presence.calls += 1;
+            presence.label = label;
+            presence.last_call = Some((Instant::now(), now_iso()));
+        });
+        CallPresence {
+            activity: self.clone(),
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    /// An owned mutation of `session_id` started (`true`) or settled (`false`).
+    pub(crate) fn owned_changed(&self, session_id: &str, started: bool) {
+        self.update(session_id, |presence| {
+            if started {
+                presence.owned += 1;
+            } else {
+                presence.owned = presence.owned.saturating_sub(1);
+            }
+        });
+    }
+
+    /// Each client with a call in flight or in the last 2 minutes, or an owned mutation
+    /// running, most recent first.
+    #[must_use]
+    pub(crate) fn active(&self) -> Vec<Value> {
+        let now = Instant::now();
+        let mut presence = self
+            .shared
+            .presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let busy = |entry: &Presence| entry.calls > 0 || entry.owned > 0;
+        let recent = |entry: &Presence| {
+            entry
+                .last_call
+                .as_ref()
+                .is_some_and(|(at, _)| now.duration_since(*at) < ACTIVE_WINDOW)
+        };
+        presence.retain(|_, entry| busy(entry) || recent(entry));
+        let mut active: Vec<(&String, &Presence)> = presence.iter().collect();
+        active.sort_by(|left, right| {
+            let at = |entry: &Presence| entry.last_call.as_ref().map(|(at, _)| *at);
+            at(right.1).cmp(&at(left.1))
+        });
+        active
+            .into_iter()
+            .map(|(session_id, entry)| {
+                json!({
+                    "clientId": session_id,
+                    "label": entry.label,
+                    "lastCallAt": entry.last_call.as_ref().map(|(_, at)| at),
+                    "running": busy(entry),
+                })
+            })
+            .collect()
+    }
+
+    /// Writes one row and sends it to every stream. A failure is logged, never returned: the
+    /// call it describes already happened.
+    pub(crate) async fn record(&self, row: NewActivity) {
+        let occurred_at = now_iso();
+        let target = row.target.to_string();
+        let NewActivity {
+            session_id,
+            label,
+            tool,
+            thread_id,
+            outcome,
+            target: target_value,
+        } = row;
+        let cutoff = retention_cutoff();
+        let inserted = {
+            let (session_id, label, tool, thread_id, outcome, occurred_at) = (
+                session_id.clone(),
+                label.clone(),
+                tool.clone(),
+                thread_id.clone(),
+                outcome.clone(),
+                occurred_at.clone(),
+            );
+            self.shared
+                .database
+                .call(move |connection| {
+                    let transaction = connection.transaction()?;
+                    transaction.execute(
+                        "INSERT INTO mcp_activity (occurred_at, session_id, label, tool, thread_id, outcome, target_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        params![occurred_at, session_id, label, tool, thread_id, outcome, target],
+                    )?;
+                    let id = transaction.last_insert_rowid();
+                    transaction.execute(
+                        "DELETE FROM mcp_activity WHERE occurred_at < ? OR activity_id <= ? - ?",
+                        params![cutoff, id, KEPT_ROWS],
+                    )?;
+                    transaction.commit()?;
+                    Ok(id)
+                })
+                .await
+        };
+        match inserted {
+            Ok(id) => {
+                let _ = self.shared.rows.send(json!({
+                    "id": id,
+                    "occurredAt": occurred_at,
+                    "clientId": session_id,
+                    "label": label,
+                    "tool": tool,
+                    "threadId": thread_id,
+                    "outcome": outcome,
+                    "target": target_value,
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(%error, tool, "MCP activity could not be recorded");
+            }
+        }
+    }
+
+    /// The newest rows of the last 7 days, newest first. It only reads: older rows are left to
+    /// the write path and to [`Self::prune_expired`], and are never returned.
+    pub(crate) async fn recent(&self) -> crate::persistence::Result<Vec<Value>> {
+        let cutoff = retention_cutoff();
+        self.shared
+            .database
+            .call(move |connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT activity_id, occurred_at, session_id, label, tool, thread_id, outcome, target_json FROM mcp_activity WHERE occurred_at >= ? ORDER BY activity_id DESC LIMIT ?",
+                )?;
+                let rows = statement
+                    .query_map(params![cutoff, RECENT_ROWS], |row| {
+                        let target: String = row.get(7)?;
+                        Ok(json!({
+                            "id": row.get::<_, i64>(0)?,
+                            "occurredAt": row.get::<_, String>(1)?,
+                            "clientId": row.get::<_, String>(2)?,
+                            "label": row.get::<_, Option<String>>(3)?,
+                            "tool": row.get::<_, String>(4)?,
+                            "threadId": row.get::<_, Option<String>>(5)?,
+                            "outcome": row.get::<_, String>(6)?,
+                            "target": serde_json::from_str::<Value>(&target).unwrap_or_else(|_| json!({})),
+                        }))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// [`Self::active`] plus each agent with a running turn attributed to it, with its count
+    /// as `runningTurns`.
+    #[cfg(test)]
+    pub(crate) async fn active_now(&self) -> Vec<Value> {
+        merge_active(self.active(), &self.running_turns().await)
+    }
+
+    /// The running turns attributed to outside agents; none when the store cannot be read.
+    async fn running_turns(&self) -> Vec<RunningTurn> {
+        self.shared.turn_queries.fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .database
+            .call(|connection| attributed_running_turns(connection, None))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "MCP activity could not read agents' running turns");
+                Vec::new()
+            })
+    }
+
+    fn snapshot_value(&self, rows: Vec<Value>, active: Vec<Value>) -> Value {
+        json!({ "type": "snapshot", "rows": rows, "active": active })
+    }
+}
+
+/// Registers `subscribeMcpActivity` (`access:read`): a snapshot of the last 200 rows and the
+/// active clients, then each new row and each change of who is active.
+pub(crate) fn register_mcp_activity_rpc(registry: &mut RpcRegistry, activity: McpActivity) {
+    registry.register_stream("subscribeMcpActivity", move |_request, cancellation| {
+        activity_stream(activity.clone(), cancellation)
+    });
+}
+
+fn activity_stream(
+    activity: McpActivity,
+    cancellation: CancellationToken,
+) -> mpsc::Receiver<RpcStreamChunk> {
+    let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+    tokio::spawn(async move {
+        let send = |value: Value| {
+            let sender = sender.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::select! {
+                    () = cancellation.cancelled() => false,
+                    sent = sender.send(Ok(vec![value])) => sent.is_ok(),
+                }
+            }
+        };
+        let mut rows = activity.shared.rows.subscribe();
+        let mut presence = activity.shared.presence_changed.subscribe();
+        let snapshot = match activity.recent().await {
+            Ok(recent) => recent,
+            Err(error) => {
+                tracing::warn!(%error, "MCP activity could not be read");
+                let _ = sender
+                    .send(Err(json!({
+                        "_tag": "McpActivityError",
+                        "message": "BiBCode could not read the agent activity; try again.",
+                    })))
+                    .await;
+                return;
+            }
+        };
+        // One shared task reads the running turns for every subscriber, every 15 s; each of
+        // its refreshes is also this stream's re-check of who is still active. A presence
+        // change reuses the last refresh, so neither calls nor subscribers add store reads.
+        let mut shared_turns = activity.shared.turns.subscribe();
+        activity.ensure_turn_refresh();
+        let first = match shared_turns.wait_for(|(version, _)| *version > 0).await {
+            Ok(first) => Some(Arc::clone(&first.1)),
+            Err(_) => None,
+        };
+        let Some(mut turns) = first else {
+            return;
+        };
+        let mut active = merge_active(activity.active(), &turns);
+        if !send(activity.snapshot_value(snapshot, active.clone())).await {
+            return;
+        }
+        loop {
+            let next = tokio::select! {
+                () = cancellation.cancelled() => break,
+                row = rows.recv() => match row {
+                    Ok(row) => json!({ "type": "row", "row": row }),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(recent) = activity.recent().await else { break };
+                        active = merge_active(activity.active(), &turns);
+                        activity.snapshot_value(recent, active.clone())
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                changed = presence.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let now = merge_active(activity.active(), &turns);
+                    if now == active {
+                        continue;
+                    }
+                    active = now;
+                    json!({ "type": "active", "active": active })
+                }
+                changed = shared_turns.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    turns = Arc::clone(&shared_turns.borrow_and_update().1);
+                    let now = merge_active(activity.active(), &turns);
+                    if now == active {
+                        continue;
+                    }
+                    active = now;
+                    json!({ "type": "active", "active": active })
+                }
+            };
+            if !send(next).await {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+/// Whether a keyed call is a retry: its `clientRequestId` already has a live row, so the work
+/// ran (or runs) under the first call, which has its own row.
+pub(crate) async fn is_retry(
+    control: &McpControl,
+    session_id: &str,
+    arguments: &Map<String, Value>,
+) -> bool {
+    let Some(client_request_id) = arguments
+        .get("clientRequestId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    let session_id = session_id.to_owned();
+    let cutoff = (time::OffsetDateTime::now_utc()
+        - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap_or_default();
+    control
+        .repositories()
+        .database()
+        .call(move |connection| {
+            // The `bibcode thread` CLI's requests share one scope (see `stored_request`).
+            Ok(connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM mcp_tool_requests WHERE client_request_id = ?2 AND created_at >= ?4 AND session_id = COALESCE((SELECT CASE WHEN client_label = ?3 THEN ?3 ELSE session_id END FROM auth_sessions WHERE session_id = ?1), ?1))",
+                params![session_id, client_request_id, super::thread_cli::LABEL, cutoff],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "MCP activity could not check for a retry");
+            false
+        })
+}
+
+/// Records the row of a mutating call that ran work. A keyed call cancelled while its owned
+/// mutation goes on is recorded once that work's outcome is written.
+pub(crate) async fn settle(
+    control: &McpControl,
+    session_id: &str,
+    label: Option<String>,
+    spec: &ToolSpec,
+    arguments: &Map<String, Value>,
+    result: &Value,
+) {
+    let activity = control.activity().clone();
+    let tool = spec.name.to_owned();
+    let keyed = arguments
+        .get("clientRequestId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let (Some(client_request_id), "McpCancelledError") = (keyed, outcome_of(result).as_str()) {
+        let database = control.repositories().database().clone();
+        let session_id = session_id.to_owned();
+        let arguments = arguments.clone();
+        let shutdown = control.shutdown_token();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + OUTCOME_WAIT;
+            while Instant::now() < deadline {
+                let (id, scope) = (client_request_id.clone(), session_id.clone());
+                let stored = database
+                    .call(move |connection| {
+                        Ok(connection.query_row(
+                            "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = ?2 AND session_id = COALESCE((SELECT CASE WHEN client_label = ?3 THEN ?3 ELSE session_id END FROM auth_sessions WHERE session_id = ?1), ?1)",
+                            params![scope, id, super::thread_cli::LABEL],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                        )?)
+                    })
+                    .await;
+                match stored {
+                    Ok((state, Some(outcome))) if state != "running" => {
+                        let outcome = serde_json::from_str(&outcome).unwrap_or(Value::Null);
+                        activity
+                            .record(row(&session_id, label, &tool, &arguments, &outcome))
+                            .await;
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, tool, "MCP activity could not read an outcome");
+                        return;
+                    }
+                }
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(OUTCOME_POLL) => {}
+                }
+            }
+        });
+        return;
+    }
+    activity
+        .record(row(session_id, label, &tool, arguments, result))
+        .await;
+}
+
+fn row(
+    session_id: &str,
+    label: Option<String>,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    result: &Value,
+) -> NewActivity {
+    let content = &result["structuredContent"];
+    let thread_id = [arguments.get("threadId"), content.get("threadId")]
+        .into_iter()
+        .flatten()
+        .find_map(safe_id)
+        .map(str::to_owned);
+    NewActivity {
+        session_id: session_id.to_owned(),
+        label,
+        tool: tool.to_owned(),
+        thread_id,
+        outcome: outcome_of(result),
+        target: target(arguments, content),
+    }
+}
+
+/// `success`, or the typed failure's tag.
+fn outcome_of(result: &Value) -> String {
+    if result["isError"] == true {
+        result["structuredContent"]["error"]["_tag"]
+            .as_str()
+            .and_then(|tag| safe_id(&Value::from(tag)).map(str::to_owned))
+            .unwrap_or_else(|| "McpToolError".to_owned())
+    } else {
+        "success".to_owned()
+    }
+}
+
+/// What a call acted on, as ids and counts only: never a path, message, branch name or output.
+fn target(arguments: &Map<String, Value>, content: &Value) -> Value {
+    let mut target = Map::new();
+    if let Some(sha) = content.get("sha").and_then(hex_id) {
+        target.insert("sha".to_owned(), sha.into());
+    }
+    if let Some(sha) = arguments.get("sha").and_then(hex_id) {
+        target.insert("revertedSha".to_owned(), sha.into());
+    }
+    if let Some(number) = content
+        .get("number")
+        .or_else(|| arguments.get("number"))
+        .and_then(Value::as_u64)
+    {
+        target.insert("pullRequest".to_owned(), number.into());
+    }
+    for (key, name) in [
+        ("worktreeKey", "worktreeKey"),
+        ("cloneId", "cloneId"),
+        ("transferId", "transferId"),
+    ] {
+        if let Some(id) = content.get(key).and_then(safe_id) {
+            target.insert(name.to_owned(), id.into());
+        }
+    }
+    if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+        target.insert("fileCount".to_owned(), paths.len().into());
+    }
+    Value::Object(target)
+}
+
+/// An id made of letters, digits, `-`, `_`, `.` and `:` only.
+fn safe_id(value: &Value) -> Option<&str> {
+    value.as_str().filter(|id| {
+        !id.is_empty()
+            && id.len() <= MOST_ID_CHARS
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    })
+}
+
+fn hex_id(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|sha| (4..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Lets Stop interrupt the turns of the agent a person stops and wait for the outcome. The
+/// handler holds the service weakly, so it never keeps a dropped one alive; after shutdown it
+/// interrupts nothing.
+pub(crate) fn watch_stops(control: &McpControl) {
+    let inner: Weak<Inner> = Arc::downgrade(&control.inner);
+    let handler: McpStopHandler = Arc::new(move |session_id: String| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            match inner.upgrade() {
+                Some(inner) if !inner_shutdown(&inner) => {
+                    interrupt_turns_of(&McpControl { inner }, &session_id).await
+                }
+                _ => McpStopOutcome::default(),
+            }
+        })
+    });
+    control.auth().set_mcp_stop_handler(handler);
+}
+
+fn inner_shutdown(inner: &Arc<Inner>) -> bool {
+    McpControl {
+        inner: Arc::clone(inner),
+    }
+    .shutdown_token()
+    .is_cancelled()
+}
+
+/// A running turn attributed to an outside agent: its thread's latest sent user message is
+/// one the agent sent.
+pub(crate) struct RunningTurn {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) client_id: String,
+    pub(crate) label: Option<String>,
+}
+
+/// The running turns attributed to an outside agent, to `client_id`'s only when given.
+/// A running turn belongs to the actor of the command that started it: the user message the
+/// turn was started for (`pending_message_id`) carries that command's actor. A turn started by
+/// no message (a compaction) belongs to no one, whoever wrote the thread's latest message.
+/// Only running turns are read, through `idx_projection_turns_running`; `CROSS JOIN` keeps
+/// them the outer loop, so each thread and message is a primary-key lookup.
+const RUNNING_TURNS_SQL: &str = "SELECT turn.thread_id, turn.turn_id,
+       json_extract(message.actor_json, '$.clientId'), json_extract(message.actor_json, '$.label')
+  FROM projection_turns AS turn
+  CROSS JOIN projection_threads AS thread
+  CROSS JOIN projection_thread_messages AS message
+ WHERE turn.state = 'running' AND turn.turn_id IS NOT NULL
+   AND thread.thread_id = turn.thread_id AND thread.latest_turn_id = turn.turn_id
+   AND thread.deleted_at IS NULL
+   AND message.message_id = turn.pending_message_id
+   AND message.role = 'user' AND message.actor_json IS NOT NULL
+   AND (?1 IS NULL OR json_extract(message.actor_json, '$.clientId') = ?1)";
+
+fn attributed_running_turns(
+    connection: &rusqlite::Connection,
+    client_id: Option<&str>,
+) -> crate::persistence::Result<Vec<RunningTurn>> {
+    let mut statement = connection.prepare_cached(RUNNING_TURNS_SQL)?;
+    let rows = statement
+        .query_map([client_id], |row| {
+            Ok(RunningTurn {
+                thread_id: row.get(0)?,
+                turn_id: row.get(1)?,
+                client_id: row.get(2)?,
+                label: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The presence list with each agent's running attributed turns counted in: an agent with one
+/// is active (and `running`) however long ago it last called, so Stop stays in reach.
+fn merge_active(presence: Vec<Value>, turns: &[RunningTurn]) -> Vec<Value> {
+    let mut counts: Vec<(&str, Option<&str>, usize)> = Vec::new();
+    for turn in turns {
+        match counts
+            .iter_mut()
+            .find(|(client, ..)| *client == turn.client_id)
+        {
+            Some((.., count)) => *count += 1,
+            None => counts.push((&turn.client_id, turn.label.as_deref(), 1)),
+        }
+    }
+    let mut active: Vec<Value> = presence
+        .into_iter()
+        .map(|mut entry| {
+            let count = counts
+                .iter()
+                .find(|(client, ..)| entry["clientId"] == *client)
+                .map_or(0, |(.., count)| *count);
+            entry["runningTurns"] = count.into();
+            if count > 0 {
+                entry["running"] = true.into();
+            }
+            entry
+        })
+        .collect();
+    for (client, label, count) in counts {
+        if !active.iter().any(|entry| entry["clientId"] == client) {
+            active.push(json!({
+                "clientId": client,
+                "label": label,
+                "lastCallAt": null,
+                "running": true,
+                "runningTurns": count,
+            }));
+        }
+    }
+    active
+}
+
+/// Interrupts each running turn `session_id`'s agent started, and counts the turns
+/// interrupted and those whose interrupt failed. Running turns that cannot be read count as
+/// one failure, since Stop cannot say they stopped.
+pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -> McpStopOutcome {
+    let client_id = session_id.to_owned();
+    let running = control
+        .repositories()
+        .database()
+        .call(move |connection| attributed_running_turns(connection, Some(&client_id)))
+        .await;
+    let running = match running {
+        Ok(running) => running,
+        Err(error) => {
+            tracing::warn!(%error, "MCP Stop could not read the agent's running turns");
+            return McpStopOutcome {
+                interrupted: 0,
+                failed: 1,
+            };
+        }
+    };
+    let mut outcome = McpStopOutcome::default();
+    for RunningTurn {
+        thread_id, turn_id, ..
+    } in running
+    {
+        // The UI's stop button's path: the engine records it, then the provider is told. The
+        // server sends it itself, so no principal's scope applies.
+        let command = json!({
+            "type": "thread.turn.interrupt",
+            "commandId": format!("server:mcp-stop:{}", uuid::Uuid::new_v4()),
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "createdAt": now_iso(),
+        });
+        match control
+            .registry()
+            .invoke_local(
+                "orchestration.dispatchCommand",
+                command,
+                RpcSessionContext::unauthenticated(),
+                control.shutdown_token(),
+            )
+            .await
+        {
+            Ok(_) => outcome.interrupted += 1,
+            Err(error) => {
+                outcome.failed += 1;
+                let tag = error["_tag"].as_str().unwrap_or("unknown");
+                tracing::warn!(tag, "MCP Stop could not interrupt a turn");
+            }
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_target_keeps_ids_and_counts_and_never_content() {
+        let arguments = json!({
+            "threadId": "t-1",
+            "paths": ["secret/a.txt", "b.txt"],
+            "summary": "a commit message",
+            "sha": "abc123",
+            "branch": "feature/x",
+        });
+        let content =
+            json!({ "sha": "deadbeef", "number": 7, "worktreeKey": "wk-1", "message": "output" });
+        let kept = target(arguments.as_object().unwrap(), &content);
+        assert_eq!(
+            kept,
+            json!({ "sha": "deadbeef", "revertedSha": "abc123", "pullRequest": 7, "worktreeKey": "wk-1", "fileCount": 2 })
+        );
+        let text = kept.to_string();
+        for leaked in ["secret", "commit message", "feature/x", "output"] {
+            assert!(!text.contains(leaked), "{leaked}");
+        }
+        // A value that is not an id is dropped.
+        let odd = target(
+            &Map::new(),
+            &json!({ "sha": "not hex", "worktreeKey": "../etc" }),
+        );
+        assert_eq!(odd, json!({}));
+    }
+
+    #[test]
+    fn a_failure_records_its_tag() {
+        let failure = super::super::protocol::typed_tool_failure("McpBusyError", "busy");
+        assert_eq!(outcome_of(&failure), "McpBusyError");
+        assert_eq!(outcome_of(&json!({ "structuredContent": {} })), "success");
+    }
+
+    async fn migrated() -> Database {
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        database
+    }
+
+    fn new_row(tool: &str) -> NewActivity {
+        NewActivity {
+            session_id: "s-1".to_owned(),
+            label: Some("Claude Code".to_owned()),
+            tool: tool.to_owned(),
+            thread_id: Some("t-1".to_owned()),
+            outcome: "success".to_owned(),
+            target: json!({ "sha": "abc123" }),
+        }
+    }
+
+    async fn next(receiver: &mut mpsc::Receiver<RpcStreamChunk>) -> Value {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("in time")
+            .expect("open")
+            .expect("ok");
+        chunk.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_stream_sends_recent_rows_then_each_new_row_and_who_is_active() {
+        let activity = McpActivity::new(migrated().await);
+        activity.record(new_row("git_commit")).await;
+        let cancellation = CancellationToken::new();
+        let mut stream = activity_stream(activity.clone(), cancellation.clone());
+        let snapshot = next(&mut stream).await;
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(snapshot["rows"][0]["tool"], "git_commit");
+        assert_eq!(snapshot["rows"][0]["target"]["sha"], "abc123");
+        assert_eq!(snapshot["active"], json!([]));
+
+        activity.record(new_row("git_push")).await;
+        let row = next(&mut stream).await;
+        assert_eq!(row["type"], "row");
+        assert_eq!(row["row"]["tool"], "git_push");
+        assert_eq!(row["row"]["label"], "Claude Code");
+
+        let _call = activity.call_started("s-1", Some("Claude Code".to_owned()));
+        let active = next(&mut stream).await;
+        assert_eq!(active["type"], "active");
+        assert_eq!(active["active"][0]["clientId"], "s-1");
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn rows_past_the_retention_count_are_pruned() {
+        let database = migrated().await;
+        let activity = McpActivity::new(database.clone());
+        database
+            .call(|connection| {
+                connection.execute_batch(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                     INSERT INTO mcp_activity (occurred_at, session_id, tool, outcome, target_json)
+                     SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 's', 'git_commit', 'success', '{}' FROM n;
+                     INSERT INTO mcp_activity (occurred_at, session_id, tool, outcome, target_json)
+                     VALUES ('2020-01-01T00:00:00Z', 's', 'old', 'success', '{}');",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        activity.record(new_row("git_push")).await;
+        let (count, old) = database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*), SUM(tool = 'old') FROM mcp_activity",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(count <= KEPT_ROWS, "{count}");
+        assert_eq!(old, 0, "a row older than 7 days is pruned");
+        assert_eq!(activity.recent().await.unwrap().len(), 200);
+    }
+
+    async fn old_rows(database: &Database) -> i64 {
+        database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_activity WHERE tool = 'old'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Review rounds 2 and 3: retention holds while no row is written, a read-scoped
+    /// subscriber never writes, and the server's own maintenance prunes.
+    #[tokio::test]
+    async fn rows_past_seven_days_are_hidden_from_readers_who_never_delete_them() {
+        let database = migrated().await;
+        let activity = McpActivity::new(database.clone());
+        activity.record(new_row("git_commit")).await;
+        database
+            .call(|connection| {
+                connection.execute(
+                    "INSERT INTO mcp_activity (occurred_at, session_id, tool, outcome, target_json) VALUES ('2020-01-01T00:00:00Z', 's', 'old', 'success', '{}')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let changes_before = total_changes(&database).await;
+        let recent = activity.recent().await.unwrap();
+        assert_eq!(recent.len(), 1, "{recent:?}");
+        assert_eq!(recent[0]["tool"], "git_commit");
+        let cancellation = CancellationToken::new();
+        let mut stream = activity_stream(activity.clone(), cancellation.clone());
+        let snapshot = next(&mut stream).await;
+        assert_eq!(snapshot["rows"].as_array().unwrap().len(), 1);
+        cancellation.cancel();
+        assert_eq!(old_rows(&database).await, 1, "a reader deletes nothing");
+        assert_eq!(
+            total_changes(&database).await,
+            changes_before,
+            "nor writes anything"
+        );
+
+        // Startup maintenance (the server's, not a reader's) prunes it.
+        activity.prune_expired().await;
+        assert_eq!(old_rows(&database).await, 0);
+    }
+
+    async fn total_changes(database: &Database) -> i64 {
+        database
+            .call(|connection| {
+                Ok(connection.query_row("SELECT total_changes()", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Review round 3: the running-turn lookup reads running turns through their index.
+    #[tokio::test]
+    async fn the_running_turn_lookup_uses_the_running_state_index() {
+        let plan = migrated()
+            .await
+            .call(|connection| {
+                let mut statement =
+                    connection.prepare(&format!("EXPLAIN QUERY PLAN {RUNNING_TURNS_SQL}"))?;
+                let details = statement
+                    .query_map([Option::<String>::None], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(details)
+            })
+            .await
+            .unwrap();
+        // The partial index holds running turns only, so walking it reads those and nothing
+        // else; every other table is a primary-key lookup.
+        assert_eq!(
+            plan.first().map(String::as_str),
+            Some("SCAN turn USING INDEX idx_projection_turns_running"),
+            "{plan:?}"
+        );
+        assert!(
+            plan[1..].iter().all(|detail| detail.starts_with("SEARCH")),
+            "{plan:?}"
+        );
+    }
+
+    /// Review round 3: one shared refresh of the running turns, however many subscribers.
+    #[tokio::test]
+    async fn subscribers_share_one_running_turn_query_per_tick() {
+        let activity = McpActivity::with_turn_refresh(migrated().await, Duration::from_millis(100));
+        assert_eq!(
+            activity.turn_queries(),
+            0,
+            "nothing runs without a subscriber"
+        );
+        let cancellation = CancellationToken::new();
+        let mut streams: Vec<_> = (0..5)
+            .map(|_| activity_stream(activity.clone(), cancellation.clone()))
+            .collect();
+        for stream in &mut streams {
+            assert_eq!(next(stream).await["type"], "snapshot");
+        }
+        let started = activity.turn_queries();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let ticks = activity.turn_queries() - started;
+        assert!(
+            (3..=7).contains(&ticks),
+            "five subscribers, about five ticks, one query each: {ticks}"
+        );
+        cancellation.cancel();
+        drop(streams);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopped = activity.turn_queries();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            activity.turn_queries(),
+            stopped,
+            "the refresh stops with its subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_active_list_holds_calls_in_flight_and_owned_work() {
+        let database = Database::open_in_memory().await.unwrap();
+        let activity = McpActivity::new(database);
+        assert!(activity.active().is_empty());
+        let call = activity.call_started("s-1", Some("Claude Code".to_owned()));
+        let active = activity.active();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["clientId"], "s-1");
+        assert_eq!(active[0]["label"], "Claude Code");
+        assert_eq!(active[0]["running"], true);
+        drop(call);
+        // Still active for two minutes after its last call.
+        assert_eq!(activity.active()[0]["running"], false);
+        activity.owned_changed("s-1", true);
+        assert_eq!(activity.active()[0]["running"], true);
+        activity.owned_changed("s-1", false);
+        assert_eq!(activity.active()[0]["running"], false);
+    }
+}

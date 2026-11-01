@@ -128,6 +128,9 @@ describe("auth HTTP fixture exporter", () => {
       "revokePairingLink",
       "clients",
       "revokeClient",
+      "setMcpAccess",
+      "approveMcpAuthorization",
+      "denyMcpAuthorization",
       "revokeOtherClients",
     ]);
     expect(manifest.errors).toHaveLength(5);
@@ -138,9 +141,9 @@ describe("auth HTTP fixture exporter", () => {
       "errors/operation-forbidden.json",
       "errors/internal.json",
     ]);
-    expect(manifest.fixtures).toHaveLength(26);
+    expect(manifest.fixtures).toHaveLength(32);
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(29);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(34);
 
     for (const route of manifest.routes) {
       const payloadKeys = route.payloads.map(

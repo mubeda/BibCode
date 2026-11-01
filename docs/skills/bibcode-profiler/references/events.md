@@ -64,6 +64,18 @@ alone repeats across restarts. `profiler symbolicate` names a panic event as
 `profiler events` lists matches in file order, oldest first, keeping the newest
 `--limit`.
 
+An outside agent's `profiler_events` and `profiler_crash` on BiBCode's own
+`/mcp` return each event with these envelope fields and only the payload fields
+its kind lists below; an event of an unlisted kind keeps its envelope only.
+A `clientId`, and the id in a `client:<clientId>` source, becomes an opaque
+`h` and 12 hex characters of HMAC-SHA-256 under a secret the server draws at
+start, matching across events and findings until the server restarts;
+`correlationId` and `appVersion`, which the client chooses, are left out; a
+client batch's `capabilities` keep the known values; a panic's `location` and
+each frame's `module` keep a relative path or the file name; and a panic's
+`message` is left out, since it can still name a file. Adding a kind or a field here means
+adding it to `event_fields` in `apps/server/src/mcp/tools/diagnostics.rs` too.
+
 ## Events
 
 ### session.start
@@ -116,7 +128,9 @@ Follow one process across restarts by `kind` and `label`; its `pid` changes.
 A request the server handled that crossed a latency tier. Requests under every
 tier write nothing.
 
-- `method`;
+- `method`: an RPC method, or `mcp.<tool>` for a `/mcp` tool call (an outside
+  agent's tool such as `mcp.wait_for_thread` or `mcp.profiler_findings`, or a
+  provider's `mcp.preview_*` and `mcp.device_*`);
 - `outcome`: `success`, `failure`, or `first-item` for a stream timed to its
   first item;
 - `ms`: handler time;
@@ -371,7 +385,9 @@ Push, and the pull or merge request actions) that started. The stream reports a
 failure inside a successful stream, so `rpc.histogram` shows only its
 `first-item` (#158).
 
-- `action`: `commit`, `push`, `create_pr`, `commit_push` or `commit_push_pr`;
+- `action`: `commit`, `push`, `create_pr`, `commit_push` or `commit_push_pr`, or
+  `unknown` for any other action a client sent (refused as `rejected`). Builds
+  through v0.13.0 recorded that client text itself;
 - `featureBranch`: the action first created a feature branch;
 - `ok`;
 - `phase`: the step that failed, `branch`, `commit`, `push` or `pr`, or `null`

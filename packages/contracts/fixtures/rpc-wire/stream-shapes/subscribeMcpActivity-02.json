@@ -1,0 +1,81 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "type": "active",
+      "active": [
+        {
+          "clientId": "�",
+          "label": null,
+          "lastCallAt": "😀",
+          "running": false,
+          "runningTurns": 76
+        },
+        {
+          "clientId": "=",
+          "label": "kMN8UeV|rg",
+          "lastCallAt": null,
+          "running": true,
+          "runningTurns": 4
+        },
+        {
+          "clientId": "�",
+          "label": null,
+          "lastCallAt": null,
+          "running": true,
+          "runningTurns": 80
+        },
+        {
+          "clientId": "(.0s9):0#/",
+          "label": null,
+          "lastCallAt": null,
+          "running": false,
+          "runningTurns": 53
+        },
+        {
+          "clientId": "prototype",
+          "label": "&:U]?./NCO",
+          "lastCallAt": null,
+          "running": true,
+          "runningTurns": 0
+        },
+        {
+          "clientId": "toString",
+          "label": "toString",
+          "lastCallAt": null,
+          "running": false,
+          "runningTurns": 46
+        },
+        {
+          "clientId": "nh!82a\\M:`",
+          "label": "",
+          "lastCallAt": null,
+          "running": false,
+          "runningTurns": 32
+        },
+        {
+          "clientId": "|8:>*",
+          "label": "_O<:m",
+          "lastCallAt": null,
+          "running": true,
+          "runningTurns": 17
+        },
+        {
+          "clientId": "rJZ(_Q#=cd",
+          "label": "�",
+          "lastCallAt": null,
+          "running": true,
+          "runningTurns": 5
+        },
+        {
+          "clientId": "�",
+          "label": "HB>N)6NN",
+          "lastCallAt": null,
+          "running": false,
+          "runningTurns": 97
+        }
+      ]
+    }
+  ]
+}

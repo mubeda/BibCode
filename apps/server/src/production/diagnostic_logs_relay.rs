@@ -75,7 +75,7 @@ pub const MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// Whether a request header is one a local reverse proxy (Tailscale Serve, a forwarding
 /// proxy) adds: a request carrying one came from elsewhere even though its socket peer is
 /// loopback. `name` is lowercase, as `HeaderName` stores it.
-fn is_forwarding_header(name: &str) -> bool {
+pub(crate) fn is_forwarding_header(name: &str) -> bool {
     name == "forwarded"
         || name == "x-real-ip"
         || name.starts_with("x-forwarded-")

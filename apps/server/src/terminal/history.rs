@@ -21,6 +21,56 @@ pub(crate) struct TerminalHistory {
     line_limit: usize,
     total_bytes: usize,
     byte_limit: usize,
+    /// Every byte ever pushed, eviction and clearing included: the end offset of the output,
+    /// which a reader's cursor counts in.
+    total_bytes_written: u64,
+    /// Unique to this history in the process: a restarted or reopened terminal gets a new
+    /// history whose offsets start again at 0, so a cursor names its history too.
+    epoch: u64,
+}
+
+/// Hands out history epochs. It starts at a random value, so another server lifetime (a
+/// restart, which reopens terminal ids) never hands out the epochs of this one.
+static NEXT_EPOCH: std::sync::LazyLock<std::sync::atomic::AtomicU64> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicU64::new(uuid::Uuid::new_v4().as_u64_pair().0)
+    });
+
+/// A position in one history's output: its epoch and a byte offset into everything it was
+/// ever given. Written `<epoch>:<offset>`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryCursor {
+    pub(crate) epoch: u64,
+    pub(crate) offset: u64,
+}
+
+impl HistoryCursor {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let (epoch, offset) = text.split_once(':')?;
+        Some(Self {
+            epoch: epoch.parse().ok()?,
+            offset: offset.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for HistoryCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.epoch, self.offset)
+    }
+}
+
+/// A run of retained output between two byte offsets of everything ever written.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HistoryWindow {
+    pub(crate) text: String,
+    /// The history the offsets count in.
+    pub(crate) epoch: u64,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    /// The requested offset is no longer retained (evicted, cleared, or from another
+    /// history), so the window starts at the oldest retained byte instead.
+    pub(crate) dropped: bool,
 }
 
 #[derive(Debug)]
@@ -101,6 +151,17 @@ impl TerminalHistory {
             line_limit,
             total_bytes: 0,
             byte_limit,
+            total_bytes_written: 0,
+            epoch: NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// The cursor at `offset` of this history.
+    #[cfg(test)]
+    pub(crate) fn at(&self, offset: u64) -> HistoryCursor {
+        HistoryCursor {
+            epoch: self.epoch,
+            offset,
         }
     }
 
@@ -108,7 +169,94 @@ impl TerminalHistory {
         self.line_limit
     }
 
+    pub(crate) fn total_bytes_written(&self) -> u64 {
+        self.total_bytes_written
+    }
+
+    /// The offset of the oldest retained byte.
+    fn oldest(&self) -> u64 {
+        self.total_bytes_written - self.total_bytes as u64
+    }
+
+    /// At most `max_chars` characters of retained output from `cursor`. A cursor of another
+    /// history, or an offset no longer retained or past the end, starts at the oldest retained
+    /// byte and reports `dropped`; one inside a character starts at the next character.
+    pub(crate) fn read_window(&self, cursor: HistoryCursor, max_chars: usize) -> HistoryWindow {
+        let from = cursor.offset;
+        let oldest = self.oldest();
+        let dropped =
+            cursor.epoch != self.epoch || from < oldest || from > self.total_bytes_written;
+        let mut skip = if dropped {
+            0
+        } else {
+            usize::try_from(from - oldest).unwrap_or(usize::MAX)
+        };
+        let mut start = if dropped { oldest } else { from };
+        let mut text = String::new();
+        let mut remaining = max_chars;
+        for chunk in &self.chunks {
+            let retained = chunk.retained();
+            if skip >= retained.len() {
+                skip -= retained.len();
+                continue;
+            }
+            let mut offset = skip;
+            while !retained.is_char_boundary(offset) {
+                offset += 1;
+            }
+            start += (offset - skip) as u64;
+            skip = 0;
+            let piece = &retained[offset..];
+            let taken = piece
+                .char_indices()
+                .nth(remaining)
+                .map_or(piece.len(), |(index, _)| index);
+            text.push_str(&piece[..taken]);
+            remaining -= piece[..taken].chars().count();
+            if remaining == 0 {
+                break;
+            }
+        }
+        let end = start + text.len() as u64;
+        HistoryWindow {
+            text,
+            epoch: self.epoch,
+            start,
+            end,
+            dropped,
+        }
+    }
+
+    /// The last `max_chars` characters of retained output, ending at the total.
+    pub(crate) fn tail(&self, max_chars: usize) -> HistoryWindow {
+        let mut pieces = Vec::new();
+        let mut remaining = max_chars;
+        for chunk in self.chunks.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let retained = chunk.retained();
+            let cut = retained
+                .char_indices()
+                .rev()
+                .nth(remaining.saturating_sub(1))
+                .map_or(0, |(index, _)| index);
+            let piece = &retained[cut..];
+            remaining -= piece.chars().count().min(remaining);
+            pieces.push(piece);
+        }
+        let text: String = pieces.into_iter().rev().collect();
+        HistoryWindow {
+            epoch: self.epoch,
+            start: self.total_bytes_written - text.len() as u64,
+            end: self.total_bytes_written,
+            text,
+            dropped: false,
+        }
+    }
+
     pub(crate) fn push(&mut self, data: &str) {
+        self.total_bytes_written += data.len() as u64;
         if self.line_limit == 0 || self.byte_limit == 0 {
             self.clear();
             return;
@@ -232,7 +380,7 @@ fn byte_index_after_nth_newline(data: &str, count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalHistory;
+    use super::{HistoryCursor, TerminalHistory};
 
     fn legacy_push(history: &mut String, data: &str, line_limit: usize) {
         history.push_str(data);
@@ -480,5 +628,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_window_reads_forward_from_a_cursor_and_counts_every_byte_written() {
+        let mut history = TerminalHistory::new(100);
+        history.push("one\n");
+        history.push("twö\n");
+        assert_eq!(history.total_bytes_written(), 9);
+        let all = history.read_window(history.at(0), 100);
+        assert_eq!(
+            (all.text.as_str(), all.start, all.end),
+            ("one\ntwö\n", 0, 9)
+        );
+        assert!(!all.dropped);
+        let rest = history.read_window(history.at(4), 100);
+        assert_eq!((rest.text.as_str(), rest.start, rest.end), ("twö\n", 4, 9));
+        // At most `max_chars` characters, ending on a character boundary.
+        let page = history.read_window(history.at(4), 3);
+        assert_eq!((page.text.as_str(), page.end), ("twö", 8));
+        // Nothing new past the end.
+        let caught_up = history.read_window(history.at(9), 100);
+        assert_eq!(
+            (caught_up.text.as_str(), caught_up.start, caught_up.end),
+            ("", 9, 9)
+        );
+        // A cursor inside a character starts at the next one.
+        let inside = history.read_window(history.at(7), 100);
+        assert_eq!((inside.text.as_str(), inside.start), ("\n", 8));
+    }
+
+    #[test]
+    fn an_evicted_cursor_reports_dropped_and_starts_at_the_oldest_retained_byte() {
+        let mut history = TerminalHistory::new(5_000);
+        history.push("first\n");
+        let cursor = history.total_bytes_written();
+        let block = "x".repeat(64 * 1024);
+        for _ in 0..17 {
+            history.push(&block);
+        }
+        assert!(history.total_bytes_written() > 1_048_576 + cursor);
+        let window = history.read_window(history.at(cursor), 10);
+        assert!(window.dropped);
+        let oldest = history.total_bytes_written() - history.snapshot().len() as u64;
+        assert_eq!(window.start, oldest);
+        assert_eq!(window.text, "x".repeat(10));
+        // Clearing keeps the count, so an old cursor is dropped, never reused.
+        history.clear();
+        let after = history.total_bytes_written();
+        let cleared = history.read_window(history.at(cursor), 10);
+        assert!(cleared.dropped);
+        assert_eq!(
+            (cleared.start, cleared.end, cleared.text.as_str()),
+            (after, after, "")
+        );
+        history.push("new");
+        assert_eq!(history.read_window(history.at(after), 10).text, "new");
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_is_dropped_and_starts_at_the_oldest_byte() {
+        let mut history = TerminalHistory::new(100);
+        history.push("fresh");
+        let window = history.read_window(history.at(1_000), 100);
+        assert!(window.dropped);
+        assert_eq!((window.start, window.text.as_str()), (0, "fresh"));
+    }
+
+    /// Two server lifetimes never hand out the same epoch, so a cursor kept across a restart
+    /// cannot match a reopened terminal's history (#139 slice T review, round 3). Each phase
+    /// runs in a process of its own and writes its first epoch to a file.
+    #[test]
+    fn epochs_differ_across_server_lifetimes() {
+        const NAME: &str = "terminal::history::tests::epochs_differ_across_server_lifetimes";
+        const FILE: &str = "BIBCODE_TEST_EPOCH_FILE";
+        for phase in ["first", "second"] {
+            if let Some(child) = crate::test_support::reexec::enter(NAME, phase) {
+                let epoch = TerminalHistory::new(1).at(0).epoch;
+                std::fs::write(std::env::var(FILE).expect("epoch file"), epoch.to_string())
+                    .expect("epoch written");
+                child.complete();
+                return;
+            }
+        }
+        let directory = tempfile::tempdir().expect("epoch directory");
+        let epochs: Vec<String> = ["first", "second"]
+            .into_iter()
+            .map(|phase| {
+                let file = directory.path().join(phase);
+                crate::test_support::reexec::run(NAME, phase, None, |command| {
+                    command.env(FILE, &file);
+                });
+                std::fs::read_to_string(file).expect("epoch read")
+            })
+            .collect();
+        assert_ne!(epochs[0], epochs[1]);
+    }
+
+    #[test]
+    fn a_cursor_from_another_history_is_dropped_even_inside_its_range() {
+        // A restarted or reopened terminal has a new history whose offsets start again at 0,
+        // so an earlier session's cursor can land inside the new range.
+        let mut before = TerminalHistory::new(100);
+        before.push("old\n");
+        let stale = before.at(before.total_bytes_written());
+        let mut after = TerminalHistory::new(100);
+        after.push("new output\n");
+        assert_ne!(stale.epoch, after.at(0).epoch);
+        let window = after.read_window(stale, 100);
+        assert!(window.dropped);
+        assert_eq!((window.start, window.text.as_str()), (0, "new output\n"));
+        assert_eq!(window.epoch, after.at(0).epoch);
+        // A cursor round-trips through its text form.
+        let cursor = after.at(window.end);
+        assert_eq!(HistoryCursor::parse(&cursor.to_string()), Some(cursor));
+        assert_eq!(HistoryCursor::parse("12"), None);
+        assert_eq!(HistoryCursor::parse("a:1"), None);
+    }
+
+    #[test]
+    fn the_tail_is_the_last_characters_and_ends_at_the_total() {
+        let mut history = TerminalHistory::new(100);
+        history.push("abc\n");
+        history.push("déf");
+        let tail = history.tail(4);
+        assert_eq!((tail.text.as_str(), tail.start, tail.end), ("\ndéf", 3, 8));
+        assert!(!tail.dropped);
+        assert_eq!(tail.epoch, history.at(0).epoch);
+        let all = history.tail(100);
+        assert_eq!((all.text.as_str(), all.start), ("abc\ndéf", 0));
     }
 }

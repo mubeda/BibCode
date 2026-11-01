@@ -277,6 +277,7 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         pending_approval_count: 0,
         pending_user_input_count: 0,
         last_activity_at: None,
+        requester: None,
         has_actionable_proposed_plan: 0,
         unresolved_delivery_state: None,
         unresolved_delivery_detail: None,
@@ -335,6 +336,8 @@ fn public_repository_api_inventory_is_explicit() {
     let mut expected = vec![
         "append_event",
         "event_pages",
+        "change_feed_heads",
+        "read_change_feed",
         "auth_authority_revision",
         "can_promote_queued_provider_turn",
         "claim_provider_turn",
@@ -424,6 +427,7 @@ fn public_repository_api_inventory_is_explicit() {
         "revoke_pending_auth_sessions",
         "revoke_other_auth_sessions",
         "set_auth_session_last_connected_at",
+        "set_auth_session_mcp_access",
         "upsert_activity",
         "upsert_checkpoint",
         "upsert_checkpoint_diff_blob",
@@ -439,6 +443,17 @@ fn public_repository_api_inventory_is_explicit() {
         "upsert_turn_by_id",
         "verify_prepared_command_receipt",
         "complete_worktree_removal_receipt",
+        "register_mcp_oauth_client",
+        "get_mcp_oauth_client",
+        "create_mcp_oauth_authorization",
+        "get_mcp_oauth_authorization",
+        "get_mcp_oauth_authorization_by_code",
+        "list_pending_mcp_oauth_authorizations",
+        "decide_mcp_oauth_authorization",
+        "attach_mcp_oauth_code",
+        "exchange_mcp_oauth_code",
+        "revoke_replayed_mcp_oauth_code",
+        "rotate_mcp_oauth_refresh_token",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1235,6 +1250,8 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
         delivery_mode: None,
         delivery_held: None,
         resend_of_message_id: None,
+        actor: None,
+        source_thread_id: None,
         message_id: "message-a".to_owned(),
         thread_id: "thread-conversation".to_owned(),
         turn_id: Some("turn-a".to_owned()),
@@ -1813,6 +1830,7 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
         revoked_at: None,
         reach: None,
         off_host: None,
+        mcp_access: None,
     };
     let later_pairing = AuthPairingLink {
         id: "pairing-b".to_owned(),
@@ -1979,6 +1997,7 @@ async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
         revoked_at: None,
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
+        mcp_access: None,
     };
     repositories
         .create_auth_pairing_link_with_offer(
@@ -2346,6 +2365,7 @@ fn pairing_offer_link(index: usize) -> AuthPairingLink {
         revoked_at: None,
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
+        mcp_access: None,
     }
 }
 
@@ -2367,6 +2387,7 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
             revoked_at: None,
             reach: Some("another-device".to_owned()),
             off_host: Some(true),
+            mcp_access: None,
         })
         .await
         .expect("pairing insert");
@@ -2388,6 +2409,7 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
             expires_at: FUTURE.to_owned(),
             reach: Some("this-computer".to_owned()),
             off_host: Some(false),
+            mcp_access: None,
             delivery_state: AuthSessionDeliveryState::Active,
         })
         .await
@@ -2413,6 +2435,7 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         expires_at: FUTURE.to_owned(),
         reach: None,
         off_host: None,
+        mcp_access: None,
         delivery_state: AuthSessionDeliveryState::Active,
     };
     let session_b = NewAuthSession {
@@ -2551,6 +2574,7 @@ async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() 
         expires_at: FUTURE.to_owned(),
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
+        mcp_access: None,
         delivery_state,
     };
     repositories

@@ -436,13 +436,23 @@ FUSE mount down and kill it with SIGBUS. If `systemd-run` fails, Tauri's
 in-place relaunch runs as before.
 
 The gate checks a few variables before copying the full environment. A nonempty
-`APPIMAGE` and an absolute, non-root `APPDIR` activate isolation. For an
-extracted AppDir without `APPIMAGE`, require the current executable to be under
-`APPDIR` and `$APPDIR/AppRun` to exist. This supports `squashfs-root/AppRun` on
-Ubuntu without FUSE while rejecting a stray `APPDIR` in an ordinary installation.
-Once gated, the policy inspects every variable in the effective child environment
-and removes entries rooted in `APPDIR` or absolute paths containing a stale
-`.mount_*` component. This covers launcher and plugin additions, including
+`APPIMAGE` and an absolute, non-root `APPDIR` activate isolation rooted in
+`APPDIR`; when the current executable is not under that `APPDIR` but has the
+extracted layout below, its `<root>` is a second root, because an extracted
+AppDir launched from a mounted AppImage inherits its `APPIMAGE` and `APPDIR`.
+For an extracted AppDir without `APPIMAGE`, the root comes from the
+current executable: `<root>/usr/bin/<name>` with `<root>/AppRun` present, and
+`<root>` not `/`. `APPDIR` does not choose that root, because the GTK AppRun hook
+keeps an inherited `APPDIR` while `AppRun.wrapped` builds loader paths from its
+own location (#209). When an inherited `APPDIR` names a different absolute,
+non-root directory containing `AppRun`, it is a second root: an AppDir launched
+from another extracted AppDir keeps the outer AppDir's paths after its own. This
+supports `squashfs-root/AppRun` on Ubuntu without FUSE, a preset or missing
+`APPDIR`, stacked AppDir and AppImage launches, and launchers that exec
+`usr/bin/bibcode-desktop` directly, while a stray `APPDIR` in an ordinary
+installation changes nothing. Once gated, the policy inspects every variable in
+the effective child environment and removes entries under those roots or
+absolute paths containing a stale `.mount_*` component. This covers launcher and plugin additions, including
 Python, Qt, and GStreamer settings, without a fixed path-variable list.
 
 Values are split on colons, with semicolons also accepted for `LD_LIBRARY_PATH`
@@ -1997,8 +2007,58 @@ bounded memory, and works while the server is stopped.
   one approval there, or with the app closed through a diagnostics-only
   credential of its own, `download --remote` (see
   [Observability](../operations/observability.md#from-the-command-line)).
+  Its framing (protocol eras, version checks, result shapes and the 80,000
+  character cap) lives in `mcp/protocol.rs`, which `/mcp` shares.
+  `profiler_findings` without `since` or `cursor` returns the newest findings;
+  with either it returns them oldest first by `lastSeen` and id, `since`
+  inclusive, with an opaque `nextCursor` while more remain, so a gap of any
+  size is caught up page by page. `lastSeen` is whole seconds and the book
+  keeps no position, so the cursor names the second its page ended in and marks
+  the latest count read of each finding still in that second; that second is
+  read again, which returns a finding written into it later or one that
+  recurred in it. One mark per finding bounds a cursor by the book's 1,000. A
+  page is fitted with its own cursor, dropping findings and never the cursor,
+  and a finding too large alone comes with `evidenceOmitted: true`, so every
+  page makes progress.
+- **Profiler tools on `/mcp`.** Outside agents get `profiler_status`,
+  `profiler_findings`, `profiler_events` and `profiler_crash` in the
+  Diagnostics set (`mcp/tools/diagnostics.rs`, slice X2 of #139). They run the
+  stdio handlers in process over the server's own profiler directory (the
+  installed `ProfilerHandle`'s), in `spawn_blocking`, and take no RPC
+  admission. Findings, events and crash records are projected: a finding keeps
+  its documented fields and its kind's evidence from
+  [`findings.md`](../skills/bibcode-profiler/references/findings.md), without
+  `title` or `summary`; an event keeps its envelope and the payload fields its
+  kind documents in
+  [`events.md`](../skills/bibcode-profiler/references/events.md), and an
+  undocumented kind its envelope only. A client's id becomes an HMAC-SHA-256
+  alias keyed with a random secret drawn once per server process, so it holds
+  within one run and cannot be recovered by hashing guesses; its correlation
+  id and version are left out, worktree paths outside home are left out, and
+  source locations, crash modules and frames, and frame files keep a relative
+  path or a file name.
+  `profiler_symbolicate` stays on stdio. `git.stacked-action` records only a
+  supported action name, or `unknown`, since the client chooses that text.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
+- **MCP tool calls.** Each `/mcp` tool call is timed as `mcp.<tool>` (`rpc.timing`
+  and the hang check). A tool is long-running when its `ToolSpec` says so
+  (`mcp.wait_for_thread`, every `mcp.preview_*` and `mcp.device_*` call, network
+  tools) or its RPC method is long-running (so `mcp.refresh_providers` and
+  `mcp.diagnose_environment`, through `server.refreshProviders` and
+  `server.discoverSourceControl`); a client tool and a provider tool of one
+  name are both asked. The tools' own RPC dispatches keep their RPC names' timing.
+  `/mcp` logs a failed call's tool, thread id and error type, never its arguments,
+  prompts or replies; a destructive tool also writes one content-free
+  `MCP destructive tool` line. The MCP service stops right after `begin_stopping()`,
+  ending every wait in flight and interrupting owned mutations (recorded `unknown`),
+  before the orchestration engine shuts down.
+- **Webhook dispatcher.** Outbound HTTP is not a child process. `webhooks.sendTest`
+  and `webhooks.redeliver` wait on a person's endpoint and are long-running; the
+  other `webhooks.*` methods are timed as usual. A failed delivery logs a
+  `tracing::warn!` with the endpoint id, status and error tag, never the URL. The
+  dispatcher stops right after the MCP service in the quiesce sequence, before the
+  profiler's teardown (see [Outbound webhooks](#outbound-webhooks)).
 
 ### Known limits
 
@@ -2025,8 +2085,10 @@ bounded memory, and works while the server is stopped.
   scripts.
 - The restart waiter of a Windows update treats a `bibcode-desktop.exe` with a
   window as the relaunched app, so the profiler's windowless `profiler mcp`
-  server and crash monitor do not count. The passive installer's preinstall
-  hook ends every same-user `bibcode-desktop.exe`, an MCP server included.
+  server, an outside agent's `mcp` relay, a `thread` command and the crash
+  monitor do not count. The passive installer's preinstall hook ends every
+  same-user `bibcode-desktop.exe`, both MCP servers and a running `thread`
+  included; the agent restarts its MCP server afterwards.
 
 ## Device previews
 
@@ -2550,8 +2612,10 @@ with the setting off the tools disappear from `tools/list` and a call fails
 with `DevicePreviewsDisabledError`. There is no per-call scope check, by
 invariant: a valid provider MCP credential is issued only by `provider_runtime`
 when it launches a thread's provider, so holding it is the operate grant, as
-for the `preview_*` tools. If MCP credentials are ever issued to
-lower-privileged principals, both tool families need a real scope check.
+for the `preview_*` tools. Outside agents' `mcp-client` credentials reach these
+tools only through their client twins in `mcp/tools/previews.rs`, which
+`McpControl` gates by scope, access ceiling and the Workspace set like every
+other client tool (see [Outside agents over MCP](#outside-agents-over-mcp)).
 `DeviceTools::call` receives the calling thread's `PreviewScope` and logs its
 environment, thread, and owner ids with the operation at `debug`, never the
 arguments.
@@ -2585,6 +2649,100 @@ checks each one. The iOS live path was checked on Xcode 27 with the iOS 26.5
 runtime only; the
 [iOS simulator runbook](../testing/macos-desktop.md#ios-simulator-previews)
 repeats it on each Xcode or runtime a release supports.
+
+## Outside agents over MCP
+
+`apps/server/src/mcp/` (#139) lets an AI agent BiBCode did not start operate an
+environment through the same `/mcp` endpoint providers use, with tools of its
+own. The agent-facing contract is the [MCP reference](../reference/mcp.md); the
+person's guide is [Outside agents over MCP](../user/mcp.md); the tool-to-RPC
+mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-thread-tools).
+
+- **Transport.** `bibcode mcp` (and `<desktop exe> mcp`, `ssh <host> bibcode
+  mcp`) is a stdio relay (`mcp/relay.rs`). It finds the server through the
+  endpoint record and its per-boot proof (`mcp/endpoint.rs`), mints its own
+  `mcp-client` credential in the data root's store, relays each JSON-RPC message
+  to `POST /mcp`, and revokes the credential when it exits. `bibcode thread`
+  (`mcp/thread_cli.rs`) calls the same tools from a shell. Both protocol eras
+  are served (`mcp/protocol.rs`). Remote Streamable HTTP with OAuth is slice R.
+- **Registry.** Tools are registered in families (`mcp/tools/*.rs`, listed in
+  `control::FAMILIES`). Each `ToolSpec` names its scope, RPC methods, MCP
+  annotations, capability set and timing class; `McpControl::call` checks the
+  off switch, scope, set, access ceiling and per-session limits before the
+  family runs, and every tool reaches the UI's own RPC handlers through
+  `RpcRegistry::invoke_local`, so scope checks, maintenance admission and
+  command receipts are shared.
+- **Access.** The credential's ceiling and the live `mcpServerAccess` give the
+  effective ceiling; `mcpCapabilities` turns tool sets on and off;
+  `terminal:operate` is minted only with Terminals on at Full access.
+- **Retries and live controls** (`mcp/outcome.rs`). Engine-backed tools replay
+  stored commands by receipt; Git, pull request, terminal, file and clone tools
+  run keyed work at most once as owned mutations whose outcome rows
+  (`mcp_tool_requests`) replay on retry. Owned work runs under a token that the
+  off switch, read-only, revocation and shutdown cancel, and is recorded
+  `unknown`, never success, when interrupted.
+- **Attribution.** An agent's commands stamp an `mcp-client` actor on their
+  events; each mutating call writes a content-free `mcp_activity` row
+  (`mcp/activity.rs`); Stop, Take over and Hand back act on the session.
+- **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
+  the activity log by a monotonic cursor without reading payload text; the
+  webhook dispatcher follows the same pages.
+- **Drift test.** `mcp::reference_docs` fails when a registered client tool,
+  a `feed::ERRORS` tag or a webhook event type is missing from
+  `docs/reference/`.
+
+## Outbound webhooks
+
+`apps/server/src/webhooks/` (#139 slice X8) posts signed events to the HTTPS
+endpoints a person registers per environment ([user guide](../user/webhooks.md),
+[receiver reference](../reference/webhooks.md)).
+
+- **Sources, never the broadcast.** The dispatcher reads X3's change feed through
+  `mcp::tools::feed::page_after` (the page `changes_since` returns) from a stored
+  cursor, and the profiler's findings book from the `lastSeen` second and the
+  `(id, count)` marks it last delivered. Each read's deliveries and its new position
+  are written in one SQLite transaction (migration 61: `webhook_endpoints`,
+  `webhook_deliveries`, `webhook_state`), so a restart resumes without loss or
+  repeats. The engine's in-process event broadcast, which drops under load, is not a
+  source; Authorized-clients changes only wake the dispatcher.
+- **Queue.** Delivery rows are the queue and the log: one request open per endpoint
+  (a per-endpoint lock that the dispatcher, test events and redeliveries all take),
+  oldest first, at most eight endpoints at once; retries after 30 s, 2, 5, 10 and 15
+  minutes on a timeout, connection error, unresolved host, 5xx or 429; 10 failed
+  deliveries in a row disable the endpoint; at most 10,000 pending, oldest abandoned
+  past that (`queue_full`), recorded per endpoint in `webhook_state` as numbered drop
+  batches, announced as `dropped` on its next delivery and acknowledged batch by batch
+  by a 2xx; finished rows kept 7 days, 1,000 per endpoint. A slot goes only to an
+  endpoint whose send lock is free (a test event or redelivery holding it wakes the
+  loop when done); with every slot taken the loop waits for a completion, otherwise
+  until the earliest due head of an endpoint that is free, or the poll. A new URL,
+  project or event list, and turning it off or on, bumps the endpoint's `revision`
+  and abandons its queue (`endpoint_changed`) in one transaction. Each queued row is
+  stamped with the revision it was chosen under; the enqueue drops a row whose
+  revision moved (checked in its own transaction), and the dispatcher re-reads a picked
+  row under the endpoint's lock and token and drops it when stale. A test event or
+  redelivery re-reads the endpoint after its lock and token and is refused
+  (`endpoint_changed`) when the revision moved. A change that moves the revision (and a
+  delete) cancels the endpoint's token, takes its send lock, commits and leaves a fresh
+  token, so no sender is ever between its revision read and its request when the
+  revision moves. Drop batch numbers come from a counter that is never reset. A redelivery of a queued delivery is refused.
+- **Outbound trust boundary.** HTTPS only; every resolved address must be public by
+  `git::clone_policy::is_public` (shared with agent clones); the client connects to
+  the checked addresses only (reqwest's resolve override, every other name refused),
+  ignores proxies, follows no redirects, and gives up after 10 seconds without
+  reading the body.
+- **Content.** Payloads carry ids, kinds, statuses and the feed cursor (or a
+  finding's `{ id, count, lastSeen }`); an agent is its kind and opaque client id,
+  never its label. Each body is HMAC-SHA256 signed over its timestamp with
+  the endpoint's secret, kept in the secret store as `webhook-<id>`.
+- **Controls.** `enableWebhooks` (default off) is a live setting: off cancels every
+  request in flight, abandons the queue and resets the positions to the heads.
+  Disabling an endpoint does the same for it; revoking its paired MCP client
+  (read from `auth_sessions` each pass) disables it. `profiler.finding` is queued
+  only while MCP and its Diagnostics set are on.
+- **Administration.** `webhooks.list` and `listDeliveries` need `access:read`;
+  `upsert`, `delete`, `rotateSecret`, `sendTest` and `redeliver` need
+  `access:write`, which an `mcp-client` session never holds.
 
 ## Request and event flow
 
@@ -3161,8 +3319,20 @@ view), or free scrolling.
   released row then only goes on holding the reader's place. A send names its
   row pending before the previous row stops being positioned, so a takeover
   releases the pending row first.
-- **Settling.** The glide settles on `scrollend` or after 750 ms, whichever
-  comes first. A turn taller than the view is pinned where it is and then
+- **Glide.** `ChatView` drives the sent row's glide itself: each frame it
+  measures the row on screen (or, until the row mounts, takes its position
+  from LegendList), scrolls the scroller part of the way there at once (an
+  ease with a 90 ms time constant, at least a fifth per frame), and settles
+  once the row is within 1 px or 500 ms have passed, however few frames a
+  busy webview paints; a scroll the content cannot take yet is clamped and
+  tried again the next frame. With reduced motion it lands in one step. A browser's smooth
+  scroll runs off the page's thread, where a takeover cannot stop it: WebKit
+  finished it after a scroll key, over the stop, and on macOS arm64 that also
+  cancelled the key's own scroll, while LegendList held a row's growth during
+  it as an offset that a later scroll left behind (#214). A takeover cancels the next frame, so nothing scrolls
+  the timeline after the reader's input, and a new glide withdraws what the
+  list still holds, such as an earlier row's landing.
+- **Settling.** A turn taller than the view is pinned where it is and then
   follows its end. A turn that fits lands its sent row by measuring the row
   on screen (`[data-message-id]` against the scroller's top), not from
   LegendList's positions. It stays unsettled, with following waiting, until
@@ -3171,6 +3341,30 @@ view), or free scrolling.
   layout have passed, so a landing clamped to content that had not caught up
   lands again, for up to 2 s and 20 landings. It then settles where it is. A
   turn that grows past the view meanwhile settles at once and follows its
-  end. A takeover, a later send (its glide replaces the landing)
+  end. A takeover, a later send (its glide withdraws the landing)
   or another thread (the timeline remounts, and LegendList drops its
   requests) ends the landing; only a takeover needs to withdraw it.
+- **Following without a new entry.** A follow pass runs two frames after new
+  entries render. Rows can also change with no new entry. A row of the
+  anchored turn that grows is followed when the turn's end showed before the
+  growth, so a row expanded away from the end keeps the reader's place. When
+  the latest turn settles, its "Worked for" row arrives above the answer and
+  the work and working rows below it go; those were the rows LegendList held
+  in place, so it holds none and the answer's end can drop out of view.
+  `MessagesTimeline` reports the settled turn (`onTurnSettled`) from a layout
+  effect, after LegendList has taken the new rows, and `ChatView` runs the
+  same follow pass two frames later, unless the reader has taken over.
+- **Scroll keys.** The browser scrolls for a key after the keydown, and WebKit
+  can start that scroll several hundred milliseconds later on a busy webview.
+  Any scroll the list makes in between cancels it, such as LegendList holding
+  the row below a streamed reply in place as the reply grows. For
+  `TIMELINE_NATIVE_SCROLL_PENDING_MS` (1.2 s) after a key takeover, renewed by
+  each key, `MessagesTimeline` therefore asks LegendList to keep no content
+  position (`resolveTimelineMaintainVisibleContentPosition`). A row that
+  changes size above the reading line in that window moves it. The wheel, a
+  touch and a press do not hold, nor do the composer's PageUp and PageDown,
+  the minimap and find, which scroll the list themselves. All but a press end
+  a key's hold at once, so LegendList keeps the reading line in place again
+  while the reader scrolls by other means. A press scrolls nothing, and a
+  click on the timeline's text before WebKit starts the key's scroll leaves
+  the hold on until its timer ends it.

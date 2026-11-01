@@ -24,6 +24,9 @@ export const ProjectCreateUploadUrlInput = Schema.Struct({
   // The one file the minted token authorises. The upload route takes the name from the token, so a
   // leaked URL can only write this file in this directory.
   fileName: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  // Binds whether the upload may replace an existing file into the token. Absent, the upload route
+  // decides by its `?overwrite=1`; bound to false, it refuses that flag.
+  overwrite: Schema.optional(Schema.Boolean),
 });
 export type ProjectCreateUploadUrlInput = typeof ProjectCreateUploadUrlInput.Type;
 
@@ -39,7 +42,14 @@ export class ProjectTransferError extends Schema.TaggedError<ProjectTransferErro
   {
     cwd: TrimmedNonEmptyString,
     relativePath: Schema.String,
-    failure: Schema.Literals(["not_found", "outside_root", "not_configured", "operation_failed"]),
+    // `git_metadata`: the path is, or resolves into, Git's own metadata.
+    failure: Schema.Literals([
+      "not_found",
+      "outside_root",
+      "not_configured",
+      "operation_failed",
+      "git_metadata",
+    ]),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },
