@@ -2,9 +2,9 @@ import { defineRule, type Node } from "@oxlint/plugins";
 
 const EM_DASH = "—";
 const NON_COPY_FILE =
-  /(?:\.test\.|\.spec\.|\.d\.ts$|\.gen\.|\/(?:fixtures?|__fixtures__|generated)\/)/u;
+  /(?:\.test\.|\.spec\.|\.d\.ts$|\.gen\.|\/(?:fixtures?|__fixtures__|__tests__|tests?|generated)\/)/u;
 const COPY_SCOPE = /(?:^|\/)(?:apps|packages)\/[^/]+\/src\//u;
-const EM_DASH_ENTITY = /&(?:mdash|#8212|#x2014);/iu;
+const EM_DASH_ENTITY = /&(?:mdash|#0*8212|#x0*2014);/iu;
 
 const MESSAGE =
   "Do not use an em dash in interface copy. Use a comma, colon, period, or parentheses. A lone em dash is allowed only as an empty-value placeholder.";
@@ -50,6 +50,14 @@ export default defineRule({
       Literal(node) {
         if (typeof node.value !== "string" || !node.value.includes(EM_DASH)) return;
         if (!isPlaceholder(node.value)) context.report({ node, message: MESSAGE });
+      },
+      // JSX decodes entities in attribute strings (plain JS strings do not), so check them here.
+      JSXAttribute(node) {
+        const { value } = node as unknown as { value?: { type?: string; value?: unknown } };
+        if (value?.type !== "Literal" || typeof value.value !== "string") return;
+        if (EM_DASH_ENTITY.test(value.value)) {
+          context.report({ node: value as unknown as Node, message: MESSAGE });
+        }
       },
       // JSXText nodes are not dispatched to a JSXText visitor, so read them off their parent.
       JSXElement(node) {

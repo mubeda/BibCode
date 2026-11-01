@@ -15,6 +15,9 @@ const outOfScopeRule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
 const fixtureRule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
   filename: "apps/web/src/fixtures/example.tsx",
 });
+const testDirRule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
+  filename: "apps/web/src/test/mermaidCorpus.ts",
+});
 
 const DASH = "—";
 
@@ -78,8 +81,22 @@ describe("bibcode/no-em-dash-copy", () => {
     `export const l = "a ${DASH} b";`,
   );
   fixtureRule.valid("ignores fixture directories", `export const l = "a ${DASH} b";`);
+  testDirRule.valid("ignores test directories", `export const l = "a ${DASH} b";`);
 
-  for (const entity of ["&mdash;", "&#8212;", "&#x2014;"]) {
+  rule.valid(
+    "allows entity spelling in a plain string, which renders literally",
+    `export const l = "a &mdash; b";`,
+  );
+
+  rule.invalid(
+    "reports an entity in a JSX attribute string",
+    `export const A = () => <button title="Locked &mdash; wait" />;`,
+    (output) => {
+      assert.match(output, /Do not use an em dash/);
+    },
+  );
+
+  for (const entity of ["&mdash;", "&#8212;", "&#x2014;", "&#08212;", "&#x02014;"]) {
     rule.invalid(
       `reports the ${entity} entity in JSX text`,
       `export const A = () => <span>a ${entity} b</span>;`,
