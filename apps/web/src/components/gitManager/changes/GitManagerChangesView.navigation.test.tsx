@@ -11,6 +11,8 @@ const h = vi.hoisted(() => ({
   scrollTo: vi.fn(),
   patches: {} as Record<string, string>,
   files: [] as ReadonlyArray<string>,
+  pending: new Set<string>(),
+  failing: new Set<string>(),
 }));
 
 vi.mock("../../../state/vcs", () => ({
@@ -64,6 +66,12 @@ vi.mock("../../../state/query", () => ({
         isPending: false,
         data: { conflictedPaths: [], headRef: "main", isDirty: true, localBranches: [] },
       };
+    }
+    if (atom?.kind === "diff" && h.pending.has(atom.path ?? "")) {
+      return { ...base, isPending: true, data: null };
+    }
+    if (atom?.kind === "diff" && h.failing.has(atom.path ?? "")) {
+      return { ...base, isPending: false, data: null, error: "Could not read this diff." };
     }
     if (atom?.kind === "diff") {
       const patch = h.patches[atom.path ?? ""] ?? "";
@@ -145,7 +153,20 @@ async function press(init: KeyboardEventInit) {
   });
 }
 
+const view = () => (
+  <GitManagerChangesView
+    scope={{ environmentId: "environment-1" as never, cwd: "/repo" }}
+    projectRef={projectRef}
+    refsRecovering={false}
+    repositoryUnavailable={null}
+    retrying={false}
+    onRetry={() => {}}
+  />
+);
+
 beforeEach(async () => {
+  h.pending.clear();
+  h.failing.clear();
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.scrollTo.mockClear();
   h.files = ["a.ts", "b.ts", "c.png"];
@@ -158,18 +179,7 @@ beforeEach(async () => {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  await act(async () =>
-    root.render(
-      <GitManagerChangesView
-        scope={{ environmentId: "environment-1" as never, cwd: "/repo" }}
-        projectRef={projectRef}
-        refsRecovering={false}
-        repositoryUnavailable={null}
-        retrying={false}
-        onRetry={() => {}}
-      />,
-    ),
-  );
+  await act(async () => root.render(view()));
 });
 
 afterEach(async () => {
@@ -243,6 +253,59 @@ describe("Changes diff navigation", () => {
 
     expect(selectedPath()).toBe("a.ts");
     expect(lastScroll().lineNumber).toBe(1);
+  });
+
+  it("waits for a diff that is still loading instead of passing the file over", async () => {
+    h.pending.add("a.ts");
+    await select("a.ts");
+
+    await press({ key: "F7" });
+
+    expect(selectedPath()).toBe("a.ts");
+    expect(h.scrollTo).not.toHaveBeenCalled();
+    expect(button("Next change").getAttribute("aria-disabled")).toBe("true");
+
+    h.pending.clear();
+    await act(async () => root.render(view()));
+    await press({ key: "F7" });
+
+    expect(selectedPath()).toBe("a.ts");
+    expect(lastScroll().lineNumber).toBe(1);
+  });
+
+  it("keeps keyboard focus in the diff across the file boundary", async () => {
+    await select("a.ts");
+    await act(async () => button("Next change").focus());
+    const pressFocused = () =>
+      act(async () => {
+        document.activeElement!.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "F7", bubbles: true, cancelable: true }),
+        );
+      });
+
+    await pressFocused();
+    await pressFocused();
+    await pressFocused();
+    expect(selectedPath()).toBe("b.ts");
+    expect(document.activeElement?.closest('section[aria-label="Diff for b.ts"]')).not.toBeNull();
+
+    await pressFocused();
+    expect(lastScroll().lineNumber).toBe(20);
+  });
+
+  it("stops on a file whose diff failed to load and shows the error", async () => {
+    h.failing.add("b.ts");
+    await select("a.ts");
+    await press({ key: "F7" });
+    await press({ key: "F7" });
+
+    await press({ key: "F7" });
+
+    expect(selectedPath()).toBe("b.ts");
+    expect(container.textContent).toContain("Could not read this diff.");
+    // Asking again moves on: the stop was for the error to be seen, not a dead end.
+    await press({ key: "F7" });
+    expect(selectedPath()).toBe("c.png");
   });
 
   it("leaves other keys alone", async () => {
