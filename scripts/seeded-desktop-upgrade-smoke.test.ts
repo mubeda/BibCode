@@ -927,8 +927,8 @@ describe("seeded packaging build budgets", () => {
     ["mac", "arm64", 90],
     ["linux", "x64", 45],
     ["linux", "arm64", 45],
-    ["win", "x64", 45],
-    ["win", "arm64", 45],
+    ["win", "x64", 60],
+    ["win", "arm64", 60],
   ] as const)(
     "bounds all three %s/%s packaging commands at %i minutes",
     async (platform, arch, minutes) => {

@@ -2057,7 +2057,8 @@ const buildPackagedApplication = async (input: {
     inherit: true,
     // Each seeded package has its own cold Cargo output. Intel needs more than 45 minutes, and
     // the capacity-constrained Apple silicon runners have taken 43 minutes for one build.
-    timeoutMs: (input.platform === "mac" ? 90 : 45) * 60_000,
+    // Windows x64 took 43 minutes to compile one release build, then ran out of time bundling.
+    timeoutMs: (input.platform === "mac" ? 90 : input.platform === "win" ? 60 : 45) * 60_000,
   });
 };
 
