@@ -171,8 +171,13 @@ flowchart TB
   create a fresh watcher generation. Server shutdown closes subscription and
   read admission and awaits owned setup, physical reads, and lifecycle tasks.
   A completed terminal launched as a structured BiBCode command notifies the
-  deepest active canonical worktree ancestor after terminal exit publication;
-  provider, session, and delivery events do not. Commands typed inside a
+  deepest active canonical worktree ancestor after terminal exit publication.
+  A settled provider command item (a Codex or Cursor `command_execution`, a
+  Claude `Bash` call with a result) that runs `gh pr create` or
+  `glab mr create` at command position reports a local change for the thread's
+  cwd the same way, through the orchestration engine's local-change observer;
+  only the match is used, never the command text. Other provider, session, and
+  delivery events do not notify. Commands typed inside a
   persistent interactive shell have no structured completion boundary and
   therefore converge through native watcher events or the safety read. Native
   watching covers only filesystem paths visible to the server execution host;

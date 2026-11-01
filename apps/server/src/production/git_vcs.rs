@@ -7479,6 +7479,53 @@ esac
     }
 
     #[tokio::test]
+    async fn a_provider_reported_change_runs_a_fresh_lookup_before_the_ttl() {
+        let fixture = Fixture::new("pr-lookup-provider-change");
+        let cancellation = CancellationToken::new();
+        let mut stream = fixture.services.status_stream(
+            RpcRequest {
+                id: RequestId::try_from("3").expect("request id"),
+                tag: "subscribeVcsStatus".to_owned(),
+                payload: json!({ "cwd": fixture.repository }),
+                headers: Vec::new(),
+                trace_id: None,
+                span_id: None,
+                sampled: None,
+            },
+            cancellation.clone(),
+        );
+        stream
+            .recv()
+            .await
+            .expect("status stream stays open")
+            .expect("status snapshot");
+        fixture.refresh().await;
+        let cached = fixture.refresh().await;
+        assert!(cached["pr"].is_null(), "{cached}");
+        assert_eq!(fixture.lookups(), ["main"]);
+
+        // An agent's `gh pr create` settles; the provider runtime reports it synchronously.
+        fixture.set("open", "");
+        let report = fixture.services.broadcaster.local_change_reporter();
+        report(&fixture.repository);
+        // Well inside the 10-second lookup TTL.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = fixture.refresh().await;
+            if status["pr"]["number"] == 42 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cached lookup was reused: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(fixture.lookups(), ["main", "main"]);
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
     async fn an_expired_lookup_asks_the_forge_again() {
         let fixture = Fixture::new("pr-lookup-expiry");
         fixture
