@@ -105,6 +105,8 @@ describe("extractTerminalLinks", () => {
     ['"./my dir/a(b)"', ["./my dir/a(b)"]],
     ['"My Project\\src\\index.ts:12"', ["My Project\\src\\index.ts:12"]],
     ['"my dir/a.ts"', ["my dir/a.ts"]],
+    ['"My Project\\.editorconfig":12', ['My Project\\.editorconfig":12']],
+    ['"My Project\\src\\.gitattributes"', ["My Project\\src\\.gitattributes"]],
     ['"C:\\Users\\Jane Doe\\p\\i.ts":12:7', ['C:\\Users\\Jane Doe\\p\\i.ts":12:7']],
     ["'./a b.ts':3", ["./a b.ts':3"]],
     ['"and/or maybe" ok', ["and/or"]],
