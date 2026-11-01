@@ -54,7 +54,7 @@ Implementation order: #235 (the `diffAvailable` flag), then the trusted-baseline
 | Option                                                                                    | Wire / contract                                                                                                                           | Persisted shape                                                            | Trade-off                                                                                                                                                                                                                                                                                                                                            |
 | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A. New status literal `captured` (end state valid, no diff)                               | Adds a new `OrchestrationCheckpointStatus` literal. An older client decodes the literal strictly and rejects the whole snapshot or event. | None (TEXT value)                                                          | `docs/architecture/remote.md` already refused a new literal for this reason. A remote server newer than its client is a supported setup, so this option is rejected.                                                                                                                                                                                 |
-| B. Keep `ready` = capture valid, add an additive `diffAvailable` flag                     | Optional `diffAvailable?: boolean` on the summary, the payload and the command. Absent means `true`. Older clients ignore the key.        | One additive column `checkpoint_diff_available INTEGER NOT NULL DEFAULT 1` | One migration. An older binary already refuses a newer ledger (`persistence/migrations.rs:163-174`), so a downgrade cannot misread a `ready` row that has no diff. Existing rows need no backfill: every existing `ready` row was recorded with a baseline.                                                                                          |
+| B. Keep `ready` = capture valid, add an additive `diffAvailable` flag                     | Optional `diffAvailable?: boolean` on the summary, the payload and the command. Absent means `true`. Older clients ignore the key.        | One additive column `checkpoint_diff_available INTEGER NOT NULL DEFAULT 1` | One migration. An older binary already refuses a newer ledger (`persistence/migrations.rs:163-174`), so a downgrade cannot misread a `ready` row that has no diff. Existing `ready` rows whose predecessor is not `ready` are backfilled to `0` (see the migration bullet).                                                                          |
 | C. Keep `ready` = capture valid and derive diff availability at read time (no stored bit) | None                                                                                                                                      | None                                                                       | The diff RPC would check that row `n - 1` is not `error` and that ref `n - 1` resolves, which repeats the capture-time rule. But a missing from-ref falls back to legacy diff blobs (`orchestration_rpc.rs:1035-1049`). The client cannot tell "no diff" from "no changes", so the acceptance criterion ("shows no diff available") fails in the UI. |
 
 ### Recommendation: B
@@ -73,7 +73,20 @@ Implementation order: #235 (the `diffAvailable` flag), then the trusted-baseline
   existing fixtures stay valid. The projector (`:8080`) writes the column, and an `error`
   row keeps `1`.
 - Migration 63 `ProjectionTurnCheckpointDiffAvailable`: `ALTER TABLE projection_turns ADD
-  COLUMN checkpoint_diff_available INTEGER NOT NULL DEFAULT 1`. Also update
+  COLUMN checkpoint_diff_available INTEGER NOT NULL DEFAULT 1`. In the same migration,
+  backfill conservatively. Before this change, `record_checkpoint` refused only an
+  `error` predecessor (`orchestration_effects.rs:1565-1576`). A `ready` row whose
+  predecessor is `missing` can therefore hold a diff read against a leftover ref (#236),
+  or against a ref that a late baseline wrote (#234). The migration applies the
+  trusted-baseline rule to existing rows, so it never has to guess which case it is:
+  `UPDATE projection_turns AS t SET checkpoint_diff_available = 0, checkpoint_files_json
+  = '[]' WHERE t.checkpoint_status = 'ready' AND t.checkpoint_turn_count >= 2 AND NOT
+  EXISTS (SELECT 1 FROM projection_turns p WHERE p.thread_id = t.thread_id AND
+  p.checkpoint_turn_count = t.checkpoint_turn_count - 1 AND p.checkpoint_status =
+  'ready')`. Turn 1 keeps `1`, because ref 0 is a trusted baseline. The read path needs no
+  predecessor lookup, since after the migration the column alone states the rule. The
+  projection is never rebuilt from the event log, so old events that lack the key cannot
+  bring a trusted diff back. Also update
   `ProjectionCheckpoint` and `decode_checkpoint` (`persistence/repositories.rs:3107-3116`,
   `:4468-4479`), the selects at `:1608` and `:1615`, the checkpoint upsert at `:1602`, the
   ledger name test (`persistence/migrations.rs:4023-4036`), and the snapshot mapping.
@@ -123,6 +136,24 @@ Implementation order: #235 (the `diffAvailable` flag), then the trusted-baseline
   whose own capture failed is still refused.
 - Persistence: the migration ledger test, plus a round-trip test that `get_checkpoint`
   reads the column back.
+- Upgrade regression, new:
+  `the_diff_flag_migration_distrusts_a_ready_turn_after_an_untrusted_predecessor` in
+  `persistence/migrations.rs` tests. It follows the
+  `run_migrations(&mut connection, Some(62))`, seed, `run_migrations(.., None)` pattern
+  of `activity_journal_key_namespace_migration_preserves_legacy_identity_domain`
+  (`:4107`).
+  - Seed, on one thread: turns 1 and 2 `ready`; turn 3 `missing`, the #236 leftover
+    case; turn 4 `ready` with non-empty files. On a second thread, as the control: turn 1
+    `ready` and turn 2 `ready`. Old code never left a `ready` row after an `error` one,
+    so no such case is seeded.
+  - Assert: turn 4 has `checkpoint_diff_available = 0` and `files == []`. Turns 1 and 2
+    and the control keep `1` and their files.
+- Upgrade regression, RPC, new:
+  `an_upgraded_ready_turn_after_a_missing_one_has_no_one_turn_diff` next to the
+  `orchestration_rpc.rs` diff tests. Open a database seeded at migration 62 as above, with
+  refs 3 (the leftover) and 4 in the repository. Assert that `orchestration.diff` 3..4 is
+  refused with the no-baseline detail, that 2..4 is still served, and that the snapshot
+  carries `diffAvailable: false` for turn 4.
 - Contracts: a decode test in `packages/contracts` for a summary with and without
   `diffAvailable`. It also checks that a schema without the field ignores the key, which
   is what an older client does.
@@ -256,10 +287,21 @@ checkout that might already hold the next turn's edits. Remove that permission, 
      The `error` record and its activity remain the user-visible record when the database
      accepts them.
 4. **A stale turn's hold is released only by its expiry task**, after its single write
-   attempt. `CheckpointHoldRelease::drop` skips the release when
-   `engine.checkpoint_is_stale(thread, turn)`. `expire_checkpoint_hold` sets the mark
-   under the hold lock before it returns `true`, and the task then always reaches its
-   release. Thread deletion (`:1068-1071`) and effects shutdown (`engine.rs:2790-2799`)
+   attempt. Reading the stale mark and removing the hold must be one decision.
+   `checkpoint_is_stale` followed by `release_checkpoint_hold` would take the locks
+   twice (`engine.rs:2832-2834`, `:2886-2892`). The expiry could then mark the turn in
+   between and pause before its write. The guard would release, a revert would delete
+   the row, and the expiry's write would insert it again (second review, finding 1). So
+   `CheckpointHoldRelease::drop` calls a new
+   `OrchestrationEngine::release_checkpoint_hold_unless_stale(thread, turn)`. It takes the
+   `turns` lock and reads `stale` while it still holds it, in the lock order of
+   `claim_checkpoint_completion` (`:2865-2884`). It removes the hold only when the turn is
+   not stale, then wakes delivery as `release_checkpoint_holds` does.
+   `expire_checkpoint_hold` marks the turn under that same `turns` lock and only while
+   the hold is still there (`:2840-2858`). Only two orders are left. In one, the guard
+   releases first, so the expiry finds no hold, returns `false` and writes nothing. In the
+   other, the expiry marks first, so the guard leaves the hold, and the expiry task
+   always goes on to its release. Thread deletion (`:1068-1071`) and effects shutdown (`engine.rs:2790-2799`)
    still release every hold. This resolves finding 1 as the review suggests, although
    rule 3 already makes an early release harmless for baselines. Rule 5 needs it.
 5. **A revert waits out the hold.** `plan_revert` refuses while
@@ -326,6 +368,30 @@ engine, inject the failure at the command decider instead.
     `turns_held_for_checkpoint("t")` is still true and that the queued follow-up is not
     received.
   - Then `release_checkpoint_hold`, and assert that the follow-up is received.
+- New, engine unit test (`orchestration/engine.rs` tests):
+  `a_hold_release_and_its_expiry_decide_once_in_either_order`. It covers the
+  interleaving from the second review, in which a failed capture's guard races an expiry
+  that has not yet marked the turn.
+  - Order A: take a hold, call `release_checkpoint_hold_unless_stale`, then
+    `expire_checkpoint_hold(.., id)`. Assert that the release removed the hold, that the
+    expiry returns `false`, and that the turn is not stale. The expiry task then writes
+    nothing.
+  - Order B: take a hold, call `expire_checkpoint_hold`, then
+    `release_checkpoint_hold_unless_stale`. Assert that the expiry returns `true` and
+    that the hold is still there after the guard ran.
+  - Race: 1,000 iterations on a multi-thread runtime. Each one starts the two calls from
+    two tasks behind a `Barrier`. Assert the invariant every time: the expiry returned
+    `true` exactly when the hold is still there after both calls return. The two-lock
+    version fails this invariant (the expiry returns `true` and the hold is gone), so
+    the test is red before the fix.
+- New, end to end: `a_failed_capture_racing_its_expiry_never_brings_back_a_reverted_turn`
+  in `production/turn_delivery_queue_tests.rs`. Turn 3's capture fails (the ref lock
+  from #236), with a hold limit short enough that the expiry lands around the failure.
+  Once both have finished, the test requests a revert to 2, which waits out any hold
+  (rule 5). Assert that row 3 is gone after the revert and stays gone: no record of
+  turn 3 lands afterwards. Assert also that the thread's next turn is numbered 3. This
+  test checks the whole flow; the unit test above is the one that forces the exact
+  interleaving.
 - New: `a_revert_is_refused_while_a_stale_record_holds_the_thread`. Use the same setup
   with a ready turn 2.
   - Request a revert to 2. Assert one `checkpoint.revert.failed` with the pending-record
@@ -374,8 +440,11 @@ engine, inject the failure at the command decider instead.
     delivery. This race existed before this change and is not changed by it. Option D is
     the fix, and it should get its own issue.
   - Old `missing` rows that are really captured without a baseline are not backfilled.
-    They stay refused, as they are today. An old `missing` predecessor whose ref a
-    baseline wrote under the old rule is no longer a diff start.
+    They stay refused, as they are today.
+  - The migration also hides old diffs that were correct: a `ready` turn after a
+    `missing` one whose ref a timely baseline wrote. That is the conservative side of a
+    case the database cannot tell apart from the #236 leftover. Those turns stay
+    revertible, and multi-turn ranges between two `ready` ends are still served.
   - Migration id 63 may collide with another v0.15 slice.
 
 ## Review findings (Codex, first revision)
@@ -385,3 +454,10 @@ engine, inject the failure at the command decider instead.
 | 1. The capture worker releases the hold before the record is durable | Yes: `orchestration_effects.rs:1050-1058`, `:1270-1275`, `:1507-1509`, `:1539-1551`. It also happens today, without a retry. | Rule 4: a stale turn's hold is released only by its expiry. Rules 1-3 make a release before durability harmless for baselines. Test: `a_stale_captures_worker_leaves_the_hold_to_its_expiry`. |
 | 2. A restart does not guarantee a safe baseline                      | Yes: `turn_delivery.rs:1399-1415` against `orchestration_effects.rs:1041-1045`. Also reachable without a restart (see #234). | Rule 1: no baseline writes a numbered ref, so ordering cannot matter. Test: `a_restart_after_an_unwritten_stale_record_never_writes_that_turns_ref`, with the edits in the checkout first.    |
 | 3. A pending retry brings back a turn that a revert removed          | Yes: `engine.rs:8080-8100`, `:8103-8110`. The window is one dispatch today.                                                  | No retry exists any more. Rules 4-5 make every record land before the release, and a revert waits for the release. Test: `a_revert_is_refused_while_a_stale_record_holds_the_thread`.         |
+
+## Review findings (Codex, second revision)
+
+| Finding                                                          | Verified against source                                                                                                                                                                                       | Resolution                                                                                                                                                                                                                            |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. The guard's stale check and hold release race with the expiry | Yes: `checkpoint_is_stale` (`engine.rs:2886-2892`) and `release_checkpoint_hold` (`:2832-2834`) take the locks separately, and `expire_checkpoint_hold` (`:2840-2858`) can mark the turn between them.        | Rule 4: one `release_checkpoint_hold_unless_stale` under the `turns` lock that the expiry uses. Tests: `a_hold_release_and_its_expiry_decide_once_in_either_order` (both orders, plus a barrier race) and the end-to-end revert test. |
+| 2. The migration keeps unsafe legacy diffs                       | Yes: before this change, `record_checkpoint` refuses only an `error` predecessor (`orchestration_effects.rs:1565-1576`), so a `ready` turn after a `missing` one with a leftover ref exists in old databases. | Migration 63 backfills `diffAvailable = 0` and `files = []` for a `ready` row whose predecessor is not `ready`. Tests: a migration upgrade test and an RPC upgrade test.                                                              |
