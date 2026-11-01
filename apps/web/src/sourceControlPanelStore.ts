@@ -155,7 +155,12 @@ function currentStorage() {
 
 /** The draft saved for the folder; `undefined` when none, or storage answers later. */
 function readDraft(cwdKey: string): SourceControlDraft | undefined {
-  const saved = currentStorage()?.getItem(`${DRAFT_PREFIX}${cwdKey}`);
+  let saved;
+  try {
+    saved = currentStorage()?.getItem(`${DRAFT_PREFIX}${cwdKey}`);
+  } catch {
+    return undefined; // blocked storage reads as no draft
+  }
   if (saved === null || saved === undefined || saved instanceof Promise) return undefined;
   const draft = saved.state as unknown as Partial<SourceControlDraft> | undefined;
   if (typeof draft?.message !== "string") return undefined;
@@ -167,16 +172,28 @@ function readDraft(cwdKey: string): SourceControlDraft | undefined {
     : { message: draft.message };
 }
 
+let warnedAboutDraftStorage = false;
+
+/**
+ * Saves the folder's draft, or removes it. A failing storage (quota, blocked) never fails the
+ * edit: the draft stays in memory, and the failure is logged once.
+ */
 function writeDraft(cwdKey: string, draft: SourceControlDraft | undefined): void {
   const name = `${DRAFT_PREFIX}${cwdKey}`;
-  if (draft === undefined) {
-    void currentStorage()?.removeItem(name);
-    return;
+  try {
+    if (draft === undefined) {
+      void currentStorage()?.removeItem(name);
+      return;
+    }
+    void currentStorage()?.setItem(name, {
+      state: draft as unknown as SourceControlPanelStoreState,
+      version: DRAFT_VERSION,
+    });
+  } catch (error) {
+    if (warnedAboutDraftStorage) return;
+    warnedAboutDraftStorage = true;
+    console.warn("Could not save the commit message draft; it stays in memory only.", error);
   }
-  void currentStorage()?.setItem(name, {
-    state: draft as unknown as SourceControlPanelStoreState,
-    version: DRAFT_VERSION,
-  });
 }
 
 /** Every folder draft saved now, for a tab that has just opened. */
@@ -235,6 +252,17 @@ function putDraft(
   return { ...state.byCwdKey, [cwdKey]: saveMessage(cwdKey, state.byCwdKey[cwdKey], message) };
 }
 
+/** `state.byCwdKey` with the folder's draft written (or removed) and shown as written. */
+function showWritten(
+  state: Pick<SourceControlPanelStoreState, "byCwdKey">,
+  cwdKey: string,
+  draft: SourceControlDraft | undefined,
+): Record<string, SourceControlDraft> {
+  writeDraft(cwdKey, draft);
+  const { [cwdKey]: _previous, ...others } = state.byCwdKey;
+  return draft === undefined ? others : { ...others, [cwdKey]: draft };
+}
+
 /** `state.byCwdKey` with the folder as storage holds it now. */
 function takeStored(
   state: Pick<SourceControlPanelStoreState, "byCwdKey">,
@@ -255,7 +283,11 @@ function clearSubmitted(
   const stored = readDraft(cwdKey);
   if (stored !== undefined && stored.message.trim() === submitted.trim()) {
     const alternates = stored.alternates ?? [];
-    writeDraft(cwdKey, alternates.length === 0 ? undefined : withAlternates("", alternates));
+    return showWritten(
+      state,
+      cwdKey,
+      alternates.length === 0 ? undefined : withAlternates("", alternates),
+    );
   }
   return takeStored(state, cwdKey);
 }
@@ -316,20 +348,26 @@ const persistedStore = persist<SourceControlPanelStoreState>(
     useCwdAlternate: (cwdKey, alternate) =>
       set((state) => {
         const stored = readDraft(cwdKey);
-        if (stored?.alternates?.includes(alternate) === true) {
-          const others = stored.alternates.filter((text) => text !== alternate);
-          writeDraft(cwdKey, withAlternates(alternate, [stored.message, ...others]));
+        if (stored?.alternates?.includes(alternate) !== true) {
+          return { byCwdKey: takeStored(state, cwdKey) };
         }
-        return { byCwdKey: takeStored(state, cwdKey) };
+        const others = stored.alternates.filter((text) => text !== alternate);
+        return {
+          byCwdKey: showWritten(
+            state,
+            cwdKey,
+            withAlternates(alternate, [stored.message, ...others]),
+          ),
+        };
       }),
     dismissCwdAlternate: (cwdKey, alternate) =>
       set((state) => {
         const stored = readDraft(cwdKey);
-        if (stored?.alternates?.includes(alternate) === true) {
-          const others = stored.alternates.filter((text) => text !== alternate);
-          writeDraft(cwdKey, withAlternates(stored.message, others));
+        if (stored?.alternates?.includes(alternate) !== true) {
+          return { byCwdKey: takeStored(state, cwdKey) };
         }
-        return { byCwdKey: takeStored(state, cwdKey) };
+        const others = stored.alternates.filter((text) => text !== alternate);
+        return { byCwdKey: showWritten(state, cwdKey, withAlternates(stored.message, others)) };
       }),
     promoteThreadDraft: (threadKey, cwdKey) =>
       set((state) => (threadKey in state.byThreadKey ? promote(state, threadKey, cwdKey) : state)),

@@ -146,6 +146,31 @@ describe("source control draft persistence", () => {
   });
 });
 
+describe("source control drafts when storage is full", () => {
+  it("keeps what is typed in memory, and warns once, when every save throws", () => {
+    const quota = () => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    };
+    useSourceControlPanelStore.persist.setOptions({
+      // A full disk refuses the new draft entries; the panel's own entry is unchanged from before.
+      storage: createJSONStorage(() => ({
+        ...storage,
+        setItem: (name: string, value: string) =>
+          name.includes(":draft:") ? quota() : storage.setItem(name, value),
+      })),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const key = "env-a::/full";
+    const store = () => useSourceControlPanelStore.getState();
+
+    store().setCwdMessage(key, "Typed");
+    store().setCwdMessage(key, "Typed and pasted");
+    expect(store().byCwdKey[key]).toEqual({ message: "Typed and pasted" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+});
+
 describe("source control drafts in several tabs (#219)", () => {
   const ONE = "env-a::/one";
   const TWO = "env-a::/two";
