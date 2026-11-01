@@ -39,7 +39,11 @@ export interface WrappedTerminalLinkLine {
 
 const URL_PATTERN = /https?:\/\/[^\s"'`<>]+/g;
 const FILE_PATH_PATTERN =
-  /(?:~\/|\.{1,2}\/|\/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+(?::\d+){0,2}/g;
+  /(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|[A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)+(?::\d+){0,2}/g;
+// A path between matching quotes keeps its spaces and wins over the partial unquoted token. A
+// `:line[:col]` suffix is linked only inside the quotes (the match text must stay contiguous).
+const QUOTED_FILE_PATH_PATTERN =
+  /(?<q>["'`])(?<link>(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)(?:(?!\k<q>)[^<>\r\n])+)\k<q>/g;
 const FILE_URL_PATTERN = /file:\/\/[^\s"'`<>]+/g;
 // Whole delimiter-bounded tokens only: a prefix or suffix of a longer name would open a different
 // file. The leading delimiter is consumed (not a lookbehind, which older macOS WebKit rejects) and
@@ -150,7 +154,7 @@ function inferHomeFromCwd(cwd: string): string | undefined {
     return `/home/${posixHome[1]}`;
   }
 
-  const windowsUser = cwd.match(/^([A-Za-z]:\\Users\\[^\\]+)/);
+  const windowsUser = cwd.match(/^([A-Za-z]:[\\/]Users[\\/][^\\/]+)/i);
   if (windowsUser?.[1]) {
     return windowsUser[1];
   }
@@ -270,12 +274,16 @@ export function extractTerminalLinks(line: string): TerminalLinkMatch[] {
   // File URLs go first so the Windows-drive path alternative can't match inside `file:`.
   const fileUrlMatches = collectMatches(line, "path", FILE_URL_PATTERN, urlMatches);
   const taken = [...urlMatches, ...fileUrlMatches];
-  const pathMatches = collectMatches(line, "path", FILE_PATH_PATTERN, taken);
+  const quotedMatches = collectMatches(line, "path", QUOTED_FILE_PATH_PATTERN, taken);
+  const pathMatches = collectMatches(line, "path", FILE_PATH_PATTERN, [...taken, ...quotedMatches]);
   const filenameMatches = collectMatches(line, "path", PREVIEW_FILENAME_PATTERN, [
     ...taken,
+    ...quotedMatches,
     ...pathMatches,
   ]);
-  return [...taken, ...pathMatches, ...filenameMatches].toSorted((a, b) => a.start - b.start);
+  return [...taken, ...quotedMatches, ...pathMatches, ...filenameMatches].toSorted(
+    (a, b) => a.start - b.start,
+  );
 }
 
 export function collectWrappedTerminalLinkLine(
@@ -382,11 +390,13 @@ export function resolvePathLinkTarget(rawPath: string, cwd: string): string {
   const { path, line, column } = splitPathAndPosition(rawPath);
 
   let resolvedPath = path;
-  if (path.startsWith("~/")) {
+  if (/^~[\\/]/.test(path)) {
     const home = inferHomeFromCwd(cwd);
-    if (home) {
-      const separator: "/" | "\\" = isWindowsPathStyle(home) ? "\\" : "/";
-      resolvedPath = joinPath(home, path.slice(2), separator);
+    // `~\` is a Windows spelling; against a POSIX home it stays unexpanded.
+    if (home && (path[1] === "/" || isWindowsAbsolutePath(home))) {
+      // Keep the home's own separator (`C:/Users/Jane` stays forward-slashed).
+      const separator: "/" | "\\" = home.includes("\\") ? "\\" : "/";
+      resolvedPath = joinPath(home, path.slice(2).replaceAll("\\", separator), separator);
     }
   } else if (!isAbsolutePath(path)) {
     const separator: "/" | "\\" = isWindowsPathStyle(cwd) ? "\\" : "/";
