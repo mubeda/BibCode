@@ -542,7 +542,10 @@ const publicPairingGrant = {
 };
 
 /** Executes the generated credential callback and its receipt/driver handoff without a desktop. */
-const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
+const remoteGrantFixture = (
+  responses: ReadonlyArray<unknown>,
+  options: { readonly fromShareUi?: boolean } = {},
+) => {
   const input = {
     candidateVersion: "0.7.3",
     expectedDataRoot: absolute("remote", "data"),
@@ -558,9 +561,13 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     remoteSecretPath: absolute("remote", "private.json"),
     remoteUploadSecretPath: absolute("remote", "upload-private.json"),
     remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
+    remoteTracePath: absolute("remote", "evidence", "remote-credential-trace.log"),
   };
   const spec = createSeededUpgradeDriverSpec(input);
-  const start = spec.indexOf("    let credentials;");
+  // From the share UI, the generated scenario also runs the real widening guard.
+  const start = spec.indexOf(
+    options.fromShareUi ? "    const traceRemote = (entry) => {" : "    let credentials;",
+  );
   const end = spec.indexOf("\n  });\n});", start);
   if (start < 0 || end < 0) throw new Error("Generated remote credential scenario is missing.");
   // Replace module loading only; run the actual browser callback and handoff statements.
@@ -574,13 +581,31 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
   const driver = vi.fn(async (_credentials: unknown) => ({ phases: ["succeeded"] }));
   const execute = async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
     callback(...args);
+  const traces: string[] = [];
   const context = {
     input,
     widened: true,
     traceRemote: () => {},
     observation: { projectId: "remote-project" },
-    browser: { execute },
+    browser: {
+      execute,
+      // Poll the condition once per interval without a real clock.
+      waitUntil: async (
+        condition: () => Promise<boolean>,
+        { timeout, interval }: { timeout: number; interval: number },
+      ) => {
+        for (let elapsed = 0; elapsed < timeout; elapsed += interval) {
+          if (await condition()) return true;
+        }
+        throw new Error("waitUntil timed out");
+      },
+    },
+    document: {
+      // The share control exists but never becomes enabled.
+      querySelectorAll: () => [{ textContent: " Generate pairing offer ", disabled: true }],
+    },
     window: {
+      location: { hash: "" },
       desktopBridge: {
         getLocalEnvironmentBootstraps: () => [
           {
@@ -595,6 +620,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     NodeFS: {
       writeFileSync: (path: string, contents: string, options?: { mode: number }) =>
         files.set(path, { contents, ...options }),
+      appendFileSync: (_path: string, line: string) => traces.push(line),
     },
     loadFixture: async (path: string) => {
       if (path === input.remoteInstallDriverPath) return { runRemoteInstallDriver: driver };
@@ -613,6 +639,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     input,
     context,
     files,
+    traces,
     fetch,
     driver,
     run: () =>
@@ -651,6 +678,17 @@ describe("generated remote sharing grant handoff", () => {
       if (path !== fixture.input.remoteSecretPath)
         expect(file.contents).not.toContain("fixture-distinct-grant");
     }
+  });
+
+  it("fails fast without a credential receipt or coordinator call when the pairing offer cannot be generated", async () => {
+    const fixture = remoteGrantFixture([[publicPairingGrant]], { fromShareUi: true });
+    await expect(fixture.run()).rejects.toThrow(
+      "Remote verification pairing offer could not be generated (share UI found=false, clicked=false).",
+    );
+    expect(fixture.files.size).toBe(0);
+    expect(fixture.fetch).not.toHaveBeenCalled();
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(fixture.traces.join("")).toContain('"step":"pairing-offer"');
   });
 
   it("waits for minting after native exposure has already widened", async () => {
