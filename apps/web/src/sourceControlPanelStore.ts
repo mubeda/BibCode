@@ -175,26 +175,54 @@ function readDraft(cwdKey: string): SourceControlDraft | undefined {
 let warnedAboutDraftStorage = false;
 
 /**
- * Saves the folder's draft, or removes it. A failing storage (quota, blocked) never fails the
- * edit: the draft stays in memory, and the failure is logged once.
+ * What this tab last wrote to, or read from, each folder's entry. A draft in memory that differs
+ * from it never reached storage: an unsaved edit, which another tab's save must not replace.
  */
-function writeDraft(cwdKey: string, draft: SourceControlDraft | undefined): void {
+const knownStored = new Map<string, SourceControlDraft | undefined>();
+
+function hasUnsavedEdit(
+  cwdKey: string,
+  local: SourceControlDraft | undefined,
+): local is SourceControlDraft {
+  return (
+    local !== undefined &&
+    local.message.trim() !== "" &&
+    local.message !== (knownStored.get(cwdKey)?.message ?? "")
+  );
+}
+
+/**
+ * Saves the folder's draft, or removes it; `false` when storage refused. A failing storage
+ * (quota, blocked) never fails the edit: the draft stays in memory, and the failure is logged
+ * once.
+ */
+function writeDraft(cwdKey: string, draft: SourceControlDraft | undefined): boolean {
   const name = `${DRAFT_PREFIX}${cwdKey}`;
   try {
     if (draft === undefined) {
       void currentStorage()?.removeItem(name);
-      return;
+    } else {
+      void currentStorage()?.setItem(name, {
+        state: draft as unknown as SourceControlPanelStoreState,
+        version: DRAFT_VERSION,
+      });
     }
-    void currentStorage()?.setItem(name, {
-      state: draft as unknown as SourceControlPanelStoreState,
-      version: DRAFT_VERSION,
-    });
+    knownStored.set(cwdKey, draft);
+    return true;
   } catch (error) {
-    if (warnedAboutDraftStorage) return;
-    warnedAboutDraftStorage = true;
-    console.warn("Could not save the commit message draft; it stays in memory only.", error);
+    if (!warnedAboutDraftStorage) {
+      warnedAboutDraftStorage = true;
+      console.warn("Could not save the commit message draft; it stays in memory only.", error);
+    }
+    return false;
   }
 }
+
+/**
+ * Drafts from before version 3 that could not be copied to their own entries. Persist keeps
+ * them in the saved entry, and they are copied again the next time the app loads.
+ */
+let unmigratedDrafts: Record<string, SourceControlDraft> = {};
 
 /** Every folder draft saved now, for a tab that has just opened. */
 function readAllDrafts(): Record<string, SourceControlDraft> {
@@ -206,7 +234,10 @@ function readAllDrafts(): Record<string, SourceControlDraft> {
       if (name === null || !name.startsWith(DRAFT_PREFIX)) continue;
       const cwdKey = name.slice(DRAFT_PREFIX.length);
       const draft = readDraft(cwdKey);
-      if (draft !== undefined) drafts[cwdKey] = draft;
+      if (draft !== undefined) {
+        drafts[cwdKey] = draft;
+        knownStored.set(cwdKey, draft);
+      }
     }
   } catch {
     // No localStorage: drafts live in memory only.
@@ -221,26 +252,61 @@ function withAlternates(message: string, alternates: readonly string[]): SourceC
 }
 
 /**
- * Saves `message` as the folder's draft, over whatever storage holds now. This tab last saw
- * `local`; a different message in storage was written by another tab since, and becomes an
- * alternate rather than being overwritten. So no text any tab wrote leaves storage until the
- * person uses, dismisses, or commits it.
+ * `message` as the folder's draft, over whatever storage holds now. This tab last saw `local`;
+ * a different message in storage was written by another tab since, and becomes an alternate
+ * rather than being overwritten. So no text any tab wrote leaves storage until the person uses,
+ * dismisses, or commits it. `extra` are further versions to offer.
  */
-function saveMessage(
+function composeMessage(
   cwdKey: string,
   local: SourceControlDraft | undefined,
   message: string,
+  extra: readonly string[] = [],
 ): SourceControlDraft {
   // shortcut: read-then-write is not atomic across windows; a save landing in that gap can still lose one version; upgrade to navigator.locks if users hit it
   const stored = readDraft(cwdKey);
   const theirs = stored?.message ?? "";
   const unseen = theirs.trim() !== "" && theirs !== message && theirs !== (local?.message ?? "");
-  const draft = withAlternates(message, [
+  return withAlternates(message, [
     ...(unseen ? [theirs] : []),
     ...(stored?.alternates ?? []),
+    ...extra,
   ]);
-  writeDraft(cwdKey, draft);
+}
+
+/** Saves `message` as the folder's draft (see {@link composeMessage}). */
+function saveMessage(
+  cwdKey: string,
+  local: SourceControlDraft | undefined,
+  message: string,
+  extra: readonly string[] = [],
+): SourceControlDraft {
+  const unmigrated = unmigratedDrafts[cwdKey];
+  const draft = composeMessage(cwdKey, local, message, [
+    ...extra,
+    ...(unmigrated === undefined ? [] : [unmigrated.message]),
+  ]);
+  if (writeDraft(cwdKey, draft)) delete unmigratedDrafts[cwdKey];
   return draft;
+}
+
+/**
+ * Copies drafts saved before version 3 to their own entries and returns them as shown. Any that
+ * storage refuses are kept in {@link unmigratedDrafts}; a draft already in its entry becomes an
+ * alternate of the copied one.
+ */
+function migrateDrafts(
+  old: Record<string, SourceControlDraft>,
+): Record<string, SourceControlDraft> {
+  const shown: Record<string, SourceControlDraft> = {};
+  const failed: Record<string, SourceControlDraft> = {};
+  for (const [cwdKey, draft] of Object.entries(old)) {
+    if (!hasText(draft)) continue;
+    shown[cwdKey] = composeMessage(cwdKey, undefined, draft.message);
+    if (!writeDraft(cwdKey, shown[cwdKey])) failed[cwdKey] = { message: draft.message };
+  }
+  unmigratedDrafts = failed;
+  return shown;
 }
 
 /** `state.byCwdKey` with the folder's message saved as `message` (see {@link saveMessage}). */
@@ -270,10 +336,14 @@ function takeStored(
 ): Record<string, SourceControlDraft> {
   const { [cwdKey]: _previous, ...others } = state.byCwdKey;
   const stored = readDraft(cwdKey);
+  knownStored.set(cwdKey, stored);
   return stored === undefined ? others : { ...others, [cwdKey]: stored };
 }
 
-/** The commit of `submitted` landed: its message goes; alternates and newer text stay. */
+/**
+ * The commit of `submitted` landed: its message goes from storage, and from memory only while
+ * memory still holds it. Alternates and newer text stay, saved or not.
+ */
 function clearSubmitted(
   state: Pick<SourceControlPanelStoreState, "byCwdKey">,
   cwdKey: string,
@@ -281,15 +351,23 @@ function clearSubmitted(
 ): Record<string, SourceControlDraft> {
   // shortcut: read-then-write is not atomic across windows; a save landing in that gap can still lose one version; upgrade to navigator.locks if users hit it
   const stored = readDraft(cwdKey);
-  if (stored !== undefined && stored.message.trim() === submitted.trim()) {
-    const alternates = stored.alternates ?? [];
-    return showWritten(
-      state,
-      cwdKey,
-      alternates.length === 0 ? undefined : withAlternates("", alternates),
-    );
+  const local = state.byCwdKey[cwdKey];
+  const sent = submitted.trim();
+  const localIsSent = local !== undefined && local.message.trim() === sent;
+  const unsaved = hasUnsavedEdit(cwdKey, local);
+  const remaining = (alternates: readonly string[] = []) =>
+    alternates.length === 0 ? undefined : withAlternates("", alternates);
+  if (stored !== undefined && stored.message.trim() === sent) {
+    const cleared = remaining(stored.alternates);
+    if (!unsaved || localIsSent) return showWritten(state, cwdKey, cleared);
+    writeDraft(cwdKey, cleared); // an edit only in memory stays
+    return state.byCwdKey;
   }
-  return takeStored(state, cwdKey);
+  if (!unsaved) return takeStored(state, cwdKey);
+  if (!localIsSent || local === undefined) return state.byCwdKey;
+  const { [cwdKey]: _sent, ...others } = state.byCwdKey;
+  const left = remaining(local.alternates);
+  return left === undefined ? others : { ...others, [cwdKey]: left };
 }
 
 /** What is saved: the persisted fields, any of which an older or other tab may have left out. */
@@ -464,11 +542,8 @@ const persistedStore = persist<SourceControlPanelStoreState>(
     migrate: (persistedState) => {
       const state = persistedState as Partial<SourceControlPanelStoreState> | undefined;
       // Folder drafts left this entry in version 3. Each is written to its own entry before
-      // persist saves this one without them; a draft already there becomes an alternate.
-      const byCwdKey: Record<string, SourceControlDraft> = {};
-      for (const [cwdKey, draft] of Object.entries(state?.byCwdKey ?? {})) {
-        if (hasText(draft)) byCwdKey[cwdKey] = saveMessage(cwdKey, undefined, draft.message);
-      }
+      // persist saves this one without them; one storage refuses stays here to be tried again.
+      const byCwdKey = migrateDrafts(state?.byCwdKey ?? {});
       // `sourceControlGroupByFolder` is intentionally absent: persist's shallow
       // merge keeps a stored value and falls back to the grouped default.
       return {
@@ -481,6 +556,7 @@ const persistedStore = persist<SourceControlPanelStoreState>(
     partialize: (state) =>
       ({
         byThreadKey: state.byThreadKey,
+        ...(Object.keys(unmigratedDrafts).length > 0 ? { byCwdKey: unmigratedDrafts } : {}),
         agentSuggestionByCwdKey: state.agentSuggestionByCwdKey,
         sourceControlGroupByFolder: state.sourceControlGroupByFolder,
       }) as SourceControlPanelStoreState,
@@ -495,10 +571,19 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
   return persistedStore(...args);
 }) as typeof persistedStore);
 
-// Drafts saved before this tab opened (migrated ones are already in the state).
-setWithoutSaving({
-  byCwdKey: { ...readAllDrafts(), ...useSourceControlPanelStore.getState().byCwdKey },
-});
+// Drafts saved before this tab opened, and any an earlier load could not copy to their entries.
+{
+  const leftover = readSavedState()?.byCwdKey ?? {};
+  const retried = Object.keys(leftover).length > 0 ? migrateDrafts(leftover) : {};
+  const byCwdKey = {
+    ...useSourceControlPanelStore.getState().byCwdKey,
+    ...readAllDrafts(),
+    ...retried,
+  };
+  // Through `set` once, so the saved entry drops the drafts that were copied.
+  if (Object.keys(leftover).length > 0) useSourceControlPanelStore.setState({ byCwdKey });
+  else setWithoutSaving({ byCwdKey });
+}
 
 // Another tab saved a folder's draft: show it as saved. Not through `set`, which would save.
 if (typeof window !== "undefined") {
@@ -506,7 +591,12 @@ if (typeof window !== "undefined") {
     if (event.key === null || !event.key.startsWith(DRAFT_PREFIX)) return;
     const cwdKey = event.key.slice(DRAFT_PREFIX.length);
     const state = useSourceControlPanelStore.getState();
-    setWithoutSaving({ byCwdKey: takeStored(state, cwdKey) });
+    const local = state.byCwdKey[cwdKey];
+    // An edit that never reached storage stays the message; what arrived is offered beside it.
+    const byCwdKey = hasUnsavedEdit(cwdKey, local)
+      ? { ...state.byCwdKey, [cwdKey]: saveMessage(cwdKey, local, local.message, local.alternates) }
+      : takeStored(state, cwdKey);
+    setWithoutSaving({ byCwdKey });
   });
 }
 

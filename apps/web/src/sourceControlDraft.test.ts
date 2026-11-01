@@ -11,9 +11,14 @@ import { useSourceControlPanelStore } from "./sourceControlPanelStore";
 
 const STORAGE_KEY = "bibcode:source-control-panel-state:v1";
 const persisted = new Map<string, string>();
+/** While set, the storage refuses new draft entries, as a full disk does. */
+let refusing = false;
 const storage = {
   getItem: (name: string) => persisted.get(name) ?? null,
   setItem: (name: string, value: string) => {
+    if (refusing && name.includes(":draft:")) {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    }
     persisted.set(name, value);
   },
   removeItem: (name: string) => {
@@ -55,6 +60,7 @@ let root: Root | null;
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   persisted.clear();
+  refusing = false;
   useSourceControlPanelStore.persist.setOptions({ storage: createJSONStorage(() => storage) });
   useSourceControlPanelStore.setState({ byThreadKey: {}, byCwdKey: {} });
   container = document.createElement("div");
@@ -168,6 +174,77 @@ describe("source control drafts when storage is full", () => {
     expect(store().byCwdKey[key]).toEqual({ message: "Typed and pasted" });
     expect(warn).toHaveBeenCalledTimes(1);
     warn.mockRestore();
+  });
+});
+
+describe("source control drafts that storage refused", () => {
+  const warn = () => vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  it("keeps old drafts in the saved entry until each is copied, and copies them next load", async () => {
+    const oldBlob = {
+      version: 2,
+      state: { byCwdKey: { "env-a::/migrate-one": { message: "One" } } },
+    };
+    persisted.set(STORAGE_KEY, JSON.stringify(oldBlob));
+    refusing = true;
+    const spy = warn();
+
+    await useSourceControlPanelStore.persist.rehydrate();
+
+    expect(useSourceControlPanelStore.getState().byCwdKey["env-a::/migrate-one"]?.message).toBe(
+      "One",
+    );
+    expect(saved("env-a::/migrate-one")).toBeUndefined();
+    const kept = JSON.parse(persisted.get(STORAGE_KEY)!);
+    expect(kept.version).toBe(3);
+    expect(kept.state.byCwdKey).toEqual({ "env-a::/migrate-one": { message: "One" } });
+    spy.mockRestore();
+
+    // The next load, with room again, copies it and drops it from the saved entry.
+    refusing = false;
+    window.localStorage.setItem(STORAGE_KEY, persisted.get(STORAGE_KEY)!);
+    vi.resetModules();
+    const reopened = await import("./sourceControlPanelStore");
+    const entry = window.localStorage.getItem(draftEntry("env-a::/migrate-one"));
+    expect(JSON.parse(entry!).state).toEqual({ message: "One" });
+    expect(reopened.useSourceControlPanelStore.getState().byCwdKey["env-a::/migrate-one"]).toEqual({
+      message: "One",
+    });
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY)!).state.byCwdKey).toBeUndefined();
+    window.localStorage.clear();
+  });
+
+  it("keeps an unsaved edit as the message when another tab saves, and offers theirs", async () => {
+    const key = "env-a::/refused-event";
+    const [a, b] = [await openTab(), await openTab()];
+    const spy = warn();
+    refusing = true;
+    a.store().setCwdMessage(key, "A typed, not saved");
+    refusing = false;
+    b.store().setCwdMessage(key, "B saved");
+    spy.mockRestore();
+
+    await act(async () => hearSaves());
+
+    const expected = { message: "A typed, not saved", alternates: ["B saved"] };
+    expect(a.store().byCwdKey[key]).toEqual(expected);
+    expect(saved(key)).toEqual(expected);
+  });
+
+  it("keeps newer unsaved text when a delayed commit of the saved text lands", async () => {
+    const key = "env-a::/refused-commit";
+    const a = await openTab();
+    a.store().setCwdMessage(key, "Sent");
+    const spy = warn();
+    refusing = true;
+    a.store().setCwdMessage(key, "Newer, not saved");
+    refusing = false;
+    spy.mockRestore();
+
+    a.store().clearCwdDraft(key, "Sent");
+
+    expect(a.store().byCwdKey[key]).toEqual({ message: "Newer, not saved" });
+    expect(saved(key)).toBeUndefined();
   });
 });
 
