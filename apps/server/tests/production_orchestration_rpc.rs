@@ -1589,6 +1589,21 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
             })
             .await
             .expect("diff blob");
+        // The stored diff serves only a captured turn, as the live one does.
+        harness
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.turn.diff.complete", "commandId": "diff-thread-1",
+                    "threadId": "thread-1", "turnId": "turn-1", "checkpointTurnCount": 1,
+                    "checkpointRef": "refs/bibcode/checkpoints/legacy/turn/1", "status": "ready",
+                    "files": [], "assistantMessageId": null,
+                    "completedAt": CREATED_AT, "createdAt": CREATED_AT,
+                }))
+                .expect("checkpoint command"),
+            )
+            .await
+            .expect("captured checkpoint");
 
         let archived_snapshot = unary_success(
             &mut socket,

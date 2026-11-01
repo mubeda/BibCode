@@ -126,6 +126,9 @@ pub struct HttpRoutesState {
     /// the production runtime.
     pub diagnostic_logs_relay:
         Option<crate::production::diagnostic_logs_relay::DiagnosticLogsRelayRoute>,
+    /// The per-boot key `POST /mcp/endpoint-proof` signs with; `None` (answering `503`)
+    /// without the production runtime.
+    pub mcp_proof_key: Option<crate::mcp::endpoint::ProofKey>,
 }
 
 impl HttpRoutesState {
@@ -149,6 +152,7 @@ impl HttpRoutesState {
             transfer_upload,
             device_media: None,
             diagnostic_logs_relay: None,
+            mcp_proof_key: None,
             open_url: Arc::new(|_body, _context| {
                 Box::pin(async {
                     Err(HttpRouteError::new(
@@ -197,6 +201,19 @@ pub struct RouteContext {
     pub headers: HeaderMap,
     pub uri: Uri,
     pub cancellation: CancellationToken,
+    /// How the request reached this server (slice R): `/mcp` checks a bearer's audience
+    /// against it. [`RequestClass::Other`](crate::RequestClass::Other) unless the router's
+    /// forwarded-header layer classified it.
+    pub origin: crate::RequestOrigin,
+}
+
+/// The class the router's forwarded-header layer gave a request, or the fail-closed default.
+fn request_origin(parts: &axum::http::request::Parts) -> crate::RequestOrigin {
+    parts
+        .extensions
+        .get::<crate::RequestOrigin>()
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub struct JsonRouteResponse {
@@ -280,6 +297,9 @@ pub struct McpHttpResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// A streamed body (`text/event-stream`) in place of `body`: each item is sent as it
+    /// comes, and dropping the response closes the channel, which ends the work behind it.
+    pub stream: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -307,6 +327,11 @@ impl HttpRouteError {
 
     fn into_response(self) -> Response {
         json_response(self.status, self.headers, self.body)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
     }
 }
 
@@ -344,7 +369,18 @@ where
         .route("/api/preview/open-url", post(preview_open_url))
         .route(DEVICE_MEDIA_PATH, get(device_media))
         .route(DEVICE_MEDIA_E2EE_PATH, get(device_media_e2ee))
-        .route("/mcp", post(mcp_post).delete(mcp_delete))
+        .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
+        .route(crate::mcp::endpoint::PROOF_PATH, post(mcp_endpoint_proof))
+}
+
+/// Unauthenticated and loopback-only: it reads no bearer, and signs only a nonce the caller
+/// chose, so it reveals nothing secret (see `mcp::endpoint`).
+async fn mcp_endpoint_proof(
+    State(state): State<HttpRoutesState>,
+    connection: crate::http::ConnectionInfo,
+    request: Request,
+) -> Response {
+    crate::mcp::endpoint::proof_http(state.mcp_proof_key, connection, request).await
 }
 
 async fn device_media(
@@ -546,6 +582,7 @@ async fn diagnostic_logs(State(state): State<HttpRoutesState>, request: Request)
         ));
     }
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -590,6 +627,7 @@ async fn json_request(
         },
     };
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -634,6 +672,7 @@ async fn asset(
     let _guard = CancellationGuard(cancellation.clone());
     let (parts, _) = request.into_parts();
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -665,6 +704,7 @@ async fn transfer_download(
     let _guard = CancellationGuard(cancellation.clone());
     let (parts, _) = request.into_parts();
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -725,6 +765,7 @@ async fn transfer_upload(
         .get("overwrite")
         .is_some_and(|value| value == "1" || value == "true");
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -781,6 +822,7 @@ async fn preview_open_url(State(state): State<HttpRoutesState>, request: Request
         Err(_) => return payload_too_large(),
     };
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -789,6 +831,12 @@ async fn preview_open_url(State(state): State<HttpRoutesState>, request: Request
         Ok(response) => json_response(response.status, response.headers, response.body),
         Err(error) => error.into_response(),
     }
+}
+
+/// `GET /mcp`: no stream is served. An unauthenticated GET still gets the 401 challenge, so
+/// a client's discovery probe finds the metadata; an authenticated one gets 405.
+async fn mcp_get(State(state): State<HttpRoutesState>, request: Request) -> Response {
+    mcp_request(state, Method::GET, request).await
 }
 
 async fn mcp_post(State(state): State<HttpRoutesState>, request: Request) -> Response {
@@ -808,6 +856,7 @@ async fn mcp_request(state: HttpRoutesState, method: Method, request: Request) -
         Err(_) => return payload_too_large(),
     };
     let context = RouteContext {
+        origin: request_origin(&parts),
         headers: parts.headers,
         uri: parts.uri,
         cancellation,
@@ -848,13 +897,20 @@ fn mcp_response(response: McpHttpResponse) -> Response {
     let Ok(mut status) = StatusCode::from_u16(response.status) else {
         return internal_error();
     };
-    if status == StatusCode::OK && response.body.is_empty() {
+    if status == StatusCode::OK && response.body.is_empty() && response.stream.is_none() {
         status = StatusCode::ACCEPTED;
     }
+    let body = match response.stream {
+        Some(stream) => Body::from_stream(tokio_stream::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(stream),
+            Ok::<_, std::convert::Infallible>,
+        )),
+        None => Body::from(response.body),
+    };
     let mut output = Response::builder()
         .status(status)
         .header(header::CACHE_CONTROL, NO_STORE)
-        .body(Body::from(response.body))
+        .body(body)
         .unwrap_or_else(|_| internal_error());
     append_headers(&mut output, response.headers);
     output

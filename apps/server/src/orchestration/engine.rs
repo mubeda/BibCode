@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     path::Path,
     pin::Pin,
@@ -144,7 +144,19 @@ pub struct ThreadMessageInput {
     pub role: String,
     pub text: String,
     pub attachments: Vec<Value>,
+    /// The thread this message came from (a chat panel's provenance, slice X4). Only a command
+    /// whose claim carries an outside agent's actor may set it, and the source must be another
+    /// live thread of the target's worktree.
+    #[serde(
+        rename = "sourceThreadId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_thread_id: Option<String>,
 }
+
+/// The longest `purpose` a created thread may carry.
+pub const MAX_THREAD_PURPOSE_CHARS: usize = 200;
 
 /// One historical message appended by `thread.history.import`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +248,9 @@ pub struct ThreadTurnStartBootstrapCreateThread {
     #[serde(default)]
     pub worktree_path: Option<String>,
     pub created_at: String,
+    /// Why an outside agent creates the thread (#139, slice X1), as on `thread.create`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -463,6 +478,10 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         host_thread_id: Option<String>,
+        /// Why an outside agent created the thread (untrusted text, at most 200 characters);
+        /// shown with the agent's label, never logged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
         #[serde(rename = "modelSelection")]
         model_selection: Value,
         #[serde(rename = "runtimeMode")]
@@ -1623,6 +1642,9 @@ pub(crate) struct CommandAdmissionClaim {
 
 struct CommandAdmissionClaimInner {
     command_id: String,
+    /// Who sent the command, stamped by the server from the authenticated principal (#139,
+    /// slice X1). Never read from the command itself, so no client can claim an actor.
+    actor: std::sync::OnceLock<Value>,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -1646,6 +1668,7 @@ impl CommandAdmissionFence {
         CommandAdmissionClaim {
             inner: Arc::new(CommandAdmissionClaimInner {
                 command_id: command_id.to_owned(),
+                actor: std::sync::OnceLock::new(),
                 _guard: gate.lock_owned().await,
             }),
         }
@@ -1671,6 +1694,16 @@ impl CommandAdmissionClaim {
                 command_id: command_id.to_owned(),
             })
         }
+    }
+
+    /// Attributes every event this claim's command plans to `actor` (`metadata.actor`). The
+    /// first attribution wins.
+    pub(crate) fn attribute_to(&self, actor: Value) {
+        let _ = self.inner.actor.set(actor);
+    }
+
+    fn actor(&self) -> Option<&Value> {
+        self.inner.actor.get()
     }
 }
 
@@ -1958,9 +1991,26 @@ pub struct OrchestrationEngine {
     thread_turns: ThreadTurnFence,
     compaction_waiters: CompactionWaiters,
     ask_recovery_holds: AskRecoveryHolds,
+    checkpoint_holds: CheckpointHolds,
     #[cfg(test)]
     test_hooks: TestHooks,
 }
+
+/// Ended turns the effects worker has yet to checkpoint, by thread and turn, each with the id of
+/// the hold that owns it. Holds are taken only while the effects worker runs (`limit` is set).
+#[derive(Clone, Default)]
+struct CheckpointHolds {
+    /// How long a hold lasts before its capture is given up as stale; `None` while no effects
+    /// worker runs.
+    limit: Arc<StdMutex<Option<Duration>>>,
+    turns: Arc<StdMutex<HeldTurns>>,
+    /// Ended turns whose hold expired before the worker captured them, by thread and turn: their
+    /// checkpoint is never recorded `ready`, and the next turn's baseline does not stand in for it.
+    stale: Arc<StdMutex<HashSet<(String, String)>>>,
+}
+
+/// The last hold id given out, and each held `(thread, turn)` with its hold's id.
+type HeldTurns = (u64, HashMap<(String, String), u64>);
 
 /// Threads whose resumed session has not yet read the asks its provider kept (#187), each with
 /// the id of the hold that owns it.
@@ -2038,6 +2088,7 @@ impl OrchestrationEngine {
             thread_turns: ThreadTurnFence::default(),
             compaction_waiters: CompactionWaiters::default(),
             ask_recovery_holds: AskRecoveryHolds::default(),
+            checkpoint_holds: CheckpointHolds::default(),
             #[cfg(test)]
             test_hooks: options.test_hooks,
         })
@@ -2731,6 +2782,160 @@ impl OrchestrationEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .1
             .contains_key(thread_id)
+    }
+
+    /// Lets an ended turn hold its thread's turn deliveries until the effects worker has
+    /// checkpointed it, for at most `limit` (the effects worker that records checkpoints runs), or
+    /// with `None` stops that, releasing every hold.
+    pub(crate) fn set_checkpoint_hold_limit(&self, limit: Option<Duration>) {
+        *self
+            .checkpoint_holds
+            .limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limit;
+        if limit.is_none() {
+            self.release_checkpoint_holds(|_| true);
+        }
+    }
+
+    /// How long an ended turn holds its thread's deliveries, or `None` while no effects worker
+    /// runs.
+    pub(crate) fn checkpoint_hold_limit(&self) -> Option<Duration> {
+        *self
+            .checkpoint_holds
+            .limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Holds every turn delivery of the thread (a direct start, Send now, a queued follow-up, a
+    /// steer) until the effects worker has recorded the checkpoint of `turn_id`, which just ended,
+    /// so no turn can edit the checkout before it is captured. Taken before the turn's session
+    /// settles. Returns the hold's id, or `None` (nothing held) while no effects worker runs.
+    pub(crate) fn hold_turns_for_checkpoint(&self, thread_id: &str, turn_id: &str) -> Option<u64> {
+        self.checkpoint_hold_limit()?;
+        let mut holds = self
+            .checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds.0 = holds.0.wrapping_add(1).max(1);
+        let id = holds.0;
+        holds
+            .1
+            .insert((thread_id.to_owned(), turn_id.to_owned()), id);
+        Some(id)
+    }
+
+    /// The effects worker is done with the checkpoint of `turn_id`: once no other ended turn of
+    /// the thread waits for one, its turns may be delivered again.
+    pub(crate) fn release_checkpoint_hold(&self, thread_id: &str, turn_id: &str) {
+        self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
+    }
+
+    /// Gives up hold `id` of `turn_id` before the worker captured the turn: marks the turn's
+    /// checkpoint stale and keeps the hold, which the caller releases once the stale checkpoint
+    /// is recorded. Returns `false`, changing nothing, when the hold is already gone (the worker
+    /// claimed the capture, or the thread was deleted).
+    pub(crate) fn expire_checkpoint_hold(&self, thread_id: &str, turn_id: &str, id: u64) -> bool {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let holds = self
+            .checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Decided under the hold lock, against `claim_checkpoint_completion`: one of the two wins.
+        // The hold stays until the caller has recorded the stale checkpoint durably.
+        let current = holds.1.get(&key) == Some(&id);
+        if current {
+            self.checkpoint_holds
+                .stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
+        }
+        current
+    }
+
+    /// The worker captured `turn_id`'s checkout and will record it `ready`: unless its hold has
+    /// already expired (it is stale), takes the hold over from its expiry, which can then no
+    /// longer fire. The hold itself stays until the worker releases it, after the record.
+    /// Returns whether the capture may be recorded. One atomic decision against
+    /// `expire_checkpoint_hold`: a turn ends either `ready` or stale, never both.
+    pub(crate) fn claim_checkpoint_completion(&self, thread_id: &str, turn_id: &str) -> bool {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let mut holds = self
+            .checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale = self
+            .checkpoint_holds
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key);
+        if !stale && let Some(id) = holds.1.get_mut(&key) {
+            // Hold ids start at 1, so no expiry owns id 0.
+            *id = 0;
+        }
+        !stale
+    }
+
+    /// Whether `turn_id`'s hold expired before the worker captured it.
+    pub(crate) fn checkpoint_is_stale(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.checkpoint_holds
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(thread_id.to_owned(), turn_id.to_owned()))
+    }
+
+    /// Forgets a deleted thread: releases its checkpoint holds and stale marks.
+    pub(crate) fn release_thread_checkpoint_holds(&self, thread_id: &str) {
+        self.release_checkpoint_holds(|((thread, _), _)| thread == thread_id);
+        self.checkpoint_holds
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(thread, _)| thread != thread_id);
+    }
+
+    /// Releases the holds `matches` picks, waking delivery. Returns whether any was released.
+    fn release_checkpoint_holds(
+        &self,
+        matches: impl Fn((&(String, String), &u64)) -> bool,
+    ) -> bool {
+        let released = {
+            let mut holds = self
+                .checkpoint_holds
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = holds.1.len();
+            holds.1.retain(|key, id| !matches((key, id)));
+            holds.1.len() != before
+        };
+        if released {
+            self.wake_turn_delivery();
+        }
+        released
+    }
+
+    /// Whether the thread's turn deliveries wait for an ended turn's checkpoint.
+    pub(crate) fn turns_held_for_checkpoint(&self, thread_id: &str) -> bool {
+        self.checkpoint_holds
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .keys()
+            .any(|(thread, _)| thread == thread_id)
+    }
+
+    /// Cancelled when the engine shuts down, for tasks that must not outlive it.
+    pub(crate) fn shutdown_signal(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Where the event pump reports a compaction's tagged turn to the compaction effect.
@@ -3455,6 +3660,7 @@ async fn process_envelope(
         &command,
         &prepared_worktree,
         &occurred_at,
+        command_claim.actor().is_some(),
     )
     .await
     {
@@ -3505,6 +3711,12 @@ async fn process_envelope(
                 "updatedAt": turn.created_at,
             }),
         ));
+    }
+
+    if let Some(actor) = command_claim.actor() {
+        for event in &mut planned {
+            event.metadata["actor"] = actor.clone();
+        }
     }
 
     reserve_project_create_side_effect(
@@ -3885,6 +4097,7 @@ async fn plan_command(
     command: &OrchestrationCommand,
     prepared_worktree: &PreparedWorktreeCommand,
     occurred_at: &str,
+    from_agent: bool,
 ) -> Result<Vec<NewOrchestrationEvent>, OrchestrationError> {
     let metadata = Value::Object(Default::default());
     match command {
@@ -4290,6 +4503,7 @@ async fn plan_command(
             title,
             kind,
             host_thread_id,
+            purpose,
             model_selection,
             runtime_mode,
             interaction_mode,
@@ -4298,6 +4512,15 @@ async fn plan_command(
             created_at,
         } => {
             require_project(model, command, project_id)?;
+            if purpose
+                .as_deref()
+                .is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS)
+            {
+                return invariant(
+                    command,
+                    format!("A thread's purpose is at most {MAX_THREAD_PURPOSE_CHARS} characters."),
+                );
+            }
             if kind.as_deref() == Some("default")
                 && model.threads.values().any(|thread| {
                     thread.project_id == project_id.as_str()
@@ -4340,6 +4563,7 @@ async fn plan_command(
                 "hostThreadId",
                 host_thread_id.as_ref().map(|v| json!(v)),
             );
+            insert_optional(&mut payload, "purpose", purpose.as_ref().map(|v| json!(v)));
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -4557,6 +4781,35 @@ async fn plan_command(
                         );
                     };
                     require_project(model, command, &create.project_id)?;
+                    if create
+                        .purpose
+                        .as_deref()
+                        .is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS)
+                    {
+                        return invariant(
+                            command,
+                            format!(
+                                "A thread's purpose is at most {MAX_THREAD_PURPOSE_CHARS} characters."
+                            ),
+                        );
+                    }
+                    let mut created_payload = json!({
+                        "threadId":thread_id,
+                        "projectId":create.project_id,
+                        "title":create.title,
+                        "modelSelection":create.model_selection,
+                        "runtimeMode":create.runtime_mode,
+                        "interactionMode":create.interaction_mode,
+                        "branch":create.branch,
+                        "worktreePath":create.worktree_path,
+                        "createdAt":create.created_at,
+                        "updatedAt":create.created_at,
+                    });
+                    insert_optional(
+                        &mut created_payload,
+                        "purpose",
+                        create.purpose.as_ref().map(|v| json!(v)),
+                    );
                     let event = make_event(
                         "thread.created",
                         "thread",
@@ -4564,18 +4817,7 @@ async fn plan_command(
                         &create.created_at,
                         command_id,
                         metadata.clone(),
-                        json!({
-                            "threadId":thread_id,
-                            "projectId":create.project_id,
-                            "title":create.title,
-                            "modelSelection":create.model_selection,
-                            "runtimeMode":create.runtime_mode,
-                            "interactionMode":create.interaction_mode,
-                            "branch":create.branch,
-                            "worktreePath":create.worktree_path,
-                            "createdAt":create.created_at,
-                            "updatedAt":create.created_at,
-                        }),
+                        created_payload,
                     );
                     (
                         ThreadState {
@@ -4621,6 +4863,43 @@ async fn plan_command(
                     );
                 }
             }
+            // Provenance (#139, slice X4): only an outside agent's panel message names its
+            // source, so the claim must carry the server-stamped actor, and the source must
+            // share the target's worktree (the same host thread, or one hosts the other).
+            if let Some(source_thread_id) = &message.source_thread_id {
+                if !from_agent {
+                    return invariant(
+                        command,
+                        "Only an outside agent's panel message may name a source thread."
+                            .to_owned(),
+                    );
+                }
+                let host_of = |id: &str, state: &ThreadState| {
+                    state
+                        .host_thread_id
+                        .clone()
+                        .unwrap_or_else(|| id.to_owned())
+                };
+                let shares_worktree = source_thread_id != thread_id
+                    && model.threads.get(source_thread_id).is_some_and(|source| {
+                        source.deleted_at.is_none()
+                            && host_of(source_thread_id, source) == host_of(thread_id, &thread)
+                    });
+                if !shares_worktree {
+                    return invariant(
+                        command,
+                        format!(
+                            "Source thread '{source_thread_id}' is not another thread of this thread's worktree."
+                        ),
+                    );
+                }
+            }
+            let mut user_payload = json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at});
+            insert_optional(
+                &mut user_payload,
+                "sourceThreadId",
+                message.source_thread_id.as_ref().map(|v| json!(v)),
+            );
             let user = make_event(
                 "thread.message-sent",
                 "thread",
@@ -4628,7 +4907,7 @@ async fn plan_command(
                 created_at,
                 command_id,
                 metadata.clone(),
-                json!({"threadId":thread_id,"messageId":message.message_id,"role":"user","text":message.text,"attachments":message.attachments,"turnId":null,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
+                user_payload,
             );
             if *queued == Some(true) {
                 return Ok(created.into_iter().chain([user]).collect());
@@ -6837,10 +7116,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -6865,6 +7144,14 @@ fn apply_threads_projector_tx(
                 required_str(payload, "createdAt")?,
                 required_str(payload, "updatedAt")?,
                 optional_string(payload.get("hostThreadId")),
+                event
+                    .event
+                    .metadata
+                    .get("actor")
+                    .map(|actor| json_string(
+                        &json!({ "actor": actor, "purpose": payload.get("purpose") }),
+                    ))
+                    .transpose()?,
             ],
         )?;
     } else {
@@ -7281,14 +7568,16 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (message_id) DO UPDATE SET \
            thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_messages.text || excluded.text WHEN excluded.text = '' THEN projection_thread_messages.text ELSE excluded.text END, \
            attachments_json = COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
            is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, \
-           resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id)",
+           resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id), \
+           actor_json = COALESCE(excluded.actor_json, projection_thread_messages.actor_json), \
+           source_thread_id = COALESCE(excluded.source_thread_id, projection_thread_messages.source_thread_id)",
         params![
             required_str(payload, "messageId")?,
             required_str(payload, "threadId")?,
@@ -7300,6 +7589,15 @@ fn apply_messages_projector_tx(
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
             optional_string(payload.get("resendOf")),
+            // Only a message a person would send carries who sent it.
+            event
+                .event
+                .metadata
+                .get("actor")
+                .filter(|_| payload.get("role").and_then(Value::as_str) == Some("user"))
+                .map(json_string)
+                .transpose()?,
+            optional_string(payload.get("sourceThreadId")),
         ],
     )?;
     Ok(())
@@ -7759,18 +8057,27 @@ fn apply_turns_projector_tx(
             let turn_id = required_str(payload, "turnId")?;
             let completed_at = required_str(payload, "completedAt")?;
             let running = transaction.query_row("SELECT 1 FROM projection_thread_sessions WHERE thread_id = ? AND status = 'running' AND active_turn_id = ?", params![thread_id, turn_id], |_| Ok(())).optional()?.is_some();
-            let status = required_str(payload, "status")?;
-            let next_state = if running {
-                "running"
-            } else if status == "error" {
-                "error"
-            } else {
-                "completed"
-            };
+            // A checkpoint's status says whether its capture is usable (`error`: given up, never
+            // restored), not how the turn went: the turn keeps the state its session gave it.
+            let next_state = if running { "running" } else { "completed" };
             let checkpoint_turn_count = required_i64(payload, "checkpointTurnCount")?;
+            // `error` is terminal: a turn's checkpoint given up stays so, whatever record of the
+            // same checkpoint follows, so nothing can make it a capture or a revert target again.
+            let given_up = transaction.query_row("SELECT 1 FROM projection_turns WHERE thread_id = ? AND turn_id = ? AND checkpoint_turn_count = ? AND checkpoint_status = 'error'", params![thread_id, turn_id, checkpoint_turn_count], |_| Ok(())).optional()?.is_some();
+            let status = if given_up {
+                "error".to_owned()
+            } else {
+                required_str(payload, "status")?
+            };
             transaction.execute("UPDATE projection_turns SET checkpoint_turn_count = NULL, checkpoint_ref = NULL, checkpoint_status = NULL, checkpoint_files_json = '[]' WHERE thread_id = ? AND turn_id <> ? AND checkpoint_turn_count = ?", params![thread_id, turn_id, checkpoint_turn_count])?;
-            let files = json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?;
-            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = ?, state = ?, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
+            let files = if given_up {
+                "[]".to_owned()
+            } else {
+                json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?
+            };
+            // A turn its session ended interrupted or failed keeps that state, and an event that
+            // names no answer keeps the one the turn already has.
+            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
             if updated == 0 {
                 transaction.execute(
                     TURN_UPSERT_SQL,
@@ -8120,6 +8427,9 @@ fn upsert_projection_state_tx(
 }
 
 fn infer_actor_kind(event: &NewOrchestrationEvent) -> &'static str {
+    if event.metadata.get("actor").is_some() {
+        return "mcp-client";
+    }
     match event.command_id.as_deref() {
         Some(command_id) if command_id.starts_with("provider:") => "provider",
         Some(command_id) if command_id.starts_with("server:") => "server",
@@ -8864,6 +9174,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -9125,6 +9436,7 @@ mod tests {
                         title: id.to_owned(),
                         kind: Some(kind.to_owned()),
                         host_thread_id: host.map(str::to_owned),
+                        purpose: None,
                         model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                         runtime_mode: "full-access".to_owned(),
                         interaction_mode: "default".to_owned(),
@@ -9466,6 +9778,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -10331,6 +10644,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host_id.clone()),
+                purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
                 interaction_mode: "default".to_owned(),
@@ -10415,6 +10729,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host.to_owned()),
+                purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
                 interaction_mode: "default".to_owned(),

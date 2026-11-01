@@ -56,6 +56,14 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (43, "worktree_removal_receipts"),
     (53, "pull_request_snapshots"),
     (55, "projection_thread_reasoning"),
+    (58, "mcp_tool_requests"),
+    (60, "mcp_activity"),
+    (61, "webhook_endpoints"),
+    (61, "webhook_deliveries"),
+    (61, "webhook_state"),
+    (62, "mcp_oauth_clients"),
+    (62, "mcp_oauth_authorizations"),
+    (62, "mcp_oauth_refresh_tokens"),
 ];
 
 #[derive(Debug, Error)]
@@ -688,6 +696,11 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(55, "ProjectionThreadReasoning", migration_055),
     Migration::new(56, "ThreadCompactions", migration_056),
     Migration::new(57, "ProjectionThreadAgentStatus", migration_057),
+    Migration::new(58, "McpClientAccessAndRequests", migration_058),
+    Migration::new(59, "McpToolOutcomes", migration_059),
+    Migration::new(60, "McpActorAttribution", migration_060),
+    Migration::new(61, "Webhooks", migration_061),
+    Migration::new(62, "McpOAuth", migration_062),
 ];
 
 impl Migration {
@@ -2683,6 +2696,225 @@ fn migration_057(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_058(transaction: &Transaction<'_>) -> Result<()> {
+    // Outside agents over MCP (#139): the access ceiling an `mcp-client` pairing link carries
+    // into its session, and the first commands of each retryable tool call, so a retry
+    // dispatches the same payloads and command admission replays them by receipt.
+    for table in ["auth_pairing_links", "auth_sessions"] {
+        if table_exists(transaction, table)? && !table_has_column(transaction, table, "mcp_access")?
+        {
+            transaction
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN mcp_access TEXT;"))?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_tool_requests (
+           session_id TEXT NOT NULL,
+           client_request_id TEXT NOT NULL,
+           tool TEXT NOT NULL,
+           arguments_digest TEXT NOT NULL,
+           commands_json TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY (session_id, client_request_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_tool_requests_created_at
+           ON mcp_tool_requests(created_at);",
+    )?;
+    Ok(())
+}
+
+fn migration_059(transaction: &Transaction<'_>) -> Result<()> {
+    // Recorded outcomes for MCP tools whose RPCs carry no command receipt (#139, C4). A
+    // slice-1 row reads as `commands` and keeps its receipt replay; a recorded call's row goes
+    // `running`, then `done`, `failed` or `unknown`, with the bounded tool result.
+    if table_exists(transaction, "mcp_tool_requests")? {
+        if !table_has_column(transaction, "mcp_tool_requests", "state")? {
+            transaction.execute_batch(
+                "ALTER TABLE mcp_tool_requests ADD COLUMN state TEXT NOT NULL DEFAULT 'commands';",
+            )?;
+        }
+        if !table_has_column(transaction, "mcp_tool_requests", "outcome_json")? {
+            transaction
+                .execute_batch("ALTER TABLE mcp_tool_requests ADD COLUMN outcome_json TEXT;")?;
+        }
+    }
+    Ok(())
+}
+
+fn migration_060(transaction: &Transaction<'_>) -> Result<()> {
+    // Who acted (#139, slice X1): the outside agent behind a user message, a message's source
+    // thread (a panel's provenance), and the agent and purpose behind a thread it created; the
+    // session's access before a person took it over, so Hand back restores exactly that; and
+    // one content-free row per mutating MCP tool call.
+    for (table, column) in [
+        ("projection_thread_messages", "actor_json"),
+        ("projection_thread_messages", "source_thread_id"),
+        ("projection_threads", "requester_json"),
+        ("auth_sessions", "mcp_access_hand_back"),
+    ] {
+        if table_exists(transaction, table)? && !table_has_column(transaction, table, column)? {
+            transaction.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_activity (
+           activity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+           occurred_at TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           label TEXT,
+           tool TEXT NOT NULL,
+           thread_id TEXT,
+           outcome TEXT NOT NULL,
+           target_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_activity_occurred_at
+           ON mcp_activity(occurred_at);",
+    )?;
+    // The running turns an agent started, which keep it active and which Stop interrupts:
+    // only running turns are indexed, so the lookup reads those and nothing else.
+    if table_exists(transaction, "projection_turns")? {
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_projection_turns_running
+               ON projection_turns(thread_id, turn_id) WHERE state = 'running';",
+        )?;
+    }
+    // `changes_since` (slice X3) maps a session update by the thread's previous one; this
+    // seeks it directly instead of walking every event between the two. Partial, so only
+    // session updates pay for it on write. A database that already ran 60 just lacks it.
+    if table_exists(transaction, "orchestration_events")? {
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_orch_events_thread_session_updates
+               ON orchestration_events(aggregate_kind, stream_id, event_type, sequence)
+               WHERE event_type = 'thread.session-set';",
+        )?;
+    }
+    Ok(())
+}
+
+fn migration_061(transaction: &Transaction<'_>) -> Result<()> {
+    // Outbound webhooks (#139, slice X8): each endpoint (its secret lives in the secret store,
+    // never here), the durable delivery queue and log, and the dispatcher's positions in its
+    // sources (the change feed's cursor and the last findings delivered).
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS webhook_endpoints (
+           endpoint_id TEXT PRIMARY KEY NOT NULL,
+           name TEXT NOT NULL,
+           url TEXT NOT NULL,
+           enabled INTEGER NOT NULL DEFAULT 1,
+           event_types_json TEXT NOT NULL,
+           project_id TEXT,
+           paired_session_id TEXT,
+           consecutive_failures INTEGER NOT NULL DEFAULT 0,
+           disabled_reason TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           revision INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS webhook_deliveries (
+           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+           delivery_id TEXT NOT NULL UNIQUE,
+           endpoint_id TEXT NOT NULL,
+           event_id TEXT NOT NULL,
+           event_type TEXT NOT NULL,
+           body TEXT NOT NULL,
+           state TEXT NOT NULL,
+           attempts INTEGER NOT NULL DEFAULT 0,
+           next_attempt_ms INTEGER NOT NULL,
+           last_status INTEGER,
+           last_error TEXT,
+           latency_ms INTEGER,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           endpoint_revision INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
+           ON webhook_deliveries(state, next_attempt_ms);
+         CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_endpoint
+           ON webhook_deliveries(endpoint_id, sequence);
+         CREATE TABLE IF NOT EXISTS webhook_state (
+           key TEXT PRIMARY KEY NOT NULL,
+           value TEXT NOT NULL
+         );",
+    )?;
+    ensure_webhook_revisions(transaction)
+}
+
+fn migration_062(transaction: &Transaction<'_>) -> Result<()> {
+    // Remote Streamable HTTP with MCP OAuth (#139, slice R): dynamically registered public
+    // clients, the pending authorizations a person approves in BiBCode (codes and the status
+    // cookie are stored only as hashes), the single-use refresh tokens of each grant, and the
+    // resource (`<origin>/mcp`) an OAuth session is bound to. Its own times are epoch
+    // milliseconds, so expiry and pruning compare numbers.
+    if table_exists(transaction, "auth_sessions")?
+        && !table_has_column(transaction, "auth_sessions", "mcp_resource")?
+    {
+        transaction.execute_batch("ALTER TABLE auth_sessions ADD COLUMN mcp_resource TEXT;")?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+           client_id TEXT PRIMARY KEY NOT NULL,
+           client_name TEXT NOT NULL,
+           redirect_uris_json TEXT NOT NULL,
+           source_key TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           approved_at INTEGER,
+           last_used_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_clients_source
+           ON mcp_oauth_clients(source_key, created_at);
+         CREATE TABLE IF NOT EXISTS mcp_oauth_authorizations (
+           id TEXT PRIMARY KEY NOT NULL,
+           user_code TEXT NOT NULL UNIQUE,
+           client_id TEXT NOT NULL,
+           redirect_uri TEXT NOT NULL,
+           code_challenge TEXT NOT NULL,
+           state TEXT,
+           resource TEXT NOT NULL,
+           scopes TEXT NOT NULL,
+           origin TEXT NOT NULL,
+           source_key TEXT NOT NULL,
+           status_cookie_hash TEXT NOT NULL,
+           status TEXT NOT NULL,
+           approved_access TEXT,
+           approved_scopes TEXT,
+           code_hash TEXT UNIQUE,
+           code_expires_at INTEGER,
+           session_id TEXT,
+           created_at INTEGER NOT NULL,
+           expires_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_authorizations_status
+           ON mcp_oauth_authorizations(status, created_at);
+         CREATE TABLE IF NOT EXISTS mcp_oauth_refresh_tokens (
+           token_hash TEXT PRIMARY KEY NOT NULL,
+           session_id TEXT NOT NULL,
+           client_id TEXT NOT NULL,
+           issued_at INTEGER NOT NULL,
+           used_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_refresh_tokens_session
+           ON mcp_oauth_refresh_tokens(session_id);",
+    )?;
+    Ok(())
+}
+
+/// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
+/// before it was released. A development store that ran the earlier 61 gets them here: the
+/// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
+pub(crate) fn ensure_webhook_revisions(transaction: &Transaction<'_>) -> Result<()> {
+    for (table, column) in [
+        ("webhook_endpoints", "revision"),
+        ("webhook_deliveries", "endpoint_revision"),
+    ] {
+        if table_exists(transaction, table)? && !table_has_column(transaction, table, column)? {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2881,6 +3113,177 @@ mod tests {
     }
 
     #[test]
+    fn migration_059_keeps_slice_one_rows_replayable_and_records_outcomes() -> rusqlite::Result<()>
+    {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(58))?;
+        connection.execute(
+            "INSERT INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at) VALUES ('s', 'k', 'start_thread', 'd', '[]', '2026-10-30T00:00:00Z')",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [59, 60, 61, 62]
+        );
+        let (state, outcome) = connection.query_row(
+            "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        assert_eq!((state.as_str(), outcome), ("commands", None));
+        connection.execute(
+            "INSERT INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at, state, outcome_json) VALUES ('s', 'push', 'git_push', 'd', '{}', '2026-10-30T00:00:00Z', 'done', '{}')",
+            [],
+        )?;
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_059(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_061_adds_the_webhook_tables() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(60))?;
+        assert!(!table_exists(&connection, "webhook_endpoints")?);
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [61, 62]
+        );
+        connection.execute(
+            "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO webhook_deliveries (delivery_id, endpoint_id, event_id, event_type, body, state, next_attempt_ms, created_at, updated_at) VALUES ('d', 'w', 'e', 'webhook.test', '{}', 'pending', 0, '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO webhook_state (key, value) VALUES ('feed', 'v1.0.0')",
+            [],
+        )?;
+        let revisions: (i64, i64) = connection.query_row(
+            "SELECT (SELECT revision FROM webhook_endpoints WHERE endpoint_id = 'w'), \
+                    (SELECT endpoint_revision FROM webhook_deliveries WHERE delivery_id = 'd')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(revisions, (0, 0));
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_061(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_062_adds_the_oauth_tables_and_the_session_resource() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(61))?;
+        assert!(!table_exists(&connection, "mcp_oauth_clients")?);
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [62]
+        );
+        for table in [
+            "mcp_oauth_clients",
+            "mcp_oauth_authorizations",
+            "mcp_oauth_refresh_tokens",
+        ] {
+            assert!(table_exists(&connection, table)?, "{table}");
+        }
+        connection.prepare("SELECT mcp_resource FROM auth_sessions LIMIT 0")?;
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_062(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_ran_the_earlier_061_gains_the_revisions() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, None)?;
+        // The shape of the first, unreleased 61.
+        connection.execute_batch(
+            "ALTER TABLE webhook_endpoints DROP COLUMN revision; \
+             ALTER TABLE webhook_deliveries DROP COLUMN endpoint_revision;",
+        )?;
+        connection.execute(
+            "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', 't', 't')",
+            [],
+        )?;
+        let transaction = connection.transaction()?;
+        super::ensure_webhook_revisions(&transaction)?;
+        super::ensure_webhook_revisions(&transaction)?;
+        transaction.commit()?;
+        let revision: i64 = connection.query_row(
+            "SELECT revision FROM webhook_endpoints WHERE endpoint_id = 'w'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(revision, 0);
+        connection.prepare("SELECT endpoint_revision FROM webhook_deliveries LIMIT 0")?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_060_adds_attribution_columns_and_the_activity_log() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(59))?;
+        assert!(!table_exists(&connection, "mcp_activity")?);
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [60, 61, 62]
+        );
+        for (table, column) in [
+            ("projection_thread_messages", "actor_json"),
+            ("projection_thread_messages", "source_thread_id"),
+            ("projection_threads", "requester_json"),
+            ("auth_sessions", "mcp_access_hand_back"),
+        ] {
+            assert!(
+                connection
+                    .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+                    .is_ok(),
+                "{table}.{column}"
+            );
+        }
+        connection.execute(
+            "INSERT INTO mcp_activity (occurred_at, session_id, label, tool, thread_id, outcome, target_json) VALUES ('2026-10-30T00:00:00Z', 's', 'Claude Code', 'git_commit', 't', 'success', '{}')",
+            [],
+        )?;
+        let session_index: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_orch_events_thread_session_updates'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(session_index, 1, "the session update index (slice X3)");
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_060(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_055_adds_the_reasoning_projection_and_its_indexes() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(54))?;
@@ -2893,7 +3296,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57]
+            [55, 56, 57, 58, 59, 60, 61, 62]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3622,7 +4025,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=57).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=62).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3682,6 +4085,11 @@ mod tests {
                 (55, "ProjectionThreadReasoning"),
                 (56, "ThreadCompactions"),
                 (57, "ProjectionThreadAgentStatus"),
+                (58, "McpClientAccessAndRequests"),
+                (59, "McpToolOutcomes"),
+                (60, "McpActorAttribution"),
+                (61, "Webhooks"),
+                (62, "McpOAuth"),
             ],
         );
         assert_eq!(
@@ -3778,7 +4186,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 41);
+        assert_eq!(second.len(), 46);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -3786,6 +4194,10 @@ mod tests {
         assert_eq!(second[38].id, 55);
         assert_eq!(second[39].id, 56);
         assert_eq!(second[40].id, 57);
+        assert_eq!(second[41].id, 58);
+        assert_eq!(second[42].id, 59);
+        assert_eq!(second[43].id, 60);
+        assert_eq!(second[44].id, 61);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3797,7 +4209,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 31);
+        assert_eq!(application_table_count, 39);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3893,7 +4305,8 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+                61, 62
             ]
         );
         let policy = connection.query_row(
@@ -3932,7 +4345,8 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
+                62
             ]
         );
         let pin = connection.query_row(
@@ -3962,7 +4376,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
             ]
         );
         let pin = connection.query_row(
@@ -4103,7 +4517,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57]
+            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62]
         );
         assert_eq!(
             connection.query_row(
@@ -4132,7 +4546,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 24);
+        assert_eq!(applied.len(), 29);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -4157,6 +4571,10 @@ mod tests {
         assert_eq!(applied[21].id, 55);
         assert_eq!(applied[22].id, 56);
         assert_eq!(applied[23].id, 57);
+        assert_eq!(applied[24].id, 58);
+        assert_eq!(applied[25].id, 59);
+        assert_eq!(applied[26].id, 60);
+        assert_eq!(applied[27].id, 61);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

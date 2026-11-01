@@ -33,6 +33,7 @@ import {
   DropdownMenuTrigger,
 } from "~/components/ui/menu";
 import { CenterHeaderIconButton } from "./CenterHeaderIconButton";
+import { PanelTabAgentBadge, PanelTabAgentTooltip, usePanelRequester } from "./PanelTabAgentBadge";
 import type { CenterPanelTabDragData } from "./centerPanelDnd";
 
 interface CenterPanelTabsProps {
@@ -134,6 +135,7 @@ function SortableCenterTab({
       title,
     } satisfies CenterPanelTabDragData,
   });
+  const requester = usePanelRequester(surface.kind === "chat" ? surface.threadId : null);
 
   return (
     <div
@@ -170,10 +172,14 @@ function SortableCenterTab({
             >
               <CenterSurfaceIcon kind={surface.kind} />
               <span className="truncate">{title}</span>
+              {requester ? <PanelTabAgentBadge requester={requester} /> : null}
             </button>
           }
         />
-        <TooltipPopup>{title}</TooltipPopup>
+        <TooltipPopup>
+          {title}
+          {requester ? <PanelTabAgentTooltip requester={requester} /> : null}
+        </TooltipPopup>
       </Tooltip>
       <button
         type="button"

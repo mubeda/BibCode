@@ -1,4 +1,5 @@
 import { QueuedMessageTimelineRow } from "./QueuedMessageTimelineRow";
+import { MessageProvenance } from "./MessageProvenance";
 import { AttachmentUploadNotice, type PendingAttachmentUpload } from "./AttachmentUploadNotice";
 import { deliveryProviderLabel, waitsBehind, type QueuedCardStatus } from "../ChatView.logic";
 import {
@@ -101,6 +102,7 @@ import {
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
   resolveTimelineMaintainScrollAtEnd,
+  resolveTimelineMaintainVisibleContentPosition,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
@@ -231,6 +233,11 @@ interface MessagesTimelineProps {
    * in the bottom region's height leaves the line they read in place. Defaults to true.
    */
   followsEnd?: boolean;
+  /**
+   * Whether a scroll key's native scroll may still be about to start, during which LegendList
+   * keeps no content position, since a scroll of its own would cancel the key's (#207).
+   */
+  nativeScrollPending?: boolean;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   queuedMessages: ReadonlyArray<TimelineMessage>;
   queuedStatuses: ReadonlyArray<QueuedCardStatus>;
@@ -269,6 +276,11 @@ interface MessagesTimelineProps {
     readonly previous: number;
     readonly size: number;
   }) => void;
+  /**
+   * The latest turn settled: its "Worked for" row arrived and the rows that showed its work went,
+   * with no new entry. Called once the list has taken the new rows.
+   */
+  onTurnSettled?: () => void;
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
@@ -297,6 +309,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   listRef,
   onListMount,
   followsEnd = true,
+  nativeScrollPending = false,
   timelineEntries,
   queuedMessages,
   queuedStatuses,
@@ -330,6 +343,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onAnchorReady,
   onAnchorSizeChanged,
   onRowSizeChanged,
+  onTurnSettled,
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
@@ -570,6 +584,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     ],
   );
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
+  // Runs after LegendList's own layout effects have taken the settled turn's rows (#208).
+  const settlingTurnIdRef = useRef(unsettledTurnId);
+  useLayoutEffect(() => {
+    const settled = settlingTurnIdRef.current !== null && unsettledTurnId === null;
+    settlingTurnIdRef.current = unsettledTurnId;
+    if (settled) {
+      onTurnSettled?.();
+    }
+  }, [onTurnSettled, unsettledTurnId]);
   const activityState = useMemo<TimelineRowActivityState>(
     () => ({
       isWorking,
@@ -690,12 +713,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                     anchored: !!anchoredEndSpace,
                     followsEnd,
                   })}
-                  // A row that changes size above the first visible one, such as a Mermaid
-                  // diagram replacing its source, keeps the line the user reads in place.
-                  maintainVisibleContentPosition={{
-                    data: true,
-                    size: true,
-                  }}
+                  maintainVisibleContentPosition={resolveTimelineMaintainVisibleContentPosition(
+                    nativeScrollPending,
+                  )}
                   onScroll={handleScroll}
                   {...(onRowSizeChanged ? { onItemSizeChanged: onRowSizeChanged } : {})}
                   onMetricsChange={onListMetricsChange}
@@ -1305,6 +1325,11 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
   return (
     <div className="group flex flex-col items-end gap-1">
+      <MessageProvenance
+        actor={row.message.actor}
+        sourceThreadId={row.message.sourceThreadId}
+        environmentId={ctx.activeThreadEnvironmentId}
+      />
       <div className="relative max-w-[80%] rounded-2xl border border-border bg-secondary p-3">
         {regularImages.length > 0 && (
           <div className="mb-2 grid max-w-[420px] grid-cols-2 gap-2">

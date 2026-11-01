@@ -19,8 +19,9 @@ fn main() {
             .block_on(bibcode_server::open_url::run_open_url(&url));
         std::process::exit(code);
     }
-    // `<desktop exe> profiler …`: the desktop install ships no separate `bibcode`, so the
-    // profiler CLI runs here, with no Tauri, no window and no single-instance check.
+    // `<desktop exe> profiler …`, `diagnostics …` and `mcp …` (#139): the desktop install ships
+    // no separate `bibcode`, so the command runs here, after the crash hook, with no Tauri, no
+    // window and no single-instance check.
     if let Some(code) =
         bibcode_server::diagnostics::profiler::cli::desktop_dispatch(attach_parent_console)
     {

@@ -1,0 +1,169 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "type": "snapshot",
+      "intents": [
+        {
+          "kind": "focus",
+          "intentId": "m",
+          "threadId": "R",
+          "surface": "thread",
+          "path": null,
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "w!t}",
+            "label": null
+          },
+          "createdAt": "LUt33Jb,jm",
+          "expiresAt": "prototype",
+          "expiresInMs": 5
+        },
+        {
+          "kind": "focus",
+          "intentId": "prototype",
+          "threadId": ">",
+          "surface": "sourceControl",
+          "path": "i;8XT3",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "__proto__",
+            "label": null
+          },
+          "createdAt": "YB$^C%{",
+          "expiresAt": "",
+          "expiresInMs": 82
+        },
+        {
+          "kind": "focus",
+          "intentId": "_V_tb|;4HN",
+          "threadId": "i",
+          "surface": "thread",
+          "path": "",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "}ue/",
+            "label": ""
+          },
+          "createdAt": "__proto__",
+          "expiresAt": "",
+          "expiresInMs": 97
+        },
+        {
+          "kind": "focus",
+          "intentId": "''0sC{mz)5",
+          "threadId": "2x;106}UU",
+          "surface": "files",
+          "path": "EZiA$EQ",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "😀",
+            "label": null
+          },
+          "createdAt": "",
+          "expiresAt": "o)t.072/p$",
+          "expiresInMs": 66
+        },
+        {
+          "kind": "commitMessage",
+          "intentId": "-1",
+          "bootId": ")",
+          "sequence": 28,
+          "threadId": "0",
+          "cwd": "",
+          "message": "tKG7k?uW4O",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "�",
+            "label": "0"
+          },
+          "createdAt": "Q|+XRPH",
+          "expiresAt": "`jaG7y%?cW",
+          "expiresInMs": 59
+        },
+        {
+          "kind": "focus",
+          "intentId": "}nqC:54i",
+          "threadId": "<*;",
+          "surface": "sourceControl",
+          "path": "�",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "\"JOzHl1gb}",
+            "label": ""
+          },
+          "createdAt": "f>P-x7Q7pA",
+          "expiresAt": "\t",
+          "expiresInMs": 1
+        },
+        {
+          "kind": "commitMessage",
+          "intentId": "Z!J!{$N/@I",
+          "bootId": "",
+          "sequence": 63,
+          "threadId": "�",
+          "cwd": "prototype",
+          "message": "",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "",
+            "label": null
+          },
+          "createdAt": "NmI;'t5:b",
+          "expiresAt": "^fw#VTd)1J",
+          "expiresInMs": 3
+        },
+        {
+          "kind": "commitMessage",
+          "intentId": "l",
+          "bootId": "rK7PO/",
+          "sequence": 34,
+          "threadId": "@`T*,eH",
+          "cwd": "prototype",
+          "message": "{PaZw",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "",
+            "label": "0"
+          },
+          "createdAt": "�",
+          "expiresAt": "",
+          "expiresInMs": 0
+        },
+        {
+          "kind": "focus",
+          "intentId": "�",
+          "threadId": "UM`\\zK",
+          "surface": "thread",
+          "path": null,
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "toString",
+            "label": null
+          },
+          "createdAt": "\t",
+          "expiresAt": "_dr",
+          "expiresInMs": 41
+        },
+        {
+          "kind": "commitMessage",
+          "intentId": "",
+          "bootId": "Bk^$3I&m",
+          "sequence": 1,
+          "threadId": "|<gH!12\\GR",
+          "cwd": "prototype",
+          "message": "%Ns}SR<-x8",
+          "actor": {
+            "kind": "mcp-client",
+            "clientId": "C;*y6KpRhZ",
+            "label": null
+          },
+          "createdAt": "toString",
+          "expiresAt": "0",
+          "expiresInMs": 3
+        }
+      ]
+    }
+  ]
+}

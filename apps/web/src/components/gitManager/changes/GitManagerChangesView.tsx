@@ -175,6 +175,17 @@ function errorPanel(title: string, message: string, retry: RetryButtonProps) {
   );
 }
 
+const MAX_KEPT_PATHS_NAMED = 3;
+
+/** What a permanent discard left in place (an ignored file, or one in a linked folder). */
+function keptAfterPermanentDiscard(paths: ReadonlyArray<string>): string {
+  const named = paths.slice(0, MAX_KEPT_PATHS_NAMED).join(", ");
+  const more =
+    paths.length > MAX_KEPT_PATHS_NAMED ? ` and ${paths.length - MAX_KEPT_PATHS_NAMED} more` : "";
+  const pronoun = paths.length === 1 ? "it" : "them";
+  return `Kept ${named}${more}: ignored files and files in linked folders can't be discarded here. Remove ${pronoun} in your file manager.`;
+}
+
 function gitManagerMutationErrorMessage(error: unknown): string {
   if (isGitManagerOperationError(error)) {
     return error.blocked?.message ?? error.message;
@@ -513,6 +524,9 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         });
         return "keep-open";
       }
+      if (result.value.trashUnavailable.length > 0) {
+        setMutationError(keptAfterPermanentDiscard(result.value.trashUnavailable));
+      }
     });
   }, [cwd, discard, environmentId, pendingDiscard]);
   const handleOpenExternal = useCallback(
@@ -774,6 +788,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         <GitManagerDiscardDialog
           disposition={pendingDiscard.disposition}
           errorMessage={mutationError}
+          putBackRestoresInPlace={serverConfig?.environment?.platform?.os === "windows"}
           isBusy={mutationBusy}
           open
           paths={pendingDiscard.paths}

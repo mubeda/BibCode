@@ -14,8 +14,21 @@ const decodeDownloadInput = Schema.decodeUnknownSync(ProjectCreateDownloadUrlInp
 const decodeDownloadResult = Schema.decodeUnknownSync(ProjectCreateDownloadUrlResult);
 const decodeUploadInput = Schema.decodeUnknownSync(ProjectCreateUploadUrlInput);
 const decodeUploadResult = Schema.decodeUnknownSync(ProjectCreateUploadUrlResult);
+const decodeTransferError = Schema.decodeUnknownSync(ProjectTransferError);
 
 describe("transfer contracts", () => {
+  it("names a transfer refused because it is Git's own metadata", () => {
+    expect(
+      decodeTransferError({
+        _tag: "ProjectTransferError",
+        cwd: "/repo",
+        relativePath: ".git",
+        failure: "git_metadata",
+        message: ".git is Git's own metadata (.git).",
+      }).failure,
+    ).toBe("git_metadata");
+  });
+
   it("registers both methods", () => {
     expect(WS_METHODS.projectsCreateDownloadUrl).toBe("projects.createDownloadUrl");
     expect(WS_METHODS.projectsCreateUploadUrl).toBe("projects.createUploadUrl");
@@ -46,6 +59,20 @@ describe("transfer contracts", () => {
       decodeUploadResult({ relativeUrl: "/api/transfers/x.y", expiresAt: 1, maxBytes: 1024 })
         .maxBytes,
     ).toBe(1024);
+  });
+
+  it("lets an upload mint bind overwrite, and leaves it unbound by default", () => {
+    expect(
+      decodeUploadInput({ cwd: "/repo", relativeDirectory: "", fileName: "a.txt" }).overwrite,
+    ).toBeUndefined();
+    expect(
+      decodeUploadInput({
+        cwd: "/repo",
+        relativeDirectory: "",
+        fileName: "a.txt",
+        overwrite: false,
+      }).overwrite,
+    ).toBe(false);
   });
 
   it("requires the upload token to name one file", () => {

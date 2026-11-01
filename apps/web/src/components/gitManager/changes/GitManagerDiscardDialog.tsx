@@ -16,6 +16,11 @@ export interface GitManagerDiscardDialogProps {
   readonly open: boolean;
   readonly paths: ReadonlyArray<string>;
   readonly disposition: "trash" | "permanent";
+  /**
+   * Whether the trash's Put Back returns a file to where it was. A macOS or Linux server moves
+   * each file into its repository's Git folder before the trash takes it, so there it does not.
+   */
+  readonly putBackRestoresInPlace: boolean;
   readonly isBusy: boolean;
   readonly errorMessage?: string | null;
   readonly onOpenChange: (open: boolean) => void;
@@ -26,6 +31,7 @@ export const GitManagerDiscardDialog = memo(function GitManagerDiscardDialog({
   open,
   paths,
   disposition,
+  putBackRestoresInPlace,
   isBusy,
   errorMessage = null,
   onOpenChange,
@@ -61,8 +67,10 @@ export const GitManagerDiscardDialog = memo(function GitManagerDiscardDialog({
           </DialogTitle>
           <DialogDescription>
             {disposition === "trash"
-              ? "This asks the server to move these files to the OS trash. If trash is unavailable, no affected path is permanently discarded without another confirmation."
-              : "The server reported that OS trash is unavailable for these paths. Confirming permanently discards their changes and cannot be undone."}
+              ? putBackRestoresInPlace
+                ? "Moves these files to the server's trash. Nothing is deleted for good without asking again."
+                : "Moves these files to the server's trash. Put Back won't return them here: drag one back to restore it. Nothing is deleted for good without asking again."
+              : "The trash couldn't take these files. Discarding them permanently can't be undone."}
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-72 overscroll-contain overflow-y-auto px-6 pb-4">

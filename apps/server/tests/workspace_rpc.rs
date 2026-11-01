@@ -2078,6 +2078,24 @@ async fn write_file_nested_gitignore_rebuilds_cached_classification() {
     assert_eq!(rpc.index_scans(), 3);
 }
 
+/// Asserts that the workspace write path refuses `relative` as Git's own metadata (#139 X5
+/// review round 6): an agent or the Files panel never changes `.git`.
+async fn assert_git_metadata_write_refused(rpc: &WorkspaceRpc, cwd: &str, relative: &str) {
+    let refused = rpc
+        .handle(
+            "projects.writeFile",
+            json!({ "cwd": cwd, "relativePath": relative, "contents": "changed by the workspace" }),
+        )
+        .await
+        .expect_err("a write into Git's metadata is refused");
+    assert_eq!(refused["failure"], "git_metadata", "{relative}: {refused}");
+}
+
+/// The Git-internal classification controls (`.git/info/exclude`, and `core.excludesFile` in
+/// `.git/config`) can no longer be written through the workspace (#139 X5 review round 6), so
+/// they change only through Git or another program. The workspace write is refused and leaves
+/// them as they were; a refreshed index (what the runtime does after a turn or a terminal
+/// exits) reads them again, so the cached classification follows each change.
 #[tokio::test]
 async fn write_file_git_internal_controls_rebuild_cached_classification() {
     let root = TempDir::new().expect("root");
@@ -2129,17 +2147,28 @@ async fn write_file_git_internal_controls_rebuild_cached_classification() {
         &initial,
         "bibcode-task2-config-exclude-6e2d38f4"
     ));
+    assert_eq!(rpc.index_scans(), 1);
 
-    rpc.handle(
-        "projects.writeFile",
-        json!({
-            "cwd": cwd,
-            "relativePath": ".git/info/exclude",
-            "contents": format!("{original_exclude}\nbibcode-task2-info-exclude-41ac90d7\n")
-        }),
+    for control in [".git/info/exclude", ".git/config"] {
+        assert_git_metadata_write_refused(&rpc, &cwd, control).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(".git/info/exclude")).unwrap(),
+        original_exclude
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(".git/config")).unwrap(),
+        original_config
+    );
+
+    // Another program adds an exclude.
+    write(
+        root.path(),
+        ".git/info/exclude",
+        format!("{original_exclude}\nbibcode-task2-info-exclude-41ac90d7\n").as_bytes(),
     )
-    .await
-    .expect("write Git exclude");
+    .await;
+    rpc.refresh_index(root.path()).await;
     let excluded = rpc
         .handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
@@ -2150,23 +2179,17 @@ async fn write_file_git_internal_controls_rebuild_cached_classification() {
     ));
     assert_eq!(rpc.index_scans(), 2);
 
+    // Git itself points core.excludesFile at another file.
     let excludes_path = root
         .path()
         .join(".task2-global-ignore")
         .to_string_lossy()
         .replace('\\', "/");
-    rpc.handle(
-        "projects.writeFile",
-        json!({
-            "cwd": cwd,
-            "relativePath": ".git/config",
-            "contents": format!(
-                "{original_config}\n[core]\n\texcludesFile = {excludes_path}\n"
-            )
-        }),
-    )
-    .await
-    .expect("write Git config");
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &excludes_path],
+    );
+    rpc.refresh_index(root.path()).await;
     let configured = rpc
         .handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
@@ -2181,12 +2204,11 @@ async fn write_file_git_internal_controls_rebuild_cached_classification() {
     ));
     assert_eq!(rpc.index_scans(), 3);
 
-    rpc.handle(
-        "projects.writeFile",
-        json!({ "cwd": cwd, "relativePath": ".git/config", "contents": original_config }),
-    )
-    .await
-    .expect("restore Git config");
+    git_in(
+        root.path(),
+        &["config", "core.excludesFile", &empty_excludes],
+    );
+    rpc.refresh_index(root.path()).await;
     let config_restored = rpc
         .handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
@@ -2201,16 +2223,13 @@ async fn write_file_git_internal_controls_rebuild_cached_classification() {
     ));
     assert_eq!(rpc.index_scans(), 4);
 
-    rpc.handle(
-        "projects.writeFile",
-        json!({
-            "cwd": cwd,
-            "relativePath": ".git/info/exclude",
-            "contents": original_exclude
-        }),
+    write(
+        root.path(),
+        ".git/info/exclude",
+        original_exclude.as_bytes(),
     )
-    .await
-    .expect("restore Git exclude");
+    .await;
+    rpc.refresh_index(root.path()).await;
     let exclude_restored = rpc
         .handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
@@ -2222,6 +2241,10 @@ async fn write_file_git_internal_controls_rebuild_cached_classification() {
     assert_eq!(rpc.index_scans(), 5);
 }
 
+/// A symlink to a `.gitignore` is still a classification control the workspace may write, and
+/// writing it rebuilds the classification. A symlink to `.git` is not a way into Git's metadata
+/// (#139 X5 review round 6): the write through it is refused, and a change another program makes
+/// there is read once the index is refreshed.
 #[cfg(unix)]
 #[tokio::test]
 async fn write_file_symlink_aliases_to_classification_controls_invalidate() {
@@ -2290,18 +2313,20 @@ async fn write_file_symlink_aliases_to_classification_controls_invalidate() {
     ));
     assert_eq!(rpc.index_scans(), 2);
 
-    rpc.handle(
-        "projects.writeFile",
-        json!({
-            "cwd": cwd,
-            "relativePath": "git-control-alias/info/exclude",
-            "contents": format!(
-                "{original_exclude}\nbibcode-task2-alias-exclude-a9306d4e\n"
-            )
-        }),
+    assert_git_metadata_write_refused(&rpc, &cwd, "git-control-alias/info/exclude").await;
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(".git/info/exclude")).unwrap(),
+        original_exclude
+    );
+
+    // Another program writes through the alias.
+    write(
+        root.path(),
+        "git-control-alias/info/exclude",
+        format!("{original_exclude}\nbibcode-task2-alias-exclude-a9306d4e\n").as_bytes(),
     )
-    .await
-    .expect("write Git control alias");
+    .await;
+    rpc.refresh_index(root.path()).await;
     let excluded = rpc
         .handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
@@ -2313,6 +2338,9 @@ async fn write_file_symlink_aliases_to_classification_controls_invalidate() {
     assert_eq!(rpc.index_scans(), 3);
 }
 
+/// A `.gitignore` in any letter case is a classification control, and writing it rebuilds the
+/// index on every host; an ordinary file does not. Git's own metadata in any letter case is
+/// refused (#139 X5 review round 6) and left as it was.
 #[tokio::test]
 async fn write_file_mixed_case_classification_controls_invalidate_on_all_hosts() {
     let root = TempDir::new().expect("root");
@@ -2332,23 +2360,30 @@ async fn write_file_mixed_case_classification_controls_invalidate_on_all_hosts()
         .expect("warm index");
     assert_eq!(rpc.index_scans(), 1);
 
-    for (expected_scans, path) in [
-        (2, "nested/.GITIGNORE"),
-        (3, ".GIT/config"),
-        (4, ".GiT/INFO/EXCLUDE"),
-    ] {
-        rpc.handle(
-            "projects.writeFile",
-            json!({ "cwd": cwd, "relativePath": path, "contents": "after" }),
-        )
+    rpc.handle(
+        "projects.writeFile",
+        json!({ "cwd": cwd, "relativePath": "nested/.GITIGNORE", "contents": "after" }),
+    )
+    .await
+    .expect("write mixed-case ignore file");
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
-        .unwrap_or_else(|error| panic!("write {path}: {error}"));
-        rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
-            .await
-            .unwrap_or_else(|error| panic!("list after {path}: {error}"));
-        assert_eq!(rpc.index_scans(), expected_scans, "path {path}");
+        .expect("list after the ignore file");
+    assert_eq!(rpc.index_scans(), 2);
+
+    for path in [".GIT/config", ".GiT/INFO/EXCLUDE"] {
+        assert_git_metadata_write_refused(&rpc, &cwd, path).await;
+        assert_eq!(
+            std::fs::read(root.path().join(path)).unwrap(),
+            b"before",
+            "{path}"
+        );
     }
 
+    rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
+        .await
+        .expect("list after the refusals");
+    let scans = rpc.index_scans();
     rpc.handle(
         "projects.writeFile",
         json!({ "cwd": cwd, "relativePath": "ordinary.txt", "contents": "after" }),
@@ -2358,7 +2393,7 @@ async fn write_file_mixed_case_classification_controls_invalidate_on_all_hosts()
     rpc.handle("projects.listEntries", json!({ "cwd": cwd }))
         .await
         .expect("reuse index after ordinary write");
-    assert_eq!(rpc.index_scans(), 4);
+    assert_eq!(rpc.index_scans(), scans);
 }
 
 #[tokio::test]

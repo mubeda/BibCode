@@ -60,7 +60,22 @@ pub fn resolve_relative(root: &Path, relative: &str) -> Result<(PathBuf, String)
     Ok((root.join(&normalized), to_posix(&normalized)))
 }
 
+/// `target` (under `root`) resolved through every symlink, checked to stay inside `root` and
+/// out of Git's own metadata ([`refuse_git_metadata`]).
 pub async fn canonical_existing_within(
+    root: &Path,
+    target: &Path,
+) -> Result<(PathBuf, PathBuf), WorkspaceError> {
+    refuse_named_git_metadata(root, target)?;
+    let (canonical_root, canonical_target) =
+        canonical_existing_anywhere_within(root, target).await?;
+    refuse_git_metadata(&canonical_root, &canonical_target)?;
+    Ok((canonical_root, canonical_target))
+}
+
+/// [`canonical_existing_within`] without the Git metadata check, for what an entry that is
+/// itself a symlink names: a rename or delete acts on the link, never on its target.
+pub async fn canonical_existing_anywhere_within(
     root: &Path,
     target: &Path,
 ) -> Result<(PathBuf, PathBuf), WorkspaceError> {
@@ -72,7 +87,40 @@ pub async fn canonical_existing_within(
     Ok((canonical_root, canonical_target))
 }
 
+/// Refuses a canonical `target` under the canonical `root` that is Git's own metadata or is
+/// inside it: a path with a `.git` component below the root (any letter case), the checkout's
+/// Git directory or common directory wherever its `.git` file puts them below the root, or a
+/// folder that holds one of those. Changing Git's metadata can make Git run a command as the
+/// server's user (`core.fsmonitor`, `core.hooksPath`, a hook), so neither an agent nor the
+/// Files panel reads or changes it (#139 X5 review round 6).
+pub fn refuse_git_metadata(root: &Path, target: &Path) -> Result<(), WorkspaceError> {
+    refuse_named_git_metadata(root, target)?;
+    let inside = crate::git::checkout_git_dirs(root)
+        .into_iter()
+        .filter(|dir| dir.starts_with(root) && dir != root)
+        .any(|dir| target.starts_with(&dir) || (dir.starts_with(target) && target != root));
+    if inside {
+        return Err(WorkspaceError::GitMetadata {
+            path: target.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// The lexical half of [`refuse_git_metadata`]: a `.git` component below `root`.
+fn refuse_named_git_metadata(root: &Path, target: &Path) -> Result<(), WorkspaceError> {
+    match target.strip_prefix(root) {
+        Ok(relative) if crate::git::names_git_metadata(relative) => {
+            Err(WorkspaceError::GitMetadata {
+                path: target.to_path_buf(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 pub async fn safe_mutation_target(root: &Path, target: &Path) -> Result<PathBuf, WorkspaceError> {
+    refuse_named_git_metadata(root, target)?;
     let canonical_root = normalize_root(root, false).await?;
     let mut existing = target.to_path_buf();
     let mut suffix = Vec::new();
@@ -97,6 +145,7 @@ pub async fn safe_mutation_target(root: &Path, target: &Path) -> Result<PathBuf,
     for component in suffix.iter().rev() {
         canonical_target.push(component);
     }
+    refuse_git_metadata(&canonical_root, &canonical_target)?;
     Ok(canonical_target)
 }
 
@@ -118,6 +167,87 @@ pub fn to_posix(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Git's own metadata is refused by every path check here, however it is named or
+    /// reached; ordinary dot-files are not (#139 X5 review round 6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gits_own_metadata_is_refused_however_it_is_reached() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        std::fs::create_dir_all(root.join("vendor/lib/.git")).unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(root.join(".gitignore"), "x\n").unwrap();
+        std::os::unix::fs::symlink(".git", root.join("gitlink")).unwrap();
+        let git_metadata = |result: Result<_, WorkspaceError>| {
+            matches!(result, Err(WorkspaceError::GitMetadata { .. }))
+        };
+
+        for relative in [
+            ".git/config",
+            ".GIT/config",
+            "./.git/config",
+            ".git/",
+            "gitlink/config",
+            "vendor/lib/.git",
+        ] {
+            let (target, _) = resolve_relative(&root, relative).unwrap();
+            assert!(
+                git_metadata(canonical_existing_within(&root, &target).await.map(|_| ())),
+                "{relative}"
+            );
+        }
+        for relative in [".git/hooks/post-commit", "gitlink/hooks/new", ".Git/new"] {
+            let (target, _) = resolve_relative(&root, relative).unwrap();
+            assert!(
+                git_metadata(safe_mutation_target(&root, &target).await.map(|_| ())),
+                "{relative}"
+            );
+        }
+        for relative in [".gitignore", ".github"] {
+            let (target, _) = resolve_relative(&root, relative).unwrap();
+            canonical_existing_within(&root, &target).await.unwrap();
+            safe_mutation_target(&root, &target.join("new"))
+                .await
+                .unwrap();
+        }
+        // The link itself is only a link.
+        canonical_existing_anywhere_within(&root, &root.join("gitlink"))
+            .await
+            .unwrap();
+    }
+
+    /// A `.git` file that puts the Git directory (and its common directory) inside the root
+    /// under another name: both are refused, and so is a folder that holds them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_directory_a_git_file_names_inside_the_root_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("meta/worktree")).unwrap();
+        std::fs::create_dir_all(root.join("common/hooks")).unwrap();
+        std::fs::write(root.join("meta/worktree/commondir"), "../../common\n").unwrap();
+        std::fs::write(root.join(".git"), "gitdir: meta/worktree\n").unwrap();
+        std::fs::write(root.join("common/config"), "[core]\n").unwrap();
+        std::fs::write(root.join("meta/notes.txt"), "x").unwrap();
+        for target in ["meta/worktree/commondir", "common/config", "common", "meta"] {
+            assert!(
+                matches!(
+                    refuse_git_metadata(&root, &root.join(target)),
+                    Err(WorkspaceError::GitMetadata { .. })
+                ),
+                "{target}"
+            );
+        }
+        // A sibling of the Git directory is an ordinary file.
+        refuse_git_metadata(&root, &root.join("meta/notes.txt")).unwrap();
+        assert_eq!(
+            crate::git::checkout_git_dirs(&root),
+            [root.join("meta/worktree"), root.join("common")]
+        );
+    }
 
     #[tokio::test]
     async fn path_helpers_cover_creation_validation_and_containment() {

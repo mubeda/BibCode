@@ -42,6 +42,10 @@ vi.mock("~/state/query", () => ({
     return harness.query;
   },
 }));
+vi.mock("~/state/mcpActivity", () => ({
+  useAgentCommitLabels: () => new Map(),
+  agentLabelForCommit: () => null,
+}));
 vi.mock("~/state/vcs", () => ({
   vcsEnvironment: { listCommits: harness.listCommits },
 }));

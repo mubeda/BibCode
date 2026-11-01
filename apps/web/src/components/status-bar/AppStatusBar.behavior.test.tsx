@@ -49,6 +49,7 @@ const harness = vi.hoisted(() => ({
 }));
 
 vi.mock("./ProfilerRecordingSegment", () => ({ ProfilerRecordingSegment: () => null }));
+vi.mock("./McpAgentIndicator", () => ({ McpAgentIndicator: () => null }));
 
 vi.mock("react", async (importOriginal) => ({
   ...(await importOriginal<typeof import("react")>()),

@@ -18,7 +18,13 @@ async fn engine() -> OrchestrationEngine {
     engine_with_hooks(crate::orchestration::engine::TestHooks::default()).await
 }
 async fn engine_with_hooks(hooks: crate::orchestration::engine::TestHooks) -> OrchestrationEngine {
-    let database = Database::open_in_memory().await.unwrap();
+    engine_on(Database::open_in_memory().await.unwrap(), hooks).await
+}
+/// The queue engine (project `p`, thread `t`) on a new `database`.
+async fn engine_on(
+    database: Database,
+    hooks: crate::orchestration::engine::TestHooks,
+) -> OrchestrationEngine {
     database
         .call(|connection| {
             run_migrations(connection, None)?;
@@ -779,6 +785,14 @@ struct GatedRewind {
     suspended: std::sync::atomic::AtomicBool,
     reopen_entered: Notify,
     reopen_release: Notify,
+    /// The worker's next workspace lookup waits for `workspace_release`, like Git hung on it.
+    hold_workspace: std::sync::atomic::AtomicBool,
+    workspace_release: Notify,
+    /// The worker's next workspace refresh (after a capture, before its `ready` record) waits for
+    /// `refresh_release`, announcing itself on `refresh_entered`.
+    hold_refresh: std::sync::atomic::AtomicBool,
+    refresh_entered: Notify,
+    refresh_release: Notify,
 }
 
 impl GatedRewind {
@@ -798,7 +812,15 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks for 
         &'a self,
         _thread_id: &'a str,
     ) -> crate::production::orchestration_effects::BoxEffectFuture<'a, Option<PathBuf>> {
-        Box::pin(async move { Ok(Some(self.cwd.clone())) })
+        Box::pin(async move {
+            if self
+                .hold_workspace
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.workspace_release.notified().await;
+            }
+            Ok(Some(self.cwd.clone()))
+        })
     }
 
     fn rollback_provider<'a>(
@@ -848,7 +870,16 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks for 
         &'a self,
         _cwd: &'a Path,
     ) -> crate::production::orchestration_effects::BoxEffectFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            if self
+                .hold_refresh
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.refresh_entered.notify_one();
+                self.refresh_release.notified().await;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -899,12 +930,26 @@ fn revert_checkout() -> tempfile::TempDir {
 
 impl RevertFixture {
     async fn new() -> Self {
+        Self::with_options(crate::production::orchestration_effects::EffectsOptions::default())
+            .await
+    }
+
+    async fn with_options(
+        options: crate::production::orchestration_effects::EffectsOptions,
+    ) -> Self {
+        Self::on(Database::open_in_memory().await.unwrap(), options).await
+    }
+
+    async fn on(
+        database: Database,
+        options: crate::production::orchestration_effects::EffectsOptions,
+    ) -> Self {
         use crate::production::orchestration_effects::{
-            EffectsOptions, OrchestrationEffects, capture_checkpoint, checkpoint_ref,
+            OrchestrationEffects, capture_checkpoint, checkpoint_ref,
         };
         let repository = revert_checkout();
         let cwd = repository.path().to_path_buf();
-        let engine = engine().await;
+        let engine = engine_on(database, crate::orchestration::engine::TestHooks::default()).await;
         for (turn_count, content) in [(0, "baseline\n"), (1, "one\n"), (2, "two\n")] {
             std::fs::write(cwd.join("tracked.txt"), content).unwrap();
             capture_checkpoint(&cwd, "t", turn_count).await.unwrap();
@@ -927,12 +972,17 @@ impl RevertFixture {
             suspended: std::sync::atomic::AtomicBool::new(false),
             reopen_entered: Notify::new(),
             reopen_release: Notify::new(),
+            hold_workspace: std::sync::atomic::AtomicBool::new(false),
+            workspace_release: Notify::new(),
+            hold_refresh: std::sync::atomic::AtomicBool::new(false),
+            refresh_entered: Notify::new(),
+            refresh_release: Notify::new(),
         });
         let effects = OrchestrationEffects::start(
             engine.clone(),
             Arc::new(crate::git::GitRepository::default()),
             rewind.clone(),
-            EffectsOptions::default(),
+            options,
         )
         .await
         .unwrap();
@@ -1065,18 +1115,23 @@ async fn a_reverting_threads_later_effects_run_after_the_revert() {
         .unwrap();
     fixture.rewind.reopen_release.notify_one();
     fixture.event("thread.reverted", |_| true).await;
-    fixture
-        .event("thread.turn-diff-completed", |payload| {
-            payload["turnId"] == "turn-late" && payload["status"] == "ready"
-        })
-        .await;
+    // Turn 5 has no checkpoint before it, so it is never `ready`; its own ref is still captured.
     let captured = format!(
         "{}:tracked.txt",
         crate::production::orchestration_effects::checkpoint_ref("t", 5)
     );
+    let contents = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(contents) = fixture.git_output(&["show", &captured]) {
+                return contents;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the late checkpoint is captured");
     assert_eq!(
-        fixture.git_output(&["show", &captured]).as_deref(),
-        Some("one\n"),
+        contents, "one\n",
         "the late checkpoint was captured before the revert restored the files"
     );
     fixture.shutdown().await;
@@ -1212,6 +1267,455 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks
     ) -> crate::production::orchestration_effects::BoxEffectFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// A turn's end holds its thread's queued follow-up until the effects worker has captured the
+/// checkout as that turn left it, so the follow-up's edits never land in its checkpoint. With
+/// no effects worker, nothing is held.
+#[tokio::test]
+async fn a_queued_follow_up_waits_for_the_ended_turns_checkpoint() {
+    use crate::production::orchestration_effects::{TurnEnd, record_turn_end};
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    session(&engine, "running", "running-third").await;
+    enqueue(&engine, "queued", true).await;
+    let (service, mut routes) = service(&engine);
+    quiet(&mut routes).await;
+    std::fs::write(fixture.rewind.cwd.join("tracked.txt"), "three\n").unwrap();
+    record_turn_end(
+        &engine,
+        "t",
+        "turn-3",
+        TIME,
+        TurnEnd::Live,
+        Some(&fixture.rewind.cwd),
+    )
+    .await
+    .unwrap();
+    session(&engine, "ready", "ready-third").await;
+    received(&mut routes, "queued").await;
+    service.shutdown().await;
+
+    let events = engine.read_events(0).await.unwrap();
+    let position = |matches: &dyn Fn(&crate::persistence::OrchestrationEvent) -> bool| {
+        events
+            .iter()
+            .find(|event| matches(event))
+            .map(|event| event.sequence)
+    };
+    let recorded = position(&|event| {
+        event.event.event_type == "thread.turn-diff-completed"
+            && event.event.payload["turnId"] == "turn-3"
+            && event.event.payload["status"] == "ready"
+    })
+    .expect("the ended turn's checkpoint is recorded");
+    let promoted = position(&|event| {
+        event.event.event_type == "thread.turn-start-requested"
+            && event.event.payload["messageId"] == "queued"
+    })
+    .expect("the follow-up starts");
+    assert!(recorded < promoted, "{recorded} >= {promoted}");
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 3)
+        .await
+        .unwrap()
+        .expect("checkpoint 3");
+    assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
+
+    fixture.shutdown().await;
+    assert_eq!(engine.hold_turns_for_checkpoint("t", "turn-4"), None);
+    assert!(!engine.turns_held_for_checkpoint("t"));
+}
+
+/// Each ended turn holds the thread for itself: when two turns end before the effects worker
+/// catches up, capturing the first does not release the second's hold. Deleting the thread
+/// releases them all.
+#[tokio::test]
+async fn each_ended_turn_holds_the_queue_until_its_own_checkpoint() {
+    let engine = engine().await;
+    engine.set_checkpoint_hold_limit(Some(Duration::from_secs(60)));
+    engine.hold_turns_for_checkpoint("t", "turn-1");
+    engine.hold_turns_for_checkpoint("t", "turn-2");
+    engine.release_checkpoint_hold("t", "turn-1");
+    assert!(engine.turns_held_for_checkpoint("t"));
+    engine.release_checkpoint_hold("t", "turn-2");
+    assert!(!engine.turns_held_for_checkpoint("t"));
+
+    engine.hold_turns_for_checkpoint("t", "turn-3");
+    engine.hold_turns_for_checkpoint("other", "turn-1");
+    engine.release_thread_checkpoint_holds("t");
+    assert!(!engine.turns_held_for_checkpoint("t"));
+    assert!(engine.turns_held_for_checkpoint("other"));
+    engine.set_checkpoint_hold_limit(None);
+    assert!(!engine.turns_held_for_checkpoint("other"));
+    engine.shutdown().await;
+}
+
+/// A direct start (the composer, MCP `send_message`, `start_thread` and panel messages, which
+/// all dispatch `thread.turn.start`) and **Send now** (`thread.turn.promote`) are delivered only
+/// once the checkpoint of the thread's last turn is recorded, like a queued follow-up: no turn
+/// edits the checkout before it is captured.
+#[tokio::test]
+async fn direct_starts_and_send_now_wait_for_the_ended_turns_checkpoint() {
+    for send_now in [false, true] {
+        let engine = engine().await;
+        engine.set_checkpoint_hold_limit(Some(Duration::from_secs(60)));
+        session(&engine, "running", "running").await;
+        let held = engine.hold_turns_for_checkpoint("t", "running");
+        assert!(held.is_some());
+        session(&engine, "ready", "ready").await;
+        let (service, mut routes) = service(&engine);
+        if send_now {
+            enqueue(&engine, "next", true).await;
+            engine.dispatch(command(json!({"type":"thread.turn.promote", "commandId":"send-now", "threadId":"t", "messageId":"next", "createdAt":TIME}))).await.unwrap();
+        } else {
+            enqueue(&engine, "next", false).await;
+        }
+        quiet(&mut routes).await;
+        assert_eq!(row(&engine, "next").await.attempts, 0);
+        engine.release_checkpoint_hold("t", "running");
+        received(&mut routes, "next").await;
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+}
+
+/// A capture still pending when its hold expires (Git hung, or a long backlog) is given up:
+/// the thread's turns go on, the turn's checkpoint is recorded stale and never `ready`, and the
+/// next turn's baseline does not stand in for it, since the checkout may hold the next turn's
+/// edits by then.
+#[tokio::test]
+async fn an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_thread() {
+    use crate::production::orchestration_effects::{
+        EffectsOptions, TurnEnd, checkpoint_ref, record_turn_end,
+    };
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: Duration::from_millis(300),
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    session(&engine, "running", "running-third").await;
+    enqueue(&engine, "queued", true).await;
+    let (service, mut routes) = service(&engine);
+    quiet(&mut routes).await;
+    std::fs::write(
+        fixture.rewind.cwd.join("tracked.txt"),
+        "three
+",
+    )
+    .unwrap();
+    fixture
+        .rewind
+        .hold_workspace
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    record_turn_end(
+        &engine,
+        "t",
+        "turn-3",
+        TIME,
+        TurnEnd::Live,
+        Some(&fixture.rewind.cwd),
+    )
+    .await
+    .unwrap();
+    session(&engine, "ready", "ready-third").await;
+    // The worker is stuck on the capture; the hold expires and the follow-up goes.
+    received(&mut routes, "queued").await;
+    service.shutdown().await;
+    assert!(engine.checkpoint_is_stale("t", "turn-3"));
+
+    // The worker then gets past the capture: it records nothing for the stale turn.
+    fixture.rewind.workspace_release.notify_one();
+    assert!(fixture.other_thread_gets_its_baseline().await);
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 3)
+        .await
+        .unwrap()
+        .expect("checkpoint 3");
+    assert_eq!(checkpoint.status, "error");
+    assert_eq!(
+        fixture.git_output(&["rev-parse", "--verify", "--quiet", &checkpoint_ref("t", 3)]),
+        None
+    );
+    assert_eq!(capture_failures(&engine, "turn-3").await, 1);
+    fixture.shutdown().await;
+}
+
+/// A stale capture's ref that Git could not delete stays behind its `error` row. The next
+/// turn's capture is never read against it: that turn is not `ready`, so it is neither a diff
+/// nor a revert target.
+#[tokio::test]
+async fn a_stale_captures_leftover_ref_never_makes_the_next_turn_ready() {
+    use crate::production::orchestration_effects::{
+        TurnEnd, capture_checkpoint, checkpoint_ref, record_turn_end,
+    };
+    let mut fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    // Turn 3 was given up, and its ref was left behind.
+    std::fs::write(cwd.join("tracked.txt"), "stale three\n").unwrap();
+    capture_checkpoint(&cwd, "t", 3).await.unwrap();
+    engine
+        .dispatch(command(json!({
+            "type":"thread.turn.diff.complete", "commandId":"diff-stale-3", "threadId":"t",
+            "turnId":"turn-3", "checkpointTurnCount":3, "checkpointRef":checkpoint_ref("t", 3),
+            "status":"error", "files":[], "assistantMessageId":null,
+            "completedAt":TIME, "createdAt":TIME
+        })))
+        .await
+        .unwrap();
+
+    std::fs::write(cwd.join("tracked.txt"), "four\n").unwrap();
+    record_turn_end(&engine, "t", "turn-4", TIME, TurnEnd::Live, Some(&cwd))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while capture_failures(&engine, "turn-4").await == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("turn 4's checkpoint is reported unreadable");
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 4)
+        .await
+        .unwrap()
+        .expect("checkpoint 4");
+    assert_eq!(checkpoint.status, "missing");
+
+    engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":"revert-4", "threadId":"t", "turnCount":4, "createdAt":TIME}))).await.unwrap();
+    let refused = fixture
+        .event("thread.activity-appended", |payload| {
+            payload["activity"]["kind"] == "checkpoint.revert.failed"
+        })
+        .await;
+    assert!(
+        refused.event.payload["activity"]["payload"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no captured checkpoint"),
+        "{}",
+        refused.event.payload
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        "four\n"
+    );
+    fixture.shutdown().await;
+}
+
+/// The `checkpoint.capture.failed` activities of `turn_id` on thread `t`.
+async fn capture_failures(engine: &OrchestrationEngine, turn_id: &str) -> usize {
+    crate::orchestration::load_snapshot(&engine.repositories())
+        .await
+        .unwrap()
+        .activities
+        .into_iter()
+        .filter(|activity| {
+            activity.kind == "checkpoint.capture.failed"
+                && activity.turn_id.as_deref() == Some(turn_id)
+        })
+        .count()
+}
+
+/// Expiry and completion decide once per turn: a capture the worker has taken is recorded
+/// `ready`, and an expiry that falls while the worker still records it (here, while it
+/// refreshes the workspace) neither reports a failure nor marks it stale.
+#[tokio::test]
+async fn an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready() {
+    // Longer than the capture takes under load, so the worker takes it before the expiry.
+    const HOLD_LIMIT: Duration = Duration::from_secs(3);
+    use crate::production::orchestration_effects::{EffectsOptions, TurnEnd, record_turn_end};
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: HOLD_LIMIT,
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    std::fs::write(fixture.rewind.cwd.join("tracked.txt"), "three\n").unwrap();
+    fixture
+        .rewind
+        .hold_refresh
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ended = tokio::time::Instant::now();
+    record_turn_end(
+        &engine,
+        "t",
+        "turn-3",
+        TIME,
+        TurnEnd::Live,
+        Some(&fixture.rewind.cwd),
+    )
+    .await
+    .unwrap();
+    timeout(HOLD_LIMIT, fixture.rewind.refresh_entered.notified())
+        .await
+        .expect("the worker takes the capture before the hold expires");
+    // The capture is taken; the hold limit passes while the worker still records it.
+    tokio::time::sleep_until(ended + HOLD_LIMIT + Duration::from_millis(500)).await;
+    fixture.rewind.refresh_release.notify_one();
+    let ready = timeout(Duration::from_secs(10), async {
+        loop {
+            let checkpoint = engine
+                .repositories()
+                .get_checkpoint("t".to_owned(), 3)
+                .await
+                .unwrap()
+                .expect("checkpoint 3");
+            if checkpoint.status != "missing" {
+                return checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the turn's checkpoint is recorded");
+    assert_eq!(ready.status, "ready");
+    assert!(!engine.checkpoint_is_stale("t", "turn-3"));
+    assert_eq!(capture_failures(&engine, "turn-3").await, 0);
+    fixture.shutdown().await;
+}
+
+/// A turn given up as stale stays so across a restart: rebuilt from persistence, the engine
+/// keeps its checkpoint `error`, the next turn's baseline does not write its ref, a missing
+/// record of it captures nothing, and a revert to it is refused before anything changes.
+#[tokio::test]
+async fn a_stale_turn_is_never_a_revert_target_after_a_restart() {
+    use crate::production::orchestration_effects::{
+        EffectsOptions, OrchestrationEffects, TurnEnd, checkpoint_ref, record_turn_end,
+    };
+    let state = tempfile::tempdir().unwrap();
+    let database_path = state.path().join("stale.sqlite3");
+    let options = EffectsOptions {
+        checkpoint_hold_limit: Duration::from_millis(200),
+        ..EffectsOptions::default()
+    };
+    let fixture =
+        RevertFixture::on(Database::create_new(&database_path).await.unwrap(), options).await;
+    let engine = fixture.engine.clone();
+    std::fs::write(fixture.rewind.cwd.join("tracked.txt"), "three\n").unwrap();
+    fixture
+        .rewind
+        .hold_workspace
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    record_turn_end(
+        &engine,
+        "t",
+        "turn-3",
+        TIME,
+        TurnEnd::Live,
+        Some(&fixture.rewind.cwd),
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while engine
+            .repositories()
+            .get_checkpoint("t".to_owned(), 3)
+            .await
+            .unwrap()
+            .is_none_or(|checkpoint| checkpoint.status != "error")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stale checkpoint is recorded");
+    fixture.rewind.workspace_release.notify_one();
+    let RevertFixture {
+        engine,
+        effects,
+        rewind,
+        _repository: repository,
+        ..
+    } = fixture;
+    effects.shutdown().await;
+    let database = engine.repositories().database().clone();
+    engine.shutdown().await;
+    database.checkpoint_wal().await.unwrap();
+    drop(database);
+
+    // The later checkout, which a restart must not take for turn 3's end state.
+    std::fs::write(rewind.cwd.join("tracked.txt"), "later\n").unwrap();
+    let engine = OrchestrationEngine::start(
+        Database::open_existing(&database_path).await.unwrap(),
+        EngineOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!engine.checkpoint_is_stale("t", "turn-3"));
+    let effects = OrchestrationEffects::start(
+        engine.clone(),
+        Arc::new(crate::git::GitRepository::default()),
+        rewind.clone(),
+        options,
+    )
+    .await
+    .unwrap();
+    let mut events = engine.subscribe_events();
+    session(&engine, "ready", "after-restart").await;
+    // A replayed missing record, and the next turn's baseline.
+    engine
+        .dispatch(command(json!({
+            "type":"thread.turn.diff.complete", "commandId":"diff-replayed", "threadId":"t",
+            "turnId":"turn-3", "checkpointTurnCount":3, "checkpointRef":checkpoint_ref("t", 3),
+            "status":"missing", "files":[], "assistantMessageId":null,
+            "completedAt":TIME, "createdAt":TIME
+        })))
+        .await
+        .unwrap();
+    engine.dispatch(command(json!({"type":"thread.turn.start", "commandId":"turn-4", "threadId":"t", "message":{"messageId":"m-4", "role":"user", "text":"next", "attachments":[]}, "createdAt":TIME}))).await.unwrap();
+    engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":"revert-stale", "threadId":"t", "turnCount":3, "createdAt":TIME}))).await.unwrap();
+    let refused = timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.event.event_type == "thread.activity-appended"
+                && event.event.payload["activity"]["kind"] == "checkpoint.revert.failed"
+            {
+                return event.event.payload["activity"]["payload"]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .expect("the revert is refused");
+    assert!(refused.contains("no captured checkpoint"), "{refused}");
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t".to_owned(), 3)
+        .await
+        .unwrap()
+        .expect("checkpoint 3");
+    assert_eq!(checkpoint.status, "error");
+    let probe = |args: &[&str]| {
+        let config = IsolatedGitConfig::new();
+        let mut command = std::process::Command::new("git");
+        config.apply_to_command(&mut command);
+        command
+            .args(args)
+            .current_dir(&rewind.cwd)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        !probe(&["rev-parse", "--verify", "--quiet", &checkpoint_ref("t", 3)])
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(rewind.cwd.join("tracked.txt")).unwrap(),
+        "later\n"
+    );
+    assert_eq!(rewind.rewinds.load(std::sync::atomic::Ordering::SeqCst), 0);
+    effects.shutdown().await;
+    engine.shutdown().await;
+    drop(repository);
 }
 
 /// Five chats sharing one checkout revert, one more than are prepared at once, while every

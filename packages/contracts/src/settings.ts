@@ -240,6 +240,41 @@ export const DEFAULT_CLIENT_SETTINGS: ClientSettings = Schema.decodeSync(ClientS
 
 // ── Server Settings (server-authoritative) ────────────────────
 
+/**
+ * The most an outside agent's MCP connection may do on this environment (#139): read only, or
+ * start and message threads that run at most in this runtime mode.
+ */
+export const McpServerAccess = Schema.Literals([
+  "read-only",
+  "approval-required",
+  "auto-accept-edits",
+  "full-access",
+]);
+export type McpServerAccess = typeof McpServerAccess.Type;
+export const DEFAULT_MCP_SERVER_ACCESS: McpServerAccess = "approval-required";
+
+/**
+ * The tool sets outside agents may use on this environment (#139, C8). Each turns a family of
+ * MCP tools on or off, live; terminals start off.
+ */
+export const McpCapabilities = Schema.Struct({
+  workspace: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  sourceControl: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  files: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  diagnostics: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  terminals: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+});
+export type McpCapabilities = typeof McpCapabilities.Type;
+
+export const McpCapabilitiesPatch = Schema.Struct({
+  workspace: Schema.optionalKey(Schema.Boolean),
+  sourceControl: Schema.optionalKey(Schema.Boolean),
+  files: Schema.optionalKey(Schema.Boolean),
+  diagnostics: Schema.optionalKey(Schema.Boolean),
+  terminals: Schema.optionalKey(Schema.Boolean),
+});
+export type McpCapabilitiesPatch = typeof McpCapabilitiesPatch.Type;
+
 export const ThreadEnvMode = Schema.Literals(["local", "worktree"]);
 export type ThreadEnvMode = typeof ThreadEnvMode.Type;
 
@@ -538,6 +573,13 @@ export const ServerSettings = Schema.Struct({
   ),
   enableProfiler: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   enableDevicePreviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  enableMcpServer: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  /** Outbound webhooks (#139, slice X8); off until a person turns them on. */
+  enableWebhooks: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  mcpServerAccess: McpServerAccess.pipe(
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_MCP_SERVER_ACCESS)),
+  ),
+  mcpCapabilities: McpCapabilities.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   automaticGitFetchInterval: Schema.DurationFromMillis.pipe(
     Schema.withDecodingDefault(
       Effect.succeed(Duration.toMillis(DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL)),
@@ -705,6 +747,10 @@ export const ServerSettingsPatch = Schema.Struct({
   enableTerminalAgentActivity: Schema.optionalKey(Schema.Boolean),
   enableProfiler: Schema.optionalKey(Schema.Boolean),
   enableDevicePreviews: Schema.optionalKey(Schema.Boolean),
+  enableMcpServer: Schema.optionalKey(Schema.Boolean),
+  enableWebhooks: Schema.optionalKey(Schema.Boolean),
+  mcpServerAccess: Schema.optionalKey(McpServerAccess),
+  mcpCapabilities: Schema.optionalKey(McpCapabilitiesPatch),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
   defaultThreadEnvMode: Schema.optionalKey(ThreadEnvMode),
   newWorktreesStartFromOrigin: Schema.optionalKey(Schema.Boolean),

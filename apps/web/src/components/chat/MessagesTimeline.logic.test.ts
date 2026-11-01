@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   deriveReasoningWorkEntries,
   deriveTimelineEntries,
+  type TimelineEntry,
   type WorkLogEntry,
 } from "../../session-logic";
 import { type ChatMessage } from "../../types";
@@ -1914,7 +1915,7 @@ describe("settled turn answer visibility", () => {
 });
 
 describe("working row answer delivery", () => {
-  const workingRowFor = (streaming: boolean) => {
+  const workingRowFor = (streaming: boolean, later: ReadonlyArray<TimelineEntry> = []) => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [
         {
@@ -1931,6 +1932,7 @@ describe("working row answer delivery", () => {
             streaming,
           },
         },
+        ...later,
       ],
       latestTurn: {
         turnId: "turn-1" as never,
@@ -1958,6 +1960,24 @@ describe("working row answer delivery", () => {
 
   it("still reports a plain wait while the answer is streaming", () => {
     expect(workingRowFor(true)?.answerDelivered).toBe(false);
+  });
+
+  it("reports a plain wait when work followed the message, as an approval still pending", () => {
+    // "I'll create the file" settles, then the turn asks for approval: that message was not
+    // the answer, and the provider is waiting on a person, not closing the turn.
+    const approval: TimelineEntry = {
+      id: "approval-entry",
+      kind: "work",
+      createdAt: "2026-01-01T00:00:06Z",
+      entry: {
+        id: "approval-1",
+        createdAt: "2026-01-01T00:00:06Z",
+        turnId: "turn-1" as never,
+        label: "Command approval requested",
+        tone: "info",
+      },
+    };
+    expect(workingRowFor(false, [approval])?.answerDelivered).toBe(false);
   });
 });
 

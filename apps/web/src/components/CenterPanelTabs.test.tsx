@@ -78,6 +78,12 @@ vi.mock("./CenterHeaderIconButton", () => ({
 vi.mock("@dnd-kit/sortable", () => ({
   useSortable: harness.useSortable,
 }));
+const requesters = vi.hoisted(() => new Map<string, unknown>());
+vi.mock("./PanelTabAgentBadge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./PanelTabAgentBadge")>()),
+  usePanelRequester: (threadId: string | null) =>
+    threadId === null ? null : (requesters.get(threadId) ?? null),
+}));
 
 import { CenterPanelTabs } from "./CenterPanelTabs";
 
@@ -194,6 +200,25 @@ describe("CenterPanelTabs", () => {
     const unlabeled = renderToStaticMarkup(<CenterPanelTabs {...unlabeledProps} />);
     expect(unlabeled).toContain("Chat");
     expect(unlabeled).toContain("Terminal 1");
+  });
+
+  it("marks a chat panel an outside agent opened, naming it and its purpose", () => {
+    requesters.set(chat.threadId, {
+      actor: { kind: "mcp-client", clientId: "session-1", label: "Claude Code" },
+      purpose: "Review the diff",
+    });
+    try {
+      const markup = renderToStaticMarkup(<CenterPanelTabs {...props()} />);
+      expect(markup.match(/data-panel-agent-badge/g)).toHaveLength(1);
+      expect(markup).toContain(", opened by Agent · Claude Code");
+      expect(markup).toContain("Opened by Agent · Claude Code");
+      expect(markup).toContain("Review the diff");
+    } finally {
+      requesters.clear();
+    }
+    expect(renderToStaticMarkup(<CenterPanelTabs {...props()} />)).not.toContain(
+      "data-panel-agent-badge",
+    );
   });
 
   it("keeps an accessible tablist and empty state when a pane has no surfaces", () => {

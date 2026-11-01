@@ -3,16 +3,34 @@ import { ChevronDownIcon } from "lucide-react";
 import { useEffect, useEffectEvent, useState } from "react";
 
 import { cn } from "~/lib/utils";
+import { agentLabelForCommit, useAgentCommitLabels } from "~/state/mcpActivity";
 import { useEnvironmentQuery } from "~/state/query";
 import { vcsEnvironment } from "~/state/vcs";
 
+import { AgentActorChip } from "./chat/AgentActorChip";
 import { formatCommitTimestamp } from "./SourceControlCommits.logic";
 
-export function SourceControlCommitRow({ commit, nowMs }: { commit: VcsCommit; nowMs: number }) {
+export function SourceControlCommitRow({
+  commit,
+  nowMs,
+  agentLabel = null,
+}: {
+  commit: VcsCommit;
+  nowMs: number;
+  /** The agent whose recent MCP call made this commit, if one did. */
+  agentLabel?: string | null;
+}) {
   return (
     <div className="flex items-center gap-2 px-2 py-1 text-xs">
       <span className="shrink-0 font-mono text-xs text-muted-foreground">{commit.shortSha}</span>
       <span className="min-w-0 flex-1 truncate">{commit.subject}</span>
+      {agentLabel !== null ? (
+        <AgentActorChip
+          compact
+          label={agentLabel}
+          detail="An outside agent made this commit over MCP."
+        />
+      ) : null}
       <span className="shrink-0 text-xs text-muted-foreground">{commit.authorName}</span>
       <span className="shrink-0 text-xs text-muted-foreground">
         {formatCommitTimestamp(commit.authoredAtMs, nowMs)}
@@ -35,6 +53,7 @@ export function SourceControlCommits({
   reloadToken?: number;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const agentCommits = useAgentCommitLabels(threadRef.environmentId);
   // Pagination: `cursor` drives the currently-fetched page; pages already
   // fetched are accumulated in `previousPages` so "Load more" appends.
   const [cursor, setCursor] = useState<number | null>(null);
@@ -102,7 +121,12 @@ export function SourceControlCommits({
         ) : (
           <div className="max-h-48 overflow-auto pb-1">
             {commits.map((commit) => (
-              <SourceControlCommitRow key={commit.sha} commit={commit} nowMs={nowMs} />
+              <SourceControlCommitRow
+                key={commit.sha}
+                commit={commit}
+                nowMs={nowMs}
+                agentLabel={agentLabelForCommit(agentCommits, commit.sha)}
+              />
             ))}
             {nextCursor !== null ? (
               <button

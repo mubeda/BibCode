@@ -316,6 +316,14 @@ impl Reader {
         })
     }
 
+    /// The findings file's length and modification time, or `None` when it is missing: a
+    /// follower that saw the same value has nothing new to read (the webhook dispatcher).
+    pub fn findings_version(&self) -> Option<(u64, Option<SystemTime>)> {
+        fs::metadata(self.dir.join(FINDINGS_FILE))
+            .ok()
+            .map(|meta| (meta.len(), meta.modified().ok()))
+    }
+
     /// Calls `emit` with every finding that appears or changes from now on, for `duration`.
     /// `findings.ndjson` is replaced when compacted, so it is replayed whenever it changes
     /// rather than followed by offset.

@@ -10637,7 +10637,7 @@ async fn claude_terminal_behind_a_shim_runs_unhooked_when_its_install_is_unappro
     for version in [
         "2026.10.19 macos-arm64 (2026-10-19)\n",
         "2.1.219 (Claude Code)\n",
-        "2.1.313 (Claude Code)\n",
+        "2.1.315 (Claude Code)\n",
     ] {
         let root = tempfile::tempdir().expect("fixture root");
         let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");

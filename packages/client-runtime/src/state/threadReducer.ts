@@ -78,6 +78,15 @@ export function applyThreadDetailEvent(
           interactionMode: event.payload.interactionMode,
           branch: event.payload.branch,
           worktreePath: event.payload.worktreePath,
+          // An outside agent's thread names it and why (#139, slice X1).
+          ...(event.metadata.actor !== undefined
+            ? {
+                requester: {
+                  actor: event.metadata.actor,
+                  purpose: event.payload.purpose ?? null,
+                },
+              }
+            : {}),
           latestTurn: null,
           createdAt: event.payload.createdAt,
           updatedAt: event.payload.updatedAt,
@@ -259,6 +268,13 @@ export function applyThreadDetailEvent(
         turnId: event.payload.turnId,
         streaming: event.payload.streaming,
         ...(event.payload.resendOf !== undefined ? { resendOf: event.payload.resendOf } : {}),
+        // Who sent a user message and where from (#139, slices X1 and X4).
+        ...(event.payload.role === "user" && event.metadata.actor !== undefined
+          ? { actor: event.metadata.actor }
+          : {}),
+        ...(event.payload.sourceThreadId !== undefined
+          ? { sourceThreadId: event.payload.sourceThreadId }
+          : {}),
         createdAt: event.payload.createdAt,
         updatedAt: event.payload.updatedAt,
       };
@@ -531,16 +547,23 @@ export function applyThreadDetailEvent(
       const diffTurnStillRunning =
         thread.session?.status === "running" &&
         thread.session.activeTurnId === event.payload.turnId;
+      // A turn its session ended interrupted or failed keeps that state, and a checkpoint
+      // that names no answer keeps the one the turn already has.
+      const sameTurn =
+        thread.latestTurn?.turnId === event.payload.turnId ? thread.latestTurn : null;
       const latestTurn =
-        !diffTurnStillRunning &&
-        (thread.latestTurn === null || thread.latestTurn.turnId === event.payload.turnId)
+        !diffTurnStillRunning && (thread.latestTurn === null || sameTurn !== null)
           ? {
               turnId: event.payload.turnId,
-              state: checkpointStatusToTurnState(event.payload.status),
+              state:
+                sameTurn?.state === "interrupted" || sameTurn?.state === "error"
+                  ? sameTurn.state
+                  : checkpointStatusToTurnState(event.payload.status),
               requestedAt: thread.latestTurn?.requestedAt ?? event.payload.completedAt,
               startedAt: thread.latestTurn?.startedAt ?? event.payload.completedAt,
               completedAt: event.payload.completedAt,
-              assistantMessageId: event.payload.assistantMessageId,
+              assistantMessageId:
+                event.payload.assistantMessageId ?? sameTurn?.assistantMessageId ?? null,
             }
           : thread.latestTurn;
 
@@ -681,8 +704,9 @@ function checkpointStatusToTurnState(
   switch (status) {
     case "ready":
       return "completed";
+    // A checkpoint given up (`error`) says its capture is unusable, not that the turn failed.
     case "error":
-      return "error";
+      return "completed";
     case "missing":
       return "completed";
   }

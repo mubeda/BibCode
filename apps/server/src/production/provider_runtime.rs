@@ -2785,6 +2785,19 @@ async fn reconcile_abandoned_provider_session(
             && projected.updated_at == settled_at
     });
     if let Some(turn_id) = abandoned_turn_id {
+        // The turn the restart cut off keeps its checkpoint number, `missing`: the checkout
+        // after a restart is not where it ended. The next turn's baseline captures its ref, and
+        // a revert across it still rewinds the provider by every turn.
+        super::orchestration_effects::record_turn_end(
+            engine,
+            &session.thread_id,
+            &turn_id,
+            &settled_at,
+            super::orchestration_effects::TurnEnd::CutOff,
+            None,
+        )
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
         settle_streaming_assistant_messages(
             engine,
             &session.thread_id,
@@ -7617,6 +7630,8 @@ mod context_handoff_tests {
             delivery_mode: None,
             delivery_held: None,
             resend_of_message_id: None,
+            actor: None,
+            source_thread_id: None,
             created_at: format!("2026-01-01T00:00:{id:02}Z"),
             updated_at: format!("2026-01-01T00:00:{id:02}Z"),
         }
@@ -11204,6 +11219,24 @@ async fn project_provider_event(
             compactable: event.payload.get("compactable").and_then(Value::as_bool),
         });
         let status = if failed { "error" } else { "ready" };
+        // Its checkpoint number is recorded before the session settles: a settled session
+        // promotes queued messages, which wait until the checkout is captured. A turn whose
+        // number cannot be recorded is not settled either.
+        if compaction_id.is_none()
+            && event.thread_id == launch.thread_id
+            && let Some(turn_id) = &event.turn_id
+        {
+            super::orchestration_effects::record_turn_end(
+                engine,
+                &launch.thread_id,
+                turn_id,
+                &created_at,
+                super::orchestration_effects::TurnEnd::Live,
+                Some(&launch.cwd),
+            )
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        }
         persist_runtime(
             &engine.repositories(),
             launch,

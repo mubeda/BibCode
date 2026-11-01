@@ -1,8 +1,10 @@
 import type {
   AuthBrowserSessionResult,
   AuthClientMetadata,
+  AuthClientSessionRevokeResult,
   AuthCreatePairingOfferInput,
   AuthEnvironmentScope,
+  AuthMcpAccessLevel,
   AuthPairingCredentialResult,
   AuthPairingOfferResult,
   AuthShareStateResult,
@@ -41,6 +43,8 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "list-client-sessions",
   "revoke-client-session",
   "revoke-other-client-sessions",
+  "set-mcp-client-access",
+  "decide-mcp-authorization",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -184,6 +188,9 @@ export interface ServerClientSessionRecord {
   readonly connected: boolean;
   readonly current: boolean;
   readonly reach?: RemotePairingReach;
+  /** An outside agent's access, and the level Hand back restores while it is taken over. */
+  readonly mcpAccess?: string;
+  readonly mcpAccessHandBack?: string;
 }
 
 type ServerAuthGateState =
@@ -584,6 +591,10 @@ export async function listServerClientSessions(): Promise<
       connected: clientSession.connected,
       current: clientSession.current,
       ...(clientSession.reach === undefined ? {} : { reach: clientSession.reach }),
+      ...(clientSession.mcpAccess === undefined ? {} : { mcpAccess: clientSession.mcpAccess }),
+      ...(clientSession.mcpAccessHandBack === undefined
+        ? {}
+        : { mcpAccessHandBack: clientSession.mcpAccessHandBack }),
     }));
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
@@ -606,6 +617,96 @@ export async function revokeServerClientSession(sessionId: AuthSessionId): Promi
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "revoke-client-session",
       sessionId,
+      cause: error,
+    });
+  }
+}
+
+/**
+ * **Stop** an outside agent (#139, slice X1): revoke it, which ends its calls and owned work,
+ * and interrupt each running turn it started, also after a Revoke. The answer says whether it
+ * was stopped (`revoked: false`: the server no longer knows it) and how its interrupts went.
+ */
+export async function stopServerMcpClient(
+  sessionId: AuthSessionId,
+): Promise<AuthClientSessionRevokeResult> {
+  try {
+    const result = await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.auth.revokeClient({
+            headers: {},
+            payload: { sessionId, interruptTurns: true },
+          }),
+        ),
+      ),
+    );
+    return result;
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "revoke-client-session",
+      sessionId,
+      cause: error,
+    });
+  }
+}
+
+/** **Take over** (`read-only`) or **Hand back** (the level Take over replaced). */
+export async function setServerMcpClientAccess(
+  sessionId: AuthSessionId,
+  access: AuthMcpAccessLevel,
+): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.auth.setMcpAccess({ headers: {}, payload: { sessionId, access } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "set-mcp-client-access",
+      sessionId,
+      cause: error,
+    });
+  }
+}
+
+/**
+ * **Approve** or **Deny** a remote AI tool's request to connect (#139, slice R). Approval names
+ * the access, at most the environment's, and whether terminals are allowed.
+ */
+export async function decideServerMcpAuthorization(
+  decision:
+    | {
+        readonly kind: "approve";
+        readonly id: string;
+        readonly access: AuthMcpAccessLevel;
+        readonly terminals: boolean;
+      }
+    | { readonly kind: "deny"; readonly id: string },
+): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          decision.kind === "approve"
+            ? client.auth.approveMcpAuthorization({
+                headers: {},
+                payload: {
+                  id: decision.id,
+                  access: decision.access,
+                  terminals: decision.terminals,
+                },
+              })
+            : client.auth.denyMcpAuthorization({ headers: {}, payload: { id: decision.id } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "decide-mcp-authorization",
       cause: error,
     });
   }

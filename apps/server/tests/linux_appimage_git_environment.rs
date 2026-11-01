@@ -11,6 +11,8 @@ use std::{
 use bibcode_server::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
 #[path = "support/reexec.rs"]
 mod reexec;
 
@@ -111,10 +113,9 @@ fn git_subprocesses_ignore_appimage_libraries() {
         String::from_utf8_lossy(&broken.stderr)
     );
 
-    reexec::run(TEST, PHASE, None, |command| {
+    let launch = |command: &mut Command| {
         command
-            .env("APPIMAGE", fixture.path().join("bibcode.AppImage"))
-            .env("APPDIR", &appdir)
+            .env("BIBCODE_TEST_APPDIR", &appdir)
             .env("LD_LIBRARY_PATH", &library_path)
             .env("BIBCODE_TEST_GIT_HELPER", &helper)
             .env("BIBCODE_TEST_BUNDLED_LIBRARY", bundled.join(curl_library))
@@ -122,12 +123,57 @@ fn git_subprocesses_ignore_appimage_libraries() {
             .env("SSH_AUTH_SOCK", fixture.path().join("agent.sock"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    };
+    reexec::run(TEST, PHASE, None, |command| {
+        launch(command);
+        command
+            .env("APPIMAGE", fixture.path().join("bibcode.AppImage"))
+            .env("APPDIR", &appdir);
+    });
+
+    // An extracted AppDir has no APPIMAGE. AppRun keeps an inherited APPDIR,
+    // and a launcher may exec the binary without one, while AppRun.wrapped
+    // roots the loader path in the running AppDir.
+    let bin = appdir.join("usr/bin");
+    fs::create_dir_all(&bin).expect("AppDir executable directory");
+    let extracted = bin.join("bibcode-git-test");
+    executable_fixture::copy_executable(
+        &std::env::current_exe().expect("test executable"),
+        &extracted,
+    );
+    fs::write(appdir.join("AppRun"), "fixture launcher").expect("AppDir launcher");
+    for stale in [Some(fixture.path().join("stale AppDir")), None] {
+        reexec::run(TEST, PHASE, Some(&extracted), |command| {
+            launch(command);
+            command.env_remove("APPIMAGE");
+            match &stale {
+                Some(stale) => command.env("APPDIR", stale),
+                None => command.env_remove("APPDIR"),
+            };
+        });
+    }
+
+    // Launched from the first AppDir, a second one keeps its APPDIR and its
+    // incompatible libraries on the loader path (#209).
+    let inner = fixture.path().join("Inner AppDir");
+    fs::create_dir_all(inner.join("usr/bin")).expect("inner AppDir executable directory");
+    let stacked = inner.join("usr/bin/bibcode-git-test");
+    executable_fixture::copy_executable(
+        &std::env::current_exe().expect("test executable"),
+        &stacked,
+    );
+    fs::write(inner.join("AppRun"), "fixture launcher").expect("inner AppDir launcher");
+    reexec::run(TEST, PHASE, Some(&stacked), |command| {
+        launch(command);
+        command.env_remove("APPIMAGE").env("APPDIR", &appdir);
     });
 }
 
 async fn assert_git_children() {
     let original = std::env::var_os("LD_LIBRARY_PATH").expect("inherited loader path");
-    let appdir = std::env::var_os("APPDIR").expect("AppImage root");
+    let appdir = std::env::var_os("BIBCODE_TEST_APPDIR").expect("AppImage root");
+    let launcher_appdir = std::env::var_os("APPDIR");
+    let extracted = std::env::var_os("APPIMAGE").is_none();
     let helper = std::env::var_os("BIBCODE_TEST_GIT_HELPER").expect("HTTPS helper path");
     let custom = std::env::var("BIBCODE_TEST_CUSTOM_LIBRARY_PATH").expect("custom library path");
     let cancellation = CancellationToken::new();
@@ -213,7 +259,13 @@ async fn assert_git_children() {
         .run(ordinary, &cancellation)
         .await
         .expect("non-AppImage environment");
-    assert_eq!(output.stdout, original.to_string_lossy());
+    // An empty marker turns off only the mounted gate; the executable still
+    // identifies an extracted AppDir.
+    if extracted {
+        assert_eq!(output.stdout, custom);
+    } else {
+        assert_eq!(output.stdout, original.to_string_lossy());
+    }
 
     // AppRun appends ':' even when the original value is empty. A sole empty
     // survivor must not become '.', which would allow repository libraries to
@@ -222,11 +274,8 @@ async fn assert_git_children() {
     let library = PathBuf::from(
         std::env::var_os("BIBCODE_TEST_BUNDLED_LIBRARY").expect("bundled fixture library"),
     );
-    fs::copy(
-        &library,
-        Path::new(&custom).join(library.file_name().expect("library name")),
-    )
-    .expect("working-directory library fixture");
+    let planted = Path::new(&custom).join(library.file_name().expect("library name"));
+    fs::copy(&library, &planted).expect("working-directory library fixture");
     let mut cwd_library = https_request;
     cwd_library.cwd = PathBuf::from(&custom);
     cwd_library.env.push((
@@ -244,7 +293,9 @@ async fn assert_git_children() {
         "a planted cwd library was loaded: {}",
         output.stderr
     );
+    // The custom directory stays on the next launch's host loader path.
+    fs::remove_file(planted).expect("remove working-directory library fixture");
 
     assert_eq!(std::env::var_os("LD_LIBRARY_PATH"), Some(original));
-    assert_eq!(std::env::var_os("APPDIR"), Some(appdir));
+    assert_eq!(std::env::var_os("APPDIR"), launcher_appdir);
 }

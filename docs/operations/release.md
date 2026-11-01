@@ -348,8 +348,8 @@ server versions describe the same build. The calling checkout is not rewritten.
 
 The three packages compile sequentially into separate Cargo output directories
 under the isolated run root; the workflow's cached repository `target` does not
-warm them. The macOS packaging children have a 90-minute bound; every other
-target retains 45 minutes. Each checkout's frozen dependency install retains
+warm them. The macOS packaging children have a 90-minute bound, Windows
+children 60 minutes, and Linux children 45 minutes. Each checkout's frozen dependency install retains
 10 minutes. The complete macOS jobs allow 360 minutes: 270 for packaging, 30
 for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
 The other four native rows and the separate WSL job retain 240 minutes.
@@ -412,7 +412,12 @@ observed download/protection progress, a verified pre-update backup, and exactly
 one requester log line. Linux additionally requires one lane-specific AppImage
 mount/runtime and cleans only processes still carrying that lane's exact
 `BIBCODE_HOME`. Host evidence is captured before WebDriver teardown; backup and
-project retention are read through public bridge/RPC observations. Credentials
+project retention are read through public bridge/RPC observations. The verify
+phase re-reads project-data statuses for up to 8 seconds while primary is
+missing or `unavailable`, never while it is healthy. A missing backup then fails
+with the reason: no primary status, an inspection issue, or a healthy store
+that listed none. A lane whose desktop rejected a backup generation keeps
+those warnings in `<lane>-backup-inventory.log`. Credentials
 stay in a private receipt outside retained evidence and are redacted from logs.
 The upload receipt is also private and immutable. Evidence redaction removes
 full, truncated and escaped transfer-capability labels before applying size

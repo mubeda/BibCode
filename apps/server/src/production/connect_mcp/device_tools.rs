@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{PreviewScope, snapshot_tool_result, tool_failure};
+use super::{PreviewScope, keep_device_fields, snapshot_tool_result, tool_failure};
 use crate::device::{
     DeviceManager, DeviceOpError,
     catalog::{DeviceSnapshot, DeviceState, Platform},
@@ -25,10 +25,11 @@ const SCREENSHOT_MAX_WIDTH: u32 = 1080;
 /// The tools are on only while `DeviceManager::enabled` is true, the same gate the `device.*`
 /// RPC methods use.
 ///
-/// There is no per-call permission check, by invariant: a valid provider MCP credential is
-/// issued only by `provider_runtime` when it launches a thread's provider, so holding the
-/// credential is the operate grant, exactly as for the `preview_*` tools. If MCP credentials
-/// are ever issued to lower-privileged principals, both tool families need a scope check.
+/// There is no permission check here. A valid provider MCP credential is issued only by
+/// `provider_runtime` when it launches a thread's provider, so holding the credential is the
+/// operate grant, exactly as for the `preview_*` tools. An outside agent reaches this through
+/// its client twin (`mcp::tools::previews`), which `McpControl` checks per call for scope,
+/// capability set and ceiling before it builds the scope.
 /// The refusals of another thread's device keep tasks apart; they are not access control.
 #[derive(Clone)]
 pub struct DeviceTools {
@@ -58,7 +59,7 @@ impl DeviceTools {
     /// Runs `operation` (the tool name without `device_`) for the thread `scope` names, and
     /// returns the MCP tool result. `cancellation` ends a wait for boot; the device stays
     /// with the manager and keeps booting.
-    pub(super) async fn call(
+    pub(crate) async fn call(
         &self,
         scope: &PreviewScope,
         operation: &str,
@@ -358,13 +359,15 @@ fn success(value: Value) -> Value {
 
 fn failure(error: &DeviceOpError) -> Value {
     let rpc = error.to_rpc_error();
-    tool_failure(
+    let mut failure = tool_failure(
         rpc["_tag"].as_str().unwrap_or("DeviceError"),
         &error.to_string(),
-    )
+    );
+    keep_device_fields(&rpc, &mut failure);
+    failure
 }
 
-pub(super) fn device_tool_descriptors() -> Vec<Value> {
+pub(crate) fn device_tool_descriptors() -> Vec<Value> {
     let on_server = "The device runs on the BiBCode server, not on this machine.";
     let kinds = "Android emulators and iOS simulators (macOS servers)";
     let tool = |name: &str, title: &str, description: String, schema: Value, read_only: bool| {

@@ -489,6 +489,31 @@ describe("applyThreadDetailEvent", () => {
   });
 
   describe("thread.message-sent", () => {
+    it("keeps the outside agent that sent a user message, and only a user message", () => {
+      const actor = { kind: "mcp-client" as const, clientId: "s-1", label: "Claude Code" };
+      const sent = (messageId: string, role: "user" | "assistant") =>
+        applyThreadDetailEvent(baseThread, {
+          ...event("thread.message-sent", {
+            messageId: MessageId.make(messageId),
+            role,
+            text: "Hi",
+            turnId: null,
+            streaming: false,
+            sourceThreadId: ThreadId.make("thread-panel"),
+            createdAt: "2026-04-01T06:00:00.000Z",
+            updatedAt: "2026-04-01T06:00:00.000Z",
+          }),
+          metadata: { actor },
+        });
+      const user = sent("msg-user", "user");
+      expect(user.kind === "updated" && user.thread.messages[0]?.actor).toEqual(actor);
+      expect(user.kind === "updated" && user.thread.messages[0]?.sourceThreadId).toBe(
+        "thread-panel",
+      );
+      const reply = sent("msg-reply", "assistant");
+      expect(reply.kind === "updated" && reply.thread.messages[0]?.actor).toBeUndefined();
+    });
+
     it("appends a new message", () => {
       const result = applyThreadDetailEvent(baseThread, {
         ...baseEventFields,
@@ -1137,6 +1162,48 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.latestTurn?.state).toBe("completed");
       }
     });
+
+    it.each(["interrupted", "error"] as const)(
+      "keeps a %s turn's state and answer when its checkpoint lands",
+      (state) => {
+        const settled: OrchestrationThread = {
+          ...baseThread,
+          latestTurn: {
+            turnId: TurnId.make("turn-1"),
+            state,
+            requestedAt: "2026-04-01T11:00:00.000Z",
+            startedAt: "2026-04-01T11:00:01.000Z",
+            completedAt: "2026-04-01T11:59:00.000Z",
+            assistantMessageId: MessageId.make("msg-3"),
+          },
+        };
+        const result = applyThreadDetailEvent(settled, {
+          ...baseEventFields,
+          sequence: 13,
+          occurredAt: "2026-04-01T12:00:00.000Z",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.turn-diff-completed",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            turnId: TurnId.make("turn-1"),
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("ref-1"),
+            status: "ready",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-04-01T12:00:00.000Z",
+          },
+        });
+
+        expect(result.kind).toBe("updated");
+        if (result.kind === "updated") {
+          expect(result.thread.checkpoints).toHaveLength(1);
+          expect(result.thread.latestTurn?.state).toBe(state);
+          expect(result.thread.latestTurn?.assistantMessageId).toBe("msg-3");
+        }
+      },
+    );
   });
 
   describe("thread.reverted", () => {
@@ -1750,7 +1817,8 @@ describe("applyThreadDetailEvent", () => {
         kind: "updated",
         thread: {
           checkpoints: [{ turnId: "turn-1" }, { turnId: "turn-2" }, { turnId: "turn-3" }],
-          latestTurn: { state: "error" },
+          // An `error` checkpoint (its capture given up) does not fail the turn.
+          latestTurn: { state: "completed" },
         },
       });
     });
