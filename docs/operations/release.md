@@ -740,6 +740,12 @@ budgets are timeouts, not expected completion durations:
 
 Use Actions job timings to plan the tag and approval runs separately.
 
+Preflight, like CI's Test job, builds test binaries without debug information
+(`CARGO_PROFILE_TEST_DEBUG=0`). Full debug information in every linked test
+binary fills the hosted runner's disk, which shows as `No space left on device`
+while compiling. That failure repeats on a rerun, so fix the workflow instead
+of retrying.
+
 After publication, check latest through the REST endpoint. `isLatest` is not a
 supported `gh release view --json` field:
 

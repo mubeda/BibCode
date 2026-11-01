@@ -44,6 +44,10 @@ jobs:
     # measured hosted-runner variance; the serialized test graph below trades
     # some wall-clock for tests that no longer share the CPU with rustc.
     timeout-minutes: 60
+    # Full debug info in every linked test binary fills the runner disk, as in
+    # CI's Test job; the v0.14.0 tag run hit ENOSPC compiling server tests.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     outputs:
       release_channel: ${{ steps.release_meta.outputs.release_channel }}
       version: ${{ steps.release_meta.outputs.version }}
