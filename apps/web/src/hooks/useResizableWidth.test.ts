@@ -172,12 +172,14 @@ function pointerEvent(
   overrides: Partial<{
     button: number;
     clientX: number;
+    clientY: number;
     pointerId: number;
   }> = {},
 ): ReactPointerEvent<HTMLElement> {
   return {
     button: 0,
     clientX: 100,
+    clientY: 100,
     pointerId: 7,
     currentTarget: target,
     preventDefault: vi.fn(),
@@ -206,7 +208,12 @@ function renderHook(overrides: Partial<UseResizableWidthOptions> = {}): {
 function beginDrag(
   handlers: ResizableWidthHandlers,
   target: PointerTarget = pointerTarget(),
-  eventOverrides: Partial<{ button: number; clientX: number; pointerId: number }> = {},
+  eventOverrides: Partial<{
+    button: number;
+    clientX: number;
+    clientY: number;
+    pointerId: number;
+  }> = {},
 ): PointerTarget {
   handlers.onPointerDown(pointerEvent(target.element, eventOverrides));
   return target;
@@ -526,5 +533,31 @@ describe("useResizableWidth committed and painted width", () => {
 
     expect(storage.writes.at(-1)).toMatchObject({ value: 200 });
     expect(renderHook().width).toBe(200);
+  });
+});
+
+describe("useResizableWidth vertical axis", () => {
+  it("measures a vertical drag by clientY and shows the row cursor", () => {
+    installAnimationFrames();
+    const first = renderHook({ axis: "y" });
+    const target = beginDrag(first.handlers);
+    expect(document.body.style.cursor).toBe("row-resize");
+
+    // Horizontal travel is ignored; 80px down grows a pane above the handle.
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 400, clientY: 180 }));
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 400, clientY: 180 }));
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 400 }]);
+  });
+
+  it("grows a pane below the handle when dragged up", () => {
+    installAnimationFrames();
+    const first = renderHook({ axis: "y", edge: "left" });
+    const target = beginDrag(first.handlers);
+
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientY: 60 }));
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientY: 60 }));
+
+    expect(storage.writes).toMatchObject([{ value: 360 }]);
   });
 });
