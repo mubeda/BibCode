@@ -83,8 +83,14 @@ including for a configured remote endpoint; command entries with `source: skill`
 become slash skills. Its native catalog resolves collisions. Cursor scans
 `.cursor/skills`, `.agents/skills`, `.claude/skills`, and `.codex/skills` in the
 workspace, applicable ancestors up to its Git root, and the effective user home.
-Its traversal follows nested and symlinked directories, guards canonical paths
-against cycles, and deduplicates names with project precedence.
+Its traversal follows nested and symlinked directories and deduplicates names
+with project precedence. It skips folders named `node_modules`, `.git`, `target`,
+`.venv`, `venv`, and `__pycache__` (other dot-folders such as `.system` are
+walked), and one set of canonical paths covers every root, so a symlinked root
+is walked once and its skills keep the scope of the first root that reached
+them. One budget of 10 folder levels below a root and 10,000 directory entries
+covers the whole scan; when it runs out the skills found so far are kept with
+one "Skill list is incomplete" issue.
 
 `packages/client-runtime` owns the capability query family. Cache identity
 includes environment, provider instance, directory, and a configuration revision.
@@ -101,7 +107,8 @@ Runtime shutdown and update quiesce close discovery admission, cancel active
 probes, and drain their cleanup before shutting down providers and terminals.
 Discovery does not send a model prompt or persist another skill index. Partial
 catalogs retain native errors in `issues`; unreadable Cursor roots are reported,
-while absent optional roots are normal. Failed discovery raises
+while absent optional roots are normal. A Cursor scan that outlives its 15 second
+limit returns the skills found so far with an incomplete issue instead of failing. Failed discovery raises
 `ServerProviderCapabilitiesError`; the composer offers Retry and preserves the
 draft. Native `$` (Codex) and `/` (Claude, Cursor, OpenCode) menus remain reachable
 with an empty catalog so newly installed skills can be discovered.
