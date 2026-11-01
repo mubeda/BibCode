@@ -1,13 +1,14 @@
 # Storage Compaction
 
-Status: Proposed 2026-11-01, revision 4, awaiting approval. Design for issue
+Status: Proposed 2026-11-01, revision 5, awaiting approval. Design for issue
 230, verified against `9c8799b80` (v0.14.0). Implementation must not start
 before approval (AGENTS.md, Architectural Decision Standards): it changes a
 persisted shape (`auto_vacuum` on new stores, a new manifest trigger, a
 retention rule) and adds a CLI write path.
 
-Revision 3 replanned after two review rounds; revision 4 narrows the
-inspection lock scope and fixes the space check (round 3) (see "Review findings and
+Revision 3 replanned after two review rounds; revision 4 narrowed the
+inspection lock scope and fixed the space check (round 3); revision 5 keeps
+pre-backup refusals free of writes (round 4) (see "Review findings and
 resolutions" at the end). The rule: decide what to open from a lock held for
 the whole operation, never from an earlier file check. Inspection holds the
 non-creating runtime guard for classification and stats, releases it before
@@ -270,11 +271,16 @@ real run (the dry run is D8):
    finding 1).
 4. **Open one writable maintenance connection and lock it.** A new
    `Database::open_for_maintenance` opens `state.sqlite` and sets, in this
-   order: `busy_timeout = 0`; `locking_mode = EXCLUSIVE`, *before first
-   access*, so SQLite keeps the WAL index in heap memory and never uses
-   `-shm`; then the normal `open_connection` pragmas (`foreign_keys`,
-   `synchronous = FULL`, `journal_mode = WAL`, autocheckpoint and journal
-   limit); then `BEGIN EXCLUSIVE; COMMIT`. In exclusive locking mode the lock
+   order, before anything reads the database:
+   `set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)`
+   (rusqlite 0.40.2, `src/config.rs:28,125`), so closing this connection
+   never checkpoints a crash-left WAL into `state.sqlite` and never deletes
+   `-wal` (review finding r4-1; exclusive locking does not stop the
+   checkpoint on close); `busy_timeout = 0`; `locking_mode = EXCLUSIVE`, so
+   SQLite keeps the WAL index in heap memory and never uses `-shm`; then the
+   normal `open_connection` pragmas **except `journal_mode = WAL`**
+   (`foreign_keys`, `synchronous = FULL`, autocheckpoint and journal limit);
+   then `BEGIN EXCLUSIVE; COMMIT`. In exclusive locking mode the lock
    is kept after the commit until the connection closes. `SQLITE_BUSY` or
    `SQLITE_LOCKED` at any point gives `RecoveryError::DatabaseLocked`
    ("Another program has the database open. Close it, then retry.") at once,
@@ -292,10 +298,13 @@ real run (the dry run is D8):
      quit" step. A crash-left `-shm` is not used and stays as it was;
      the next normal open reinitializes it.
    - **A restored store is in `journal_mode = DELETE`** (backups are switched
-     to it, `database.rs:715`, and restore installs the file unchanged). The
-     `journal_mode = WAL` pragma converts it, as the next server start would.
-     That is a header write under our lock, before the backup, and it is
-     part of "the store as BiBCode would open it".
+     to it, `database.rs:715`, and restore installs the file unchanged). Its
+     conversion to WAL is a header write, so it is deferred to step 9, after
+     the backup. The backup copies the store in whatever mode it is.
+   - **Nothing is written before the backup.** WAL replay builds only the
+     in-memory index, the empty `BEGIN EXCLUSIVE; COMMIT` writes no frames,
+     and the close does not checkpoint. So every refusal in steps 4 to 8
+     leaves `state.sqlite`, `-wal` and `-shm` byte for byte as they were.
    From here, every step uses this one connection, so the exclusive lock does
    not block our own backup.
 5. **Schema check on that connection.** The ledger-prefix and core-table checks
@@ -328,6 +337,8 @@ real run (the dry run is D8):
       ([sqlite3_interrupt](https://www.sqlite.org/c3ref/interrupt.html)), so
       an interrupt-only design would lose a Ctrl-C pressed in that gap
       (review finding 6);
+    - `PRAGMA journal_mode = WAL`, which converts a restored `DELETE`-mode
+      store, as a server start would, and is a no-op otherwise;
     - install `progress_handler(1_000, || token.is_cancelled())`, the pattern
       the validators and `quick_check_database` already use. VACUUM copies
       rows with ordinary statements on this connection, so the handler fires
@@ -337,13 +348,17 @@ real run (the dry run is D8):
       not interruptible; it is bounded by the compacted size;
     - `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`, then remove the handler.
     No interrupt handle is needed.
-10. **`PRAGMA wal_checkpoint(TRUNCATE)`.** With the exclusive lock it cannot
-    be busy; if it is, report the step and keep going, because the data is
-    committed and the close checkpoints it.
+10. **`PRAGMA wal_checkpoint(TRUNCATE)`**, the explicit checkpoint. With the
+    exclusive lock it cannot be busy; if it is, report the step and keep
+    going, because the data is committed and step 12's close checkpoints it.
 11. **`PRAGMA quick_check`**, then measure again. The `after` stats must show
     `freelistCount == 0` and `autoVacuum == "incremental"`; anything else is a
     `CompactFailed { phase: "verify" }` that carries the backup ID.
-12. **Close** the connection, which deletes the WAL, and release the guards.
+12. **Close.** Only when step 11 passed, call
+    `set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)` so
+    the close checkpoints anything left and deletes the WAL, as a normal
+    shutdown does. On every failure or cancellation the flag stays set, and
+    the WAL is left for the next open to replay. Then release the guards.
 
 The token is also checked between steps. Steps 10 to 12 are not cancellable:
 the compaction is committed, and they only finish it.
@@ -488,8 +503,8 @@ required, available }`, which reads: "Compaction needs 11.2 GB free on the
 data-root volume and 3.8 GB on the temporary-files volume; 6.0 GB is free on
 the data-root volume. Free up space or set `SQLITE_TMPDIR`/`TMPDIR` to a larger
 volume, then retry." (The `TMPDIR` hint is Unix only.) The check runs before
-the backup, so a refusal writes nothing (step 4's WAL replay changes only
-the in-memory WAL index). The test hook is `CompactTestHook::FreeSpace`
+the backup, so a refusal writes nothing (D3 step 4: the replay changes only
+the in-memory WAL index, and the connection does not checkpoint on close). The test hook is `CompactTestHook::FreeSpace`
 (see Code changes).
 
 ### D8. `--dry-run`
@@ -537,14 +552,14 @@ flag; the command compacts unless `--dry-run` is given.
 
 ### D9. Failure, cancellation and rollback
 
-| Where                                    | State left                                                                                                                                                                                                                                       | Reported                                                                                                                                            |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Steps 1–7 (refusal, cancel)              | Nothing written, except that step 4 may have replayed a crash-left WAL or converted a restored store to WAL under the lock, as a server start would. A real run may leave the two lock files (as `restore` does). A dry run leaves nothing (D8). | The specific error. No backup ID.                                                                                                                   |
-| Step 8 backup fails, times out or Ctrl-C | Live store untouched. Ctrl-C during the backup is honored when it returns (it is bounded by 30 s); the backup, if published, is kept. An unpublished `.staging` entry is ignored by inventory.                                                   | "Could not take the pre-compact backup: …; the database was not changed." Cancelled after publication: `Cancelled` with the backup ID.              |
-| Step 9 cancelled before `VACUUM` starts  | The worker returns before running the statement. The database is the pre-compact store.                                                                                                                                                          | `Cancelled { backupId }`: "Compaction was cancelled. The database was not changed. The pre-compact backup `<id>` is kept."                          |
-| Step 9 `VACUUM` fails, Ctrl-C, crash     | SQLite rolls back, or WAL recovery does on the next open. The database is the pre-compact store. Setting `auto_vacuum` alone persists nothing.                                                                                                   | `CompactFailed { phase: "vacuum", backupId }` (or `Cancelled { backupId }`): "The database was not changed. The pre-compact backup `<id>` is kept." |
-| Step 10 checkpoint busy                  | Compacted and committed in the WAL. The close checkpoints it.                                                                                                                                                                                    | A warning in the report (`checkpoint: "deferred"`). Success.                                                                                        |
-| Step 11 `quick_check` or stat mismatch   | The database as SQLite left it.                                                                                                                                                                                                                  | `CompactFailed { phase: "verify", backupId }`: "…restore it with `bibcode storage restore --backup-id <id>`." Exit non-zero.                        |
+| Where                                    | State left                                                                                                                                                                                                                                    | Reported                                                                                                                                            |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Steps 1–7 (refusal, cancel)              | Nothing written: `state.sqlite`, `-wal` and `-shm` are byte for byte as found (no checkpoint on close, no journal-mode change before the backup). A real run may leave the two lock files (as `restore` does). A dry run leaves nothing (D8). | The specific error. No backup ID.                                                                                                                   |
+| Step 8 backup fails, times out or Ctrl-C | Live store untouched. Ctrl-C during the backup is honored when it returns (it is bounded by 30 s); the backup, if published, is kept. An unpublished `.staging` entry is ignored by inventory.                                                | "Could not take the pre-compact backup: …; the database was not changed." Cancelled after publication: `Cancelled` with the backup ID.              |
+| Step 9 cancelled before `VACUUM` starts  | The worker returns before running the statement. The database is the pre-compact store.                                                                                                                                                       | `Cancelled { backupId }`: "Compaction was cancelled. The database was not changed. The pre-compact backup `<id>` is kept."                          |
+| Step 9 `VACUUM` fails, Ctrl-C, crash     | SQLite rolls back, or WAL recovery does on the next open. The database is the pre-compact store. Setting `auto_vacuum` alone persists nothing.                                                                                                | `CompactFailed { phase: "vacuum", backupId }` (or `Cancelled { backupId }`): "The database was not changed. The pre-compact backup `<id>` is kept." |
+| Step 10 checkpoint busy                  | Compacted and committed in the WAL. The close checkpoints it.                                                                                                                                                                                 | A warning in the report (`checkpoint: "deferred"`). Success.                                                                                        |
+| Step 11 `quick_check` or stat mismatch   | The database as SQLite left it.                                                                                                                                                                                                               | `CompactFailed { phase: "verify", backupId }`: "…restore it with `bibcode storage restore --backup-id <id>`." Exit non-zero.                        |
 
 There is no automatic restore. Restore is the explicit, journaled offline path,
 and putting a second mutating step inside a failure path would add risk
@@ -648,8 +663,9 @@ which is the order T3's doctor uses. That is its own design.
 ## Code changes (for the implementation PR)
 
 - `persistence/database.rs`: a create flag on the staging open that sets
-  `auto_vacuum`; `open_for_maintenance` (`busy_timeout = 0`,
-  `locking_mode = EXCLUSIVE`, `BEGIN EXCLUSIVE` probe); a space-stats query;
+  `auto_vacuum`; `open_for_maintenance` (`NO_CKPT_ON_CLOSE`,
+  `busy_timeout = 0`, `locking_mode = EXCLUSIVE`, no `journal_mode` change,
+  `BEGIN EXCLUSIVE` probe); a space-stats query;
   a cancellable `VACUUM` closure (pre-check plus progress handler).
 - `persistence/migrations.rs`: `validate_bibcode_schema(&Connection, …)`
   extracted from the two validators, which now call it.
@@ -757,22 +773,29 @@ Compaction:
     backup (`journal_mode = DELETE`, no sidecars). `compact` fails with
     `DatabaseLocked` in under 1 s (less than the classifier's 5 s and
     `BUSY_TIMEOUT`), no backup is taken, and after the other connection rolls
-    back the database bytes equal the original. In the restored case
+    back the database, `-wal` and `-shm` bytes equal the original (the
+    restored store stays in `DELETE` mode). In the restored case
     `compact --dry-run` succeeds with `sqliteLock: "not-checked"` and changes
     nothing, which pins the documented limit.
 13. `compact_refuses_insufficient_disk_space_before_the_backup`: through
-    `CompactTestHook::FreeSpace`, `InsufficientSpace` with both numbers, no
-    backup, and the database unchanged.
+    `CompactTestHook::FreeSpace`, `InsufficientSpace` with both numbers and
+    no backup. Run on three stores: clean, the crash-left WAL fixture with
+    `-shm`, and a restored `DELETE`-mode store. In each, `state.sqlite`,
+    `-wal` and `-shm` are byte for byte unchanged after the command returns
+    (finding r4-1: the refusal path closes the connection without a
+    checkpoint), and the restored store is still in `DELETE` mode.
 14. `compact_counts_main_file_growth_held_in_a_crash_left_wal` (finding
     r3-2): a crash-left WAL fixture whose `-wal` holds many pages beyond the
     physical main file, split volumes (`same_volume: false`), and store-volume
     free space exactly one byte below the new requirement, which is above the
     revision-3 formula. `InsufficientSpace { volume: "store" }`, no backup,
-    database and `-wal` bytes unchanged. With one more byte it compacts.
+    and `state.sqlite`, `-wal` and `-shm` byte for byte unchanged, so the
+    main file did not grow. With one more byte it compacts, and no `-wal`
+    remains.
 15. `compact_cancelled_after_the_backup_leaves_the_store_unchanged`
     (finding 6): `CompactTestHook::CancelAfterBackup`. `Cancelled` with the
-    backup ID; the database bytes equal the original; the backup inventories
-    as verified.
+    backup ID; `state.sqlite` and any `-wal` equal the original; the backup
+    inventories as verified.
 16. `compact_cancelled_during_vacuum_rolls_back_and_restarts_cleanly`
     (finding 6): `CompactTestHook::CancelDuringVacuum`. `Cancelled` with the
     backup ID; then `prepare_store` on the root (a normal restart) succeeds,
@@ -910,6 +933,15 @@ Round 3:
 - **r3-2**, the space check missed main-file growth held in a crash-left WAL:
   the precheck uses the logical size from the recovered connection and adds
   `mainGrowthBytes` on the store volume (D3 step 6, D7). Tests 14, 23.
+
+Round 4:
+
+- **r4-1**, a refusal before the backup could still grow the main file,
+  because closing the maintenance connection checkpoints a crash-left WAL.
+  The connection sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` before its first
+  read and clears it only after a verified compaction; the journal-mode
+  conversion moves after the backup (D3 steps 4, 9, 12). Tests 12, 13, 14
+  and 15 assert `state.sqlite`, `-wal` and `-shm` unchanged.
 
 Scope-down: compaction of stores whose backup exceeds the existing 30 s budget
 (D5, Risks). The issue's acceptance criteria use small hermetic fixtures and
