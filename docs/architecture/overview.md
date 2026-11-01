@@ -3279,9 +3279,10 @@ view), or free scrolling.
   it there, so a streaming reply crossing a bucket, or a folded row coming back
   under another one, would inflate that bucket's estimate. The timeline is
   keyed by thread, so a new thread starts both afresh. A row first seen
-  streaming takes a `live` type, shared only with other live rows, so a reply
-  that streams long never sets the estimate for short history rows; history
-  loads with its full text and takes its own bucket.
+  streaming takes a type of its own (`message:<role>:live:<row id>`), so a reply
+  that streams long sets no other row's estimate: an unmeasured live row gets
+  the default estimate. LegendList still reuses containers across types.
+  History loads with its full text and takes its own bucket.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
