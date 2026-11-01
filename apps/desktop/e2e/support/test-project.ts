@@ -605,10 +605,14 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
-const longReply = Array.from(
+// The long reply streams in ten deltas of 100 paragraphs, about 150 ms apart.
+const longReplyLines = Array.from(
   { length: ${LONG_REPLY_LINES} },
   (_, line) => "Fixture long reply line " + (line + 1) + " fills the timeline."
-).join("\n\n");
+);
+const longReplyDeltas = Array.from({ length: 10 }, (_, chunk) =>
+  (chunk === 0 ? "" : "\n\n") + longReplyLines.slice(chunk * 100, chunk * 100 + 100).join("\n\n")
+);
 const reasoningSteps = ${JSON.stringify(REASONING_TURN_STEPS)};
 const slowReasoningStepTail = ${JSON.stringify(SLOW_REASONING_STEP_TAIL)};
 const reader = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -774,29 +778,35 @@ reader.on("line", (line) => {
     void streamReasoningTurn(sessionId, slowReasoning, prompt);
     return;
   }
-  send({
-    type: "stream_event",
-    session_id: sessionId,
-    uuid: "bibcode-ui-claude-stream",
-    parent_tool_use_id: null,
-    event: {
-      type: "content_block_delta",
-      index: 0,
-      delta: {
-        type: "text_delta",
-        text: prompt.includes(${JSON.stringify(LONG_REPLY_TURN_MARKER)}) ? longReply : streamResponse
-      }
+  const deltas = prompt.includes(${JSON.stringify(LONG_REPLY_TURN_MARKER)})
+    ? longReplyDeltas
+    : [streamResponse];
+  // A single delta is sent synchronously, as before; only a long reply waits between deltas.
+  void (async () => {
+    for (const [chunk, text] of deltas.entries()) {
+      if (chunk > 0) await delay(150);
+      send({
+        type: "stream_event",
+        session_id: sessionId,
+        uuid: chunk === 0 ? "bibcode-ui-claude-stream" : "bibcode-ui-claude-stream-" + chunk,
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text }
+        }
+      });
     }
-  });
-  send({
-    type: "result",
-    subtype: "success",
-    is_error: false,
-    errors: [],
-    stop_reason: "end_turn",
-    session_id: sessionId,
-    uuid: "bibcode-ui-claude-result"
-  });
+    send({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      errors: [],
+      stop_reason: "end_turn",
+      session_id: sessionId,
+      uuid: "bibcode-ui-claude-result"
+    });
+  })();
 });
 `.trimStart();
 

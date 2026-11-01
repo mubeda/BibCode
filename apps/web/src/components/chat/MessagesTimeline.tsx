@@ -101,7 +101,7 @@ import {
   TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
-  resolveTimelineItemType,
+  createStickyTimelineItemType,
   resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMaintainVisibleContentPosition,
   resolveTimelineMinimapHasPersistentGutter,
@@ -430,6 +430,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     ],
   );
   const rows = useStableRows(rawRows);
+  const [itemTypes] = useState(createStickyTimelineItemType);
+  useLayoutEffect(() => itemTypes.retain(rows), [itemTypes, rows]);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
@@ -703,7 +705,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   ref={handleListRef}
                   data={rows}
                   keyExtractor={keyExtractor}
-                  getItemType={resolveTimelineItemType}
+                  getItemType={itemTypes.resolve}
                   renderItem={renderItem}
                   estimatedItemSize={90}
                   initialScrollAtEnd
