@@ -285,8 +285,9 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           : changeTargets.length - 1;
   const [viewer, setViewer] = useState<AnnotatableCodeViewHandle | null>(null);
   // The query keeps the last data while it refreshes or after a failed read, so readiness
-  // is the current request's status, not whether there is data.
-  const diffSettled = !diffQuery.isPending;
+  // is the current request's status, not whether there is data. A patch is ready to step
+  // through once its renderer (loaded lazily) is there to scroll; a scroll before that is lost.
+  const diffSettled = !diffQuery.isPending && (fileDiff === null || viewer !== null);
   const scrollToChange = (index: number) => {
     const target = changeTargets[index];
     if (target === undefined) return;

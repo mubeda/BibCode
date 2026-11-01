@@ -9,12 +9,15 @@ import { useGitManagerStore } from "../../../gitManagerStore";
 const h = vi.hoisted(() => ({
   listProps: null as { onSelect: (path: string) => void } | null,
   scrollTo: vi.fn(),
+  viewer: null as unknown,
   patches: {} as Record<string, string>,
   files: [] as ReadonlyArray<string>,
   pending: new Set<string>(),
   failing: new Set<string>(),
   // Data the query still holds from an earlier read of the path.
   stale: {} as Record<string, unknown>,
+  // The lazy renderer is still being prepared: it has no viewer to hand out yet.
+  rendererPreparing: false,
 }));
 
 vi.mock("../../../state/vcs", () => ({
@@ -118,8 +121,8 @@ vi.mock("../../diffs/AnnotatableCodeView", () => ({
   AnnotatableCodeView: (props: { viewerRef?: (handle: unknown) => void }) => {
     const { viewerRef } = props;
     useEffect(() => {
-      viewerRef?.({ scrollTo: h.scrollTo });
-    }, [viewerRef]);
+      if (!h.rendererPreparing) viewerRef?.(h.viewer);
+    });
     return <div data-testid="code-view" />;
   },
 }));
@@ -172,6 +175,8 @@ const view = () => (
 );
 
 beforeEach(async () => {
+  h.viewer = { scrollTo: h.scrollTo };
+  h.rendererPreparing = false;
   h.pending.clear();
   h.failing.clear();
   h.stale = {};
@@ -364,6 +369,26 @@ describe("Changes diff navigation", () => {
     await pressFocused({ shiftKey: true });
     expect(selectedPath()).toBe("b.ts");
     expect(lastScroll().lineNumber).toBe(30);
+  });
+
+  it("treats a renderer that is still preparing like a diff that is still loading", async () => {
+    h.rendererPreparing = true;
+    await select("a.ts");
+
+    await press({ key: "F7" });
+    await press({ key: "F7" });
+
+    expect(h.scrollTo).not.toHaveBeenCalled();
+    expect(button("Next change").getAttribute("aria-disabled")).toBe("true");
+
+    h.rendererPreparing = false;
+    await act(async () => root.render(view()));
+    expect(button("Next change").getAttribute("aria-disabled")).toBe("false");
+    await press({ key: "F7" });
+    expect(lastScroll().lineNumber).toBe(1);
+    await press({ key: "F7" });
+    expect(lastScroll().lineNumber).toBe(10);
+    expect(selectedPath()).toBe("a.ts");
   });
 
   it("leaves other keys alone", async () => {
