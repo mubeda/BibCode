@@ -710,15 +710,15 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       traceRemote({ step: "share-ui", found, clicked, widened: false, message: String(error && error.message ? error.message : error) });
       widened = false;
     }
+    // The desktop bootstrap token is revoked by the restart that widening causes, so it
+    // is never a fallback: without a minted offer the coordinator would only answer 401.
+    if (!widened) {
+      throw new Error("Remote verification pairing offer could not be generated (share UI found=" + found + ", clicked=" + clicked + ").");
+    }
     let credentials;
     try {
-    credentials = await browser.execute(async (widened) => {
+    credentials = await browser.execute(async () => {
       const readBootstrap = () => window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
-      if (!widened) {
-        const bootstrap = readBootstrap();
-        if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
-        return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
-      }
       // The bridge cache updates when the restarted backend is ready. Hold neither
       // the first endpoint nor the first bearer across that publication.
       const deadline = Date.now() + 20000;
@@ -785,7 +785,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         " attempts=" + attempts + " endpointChanged=" + endpointChanged;
       if (sawTransportFailure) throw new Error("Remote verification pairing grant unavailable. " + detail);
       throw new Error("Remote verification has no live native sharing grant.");
-    }, widened);
+    });
     traceRemote({ step: "credentials-returned" });
     // Private receipt is outside retained evidence; the controller uses it to redact logs.
     NodeFS.writeFileSync(input.remoteSecretPath, JSON.stringify(credentials), { mode: 0o600 });
@@ -1018,7 +1018,7 @@ export function verifySeededUpgradeOutcome(
     throw new SeededDesktopUpgradeSmokeError(
       primary === undefined
         ? "The protected update did not retain a verified pre-update backup."
-        : `The protected update did not retain a verified pre-update backup (primary ${primary.status}, ${primary.backupCount} listed for storage ${primary.storageInstanceId ?? "unknown"}; rejected generations, if any, are in ${lane}-backup-inventory.log).`,
+        : `The protected update did not retain a verified pre-update backup (primary ${primary.status}, issue: ${primary.issue ?? "none"}, ${primary.backupCount} listed for storage ${primary.storageInstanceId ?? "unknown"}; rejected generations, if any, are in ${lane}-backup-inventory.log).`,
     );
   }
 }
