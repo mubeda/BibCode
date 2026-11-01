@@ -1,17 +1,22 @@
 # Storage Compaction
 
-Status: Proposed 2026-11-01, revision 2, awaiting approval. Design for issue
+Status: Proposed 2026-11-01, revision 3, awaiting approval. Design for issue
 230, verified against `9c8799b80` (v0.14.0). Implementation must not start
 before approval (AGENTS.md, Architectural Decision Standards): it changes a
 persisted shape (`auto_vacuum` on new stores, a new manifest trigger, a
 retention rule) and adds a CLI write path.
 
-Revision 2 answers a review (see "Review findings and resolutions" at the end).
-In short: compaction no longer reuses the inspection classifier; inspection
-never opens SQLite when exactly one sidecar exists; the dry run never opens a
-writable connection or creates a lock file; compaction keeps the existing 30 s
-backup and restore budgets instead of extending them (large stores are a
-follow-up); and cancellation is checked inside the SQLite worker.
+Revision 3 replans after two review rounds (see "Review findings and
+resolutions" at the end). The rule: decide what to open from a lock held for
+the whole operation, never from an earlier file check. Inspection holds the
+non-creating runtime guard throughout and does not open SQLite while BiBCode
+owns the root. Compaction takes its locks, then one writable connection with
+`busy_timeout = 0` and `BEGIN EXCLUSIVE`. That refuses a locked database at
+once and replays a crash-left WAL legitimately. It checks the schema on that
+connection and runs a cancellable `VACUUM`. The dry run never opens a writable
+connection and states that it does not check SQLite locks. Restore verifies
+only the selected generation. The existing 30 s backup and restore budgets are
+kept, and large stores are a follow-up.
 
 ## Problem
 
@@ -70,9 +75,12 @@ supported way to see or reclaim the space.
   (`backup.rs:533`), and verification rejects a manifest more than
   `MAX_PUBLICATION_TIME_SKEW = 60 s` from the generation directory's mtime
   (`backup.rs:2024`). Restore runs under `RECOVERY_TIMEOUT = 30 s`
-  (`backup.rs:846`); it verifies only the selected generation, copies it,
-  re-verifies the copy and moves the live files aside by rename, which is no
-  more work than creating that generation was. The triggers are
+  (`backup.rs:846`). To find the selected generation,
+  `find_verified_backup_for_recovery` (`backup.rs:1150`) runs the full
+  `inventory_blocking` of every storage identity it visits until it finds
+  it, so it hashes and `quick_check`s unrelated generations too. It then
+  copies the selected one, re-verifies the copy and moves the live files
+  aside by rename. The triggers are
   `PreMigration` (`store.rs:303`) and `PreUpdate` (`maintenance.rs:506`).
 - **Older readers.** `verify_generation` (`backup.rs:1976`) decodes the
   manifest with serde before any other check. An unknown `trigger` value
@@ -146,24 +154,6 @@ exists (otherwise `null`):
   - `"unreadable"`: the immutable open or a pragma failed (not a SQLite file,
     or the lock file vanished mid-read).
 
-  The stats do not depend on the classification. A healthy store whose
-  `quick_check` exceeds the classifier's 5 s deadline still reports its
-  sizes and free pages, which is exactly the store a user wants to measure.
-
-The classifier also gets a sidecar rule (review finding 2). Today it opens a
-plain read-only connection whenever either sidecar exists, and that open
-creates a missing `-shm`. New rule in `validate_existing_store_for_inspection`:
-
-- no sidecar: `immutable=1`, as today;
-- both sidecars: the plain read-only path, as today. Nothing is created,
-  because both files already exist;
-- exactly one sidecar: SQLite is not opened. The classification is
-  `unsafe-database-state` with the issue "A SQLite sidecar file
-  (`state.sqlite-wal` or `-shm`) is missing its partner, so the database
-  cannot be inspected without creating files. Start BiBCode once to recover
-  it, or restore a backup." Startup's writable open rebuilds the WAL index
-  from `-wal` and is unaffected.
-
 How it reads without mutating:
 
 | Option                                                                    | Trade-off                                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -172,18 +162,47 @@ How it reads without mutating:
 | B. Take `OfflineRecoveryGuard` as is, then `immutable=1`                  | Simple, but `open_private_lock_file` creates `.bibcode-runtime.lock` in a root that never ran a server. That is a mutation the existing test would miss, because it lists only `state_dir`.                                                                                                                                                                                                                   |
 | **C. Non-creating guard, then `immutable=1` only when no sidecar exists** | Opens the runtime lock **without create**. `NotFound` means no BiBCode process has ever owned the root, so there is no owner to wait for. `WouldBlock` gives `store-running`. Then it reads the four pragmas through the same `immutable=1` read-only URI that `validate_existing_bibcode_store_immutable` (`migrations.rs:94`) already uses. Immutable opens take no SQLite locks and never create sidecars. |
 
-**Recommendation: C.** Add `OfflineRecoveryGuard::try_acquire_existing` to
-`backup.rs`. It opens with `read + write`, without `create`. It holds the lock
-only for the header read, which takes milliseconds. A server starting at that
-moment already retries its shared lock for up to 30 s
-(`StoreRuntimeGuard::acquire`), so it only waits briefly. Sidecars are checked
-again after the guard is held; if any exists the result is
-`"uncheckpointed-wal"` (or `"store-running"` when the guard was
-`WouldBlock`). If the lock file is missing, a server could create it and
-start during the read. The immutable read then returns slightly stale numbers
-or fails, which gives `"unreadable"`.
-Inspection is advisory, so this is acceptable. We document it rather than add a
-lock file.
+**Recommendation: C**, with the lock held for the whole inspection, not only
+the stats read. `try_acquire_existing` is added to `backup.rs`.
+
+**One lock scope for the whole inspection (review findings 2 and r2-3).** A
+sidecar check followed by a later SQLite open is a race: a server can close
+its last connection and delete `-wal`/`-shm` between the two, and the plain
+read-only open then recreates them
+([SQLite WAL](https://www.sqlite.org/wal.html)). No file-existence check can
+close that window, so `inspect_store` decides whether to open SQLite at all
+from the runtime lock, and holds that lock for the classification and the
+stats read. It calls `OfflineRecoveryGuard::try_acquire_existing`, which opens
+`.bibcode-runtime.lock` with `read + write` and **without create**, and takes
+an exclusive `try_lock`:
+
+| Guard result                     | Who can touch the sidecars during inspection                          | Classification                                                                                                                                                                                                                                                                             | Stats                                                               |
+| -------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `WouldBlock` (a BiBCode process) | The owner, at any moment                                              | **SQLite is not opened.** File-level classification only (`classify_store_files`, D3 step 3): database and valid marker give `existing` (unmarked gives `existing-unmarked`), with no issue. The owning server validated the store when it started; inspection does not join its live WAL. | `null`, `"store-running"`                                           |
+| Acquired                         | No BiBCode process (a starting server waits on its 30 s shared retry) | No sidecar: `immutable=1`, as today. Both sidecars: the plain read-only path, as today; it creates nothing because both files exist and no BiBCode process can delete them while the lock is held. Exactly one: SQLite is not opened; `unsafe-database-state` with the issue below.        | Immutable read when no sidecar, else `null`, `"uncheckpointed-wal"` |
+| `NotFound` (no lock file)        | No BiBCode process has ever owned this root                           | No sidecar: `immutable=1`. Any sidecar: SQLite is not opened; `unsafe-database-state` with the issue below. Without a lock file nothing excludes a server that starts now, so only the immutable open, which never creates files, is allowed.                                              | Immutable read when no sidecar, else `null`, `"uncheckpointed-wal"` |
+
+The issue text for the unopened cases: "The database has SQLite sidecar files
+(`state.sqlite-wal` or `-shm`) that cannot be inspected without creating
+files. Start BiBCode once and quit it, or run `bibcode storage compact`,
+which recovers them under its own lock."
+
+What this changes for existing callers: the desktop's status list inspects the
+native root while its own in-process server runs. It now gets `existing` from
+files instead of a read-only open of the live database, so it no longer
+touches the live WAL. Both map to `healthy` (`data_safety.rs:182`). A store
+owned only by a `bibcode mcp` relay or the pairing CLI is also reported from
+files; neither changes the database. Inspection holds the exclusive lock for at
+most the classifier's 5 s, which a starting server absorbs in its 30 s retry.
+
+The remaining window is a third-party SQLite program that closes the database
+between the check and the open while BiBCode is offline. The recovery guide
+already forbids opening `state.sqlite` with other programs; this is documented
+as residual risk.
+
+The stats do not depend on the classification. A healthy store whose
+`quick_check` exceeds the classifier's 5 s deadline still reports its sizes
+and free pages, which is exactly the store a user wants to measure.
 
 The desktop does not surface these fields (D10), and
 `DesktopProjectDataEnvironmentStatus` is unchanged. The WSL path parses the
@@ -235,50 +254,61 @@ real run (the dry run is D8):
 3. **File-level classification, no SQLite.** The part of `inspect_store` that
    looks only at files (recovery journal or staging entry, marker, database
    presence) moves into a shared helper, `classify_store_files(&paths)`, used by
-   both. Only "database present, marker valid" proceeds. A missing marker is
-   refused because backups are keyed by storage ID: "Start BiBCode once so it
-   can adopt this store, then retry". Every other state is refused with the
-   inspection `issue` text. The SQLite classifier is **not** called: its 5 s
-   busy-retry and in-memory copy would wait on a locked database and time out
-   on a large one (review finding 1).
-4. **Sidecars.** If `state.sqlite-wal` or `-shm` exists, refuse at once with
-   `RecoveryError::DatabaseSidecarsPresent`: "The database has open SQLite
-   files (`state.sqlite-wal` or `-shm`). Another program may have it open, or
-   BiBCode did not shut down cleanly. Close any program that uses it; if none
-   does, start BiBCode once and quit it normally, then retry." With the
-   runtime lock held, sidecars mean another SQLite program has the file open
-   (every WAL reader has a `-wal`) or a crash. Refusing here, rather than
-   letting step 5 run WAL recovery, keeps the real run and the dry run (D8)
-   symmetric, and means the backup starts from the state the user inspected.
-   In practice this is how a database held by another program is refused.
-5. **Open the maintenance connection.** A new `Database::open_for_maintenance`
-   uses `open_connection` with `busy_timeout = 0`, then
-   `locking_mode = EXCLUSIVE` *before first access*, so no `-shm` is created
-   (SQLite keeps the WAL index in heap memory). It keeps the normal
-   `foreign_keys`, `synchronous = FULL`, WAL and journal-limit pragmas, then
-   runs `BEGIN EXCLUSIVE; COMMIT`. `SQLITE_BUSY` or `SQLITE_LOCKED` at any point
-   gives `RecoveryError::DatabaseLocked` ("Another program has the database
-   open. Close it, then retry.") at once, with no retry. This catches a
-   program that opened the file after step 4. From here, every step uses this one
-   connection, so the exclusive lock that keeps out other programs does not
-   block our own backup.
-6. **Schema check on that connection.** The ledger-prefix and core-table checks
+   inspection (D1), the dry run (D8) and compaction. Only "database present,
+   marker valid" proceeds. A missing marker is refused because backups are
+   keyed by storage ID: "Start BiBCode once so it can adopt this store, then
+   retry". Every other state is refused with the inspection `issue` text. The
+   SQLite classifier is **not** called: its 5 s busy-retry and in-memory copy
+   would wait on a locked database and time out on a large one (review
+   finding 1).
+4. **Open one writable maintenance connection and lock it.** A new
+   `Database::open_for_maintenance` opens `state.sqlite` and sets, in this
+   order: `busy_timeout = 0`; `locking_mode = EXCLUSIVE`, *before first
+   access*, so SQLite keeps the WAL index in heap memory and never uses
+   `-shm`; then the normal `open_connection` pragmas (`foreign_keys`,
+   `synchronous = FULL`, `journal_mode = WAL`, autocheckpoint and journal
+   limit); then `BEGIN EXCLUSIVE; COMMIT`. In exclusive locking mode the lock
+   is kept after the commit until the connection closes. `SQLITE_BUSY` or
+   `SQLITE_LOCKED` at any point gives `RecoveryError::DatabaseLocked`
+   ("Another program has the database open. Close it, then retry.") at once,
+   with no retry and nothing written. This is a real lock check, not an
+   inference: any connection in a transaction holds a database-file lock,
+   and a WAL-mode connection keeps a shared lock for as long as it is open
+   (that is how SQLite detects the last connection). An idle rollback-mode
+   connection holds none; it is simply refused by our lock if it tries to
+   read during compaction.
+   - **Crash-left sidecars are recovered here, legitimately (review finding
+     r2-2).** If a crash left committed frames in `-wal`, this first access
+     replays them under our exclusive lock, exactly as a server start would,
+     but without startup's 5 s whole-store validation, which a large healthy
+     store may never pass. The user does not need a separate "start and
+     quit" step. A crash-left `-shm` is not used and stays as it was;
+     the next normal open reinitializes it.
+   - **A restored store is in `journal_mode = DELETE`** (backups are switched
+     to it, `database.rs:715`, and restore installs the file unchanged). The
+     `journal_mode = WAL` pragma converts it, as the next server start would.
+     That is a header write under our lock, before the backup, and it is
+     part of "the store as BiBCode would open it".
+   From here, every step uses this one connection, so the exclusive lock does
+   not block our own backup.
+5. **Schema check on that connection.** The ledger-prefix and core-table checks
    that both validators already run move into
    `validate_bibcode_schema(&Connection, …)` in `migrations.rs`, called by the
    immutable validator, the coherent validator and compaction. They read a few
    rows, so they do not grow with database size. A mismatch is
    `NotCompactable` with the validator's detail. Integrity is checked once, by
-   the backup's `quick_check` in step 9, not here.
-7. **Measure** `page_size`, `page_count`, `freelist_count` and `auto_vacuum`.
-8. **Disk-space precheck** (D7). Refuse with the numbers.
-9. **Verified pre-compact backup** with `BackupTrigger::PreCompact`, through the
-   unchanged `create_verified_backup` and its 30 s budget (D5). Its built-in
+   the backup's `quick_check` in step 8, not here.
+6. **Measure** `page_size`, `page_count`, `freelist_count` and `auto_vacuum`.
+7. **Disk-space precheck** (D7). Refuse with the numbers.
+8. **Verified pre-compact backup** with `BackupTrigger::PreCompact`, through the
+   unchanged `create_verified_backup` and its 30 s budget (D5). Its
+   online-backup copy runs on this connection's worker. Its built-in
    `quick_check` of the page-identical copy doubles as the pre-`VACUUM`
    integrity check, so the live store is not scanned twice. A
    `BackupError::QuickCheck` publishes nothing and refuses with "the store
    failed its integrity check; run `bibcode storage inspect`". A
    `DeadlineElapsed` refuses with the scope-down message (D5).
-10. **`VACUUM` in the SQLite worker.** One `Database::call` closure, so the
+9. **`VACUUM` in the SQLite worker.** One `Database::call` closure, so the
     checks and the statement run on the same thread with nothing queued
     between them:
     - return `Cancelled` if the token is already cancelled. This closes the
@@ -296,15 +326,15 @@ real run (the dry run is D8):
       not interruptible; it is bounded by the compacted size;
     - `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`, then remove the handler.
     No interrupt handle is needed.
-11. **`PRAGMA wal_checkpoint(TRUNCATE)`.** With the exclusive lock it cannot
+10. **`PRAGMA wal_checkpoint(TRUNCATE)`.** With the exclusive lock it cannot
     be busy; if it is, report the step and keep going, because the data is
     committed and the close checkpoints it.
-12. **`PRAGMA quick_check`**, then measure again. The `after` stats must show
+11. **`PRAGMA quick_check`**, then measure again. The `after` stats must show
     `freelistCount == 0` and `autoVacuum == "incremental"`; anything else is a
     `CompactFailed { phase: "verify" }` that carries the backup ID.
-13. **Close** the connection, which deletes the WAL, and release the guards.
+12. **Close** the connection, which deletes the WAL, and release the guards.
 
-The token is also checked between steps. Steps 11 to 13 are not cancellable:
+The token is also checked between steps. Steps 10 to 12 are not cancellable:
 the compaction is committed, and they only finish it.
 
 A recovery journal is not needed. There is no file move or rename. `VACUUM` is
@@ -351,20 +381,29 @@ budget:
 | Inventory (`inspect`, desktop dialog) | Hashes and `quick_check`s every generation in 30 s. Large generations become "deadline elapsed" issues, which reads as a broken backup.                                                         |
 | Inspection classifier                 | `quick_check` in 5 s. A large healthy store is classified unsafe.                                                                                                                               |
 
-Keeping 30 s resolves findings 4 and 5 without code:
+Keeping 30 s resolves findings 4 and 5, with one small restore change:
 
 - the 60 s skew check cannot trip, because `created_at` is taken inside a 30 s
   budget. The implementation adds
   `const _: () = assert!(BACKUP_TIMEOUT.as_secs() < MAX_PUBLICATION_TIME_SKEW.as_secs());`
   next to the constants, so a future extension fails to compile until
   `created_at` moves to publication time;
-- any pre-compact backup can be restored within restore's 30 s. Creation does
-  strictly more work on the same bytes than restore does: the page copy,
-  `quick_check`, hash, reload verification (hash and `quick_check`) and the
-  retention inventory, which verifies that generation again with the others.
-  Restore verifies the one generation, copies it, verifies the copy, and moves
-  the live files aside by rename (`restore_backup_blocking`). This is the
-  same guarantee pre-update backups already have.
+- restore of a pre-compact backup must not depend on unrelated backups. Today
+  it does: the lookup inventories, and so verifies, every generation of each
+  identity it visits (review finding r2-1). The implementation changes
+  `find_verified_backup_for_recovery` to verify only the selected
+  generation: for each identity directory that contains
+  `<backup-id>`, open that identity's `BackupStoreBoundary` and call
+  `verify_generation` on that one directory. The result, error and
+  `selected_entry_failed_verification` handling stay as they are. This
+  benefits every restore, not only pre-compact ones. After it, restore does
+  the work of one verification, one copy and one verification of that copy,
+  plus renames. Creating the same generation did a page copy, a
+  `quick_check`, a hash, a reload verification and a retention inventory
+  that verified it again. So restore does less I/O than creation did, under
+  the same 30 s. This is a work bound, not a timing guarantee: a cold disk
+  cache at restore time is slower than the warm one at creation. That
+  margin is listed in Risks.
 
 The cost: a store whose backup takes more than 30 s cannot be compacted yet.
 Such a store already cannot take a pre-update or pre-migration backup today,
@@ -380,7 +419,7 @@ throughput) applied together to creation, restore, inventory and the
 classifier, with `created_at` taken immediately before the manifest write,
 Ctrl-C on `restore`, and a slow-backup test. It is listed in Risks.
 
-`VACUUM` itself has no deadline. Ctrl-C cancels it (D3 step 10). A store whose
+`VACUUM` itself has no deadline. Ctrl-C cancels it (D3 step 9). A store whose
 backup fits in 30 s compacts in a comparable time.
 
 The disk cost must be stated honestly. Right after a compaction, the store uses
@@ -435,53 +474,57 @@ convention.
 
 ### D8. `--dry-run`
 
-Revision 1 opened the writable maintenance connection in the dry run. That is
-not non-mutating: if a crash left committed frames in `-wal`, the open runs
-WAL recovery, and the close of the last connection checkpoints into
-`state.sqlite` and deletes the sidecars
+The dry run reports; it does not prove the SQLite lock. It never opens a
+writable connection, because that is not non-mutating: if a crash left
+committed frames in `-wal`, the open replays them, and the close of the last
+connection checkpoints into `state.sqlite` and deletes the sidecars
 ([SQLite WAL](https://www.sqlite.org/wal.html)). The creating guards would also
 leave `.bibcode-runtime.lock` and `.bibcode-storage.lock` behind (review
-finding 3).
+finding 3). A read-only probe cannot replace the lock check either: in WAL
+mode it creates `-shm`, and an immutable open ignores locks entirely, so it
+reports success against a restored `DELETE`-mode store that another program
+holds with `BEGIN EXCLUSIVE` (review finding r2-4).
 
-The dry run therefore uses the same non-mutating read as `inspect` (D1) and
-never opens a writable connection:
+Steps:
 
 1. resolve and re-check the root;
-2. `OfflineRecoveryGuard::try_acquire_existing` (non-creating). `WouldBlock`
-   gives `StoreRunning`; `NotFound` means no owner. `StoreOperationGuard` is
-   not taken: it creates its lock file, and the dry run writes nothing that
-   needs serializing. A concurrent `restore` or `compact` holds the runtime
-   lock exclusively, so the dry run sees `StoreRunning`;
-3. `classify_store_files` and the sidecar check, with the same refusals as the
-   real run (D3 steps 3 and 4);
-4. open `immutable=1`, run `validate_bibcode_schema` and read the four
-   pragmas. No `quick_check`: the dry run makes no integrity claim, and the
-   real run's backup checks integrity;
+2. `OfflineRecoveryGuard::try_acquire_existing` (non-creating), held to the
+   end. `WouldBlock` gives `StoreRunning`; `NotFound` means no owner.
+   `StoreOperationGuard` is not taken: it creates its lock file, and the dry
+   run writes nothing that needs serializing. A concurrent `restore` or
+   `compact` holds the runtime lock exclusively, so the dry run sees
+   `StoreRunning`;
+3. `classify_store_files`, with the same refusals as the real run (D3 step 3);
+4. without sidecars: open `immutable=1`, run `validate_bibcode_schema` and
+   read the four pragmas. No `quick_check`: the dry run makes no integrity
+   claim, and the real run's backup checks integrity. With sidecars: SQLite is
+   not opened (D1). The plan reports `before` page stats as `null` with
+   `"uncheckpointed-wal"`, sizes the backup and space needs from
+   `fileBytes + walBytes` (an upper bound), leaves `estimatedReclaimBytes`
+   `null`, and says "The real run first writes back the changes left in
+   `state.sqlite-wal`";
 5. the disk-space precheck (D7), then return the plan.
 
-What the dry run cannot prove is the SQLite lock held by another program. It
-infers it: in WAL mode every connection that has read the database has a
-`-wal` file, so "no sidecars" means no other connection is reading. A program
-that opened the file but has not read it yet is caught only by the real run's
-`busy_timeout = 0` probe, which refuses before the backup. The plan reports
-this as `"sqliteLock": "inferred-from-sidecars"`.
+The plan always carries `"sqliteLock": "not-checked"`, and the stderr summary
+says: "A dry run does not check whether another program has the database
+open. The real run refuses at once if one does, before taking the backup."
 
-A refusal (running, sidecars present, space) is the same error, with the same non-zero
-exit, as the real command. That makes `--dry-run` a reliable preflight for
-scripts, except for the two limits above (an opener racing the run, and the
-30 s backup budget). The issue's "dry run wins" behavior falls out of this:
-there is no `--fix` flag; the command compacts unless `--dry-run` is given.
+A refusal the dry run can see (running, store state, schema, space) is the
+same error, with the same non-zero exit, as the real command. It is a preflight
+for those, not for SQLite locks or the 30 s backup budget, and the guide says
+so. The issue's "dry run wins" behavior falls out of this: there is no `--fix`
+flag; the command compacts unless `--dry-run` is given.
 
 ### D9. Failure, cancellation and rollback
 
-| Where                                    | State left                                                                                                                                                                                     | Reported                                                                                                                                            |
-| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Steps 1–8 (refusal, cancel)              | Nothing written to the store. A real run may leave the two lock files (as `restore` does). A dry run leaves nothing (D8).                                                                      | The specific error. No backup ID.                                                                                                                   |
-| Step 9 backup fails, times out or Ctrl-C | Live store untouched. Ctrl-C during the backup is honored when it returns (it is bounded by 30 s); the backup, if published, is kept. An unpublished `.staging` entry is ignored by inventory. | "Could not take the pre-compact backup: …; the database was not changed." Cancelled after publication: `Cancelled` with the backup ID.              |
-| Step 10 cancelled before `VACUUM` starts | The worker returns before running the statement. The database is the pre-compact store.                                                                                                        | `Cancelled { backupId }`: "Compaction was cancelled. The database was not changed. The pre-compact backup `<id>` is kept."                          |
-| Step 10 `VACUUM` fails, Ctrl-C, crash    | SQLite rolls back, or WAL recovery does on the next open. The database is the pre-compact store. Setting `auto_vacuum` alone persists nothing.                                                 | `CompactFailed { phase: "vacuum", backupId }` (or `Cancelled { backupId }`): "The database was not changed. The pre-compact backup `<id>` is kept." |
-| Step 11 checkpoint busy                  | Compacted and committed in the WAL. The close checkpoints it.                                                                                                                                  | A warning in the report (`checkpoint: "deferred"`). Success.                                                                                        |
-| Step 12 `quick_check` or stat mismatch   | The database as SQLite left it.                                                                                                                                                                | `CompactFailed { phase: "verify", backupId }`: "…restore it with `bibcode storage restore --backup-id <id>`." Exit non-zero.                        |
+| Where                                    | State left                                                                                                                                                                                                                                       | Reported                                                                                                                                            |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Steps 1–7 (refusal, cancel)              | Nothing written, except that step 4 may have replayed a crash-left WAL or converted a restored store to WAL under the lock, as a server start would. A real run may leave the two lock files (as `restore` does). A dry run leaves nothing (D8). | The specific error. No backup ID.                                                                                                                   |
+| Step 8 backup fails, times out or Ctrl-C | Live store untouched. Ctrl-C during the backup is honored when it returns (it is bounded by 30 s); the backup, if published, is kept. An unpublished `.staging` entry is ignored by inventory.                                                   | "Could not take the pre-compact backup: …; the database was not changed." Cancelled after publication: `Cancelled` with the backup ID.              |
+| Step 9 cancelled before `VACUUM` starts  | The worker returns before running the statement. The database is the pre-compact store.                                                                                                                                                          | `Cancelled { backupId }`: "Compaction was cancelled. The database was not changed. The pre-compact backup `<id>` is kept."                          |
+| Step 9 `VACUUM` fails, Ctrl-C, crash     | SQLite rolls back, or WAL recovery does on the next open. The database is the pre-compact store. Setting `auto_vacuum` alone persists nothing.                                                                                                   | `CompactFailed { phase: "vacuum", backupId }` (or `Cancelled { backupId }`): "The database was not changed. The pre-compact backup `<id>` is kept." |
+| Step 10 checkpoint busy                  | Compacted and committed in the WAL. The close checkpoints it.                                                                                                                                                                                    | A warning in the report (`checkpoint: "deferred"`). Success.                                                                                        |
+| Step 11 `quick_check` or stat mismatch   | The database as SQLite left it.                                                                                                                                                                                                                  | `CompactFailed { phase: "verify", backupId }`: "…restore it with `bibcode storage restore --backup-id <id>`." Exit non-zero.                        |
 
 There is no automatic restore. Restore is the explicit, journaled offline path,
 and putting a second mutating step inside a failure path would add risk
@@ -526,7 +569,7 @@ the sibling commands do.
   "before": { "fileBytes": 0, "walBytes": 0, "pageSize": 0, "pageCount": 0, "freelistCount": 0, "autoVacuum": "none" },
   "plan": { "backupBytes": 0, "estimatedCompactedBytes": 0, "estimatedReclaimBytes": 0, "autoVacuumAfter": "incremental",
             "requiredFreeBytes": { "store": 0, "temp": 0, "sameVolume": true }, "availableFreeBytes": { "store": 0, "temp": 0 },
-            "backupBudgetSeconds": 30, "sqliteLock": "probed | inferred-from-sidecars (dry run)" },
+            "backupBudgetSeconds": 30, "sqliteLock": "locked | not-checked (dry run)" },
   "backupId": "uuid | null (dry run)",
   "after": { "...": "same shape as before; null for a dry run" },
   "reclaimedBytes": 0,
@@ -590,15 +633,18 @@ which is the order T3's doctor uses. That is its own design.
   a cancellable `VACUUM` closure (pre-check plus progress handler).
 - `persistence/migrations.rs`: `validate_bibcode_schema(&Connection, …)`
   extracted from the two validators, which now call it.
-- `persistence/store.rs`: the exactly-one-sidecar rule in
-  `validate_existing_store_for_inspection`.
+- `persistence/store.rs`: `validate_existing_store_for_inspection` takes the
+  guard result (D1) and opens SQLite only in the cases D1's table allows.
 - `persistence/backup.rs`: `BackupTrigger::PreCompact`; the pre-compact
-  retention rule; `OfflineRecoveryGuard::try_acquire_existing`;
+  retention rule; `OfflineRecoveryGuard::try_acquire_existing`, held by
+  `inspect_store` for classification and stats;
   `classify_store_files` extracted from `inspect_store`;
+  `find_verified_backup_for_recovery` verifies only the selected generation
+  (D5);
   `StoreInspection.database`; the `BACKUP_TIMEOUT < MAX_PUBLICATION_TIME_SKEW`
   compile-time assertion; new `RecoveryError` variants `DatabaseLocked`,
-  `DatabaseSidecarsPresent`, `InsufficientSpace`, `NotCompactable`,
-  `Cancelled` and `CompactFailed`. No backup or restore deadline changes.
+  `InsufficientSpace`, `NotCompactable`, `Cancelled` and `CompactFailed`. No
+  backup or restore deadline changes.
 - `persistence/compaction.rs` (new): the flow, the free-space probe and the
   test entry point `compact_store_for_integration_test(root, options,
   CompactTestHook)`, following the crate's `_for_integration_test` and fault
@@ -617,7 +663,12 @@ which is the order T3's doctor uses. That is its own design.
 
 Hermetic, in `apps/server/tests/project_data_safety.rs` (`TestSandbox`/temp
 roots), unless noted. "Listings" means the recursive `base_dir` listing, which
-covers `state_dir`, `backups/` and both lock files.
+covers `state_dir`, `backups/` and both lock files. "Crash-left WAL fixture"
+means `state.sqlite` and `-wal`, with committed frames, copied from a store
+whose writer is still open with `wal_autocheckpoint = 0`; "with `-shm`" adds
+that file too.
+
+Inspection:
 
 1. Extend `recovery_inspection_reports_verified_store_state_without_mutating_it`.
    The fixture inserts and then deletes rows. Check `database.fileBytes` equals
@@ -626,72 +677,104 @@ covers `state_dir`, `backups/` and both lock files.
    `-wal`, `-shm` or `.bibcode-runtime.lock`).
 2. `inspection_while_a_server_owns_the_store_reports_sizes_and_store_running`:
    `ServerRuntime::start`, then `fileBytes > 0`, stats `null`,
-   `databaseStatsUnavailable: "store-running"`, and database, marker and
-   listings unchanged.
-3. `inspection_with_a_wal_but_no_shm_creates_nothing`: an offline fixture with
-   a crash-left `-wal` holding committed frames and no `-shm` (made by
-   copying `state.sqlite` and `-wal`, not `-shm`, from a store whose writer is
-   still open with `wal_autocheckpoint = 0`, into the test root). Classification `unsafe-database-state` with the
-   sidecar issue, `databaseStatsUnavailable: "uncheckpointed-wal"`, and the
-   listings and database and `-wal` bytes unchanged. A unit test in
-   `store.rs` covers the `-shm`-only case.
-4. `first_run_store_reports_incremental_auto_vacuum_and_a_fixture_keeps_none`.
-5. `compact_dry_run_reports_reclaim_and_changes_nothing`: the estimate is
-   within 1 % of `freelistCount × pageSize`; database bytes, marker and
-   listings are unchanged, including in a root that has never had a lock file.
-6. `compact_dry_run_and_compact_refuse_a_crash_left_wal_without_touching_it`:
-   the fixture of test 3, plus one with both sidecars. Both modes return
-   `DatabaseSidecarsPresent`; database, `-wal` bytes and listings are unchanged; no
-   backup is taken.
-7. `compact_reclaims_space_behind_exactly_one_verified_pre_compact_backup`:
+   `databaseStatsUnavailable: "store-running"`, classification `existing`, and
+   database, marker and listings unchanged.
+3. `inspection_of_an_owned_store_never_opens_sqlite` (finding r2-3): the test
+   holds `.bibcode-runtime.lock` shared, as a server does, over the
+   crash-left WAL fixture without `-shm`. That is the state the shutdown race
+   produces. Classification `existing`, `"store-running"`, and no `-shm`
+   appears. The current code creates one, so this fails before the change.
+4. `inspection_of_an_offline_store_with_one_sidecar_creates_nothing`: the
+   crash-left WAL fixture without `-shm`, in a root with a lock file and in a
+   root without one. Classification `unsafe-database-state` with the sidecar
+   issue, `"uncheckpointed-wal"`, and listings, database and `-wal` bytes
+   unchanged. A `store.rs` unit test covers the `-shm`-only case and the
+   no-lock-file-with-both-sidecars case.
+5. `first_run_store_reports_incremental_auto_vacuum_and_a_fixture_keeps_none`.
+
+Dry run:
+
+6. `compact_dry_run_reports_reclaim_and_changes_nothing`: the estimate is
+   within 1 % of `freelistCount × pageSize`; `sqliteLock: "not-checked"`;
+   database bytes, marker and listings are unchanged, including in a root that
+   has never had a lock file.
+7. `compact_dry_run_on_a_crash_left_wal_reports_upper_bounds_and_changes_nothing`:
+   the crash-left WAL fixture with `-shm`. Page stats and reclaim are `null`,
+   the backup estimate is `fileBytes + walBytes`; database, `-wal` and `-shm`
+   bytes and listings are unchanged.
+
+Compaction:
+
+8. `compact_reclaims_space_behind_exactly_one_verified_pre_compact_backup`:
    one new generation with trigger `pre-compact` that inventories as verified;
    `fileBytes` shrinks; `freelistCount == 0`; `autoVacuum: "incremental"`;
    every project, thread and message reads back equal to before (snapshot of
-   the projection tables); no sidecar remains.
-8. `compact_refuses_while_a_server_owns_the_store`, modeled on `:1294`:
-   `StoreRunning`, no backup directory entry, and the database and marker are
-   unchanged.
-9. `compact_refuses_a_database_another_connection_holds_without_waiting`:
-   another connection opens `state.sqlite` and holds `BEGIN EXCLUSIVE` with a
-   pending write. Both `compact` and `compact --dry-run` fail in under 1 s
-   (less than the classifier's 5 s and `BUSY_TIMEOUT`) with
-   `DatabaseSidecarsPresent`; no backup is taken; after the other connection
-   rolls back and closes, the database bytes equal the original. Plus a unit
-   test in `database.rs`,
-   `open_for_maintenance_fails_at_once_on_a_locked_database`: the same held
-   lock, `open_for_maintenance` called directly, `DatabaseLocked` in under
-   1 s. Together they pin finding 1: nothing waits before the refusal.
-10. `compact_refuses_insufficient_disk_space_before_the_backup`: through
+   the projection tables); no `-wal` remains.
+9. `compact_recovers_a_crash_left_wal_under_its_lock` (finding r2-2): the
+   crash-left WAL fixture with `-shm`, and once without it. Compaction
+   succeeds without a server start; the rows that existed only in `-wal` are
+   present in both the pre-compact backup and the compacted store; no `-wal`
+   remains.
+10. `compact_refuses_while_a_server_owns_the_store`, modeled on `:1294`:
+    `StoreRunning`, no backup directory entry, and the database and marker
+    are unchanged.
+11. `compact_refuses_a_locked_database_without_waiting` (findings 1 and r2-4):
+    two cases, each with another connection holding `BEGIN EXCLUSIVE` and a
+    pending write: a normal WAL store, and a store just restored from a
+    backup (`journal_mode = DELETE`, no sidecars). `compact` fails with
+    `DatabaseLocked` in under 1 s (less than the classifier's 5 s and
+    `BUSY_TIMEOUT`), no backup is taken, and after the other connection rolls
+    back the database bytes equal the original. In the restored case
+    `compact --dry-run` succeeds with `sqliteLock: "not-checked"` and changes
+    nothing, which pins the documented limit.
+12. `compact_refuses_insufficient_disk_space_before_the_backup`: through
     `CompactTestHook::FreeSpace`, `InsufficientSpace` with both numbers, no
     backup, and the database unchanged.
-11. `compact_cancelled_after_the_backup_leaves_the_store_unchanged`:
-    `CompactTestHook::CancelAfterBackup`. `Cancelled` with the backup ID; the
-    database bytes equal the original; the backup inventories as verified.
-    This pins finding 6 (cancel before `VACUUM` starts).
-12. `compact_cancelled_during_vacuum_rolls_back_and_restarts_cleanly`:
-    `CompactTestHook::CancelDuringVacuum`. `Cancelled` with the backup ID;
-    then `prepare_store` on the root (a normal restart) succeeds, every
-    projection row reads back equal, `freelistCount` and `autoVacuum: "none"`
-    are as before, and the pre-compact backup is still verified.
-13. `inventory_keeps_other_backups_beside_a_manifest_with_an_unknown_trigger`.
+13. `compact_cancelled_after_the_backup_leaves_the_store_unchanged`
+    (finding 6): `CompactTestHook::CancelAfterBackup`. `Cancelled` with the
+    backup ID; the database bytes equal the original; the backup inventories
+    as verified.
+14. `compact_cancelled_during_vacuum_rolls_back_and_restarts_cleanly`
+    (finding 6): `CompactTestHook::CancelDuringVacuum`. `Cancelled` with the
+    backup ID; then `prepare_store` on the root (a normal restart) succeeds,
+    every projection row reads back equal, `freelistCount` and
+    `autoVacuum: "none"` are as before, and the pre-compact backup is still
+    verified.
+
+Backups and restore:
+
+15. `inventory_keeps_other_backups_beside_a_manifest_with_an_unknown_trigger`.
     This is the older-app model. Retention leaves the unknown generation in
     place.
-14. `pre_compact_backup_restores_with_restore_backup_id`.
-15. Unit (`backup.rs`): `pre_compact_retention_keeps_one_pre_compact_and_two_older_generations`.
-16. Unit (`config.rs`): `storage compact`, `storage compact --dry-run --json`,
+16. `pre_compact_backup_restores_with_restore_backup_id`, with an older
+    pre-update generation of the same identity and a generation of another
+    identity present.
+17. Unit (`backup.rs`), Unix only:
+    `recovery_lookup_verifies_only_the_selected_generation` (finding r2-1).
+    Beside the small selected generation, an older generation of the same
+    identity has a sparse 8 GiB `backup.sqlite` with a manifest of that
+    size. `find_verified_backup_for_recovery` with a 2 s deadline returns the
+    selected backup. The current code hashes the large file and fails with
+    `DeadlineElapsed` at 2 s, so the red run is quick. Sparse files are
+    guaranteed on the Linux and macOS CI filesystems; Windows shares the code
+    path.
+18. Unit (`backup.rs`): `pre_compact_retention_keeps_one_pre_compact_and_two_older_generations`.
+19. Unit (`database.rs`): `open_for_maintenance_fails_at_once_on_a_locked_database`.
+20. Unit (`config.rs`): `storage compact`, `storage compact --dry-run --json`,
     and a rejected unknown flag.
-17. Unit (`compaction.rs`): the required-space arithmetic for same-volume and
+21. Unit (`compaction.rs`): the required-space arithmetic for same-volume and
     split-volume cases.
-18. Contracts: an `ipc.test.ts` case that decodes a `"pre-compact"` backup.
+22. Contracts: an `ipc.test.ts` case that decodes a `"pre-compact"` backup.
     `vp run check:contracts`.
-19. Unchanged and must pass: all restore, start-empty, startup, migration,
+23. Unchanged and must pass: all restore, start-empty, startup, migration,
     pre-update, retention and validator tests (the schema-check extraction
     touches both validators); `projectDataSafety.test.ts`;
-    `ProjectDataRecoveryDialog.test.tsx`; `vp run test:ui:desktop`
-    (`main-window.e2e.ts`, `platform-capabilities.e2e.ts`).
+    `ProjectDataRecoveryDialog.test.tsx`; the desktop `data_safety.rs` tests;
+    `vp run test:ui:desktop` (`main-window.e2e.ts`,
+    `platform-capabilities.e2e.ts`).
 
-No slow-backup or large-restore test: the budgets do not change (D5). The
-compile-time assertion replaces a timing test for finding 4.
+No slow-backup test: the budgets do not change (D5). The compile-time
+assertion replaces a timing test for finding 4.
 
 Gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
 warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`,
@@ -725,16 +808,26 @@ warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`,
   is one size-scaled budget across creation, restore, inventory and the
   classifier, `created_at` at publication time, Ctrl-C on `restore`, and a
   slow-backup test. The compile-time assertion stops a partial extension.
-- That `auto_vacuum` before `journal_mode = WAL` takes effect on the staged
-  file, that `VACUUM` switches modes in WAL mode, and that the progress handler
-  interrupts `VACUUM` are SQLite behaviors (and T3's report), not yet observed
-  here. Tests 4, 7 and 12 respectively are the proof. The first has a stated
-  fallback; if the third fails, the closure also calls the connection's
-  interrupt handle from the cancellation path, keeping the pre-check.
+- Restore of a pre-compact backup does less I/O than its creation did, but on a
+  cold disk cache it may still approach the 30 s limit for a backup that took
+  close to 30 s to create. The fix is the same follow-up.
+- Four behaviors come from SQLite's documentation (and T3's report) and are
+  not yet observed here. Each has a test that proves it:
+  - `auto_vacuum` set before `journal_mode = WAL` takes effect on the staged
+    file (test 5, with a stated fallback);
+  - `VACUUM` switches the mode in WAL mode (test 8);
+  - the progress handler interrupts `VACUUM` (test 14). If it does not, the
+    closure also calls the connection's interrupt handle from the
+    cancellation path and keeps the pre-check;
+  - exclusive locking mode replays a crash-left WAL without using `-shm`
+    (test 9).
 - The final page copy inside `VACUUM` is not interruptible, so Ctrl-C can take
   as long as writing the compacted size.
-- The dry run infers the SQLite lock from sidecars (D8); the real run's probe
-  covers the race.
+- The dry run does not check SQLite locks (D8). The real run refuses at once,
+  before the backup.
+- Inspection of an offline store with both sidecars can still race a
+  third-party SQLite program that closes the database at that moment (D1).
+  The recovery guide forbids such programs while BiBCode data is in use.
 - The pre-compact backup temporarily *raises* total disk use. The dry run and
   the guide say so.
 - Older-desktop and newer-WSL skew fails closed (D10).
@@ -749,17 +842,28 @@ warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`,
 | Recommend-to-compact threshold?          | None now (D13).                                                  |
 | Run event pruning first, when it lands?  | Yes, as a step before the backup, under its own design (D14).    |
 
-## Review findings and resolutions (revision 2)
+## Review findings and resolutions
 
-| #   | Finding (verified against source and SQLite docs)                                                                                                      | Resolution                                                                                                                                                                                                                 |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Reusing the inspection classifier before the lock probe waits up to 5 s on a locked store (`migrations.rs:384`) and times out on a large healthy one.  | Compaction no longer calls the SQLite classifier. File-level checks are shared (`classify_store_files`); sidecars refuse at once; the schema check runs on the maintenance connection after its lock (D3 3–6). Test 9.     |
-| 2   | With either sidecar present the classifier opens plain read-only SQLite (`store.rs:339`), which creates a missing `-shm`.                              | Exactly one sidecar: inspection does not open SQLite and reports `unsafe-database-state` (D1). Both or none: unchanged, nothing is created. Test 3 and a `store.rs` unit test.                                             |
-| 3   | The dry run's writable open can checkpoint crash-left WAL frames into `state.sqlite` and delete sidecars; the creating guards leave lock files.        | The dry run takes only the non-creating runtime guard, refuses sidecars, and reads through `immutable=1` (D8). Tests 5 and 6 (crash-left WAL, recursive listings).                                                         |
-| 4   | `created_at` precedes the copy (`backup.rs:533`) but must be within 60 s of publication (`backup.rs:2024`), so a 1 h backup budget fails verification. | The budget is not extended (D5); 30 s cannot exceed the 60 s skew. A compile-time assertion pins `BACKUP_TIMEOUT < MAX_PUBLICATION_TIME_SKEW` for the large-store follow-up.                                               |
-| 5   | Restore keeps `RECOVERY_TIMEOUT = 30 s` (`backup.rs:846`), so a backup created under 1 h may be unrestorable.                                          | The budget is not extended (D5). Creation does strictly more work on the same bytes than restore (it verifies the new generation twice plus the retention inventory), so any pre-compact backup restores in 30 s. Test 14. |
-| 6   | `sqlite3_interrupt` with no running statement is a no-op, so Ctrl-C between the backup and `VACUUM` is lost.                                           | One worker closure checks the token, then runs `VACUUM` under a progress handler that returns the token state (D3 step 10). Tests 11, 12 (before, during, restart).                                                        |
+Round 2 disproved revision 2's premise that compaction could reuse the
+classifier, the sidecar check and the restore lookup as they are. Revision 3
+replans around one rule: decide what to open from a lock held for the whole
+operation, never from a file-existence check made earlier.
+
+| #    | Finding (verified against source and SQLite docs)                                                                                                     | Resolution (revision 3)                                                                                                                                                                                      |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | Reusing the inspection classifier before the lock probe waits up to 5 s on a locked store (`migrations.rs:384`) and times out on a large healthy one. | Compaction never calls the SQLite classifier. It takes its locks, then one writable connection with `busy_timeout = 0` and `BEGIN EXCLUSIVE`, then checks the schema on it (D3 steps 3–5). Tests 11, 19.     |
+| 2    | With either sidecar present the classifier opens plain read-only SQLite (`store.rs:339`), which creates a missing `-shm`.                             | Superseded by r2-3: SQLite is opened only as D1's lock table allows. Tests 3, 4.                                                                                                                             |
+| 3    | The dry run's writable open can checkpoint crash-left WAL frames and delete sidecars; the creating guards leave lock files.                           | The dry run takes only the non-creating runtime guard and reads through `immutable=1`, or not at all when sidecars exist (D8). Tests 6, 7.                                                                   |
+| 4    | `created_at` precedes the copy (`backup.rs:533`) but must be within 60 s of publication (`backup.rs:2024`).                                           | Budgets are not extended (D5); 30 s cannot exceed the 60 s skew. A compile-time assertion pins `BACKUP_TIMEOUT < MAX_PUBLICATION_TIME_SKEW`.                                                                 |
+| 5    | Restore keeps `RECOVERY_TIMEOUT = 30 s` (`backup.rs:846`).                                                                                            | Budgets are not extended, and restore verifies only the selected generation (r2-1), so it does less I/O than creation did. Tests 16, 17.                                                                     |
+| 6    | `sqlite3_interrupt` with no running statement is a no-op, so Ctrl-C between the backup and `VACUUM` is lost.                                          | One worker closure checks the token, then runs `VACUUM` under a progress handler that returns the token state (D3 step 9). Tests 13, 14.                                                                     |
+| r2-1 | Restore's lookup inventories every generation of each identity it visits (`backup.rs:1169–1205`), so unrelated backups spend its 30 s.                | `find_verified_backup_for_recovery` verifies only `<identity>/<backup-id>` (D5). The work-bound claim is restated with its cold-cache limit (Risks). Tests 16, 17.                                           |
+| r2-2 | Refusing crash-left sidecars can strand a store whose startup validation exceeds 5 s (`store.rs:262`, `migrations.rs:17`).                            | No refusal: compaction's locked writable connection replays the WAL itself, as a server start would, without startup's validation (D3 step 4). Test 9.                                                       |
+| r2-3 | Unlocked inspection can see both sidecars, lose them to a server shutdown, and recreate them on open.                                                 | Inspection holds the non-creating runtime guard throughout. While a BiBCode process owns the root, SQLite is not opened at all; offline, no BiBCode process can remove sidecars mid-inspection (D1). Test 3. |
+| r2-4 | The immutable dry-run read misses a `BEGIN EXCLUSIVE` held on a restored `DELETE`-mode store (`database.rs:715`).                                     | The dry run no longer claims a lock check: `sqliteLock: "not-checked"` and a stderr line say so; the real run's probe refuses at once (D8). Test 11 covers both modes.                                       |
 
 Scope-down: compaction of stores whose backup exceeds the existing 30 s budget
 (D5, Risks). The issue's acceptance criteria use small hermetic fixtures and
-are all met.
+are all met. Rejected alternative for the backup: a separate `VACUUM INTO`
+writer. It would duplicate backup publication and verification, and its copy
+is already a vacuumed artifact (D5).
