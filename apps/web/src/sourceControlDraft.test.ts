@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { createJSONStorage } from "zustand/middleware";
 
+import { SourceControlDraftConflict } from "./components/SourceControlDraftConflict";
 import { sourceControlDraftKey, useSourceControlDraft } from "./sourceControlDraft";
 import { useSourceControlPanelStore } from "./sourceControlPanelStore";
 
@@ -105,6 +106,77 @@ describe("source control draft persistence", () => {
   });
 });
 
+describe("source control drafts in two tabs (#219)", () => {
+  const ONE = "env-a::/one";
+  const TWO = "env-a::/two";
+  const store = () => useSourceControlPanelStore.getState();
+  const saved = () => JSON.parse(persisted.get(STORAGE_KEY) ?? "{}").state;
+  /** Another tab saves its folder drafts, without this tab hearing of it yet. */
+  const otherTabSaved = (byCwdKey: Record<string, { message: string }>) =>
+    persisted.set(
+      STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        state: { ...saved(), byCwdKey: { ...saved().byCwdKey, ...byCwdKey } },
+      }),
+    );
+
+  it("writes only the folder this tab changed, keeping another tab's folder", () => {
+    store().setCwdMessage(ONE, "One");
+    otherTabSaved({ [TWO]: { message: "Two from the other tab" } });
+
+    store().setCwdMessage(ONE, "One, edited");
+
+    expect(saved().byCwdKey).toEqual({
+      [ONE]: { message: "One, edited" },
+      [TWO]: { message: "Two from the other tab" },
+    });
+    expect(store().byCwdKey[TWO]).toEqual({ message: "Two from the other tab" });
+  });
+
+  it("follows another tab's drafts when it saves", async () => {
+    store().setCwdMessage(ONE, "One");
+    otherTabSaved({ [ONE]: { message: "One, typed in the other tab" } });
+
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY }));
+    });
+
+    expect(store().byCwdKey[ONE]).toEqual({ message: "One, typed in the other tab" });
+  });
+
+  it("keeps the newer draft and the other tab's version on a concurrent edit", () => {
+    store().setCwdMessage(ONE, "Mine");
+    otherTabSaved({ [ONE]: { message: "Theirs" } });
+
+    store().setCwdMessage(ONE, "Mine, newer");
+
+    const expected = { message: "Mine, newer", otherWindowMessage: "Theirs" };
+    expect(saved().byCwdKey[ONE]).toEqual(expected);
+    expect(store().byCwdKey[ONE]).toEqual(expected);
+
+    // Typing keeps the other version on offer; swapping puts it in the box, keeping this one.
+    store().setCwdMessage(ONE, "Mine, newest");
+    store().swapCwdOtherWindowMessage(ONE);
+    expect(saved().byCwdKey[ONE]).toEqual({
+      message: "Theirs",
+      otherWindowMessage: "Mine, newest",
+    });
+    store().dismissCwdOtherWindowMessage(ONE);
+    expect(saved().byCwdKey[ONE]).toEqual({ message: "Theirs" });
+  });
+
+  it("never clears a draft another tab typed since this tab last saw it", () => {
+    store().setCwdMessage(ONE, "Committed here");
+    otherTabSaved({ [ONE]: { message: "Typed there meanwhile" } });
+
+    store().clearCwdDraft(ONE);
+
+    expect(saved().byCwdKey[ONE]).toEqual({ message: "Typed there meanwhile" });
+    expect(store().byCwdKey[ONE]).toEqual({ message: "Typed there meanwhile" });
+  });
+});
+
 function DraftWriter() {
   const draft = useSourceControlDraft({ environmentId: "env-a", cwd: "/repo" });
   return createElement(
@@ -130,5 +202,34 @@ describe("useSourceControlDraft", () => {
     await act(async () => container.querySelector("button")?.click());
 
     expect(container.querySelector("output")?.textContent).toBe("Typed from writer");
+  });
+});
+
+describe("SourceControlDraftConflict", () => {
+  const button = (name: string) =>
+    [...container.querySelectorAll("button")].find((element) => element.textContent === name);
+
+  it("offers the other window's version and swaps it in without losing this one", async () => {
+    useSourceControlPanelStore.setState({
+      byCwdKey: { "env-a::/repo": { message: "Mine", otherWindowMessage: "Theirs\nbody" } },
+    });
+    await act(async () =>
+      root?.render(
+        createElement(SourceControlDraftConflict, { environmentId: "env-a", cwd: "/repo" }),
+      ),
+    );
+    expect(container.textContent).toContain("“Theirs”");
+
+    await act(async () => button("Use other version")?.click());
+    expect(useSourceControlPanelStore.getState().byCwdKey["env-a::/repo"]).toEqual({
+      message: "Theirs\nbody",
+      otherWindowMessage: "Mine",
+    });
+
+    await act(async () => button("Dismiss")?.click());
+    expect(useSourceControlPanelStore.getState().byCwdKey["env-a::/repo"]).toEqual({
+      message: "Theirs\nbody",
+    });
+    expect(container.textContent).toBe("");
   });
 });

@@ -202,10 +202,7 @@ describe("UiIntentNotifier", () => {
     try {
       const registry = fakeRegistry();
       await mount(registry);
-      await emit(registry, [
-        intent({ deadline: Date.now() - 1 }),
-        intent({ surface: "thread" }),
-      ]);
+      await emit(registry, [intent({ deadline: Date.now() - 1 }), intent({ surface: "thread" })]);
       expect(h.toasts).toHaveLength(0);
 
       visibility.mockReturnValue("visible");

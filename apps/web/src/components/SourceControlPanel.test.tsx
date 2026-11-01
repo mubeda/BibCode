@@ -481,6 +481,11 @@ vi.mock("./SourceControlAgentSuggestion", () => ({
   SourceControlAgentSuggestion: () => null,
 }));
 
+// Its own test covers the draft conflict offer (#219).
+vi.mock("./SourceControlDraftConflict", () => ({
+  SourceControlDraftConflict: () => null,
+}));
+
 vi.mock("./SourceControlCommits", () => ({
   SourceControlCommits: (props: { reloadToken: number; nowMs: number; gitCwd: string | null }) => {
     captured.commits.push(props);

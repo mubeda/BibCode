@@ -17,6 +17,7 @@ import {
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
 import { Input } from "~/components/ui/input";
+import { SourceControlDraftConflict } from "~/components/SourceControlDraftConflict";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { Textarea } from "~/components/ui/textarea";
 import { useSourceControlDraft } from "~/sourceControlDraft";
@@ -262,6 +263,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
             onChange={handleDescriptionChange}
           />
         </label>
+        <SourceControlDraftConflict environmentId={scope.environmentId} cwd={scope.cwd} />
 
         <div className="space-y-1">
           <label className="block text-xs font-medium" htmlFor="git-manager-co-author">

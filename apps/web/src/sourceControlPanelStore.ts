@@ -7,6 +7,11 @@ import { resolveStorage } from "./lib/storage";
 
 export interface SourceControlDraft {
   message: string;
+  /**
+   * The draft another tab saved for this folder while this one was typing (#219): the newer
+   * edit is `message`, and the other stays here until the person swaps to it or dismisses it.
+   */
+  otherWindowMessage?: string;
 }
 
 const DEFAULT_DRAFT: SourceControlDraft = { message: "" };
@@ -52,6 +57,10 @@ interface SourceControlPanelStoreState {
   removeThread: (ref: ScopedThreadRef) => void;
   setCwdMessage: (cwdKey: string, message: string) => void;
   clearCwdDraft: (cwdKey: string) => void;
+  /** Puts the other tab's version in the box, keeping this one as the other version. */
+  swapCwdOtherWindowMessage: (cwdKey: string) => void;
+  /** Keeps the message in the box and drops the other tab's version. */
+  dismissCwdOtherWindowMessage: (cwdKey: string) => void;
   promoteThreadDraft: (threadKey: string, cwdKey: string) => void;
   /**
    * A suggestion arrived. The thread's draft from before folder drafts (`legacyThreadKey`) is
@@ -131,10 +140,103 @@ function readSavedState(): SavedState | null {
 }
 
 /**
- * Sets this tab's state without saving the whole of it, for a change already written to storage
- * key by key. Captured from `create`, outside `persist`.
+ * Sets this tab's state without saving it, to take in what another tab saved. Captured from
+ * `create`, outside `persist`.
  */
 let setWithoutSaving: (partial: Partial<SourceControlPanelStoreState>) => void = () => {};
+
+type PersistedState = Pick<
+  SourceControlPanelStoreState,
+  "byThreadKey" | "byCwdKey" | "agentSuggestionByCwdKey" | "sourceControlGroupByFolder"
+>;
+
+const persistedFields = (state: PersistedState): PersistedState => ({
+  byThreadKey: state.byThreadKey,
+  byCwdKey: state.byCwdKey,
+  agentSuggestionByCwdKey: state.agentSuggestionByCwdKey,
+  sourceControlGroupByFolder: state.sourceControlGroupByFolder,
+});
+
+/**
+ * What this tab last saved or loaded (#219). An entry that differs from it is this tab's own
+ * change; every other entry is written as storage has it, so another tab's folders survive.
+ */
+let synced: PersistedState | null = null;
+
+/** `saved` with the entries this tab changed from `base` to `next`, each settled by `resolve`. */
+function mergeEntries<T>(
+  base: Record<string, T>,
+  next: Record<string, T>,
+  saved: Record<string, T>,
+  resolve: (ours: T | undefined, theirs: T | undefined, base: T | undefined) => T | undefined = (
+    ours,
+  ) => ours,
+): Record<string, T> {
+  let result = saved;
+  for (const key of new Set([...Object.keys(base), ...Object.keys(next)])) {
+    if (base[key] === next[key]) continue;
+    // Re-adding the key moves it last, the order `rememberSuggestion` keeps newest.
+    const { [key]: _replaced, ...others } = result;
+    const value = resolve(next[key], saved[key], base[key]);
+    result = value === undefined ? others : { ...others, [key]: value };
+  }
+  return result;
+}
+
+/**
+ * This tab's change to a folder's draft, against what another tab saved since this one last
+ * synced. The newer edit wins; the other tab's text is kept as `otherWindowMessage`, and a
+ * clear never deletes text another tab typed meanwhile.
+ */
+function resolveDraft(
+  ours: SourceControlDraft | undefined,
+  theirs: SourceControlDraft | undefined,
+  base: SourceControlDraft | undefined,
+): SourceControlDraft | undefined {
+  const theirText = theirs?.message ?? "";
+  if (theirText === (base?.message ?? "") || theirText.trim() === "") return ours;
+  if (theirText === ours?.message) return ours;
+  if (ours === undefined || ours.message.trim() === "") return theirs;
+  return { ...ours, otherWindowMessage: theirText };
+}
+
+/** What to save: this tab's changes since it last synced, over what storage holds now. */
+function mergeWithSaved(state: PersistedState): PersistedState {
+  const next = persistedFields(state);
+  const saved = readSavedState();
+  const base = synced;
+  if (saved === null || base === null) {
+    synced = next;
+    return next;
+  }
+  const merged: PersistedState = {
+    byThreadKey: mergeEntries(base.byThreadKey, next.byThreadKey, saved.byThreadKey ?? {}),
+    byCwdKey: mergeEntries(base.byCwdKey, next.byCwdKey, saved.byCwdKey ?? {}, resolveDraft),
+    agentSuggestionByCwdKey: mergeEntries(
+      base.agentSuggestionByCwdKey,
+      next.agentSuggestionByCwdKey,
+      saved.agentSuggestionByCwdKey ?? {},
+    ),
+    sourceControlGroupByFolder:
+      next.sourceControlGroupByFolder !== base.sourceControlGroupByFolder
+        ? next.sourceControlGroupByFolder
+        : (saved.sourceControlGroupByFolder ?? next.sourceControlGroupByFolder),
+  };
+  // This tab now shows what it saved, other tabs' entries included. A field that came out the
+  // same keeps this tab's objects: effects watching them must not run again on every save.
+  const taken: Partial<PersistedState> = {};
+  const result = { ...merged };
+  for (const field of Object.keys(merged) as Array<keyof PersistedState>) {
+    if (JSON.stringify(merged[field]) === JSON.stringify(next[field])) {
+      Object.assign(result, { [field]: next[field] });
+    } else {
+      Object.assign(taken, { [field]: merged[field] });
+    }
+  }
+  synced = result;
+  if (Object.keys(taken).length > 0) setWithoutSaving(taken);
+  return result;
+}
 
 function updateDraft(
   state: SourceControlPanelStoreState,
@@ -168,7 +270,7 @@ const persistedStore = persist<SourceControlPanelStoreState>(
       set((state) => ({
         byCwdKey: {
           ...state.byCwdKey,
-          [cwdKey]: { message },
+          [cwdKey]: { ...state.byCwdKey[cwdKey], message },
         },
       })),
     clearCwdDraft: (cwdKey) =>
@@ -176,6 +278,19 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         if (!(cwdKey in state.byCwdKey)) return state;
         const { [cwdKey]: _removed, ...byCwdKey } = state.byCwdKey;
         return { byCwdKey };
+      }),
+    swapCwdOtherWindowMessage: (cwdKey) =>
+      set((state) => {
+        const draft = state.byCwdKey[cwdKey];
+        if (draft?.otherWindowMessage === undefined) return state;
+        const swapped = { message: draft.otherWindowMessage, otherWindowMessage: draft.message };
+        return { byCwdKey: { ...state.byCwdKey, [cwdKey]: swapped } };
+      }),
+    dismissCwdOtherWindowMessage: (cwdKey) =>
+      set((state) => {
+        const draft = state.byCwdKey[cwdKey];
+        if (draft?.otherWindowMessage === undefined) return state;
+        return { byCwdKey: { ...state.byCwdKey, [cwdKey]: { message: draft.message } } };
       }),
     promoteThreadDraft: (threadKey, cwdKey) =>
       set((state) => (threadKey in state.byThreadKey ? promote(state, threadKey, cwdKey) : state)),
@@ -196,29 +311,22 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         ),
       });
       const saved = readSavedState();
-      if (saved === null) {
-        set((current) => fill(current));
-        return;
-      }
       // Another tab typed in this folder, or handled this suggestion: offer, write nothing.
       if (
-        hasText(saved.byCwdKey?.[cwdKey]) ||
-        saved.agentSuggestionByCwdKey?.[cwdKey]?.intentId === intentId
+        saved !== null &&
+        (hasText(saved.byCwdKey?.[cwdKey]) ||
+          saved.agentSuggestionByCwdKey?.[cwdKey]?.intentId === intentId)
       ) {
         return;
       }
-      // Only this folder's keys change in what is saved; other folders stay as saved.
-      void useSourceControlPanelStore.persist.getOptions().storage?.setItem(STORAGE_NAME, {
-        state: { ...saved, ...fill(saved) } as SourceControlPanelStoreState,
-        version: STORAGE_VERSION,
-      });
-      setWithoutSaving(fill(state));
+      // Only this folder's keys change in what is saved (`mergeWithSaved`).
+      set((current) => fill(current));
     },
     acceptAgentCommitSuggestion: (cwdKey, intentId, message) =>
       set((state) => {
         if (isHandled(state, cwdKey, intentId)) return state;
         return {
-          byCwdKey: { ...state.byCwdKey, [cwdKey]: { message } },
+          byCwdKey: { ...state.byCwdKey, [cwdKey]: { ...state.byCwdKey[cwdKey], message } },
           agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
             intentId,
             outcome: "used",
@@ -231,7 +339,10 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         const suggestion = state.agentSuggestionByCwdKey[cwdKey];
         if (suggestion?.intentId !== intentId || suggestion.outcome !== "used") return state;
         return {
-          byCwdKey: { ...state.byCwdKey, [cwdKey]: { message: suggestion.replacedDraft ?? "" } },
+          byCwdKey: {
+            ...state.byCwdKey,
+            [cwdKey]: { ...state.byCwdKey[cwdKey], message: suggestion.replacedDraft ?? "" },
+          },
           agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
             intentId,
             outcome: "dismissed",
@@ -283,13 +394,11 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         agentSuggestionByCwdKey: state?.agentSuggestionByCwdKey ?? {},
       } as SourceControlPanelStoreState;
     },
-    partialize: (state) =>
-      ({
-        byThreadKey: state.byThreadKey,
-        byCwdKey: state.byCwdKey,
-        agentSuggestionByCwdKey: state.agentSuggestionByCwdKey,
-        sourceControlGroupByFolder: state.sourceControlGroupByFolder,
-      }) as SourceControlPanelStoreState,
+    // Every save writes only what this tab changed, entry by entry (#219).
+    partialize: (state) => mergeWithSaved(state) as SourceControlPanelStoreState,
+    onRehydrateStorage: () => (state) => {
+      if (state !== undefined) synced = persistedFields(state);
+    },
   },
 );
 
@@ -300,6 +409,26 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
   setWithoutSaving = (partial) => rawSet(partial);
   return persistedStore(...args);
 }) as typeof persistedStore);
+
+// Another tab saved: show what it wrote, so this tab builds on it (#219). Not `rehydrate()`:
+// that saves back, which could ping-pong between tabs, or loop where a save fires `storage`.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== STORAGE_NAME && event.key !== null) return;
+    const saved = readSavedState();
+    if (saved === null) return;
+    const state = useSourceControlPanelStore.getState();
+    const next: PersistedState = {
+      byThreadKey: saved.byThreadKey ?? {},
+      byCwdKey: saved.byCwdKey ?? {},
+      agentSuggestionByCwdKey: saved.agentSuggestionByCwdKey ?? {},
+      sourceControlGroupByFolder:
+        saved.sourceControlGroupByFolder ?? state.sourceControlGroupByFolder,
+    };
+    synced = next;
+    setWithoutSaving(next);
+  });
+}
 
 export function selectThreadSourceControlDraft(
   byThreadKey: Record<string, SourceControlDraft>,

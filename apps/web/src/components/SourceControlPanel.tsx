@@ -87,6 +87,7 @@ import {
   stackedActionFailureTitle,
 } from "./GitActionsControl.logic";
 import { SourceControlAgentSuggestion } from "./SourceControlAgentSuggestion";
+import { SourceControlDraftConflict } from "./SourceControlDraftConflict";
 import { SourceControlChangesList } from "./SourceControlChangesList";
 import { SourceControlCommits } from "./SourceControlCommits";
 import {
@@ -1063,6 +1064,9 @@ export default function SourceControlPanel({
             )}
           </button>
         </div>
+        {gitCwd === null ? null : (
+          <SourceControlDraftConflict environmentId={environmentId} cwd={gitCwd} />
+        )}
         <SourceControlAgentSuggestion
           environmentId={environmentId}
           cwd={gitCwd}
