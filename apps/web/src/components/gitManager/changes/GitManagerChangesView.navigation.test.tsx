@@ -13,6 +13,8 @@ const h = vi.hoisted(() => ({
   files: [] as ReadonlyArray<string>,
   pending: new Set<string>(),
   failing: new Set<string>(),
+  // Data the query still holds from an earlier read of the path.
+  stale: {} as Record<string, unknown>,
 }));
 
 vi.mock("../../../state/vcs", () => ({
@@ -68,10 +70,15 @@ vi.mock("../../../state/query", () => ({
       };
     }
     if (atom?.kind === "diff" && h.pending.has(atom.path ?? "")) {
-      return { ...base, isPending: true, data: null };
+      return { ...base, isPending: true, data: h.stale[atom.path ?? ""] ?? null };
     }
     if (atom?.kind === "diff" && h.failing.has(atom.path ?? "")) {
-      return { ...base, isPending: false, data: null, error: "Could not read this diff." };
+      return {
+        ...base,
+        isPending: false,
+        data: h.stale[atom.path ?? ""] ?? null,
+        error: "Could not read this diff.",
+      };
     }
     if (atom?.kind === "diff") {
       const patch = h.patches[atom.path ?? ""] ?? "";
@@ -167,6 +174,7 @@ const view = () => (
 beforeEach(async () => {
   h.pending.clear();
   h.failing.clear();
+  h.stale = {};
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.scrollTo.mockClear();
   h.files = ["a.ts", "b.ts", "c.png"];
@@ -306,6 +314,56 @@ describe("Changes diff navigation", () => {
     // Asking again moves on: the stop was for the error to be seen, not a dead end.
     await press({ key: "F7" });
     expect(selectedPath()).toBe("c.png");
+  });
+
+  it("waits for the refresh of a file that last read as too large instead of skipping it", async () => {
+    h.stale["b.ts"] = { _tag: "large-text", generation: 1 };
+    h.pending.add("b.ts");
+    await select("a.ts");
+    await press({ key: "F7" });
+    await press({ key: "F7" });
+
+    await press({ key: "F7" });
+
+    expect(selectedPath()).toBe("b.ts");
+
+    // The fresh read is a patch: the walk lands on its first block instead of having moved on.
+    h.pending.clear();
+    await act(async () => root.render(view()));
+    expect(selectedPath()).toBe("b.ts");
+    expect(lastScroll().lineNumber).toBe(5);
+  });
+
+  it("stops on a file whose refresh failed even though older data is held", async () => {
+    h.stale["b.ts"] = { _tag: "large-text", generation: 1 };
+    h.failing.add("b.ts");
+    await select("a.ts");
+    await press({ key: "F7" });
+    await press({ key: "F7" });
+
+    await press({ key: "F7" });
+
+    expect(selectedPath()).toBe("b.ts");
+    expect(container.textContent).toContain("Could not read this diff.");
+  });
+
+  it("keeps keyboard focus in the diff when the walk ends at a trailing binary file", async () => {
+    await select("b.ts");
+    await act(async () => button("Next change").focus());
+    const pressFocused = (init: KeyboardEventInit) =>
+      act(async () => {
+        document.activeElement!.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "F7", bubbles: true, cancelable: true, ...init }),
+        );
+      });
+
+    for (let step = 0; step < 4; step += 1) await pressFocused({});
+    expect(selectedPath()).toBe("c.png");
+    expect(document.activeElement?.closest('section[aria-label="Diff for c.png"]')).not.toBeNull();
+
+    await pressFocused({ shiftKey: true });
+    expect(selectedPath()).toBe("b.ts");
+    expect(lastScroll().lineNumber).toBe(30);
   });
 
   it("leaves other keys alone", async () => {
