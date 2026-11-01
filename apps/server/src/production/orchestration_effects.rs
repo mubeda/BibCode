@@ -1522,7 +1522,16 @@ async fn record_checkpoint(
     // can no longer fire; lost, the hold expired while Git ran, the thread's next turn may have
     // edited the checkout, and this capture is not the turn's end state.
     if !engine.claim_checkpoint_completion(thread_id, turn_id) {
-        delete_ref(cwd, Path::new("git"), &target_ref, cancellation).await?;
+        if delete_ref(cwd, Path::new("git"), &target_ref, cancellation)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                thread_id,
+                turn_count,
+                "a stale turn's checkpoint ref could not be deleted"
+            );
+        }
         return Err(stale());
     }
     // Only the displayed status reads it; the checkpoint itself is captured.
@@ -1732,6 +1741,14 @@ pub(crate) fn uncaptured_checkpoint_detail(turn_count: i64) -> String {
     )
 }
 
+/// Why a turn whose checkpoint was never captured has no diff to read. The diff reads (the
+/// app's turn and full-thread patches, MCP `get_turn_diff`) refuse it as revert does.
+pub(crate) fn uncaptured_diff_detail(turn_count: i64) -> String {
+    format!(
+        "Turn {turn_count} has no captured checkpoint (its capture failed or timed out), so its changes cannot be shown."
+    )
+}
+
 fn missing_checkpoint(turn_count: i64) -> OrchestrationEffectsError {
     OrchestrationEffectsError::Effect(format!(
         "Filesystem checkpoint is unavailable for turn {turn_count}."
@@ -1842,13 +1859,23 @@ async fn finish_revert(
         .iter()
         .filter(|checkpoint| checkpoint.checkpoint_turn_count > turn_count)
     {
-        delete_ref(
+        // The rewind and the restore happened, so the revert is still recorded; the turns'
+        // rows go with it, and a diff or revert reads a checkpoint only from a `ready` row.
+        if delete_ref(
             &cwd,
             Path::new("git"),
             &checkpoint.checkpoint_ref,
             cancellation,
         )
-        .await?;
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                thread_id,
+                turn_count = checkpoint.checkpoint_turn_count,
+                "a reverted turn's checkpoint ref could not be deleted"
+            );
+        }
     }
     let created_at = now_iso();
     // A revert whose files were not restored records its completion under a tag of its own, so
@@ -2213,7 +2240,7 @@ async fn delete_ref(
     reference: &str,
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
-    run_git(
+    let output = run_git(
         cwd,
         git_command,
         &["update-ref", "-d", reference],
@@ -2222,6 +2249,13 @@ async fn delete_ref(
         cancellation,
     )
     .await?;
+    // A ref Git kept would still be read as that turn's checkpoint.
+    if output.exit_code != 0 {
+        return Err(OrchestrationEffectsError::Effect(format!(
+            "Git could not delete a checkpoint ref (exit {}).",
+            output.exit_code
+        )));
+    }
     Ok(())
 }
 
@@ -2944,6 +2978,37 @@ mod tests {
                 .await
                 .expect("deleted ref")
         );
+        // A ref Git cannot delete (its lock is held) is an error, not a deletion.
+        let baseline_lock = repository
+            .root()
+            .join(".git")
+            .join(format!("{baseline_ref}.lock"));
+        tokio::fs::write(&baseline_lock, "")
+            .await
+            .expect("ref lock");
+        assert!(
+            delete_ref(
+                repository.root(),
+                &git_command,
+                &baseline_ref,
+                &cancellation
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            has_ref(
+                repository.root(),
+                &git_command,
+                &baseline_ref,
+                &cancellation
+            )
+            .await
+            .expect("kept ref")
+        );
+        tokio::fs::remove_file(&baseline_lock)
+            .await
+            .expect("ref lock removed");
 
         assert_eq!(checkpoint_environment(Path::new("index")).len(), 5);
         assert_eq!(

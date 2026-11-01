@@ -11937,6 +11937,100 @@ async fn a_completed_turn_records_its_checkpoint_and_turn_diff() {
     session.shutdown().await;
 }
 
+/// The turn-diff reads (the Diff panel's turn and full-thread patches) show only captured
+/// turns, as revert restores only them: a turn whose checkpoint was given up (`error`) is
+/// refused even when a ref of it exists, with the revert-like wording, and the captured turn
+/// before it still reads.
+#[tokio::test]
+async fn a_turn_diff_of_an_uncaptured_turn_is_refused_even_with_its_ref() {
+    let repository = initialize_repository();
+    let session = CheckpointedSession::start(repository.path()).await;
+    session
+        .run_turn(repository.path(), 1, "one\n", "completed")
+        .await;
+    session.ready_checkpoint(1).await;
+    // Turn 2's capture was given up, but a ref of it was left behind.
+    std::fs::write(repository.path().join("tracked.txt"), "later\n").unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 2)
+        .await
+        .unwrap();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.turn.diff.complete", "commandId":"diff-stale", "threadId":"t1",
+                "turnId":"provider-turn-2", "checkpointTurnCount":2,
+                "checkpointRef":orchestration_effects::checkpoint_ref("t1", 2),
+                "status":"error", "files":[], "assistantMessageId":null,
+                "completedAt":NOW, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let settings = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        session.engine.clone(),
+        session.supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        session.engine.clone(),
+        session.supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+        attachment_upload_registry(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    for (id, tag, payload) in [
+        (
+            "1",
+            "orchestration.getTurnDiff",
+            json!({"threadId":"t1","fromTurnCount":1,"toTurnCount":2}),
+        ),
+        (
+            "2",
+            "orchestration.getFullThreadDiff",
+            json!({"threadId":"t1","toTurnCount":2}),
+        ),
+    ] {
+        let refused = tagged_rpc_request(&mut socket, id, tag, payload)
+            .await
+            .expect_err("an uncaptured turn has no diff");
+        assert_eq!(
+            refused[0]["error"]["message"],
+            "Turn 2 has no captured checkpoint (its capture failed or timed out), so its changes cannot be shown.",
+            "{refused}"
+        );
+    }
+    let captured = tagged_rpc_request(
+        &mut socket,
+        "3",
+        "orchestration.getFullThreadDiff",
+        json!({"threadId":"t1","toTurnCount":1}),
+    )
+    .await
+    .expect("the captured turn still reads");
+    assert!(
+        captured["diff"].as_str().unwrap().contains("+one"),
+        "{captured}"
+    );
+
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+    delivery.shutdown().await;
+    session.shutdown().await;
+}
+
 /// A turn that ends before the effects worker has even handled its start (a fast turn, a busy
 /// worker) is still numbered when it ends, from the checkout itself, then captured once the
 /// worker catches up. Its baseline is captured late, which is the turn-start baseline's own

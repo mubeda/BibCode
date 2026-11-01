@@ -581,8 +581,8 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
     ),
     (
         "McpNoTurnDiffError",
-        "This thread has no turn with recorded changes yet.",
-        "Ask again after a turn changed files.",
+        "This thread has no turn with recorded changes yet, or the turn asked for has no captured checkpoint (its capture failed or timed out).",
+        "Ask again after a turn changed files, or ask for another turn.",
     ),
     (
         "McpNotAWorktreeError",

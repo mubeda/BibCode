@@ -6086,6 +6086,32 @@ Findings 1, 2 and 4 of round 3 confirmed closed, with no bypass path. Two new on
   `an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready` (the worker is held
   in its workspace refresh, after the claim, past the limit).
 
+### Codex review round 5 (2026-10-31)
+
+No must-fix findings; three P2s. #2 is fixed; #1 and #3 are accepted residual risks, to be
+filed as follow-up issues.
+
+- **#2, a diff read could show a stale checkpoint's patch (fixed).**
+  - `delete_ref` took a nonzero `git update-ref -d` exit for success. It now returns an
+    error; the stale-capture path and the revert's ref cleanup log a `tracing::warn!` with the
+    thread id and turn number only. The revert still records itself (the rewind and restore
+    happened), and its turns' rows go with it. Test: the `delete_ref` lock case in
+    `unit_build_covers_workspace_normalization_and_checkpoint_git_lifecycle`.
+  - `orchestration.getTurnDiff` and `getFullThreadDiff` serve only captured turns, the rule
+    revert uses: each end of the range past turn 0 must be `ready` (the start of a one-turn
+    range is vouched for by its end). Otherwise the method's own error says "Turn n has no
+    captured checkpoint (its capture failed or timed out), so its changes cannot be shown.",
+    which the Diff panel shows as it shows a checkpoint that is gone (no web change). MCP
+    `get_turn_diff` with a `turnCount` refuses such a turn up front as `McpNoTurnDiffError`
+    (its meaning in `feed::ERRORS` widened; no new tag). Tests:
+    `a_turn_diff_of_an_uncaptured_turn_is_refused_even_with_its_ref` (RPC, with the ref left
+    behind) and `get_turn_diff_reads_only_captured_turns` (MCP).
+- **#1, accepted:** if writing the `error` record fails, the expiry still releases the hold, so
+  the turn stays `missing` while its thread goes on. It is still never revertible or readable
+  as a diff (not `ready`), but a later baseline could write its ref.
+- **#3, accepted:** a captured turn whose previous baseline is missing stays `missing`, so it is
+  neither readable as a diff nor revertible, although its own ref exists.
+
 ### Tests
 
 - Red first, then green: the three integration tests above; `threadReducer` keeps an
