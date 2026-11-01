@@ -284,7 +284,9 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           ? 0
           : changeTargets.length - 1;
   const [viewer, setViewer] = useState<AnnotatableCodeViewHandle | null>(null);
-  const diffSettled = !(diffQuery.isPending && diff === null);
+  // The query keeps the last data while it refreshes or after a failed read, so readiness
+  // is the current request's status, not whether there is data.
+  const diffSettled = !diffQuery.isPending;
   const scrollToChange = (index: number) => {
     const target = changeTargets[index];
     if (target === undefined) return;
@@ -332,19 +334,22 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
   };
   useEffect(() => {
     if (arrival === null || !diffSettled || arrivedRef.current || !onStepFile) return;
-    if (changeTargets.length > 0) {
+    if (diffQuery.error !== null) {
+      // The read failed: stop here, where the error is shown, rather than hide it.
+      arrivedRef.current = true;
+      reclaimFocus();
+    } else if (changeTargets.length > 0) {
       if (viewer === null) return;
       arrivedRef.current = true;
       scrollToChange(changeIndex);
       reclaimFocus();
-    } else if (diff === null) {
-      // The read failed: stop here, where the error is shown, rather than hide it.
-      arrivedRef.current = true;
-      reclaimFocus();
     } else {
-      // Confirmed content with no blocks to step through (binary, too large): pass it over.
+      // Confirmed content with no blocks to step through (binary, too large): pass it over,
+      // or, with no file beyond it, stay and keep focus here.
       arrivedRef.current = true;
-      onStepFile(arrival === "first" ? 1 : -1);
+      const direction = arrival === "first" ? 1 : -1;
+      if (stepFor(direction).kind === "stop") reclaimFocus();
+      onStepFile(direction);
     }
   });
   const codeViewOptions = useMemo(
@@ -521,6 +526,11 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           </button>
         ) : null}
       </div>
+      {diffQuery.error === null || diff === null ? null : (
+        <p className="border-b border-border px-2 py-1 text-xs text-destructive" role="alert">
+          {diffQuery.error}
+        </p>
+      )}
       {mutationError === null ? null : (
         <p aria-live="polite" className="border-b border-border px-2 py-1 text-xs text-destructive">
           {mutationError}
