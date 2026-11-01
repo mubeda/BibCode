@@ -16,7 +16,7 @@ BiBCode v0.14.0 lets outside AI agents operate BiBCode through its MCP server, l
 
 ### Chats and timeline
 
-- Every turn that ends in a Git checkout records a checkpoint again, so the Diff panel's turn list, turn diffs and revert have data. A queued message waits until the previous turn's checkpoint is saved. Turns from before this release start recording from their thread's next turn. (#139)
+- Every turn that ends in a Git checkout records a checkpoint again, so the Diff panel's turn list, turn diffs and revert have data. A queued message waits until the previous turn's checkpoint is saved, and a turn whose checkpoint could not be saved can't be diffed or reverted to. Turns from before this release start recording from their thread's next turn. (#139)
 - A scroll key pressed during the sent-row glide pages as asked, and no longer jumps the reading line. (#207, #214)
 - A finished reply no longer drops for a frame when its work log turns into "Worked for". (#208)
 
