@@ -5844,8 +5844,8 @@ Provider ingestion records a turn's end; the effects worker captures it.
    outlives `EffectsOptions::checkpoint_hold_limit` (120 s) marks its turn's checkpoint
    **stale** and is released (Round 3, below), so a hung Git never jams the thread.
 3. The effects worker handles the `missing` event in the existing arm
-   (`capture_missing_checkpoint` → `record_checkpoint`): captures `ref(n)` unless it already
-   exists, diffs it against `ref(n-1)`, records `ready` with the files and the turn's own
+   (`capture_missing_checkpoint` → `record_checkpoint`): captures `ref(n)`, replacing a
+   leftover of that number (Round 6), diffs it against `ref(n-1)`, records `ready` with the files and the turn's own
    assistant message id (the record carries none; the projector keeps the turn's), and
    releases that turn's hold on every exit (a drop guard), including no workspace, not a Git
    checkout, already recorded and failure. `ready` requires `ref(n-1)`: without it (the
@@ -5862,8 +5862,8 @@ Provider ingestion records a turn's end; the effects worker captures it.
 
 Committing the record before the session settles orders it before anything the settled
 session causes; the hold keeps the queued follow-up's `thread.turn-start-requested` (and the
-follow-up's edits) after the capture. The `missing` arm never overwrites an existing ref, so a
-retry cannot replace a turn's end state with a later checkout.
+follow-up's edits) after the capture. A turn is captured at most once: a `ready` or `error`
+row is never captured again, so no retry can replace a turn's end state with a later checkout.
 
 Alternative considered: an effects-only trigger that learns the running turn from
 `thread.session-set` events and captures when the session settles. It needs no change to
@@ -6111,6 +6111,48 @@ filed as follow-up issues.
   as a diff (not `ready`), but a later baseline could write its ref.
 - **#3, accepted:** a captured turn whose previous baseline is missing stays `missing`, so it is
   neither readable as a diff nor revertible, although its own ref exists.
+
+### Codex review round 6 (2026-10-31)
+
+One release-blocking finding, fixed: a ref a failed cleanup left behind could be reused as a
+new turn's capture. After a revert to turn 1 whose delete of ref 2 failed (a Git ref lock), the
+next turn took number 2, and the capture, which kept an existing ref, recorded the old turn
+2's checkout as the new turn's: wrong diff, wrong revert target. The stale-capture cleanup left
+the same kind of ref.
+
+Chosen design: the end-of-turn capture always writes its ref. Only a `missing` row reaches it
+(a `ready` or `error` row is skipped, and `error` is terminal), and with the hold in place no
+later turn or baseline can have written that number first, so a ref already there can only be
+a leftover. Weighed against retiring numbers whose refs could not be deleted, which keeps no
+leftover reachable but needs a persisted "retired" set and breaks the dense numbering the
+provider rewind counts on. The checks the brief asked for:
+
+- A duplicate or late completion of a captured turn records nothing (`record_turn_end` skips
+  a numbered turn) and captures nothing (the arm skips anything not `missing`).
+- An `error` row is never captured or written: the arm skips it, the projector keeps it, and a
+  baseline never writes its ref.
+- Restart recovery: nothing re-captures a `missing` row after a restart (the producer does not
+  replay history), so a ref written just before a crash is kept by the next baseline. It was
+  captured under the turn's hold, before the claim, so it is that turn's end state, except in
+  the window where the hold expired during that capture and the server stopped before the
+  claim failed and deleted it; the row stays `missing` either way, so it is neither a diff nor
+  a revert target. Two follow-on cases are closed as well: a capture that fails now deletes a
+  leftover of its number, so the next baseline writes the ref afresh; and a turn after a
+  given-up (`error`) turn is never `ready`, since that turn's leftover ref is no baseline.
+
+An earlier variant, recapturing a `missing` turn's ref at the next turn's start, was dropped:
+it threw away a valid capture of a turn whose own previous baseline was missing (#3) and moved
+that turn's baseline into the turn-start window.
+
+Tests (both fail on `b1363e62f9`):
+`a_ref_a_revert_could_not_delete_is_never_the_next_turns_checkpoint` (a ref lock fails the
+delete, the revert completes, the next turn reuses number 2; its checkpoint, diff files and
+revert are the new turn's) and `a_stale_captures_leftover_ref_never_makes_the_next_turn_ready`
+(a leftover ref behind an `error` row; the next turn stays `missing` and a revert to it is
+refused). Residual: if Git fails both a turn's capture and the delete of a leftover with its
+number (two failures in a row, as under a held ref lock), the next baseline keeps that
+leftover, and the next turn's diff is read against it; that turn's revert target, its own
+ref, is still right.
 
 ### Tests
 
