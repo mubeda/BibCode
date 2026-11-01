@@ -713,7 +713,10 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     // The desktop bootstrap token is revoked by the restart that widening causes, so it
     // is never a fallback: without a minted offer the coordinator would only answer 401.
     if (!widened) {
-      throw new Error("Remote verification pairing offer could not be generated (share UI found=" + found + ", clicked=" + clicked + ").");
+      const message = "Remote verification pairing offer could not be generated (share UI found=" + found + ", clicked=" + clicked + ").";
+      // No credential receipt exists yet, so the controller reads this trace line to name the failure.
+      traceRemote({ step: "pairing-offer", found, clicked, widened, message });
+      throw new Error(message);
     }
     let credentials;
     try {
@@ -2373,10 +2376,32 @@ const runWebDriverPhase = async (input: {
       });
     } catch (error) {
       if (isMissingCredentialReceipt(error)) {
+        // Raw output stays withheld; the driver's redacted trace still names why no grant exists.
+        const reported = await NodeFS.promises
+          .readFile(NodePath.join(input.evidenceDirectory, "remote-credential-trace.log"), "utf8")
+          .then((trace) =>
+            trace
+              .split("\n")
+              .map((line) => {
+                try {
+                  return (JSON.parse(line) as { message?: unknown }).message;
+                } catch {
+                  return undefined;
+                }
+              })
+              .findLast((message) => typeof message === "string" && message.length > 0),
+          )
+          .catch(() => undefined);
         await writePhaseLog(
-          "Remote WebDriver output was withheld because the private credential receipt was not published.\n",
+          "Remote WebDriver output was withheld because the private credential receipt was not published.\n" +
+            (typeof reported === "string" ? `Driver reported: ${reported}\n` : ""),
           [],
         );
+        if (typeof reported === "string") {
+          throw new SeededDesktopUpgradeSmokeError(
+            `${(error as Error).message} Driver reported: ${reported}`,
+          );
+        }
       }
       throw error;
     }

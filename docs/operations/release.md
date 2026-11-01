@@ -378,8 +378,10 @@ native runners and ephemeral signing keys, not production signing credentials.
 The ordinary native matrix also runs `remote-install`, reusing the current-source
 protected baseline in a separate data/workspace root. It generates an **Another
 device** grant through the packaged UI and redeems it for a distinct test client.
-If widening is unavailable, evidence records `widened: false`; source/native
-transport tests then supply that leg, rather than claiming a wide live pass.
+The desktop bootstrap token is revoked by the restart that widening causes, so
+it is never a fallback: if the share UI cannot mint an offer, the lane fails with
+"Remote verification pairing offer could not be generated" rather than recording
+a narrow pass. Source/native transport tests do not stand in for this leg.
 The Node driver first checks the authenticated host's updater and requires the
 requested candidate to be available before starting the product coordinator.
 An already-running check is followed through status reads within one 30-second
@@ -417,7 +419,9 @@ phase re-reads project-data statuses for up to 8 seconds while primary is
 missing or `unavailable`, never while it is healthy. A missing backup then fails
 with the reason: no primary status, an inspection issue, or a healthy store
 that listed none. A lane whose desktop rejected a backup generation keeps
-those warnings in `<lane>-backup-inventory.log`. Credentials
+those warnings in `<lane>-backup-inventory.log`; the bridge does not expose
+rejected generations, so that file (copied from the server log) is where they
+are recorded, and the missing-backup message points to it. Credentials
 stay in a private receipt outside retained evidence and are redacted from logs.
 The upload receipt is also private and immutable. Evidence redaction removes
 full, truncated and escaped transfer-capability labels before applying size
