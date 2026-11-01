@@ -38,10 +38,11 @@ describe("sticky timeline item types", () => {
     expect(getItemType(assistantRow("b", 50_000))).toBe("message:assistant:5");
   });
 
-  it("gives a row first seen streaming a live type it keeps once it settles", () => {
+  it("gives each row first seen streaming a type of its own that it keeps once it settles", () => {
     const getItemType = createStickyTimelineItemType();
-    expect(getItemType(assistantRow("live", 100, true))).toBe("message:assistant:live");
-    expect(getItemType(assistantRow("live", 100_000))).toBe("message:assistant:live");
+    expect(getItemType(assistantRow("live", 100, true))).toBe("message:assistant:live:live");
+    expect(getItemType(assistantRow("live", 100_000))).toBe("message:assistant:live:live");
+    expect(getItemType(assistantRow("other", 100, true))).toBe("message:assistant:live:other");
   });
 });
 
@@ -51,7 +52,9 @@ describe("sticky timeline item types", () => {
  */
 describe("LegendList size estimates for growing replies (#228)", () => {
   const originalRect = HTMLElement.prototype.getBoundingClientRect;
+  let viewportHeight = VIEWPORT_HEIGHT;
   beforeEach(() => {
+    viewportHeight = VIEWPORT_HEIGHT;
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
       const rows = this.querySelectorAll<HTMLElement>("[data-test-height]");
@@ -60,7 +63,7 @@ describe("LegendList size estimates for growing replies (#228)", () => {
           ? Number(this.dataset.testHeight)
           : rows.length === 1
             ? Number(rows[0]!.dataset.testHeight)
-            : VIEWPORT_HEIGHT;
+            : viewportHeight;
       return DOMRect.fromRect({ width: 800, height });
     };
   });
@@ -86,7 +89,7 @@ describe("LegendList size estimates for growing replies (#228)", () => {
             getItemType={getItemType}
             estimatedItemSize={90}
             recycleItems={false}
-            style={{ height: VIEWPORT_HEIGHT }}
+            style={{ height: viewportHeight }}
             renderItem={({ item }) => (
               <div data-test-height={item.kind === "message" ? item.message.text.length / 10 : 40}>
                 {item.id}
@@ -99,8 +102,15 @@ describe("LegendList size estimates for growing replies (#228)", () => {
       await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
     };
     const averages = () => list.current!.getState().getAverageItemSizes();
+    const scrollToEnd = async () => {
+      // happy-dom never fires the scroll that settles the returned promise.
+      await act(async () => {
+        void list.current!.scrollToEnd({ animated: false });
+      });
+      await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    };
     const unmount = () => act(async () => root.unmount());
-    return { render, averages, unmount };
+    return { render, averages, scrollToEnd, unmount };
   }
 
   const replies = (count: number, length: number) =>
@@ -151,7 +161,31 @@ describe("LegendList size estimates for growing replies (#228)", () => {
     const averages = timeline.averages();
     expect(averages["message:assistant:0"]?.count).toBe(20);
     expect(averages["message:assistant:0"]?.average).toBeCloseTo(50);
-    expect(averages["message:assistant:live"]?.average).toBeCloseTo(10_000);
+    expect(averages["message:assistant:live:streaming"]?.average).toBeCloseTo(10_000);
+    await timeline.unmount();
+  });
+
+  it("returns to the end past short live replies after long live ones", async () => {
+    viewportHeight = 1_600;
+    const timeline = mountTimelineList();
+    // Four replies stream to 40,000 px and are measured; 84 short replies then stream offscreen,
+    // never measured, and the reader returns to the end.
+    const long = Array.from({ length: 4 }, (_, index) =>
+      assistantRow(`long-${index}`, 400_000, true),
+    );
+    await timeline.render(long);
+    const short = Array.from({ length: 84 }, (_, index) =>
+      assistantRow(`short-${index}`, 320, true),
+    );
+    await timeline.render([...long, ...short]);
+    // Sharing one live estimate, each short reply placed 40,000 px tall measured at 32 px and
+    // pulled the next one in, until React threw "Maximum update depth exceeded".
+    await timeline.scrollToEnd();
+
+    const averages = timeline.averages();
+    for (const [type, { average }] of Object.entries(averages)) {
+      if (type.startsWith("message:assistant:live:short-")) expect(average).toBe(32);
+    }
     await timeline.unmount();
   });
 });
