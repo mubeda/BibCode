@@ -1270,9 +1270,7 @@ export default function SourceControlPanel({
               aria-label="Group by folder"
               aria-pressed={groupByFolder}
               title={
-                groupByFolder
-                  ? "Grouped by folder — show a flat list"
-                  : "Flat list — group by folder"
+                groupByFolder ? "Grouped by folder: show a flat list" : "Flat list: group by folder"
               }
               onClick={() => setGroupByFolder(!groupByFolder)}
               className={cn(groupByFolder && "bg-accent text-foreground")}

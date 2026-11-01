@@ -1653,7 +1653,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
         {/* The timer never truncates; the thought takes what is left of the one line. */}
         <span className="shrink-0">
           {row.answerDelivered
-            ? "Answer delivered — waiting for the provider to close the turn "
+            ? "Answer delivered, waiting for the provider to close the turn "
             : "Waiting for "}
           <WorkingTimer createdAt={row.createdAt} />
         </span>

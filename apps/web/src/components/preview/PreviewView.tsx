@@ -776,7 +776,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
         // user wouldn't be able to actually click anything underneath).
         pickDisabled={!tabId || isUnreachable}
         pickDisabledReason={
-          isUnreachable ? "Page didn't load — pick unavailable until the page renders" : undefined
+          isUnreachable ? "Page didn't load. Pick is unavailable until the page renders" : undefined
         }
         trailingActions={
           previewBridge ? (

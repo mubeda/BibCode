@@ -51,7 +51,7 @@ export function selectClosedChatPanels(
 
 /** Reason shown on a visible-but-not-ready provider item. */
 export const PROVIDER_NOT_READY_REASON =
-  "This provider isn't ready yet — check its connection in Settings.";
+  "This provider isn't ready yet. Check its connection in Settings.";
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 
 export interface PanelMenuProviderItem {

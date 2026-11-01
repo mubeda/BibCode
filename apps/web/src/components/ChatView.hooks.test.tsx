@@ -4507,7 +4507,7 @@ describe("ChatView project script handlers", () => {
     expect(createInput).toMatchObject({
       environmentId,
       input: {
-        title: "Panel — Claude",
+        title: "Panel: Claude",
         hostThreadId: threadId,
         threadDefaults: {
           modelSelection: {

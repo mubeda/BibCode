@@ -1904,7 +1904,7 @@ Opens a chat panel on a host thread and returns its `threadId`. Give it work wit
 | Argument             | Type   | Required | Limits and default                                                                          | Meaning                                                       |
 | -------------------- | ------ | -------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
 | `hostThreadId`       | string | yes      | a live thread that is not itself a panel                                                    | The host.                                                     |
-| `title`              | string | no       | trimmed; default `Panel — <provider instance id>`                                           | The panel's tab title.                                        |
+| `title`              | string | no       | trimmed; default `Panel: <provider instance id>`                                            | The panel's tab title.                                        |
 | `providerInstanceId` | string | no       | an instance id from `list_providers_and_models`                                             | Provider instance (selection rules as for `start_thread`).    |
 | `model`              | string | no       | a model slug                                                                                | Model.                                                        |
 | `runtimeMode`        | string | no       | `approval-required`, `auto-accept-edits`, `full-access`; default is this connection's limit | The panel's mode; above the limit is `McpAccessCeilingError`. |

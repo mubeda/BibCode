@@ -21,9 +21,9 @@ const progress: PendingAttachmentUpload = {
 
 describe("AttachmentUploadNotice", () => {
   it("uses acknowledged progress and singular/plural copy", () => {
-    expect(attachmentUploadCopy(progress)).toBe("Uploading 2 attachments — 3.1 of 20 MiB");
+    expect(attachmentUploadCopy(progress)).toBe("Uploading 2 attachments (3.1 of 20 MiB)");
     expect(attachmentUploadCopy({ ...progress, attachmentCount: 1 })).toBe(
-      "Uploading 1 attachment — 3.1 of 20 MiB",
+      "Uploading 1 attachment (3.1 of 20 MiB)",
     );
     expect(attachmentUploadCopy({ ...progress, phase: "reconnecting" })).toBe("Reconnecting…");
   });
