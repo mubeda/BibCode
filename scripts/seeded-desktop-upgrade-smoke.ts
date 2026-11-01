@@ -668,7 +668,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     let clicked = false;
     let widened = false;
     try {
-      await browser.waitUntil(async () => browser.execute(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Generate pairing offer")), { timeout: 30000, interval: 100 });
+      await browser.waitUntil(async () => browser.execute(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Generate pairing offer" && !button.disabled)), { timeout: 30000, interval: 100 });
       found = true;
       clicked = await browser.execute(() => {
         const button = [...document.querySelectorAll("button")].find((entry) => entry.textContent?.trim() === "Generate pairing offer");
