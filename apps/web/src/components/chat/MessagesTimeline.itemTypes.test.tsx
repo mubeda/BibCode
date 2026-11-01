@@ -8,7 +8,7 @@ import { createStickyTimelineItemType, type MessagesTimelineRow } from "./Messag
 
 const VIEWPORT_HEIGHT = 100_000;
 
-function assistantRow(id: string, length: number): MessagesTimelineRow {
+function assistantRow(id: string, length: number, streaming = false): MessagesTimelineRow {
   return {
     kind: "message",
     id,
@@ -20,7 +20,7 @@ function assistantRow(id: string, length: number): MessagesTimelineRow {
       turnId: null,
       createdAt: "2026-01-01T00:00:00Z",
       updatedAt: "2026-01-01T00:00:00Z",
-      streaming: false,
+      streaming,
     },
     durationStart: "2026-01-01T00:00:00Z",
     showAssistantMeta: false,
@@ -36,6 +36,12 @@ describe("sticky timeline item types", () => {
     expect(getItemType(assistantRow("a", 1_900))).toBe("message:assistant:0");
     expect(getItemType(assistantRow("a", 50_000))).toBe("message:assistant:0");
     expect(getItemType(assistantRow("b", 50_000))).toBe("message:assistant:5");
+  });
+
+  it("gives a row first seen streaming a live type it keeps once it settles", () => {
+    const getItemType = createStickyTimelineItemType();
+    expect(getItemType(assistantRow("live", 100, true))).toBe("message:assistant:live");
+    expect(getItemType(assistantRow("live", 100_000))).toBe("message:assistant:live");
   });
 });
 
@@ -130,6 +136,22 @@ describe("LegendList size estimates for growing replies (#228)", () => {
     // moves that size into it uncounted.
     expect(averages["message:assistant:1"]).toBeUndefined();
     expect(averages["message:assistant:0"]?.count).toBe(85);
+    await timeline.unmount();
+  });
+
+  it("keeps short history rows' estimate while a reply streams long", async () => {
+    const timeline = mountTimelineList();
+    // Short history, 50 px each; then a reply streams from 100 to 100,000 characters (10,000 px)
+    // in the same list.
+    const history = replies(20, 500);
+    for (const length of [100, 1_000, 10_000, 100_000]) {
+      await timeline.render([...history, assistantRow("streaming", length, length < 100_000)]);
+    }
+
+    const averages = timeline.averages();
+    expect(averages["message:assistant:0"]?.count).toBe(20);
+    expect(averages["message:assistant:0"]?.average).toBeCloseTo(50);
+    expect(averages["message:assistant:live"]?.average).toBeCloseTo(10_000);
     await timeline.unmount();
   });
 });

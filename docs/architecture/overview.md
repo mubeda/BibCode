@@ -3278,8 +3278,10 @@ view), or free scrolling.
   row's measured size and moves it into a new type's average without counting
   it there, so a streaming reply crossing a bucket, or a folded row coming back
   under another one, would inflate that bucket's estimate. The timeline is
-  keyed by thread, so a new thread starts both afresh. A reply streamed live is
-  measured anyway; history loads with its full text and takes its own bucket.
+  keyed by thread, so a new thread starts both afresh. A row first seen
+  streaming takes a `live` type, shared only with other live rows, so a reply
+  that streams long never sets the estimate for short history rows; history
+  loads with its full text and takes its own bucket.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
