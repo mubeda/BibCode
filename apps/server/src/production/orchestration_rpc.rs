@@ -962,6 +962,29 @@ async fn diff(
     crate::review::validate_review_diff_options(None, request.context_lines)
         .map_err(|error| invalid_request("orchestration.diff", error.to_string()))?;
     let tag = request.error_tag;
+    // Only a captured checkpoint is a turn's end state, as for revert: a ref of a turn not
+    // captured (`missing`) or given up (`error`) may hold a later checkout. Turn 0 is the ref 0
+    // baseline. The start of a one-turn range is vouched for by its end being `ready`, which
+    // required that ref.
+    for turn_count in [request.from_turn_count, request.to_turn_count] {
+        let vouched = turn_count == 0
+            || (turn_count == request.from_turn_count && request.to_turn_count == turn_count + 1);
+        if vouched {
+            continue;
+        }
+        let captured = engine
+            .repositories()
+            .get_checkpoint(request.thread_id.clone(), turn_count)
+            .await
+            .map_err(|error| orchestration_error(tag, error))?
+            .is_some_and(|checkpoint| checkpoint.status == "ready");
+        if !captured {
+            return Err(orchestration_error(
+                tag,
+                super::orchestration_effects::uncaptured_diff_detail(turn_count),
+            ));
+        }
+    }
     // Held until Git exits, so a removal waits for the read or cancels it.
     let (admission, workspace) = match availability {
         Some(availability) => availability
@@ -7944,9 +7967,31 @@ mod turn_diff_tests {
         (1..=20).map(|line| format!("line {line}\n")).collect()
     }
 
-    /// Checkpoint 0 is the committed state; checkpoint 1 changes line 10 and only the spacing
-    /// of `space.txt`.
-    async fn two_checkpoints(root: &Path, thread_id: &str) {
+    /// Records turns `turn_counts` of `thread_id` as captured (`ready`), as the effects worker
+    /// does: the diff reads serve only captured turns.
+    async fn record_captured(engine: &OrchestrationEngine, thread_id: &str, turn_counts: &[i64]) {
+        for &turn_count in turn_counts {
+            let command = serde_json::from_value::<OrchestrationCommand>(json!({
+                "type": "thread.turn.diff.complete",
+                "commandId": format!("captured-{turn_count}"),
+                "threadId": thread_id,
+                "turnId": format!("turn-{turn_count}"),
+                "checkpointTurnCount": turn_count,
+                "checkpointRef": super::super::orchestration_effects::checkpoint_ref(thread_id, turn_count),
+                "status": "ready",
+                "files": [],
+                "assistantMessageId": null,
+                "completedAt": CREATED_AT,
+                "createdAt": CREATED_AT,
+            }))
+            .expect("checkpoint command");
+            engine.dispatch(command).await.expect("captured checkpoint");
+        }
+    }
+
+    /// Checkpoint 0 is the committed state; checkpoint 1, captured, changes line 10 and only the
+    /// spacing of `space.txt`.
+    async fn two_checkpoints(engine: &OrchestrationEngine, root: &Path, thread_id: &str) {
         capture_checkpoint(root, thread_id, 0)
             .await
             .expect("checkpoint 0");
@@ -7959,6 +8004,7 @@ mod turn_diff_tests {
         capture_checkpoint(root, thread_id, 1)
             .await
             .expect("checkpoint 1");
+        record_captured(engine, thread_id, &[1]).await;
     }
 
     fn request(tag: &str, payload: Value) -> RpcRequest {
@@ -7996,7 +8042,7 @@ mod turn_diff_tests {
         let engine = engine().await;
         let (directory, thread_id) = project_thread(&engine).await;
         let root = root_of(&directory);
-        two_checkpoints(&root, &thread_id).await;
+        two_checkpoints(&engine, &root, &thread_id).await;
 
         let patch = turn_diff(
             &engine,
@@ -8092,7 +8138,7 @@ mod turn_diff_tests {
         let engine = engine().await;
         let (directory, thread_id) = project_thread(&engine).await;
         let root = root_of(&directory);
-        two_checkpoints(&root, &thread_id).await;
+        two_checkpoints(&engine, &root, &thread_id).await;
         let line = "x".repeat(99);
         let large = (0..(super::super::runtime::MAX_REVIEW_SOURCE_DIFF_BYTES / 100 + 1))
             .map(|_| format!("{line}\n"))
@@ -8101,6 +8147,7 @@ mod turn_diff_tests {
         capture_checkpoint(&root, &thread_id, 2)
             .await
             .expect("checkpoint 2");
+        record_captured(&engine, &thread_id, &[2]).await;
 
         let patch = turn_diff(
             &engine,
@@ -8117,7 +8164,7 @@ mod turn_diff_tests {
     async fn missing_checkpoints_serve_a_stored_row_or_say_the_checkpoint_is_gone() {
         let engine = engine().await;
         let (directory, thread_id) = project_thread(&engine).await;
-        two_checkpoints(&root_of(&directory), &thread_id).await;
+        two_checkpoints(&engine, &root_of(&directory), &thread_id).await;
         engine
             .repositories()
             .upsert_checkpoint_diff_blob(CheckpointDiffBlob {
@@ -8129,6 +8176,8 @@ mod turn_diff_tests {
             })
             .await
             .expect("stored row");
+        // Captured turns whose refs are gone.
+        record_captured(&engine, &thread_id, &[4, 5]).await;
 
         let stored = turn_diff(
             &engine,
@@ -8168,10 +8217,11 @@ mod turn_diff_tests {
         let engine = engine().await;
         let (directory, thread_id) = project_thread(&engine).await;
         let root = root_of(&directory);
-        two_checkpoints(&root, &thread_id).await;
+        two_checkpoints(&engine, &root, &thread_id).await;
         let blob = git(&root, &["rev-parse", "HEAD:lines.txt"]);
         let reference = super::super::orchestration_effects::checkpoint_ref(&thread_id, 2);
         git(&root, &["update-ref", &reference, &blob]);
+        record_captured(&engine, &thread_id, &[2]).await;
 
         assert_eq!(
             turn_diff(
@@ -8203,7 +8253,7 @@ mod turn_diff_tests {
         let engine = engine().await;
         let (directory, thread_id) = project_thread(&engine).await;
         let root = root_of(&directory);
-        two_checkpoints(&root, &thread_id).await;
+        two_checkpoints(&engine, &root, &thread_id).await;
         let pids = tempfile::tempdir().expect("pid directory");
         let pid_file = pids.path().join("git.pid");
         std::fs::write(root.join(".git/info/attributes"), "lines.txt diff=pause\n")

@@ -1359,7 +1359,21 @@ impl ToolCall<'_> {
         let thread_id = self.required("threadId")?.to_owned();
         self.thread(&thread_id).await?;
         let turn_count = match self.integer("turnCount")? {
-            Some(count) if count >= 1 => count,
+            // A turn not captured has no diff, as for revert: refused, typed, before any read.
+            Some(count) if count >= 1 => {
+                if checkpoint_status(self.control.repositories(), &thread_id, count)
+                    .await
+                    .map_err(storage_failure)?
+                    .as_deref()
+                    != Some("ready")
+                {
+                    return Err(typed_tool_failure(
+                        "McpNoTurnDiffError",
+                        &crate::production::orchestration_effects::uncaptured_diff_detail(count),
+                    ));
+                }
+                count
+            }
             Some(_) => return Err(invalid_argument("turnCount starts at 1")),
             None => latest_checkpoint(self.control.repositories(), &thread_id, true)
                 .await

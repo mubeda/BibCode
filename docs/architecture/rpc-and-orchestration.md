@@ -906,6 +906,13 @@ recorded have none, and a deleted thread's refs are not removed.
 Turn and full-thread patches are computed live from the checkpoint refs at
 `refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
 
+0. It serves only captured turns, as a revert restores only them: each end of
+   the range past turn 0 must have a `ready` checkpoint row (the start of a
+   one-turn range is vouched for by its end, whose capture required that
+   ref). Otherwise it returns the method's error with "Turn n has no captured
+   checkpoint (its capture failed or timed out), so its changes cannot be
+   shown.", whatever refs exist. The Diff panel shows it as it shows a
+   checkpoint that is gone.
 1. It acquires the thread's workspace admission, which resolves the thread's
    worktree or its project's root. The lease is held until Git exits. A
    workspace that is being removed, or is gone, returns

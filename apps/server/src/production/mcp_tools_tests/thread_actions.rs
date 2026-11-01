@@ -753,6 +753,22 @@ async fn get_turn_diff_reads_only_captured_turns() {
         .call(&agent, "get_turn_diff", json!({ "threadId": thread_id }))
         .await;
     assert_eq!(error_tag(&diff), "McpNoTurnDiffError", "{diff}");
+    // Asked for by number, the uncaptured turn is refused the same way, before any read.
+    let asked = harness
+        .call(
+            &agent,
+            "get_turn_diff",
+            json!({ "threadId": thread_id, "turnCount": 1 }),
+        )
+        .await;
+    assert_eq!(error_tag(&asked), "McpNoTurnDiffError", "{asked}");
+    assert!(
+        asked["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no captured checkpoint"),
+        "{asked}"
+    );
     harness.shutdown().await;
 }
 
