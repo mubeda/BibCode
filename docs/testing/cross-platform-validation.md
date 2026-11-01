@@ -1847,8 +1847,8 @@ runtime-upgrade failure. The candidate, previous stable, and protected baseline
 are three sequential builds with separate cold Cargo outputs outside the
 workflow's cached repository `target`; `remote-install` reuses the protected
 package. Only macOS (x64 and arm64) gives each packaging child 90 minutes and
-the complete job 360 minutes. Other targets keep 45-minute packaging children
-and 240-minute jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
+the complete job 360 minutes. Windows gives each packaging child 60 minutes and
+Linux 45, both within 240-minute jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
 10 minutes per checkout. Each macOS job reserves 60 additional minutes after the
 three packaging and install bounds for setup, all lanes, evidence, and cleanup.
 Product, WebDriver, and restart deadlines remain unchanged. Record a command
