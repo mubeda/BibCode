@@ -2,9 +2,18 @@ import { assert, describe } from "@effect/vitest";
 
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
-const rule = createOxlintRuleHarness("bibcode/no-em-dash-copy", { filename: "fixture.tsx" });
+const rule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
+  filename: "apps/web/src/fixture.tsx",
+});
 const testFileRule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
-  filename: "fixture.test.tsx",
+  filename: "apps/web/src/fixture.test.tsx",
+});
+
+const outOfScopeRule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
+  filename: "scripts/example.tsx",
+});
+const fixtureRule = createOxlintRuleHarness("bibcode/no-em-dash-copy", {
+  filename: "apps/web/src/fixtures/example.tsx",
 });
 
 const DASH = "—";
@@ -59,6 +68,46 @@ describe("bibcode/no-em-dash-copy", () => {
   rule.invalid(
     "reports an em dash in a JSX attribute string",
     `export const A = () => <input title="Locked ${DASH} wait" />;`,
+    (output) => {
+      assert.match(output, /Do not use an em dash/);
+    },
+  );
+
+  outOfScopeRule.valid(
+    "ignores files outside apps/*/src and packages/*/src",
+    `export const l = "a ${DASH} b";`,
+  );
+  fixtureRule.valid("ignores fixture directories", `export const l = "a ${DASH} b";`);
+
+  for (const entity of ["&mdash;", "&#8212;", "&#x2014;"]) {
+    rule.invalid(
+      `reports the ${entity} entity in JSX text`,
+      `export const A = () => <span>a ${entity} b</span>;`,
+      (output) => {
+        assert.match(output, /Do not use an em dash/);
+      },
+    );
+  }
+
+  rule.invalid(
+    "reports a lone entity placeholder written as an entity",
+    `export const A = () => <span>&mdash;</span>;`,
+    (output) => {
+      assert.match(output, /Do not use an em dash/);
+    },
+  );
+
+  rule.invalid(
+    "reports a padded separator string",
+    `export const l = (a: string, b: string) => a + " ${DASH} " + b;`,
+    (output) => {
+      assert.match(output, /Do not use an em dash/);
+    },
+  );
+
+  rule.invalid(
+    "reports a padded separator in a JSX expression",
+    `export const A = () => <span>{" ${DASH} "}</span>;`,
     (output) => {
       assert.match(output, /Do not use an em dash/);
     },

@@ -165,6 +165,7 @@ Optimize for user control, predictability, and task completion. Every surprise, 
 - Put the most important words first.
 - Avoid paragraphs in dialogs.
 - Do not explain what the system is doing unless the user needs that information to decide or recover.
+- Do not use em dashes in interface text. Use a comma, colon, period, or parentheses. The one exception is a lone "—" as an empty-value placeholder. `bibcode/no-em-dash-copy` enforces this in TypeScript under `apps/*/src` and `packages/*/src`; Astro and Rust copy follows the same rule without lint enforcement.
 
 ### Typography
 
