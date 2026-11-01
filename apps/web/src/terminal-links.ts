@@ -8,6 +8,8 @@ export interface TerminalLinkMatch {
   text: string;
   start: number;
   end: number;
+  /** The path to open when it differs from `text` (a quoted path whose `:line` follows the quote). */
+  target?: string;
 }
 
 export interface TerminalLinkBufferPosition {
@@ -42,8 +44,8 @@ const FILE_PATH_PATTERN =
   /(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|[A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)+(?::\d+){0,2}/g;
 // A path between matching quotes keeps its spaces and wins over the partial unquoted token. A
 // `:line[:col]` suffix may sit inside the quotes or right after the closing one; in the latter case
-// the match text includes that quote (`"a b.ts":3`, the text must stay contiguous) and
-// `splitPathAndPosition` drops it. A quoted path with no `./`, `~/` or drive prefix must end in a
+// the match text includes that quote (`"a b.ts":3`, the text must stay contiguous) and `target`
+// carries the path without it. A quoted path with no `./`, `~/` or drive prefix must end in a
 // file extension, so quoted prose like "see a/b c" stays unlinked.
 const QUOTED_FILE_PATH_PATTERN =
   /(?<q>["'`])(?<link>(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)(?:(?!\k<q>)[^<>\r\n])+|[A-Za-z0-9._-][A-Za-z0-9._ -]*[\\/](?:(?!\k<q>)[^<>\r\n])*\.[A-Za-z][A-Za-z0-9]{0,9}(?::\d+){0,2})(?:(?<suffix>\k<q>(?::\d+){1,2})|\k<q>)/g;
@@ -116,6 +118,8 @@ function collectMatches(
       start,
       end: start + trimmed.length,
     };
+    const suffix = rawMatch.groups?.suffix;
+    if (suffix) candidate.target = (rawMatch.groups?.link ?? "") + suffix.slice(1);
 
     const collides =
       existing.some((other) => overlaps(candidate, other)) ||
@@ -192,8 +196,6 @@ export function splitPathAndPosition(value: string): {
     line = column;
     column = undefined;
   }
-  // `"a b.ts":3` is a quoted path with an outside suffix; the quote is not part of the name.
-  path = path.replace(/["'`]$/, "");
 
   return { path, line, column };
 }
