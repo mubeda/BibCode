@@ -97,11 +97,34 @@ describe("extractTerminalLinks", () => {
     ["'.\\a b\\c.ts'", [".\\a b\\c.ts"]],
     ["`C:\\My Dir\\c.ts`", ["C:\\My Dir\\c.ts"]],
     ['cat "~/my dir/c.ts" now', ["~/my dir/c.ts"]],
+    ['"src\\my dir\\a.ts:12"', ["src\\my dir\\a.ts:12"]],
+    ['cat "src/my dir/a.ts" now', ["src/my dir/a.ts"]],
+    ["'my-pkg\\a b\\c.tsx:3:4'", ["my-pkg\\a b\\c.tsx:3:4"]],
+    ['"C:\\My Dir\\report!"', ["C:\\My Dir\\report!"]],
+    ['"C:\\My Dir\\notes."', ["C:\\My Dir\\notes."]],
+    ['"./my dir/a(b)"', ["./my dir/a(b)"]],
     ["src/index.ts:12", ["src/index.ts:12"]],
+    // Prompts, ratios, versions and prose in quotes must not become links.
+    ["PS C:\\>", []],
+    ['saw "1/2 of the v1.5" here', ["1/2"]],
+    ["see v1.2.3 and 1.5", []],
     ["see https://example.com/a and src\\a.ts:3", ["https://example.com/a", "src\\a.ts:3"]],
     ["\\\\server\\share\\a.ts", ["\\\\server\\share\\a.ts"]],
   ])("extracts links from %j", (line, texts) => {
     expect(extractTerminalLinks(line).map((match) => match.text)).toEqual(texts);
+  });
+
+  it.each([
+    [" ".repeat(10_000)],
+    ["\\".repeat(10_000)],
+    ['"\\ '.repeat(3_000)],
+    ["\"a/ 'a/ `a\\ ".repeat(1_000)],
+    [`"C:\\${" ".repeat(10_000)}`],
+    [`"a/${"b ".repeat(5_000)}`],
+  ])("scans a long pathological line in linear time", (line) => {
+    const startedAt = performance.now();
+    extractTerminalLinks(line);
+    expect(performance.now() - startedAt).toBeLessThan(500);
   });
 
   it("reports ranges that exclude the surrounding quotes", () => {
@@ -364,6 +387,10 @@ describe("resolvePathLinkTarget", () => {
     ["..\\lib\\a.ts:3", "C:\\repo", "C:\\repo\\..\\lib\\a.ts:3"],
     ["~/x.ts", "/Users/alice/p", "/Users/alice/x.ts"],
     ["~\\x.ts", "/Users/alice/p", "~\\x.ts"],
+    // A backslash in a POSIX filename is part of the name, not a separator.
+    ["~/src/a\\b.ts:3", "/home/alice/project", "/home/alice/src/a\\b.ts:3"],
+    ["~/src/a\\b.ts", "/Users/alice/p", "/Users/alice/src/a\\b.ts"],
+    ["~/src/a\\b.ts", "C:\\Users\\alice\\p", "C:\\Users\\alice\\src\\a\\b.ts"],
     ["./src/a.ts", "/repo", "/repo/./src/a.ts"],
   ])("resolves %s against %s", (raw, cwd, expected) => {
     expect(resolvePathLinkTarget(raw, cwd)).toBe(expected);
