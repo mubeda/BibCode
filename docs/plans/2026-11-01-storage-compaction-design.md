@@ -1,14 +1,14 @@
 # Storage Compaction
 
-Status: Proposed 2026-11-01, revision 5, awaiting approval. Design for issue
+Status: Proposed 2026-11-01, revision 6, awaiting approval. Design for issue
 230, verified against `9c8799b80` (v0.14.0). Implementation must not start
 before approval (AGENTS.md, Architectural Decision Standards): it changes a
 persisted shape (`auto_vacuum` on new stores, a new manifest trigger, a
 retention rule) and adds a CLI write path.
 
 Revision 3 replanned after two review rounds; revision 4 narrowed the
-inspection lock scope and fixed the space check (round 3); revision 5 keeps
-pre-backup refusals free of writes (round 4) (see "Review findings and
+inspection lock scope and fixed the space check (round 3); revisions 5 and 6 keep
+pre-backup refusals free of writes and stray sidecars (rounds 4 and 5) (see "Review findings and
 resolutions" at the end). The rule: decide what to open from a lock held for
 the whole operation, never from an earlier file check. Inspection holds the
 non-creating runtime guard for classification and stats, releases it before
@@ -273,10 +273,21 @@ real run (the dry run is D8):
    `Database::open_for_maintenance` opens `state.sqlite` and sets, in this
    order, before anything reads the database:
    `set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)`
-   (rusqlite 0.40.2, `src/config.rs:28,125`), so closing this connection
-   never checkpoints a crash-left WAL into `state.sqlite` and never deletes
-   `-wal` (review finding r4-1; exclusive locking does not stop the
-   checkpoint on close); `busy_timeout = 0`; `locking_mode = EXCLUSIVE`, so
+   (rusqlite 0.40.2, `src/config.rs:28,125`) **when a `-wal` existed before
+   the open**, so closing this connection never checkpoints a crash-left
+   WAL into `state.sqlite` and never deletes it (review finding r4-1;
+   exclusive locking does not stop the checkpoint on close). When no `-wal`
+   existed, the flag is left off (review finding r5-1): the first access
+   creates an empty `-wal` even in exclusive locking mode, and with the flag
+   set the close would leave it behind without a `-shm`, which inspection
+   then reports as `unsafe-database-state` for a healthy store. Without the
+   flag that WAL can only hold this connection's frames, and before the
+   backup it holds none that are committed, so SQLite's normal close
+   checkpoints nothing and deletes the file itself. The sidecar presence is
+   recorded under the runtime lock, which no BiBCode process can contend.
+   The alternative, deleting a still-empty `-wal` ourselves after the close,
+   adds a file deletion to BiBCode for the same result. Then
+   `busy_timeout = 0`; `locking_mode = EXCLUSIVE`, so
    SQLite keeps the WAL index in heap memory and never uses `-shm`; then the
    normal `open_connection` pragmas **except `journal_mode = WAL`**
    (`foreign_keys`, `synchronous = FULL`, autocheckpoint and journal limit);
@@ -303,8 +314,10 @@ real run (the dry run is D8):
      the backup. The backup copies the store in whatever mode it is.
    - **Nothing is written before the backup.** WAL replay builds only the
      in-memory index, the empty `BEGIN EXCLUSIVE; COMMIT` writes no frames,
-     and the close does not checkpoint. So every refusal in steps 4 to 8
-     leaves `state.sqlite`, `-wal` and `-shm` byte for byte as they were.
+     a pre-existing WAL is not checkpointed on close, and a WAL created by
+     this open is empty and removed by the close. So every refusal in steps
+     4 to 8 leaves `state.sqlite`, `-wal` and `-shm` byte for byte as they
+     were, and a sidecar that was absent stays absent.
    From here, every step uses this one connection, so the exclusive lock does
    not block our own backup.
 5. **Schema check on that connection.** The ledger-prefix and core-table checks
@@ -355,10 +368,13 @@ real run (the dry run is D8):
     `freelistCount == 0` and `autoVacuum == "incremental"`; anything else is a
     `CompactFailed { phase: "verify" }` that carries the backup ID.
 12. **Close.** Only when step 11 passed, call
-    `set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)` so
-    the close checkpoints anything left and deletes the WAL, as a normal
-    shutdown does. On every failure or cancellation the flag stays set, and
-    the WAL is left for the next open to replay. Then release the guards.
+    `set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)` (a
+    no-op when it was never set) so the close checkpoints anything left and
+    deletes the WAL, as a normal shutdown does. On a failure or cancellation
+    with a pre-existing WAL the flag stays set, and the WAL is left for the
+    next open to replay. Without one, the close drops this connection's
+    uncommitted frames and deletes the WAL, as SQLite always does. Then
+    release the guards.
 
 The token is also checked between steps. Steps 10 to 12 are not cancellable:
 the compaction is committed, and they only finish it.
@@ -663,8 +679,8 @@ which is the order T3's doctor uses. That is its own design.
 ## Code changes (for the implementation PR)
 
 - `persistence/database.rs`: a create flag on the staging open that sets
-  `auto_vacuum`; `open_for_maintenance` (`NO_CKPT_ON_CLOSE`,
-  `busy_timeout = 0`, `locking_mode = EXCLUSIVE`, no `journal_mode` change,
+  `auto_vacuum`; `open_for_maintenance` (`NO_CKPT_ON_CLOSE`
+  when a `-wal` already exists, `busy_timeout = 0`, `locking_mode = EXCLUSIVE`, no `journal_mode` change,
   `BEGIN EXCLUSIVE` probe); a space-stats query;
   a cancellable `VACUUM` closure (pre-check plus progress handler).
 - `persistence/migrations.rs`: `validate_bibcode_schema(&Connection, …)`
@@ -779,11 +795,14 @@ Compaction:
     nothing, which pins the documented limit.
 13. `compact_refuses_insufficient_disk_space_before_the_backup`: through
     `CompactTestHook::FreeSpace`, `InsufficientSpace` with both numbers and
-    no backup. Run on three stores: clean, the crash-left WAL fixture with
-    `-shm`, and a restored `DELETE`-mode store. In each, `state.sqlite`,
-    `-wal` and `-shm` are byte for byte unchanged after the command returns
-    (finding r4-1: the refusal path closes the connection without a
-    checkpoint), and the restored store is still in `DELETE` mode.
+    no backup. Run on three stores: clean WAL-mode with no sidecars, the
+    crash-left WAL fixture with `-shm`, and a restored `DELETE`-mode store.
+    In each, `state.sqlite` is byte for byte unchanged after the command
+    returns; a pre-existing `-wal` or `-shm` is byte-identical (finding r4-1:
+    no checkpoint on close); a sidecar that was absent is still absent
+    (finding r5-1: no stray empty `-wal`); and the restored store is still in
+    `DELETE` mode. A follow-up `inspect` of the clean store reports
+    `existing`.
 14. `compact_counts_main_file_growth_held_in_a_crash_left_wal` (finding
     r3-2): a crash-left WAL fixture whose `-wal` holds many pages beyond the
     physical main file, split volumes (`same_volume: false`), and store-volume
@@ -794,8 +813,10 @@ Compaction:
     remains.
 15. `compact_cancelled_after_the_backup_leaves_the_store_unchanged`
     (finding 6): `CompactTestHook::CancelAfterBackup`. `Cancelled` with the
-    backup ID; `state.sqlite` and any `-wal` equal the original; the backup
-    inventories as verified.
+    backup ID; the backup inventories as verified. Run on the clean store
+    with no sidecars and on the crash-left WAL fixture: `state.sqlite` is
+    unchanged, absent sidecars are still absent, and a pre-existing `-wal`
+    is byte-identical.
 16. `compact_cancelled_during_vacuum_rolls_back_and_restarts_cleanly`
     (finding 6): `CompactTestHook::CancelDuringVacuum`. `Cancelled` with the
     backup ID; then `prepare_store` on the root (a normal restart) succeeds,
@@ -942,6 +963,14 @@ Round 4:
   read and clears it only after a verified compaction; the journal-mode
   conversion moves after the backup (D3 steps 4, 9, 12). Tests 12, 13, 14
   and 15 assert `state.sqlite`, `-wal` and `-shm` unchanged.
+
+Round 5:
+
+- **r5-1**, a refusal on a clean store left an empty `-wal` without `-shm`,
+  which inspection reports as unsafe: the open creates the WAL, and
+  `NO_CKPT_ON_CLOSE` stops the close from deleting it. The flag is now set
+  only when a `-wal` existed before the open; otherwise SQLite's normal close
+  deletes the empty WAL (D3 steps 4 and 12). Tests 13 and 15.
 
 Scope-down: compaction of stores whose backup exceeds the existing 30 s budget
 (D5, Risks). The issue's acceptance criteria use small hermetic fixtures and
