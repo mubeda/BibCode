@@ -209,21 +209,60 @@ function nextFrames(): Promise<void> {
   });
 }
 
+/**
+ * The reader pages up from the composer, which scrolls the timeline, then jumps to the top; the
+ * timeline must stay mounted and show its first turn with no update-depth error.
+ */
+async function scrollToTopAndCheck(phase: string): Promise<void> {
+  await composerEditor().click();
+  for (let page = 0; page < 30; page += 1) {
+    await browser.keys("PageUp");
+    await nextFrames();
+  }
+  const firstPrompt = shortPrompt(1);
+  await browser.waitUntil(
+    async () => {
+      await browser.execute((surface: string) => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        );
+        if (scroller) scroller.scrollTop = 0;
+      }, visibleSurfaceSelector);
+      await nextFrames();
+      const state = await readTimelineState(firstPrompt);
+      return !state.mounted || (state.scrollTop === 0 && state.firstVisible);
+    },
+    { timeout: 30_000, timeoutMsg: `${phase}: the timeline never reached its first turn.` },
+  );
+  await browser.saveScreenshot(
+    NodePath.join(preparedArtifactDirectory, `huge-thread-scrolled-to-top-${phase}.png`),
+  );
+
+  expect(await readUpdateDepthErrors()).toEqual([]);
+  const state = await readTimelineState(firstPrompt);
+  expect(state.mounted).toBe(true);
+  expect(state.firstVisible).toBe(true);
+  expect(appLogsMentionUpdateDepth()).toBe(false);
+}
+
 describe("Chat huge thread scroll", () => {
   it("scrolls from the end of long replies to the top of many short ones", async () => {
     await setDesktopUiWindowSize(1280, 760);
     await ensureFixtureProjectImported();
     await openPrimaryWorkspace();
     await openClaudePanel();
+    await recordUpdateDepthErrors();
 
     for (let turn = 1; turn <= SHORT_TURNS; turn += 1) {
       await sendAndSettle(shortPrompt(turn));
     }
-    // The long replies come last, so reopening at the end measures them first.
     for (let turn = 1; turn <= LONG_TURNS; turn += 1) {
       await sendAndSettle(`Long turn ${turn} ${desktopUiFixture.longReplyTurnMarker}`);
     }
+    // First in the list the long replies streamed into.
+    await scrollToTopAndCheck("live");
 
+    // Then reopened: the long replies come last, so the reopened list measures them first.
     await refreshDesktopUiDocument();
     await waitForComposerDisplayed();
     await recordUpdateDepthErrors();
@@ -239,36 +278,6 @@ describe("Chat huge thread scroll", () => {
         ),
       { timeoutMsg: "The reopened thread did not show the last long reply's end." },
     );
-
-    // The reader pages up from the composer, which scrolls the timeline, then jumps to the top.
-    await composerEditor().click();
-    for (let page = 0; page < 30; page += 1) {
-      await browser.keys("PageUp");
-      await nextFrames();
-    }
-    const firstPrompt = shortPrompt(1);
-    await browser.waitUntil(
-      async () => {
-        await browser.execute((surface: string) => {
-          const scroller = document.querySelector<HTMLElement>(
-            `${surface} [class*='overflow-anchor']`,
-          );
-          if (scroller) scroller.scrollTop = 0;
-        }, visibleSurfaceSelector);
-        await nextFrames();
-        const state = await readTimelineState(firstPrompt);
-        return !state.mounted || (state.scrollTop === 0 && state.firstVisible);
-      },
-      { timeout: 30_000, timeoutMsg: "The timeline never reached its first turn." },
-    );
-    await browser.saveScreenshot(
-      NodePath.join(preparedArtifactDirectory, "huge-thread-scrolled-to-top.png"),
-    );
-
-    expect(await readUpdateDepthErrors()).toEqual([]);
-    const state = await readTimelineState(firstPrompt);
-    expect(state.mounted).toBe(true);
-    expect(state.firstVisible).toBe(true);
-    expect(appLogsMentionUpdateDepth()).toBe(false);
+    await scrollToTopAndCheck("reopened");
   }).timeout(900_000);
 });

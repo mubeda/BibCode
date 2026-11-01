@@ -765,8 +765,9 @@ LegendList estimates rows, also run `chat-huge-thread-scroll.e2e.ts`
 (`BIBCODE_E2E_SPEC=./specs/chat-huge-thread-scroll.e2e.ts`). A Claude prompt
 containing `[[long-reply]]` makes the fixture stream 1,000 paragraphs in ten
 deltas, so each long reply crosses length buckets while it renders. The
-spec builds 84 short turns and then 4 long ones in a Claude panel, reopens the
-thread at its end, pages up from the composer, and sets the scroller to the top.
+spec builds 84 short turns and then 4 long ones in a Claude panel. It pages up
+from the composer and sets the scroller to the top, first in the list the
+replies streamed into and again after reopening the thread at its end.
 It asserts that the timeline stays mounted, the first turn shows, and neither the
 page nor the app logs report React's "Maximum update depth exceeded" (#228). The
 spec builds its thread through the UI, so it takes several minutes.
