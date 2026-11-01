@@ -307,6 +307,8 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           direction,
         });
   const stepChange = (direction: 1 | -1) => {
+    // A diff still loading has no blocks to count yet: stepping now would pass the file over.
+    if (!diffSettled) return;
     const step = stepFor(direction);
     if (step.kind === "change") {
       setVisit({ fileDiff, index: step.index });
@@ -317,17 +319,32 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
   };
   useImperativeHandle(navigation?.paneRef, () => ({ goToChange: stepChange }));
   // A step into this file lands on its first or last change once the diff is on screen, once.
-  // A file with no change to land on (binary, too large, failed) passes the step on.
+  // A file with no block to land on (binary, too large) passes the step on; a failed read stops.
   const onStepFile = navigation?.onStepFile;
   const arrivedRef = useRef(false);
+  const sectionRef = useRef<HTMLElement>(null);
+  // The pane is keyed by path, so a step across files unmounts the control that had focus and
+  // focus falls to the page. Take it back here, never from something else that holds it.
+  const reclaimFocus = () => {
+    if (document.activeElement === null || document.activeElement === document.body) {
+      sectionRef.current?.focus({ preventScroll: true });
+    }
+  };
   useEffect(() => {
     if (arrival === null || !diffSettled || arrivedRef.current || !onStepFile) return;
-    if (changeTargets.length === 0) {
-      arrivedRef.current = true;
-      onStepFile(arrival === "first" ? 1 : -1);
-    } else if (viewer !== null) {
+    if (changeTargets.length > 0) {
+      if (viewer === null) return;
       arrivedRef.current = true;
       scrollToChange(changeIndex);
+      reclaimFocus();
+    } else if (diff === null) {
+      // The read failed: stop here, where the error is shown, rather than hide it.
+      arrivedRef.current = true;
+      reclaimFocus();
+    } else {
+      // Confirmed content with no blocks to step through (binary, too large): pass it over.
+      arrivedRef.current = true;
+      onStepFile(arrival === "first" ? 1 : -1);
     }
   });
   const codeViewOptions = useMemo(
@@ -450,16 +467,20 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
 
   return (
     <section
+      ref={sectionRef}
+      tabIndex={-1}
       aria-label={`Diff for ${path}`}
-      className="flex min-h-0 flex-1 flex-col border-t border-panel-separator"
+      className="flex min-h-0 flex-1 flex-col border-t border-panel-separator outline-none"
     >
       <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border px-2">
         <span className="min-w-0 flex-1 truncate font-mono text-xs">{path}</span>
         {navigation === undefined ? null : (
           <>
             <ChangeNavigationButton
-              disabled={stepFor(-1).kind === "stop"}
-              disabledReason="This is the first change in the list."
+              disabled={!diffSettled || stepFor(-1).kind === "stop"}
+              disabledReason={
+                diffSettled ? "This is the first change in the list." : "Loading this diff…"
+              }
               label="Previous change"
               shortcut={diffChangeShortcutLabel(navigation.keybindings, "diff.previousChange")}
               onClick={() => stepChange(-1)}
@@ -467,8 +488,10 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
               <ChevronUpIcon aria-hidden="true" className="size-3.5" />
             </ChangeNavigationButton>
             <ChangeNavigationButton
-              disabled={stepFor(1).kind === "stop"}
-              disabledReason="This is the last change in the list."
+              disabled={!diffSettled || stepFor(1).kind === "stop"}
+              disabledReason={
+                diffSettled ? "This is the last change in the list." : "Loading this diff…"
+              }
               label="Next change"
               shortcut={diffChangeShortcutLabel(navigation.keybindings, "diff.nextChange")}
               onClick={() => stepChange(1)}
