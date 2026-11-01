@@ -179,6 +179,9 @@ const REMOTE_HOST = "bibcode-remote.test";
 
 /** Requests an action sends this long after its result shows still belong to it. */
 const SETTLE_MS = 500;
+/** On a named link the replies trail the visible result by seconds: the window closes this long after the last frame. */
+const QUIET_MS = 2_000;
+const QUIET_CAP_MS = 120_000;
 
 const BACKGROUND_POLLS = new Set([
   "server.getProcessDiagnostics",
@@ -783,7 +786,8 @@ const threadButton = (project: string) => `(() => {
   return projectButton?.closest('[data-sidebar="menu-item"]')
     ?.querySelector('[data-thread-item="true"] button') ?? null;
 })()`;
-const bodyIncludes = (text: string) => `document.body.innerText.includes(${JSON.stringify(text)})`;
+const bodyIncludes = (text: string) =>
+  `document.body?.innerText.includes(${JSON.stringify(text)}) === true`;
 /** The transcript shows a response after the last occurrence of `prompt`. */
 const answered = (prompt: string) => `(() => {
   // The timeline is virtualised (its newest rows are the ones in the DOM) and its DOM
@@ -882,6 +886,22 @@ function threadResynced(
   }, timeoutMs);
 }
 
+/** Waits for the frames that belong to an action after its result showed; returns when its window ends. */
+async function settle(page: CdpPage, visibleAt: number, untilQuiet: boolean): Promise<number> {
+  if (!untilQuiet) {
+    await sleep(SETTLE_MS + 100);
+    return visibleAt + SETTLE_MS;
+  }
+  const deadline = Date.now() + QUIET_CAP_MS;
+  for (;;) {
+    await sleep(250);
+    const lastFrameAt = page.frames.at(-1)?.at ?? visibleAt;
+    if (Date.now() - lastFrameAt >= QUIET_MS || Date.now() > deadline) {
+      return Math.max(visibleAt + SETTLE_MS, lastFrameAt);
+    }
+  }
+}
+
 /** Runs one action, waits for it to settle, and records its measurement in `results`. */
 function createMeasure(
   page: CdpPage,
@@ -907,14 +927,14 @@ ${text}`,
       );
     });
     const visibleAt = typeof outcome === "number" ? outcome : outcome.visibleAt;
-    await sleep(SETTLE_MS + 100);
+    const settledAt = await settle(page, visibleAt, link !== undefined);
     const window = summarizeWindow(
       action,
       rttMs,
       page.frames,
       startedAt,
       visibleAt,
-      visibleAt + SETTLE_MS,
+      settledAt,
       link,
     );
     const measurement: ActionMeasurement =
