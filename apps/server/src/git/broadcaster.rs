@@ -892,6 +892,20 @@ impl StatusBroadcaster {
         }
     }
 
+    /// `notify_local_change` for synchronous callers (a provider command that settled, #221):
+    /// it schedules the report and returns at once.
+    pub fn local_change_reporter(&self) -> impl Fn(&Path) + Send + Sync + 'static {
+        let broadcaster = self.clone();
+        move |cwd| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let broadcaster = broadcaster.clone();
+            let cwd = cwd.to_path_buf();
+            handle.spawn(async move { broadcaster.notify_local_change(&cwd).await });
+        }
+    }
+
     /// A pull request of `cwd`'s branch was created, or may have been, from outside the
     /// subscribed clients (an MCP agent, say). That changes no remote ref, so the remote is read
     /// again and published even if unchanged, and each status stream looks the request up again.

@@ -11066,6 +11066,21 @@ async fn settle_session_reasoning(engine: &OrchestrationEngine, thread_id: &str,
     }
 }
 
+/// The shell command of a completed command item that ran: a Codex or Cursor
+/// `command_execution` that completed, or a Claude `Bash` call that returned a result (one
+/// without a result never ran, its turn ended first).
+fn settled_command(payload: &Value) -> Option<&str> {
+    if payload.get("itemType").and_then(Value::as_str) == Some("command_execution") {
+        return (payload.get("status").and_then(Value::as_str) == Some("completed"))
+            .then(|| payload.get("detail").and_then(Value::as_str))
+            .flatten();
+    }
+    let data = payload.get("data")?;
+    (data.get("toolName").and_then(Value::as_str) == Some("Bash") && data.get("result").is_some())
+        .then(|| data.pointer("/input/command").and_then(Value::as_str))
+        .flatten()
+}
+
 async fn project_provider_event(
     engine: &OrchestrationEngine,
     launch: &ProviderLaunchRequest,
@@ -11191,6 +11206,14 @@ async fn project_provider_event(
         engine
             .compaction_waiters()
             .compaction_item_completed(&launch.thread_id, turn_id);
+    }
+    // An agent that opened a pull request from its shell changed what the forge reports for the
+    // thread's branch: refresh now instead of on the next status cycle (#221).
+    if event.event_type == "item.completed"
+        && settled_command(&event.payload)
+            .is_some_and(crate::source_control::pr_create_command::creates_pull_request)
+    {
+        engine.report_local_change(&launch.cwd);
     }
     if event.event_type == "turn.completed" {
         let state = event
@@ -33038,6 +33061,110 @@ done
             }
         }
         engine.shutdown().await;
+    }
+
+    /// The cwds a settled provider command reported as a local change, one per report.
+    async fn reported_local_changes(
+        provider: &str,
+        events: &[(&str, Value)],
+    ) -> (Vec<std::path::PathBuf>, std::path::PathBuf) {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, provider);
+        launch.thread_id = "t1".to_owned();
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = reported.clone();
+        engine.set_local_change_observer(Arc::new(move |cwd: &std::path::Path| {
+            recorder.lock().unwrap().push(cwd.to_path_buf());
+        }));
+        for (event_type, payload) in events {
+            project_work_log_event(&engine, &launch, event_type, payload.clone()).await;
+        }
+        engine.shutdown().await;
+        let reported = reported.lock().unwrap().clone();
+        (reported, launch.cwd)
+    }
+
+    fn codex_command(command: &str, completed: bool) -> Value {
+        let mut payload =
+            json!({"itemType": "command_execution", "title": "Ran command", "detail": command});
+        if completed {
+            payload["status"] = json!("completed");
+        }
+        payload
+    }
+
+    fn claude_bash(command: &str, result: bool) -> Value {
+        let mut payload = json!({"data": {"toolName": "Bash", "input": {"command": command}}});
+        if result {
+            payload["data"]["result"] =
+                json!({"tool_use_id": "tool-1", "content": "https://github.com/o/r/pull/42"});
+        }
+        payload
+    }
+
+    #[tokio::test]
+    async fn a_settled_codex_pull_request_create_reports_the_thread_cwd_once() {
+        let command = "/bin/zsh -lc 'git push -u origin HEAD && gh pr create --fill'";
+        let (reported, cwd) = reported_local_changes(
+            "codex",
+            &[
+                ("item.started", codex_command(command, false)),
+                ("item.completed", codex_command(command, true)),
+            ],
+        )
+        .await;
+        assert_eq!(reported, [cwd]);
+    }
+
+    #[tokio::test]
+    async fn a_claude_bash_pull_request_create_reports_the_thread_cwd_once() {
+        let command = "glab mr create --fill --yes";
+        let (reported, cwd) = reported_local_changes(
+            "claudeAgent",
+            &[
+                ("item.started", claude_bash(command, false)),
+                ("item.updated", claude_bash(command, true)),
+                ("item.completed", claude_bash(command, true)),
+            ],
+        )
+        .await;
+        assert_eq!(reported, [cwd]);
+    }
+
+    #[tokio::test]
+    async fn unsettled_unstarted_or_unrelated_commands_report_no_local_change() {
+        let create = "gh pr create --fill";
+        let (codex, _) = reported_local_changes(
+            "codex",
+            &[
+                ("item.started", codex_command(create, false)),
+                ("item.updated", codex_command(create, true)),
+                // Cursor's in-progress shape, completed without a completed status.
+                (
+                    "item.completed",
+                    json!({"itemType": "command_execution", "status": "inProgress", "detail": create}),
+                ),
+                ("item.completed", codex_command("gh pr view --web", true)),
+                ("item.completed", codex_command("echo 'gh pr create'", true)),
+            ],
+        )
+        .await;
+        assert_eq!(codex, Vec::<std::path::PathBuf>::new());
+        let (claude, _) = reported_local_changes(
+            "claudeAgent",
+            &[
+                // A Bash call its turn ended before it ran completes without a result.
+                ("item.completed", claude_bash(create, false)),
+                ("item.completed", claude_bash("gh pr list", true)),
+                (
+                    "item.completed",
+                    json!({"data": {"toolName": "Read", "input": {"command": create}, "result": {}}}),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(claude, Vec::<std::path::PathBuf>::new());
     }
 
     #[tokio::test]
