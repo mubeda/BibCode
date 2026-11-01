@@ -348,8 +348,8 @@ server versions describe the same build. The calling checkout is not rewritten.
 
 The three packages compile sequentially into separate Cargo output directories
 under the isolated run root; the workflow's cached repository `target` does not
-warm them. The macOS packaging children have a 90-minute bound; every other
-target retains 45 minutes. Each checkout's frozen dependency install retains
+warm them. The macOS packaging children have a 90-minute bound, Windows
+children 60 minutes, and Linux children 45 minutes. Each checkout's frozen dependency install retains
 10 minutes. The complete macOS jobs allow 360 minutes: 270 for packaging, 30
 for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
 The other four native rows and the separate WSL job retain 240 minutes.
