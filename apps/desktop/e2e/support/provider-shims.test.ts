@@ -18,6 +18,7 @@ import {
 import { readProviderInputLog } from "./provider-input-log.ts";
 import {
   archiveAndCleanupDesktopUiTestContext,
+  desktopUiFixture,
   prepareDesktopUiTestContext,
   type DesktopUiTestContext,
 } from "./test-project.ts";
@@ -692,6 +693,33 @@ describe("generated provider shims", () => {
         }),
       }),
     );
+    expect(responses.at(-1)).toMatchObject({ type: "result", subtype: "success" });
+  });
+
+  it("answers a Claude long-reply prompt with a reply tall enough to fill the timeline", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
+      [
+        {
+          type: "user",
+          session_id: "claude-fixture",
+          message: {
+            content: [
+              { type: "text", text: `Write it all ${desktopUiFixture.longReplyTurnMarker}` },
+            ],
+          },
+        },
+      ],
+    );
+    const answer = responses
+      .filter((response) => response.type === "stream_event")
+      .map((response) => (response.event as { delta?: { text?: string } }).delta?.text ?? "")
+      .join("");
+    expect(answer.split("\n\n")).toHaveLength(1_000);
+    expect(answer.endsWith(desktopUiFixture.longReplyLastLine)).toBe(true);
     expect(responses.at(-1)).toMatchObject({ type: "result", subtype: "success" });
   });
 
