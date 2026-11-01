@@ -16,23 +16,46 @@ pub struct CursorWorkspaceCapabilities {
 }
 
 pub async fn discover_workspace_capabilities(workspace: &Path) -> CursorWorkspaceCapabilities {
-    discover_workspace_capabilities_with_home(workspace, dirs::home_dir().as_deref()).await
+    let mut capabilities = CursorWorkspaceCapabilities::default();
+    discover_into(workspace, dirs::home_dir().as_deref(), &mut capabilities).await;
+    capabilities
 }
 
 pub async fn discover_workspace_capabilities_with_environment(
     workspace: &Path,
     environment: &[(OsString, OsString)],
 ) -> CursorWorkspaceCapabilities {
-    let home = configured_home(environment).or_else(dirs::home_dir);
-    discover_workspace_capabilities_with_home(workspace, home.as_deref()).await
+    let mut capabilities = CursorWorkspaceCapabilities::default();
+    discover_workspace_capabilities_into(workspace, environment, &mut capabilities).await;
+    capabilities
 }
 
+/// Fills `capabilities` as it goes, so a caller that cancels the future (for
+/// example on a timeout) keeps everything found so far.
+pub async fn discover_workspace_capabilities_into(
+    workspace: &Path,
+    environment: &[(OsString, OsString)],
+    capabilities: &mut CursorWorkspaceCapabilities,
+) {
+    let home = configured_home(environment).or_else(dirs::home_dir);
+    discover_into(workspace, home.as_deref(), capabilities).await;
+}
+
+#[cfg(test)]
 async fn discover_workspace_capabilities_with_home(
     workspace: &Path,
     home: Option<&Path>,
 ) -> CursorWorkspaceCapabilities {
     let mut capabilities = CursorWorkspaceCapabilities::default();
+    discover_into(workspace, home, &mut capabilities).await;
+    capabilities
+}
 
+async fn discover_into(
+    workspace: &Path,
+    home: Option<&Path>,
+    capabilities: &mut CursorWorkspaceCapabilities,
+) {
     let command_roots = scoped_roots(workspace, home, ".cursor/commands");
     let mut command_names = HashSet::new();
     for (root, _scope) in command_roots {
@@ -43,19 +66,9 @@ async fn discover_workspace_capabilities_with_home(
         }
     }
 
-    let mut skill_names = HashSet::new();
+    let mut scan = SkillScan::default();
     for (root, scope) in skill_roots(workspace, home).await {
-        for (name, path) in skill_files(&root, &mut capabilities.issues).await {
-            if skill_names.insert(name.to_ascii_lowercase()) {
-                capabilities.skills.push(json!({
-                    "name": name,
-                    "path": path,
-                    "scope": scope,
-                    "enabled": true,
-                    "invocation": "slash",
-                }));
-            }
-        }
+        scan_skills(&root, scope, &mut scan, capabilities).await;
     }
 
     let mut agent_names = HashSet::new();
@@ -66,8 +79,6 @@ async fn discover_workspace_capabilities_with_home(
             }
         }
     }
-
-    capabilities
 }
 
 fn configured_home(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
@@ -185,19 +196,58 @@ async fn markdown_files(directory: &Path) -> Vec<(String, String)> {
     files
 }
 
-async fn skill_files(directory: &Path, issues: &mut Vec<String>) -> Vec<(String, String)> {
-    let mut files = Vec::new();
-    let mut pending = vec![directory.to_path_buf()];
-    let mut visited = HashSet::new();
-    while let Some(folder) = pending.pop() {
+/// Dependency and build folders hold no skills and can be huge.
+const SKIPPED_FOLDERS: [&str; 6] = [
+    "node_modules",
+    ".git",
+    "target",
+    ".venv",
+    "venv",
+    "__pycache__",
+];
+const MAX_SKILL_DEPTH: usize = 10;
+const MAX_SKILL_SCAN_ENTRIES: usize = 10_000;
+
+/// State shared by every root of one discovery, so a root that leads into an
+/// already walked tree costs nothing and the budget covers the whole scan.
+#[derive(Default)]
+struct SkillScan {
+    visited: HashSet<PathBuf>,
+    names: HashSet<String>,
+    entries: usize,
+    exhausted: bool,
+    depth_reported: bool,
+}
+
+async fn scan_skills(
+    root: &Path,
+    scope: &'static str,
+    scan: &mut SkillScan,
+    capabilities: &mut CursorWorkspaceCapabilities,
+) {
+    let first = capabilities.skills.len();
+    let mut pending = vec![(root.to_path_buf(), 0)];
+    while let Some((folder, depth)) = pending.pop() {
+        if scan.exhausted {
+            break;
+        }
+        if depth > MAX_SKILL_DEPTH {
+            if !std::mem::replace(&mut scan.depth_reported, true) {
+                capabilities.issues.push(format!(
+                    "Skill list is incomplete: skipped folders deeper than {MAX_SKILL_DEPTH} under {}",
+                    root.display()
+                ));
+            }
+            continue;
+        }
         let canonical = match fs::canonicalize(&folder).await {
             Ok(path) => path,
             Err(error) => {
                 if error.kind() != std::io::ErrorKind::NotFound
-                    || folder != directory
+                    || folder != root
                     || fs::symlink_metadata(&folder).await.is_ok()
                 {
-                    issues.push(format!(
+                    capabilities.issues.push(format!(
                         "Cannot read skills in {}: {error}",
                         folder.display()
                     ));
@@ -205,7 +255,7 @@ async fn skill_files(directory: &Path, issues: &mut Vec<String>) -> Vec<(String,
                 continue;
             }
         };
-        if !visited.insert(canonical) {
+        if !scan.visited.insert(canonical) {
             continue;
         }
         let path = folder.join("SKILL.md");
@@ -216,19 +266,28 @@ async fn skill_files(directory: &Path, issues: &mut Vec<String>) -> Vec<(String,
                     .and_then(|name| name.to_str())
                     .map(str::trim)
                     .filter(|name| !name.is_empty())
+                    && scan.names.insert(name.to_ascii_lowercase())
                 {
-                    files.push((name.to_owned(), path.to_string_lossy().into_owned()));
+                    capabilities.skills.push(json!({
+                        "name": name,
+                        "path": path.to_string_lossy(),
+                        "scope": scope,
+                        "enabled": true,
+                        "invocation": "slash",
+                    }));
                 }
             }
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                issues.push(format!("Cannot read {}: {error}", path.display()));
+                capabilities
+                    .issues
+                    .push(format!("Cannot read {}: {error}", path.display()));
             }
             _ => {}
         }
         let mut entries = match fs::read_dir(&folder).await {
             Ok(entries) => entries,
             Err(error) => {
-                issues.push(format!(
+                capabilities.issues.push(format!(
                     "Cannot read skills in {}: {error}",
                     folder.display()
                 ));
@@ -238,16 +297,40 @@ async fn skill_files(directory: &Path, issues: &mut Vec<String>) -> Vec<(String,
         let mut children = Vec::new();
         loop {
             match entries.next_entry().await {
-                Ok(Some(entry)) => match fs::metadata(entry.path()).await {
-                    Ok(metadata) if metadata.is_dir() => children.push(entry.path()),
-                    Err(error) => {
-                        issues.push(format!("Cannot read {}: {error}", entry.path().display()))
+                Ok(Some(entry)) => {
+                    scan.entries += 1;
+                    if scan.entries > MAX_SKILL_SCAN_ENTRIES {
+                        scan.exhausted = true;
+                        capabilities.issues.push(format!(
+                            "Skill list is incomplete: stopped after {MAX_SKILL_SCAN_ENTRIES} entries under {}",
+                            root.display()
+                        ));
+                        break;
                     }
-                    _ => {}
-                },
+                    let name = entry.file_name();
+                    if SKIPPED_FOLDERS.iter().any(|skipped| name == *skipped) {
+                        continue;
+                    }
+                    // The listing already says what a plain entry is; only a link needs a stat.
+                    let is_directory = match entry.file_type().await {
+                        Ok(file_type) if file_type.is_dir() => Ok(true),
+                        Ok(file_type) if file_type.is_symlink() => {
+                            fs::metadata(entry.path()).await.map(|m| m.is_dir())
+                        }
+                        Ok(_) => Ok(false),
+                        Err(error) => Err(error),
+                    };
+                    match is_directory {
+                        Ok(true) => children.push(entry.path()),
+                        Ok(false) => {}
+                        Err(error) => capabilities
+                            .issues
+                            .push(format!("Cannot read {}: {error}", entry.path().display())),
+                    }
+                }
                 Ok(None) => break,
                 Err(error) => {
-                    issues.push(format!(
+                    capabilities.issues.push(format!(
                         "Incomplete skills in {}: {error}",
                         folder.display()
                     ));
@@ -256,10 +339,10 @@ async fn skill_files(directory: &Path, issues: &mut Vec<String>) -> Vec<(String,
             }
         }
         children.sort();
-        pending.extend(children.into_iter().rev());
+        pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
     }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    files
+    capabilities.skills[first..]
+        .sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
 }
 
 #[cfg(test)]
@@ -350,5 +433,127 @@ mod tests {
             .map(|skill| skill["name"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(names, ["local-skill", "root-skill"]);
+    }
+
+    fn names(result: &CursorWorkspaceCapabilities) -> Vec<&str> {
+        result
+            .skills
+            .iter()
+            .map(|skill| skill["name"].as_str().unwrap())
+            .collect()
+    }
+
+    fn files(directory: &Path, count: usize) {
+        std::fs::create_dir_all(directory).unwrap();
+        for index in 0..count {
+            std::fs::write(directory.join(format!("file-{index}")), "").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_folders_inside_a_skill_do_not_exhaust_the_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        skill(home.path(), ".agents/skills/review");
+        files(
+            &home.path().join(".agents/skills/review/tests/node_modules"),
+            10_001,
+        );
+        skill(home.path(), ".agents/skills/sibling");
+        skill(home.path(), ".claude/skills/later");
+        let result =
+            discover_workspace_capabilities_with_home(project.path(), Some(home.path())).await;
+        assert_eq!(names(&result), ["review", "sibling", "later"]);
+        assert!(result.issues.is_empty(), "{:?}", result.issues);
+    }
+
+    #[tokio::test]
+    async fn skill_files_inside_skipped_folders_are_not_listed() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        skill(home.path(), ".agents/skills/tool/node_modules/package");
+        skill(home.path(), ".agents/skills/.git/hooked");
+        skill(home.path(), ".agents/skills/.hidden/kept");
+        let result =
+            discover_workspace_capabilities_with_home(project.path(), Some(home.path())).await;
+        assert_eq!(names(&result), ["kept"]);
+        assert!(result.issues.is_empty(), "{:?}", result.issues);
+    }
+
+    #[tokio::test]
+    async fn an_entry_budget_keeps_the_skills_found_before_it_ran_out() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        skill(home.path(), ".agents/skills/a-first");
+        files(&home.path().join(".agents/skills/b-bulk"), 10_001);
+        skill(home.path(), ".claude/skills/later");
+        let started = std::time::Instant::now();
+        let result =
+            discover_workspace_capabilities_with_home(project.path(), Some(home.path())).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(names(&result), ["a-first"]);
+        assert_eq!(result.issues.len(), 1, "{:?}", result.issues);
+        assert!(
+            result.issues[0].starts_with("Skill list is incomplete: stopped after 10000 entries"),
+            "{}",
+            result.issues[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn folders_below_the_depth_limit_are_reported_as_incomplete() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let at_limit = (1..=10)
+            .map(|level| format!("d{level}"))
+            .collect::<Vec<_>>();
+        skill(
+            home.path(),
+            &format!(".agents/skills/{}", at_limit.join("/")),
+        );
+        skill(
+            home.path(),
+            &format!(".agents/skills/{}/too-deep", at_limit.join("/")),
+        );
+        skill(home.path(), ".claude/skills/later");
+        let result =
+            discover_workspace_capabilities_with_home(project.path(), Some(home.path())).await;
+        assert_eq!(names(&result), ["d10", "later"]);
+        assert_eq!(result.issues.len(), 1, "{:?}", result.issues);
+        assert!(
+            result.issues[0]
+                .starts_with("Skill list is incomplete: skipped folders deeper than 10"),
+            "{}",
+            result.issues[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_root_is_walked_once_and_keeps_the_first_roots_scope() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        skill(home.path(), ".claude/skills/linked");
+        files(&home.path().join(".claude/skills/bulk"), 6_000);
+        std::fs::create_dir_all(home.path().join(".agents")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".claude/skills"),
+            home.path().join(".agents/skills"),
+        )
+        .unwrap();
+        skill(project.path(), ".cursor/skills/own");
+        // Walked twice, the 6,000 files would be charged twice and pass the budget.
+        let result =
+            discover_workspace_capabilities_with_home(project.path(), Some(home.path())).await;
+        assert!(result.issues.is_empty(), "{:?}", result.issues);
+        assert_eq!(names(&result), ["own", "linked"]);
+        assert_eq!(result.skills[1]["scope"], "user");
+        assert!(
+            result.skills[1]["path"]
+                .as_str()
+                .unwrap()
+                .contains(".agents")
+        );
     }
 }
