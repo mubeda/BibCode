@@ -1,14 +1,14 @@
 # Storage Compaction
 
-Status: Proposed 2026-11-01, revision 6, awaiting approval. Design for issue
+Status: Proposed 2026-11-01, revision 7, awaiting approval. Design for issue
 230, verified against `9c8799b80` (v0.14.0). Implementation must not start
 before approval (AGENTS.md, Architectural Decision Standards): it changes a
 persisted shape (`auto_vacuum` on new stores, a new manifest trigger, a
 retention rule) and adds a CLI write path.
 
 Revision 3 replanned after two review rounds; revision 4 narrowed the
-inspection lock scope and fixed the space check (round 3); revisions 5 and 6 keep
-pre-backup refusals free of writes and stray sidecars (rounds 4 and 5) (see "Review findings and
+inspection lock scope and fixed the space check (round 3); revisions 5 to 7 keep
+refusals free of writes and leave no stray sidecars (rounds 4 to 6) (see "Review findings and
 resolutions" at the end). The rule: decide what to open from a lock held for
 the whole operation, never from an earlier file check. Inspection holds the
 non-creating runtime guard for classification and stats, releases it before
@@ -269,6 +269,18 @@ real run (the dry run is D8):
    SQLite classifier is **not** called: its 5 s busy-retry and in-memory copy
    would wait on a locked database and time out on a large one (review
    finding 1).
+
+   Two more file checks run here, before any SQLite open (review finding
+   r6-2). First, the database header is read with plain file I/O: the file
+   must be at least 100 bytes, start with `SQLite format 3\0`, and have a
+   valid page size and a length of at least one page. Otherwise it is
+   refused with `NotCompactable` ("`state.sqlite` is empty or is not a SQLite
+   database"). Without this check, step 4's `BEGIN EXCLUSIVE` on a
+   zero-length file would initialize and commit page 1 before step 5 could
+   reject the schema. Second, a `state.sqlite-journal` is refused the same
+   way ("another program left an interrupted write"), because the first
+   access would roll that hot journal back into the file. BiBCode itself
+   never writes in rollback mode.
 4. **Open one writable maintenance connection and lock it.** A new
    `Database::open_for_maintenance` opens `state.sqlite` and sets, in this
    order, before anything reads the database:
@@ -373,8 +385,18 @@ real run (the dry run is D8):
     deletes the WAL, as a normal shutdown does. On a failure or cancellation
     with a pre-existing WAL the flag stays set, and the WAL is left for the
     next open to replay. Without one, the close drops this connection's
-    uncommitted frames and deletes the WAL, as SQLite always does. Then
-    release the guards.
+    uncommitted frames and deletes the WAL, as SQLite always does.
+
+    After a verified compaction, one more cleanup runs under the runtime
+    lock (review finding r6-1). In exclusive locking mode SQLite never opens
+    `-shm`, so its close deletes the WAL but not a crash-left `-shm`. That
+    leaves `-shm` without `-wal`, which inspection reports as
+    `unsafe-database-state`, and the desktop shows as recovery required
+    (`data_safety.rs:182-191`). So if `-wal` is absent and `-shm` exists,
+    compaction removes that `-shm`. It is an orphaned index of a WAL that no
+    longer exists, and no BiBCode process can have it open while the lock is
+    held. The step runs only on success. On a failure the pre-existing
+    sidecars stay as they were. Then release the guards.
 
 The token is also checked between steps. Steps 10 to 12 are not cancellable:
 the compaction is committed, and they only finish it.
@@ -778,11 +800,17 @@ Compaction:
 10. `compact_recovers_a_crash_left_wal_under_its_lock` (finding r2-2): the
     crash-left WAL fixture with `-shm`, and once without it. Compaction
     succeeds without a server start; the rows that existed only in `-wal` are
-    present in both the pre-compact backup and the compacted store; no `-wal`
-    remains.
+    present in both the pre-compact backup and the compacted store; neither
+    `-wal` nor `-shm` remains (finding r6-1); and a following `inspect`
+    reports `existing`.
 11. `compact_refuses_while_a_server_owns_the_store`, modeled on `:1294`:
     `StoreRunning`, no backup directory entry, and the database and marker
-    are unchanged.
+    are unchanged. Plus
+    `compact_refuses_an_empty_or_headerless_database_before_any_write`
+    (finding r6-2): a valid marker with a zero-length `state.sqlite`, then
+    with a 4 KiB non-SQLite file, then with a valid store beside a
+    `state.sqlite-journal`. Each case gives `NotCompactable`, no backup, no
+    new sidecar, and `state.sqlite` and the journal byte for byte unchanged.
 12. `compact_refuses_a_locked_database_without_waiting` (findings 1 and r2-4):
     two cases, each with another connection holding `BEGIN EXCLUSIVE` and a
     pending write: a normal WAL store, and a store just restored from a
@@ -883,6 +911,28 @@ warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`,
   this changes. The implementation PR reviews them and reports "reviewed and
   remain accurate" unless the implementation adds a native validation step.
 
+## Verification by implementation
+
+The design relies on these SQLite behaviors. They come from SQLite's
+documentation and source, and from T3's report. None has been observed in
+this repository yet. Each is proven by a real-SQLite test in the
+implementation PR, and a failing test reopens the design rather than being
+weakened.
+
+| Behavior relied on                                                                                                            | Proven by        |
+| ----------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| `auto_vacuum = INCREMENTAL` set on the zero-page staging connection before `journal_mode = WAL` takes effect                  | Test 6           |
+| `VACUUM` in WAL mode switches an existing store to `incremental` and leaves `freelist_count = 0`                              | Test 9           |
+| `immutable=1` opens create no files; a plain read-only open creates nothing when both sidecars exist                          | Tests 1, 3, 4    |
+| `locking_mode = EXCLUSIVE` before first access creates no `-shm`, and replays a crash-left WAL with or without `-shm`         | Tests 9, 10      |
+| `busy_timeout = 0` plus `BEGIN EXCLUSIVE` fails at once against a held lock, in WAL and `DELETE` modes                        | Tests 12, 21     |
+| The online-backup copy works from the connection that holds the exclusive lock                                                | Test 9           |
+| `NO_CKPT_ON_CLOSE` leaves a pre-existing WAL and the main file untouched on close                                             | Tests 13, 14, 15 |
+| Without the flag, closing a connection whose WAL has no committed frames writes nothing to the main file and deletes the WAL  | Tests 13, 15     |
+| A heap-index close deletes the WAL but leaves a crash-left `-shm`, which compaction then removes                              | Test 10          |
+| The pre-check plus a progress handler stops `VACUUM` before and during execution, and a cancelled `VACUUM` rolls back cleanly | Tests 15, 16     |
+| A zero-length database is initialized by the first write transaction, so it must be refused before one                        | Test 11          |
+
 ## Risks and unmeasured
 
 - `VACUUM` duration and real free-page ratios are unmeasured (the issue's "Not
@@ -895,16 +945,14 @@ warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`,
 - Restore of a pre-compact backup does less I/O than its creation did, but on a
   cold disk cache it may still approach the 30 s limit for a backup that took
   close to 30 s to create. The fix is the same follow-up.
-- Four behaviors come from SQLite's documentation (and T3's report) and are
-  not yet observed here. Each has a test that proves it:
-  - `auto_vacuum` set before `journal_mode = WAL` takes effect on the staged
-    file (test 6, with a stated fallback);
-  - `VACUUM` switches the mode in WAL mode (test 9);
-  - the progress handler interrupts `VACUUM` (test 16). If it does not, the
-    closure also calls the connection's interrupt handle from the
-    cancellation path and keeps the pre-check;
-  - exclusive locking mode replays a crash-left WAL without using `-shm`
-    (test 10).
+- The SQLite behaviors listed under "Verification by implementation" are not
+  yet observed here. If the progress handler does not interrupt `VACUUM`, the
+  closure also calls the connection's interrupt handle from the cancellation
+  path and keeps the pre-check. If `auto_vacuum` does not take effect on the
+  staged file, the pragma moves earlier (D2).
+- Removing an orphan `-shm` after compaction (D3 step 12) races only a
+  third-party SQLite program that opens the database at that moment, which
+  the recovery guide forbids.
 - The final page copy inside `VACUUM` is not interruptible, so Ctrl-C can take
   as long as writing the compacted size.
 - The dry run does not check SQLite locks (D8). The real run refuses at once,
@@ -971,6 +1019,17 @@ Round 5:
   `NO_CKPT_ON_CLOSE` stops the close from deleting it. The flag is now set
   only when a `-wal` existed before the open; otherwise SQLite's normal close
   deletes the empty WAL (D3 steps 4 and 12). Tests 13 and 15.
+
+Round 6:
+
+- **r6-1**, a successful compaction could leave an orphan `-shm`, which
+  inspection reports as unsafe: after a verified compaction, a `-shm`
+  without `-wal` is removed under the runtime lock (D3 step 12). Test 10.
+- **r6-2**, the lock probe could initialize a zero-length database before
+  the schema check: the header is checked with plain file I/O, and a hot
+  `-journal` is refused, before any SQLite open (D3 step 3). Test 11.
+- The SQLite behaviors the design relies on, and the test that proves each,
+  are listed under "Verification by implementation".
 
 Scope-down: compaction of stores whose backup exceeds the existing 30 s budget
 (D5, Risks). The issue's acceptance criteria use small hermetic fixtures and
