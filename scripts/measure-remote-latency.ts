@@ -13,6 +13,11 @@
  *
  *   node scripts/measure-remote-latency.ts --server-bin target/debug/bibcode \
  *     --static-dir apps/web/dist [--rtt 0,250] [--jitter 0] [--out report.json]
+ *   node scripts/measure-remote-latency.ts --link 3g --fixture-bin <write_load_fixture> ...
+ *
+ * `--link 3g` runs the load scenarios instead, on the large-thread fixture (a store written by
+ * `apps/server/examples/write_load_fixture.rs` before the link slows down), with every
+ * connection paying its own handshake.
  *
  * See docs/reference/scripts.md and docs/testing/cross-platform-validation.md.
  */
@@ -25,7 +30,7 @@ import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
 
 import { launchChromium, type CdpPage, type WebSocketFrame } from "./lib/cdp.ts";
-import { startThrottleProxy } from "./throttle-proxy.ts";
+import { LINK_PRESETS, startThrottleProxy, type LinkSettings } from "./throttle-proxy.ts";
 
 /** One RPC as seen from the browser. */
 export interface RpcTrace {
@@ -43,6 +48,8 @@ interface DecodedMessage {
   readonly direction: "sent" | "received";
   readonly socket: string;
   readonly bytes: number;
+  /** Bytes of the JSON this message was decoded from (the whole line, however it was framed). */
+  readonly decodedBytes: number;
   readonly message: { readonly _tag?: string; readonly [key: string]: unknown };
 }
 
@@ -63,15 +70,18 @@ export function decodeFrames(frames: ReadonlyArray<WebSocketFrame>): Array<Decod
       } catch {
         continue;
       }
+      let decodedBytes = Buffer.byteLength(line);
       for (const message of Array.isArray(value) ? value : [value]) {
         decoded.push({
           at: frame.at,
           direction: frame.direction,
           socket: frame.socket,
           bytes,
+          decodedBytes,
           message,
         });
         bytes = 0;
+        decodedBytes = 0;
       }
     }
   };
@@ -178,6 +188,8 @@ const BACKGROUND_POLLS = new Set([
 
 export interface ActionMeasurement {
   readonly action: string;
+  /** The link's name when it is a preset (`3g`); the table's column is then this, not the round trip. */
+  readonly link?: string;
   readonly rttMs: number;
   readonly visibleMs: number;
   readonly rpcs: number;
@@ -186,6 +198,8 @@ export interface ActionMeasurement {
   readonly criticalChain: ReadonlyArray<string>;
   readonly bytesSent: number;
   readonly bytesReceived: number;
+  /** Bytes of the JSON received, after the transport's inflate. Absent in older captures. */
+  readonly bytesReceivedDecoded?: number;
   /** Typing rows: delay from each keystroke until its echo arrived, median and 95th percentile. */
   readonly echoLagP50Ms?: number;
   readonly echoLagP95Ms?: number;
@@ -232,12 +246,14 @@ export function summarizeWindow(
   startedAt: number,
   visibleAt: number,
   settledAt: number,
+  link?: string,
 ): ActionMeasurement {
   const socketFrames = frames.filter((frame) => frame.url.includes("/ws"));
   const inWindow = socketFrames.filter((frame) => frame.at >= startedAt && frame.at <= settledAt);
   // Decoded from the whole stream, so a message whose records began before the action
   // still reassembles; requests count when the action, or its settling, sent them.
-  const traces = traceRpcs(decodeFrames(socketFrames)).filter(
+  const messages = decodeFrames(socketFrames);
+  const traces = traceRpcs(messages).filter(
     (trace) =>
       trace.sentAt >= startedAt && trace.sentAt <= settledAt && !BACKGROUND_POLLS.has(trace.tag),
   );
@@ -256,6 +272,7 @@ export function summarizeWindow(
   );
   return {
     action,
+    ...(link === undefined ? {} : { link }),
     rttMs,
     visibleMs: visibleAt - startedAt,
     rpcs: traces.length,
@@ -268,6 +285,12 @@ export function summarizeWindow(
     bytesReceived: inWindow
       .filter((frame) => frame.direction === "received")
       .reduce((sum, frame) => sum + frame.bytes, 0),
+    bytesReceivedDecoded: messages
+      .filter(
+        (message) =>
+          message.direction === "received" && message.at >= startedAt && message.at <= settledAt,
+      )
+      .reduce((sum, message) => sum + message.decodedBytes, 0),
   };
 }
 
@@ -315,7 +338,7 @@ interface Harness {
   readonly debugPort: string;
   readonly origin: string;
   readonly projectPath: string;
-  readonly setDelay: (oneWayMs: number, jitterMs: number) => void;
+  readonly setLink: (settings: Partial<LinkSettings>) => void;
   readonly dropSockets: () => void;
   readonly close: () => Promise<void>;
 }
@@ -325,6 +348,12 @@ async function startHarness(options: {
   readonly staticDir: string;
   readonly chromium: string;
   readonly runRoot: string;
+  /**
+   * `large` writes the load fixture's store (the big thread and its shell) with `fixtureBin`
+   * before the server starts, instead of adding two small projects through the UI.
+   */
+  readonly fixture: "small" | "large";
+  readonly fixtureBin: string;
   /**
    * Every acquired resource pushes its release here at once, so the caller can release
    * a harness still starting (a signal) and a failure part-way through releases the rest.
@@ -341,13 +370,22 @@ async function startHarness(options: {
   )) as {
     readonly prepareDesktopUiTestContext: (environment: NodeJS.ProcessEnv) => {
       readonly projectPath: string;
+      readonly runRoot: string;
+      readonly stateRoot: string;
     };
   };
   const context = fixtures.prepareDesktopUiTestContext(environment);
   // A second repository gives "switch thread" a different project to move to, and both
   // repositories some files and changes for the Files and Source Control panels.
   const secondProject = NodePath.join(NodePath.dirname(context.projectPath), "Second Fixture");
-  for (const project of [context.projectPath, secondProject]) {
+  if (options.fixture === "large") {
+    NodeChildProcess.execFileSync(
+      options.fixtureBin,
+      [context.stateRoot, NodePath.join(context.runRoot, "fixture-workspaces")],
+      { stdio: "inherit" },
+    );
+  }
+  for (const project of options.fixture === "large" ? [] : [context.projectPath, secondProject]) {
     NodeFS.mkdirSync(NodePath.join(project, "src"), { recursive: true });
     for (let index = 0; index < 40; index++) {
       NodeFS.writeFileSync(
@@ -513,7 +551,9 @@ async function startHarness(options: {
       );
       if (paired !== 200) throw new Error(`pairing failed with HTTP ${paired}`);
       await page.navigate(`${origin}/`);
-      for (const projectPath of [context.projectPath, secondProject]) {
+      for (const projectPath of options.fixture === "large"
+        ? []
+        : [context.projectPath, secondProject]) {
         await page.waitFor(`document.querySelector('[data-testid="sidebar-add-project-trigger"]')`);
         // The trigger renders before its handler is ready on a fresh load; retry the click.
         for (let attempt = 0; ; attempt++) {
@@ -564,8 +604,8 @@ async function startHarness(options: {
       debugPort: browser.debugPort,
       origin,
       projectPath: context.projectPath,
-      setDelay: (delay, jitter) => {
-        proxy.update({ delay, jitter });
+      setLink: (settings) => {
+        proxy.update(settings);
       },
       dropSockets: () => proxy.drop(),
       close,
@@ -576,7 +616,14 @@ async function startHarness(options: {
   }
 }
 
-function parseArgs(argv: ReadonlyArray<string>): Map<string, string> {
+/** One link to measure: a named preset, or just a round trip. */
+export interface Link {
+  readonly name?: string | undefined;
+  readonly rttMs: number;
+  readonly settings: Partial<LinkSettings>;
+}
+
+export function parseArgs(argv: ReadonlyArray<string>): Map<string, string> {
   const args = new Map<string, string>();
   for (let index = 0; index < argv.length; index++) {
     const key = argv[index]!;
@@ -591,6 +638,31 @@ function parseArgs(argv: ReadonlyArray<string>): Map<string, string> {
   return args;
 }
 
+/**
+ * The links to measure. `--link <preset>` is one named link, with the load scenarios; otherwise
+ * each round trip of `--rtt` (default 0,250) is a link of its own.
+ */
+export function resolveLinks(args: ReadonlyMap<string, string>, jitterMs: number): Array<Link> {
+  const name = args.get("--link");
+  if (name === undefined) {
+    return (args.get("--rtt") ?? "0,250").split(",").map((value) => {
+      const rttMs = Number(value);
+      return { rttMs, settings: { delay: rttMs / 2, jitter: jitterMs } };
+    });
+  }
+  const preset = LINK_PRESETS[name];
+  if (preset === undefined) {
+    throw new Error(`unknown --link ${name}; known: ${Object.keys(LINK_PRESETS).join(", ")}`);
+  }
+  return [
+    {
+      name,
+      rttMs: 2 * (preset.delay ?? 0),
+      settings: { ...preset, jitter: jitterMs, newConnections: true },
+    },
+  ];
+}
+
 export async function runMeasureRemoteLatencyMain(
   isMain: boolean,
   argv: ReadonlyArray<string> = process.argv.slice(2),
@@ -601,10 +673,12 @@ export async function runMeasureRemoteLatencyMain(
   const parent = args.get("--run-root") ?? NodeOS.tmpdir();
   NodeFS.mkdirSync(parent, { recursive: true });
   const runRoot = NodeFS.mkdtempSync(NodePath.join(parent, "bibcode-latency-"));
-  const rtts = (args.get("--rtt") ?? "0,250").split(",").map(Number);
+  const jitterMs = Number(args.get("--jitter") ?? 0);
+  const links = resolveLinks(args, jitterMs);
   const all: Array<ActionMeasurement> = [];
-  for (const [index, rttMs] of rtts.entries()) {
-    const harnessRoot = NodePath.join(runRoot, `rtt-${rttMs}-${index}`);
+  for (const [index, link] of links.entries()) {
+    const { rttMs } = link;
+    const harnessRoot = NodePath.join(runRoot, `${link.name ?? `rtt-${rttMs}`}-${index}`);
     NodeFS.mkdirSync(harnessRoot, { recursive: true });
     const releases: Array<() => Promise<void>> = [];
     const stop = () => {
@@ -623,22 +697,28 @@ export async function runMeasureRemoteLatencyMain(
         staticDir: NodePath.resolve(args.get("--static-dir") ?? "apps/web/dist"),
         chromium: args.get("--chromium") ?? "/usr/bin/chromium",
         runRoot: harnessRoot,
+        fixture: link.name === undefined ? "small" : "large",
+        fixtureBin: NodePath.resolve(
+          args.get("--fixture-bin") ?? "target/debug/examples/write_load_fixture",
+        ),
         releases,
       });
       if (args.has("--explore")) {
         console.log(
           `origin ${harness.origin} devtools ${harness.debugPort} project ${harness.projectPath}`,
         );
-        harness.setDelay(rttMs / 2, Number(args.get("--jitter") ?? 0));
+        harness.setLink(link.settings);
         await sleep(Number(args.get("--explore")) * 1000);
         return true;
       }
       all.push(
-        ...(await runScenarios(harness, rttMs, {
-          jitterMs: Number(args.get("--jitter") ?? 0),
-          typingIntervalMs: Number(args.get("--typing-interval") ?? 100),
-          seedMessages: Number(args.get("--seed-messages") ?? 3),
-        })),
+        ...(link.name === undefined
+          ? await runScenarios(harness, rttMs, {
+              jitterMs,
+              typingIntervalMs: Number(args.get("--typing-interval") ?? 100),
+              seedMessages: Number(args.get("--seed-messages") ?? 3),
+            })
+          : await runLoadScenarios(harness, link)),
       );
     } finally {
       process.off("SIGINT", stop);
@@ -655,14 +735,16 @@ export async function runMeasureRemoteLatencyMain(
 
 /** A Markdown table with one row per action and one column group per RTT. */
 export function formatTable(measurements: ReadonlyArray<ActionMeasurement>): string {
-  const rtts = [...new Set(measurements.map((measurement) => measurement.rttMs))];
+  const columnOf = (measurement: ActionMeasurement) =>
+    measurement.link ?? `${measurement.rttMs} ms`;
+  const rtts = [...new Set(measurements.map(columnOf))];
   const actions = [...new Set(measurements.map((measurement) => measurement.action))];
   const header = [
     "| Action | " +
       rtts
         .map(
           (rtt) =>
-            `${rtt} ms: RPCs | ${rtt} ms: sequential | ${rtt} ms: sent/recv | ${rtt} ms: visible | ${rtt} ms: echo lag p50/p95`,
+            `${rtt}: RPCs | ${rtt}: sequential | ${rtt}: sent/recv (decoded) | ${rtt}: visible | ${rtt}: echo lag p50/p95`,
         )
         .join(" | ") +
       " |",
@@ -672,10 +754,14 @@ export function formatTable(measurements: ReadonlyArray<ActionMeasurement>): str
   const rows = actions.map((action) => {
     const cells = rtts.map((rtt) => {
       const measurement = measurements.find(
-        (candidate) => candidate.action === action && candidate.rttMs === rtt,
+        (candidate) => candidate.action === action && columnOf(candidate) === rtt,
       );
       return measurement
-        ? `${measurement.rpcs} | ${measurement.criticalPath} | ${kb(measurement.bytesSent)} / ${kb(measurement.bytesReceived)} | ${measurement.visibleMs} ms | ${
+        ? `${measurement.rpcs} | ${measurement.criticalPath} | ${kb(measurement.bytesSent)} / ${kb(measurement.bytesReceived)}${
+            measurement.bytesReceivedDecoded === undefined
+              ? ""
+              : ` (${kb(measurement.bytesReceivedDecoded)})`
+          } | ${measurement.visibleMs} ms | ${
             measurement.echoLagP50Ms === undefined
               ? ""
               : `${measurement.echoLagP50Ms} / ${measurement.echoLagP95Ms} ms`
@@ -768,19 +854,42 @@ async function waitUntil(check: () => boolean, timeoutMs = 60_000): Promise<numb
   return Date.now();
 }
 
-/** Runs every scenario on `harness` at `rttMs`; the harness was set up on an undelayed link. */
-export async function runScenarios(
-  harness: Harness,
+/** Waits until a socket opened after `socketsBefore` has received a chunk of a thread subscription. */
+function threadResynced(
+  page: CdpPage,
+  socketsBefore: ReadonlySet<string>,
+  timeoutMs = 60_000,
+): Promise<number> {
+  // A Chunk carries thread state; an Exit could be a failure.
+  return waitUntil(() => {
+    const messages = decodeFrames(page.frames.filter((frame) => !socketsBefore.has(frame.socket)));
+    const subscriptions = new Set(
+      messages
+        .filter(
+          ({ direction, message }) =>
+            direction === "sent" &&
+            message._tag === "Request" &&
+            message.tag === "orchestration.subscribeThread",
+        )
+        .map(({ socket, message }) => `${socket}:${String(message.id)}`),
+    );
+    return messages.some(
+      ({ direction, socket, message }) =>
+        direction === "received" &&
+        message._tag === "Chunk" &&
+        subscriptions.has(`${socket}:${String(message.requestId)}`),
+    );
+  }, timeoutMs);
+}
+
+/** Runs one action, waits for it to settle, and records its measurement in `results`. */
+function createMeasure(
+  page: CdpPage,
   rttMs: number,
-  options: {
-    readonly jitterMs: number;
-    readonly typingIntervalMs: number;
-    readonly seedMessages: number;
-  },
-): Promise<Array<ActionMeasurement>> {
-  const { page } = harness;
-  const results: Array<ActionMeasurement> = [];
-  const measure = async (
+  results: Array<ActionMeasurement>,
+  link?: string,
+) {
+  return async (
     action: string,
     run: () => Promise<number | { readonly visibleAt: number; readonly lags: Array<number> }>,
   ) => {
@@ -788,9 +897,14 @@ export async function runScenarios(
     const startedAt = Date.now();
     const outcome = await run().catch(async (error: unknown) => {
       const text = await page.evaluate<string>("document.body.innerText").catch(() => "");
-      throw new Error(`${action} failed: ${String(error)}\n--- page text ---\n${text}`, {
-        cause: error,
-      });
+      throw new Error(
+        `${action} failed: ${String(error)}
+--- page text ---
+${text}`,
+        {
+          cause: error,
+        },
+      );
     });
     const visibleAt = typeof outcome === "number" ? outcome : outcome.visibleAt;
     await sleep(SETTLE_MS + 100);
@@ -801,6 +915,7 @@ export async function runScenarios(
       startedAt,
       visibleAt,
       visibleAt + SETTLE_MS,
+      link,
     );
     const measurement: ActionMeasurement =
       typeof outcome === "number"
@@ -814,6 +929,21 @@ export async function runScenarios(
     console.log(JSON.stringify(measurement));
     return measurement;
   };
+}
+
+/** Runs every scenario on `harness` at `rttMs`; the harness was set up on an undelayed link. */
+export async function runScenarios(
+  harness: Harness,
+  rttMs: number,
+  options: {
+    readonly jitterMs: number;
+    readonly typingIntervalMs: number;
+    readonly seedMessages: number;
+  },
+): Promise<Array<ActionMeasurement>> {
+  const { page } = harness;
+  const results: Array<ActionMeasurement> = [];
+  const measure = createMeasure(page, rttMs, results);
   const project = "BiBCode UI Fixture";
   const other = "Second Fixture";
 
@@ -839,7 +969,7 @@ export async function runScenarios(
     await page.waitFor(answered(`seed message ${index}`));
     await page.waitFor(`!document.querySelector('[aria-label="Stop generation"]')`);
   }
-  harness.setDelay(rttMs / 2, options.jitterMs);
+  harness.setLink({ delay: rttMs / 2, jitter: options.jitterMs });
 
   await measure("composer: type 40 characters", async () => {
     await page.evaluate(`document.querySelector('[data-testid="composer-editor"]').focus()`);
@@ -962,28 +1092,83 @@ export async function runScenarios(
   await measure("reconnect: dropped socket until thread resynced", async () => {
     const socketsBefore = new Set(page.frames.map((frame) => frame.socket));
     harness.dropSockets();
-    // A Chunk carries thread state; an Exit could be a failure.
-    return waitUntil(() => {
-      const messages = decodeFrames(
-        page.frames.filter((frame) => !socketsBefore.has(frame.socket)),
-      );
-      const subscriptions = new Set(
-        messages
-          .filter(
-            ({ direction, message }) =>
-              direction === "sent" &&
-              message._tag === "Request" &&
-              message.tag === "orchestration.subscribeThread",
-          )
-          .map(({ socket, message }) => `${socket}:${String(message.id)}`),
-      );
-      return messages.some(
-        ({ direction, socket, message }) =>
-          direction === "received" &&
-          message._tag === "Chunk" &&
-          subscriptions.has(`${socket}:${String(message.requestId)}`),
-      );
-    });
+    return threadResynced(page, socketsBefore);
+  });
+  return results;
+}
+
+/** The big thread of `apps/server/tests/support/load_fixture.rs`: its title and last words. */
+const BIG_THREAD_TITLE = "Large fixture thread";
+const BIG_THREAD_FINAL_MARKER = "Fixture closing answer.";
+/** A 3G link takes minutes for what a local link does in a second. */
+const LOAD_TIMEOUT_MS = 300_000;
+
+/** The sidebar button of the first thread whose row text includes (or, negated, lacks) `title`. */
+const threadWithTitle = (title: string, present: boolean) => `(() => {
+  const item = [...document.querySelectorAll('[data-thread-item="true"]')].find(
+    (candidate) => candidate.innerText.includes(${JSON.stringify(title)}) === ${present});
+  return item?.querySelector("button") ?? null;
+})()`;
+
+const clearPageCache = (harness: Harness) =>
+  harness.page.send("Storage.clearDataForOrigin", {
+    origin: harness.origin,
+    storageTypes: "local_storage,indexeddb,cache_storage,service_workers,websql,file_systems",
+  });
+
+/**
+ * The load scenarios on a named link and the large-thread fixture: open the app onto the big
+ * thread cold, open it from the sidebar with no cache, switch back to it, and reconnect. The
+ * link slows down only after the page has found the thread's route. The web build itself is
+ * served locally, undelayed, so the rows count RPC bytes, not bundle bytes.
+ */
+export async function runLoadScenarios(
+  harness: Harness,
+  link: Link,
+): Promise<Array<ActionMeasurement>> {
+  const { page } = harness;
+  const results: Array<ActionMeasurement> = [];
+  const measure = createMeasure(page, link.rttMs, results, link.name);
+  const bigThread = threadWithTitle(BIG_THREAD_TITLE, true);
+  await page.waitFor(bigThread, LOAD_TIMEOUT_MS);
+  const threadPath = await page.evaluate<string>(
+    `(${bigThread}.click(), new Promise((resolve) =>
+      setTimeout(() => resolve(location.pathname), 500)))`,
+  );
+  await page.waitFor(bodyIncludes(BIG_THREAD_FINAL_MARKER), LOAD_TIMEOUT_MS);
+  harness.setLink(link.settings);
+
+  await measure("cold connect: reload onto the big thread's route until it paints", async () => {
+    await clearPageCache(harness);
+    await page.evaluate("window.__beforeReload = true");
+    await page.navigate(`${harness.origin}${threadPath}`);
+    return page.waitFor(
+      `!window.__beforeReload && ${bodyIncludes(BIG_THREAD_FINAL_MARKER)}`,
+      LOAD_TIMEOUT_MS,
+    );
+  });
+
+  await measure("open the big thread from the sidebar after reload, no local cache", async () => {
+    await clearPageCache(harness);
+    await page.evaluate("window.__beforeReload = true");
+    await page.navigate(`${harness.origin}/`);
+    await page.waitFor(`!window.__beforeReload && ${bigThread}`, LOAD_TIMEOUT_MS);
+    await page.click(bigThread);
+    return page.waitFor(bodyIncludes(BIG_THREAD_FINAL_MARKER), LOAD_TIMEOUT_MS);
+  });
+
+  // Away to a small thread, then back: the page already holds the big one.
+  await page.click(threadWithTitle(BIG_THREAD_TITLE, false));
+  await page.waitFor(`!(${bodyIncludes(BIG_THREAD_FINAL_MARKER)})`, LOAD_TIMEOUT_MS);
+  await measure("switch thread: back to the big thread", async () => {
+    await page.click(bigThread);
+    return page.waitFor(bodyIncludes(BIG_THREAD_FINAL_MARKER), LOAD_TIMEOUT_MS);
+  });
+
+  await measure("reconnect: dropped socket until the big thread resynced", async () => {
+    const socketsBefore = new Set(page.frames.map((frame) => frame.socket));
+    harness.dropSockets();
+    return threadResynced(page, socketsBefore, LOAD_TIMEOUT_MS);
   });
   return results;
 }

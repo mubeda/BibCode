@@ -322,15 +322,20 @@ performing a production install.
   lock automatically.
 - `vp run measure:desktop-runtime -- ...`: capture startup, memory, and
   process-tree measurements.
-- `node scripts/throttle-proxy.ts --listen <host:port> --target <host:port> --control <host:port> [--down <bytes/s>] [--up <bytes/s>] [--delay <ms>] [--jitter <ms>]`:
+- `node scripts/throttle-proxy.ts --listen <host:port> --target <host:port> --control <host:port> [--preset 3g] [--down <bytes/s>] [--up <bytes/s>] [--delay <ms>] [--jitter <ms>] [--new-connections 1]`:
   development-only throttling TCP proxy for the
   [slow-link liveness scenario](../testing/cross-platform-validation.md#slow-link-liveness-scenario).
   Each direction is paced separately with backpressure. `--delay` holds every
   byte that long in each direction (125 ms is a 250 ms round trip), plus up to
-  `--jitter` more, without reordering bytes. `GET /set?down=&up=&freeze=0|1&delay=&jitter=`
+  `--jitter` more, without reordering bytes. `--preset 3g` is 50,000 bytes/s each way and a
+  200 ms one-way delay (400 kbps, a 400 ms round trip, as T3 Code's preset); an explicit flag
+  overrides it. `--new-connections 1` makes every connection pay a TCP handshake (one round
+  trip before its first byte) and ends HTTP keep-alive, by rewriting the first response on a
+  connection to `Connection: close`; a WebSocket upgrade keeps its connection.
+  `GET /set?preset=3g&down=&up=&freeze=0|1&delay=&jitter=&new-connections=0|1`
   on the control address changes the link (0 bytes/s is unlimited), `GET /drop`
   closes every open connection, and `GET /state` reports the settings.
-- `node scripts/measure-remote-latency.ts [--rtt 0,250] [--jitter <ms>] [--typing-interval <ms>] [--seed-messages <n>] [--out <json>] [--keep]`:
+- `node scripts/measure-remote-latency.ts [--rtt 0,250 | --link 3g] [--fixture-bin <path>] [--jitter <ms>] [--typing-interval <ms>] [--seed-messages <n>] [--out <json>] [--keep]`:
   development-only
   [high-latency measurement](../testing/cross-platform-validation.md#high-latency-measurement).
   For each round trip it starts a disposable `bibcode serve` (`--server-bin`,
@@ -339,10 +344,26 @@ performing a production install.
   the throttle proxy between it and a headless Chromium (`--chromium`, default
   `/usr/bin/chromium`), and drives user actions. It prints one JSON line per
   action and a Markdown table of RPCs, sequential round trips, bytes, time to
-  visible result and terminal echo lag. It serves the web build from
+  visible result and terminal echo lag. `--link 3g` replaces `--rtt`: it limits bandwidth with
+  the proxy's 3g preset and new-connection option, starts the server on the large-thread fixture
+  that `cargo build -p bibcode-server --example write_load_fixture` writes (`--fixture-bin`,
+  default `target/debug/examples/write_load_fixture`), and runs only the load scenarios (cold
+  connect onto the big thread, sidebar open with no cache, switch back, reconnect). Each row also
+  reports the decoded bytes next to the received ones. It serves the web build from
   `--static-dir` (default `apps/web/dist`) itself, so only server traffic is
   delayed; build that with `VITE_HOSTED_APP_URL=https://hosted.invalid` so
   the page treats its own origin as its server.
+- `cargo test -p bibcode-server --test transfer_budget`: the transfer byte budget. It builds the
+  deterministic large-thread fixture (`apps/server/tests/support/load_fixture.rs`: one
+  200-turn thread with a 2,400-file checkpoint and a 160-thread shell), serves it over a real
+  `/ws` to a client that offers compression, and asserts that the shell snapshot, the big
+  thread's first `subscribeThread` item and the resume answer each stay under the bytes in
+  `apps/server/tests/transfer_budget.json`, both after the transport's deflate and decoded. A
+  failure prints a table of the measured and budgeted bytes. Raise a budget only by editing that
+  file in the same change; `BIBCODE_TRANSFER_REPORT=<path>` also writes the measurements as
+  JSON. `cargo test --workspace` runs it in CI.
+- `node scripts/transfer-report.ts <base.json> <head.json> <budget.json>`: prints the Markdown
+  table that the [Thread Transfer Report](../operations/ci.md) workflow writes to its job summary.
 - `node scripts/measure-vcs-runtime.ts`: on Windows, build and run the
   current-source server VCS idle-process measurement plus the production-Atom
   foreground queue benchmark. It defaults to 600 seconds and writes all
