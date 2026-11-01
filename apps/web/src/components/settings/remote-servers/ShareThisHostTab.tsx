@@ -325,7 +325,7 @@ export function ShareThisHostTab(): ReactElement {
             <IntentOption
               value="this-computer"
               title="This computer only"
-              description="Creates a loopback offer. Other devices need a tunnel — for example SSH port forwarding — to use it."
+              description="Creates a loopback offer. Other devices need a tunnel, for example SSH port forwarding, to use it."
             />
             <IntentOption
               value="custom"
@@ -448,7 +448,7 @@ export function ShareThisHostTab(): ReactElement {
                 </span>
               ) : !hasDesktopBridge ? (
                 <span className="block">
-                  Exposure is controlled where the server is launched — restart `bibcode serve` with
+                  Exposure is controlled where the server is launched. Restart `bibcode serve` with
                   `--host` to change it.
                 </span>
               ) : (
@@ -519,7 +519,7 @@ function GeneratedOfferPanel({ offer }: { readonly offer: GeneratedShareOffer })
       <div className="min-w-0 space-y-3">
         <OfferValue label="Pairing code" value={offer.code} />
         <OfferValue label="BiBCode link" value={offer.deepLink} />
-        <OfferValue label="Open in browser — for networks you trust" value={offer.browserUrl} />
+        <OfferValue label="Open in browser (for networks you trust)" value={offer.browserUrl} />
         <p className="text-xs text-warning">
           This link and the page it loads travel over plain HTTP. Prefer the pairing code for
           BiBCode clients.
@@ -535,7 +535,7 @@ function GeneratedOfferPanel({ offer }: { readonly offer: GeneratedShareOffer })
         size={128}
         level="M"
         marginSize={2}
-        title="Pairing code — scan with a BiBCode client"
+        title="Pairing code: scan with a BiBCode client"
       />
     </div>
   );

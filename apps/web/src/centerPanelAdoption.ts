@@ -29,11 +29,13 @@ export function createCenterPanelAdoptionTracker(): CenterPanelAdoptionTracker {
   return { terminalKeys: new Set(), panelThreadIds: new Set() };
 }
 
-const PANEL_TITLE_PREFIX = "Panel — ";
+// Panels titled before the colon form used an em dash; adoption still accepts both.
+const PANEL_TITLE_PREFIX = /^Panel(?: \u2014|:) /u;
 
 /** The provider label a chat panel thread was titled with, if it has one. */
 export function panelProviderLabel(title: string): string | undefined {
-  return title.startsWith(PANEL_TITLE_PREFIX) ? title.slice(PANEL_TITLE_PREFIX.length) : undefined;
+  const prefix = PANEL_TITLE_PREFIX.exec(title);
+  return prefix ? title.slice(prefix[0].length) : undefined;
 }
 
 const terminalKey = (threadId: string, terminalId: string) => `${threadId}\u0000${terminalId}`;

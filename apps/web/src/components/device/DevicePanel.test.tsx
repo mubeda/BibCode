@@ -1017,7 +1017,7 @@ describe("DevicePanel with iOS simulators", () => {
     );
     const container = await render();
     const busy = option(container, /Running outside BiBCode/);
-    expect(busy.textContent).toBe("iPhone 17 Pro · iOS 27.0 — Running outside BiBCode");
+    expect(busy.textContent).toBe("iPhone 17 Pro · iOS 27.0 (Running outside BiBCode)");
     expect(busy.getAttribute("aria-disabled")).toBe("true");
     // The busy simulator is not picked by default.
     expect(container.querySelector("[aria-label='Virtual device']")?.textContent).toBe(
@@ -1199,12 +1199,12 @@ describe("DevicePanel with iOS simulators", () => {
   it("starts a second image on a platform while its first device runs", async () => {
     withCatalog(catalog({ images: [PIXEL, TABLET], devices: [snapshot({ deviceId: "a-1" })] }));
     const container = await render();
-    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 (Running here)");
     await click(option(container, "Tablet"));
     // The pick wins: the idle image shows, ready to Start, and the picker still lists Pixel 8.
     expect(container.querySelector("[data-device-screen]")).toBeNull();
     expect(button(container, "Start").disabled).toBe(false);
-    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 (Running here)");
     await click(button(container, "Start"));
     expect(h.calls.at(-1)).toEqual({
       command: "open",
@@ -1230,10 +1230,10 @@ describe("DevicePanel with iOS simulators", () => {
       (entry) => entry.textContent,
     );
     expect(labels).toEqual([
-      "Pixel 8 — Running here",
-      "Tablet — Running in Fix login",
-      "Fold — Running",
-      "Wear — Running outside BiBCode",
+      "Pixel 8 (Running here)",
+      "Tablet (Running in Fix login)",
+      "Fold (Running)",
+      "Wear (Running outside BiBCode)",
     ]);
   });
 
@@ -1246,7 +1246,7 @@ describe("DevicePanel with iOS simulators", () => {
       }),
     );
     const container = await render();
-    expect(option(container, /^Tablet/).textContent).toBe("Tablet — Running");
+    expect(option(container, /^Tablet/).textContent).toBe("Tablet (Running)");
   });
 
   it("shows another thread's device with whose it is, and input still works", async () => {
@@ -1281,7 +1281,7 @@ describe("DevicePanel with iOS simulators", () => {
     });
     expect(h.screens.at(-1)).toMatchObject({ deviceId: "host" });
     expect(container.querySelector("[data-device-owner]")).toBeNull();
-    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 (Running here)");
     await click(option(container, "Tablet"));
     await click(button(container, "Start"));
     expect(h.calls.at(-1)).toEqual({

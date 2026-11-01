@@ -80,7 +80,7 @@ describe("buildPanelMenuModel", () => {
     expect(ready?.disabledReason).toBeUndefined();
     expect(notReady?.disabled).toBe(true);
     expect(notReady?.disabledReason).toBe(
-      "This provider isn't ready yet — check its connection in Settings.",
+      "This provider isn't ready yet. Check its connection in Settings.",
     );
   });
 

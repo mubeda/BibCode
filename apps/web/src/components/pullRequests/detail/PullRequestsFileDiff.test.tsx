@@ -121,7 +121,7 @@ describe("PullRequestsFileDiff", () => {
   );
   it("shows tooLarge and binary metadata without attempting a renderer", async () => {
     await render({ ...file, tooLarge: true, patch: null });
-    expect(container.textContent).toContain("Diff too large to render — open on host");
+    expect(container.textContent).toContain("Diff too large to render. Open on host");
     expect(container.querySelector("a")?.href).toBe("https://example.com/pr/14");
     await render({ ...file, changeType: "binary", patch: null });
     expect(container.textContent).toContain("Binary file");
@@ -148,7 +148,7 @@ describe("PullRequestsFileDiff", () => {
   it("rejects the parse cap before mounting a diff", async () => {
     await render({ ...file, patch: "x".repeat(70_000_000) });
     await show();
-    expect(container.textContent).toContain("Diff too large to render — open on host");
+    expect(container.textContent).toContain("Diff too large to render. Open on host");
     expect(container.querySelector("diffs-container")).toBeNull();
   });
   it("gates large text with Show diff anyway before parsing", async () => {

@@ -135,7 +135,7 @@ function ResourceBanners({
           )}
         >
           <span className="font-semibold">{banner.statusLabel}</span>
-          <span> — {banner.message}</span>
+          <span>: {banner.message}</span>
         </div>
       ))}
     </div>

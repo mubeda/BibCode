@@ -116,7 +116,7 @@ export function FileEditorToolbar({
       : savePhase === "saving"
         ? "Saving…"
         : saveFailed
-          ? "Save failed — retry"
+          ? "Save failed, retry"
           : showSaved
             ? "Saved"
             : cleanStatus;

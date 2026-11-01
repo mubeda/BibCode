@@ -73,7 +73,7 @@ function ImageAsLink({ src, alt }: ComponentProps<"img">) {
   if (insideLink) return <span>image: {alt || "image"}</span>;
   return (
     <PullRequestsExternalLink href={typeof src === "string" ? src : undefined}>
-      image: {alt || "image"} — open in browser
+      image: {alt || "image"} (open in browser)
     </PullRequestsExternalLink>
   );
 }
