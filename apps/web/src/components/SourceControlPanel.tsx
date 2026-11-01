@@ -444,7 +444,8 @@ export default function SourceControlPanel({
         return;
       }
 
-      const message = draft.message.trim();
+      const submittedDraft = draft.message;
+      const message = submittedDraft.trim();
       // Commit semantics:
       //  - Real staging server (hasAreas): commit the staged index as-is; never
       //    send filePaths (which would trigger the legacy reset+add path).
@@ -516,7 +517,7 @@ export default function SourceControlPanel({
       }
       // Commit succeeded: clear the drafted message.
       if (actionCanCommit) {
-        clearDraft();
+        clearDraft(submittedDraft);
       }
       // Refresh the commits list (and the relative-time clock) after any success.
       reloadCommits();
@@ -1428,7 +1429,9 @@ export default function SourceControlPanel({
             if (!open) setPendingPullRequest(null);
           }}
           onSettled={(result) => {
-            if (result.commit.status === "created") draft.clear();
+            if (result.commit.status === "created") {
+              draft.clear(pendingPullRequest.commitInput?.commitMessage ?? draft.message);
+            }
             reloadCommits();
           }}
           onDone={(request) => {

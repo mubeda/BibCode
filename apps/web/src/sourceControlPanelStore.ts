@@ -8,11 +8,17 @@ import { resolveStorage } from "./lib/storage";
 export interface SourceControlDraft {
   message: string;
   /**
-   * The draft another tab saved for this folder while this one was typing (#219): the newer
-   * edit is `message`, and the other stays here until the person swaps to it or dismisses it.
+   * Other versions of this folder's message that two windows wrote at once (#219), newest
+   * first and at most {@link MOST_ALTERNATES}. They stay until the person uses or dismisses one.
    */
-  otherWindowMessage?: string;
+  alternates?: readonly string[];
 }
+
+/**
+ * Alternates kept per folder. Past it the oldest is dropped, which only happens after more than
+ * five unresolved concurrent edits of one folder's message.
+ */
+const MOST_ALTERNATES = 5;
 
 const DEFAULT_DRAFT: SourceControlDraft = { message: "" };
 
@@ -56,11 +62,14 @@ interface SourceControlPanelStoreState {
   clearDraft: (ref: ScopedThreadRef) => void;
   removeThread: (ref: ScopedThreadRef) => void;
   setCwdMessage: (cwdKey: string, message: string) => void;
-  clearCwdDraft: (cwdKey: string) => void;
-  /** Puts the other tab's version in the box, keeping this one as the other version. */
-  swapCwdOtherWindowMessage: (cwdKey: string) => void;
-  /** Keeps the message in the box and drops the other tab's version. */
-  dismissCwdOtherWindowMessage: (cwdKey: string) => void;
+  /**
+   * A commit of `submitted` landed: the message goes only while it is still `submitted`, so text
+   * typed since stays. Alternates stay too.
+   */
+  clearCwdDraft: (cwdKey: string, submitted: string) => void;
+  /** Puts an alternate in the box; the message it replaces becomes an alternate. */
+  useCwdAlternate: (cwdKey: string, alternate: string) => void;
+  dismissCwdAlternate: (cwdKey: string, alternate: string) => void;
   promoteThreadDraft: (threadKey: string, cwdKey: string) => void;
   /**
    * A suggestion arrived. The thread's draft from before folder drafts (`legacyThreadKey`) is
@@ -118,11 +127,136 @@ function promote(
   if (cwdKey in state.byCwdKey || legacyDraft.message.length === 0) {
     return { byThreadKey };
   }
-  return { byThreadKey, byCwdKey: { ...state.byCwdKey, [cwdKey]: { ...legacyDraft } } };
+  return { byThreadKey, byCwdKey: putDraft(state, cwdKey, legacyDraft.message) };
 }
 
 const STORAGE_NAME = "bibcode:source-control-panel-state:v1";
-const STORAGE_VERSION = 2;
+const STORAGE_VERSION = 3;
+
+/**
+ * Each folder's draft is its own storage entry (#219), so two tabs editing different folders
+ * cannot overwrite each other. Before version 3 they shared `STORAGE_NAME`'s entry.
+ */
+const DRAFT_PREFIX = `${STORAGE_NAME}:draft:`;
+const DRAFT_VERSION = 1;
+
+const defaultStorage = createJSONStorage<SourceControlPanelStoreState>(() =>
+  resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
+);
+
+/** The store's storage; tests replace it with `persist.setOptions`. */
+function currentStorage() {
+  try {
+    return useSourceControlPanelStore.persist.getOptions().storage ?? defaultStorage;
+  } catch {
+    return defaultStorage; // the store is still being created
+  }
+}
+
+/** The draft saved for the folder; `undefined` when none, or storage answers later. */
+function readDraft(cwdKey: string): SourceControlDraft | undefined {
+  const saved = currentStorage()?.getItem(`${DRAFT_PREFIX}${cwdKey}`);
+  if (saved === null || saved === undefined || saved instanceof Promise) return undefined;
+  const draft = saved.state as unknown as Partial<SourceControlDraft> | undefined;
+  if (typeof draft?.message !== "string") return undefined;
+  const alternates = Array.isArray(draft.alternates)
+    ? draft.alternates.filter((text): text is string => typeof text === "string")
+    : [];
+  return alternates.length > 0
+    ? { message: draft.message, alternates }
+    : { message: draft.message };
+}
+
+function writeDraft(cwdKey: string, draft: SourceControlDraft | undefined): void {
+  const name = `${DRAFT_PREFIX}${cwdKey}`;
+  if (draft === undefined) {
+    void currentStorage()?.removeItem(name);
+    return;
+  }
+  void currentStorage()?.setItem(name, {
+    state: draft as unknown as SourceControlPanelStoreState,
+    version: DRAFT_VERSION,
+  });
+}
+
+/** Every folder draft saved now, for a tab that has just opened. */
+function readAllDrafts(): Record<string, SourceControlDraft> {
+  const drafts: Record<string, SourceControlDraft> = {};
+  try {
+    const storage = window.localStorage;
+    for (let index = 0; index < storage.length; index += 1) {
+      const name = storage.key(index);
+      if (name === null || !name.startsWith(DRAFT_PREFIX)) continue;
+      const cwdKey = name.slice(DRAFT_PREFIX.length);
+      const draft = readDraft(cwdKey);
+      if (draft !== undefined) drafts[cwdKey] = draft;
+    }
+  } catch {
+    // No localStorage: drafts live in memory only.
+  }
+  return drafts;
+}
+
+/** A draft of `message` offering `alternates`, newest first, without blanks or repeats. */
+function withAlternates(message: string, alternates: readonly string[]): SourceControlDraft {
+  const kept = [...new Set(alternates)].filter((text) => text.trim() !== "" && text !== message);
+  return kept.length === 0 ? { message } : { message, alternates: kept.slice(0, MOST_ALTERNATES) };
+}
+
+/**
+ * Saves `message` as the folder's draft, over whatever storage holds now. This tab last saw
+ * `local`; a different message in storage was written by another tab since, and becomes an
+ * alternate rather than being overwritten. So no text any tab wrote leaves storage until the
+ * person uses, dismisses, or commits it.
+ */
+function saveMessage(
+  cwdKey: string,
+  local: SourceControlDraft | undefined,
+  message: string,
+): SourceControlDraft {
+  const stored = readDraft(cwdKey);
+  const theirs = stored?.message ?? "";
+  const unseen = theirs.trim() !== "" && theirs !== message && theirs !== (local?.message ?? "");
+  const draft = withAlternates(message, [
+    ...(unseen ? [theirs] : []),
+    ...(stored?.alternates ?? []),
+  ]);
+  writeDraft(cwdKey, draft);
+  return draft;
+}
+
+/** `state.byCwdKey` with the folder's message saved as `message` (see {@link saveMessage}). */
+function putDraft(
+  state: Pick<SourceControlPanelStoreState, "byCwdKey">,
+  cwdKey: string,
+  message: string,
+): Record<string, SourceControlDraft> {
+  return { ...state.byCwdKey, [cwdKey]: saveMessage(cwdKey, state.byCwdKey[cwdKey], message) };
+}
+
+/** `state.byCwdKey` with the folder as storage holds it now. */
+function takeStored(
+  state: Pick<SourceControlPanelStoreState, "byCwdKey">,
+  cwdKey: string,
+): Record<string, SourceControlDraft> {
+  const { [cwdKey]: _previous, ...others } = state.byCwdKey;
+  const stored = readDraft(cwdKey);
+  return stored === undefined ? others : { ...others, [cwdKey]: stored };
+}
+
+/** The commit of `submitted` landed: its message goes; alternates and newer text stay. */
+function clearSubmitted(
+  state: Pick<SourceControlPanelStoreState, "byCwdKey">,
+  cwdKey: string,
+  submitted: string,
+): Record<string, SourceControlDraft> {
+  const stored = readDraft(cwdKey);
+  if (stored !== undefined && stored.message.trim() === submitted.trim()) {
+    const alternates = stored.alternates ?? [];
+    writeDraft(cwdKey, alternates.length === 0 ? undefined : withAlternates("", alternates));
+  }
+  return takeStored(state, cwdKey);
+}
 
 /** What is saved: the persisted fields, any of which an older or other tab may have left out. */
 type SavedState = Partial<SourceControlPanelStoreState>;
@@ -140,103 +274,10 @@ function readSavedState(): SavedState | null {
 }
 
 /**
- * Sets this tab's state without saving it, to take in what another tab saved. Captured from
- * `create`, outside `persist`.
+ * Sets this tab's state without saving the whole of it, for a change already written to storage
+ * key by key. Captured from `create`, outside `persist`.
  */
 let setWithoutSaving: (partial: Partial<SourceControlPanelStoreState>) => void = () => {};
-
-type PersistedState = Pick<
-  SourceControlPanelStoreState,
-  "byThreadKey" | "byCwdKey" | "agentSuggestionByCwdKey" | "sourceControlGroupByFolder"
->;
-
-const persistedFields = (state: PersistedState): PersistedState => ({
-  byThreadKey: state.byThreadKey,
-  byCwdKey: state.byCwdKey,
-  agentSuggestionByCwdKey: state.agentSuggestionByCwdKey,
-  sourceControlGroupByFolder: state.sourceControlGroupByFolder,
-});
-
-/**
- * What this tab last saved or loaded (#219). An entry that differs from it is this tab's own
- * change; every other entry is written as storage has it, so another tab's folders survive.
- */
-let synced: PersistedState | null = null;
-
-/** `saved` with the entries this tab changed from `base` to `next`, each settled by `resolve`. */
-function mergeEntries<T>(
-  base: Record<string, T>,
-  next: Record<string, T>,
-  saved: Record<string, T>,
-  resolve: (ours: T | undefined, theirs: T | undefined, base: T | undefined) => T | undefined = (
-    ours,
-  ) => ours,
-): Record<string, T> {
-  let result = saved;
-  for (const key of new Set([...Object.keys(base), ...Object.keys(next)])) {
-    if (base[key] === next[key]) continue;
-    // Re-adding the key moves it last, the order `rememberSuggestion` keeps newest.
-    const { [key]: _replaced, ...others } = result;
-    const value = resolve(next[key], saved[key], base[key]);
-    result = value === undefined ? others : { ...others, [key]: value };
-  }
-  return result;
-}
-
-/**
- * This tab's change to a folder's draft, against what another tab saved since this one last
- * synced. The newer edit wins; the other tab's text is kept as `otherWindowMessage`, and a
- * clear never deletes text another tab typed meanwhile.
- */
-function resolveDraft(
-  ours: SourceControlDraft | undefined,
-  theirs: SourceControlDraft | undefined,
-  base: SourceControlDraft | undefined,
-): SourceControlDraft | undefined {
-  const theirText = theirs?.message ?? "";
-  if (theirText === (base?.message ?? "") || theirText.trim() === "") return ours;
-  if (theirText === ours?.message) return ours;
-  if (ours === undefined || ours.message.trim() === "") return theirs;
-  return { ...ours, otherWindowMessage: theirText };
-}
-
-/** What to save: this tab's changes since it last synced, over what storage holds now. */
-function mergeWithSaved(state: PersistedState): PersistedState {
-  const next = persistedFields(state);
-  const saved = readSavedState();
-  const base = synced;
-  if (saved === null || base === null) {
-    synced = next;
-    return next;
-  }
-  const merged: PersistedState = {
-    byThreadKey: mergeEntries(base.byThreadKey, next.byThreadKey, saved.byThreadKey ?? {}),
-    byCwdKey: mergeEntries(base.byCwdKey, next.byCwdKey, saved.byCwdKey ?? {}, resolveDraft),
-    agentSuggestionByCwdKey: mergeEntries(
-      base.agentSuggestionByCwdKey,
-      next.agentSuggestionByCwdKey,
-      saved.agentSuggestionByCwdKey ?? {},
-    ),
-    sourceControlGroupByFolder:
-      next.sourceControlGroupByFolder !== base.sourceControlGroupByFolder
-        ? next.sourceControlGroupByFolder
-        : (saved.sourceControlGroupByFolder ?? next.sourceControlGroupByFolder),
-  };
-  // This tab now shows what it saved, other tabs' entries included. A field that came out the
-  // same keeps this tab's objects: effects watching them must not run again on every save.
-  const taken: Partial<PersistedState> = {};
-  const result = { ...merged };
-  for (const field of Object.keys(merged) as Array<keyof PersistedState>) {
-    if (JSON.stringify(merged[field]) === JSON.stringify(next[field])) {
-      Object.assign(result, { [field]: next[field] });
-    } else {
-      Object.assign(taken, { [field]: merged[field] });
-    }
-  }
-  synced = result;
-  if (Object.keys(taken).length > 0) setWithoutSaving(taken);
-  return result;
-}
 
 function updateDraft(
   state: SourceControlPanelStoreState,
@@ -267,30 +308,26 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         return { byThreadKey };
       }),
     setCwdMessage: (cwdKey, message) =>
-      set((state) => ({
-        byCwdKey: {
-          ...state.byCwdKey,
-          [cwdKey]: { ...state.byCwdKey[cwdKey], message },
-        },
-      })),
-    clearCwdDraft: (cwdKey) =>
+      set((state) => ({ byCwdKey: putDraft(state, cwdKey, message) })),
+    clearCwdDraft: (cwdKey, submitted) =>
+      set((state) => ({ byCwdKey: clearSubmitted(state, cwdKey, submitted) })),
+    useCwdAlternate: (cwdKey, alternate) =>
       set((state) => {
-        if (!(cwdKey in state.byCwdKey)) return state;
-        const { [cwdKey]: _removed, ...byCwdKey } = state.byCwdKey;
-        return { byCwdKey };
+        const stored = readDraft(cwdKey);
+        if (stored?.alternates?.includes(alternate) === true) {
+          const others = stored.alternates.filter((text) => text !== alternate);
+          writeDraft(cwdKey, withAlternates(alternate, [stored.message, ...others]));
+        }
+        return { byCwdKey: takeStored(state, cwdKey) };
       }),
-    swapCwdOtherWindowMessage: (cwdKey) =>
+    dismissCwdAlternate: (cwdKey, alternate) =>
       set((state) => {
-        const draft = state.byCwdKey[cwdKey];
-        if (draft?.otherWindowMessage === undefined) return state;
-        const swapped = { message: draft.otherWindowMessage, otherWindowMessage: draft.message };
-        return { byCwdKey: { ...state.byCwdKey, [cwdKey]: swapped } };
-      }),
-    dismissCwdOtherWindowMessage: (cwdKey) =>
-      set((state) => {
-        const draft = state.byCwdKey[cwdKey];
-        if (draft?.otherWindowMessage === undefined) return state;
-        return { byCwdKey: { ...state.byCwdKey, [cwdKey]: { message: draft.message } } };
+        const stored = readDraft(cwdKey);
+        if (stored?.alternates?.includes(alternate) === true) {
+          const others = stored.alternates.filter((text) => text !== alternate);
+          writeDraft(cwdKey, withAlternates(stored.message, others));
+        }
+        return { byCwdKey: takeStored(state, cwdKey) };
       }),
     promoteThreadDraft: (threadKey, cwdKey) =>
       set((state) => (threadKey in state.byThreadKey ? promote(state, threadKey, cwdKey) : state)),
@@ -301,32 +338,38 @@ const persistedStore = persist<SourceControlPanelStoreState>(
       const state = get();
       // Handled already, or offered over this tab's text: nothing is written.
       if (isHandled(state, cwdKey, intentId) || hasText(state.byCwdKey[cwdKey])) return;
-      const filled: AgentCommitSuggestion = { intentId, outcome: "filled" };
-      const fill = (saved: Pick<SavedState, "byCwdKey" | "agentSuggestionByCwdKey">) => ({
-        byCwdKey: { ...saved.byCwdKey, [cwdKey]: { message } },
-        agentSuggestionByCwdKey: rememberSuggestion(
-          saved.agentSuggestionByCwdKey ?? {},
-          cwdKey,
-          filled,
-        ),
-      });
-      const saved = readSavedState();
       // Another tab typed in this folder, or handled this suggestion: offer, write nothing.
-      if (
-        saved !== null &&
-        (hasText(saved.byCwdKey?.[cwdKey]) ||
-          saved.agentSuggestionByCwdKey?.[cwdKey]?.intentId === intentId)
-      ) {
+      if (hasText(readDraft(cwdKey))) return;
+      const saved = readSavedState();
+      if (saved?.agentSuggestionByCwdKey?.[cwdKey]?.intentId === intentId) return;
+      const byCwdKey = putDraft(state, cwdKey, message);
+      const remember = (suggestions: Record<string, AgentCommitSuggestion>) =>
+        rememberSuggestion(suggestions, cwdKey, { intentId, outcome: "filled" });
+      if (saved === null) {
+        set((current) => ({
+          byCwdKey,
+          agentSuggestionByCwdKey: remember(current.agentSuggestionByCwdKey),
+        }));
         return;
       }
-      // Only this folder's keys change in what is saved (`mergeWithSaved`).
-      set((current) => fill(current));
+      // Only this folder's record changes in what is saved; other folders stay as saved.
+      void currentStorage()?.setItem(STORAGE_NAME, {
+        state: {
+          ...saved,
+          agentSuggestionByCwdKey: remember(saved.agentSuggestionByCwdKey ?? {}),
+        } as SourceControlPanelStoreState,
+        version: STORAGE_VERSION,
+      });
+      setWithoutSaving({
+        byCwdKey,
+        agentSuggestionByCwdKey: remember(state.agentSuggestionByCwdKey),
+      });
     },
     acceptAgentCommitSuggestion: (cwdKey, intentId, message) =>
       set((state) => {
         if (isHandled(state, cwdKey, intentId)) return state;
         return {
-          byCwdKey: { ...state.byCwdKey, [cwdKey]: { ...state.byCwdKey[cwdKey], message } },
+          byCwdKey: putDraft(state, cwdKey, message),
           agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
             intentId,
             outcome: "used",
@@ -339,10 +382,7 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         const suggestion = state.agentSuggestionByCwdKey[cwdKey];
         if (suggestion?.intentId !== intentId || suggestion.outcome !== "used") return state;
         return {
-          byCwdKey: {
-            ...state.byCwdKey,
-            [cwdKey]: { ...state.byCwdKey[cwdKey], message: suggestion.replacedDraft ?? "" },
-          },
+          byCwdKey: putDraft(state, cwdKey, suggestion.replacedDraft ?? ""),
           agentSuggestionByCwdKey: rememberSuggestion(state.agentSuggestionByCwdKey, cwdKey, {
             intentId,
             outcome: "dismissed",
@@ -364,8 +404,7 @@ const persistedStore = persist<SourceControlPanelStoreState>(
         const handled = agentSuggestionOutcome(record, intentId);
         const fromSuggestion = handled === "filled" || handled === "used";
         if (!fromSuggestion || state.byCwdKey[cwdKey]?.message !== message) return retired;
-        const { [cwdKey]: _committed, ...byCwdKey } = state.byCwdKey;
-        return { ...retired, byCwdKey };
+        return { ...retired, byCwdKey: clearSubmitted(state, cwdKey, message) };
       }),
     dismissAgentCommitSuggestion: (cwdKey, intentId) =>
       set((state) => {
@@ -381,24 +420,30 @@ const persistedStore = persist<SourceControlPanelStoreState>(
   {
     name: STORAGE_NAME,
     version: STORAGE_VERSION,
-    storage: createJSONStorage(() =>
-      resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
-    ),
+    storage: defaultStorage,
     migrate: (persistedState) => {
       const state = persistedState as Partial<SourceControlPanelStoreState> | undefined;
+      // Folder drafts left this entry in version 3. Each is written to its own entry before
+      // persist saves this one without them; a draft already there becomes an alternate.
+      const byCwdKey: Record<string, SourceControlDraft> = {};
+      for (const [cwdKey, draft] of Object.entries(state?.byCwdKey ?? {})) {
+        if (hasText(draft)) byCwdKey[cwdKey] = saveMessage(cwdKey, undefined, draft.message);
+      }
       // `sourceControlGroupByFolder` is intentionally absent: persist's shallow
       // merge keeps a stored value and falls back to the grouped default.
       return {
         byThreadKey: state?.byThreadKey ?? {},
-        byCwdKey: state?.byCwdKey ?? {},
+        byCwdKey,
         agentSuggestionByCwdKey: state?.agentSuggestionByCwdKey ?? {},
       } as SourceControlPanelStoreState;
     },
-    // Every save writes only what this tab changed, entry by entry (#219).
-    partialize: (state) => mergeWithSaved(state) as SourceControlPanelStoreState,
-    onRehydrateStorage: () => (state) => {
-      if (state !== undefined) synced = persistedFields(state);
-    },
+    // Folder drafts are saved apart from this entry, one entry each.
+    partialize: (state) =>
+      ({
+        byThreadKey: state.byThreadKey,
+        agentSuggestionByCwdKey: state.agentSuggestionByCwdKey,
+        sourceControlGroupByFolder: state.sourceControlGroupByFolder,
+      }) as SourceControlPanelStoreState,
   },
 );
 
@@ -410,23 +455,18 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
   return persistedStore(...args);
 }) as typeof persistedStore);
 
-// Another tab saved: show what it wrote, so this tab builds on it (#219). Not `rehydrate()`:
-// that saves back, which could ping-pong between tabs, or loop where a save fires `storage`.
+// Drafts saved before this tab opened (migrated ones are already in the state).
+setWithoutSaving({
+  byCwdKey: { ...readAllDrafts(), ...useSourceControlPanelStore.getState().byCwdKey },
+});
+
+// Another tab saved a folder's draft: show it as saved. Not through `set`, which would save.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
-    if (event.key !== STORAGE_NAME && event.key !== null) return;
-    const saved = readSavedState();
-    if (saved === null) return;
+    if (event.key === null || !event.key.startsWith(DRAFT_PREFIX)) return;
+    const cwdKey = event.key.slice(DRAFT_PREFIX.length);
     const state = useSourceControlPanelStore.getState();
-    const next: PersistedState = {
-      byThreadKey: saved.byThreadKey ?? {},
-      byCwdKey: saved.byCwdKey ?? {},
-      agentSuggestionByCwdKey: saved.agentSuggestionByCwdKey ?? {},
-      sourceControlGroupByFolder:
-        saved.sourceControlGroupByFolder ?? state.sourceControlGroupByFolder,
-    };
-    synced = next;
-    setWithoutSaving(next);
+    setWithoutSaving({ byCwdKey: takeStored(state, cwdKey) });
   });
 }
 
