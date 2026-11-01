@@ -996,6 +996,10 @@ that enforces eviction. The companion toolbar record contains
 read the legacy `commitDraft` field; its active draft instead uses the shared
 `bibcode:source-control-panel-state:v1` store keyed by environment and checkout,
 so the right-panel Source Control surface and Git Manager do not diverge. The
+store saves only the folders a tab changed and follows other tabs through `storage`
+events; when two tabs edit the same folder's draft at once, the newer edit stays in
+the box and the other version is offered under it (**Use other version** swaps
+them, **Dismiss** drops it). The
 selected worktree is intentionally session-only and resets to the main checkout
 after a reload. Evicted or hidden projects retain no mounted panel or live Git
 Manager subscription.
