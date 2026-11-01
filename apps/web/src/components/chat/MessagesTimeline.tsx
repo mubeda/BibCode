@@ -430,8 +430,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     ],
   );
   const rows = useStableRows(rawRows);
-  const [itemTypes] = useState(createStickyTimelineItemType);
-  useLayoutEffect(() => itemTypes.retain(rows), [itemTypes, rows]);
+  // Lives as long as the list: see `createStickyTimelineItemType`.
+  const [getItemType] = useState(createStickyTimelineItemType);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
@@ -705,7 +705,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   ref={handleListRef}
                   data={rows}
                   keyExtractor={keyExtractor}
-                  getItemType={itemTypes.resolve}
+                  getItemType={getItemType}
                   renderItem={renderItem}
                   estimatedItemSize={90}
                   initialScrollAtEnd
