@@ -663,7 +663,7 @@ old_tag_object=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
 test -n "$old_tag_object"
 git tag -f -a "$tag" -F "$tag_message" main
 test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse main)"
-git push --force-with-lease="refs/tags/$tag:$old_tag_object" origin "refs/tags/$tag:refs/tags/$tag"
+git push --force-with-lease="refs/tags/${tag}:${old_tag_object}" origin "refs/tags/${tag}:refs/tags/${tag}"
 test "$(git ls-remote origin "refs/tags/$tag^{}" | cut -f1)" = "$(git rev-parse main)"
 ```
 
