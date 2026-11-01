@@ -41,9 +41,11 @@ const URL_PATTERN = /https?:\/\/[^\s"'`<>]+/g;
 const FILE_PATH_PATTERN =
   /(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|[A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)+(?::\d+){0,2}/g;
 // A path between matching quotes keeps its spaces and wins over the partial unquoted token. A
-// `:line[:col]` suffix is linked only inside the quotes (the match text must stay contiguous).
+// `:line[:col]` suffix is linked only inside the quotes (the match text must stay contiguous). A
+// quoted path with no `./`, `~/` or drive prefix must end in a file extension, so quoted prose
+// like "and/or maybe" stays unlinked.
 const QUOTED_FILE_PATH_PATTERN =
-  /(?<q>["'`])(?<link>(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)(?:(?!\k<q>)[^<>\r\n])+)\k<q>/g;
+  /(?<q>["'`])(?<link>(?:~[\\/]|\.{1,2}[\\/]|\/|[A-Za-z]:[\\/]|\\\\)(?:(?!\k<q>)[^<>\r\n])+|[A-Za-z0-9._-]+[\\/](?:(?!\k<q>)[^<>\r\n])*\.[A-Za-z][A-Za-z0-9]{0,9}(?::\d+){0,2})\k<q>/g;
 const FILE_URL_PATTERN = /file:\/\/[^\s"'`<>]+/g;
 // Whole delimiter-bounded tokens only: a prefix or suffix of a longer name would open a different
 // file. The leading delimiter is consumed (not a lookbehind, which older macOS WebKit rejects) and
@@ -92,6 +94,7 @@ function collectMatches(
   kind: TerminalLinkKind,
   pattern: RegExp,
   existing: TerminalLinkMatch[],
+  trimTrailing = true,
 ): TerminalLinkMatch[] {
   const matches: TerminalLinkMatch[] = [];
   pattern.lastIndex = 0;
@@ -101,7 +104,8 @@ function collectMatches(
     const start = rawMatch.index === undefined ? -1 : rawMatch.index + rawMatch[0].indexOf(raw);
     if (start < 0 || raw.length === 0) continue;
 
-    const trimmed = trimClosingDelimiters(raw);
+    // Inside quotes the closing quote already bounds the path, so `!`, `.` and `)` belong to it.
+    const trimmed = trimTrailing ? trimClosingDelimiters(raw) : raw;
     if (trimmed.length === 0) continue;
     if (kind === "path" && /^https?:\/\//i.test(trimmed)) continue;
 
@@ -274,7 +278,7 @@ export function extractTerminalLinks(line: string): TerminalLinkMatch[] {
   // File URLs go first so the Windows-drive path alternative can't match inside `file:`.
   const fileUrlMatches = collectMatches(line, "path", FILE_URL_PATTERN, urlMatches);
   const taken = [...urlMatches, ...fileUrlMatches];
-  const quotedMatches = collectMatches(line, "path", QUOTED_FILE_PATH_PATTERN, taken);
+  const quotedMatches = collectMatches(line, "path", QUOTED_FILE_PATH_PATTERN, taken, false);
   const pathMatches = collectMatches(line, "path", FILE_PATH_PATTERN, [...taken, ...quotedMatches]);
   const filenameMatches = collectMatches(line, "path", PREVIEW_FILENAME_PATTERN, [
     ...taken,
@@ -396,7 +400,13 @@ export function resolvePathLinkTarget(rawPath: string, cwd: string): string {
     if (home && (path[1] === "/" || isWindowsAbsolutePath(home))) {
       // Keep the home's own separator (`C:/Users/Jane` stays forward-slashed).
       const separator: "/" | "\\" = home.includes("\\") ? "\\" : "/";
-      resolvedPath = joinPath(home, path.slice(2).replaceAll("\\", separator), separator);
+      const rest = path.slice(2);
+      // A backslash in a POSIX home's filename is part of the name, not a separator.
+      resolvedPath = joinPath(
+        home,
+        isWindowsAbsolutePath(home) ? rest.replaceAll("\\", separator) : rest,
+        separator,
+      );
     }
   } else if (!isAbsolutePath(path)) {
     const separator: "/" | "\\" = isWindowsPathStyle(cwd) ? "\\" : "/";
