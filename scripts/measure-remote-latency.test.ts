@@ -7,8 +7,12 @@ import {
   criticalPath,
   decodeFrames,
   echoLags,
+  formatTable,
+  parseArgs,
   percentile,
+  resolveLinks,
   runMeasureRemoteLatencyMain,
+  summarizeWindow,
   traceRpcs,
 } from "./measure-remote-latency.ts";
 
@@ -117,6 +121,47 @@ describe("echoLags", () => {
     expect(lags).toEqual([120, 300, 200]);
     expect(percentile(lags, 50)).toBe(200);
     expect(percentile(lags, 95)).toBe(300);
+  });
+});
+
+describe("--link", () => {
+  it("parses 3g as one named link with the preset's rates and a handshake per connection", () => {
+    expect(resolveLinks(parseArgs(["--link", "3g", "--jitter", "5"]), 5)).toEqual([
+      {
+        name: "3g",
+        rttMs: 400,
+        settings: { down: 50_000, up: 50_000, delay: 200, jitter: 5, newConnections: true },
+      },
+    ]);
+  });
+
+  it("keeps --rtt as plain round trips and rejects an unknown link", () => {
+    expect(resolveLinks(parseArgs(["--rtt", "0,250"]), 0)).toEqual([
+      { rttMs: 0, settings: { delay: 0, jitter: 0 } },
+      { rttMs: 250, settings: { delay: 125, jitter: 0 } },
+    ]);
+    expect(() => resolveLinks(parseArgs(["--link", "5g"]), 0)).toThrow(/5g/);
+  });
+
+  it("labels rows with the link and reports compressed and decoded bytes", () => {
+    const message = JSON.stringify({ _tag: "Exit", requestId: "1", exit: { _tag: "Success" } });
+    const plain = Buffer.from(message);
+    const deflated = NodeZlib.deflateRawSync(plain);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(plain.length);
+    const record = Buffer.concat([Buffer.of(0x10), length, deflated]);
+    const frames = [text(0, "sent", { _tag: "Request", id: "1", tag: "a" }), binary(10, record)];
+    const measurement = summarizeWindow("open", 400, frames, 0, 10, 20, "3g");
+    expect(measurement.link).toBe("3g");
+    expect(measurement.bytesReceived).toBe(record.length);
+    expect(measurement.bytesReceivedDecoded).toBe(plain.length);
+    const table = formatTable([measurement]);
+    expect(table).toContain("3g: sent/recv (decoded)");
+    expect(table).not.toContain("400 ms");
+    // A table of plain round trips keeps its columns.
+    expect(formatTable([summarizeWindow("open", 250, frames, 0, 10, 20)])).toContain(
+      "250 ms: RPCs",
+    );
   });
 });
 
