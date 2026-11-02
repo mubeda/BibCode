@@ -92,8 +92,8 @@ pub(super) async fn fixture_with(register: impl FnOnce(&mut RpcRegistry)) -> Fix
         tempfile::tempdir().expect("remote"),
         tempfile::tempdir().expect("trash"),
     ];
-    let repo = folders[0].path().canonicalize().unwrap();
-    let remote = folders[1].path().canonicalize().unwrap();
+    let repo = super::canonical(folders[0].path());
+    let remote = super::canonical(folders[1].path());
     git(&remote, &["init", "-q", "--bare", "-b", "main"]);
     git(&repo, &["init", "-q", "-b", "main"]);
     for (key, value) in [

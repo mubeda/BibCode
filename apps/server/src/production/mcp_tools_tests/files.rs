@@ -92,8 +92,8 @@ async fn fixture() -> Fixture {
         tempfile::tempdir().expect("trash"),
         tempfile::tempdir().expect("state"),
     ];
-    let folder = folders[0].path().canonicalize().unwrap();
-    let outside = folders[1].path().canonicalize().unwrap();
+    let folder = super::canonical(folders[0].path());
+    let outside = super::canonical(folders[1].path());
     let trash = Arc::new(TestTrash {
         folder: folders[2].path().to_path_buf(),
         available: AtomicBool::new(true),
