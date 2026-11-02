@@ -1,6 +1,7 @@
 # Side Chats
 
-Status: Proposed 2026-11-02, awaiting Mauro's approval. Issue #265. Verified at `fd98b43306`
+Status: Proposed 2026-11-02, awaiting Mauro's approval (revision 1, after the Codex round 1
+review). Issue #265. Verified at `fd98b43306`
 (`origin/main`). Line references are to that commit. No product code is
 written until this design is approved.
 
@@ -77,11 +78,19 @@ and wraps them in the side-chat block.
 - (b) would persist a snapshot (a column or a hidden message) that goes stale, duplicates
   private text, and needs its own cleanup and replay rules.
 
-**When the seed is owed** is derived, not flagged. A side chat owes the seed while it has no
-earlier delivered user or assistant message of its own. That is durable through restarts and
-needs no new state. A first delivery that ends `Ambiguous` and is retried may carry the seed
-twice; that costs tokens, not correctness. After the first turn, a lost side-chat session
-uses today's handoff of the side chat's own messages, which do not include the host.
+**When the seed is owed** follows the seed's own delivery, not the side chat's message
+history (review finding 1). After a turn that carried the seed ends `Accepted`,
+`AlreadyDelivered` or `Ambiguous`, the server appends a thread activity of kind
+`side-chat.context-shared`, shown in the work log as "Started with the thread's last N
+messages", with a payload of counts only (`messages`, `chars`, `truncated`). A side chat owes
+the seed while it has no such activity. A `/` turn carries no seed, so it records nothing and
+the next ordinary question still gets the seed, across restarts too, because activities are
+durable events. The session entry caches "shared" once it is true, so the lookup runs once
+per session. A crash between the provider accepting the turn and the activity being written,
+or an `Ambiguous` retry, can send the seed twice; that costs tokens, not correctness. Once
+the seed is shared, a lost side-chat session uses today's handoff of the side chat's own
+messages, which do not include the host. The activity follows the precedent of
+`append_context_handoff_activity` (`provider_runtime.rs:8508`).
 
 ## Design
 
@@ -107,8 +116,13 @@ uses today's handoff of the side chat's own messages, which do not include the h
 - `OrchestrationThread`, the thread shell and `ThreadCreatedPayload` gain
   `sideChat: Schema.optional(Schema.Boolean)`. The server sends it only when true.
 - `WorktreeCreatePanelInput` gains `sideChat: Schema.optional(Schema.Boolean)`. The Rust input
-  gains `#[serde(default)] side_chat: bool`; it joins the idempotency digest, so a replay
-  with a different marker is a different command.
+  gains `#[serde(default, skip_serializing_if = "std::ops::Not::not")] side_chat: bool`. The
+  idempotency digest is computed from the serialized input (`canonical_command_digest`,
+  `orchestration/delivery.rs:115`), so `false` must be omitted: otherwise a plain panel
+  request retried across the upgrade digests differently from its stored receipt and is
+  refused as `CommandConflict` (`worktree_catalog_rpc.rs:1178`) (review finding 4). A side
+  chat request digests differently from a plain one, so a replay that changes the marker is
+  a conflict, as it should be.
 - **No first prompt on `createPanel`.** The client sends the question with the existing
   `thread.turn.start` (`startThreadTurn` in `client-runtime/operations/commands.ts:196`) once
   `createPanel` resolves. A server-side first prompt would duplicate the turn admission path
@@ -137,11 +151,15 @@ the payload. Host checks, the project lock and the dispatch gate are unchanged.
   and the session entry keeps it.
 - Both delivery sites (`:7405`, `:8596`) pass it to `text_with_pending_context_handoff`.
   The order inside that function is:
-  1. A `/` turn returns `None`, as today.
-  2. For a side chat, read its own messages. If none count as earlier messages, read the
-     host's messages and compose them with side-chat framing. Clear a pending lost-session
-     mark if one is set, since there is nothing of its own to hand off.
+  1. A `/` turn returns `None`, as today, and records nothing.
+  2. For a side chat that has not shared the seed, read the host's messages and compose
+     them with side-chat framing. Clear a pending lost-session mark if one is set: the host
+     block stands in for it.
   3. Otherwise, today's behaviour: the pending mark and the thread's own messages.
+
+  The caller appends `side-chat.context-shared` after an accepted delivery that carried
+  the seed, next to where it clears the pending mark today (`:7421-7431`).
+
 - `compose_thread_context_handoff` takes the framing as a parameter. Limits, filters and
   escaping stay shared. The side-chat framing, inside the same `<bibcode_thread_context>`
   tag:
@@ -195,19 +213,39 @@ rebased on it.
   in the side chat.", so nothing is split between two chats.
 - **Opening.** `createSideChat(hostRef, question)` in `centerPanelActions.ts` reuses
   `createChatPanel`'s reserve, create and failure handling, with `sideChat: true`,
-  `approval-required`, the host's model, and title `Side chat — <provider>`. The host draft
-  text is cleared when the tab is reserved. If `createPanel` fails, the tab closes, the
-  question goes back into the host composer (merged with anything typed since, as plan
-  follow-ups do), and the existing **Failed to open chat panel** toast says why. If the
-  first `startThreadTurn` fails, the question is put in the side chat's composer draft and a
-  toast says "Couldn't send to the side chat. Your question is in its composer." A bare
-  `:btw` opens an empty side chat with focus in its composer.
+  `approval-required`, the host's model, and title `Panel — Side chat · <provider>` (see
+  Labels). The question always lives in a persisted draft (review finding 2):
+  1. While `createPanel` is pending, the `:btw` text stays in the host's persisted draft and
+     the host composer refuses another submit for this host. A reload then loses nothing:
+     the text is still in the host composer, and a side chat the server did create is
+     adopted as an empty tab.
+  2. When `createPanel` succeeds, the question is written to the side chat's persisted
+     composer draft, then the host draft text is cleared.
+  3. The client sends it with `startThreadTurn`; on success the side chat's draft is cleared
+     as any send clears it. If the send fails, the question stays in the side chat's
+     composer and a toast says "Couldn't send to the side chat. Your question is in its
+     composer." A reload between 2 and 3 shows the question in the adopted side chat's
+     composer, unsent.
+  4. If `createPanel` fails, the tab closes, the host draft is untouched, and the existing
+     **Failed to open chat panel** toast says why.
+
+  A bare `:btw` opens an empty side chat with focus in its composer.
+
+- **Closing a tab that is still being created** (review finding 3). Today closing a
+  reserved tab archives a thread that does not exist yet, which the engine refuses
+  (`engine.rs:4625`), and creation then finishes with the panel live. The fix sits in the
+  shared `createChatPanel` path, so plain panels gain it too: `cleanupRemoved` records a
+  close intent for a thread still in `pendingChatPanelThreadKeys` instead of archiving it.
+  When `createPanel` settles, a closed side chat sends nothing, keeps the question in the
+  host draft (step 2 never ran), and is archived; a failed creation just drops the intent.
 - **Menu.** **Side chat** sits first in the **+** menu, above the provider list, and opens an
   empty side chat of the host on the host's provider and model. When unavailable it is shown
   disabled with its reason, not hidden, so the feature stays discoverable on an older server.
-- **Labels.** `panelProviderLabel(title)` becomes `chatPanelLabel(thread)`: `Side chat ·
-  <provider>` when `sideChat` is true, otherwise today's provider label. Tabs, adoption on
-  other clients, the Inbox row and **Reopen closed chat** all use it.
+- **Labels** (review finding 5). The title is `Panel — Side chat · <provider>`, so today's
+  `panelProviderLabel(title)` (`centerPanelAdoption.ts:35`) already yields `Side chat ·
+  <provider>` for tabs, adoption on other clients, the Inbox row and **Reopen closed chat**,
+  in new and older clients alike. No label helper changes. The marker, not the title,
+  drives behaviour (availability, seed, checkpoints).
 - **Lifecycle.** As any panel: closing interrupts and archives, **Reopen closed chat** lists
   it, deleting the host deletes it. Its runtime mode picker can change `approval-required`
   after the first turn.
@@ -218,15 +256,16 @@ The capability is per environment, so a remote server gates its own side chats. 
 server does not advertise `sideChats`, and its `createPanel` would reject the `sideChat`
 field (`deny_unknown_fields`), so the client never sends it there. The menu item is disabled
 with its reason and `:btw` explains instead of sending. An older client on a newer server
-ignores the unknown `sideChat` field and shows a side chat as a chat panel titled
-`Side chat — <provider>`; typing `:btw` there sends the text to the thread, as it does today.
+ignores the unknown `sideChat` field and shows a side chat as a chat panel whose tab reads
+`Side chat · <provider>` (from the title prefix); typing `:btw` there sends the text to the
+thread, as it does today.
 
 ### Privacy and profiler
 
 - The seed and the question are user and assistant text. Neither reaches logs, traces,
-  profiler records or MCP activity records. The only new log line is a `tracing::debug!`
-  after composing a seed with counts: messages kept, chars, truncated yes or no, and the two
-  thread ids. It feeds the budget measurement below.
+  profiler records or MCP activity records. The `side-chat.context-shared` activity carries
+  counts only (messages kept, chars, truncated yes or no), which also feed the budget
+  measurement below. No new log line.
 - No new profiler event or finding, so `docs/skills/bibcode-profiler/references/` is
   unchanged.
 - Coverage: no new child process (a side chat's provider session is spawned and attributed
@@ -242,10 +281,13 @@ ignores the unknown `sideChat` field and shows a side chat as a chat panel title
 | Host deleted before the side chat is created | `createPanel` or the engine refuses ("Host thread … is deleted"); the tab closes and the question returns to the composer, which is gone with the host, so the toast is the only trace.         |
 | Host deleted mid-turn of the side chat       | The cascade deletes the side chat in the same command; the deleted-thread cleanup stops its session, as for any panel.                                                                          |
 | Host busy approving or asking                | No effect. The side chat's own approvals appear in its tab and roll up to the host's Inbox row.                                                                                                 |
-| Server restarts before the first delivery    | The seed is owed by derivation, so the first delivered turn still carries it.                                                                                                                   |
+| First turn is a `/` command                  | It carries no seed and records nothing; the next ordinary question gets the seed, including after a restart in between.                                                                         |
+| Reload while the side chat is being created  | The `:btw` text is still in the host's persisted draft; a side chat the server created is adopted empty.                                                                                        |
+| Tab closed while it is being created         | The close intent is kept; when creation settles nothing is sent, the question stays in the host draft, and the side chat is archived.                                                           |
+| Server restarts before the first delivery    | No `side-chat.context-shared` activity exists, so the first ordinary turn still carries the seed.                                                                                               |
 | First delivery `Ambiguous`, then retried     | The seed may be sent twice. Accepted.                                                                                                                                                           |
 | Duplicate `createPanel`                      | The command id replays the same thread, as today.                                                                                                                                               |
-| Two `:btw` in quick succession               | Two side chats. The host draft is cleared on the first, so a second Enter sends nothing.                                                                                                        |
+| Two `:btw` in quick succession               | A second Enter on the same `:btw` is refused while the first creation is pending; a new `:btw` after it opens a second side chat.                                                               |
 | Provider switch inside the side chat         | The UI locks a panel's provider. A model change or lost session after the first turn hands off the side chat's own messages only; the host block is not resent (non-goal).                      |
 | Host's provider later switches               | No effect on existing side chats, which keep their own instance.                                                                                                                                |
 | Host reverts files while a side chat works   | Allowed in P0, as for any panel today. P1 adds the guard.                                                                                                                                       |
@@ -256,7 +298,7 @@ Keep 40 messages and 24,000 chars. A side chat exists to know the thread, and 24
 about 6,000 tokens on the first turn only. The reference's 8,000-char cap applies to a
 busy-parent digest added on top of a native fork, so it is not comparable. Alternatives: a
 smaller cap (cheaper, but loses the decisions a user asks about) or a byte-budgeted window
-from #226 (the right long-term reader, not merged yet). Measure with the debug counts and the
+from #226 (the right long-term reader, not merged yet). Measure with the activity's counts and the
 first-turn latency in the e2e run before changing it.
 
 ## Phasing
@@ -293,7 +335,7 @@ provider MCP tool that reads the host for live state.
 | 2   | `:btw` or `/btw`                 | `:btw` and `:side`; `/` stays the provider's.                                                                                   | `/btw`: familiar from the reference, but shadows a provider command of that name.                                   |
 | 3   | Center tab or right panel        | Center tab, active in the focused pane; auto-split in P2.                                                                       | Right panel: always beside the host, but mixes chats with tools. Auto-split now: changes layout unasked.            |
 | 4   | Native fork in v1                | No. Portable seed for every provider.                                                                                           | Fork first: full context, but Claude Code only and idle host only.                                                  |
-| 5   | Seed budget                      | 40 messages, 24,000 chars; measure with counts.                                                                                 | 8,000 chars: cheaper, loses context. Byte window (#226): later.                                                     |
+| 5   | Seed budget                      | 40 messages, 24,000 chars; measure with the activity counts.                                                                    | 8,000 chars: cheaper, loses context. Byte window (#226): later.                                                     |
 | 6   | First-turn runtime mode          | Create the side chat in `approval-required`; the picker can change it.                                                          | Inherit the host's mode: fewer prompts, but a question could edit the host's checkout unasked.                      |
 | 7   | Checkpoints and host rewind      | No side chat checkpoints in P0; host restore guard for every sibling panel in P1.                                               | Capture like panels: side chat can revert its own edits, but that revert also drops host edits.                     |
 | 8   | Bring back in v1                 | P1, as a host-composer draft, never sent, idle host only.                                                                       | Auto-send: faster, but writes into the host without review.                                                         |
@@ -310,14 +352,20 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
   `side_chat_seed_skips_the_host_streaming_and_queued_messages`,
   `side_chat_seed_is_sent_once_then_its_own_history_is_used`,
   `side_chat_seed_is_still_owed_after_a_restart`,
-  `side_chat_seed_defers_on_a_slash_turn`; every existing `handoff_*` test stays green.
+  `side_chat_seed_defers_on_a_slash_turn`,
+  `side_chat_seed_follows_a_delivered_slash_turn` (a `/compact` first, then a question,
+  with and without a restart between),
+  `side_chat_seed_records_counts_only_after_an_accepted_delivery`; every existing
+  `handoff_*` test stays green.
 - `orchestration/engine.rs`: `side_chat_cannot_host_a_panel_or_side_chat`,
   `side_chat_marker_requires_a_panel_with_a_host`,
   `host_delete_cascades_to_open_and_archived_side_chats`,
   `side_chat_marker_round_trips_through_projection_threads`.
 - `persistence/migrations.rs`: `migration_066_adds_the_side_chat_column_defaulting_false`.
 - `production/worktree_catalog_rpc.rs`:
-  `create_panel_with_side_chat_records_the_marker_and_replays`.
+  `create_panel_with_side_chat_records_the_marker_and_replays`,
+  `create_panel_replays_a_receipt_stored_before_side_chats` (an old-format digest still
+  replays).
 - `production/orchestration_effects.rs`: `side_chat_turns_capture_no_checkpoints`.
 - `lifecycle.rs`: the descriptor assertion adds `sideChats`.
 - `mcp/tools/threads.rs` and `panels.rs`: summaries mark side chats.
@@ -330,8 +378,11 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
   attachments, each keeping the text and showing its reason.
 - `apps/web/src/sideChatAvailability.test.ts`: every reason above, and `null` when available.
 - `apps/web/src/centerPanelActions.test.ts`: `createSideChat` sends `sideChat: true`,
-  `approval-required` and the host's model; a create failure restores the host draft; a send
-  failure leaves the question in the side chat's draft.
+  `approval-required` and the host's model; the host draft keeps the question until
+  creation succeeds (a simulated reload during creation keeps it); a create failure leaves
+  the host draft untouched; a send failure leaves the question in the side chat's draft;
+  closing the tab while creation waits sends nothing, keeps the host draft and archives the
+  panel once created (for a plain panel too).
 - `apps/web/src/centerPanelStore.test.ts`: open, close and reopen a side chat with the
   unchanged surface shape.
 - `ChatHeaderPanelMenu` test: **Side chat** enabled, and disabled with each reason.
@@ -359,3 +410,16 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
 - Whether the Codex CLI can fork a session (P2 only).
 - The exact first-turn latency and token cost of a 24,000-char seed; the debug counts and
   the e2e run measure it.
+
+## Review findings and resolutions
+
+Codex round 1 returned REVISE with five findings. Each was checked in source at
+`fd98b43306`, and each is accepted.
+
+| #   | Finding                                                                                                                      | Verified in source                                                                                                                                                               | Resolution                                                                                                                                                 |
+| --- | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | A delivered `/` command counts as an earlier message, so deriving "owed" from history never sends the seed after `/compact`. | Yes. `compose_thread_context_handoff` counts any delivered user message (`provider_runtime.rs:7515-7523`), and a `/` turn only defers (`:7588`).                                 | "Owed" now follows a `side-chat.context-shared` activity written after an accepted seed delivery. Tests cover `/compact` then a question, with a restart.  |
+| 2   | Clearing the host draft at reservation loses the question on reload.                                                         | Yes. The question would live only in the pending client operation, while the composer draft store is persisted (`composerDraftStore.ts:2319`).                                   | The host draft keeps the text until `createPanel` succeeds; the question then moves into the side chat's persisted draft before the host draft is cleared. |
+| 3   | Closing a reserved tab archives a thread that does not exist yet, and creation then finishes and sends.                      | Yes. `cleanupRemoved` archives at once (`centerPanelActions.ts:183-207`, `:298-311`), and `thread.archive` requires the thread (`engine.rs:4625`). Plain panels have this today. | A close intent is kept for a pending panel; when creation settles nothing is sent and the panel is archived. Fixed in the shared path.                     |
+| 4   | `#[serde(default)] side_chat: bool` serializes `false` and changes the digest of every plain panel request.                  | Yes. The digest hashes the serialized input (`delivery.rs:115-120`), and a mismatch is `CommandConflict` (`worktree_catalog_rpc.rs:1178`).                                       | `skip_serializing_if = "std::ops::Not::not"`; a test replays a receipt stored before the change.                                                           |
+| 5   | Older clients label adopted panels only from the `Panel — ` title prefix, so `Side chat — …` renders "Chat".                 | Yes. `panelProviderLabel` (`centerPanelAdoption.ts:32-37`), and the tab falls back to "Chat" (`CenterPanelTabs.tsx:78`).                                                         | Title `Panel — Side chat · <provider>`, which every client labels `Side chat · <provider>`; no label helper change.                                        |
