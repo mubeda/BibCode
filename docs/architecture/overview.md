@@ -639,7 +639,11 @@ explicitly disconnected environment.
 
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
-with an atomic no-replace hard link. Platform file identity checks bind cleanup
+with an atomic no-replace hard link. The staging open, the only connection that
+sees a zero-page database, sets `auto_vacuum = INCREMENTAL` before
+`journal_mode = WAL`, so new stores keep pointer maps for a future incremental
+reclaim. Existing stores keep `NONE` until `bibcode storage compact` rewrites
+them; nothing runs `incremental_vacuum` yet. Platform file identity checks bind cleanup
 and the final reopen to that staged filesystem object, so a competing or
 replacement final path is never configured, migrated, removed, or overwritten.
 
@@ -675,7 +679,9 @@ and one singly-linked `manifest.json`; their manifest ledger version must match
 an exact migration prefix recognized by the running binary, and their canonical
 UTC creation time must agree with the generation's filesystem publication time.
 Retention keeps the newest three for the store and state kind, ordered by that
-filesystem time with a backup-ID tie-break. It reopens and revalidates each
+filesystem time with a backup-ID tie-break. Publishing a `pre-compact`
+generation first expires the older `pre-compact` generations, so at most one is
+kept and repeated compaction displaces at most one other generation. It reopens and revalidates each
 expired generation, deletes only the two bound files, and removes the now-empty
 directory without recursive deletion. Staging entries, extra or linked content,
 malformed manifests, location or identity mismatches, future-schema ledgers,
@@ -686,7 +692,16 @@ syncing.
 
 Offline recovery is explicit and state-kind scoped. `bibcode storage inspect`
 classifies the resolved store and inventories verified backups without changing
-database, WAL, marker, or catalog bytes. `bibcode storage restore --backup-id`
+database, WAL, marker, or catalog bytes, or creating any file. It decides
+whether SQLite may be opened from the runtime lock, which it opens without
+creating and holds exclusively for classification and its header read of page
+statistics: while a BiBCode process holds the lock it reports the store from
+its files and never joins the live WAL; offline it opens `immutable=1` when no
+sidecar exists and the plain read-only path only when both sidecars exist under
+its lock; any other sidecar state is reported as unsafe without opening SQLite.
+It releases the lock before the backup inventory, which reads only `backups/`.
+Restore verifies only the selected generation, not every generation of its
+identity. `bibcode storage restore --backup-id`
 accepts only a selected generation whose manifest, location, storage identity,
 checksum, SQLite integrity, and migration prefix verify for that same state
 kind. Restore reopens the verified database through a no-follow, read-capable
@@ -703,6 +718,27 @@ server owns the root. Startup refuses to create or open SQLite while a recovery
 journal or strict recovery-staging entry remains. A crash or cancellation after
 preservation therefore leaves recoverable files and an explicit incomplete
 operation instead of silently converting the root into a first-run store.
+
+`bibcode storage compact` takes the same two locks, then checks the store from
+its files (a marked store, no symbolic link or junction for the state directory
+or `state.sqlite`, since SQLite keeps sidecars beside a link's target, a SQLite
+header, no rollback journal) and opens one
+writable connection with `busy_timeout = 0` and `locking_mode = EXCLUSIVE` set
+before its first access, so SQLite keeps the WAL index in heap memory and a
+`BEGIN EXCLUSIVE` probe refuses at once while another program has the database
+open. That access replays a crash-left WAL under the lock. When a `-wal`
+existed, `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` keeps the close from checkpointing
+it until a compaction verifies, so every refusal before the backup leaves the
+database and its sidecars byte for byte as found. It then checks the schema,
+measures the logical size, checks free space on the data-root and SQLite
+temporary-file volumes, publishes a verified `pre-compact` backup through the
+online-backup API on that connection under the unchanged 30-second budget, and
+runs a cancellable `VACUUM` into `auto_vacuum = INCREMENTAL`. After a verified
+compaction it removes a crash-left `-shm` that no WAL needs any more. It needs
+no recovery journal: there is no rename, `VACUUM` is one SQLite transaction,
+and backup publication is already atomic. `--dry-run` takes only the
+non-creating runtime lock, reads `immutable=1` or not at all, and does not
+check SQLite locks.
 
 ## Desktop project-data recovery
 
@@ -1523,6 +1559,18 @@ are listed in the
   that report always says `exit 1`, with the `launchd_sim` pid, or pid `0` when
   that process was not found after boot. The sampler attributes a booted
   simulator's `launchd_sim` to BiBCode as a `helper`.
+- **Offline commands.** `bibcode storage compact` runs with no server, so it
+  cannot reach the global handle. While it holds the store's exclusive runtime
+  lock, and only when the persisted `enableProfiler` is on, it starts an
+  `OfflineWriter`: a `ProfilerStore` with a fresh `sid` that writes events with
+  source `cli` and writes no `session.json`. It holds `profiler/.lock` for its
+  life, with the runtime's brief retry, and records nothing when another writer
+  still holds it. Dropping it waits at most 2 s for the writer to finish, and a
+  writer stuck on disk keeps its lock until it does.
+  It records `storage.compact` `start` and `end` (outcome, failed step, page
+  size, before and after sizes, free pages and `auto_vacuum`, and timings),
+  never paths, IDs or error text. A refusal because BiBCode owns the store is
+  not recorded, and the dry run starts no writer.
 - `ProductionRuntime::start` starts the runtime on a blocking thread, because it
   replays `findings.ndjson`, before the orchestration engine starts.
 - **Global handle.** Hot paths reach the runtime through a process-global
@@ -1566,14 +1614,14 @@ are listed in the
 Everything lives in `<state dir>/profiler/`: `<data root>/userdata/profiler`, or
 `<data root>/dev/profiler` with a development URL.
 
-| Path                   | Contents                                                                                                                                                                                                                                                                                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.lock`                | The single-writer lock.                                                                                                                                                                                                                                                                                                                           |
-| `events-NNNNNN.ndjson` | One event per line: `{ v: 1, seq, sid, eventId, ts, kind, source, …payload }`. `sid` (8 hex digits) names the writer session, so `"<sid>:<seq>"` locates an event across restarts. `eventId`, `"<sid>-<n>"`, is taken by the sender before the writer runs, so a finding can cite the event at once. `source` is `server` or `client:<clientId>`. |
-| `findings.ndjson`      | One line per persisted finding state; the last line for an id wins.                                                                                                                                                                                                                                                                               |
-| `session.json`         | The clean-shutdown sentinel: `state` is `running`, then `stopping` once shutdown begins, then `clean`.                                                                                                                                                                                                                                            |
-| `capabilities.json`    | `{ nativeDumps, osCrashRecords }`, written by the crash monitor detector.                                                                                                                                                                                                                                                                         |
-| `crashes/`             | Minidumps `<uuid>.dmp` and their `<uuid>.json` sidecars.                                                                                                                                                                                                                                                                                          |
+| Path                   | Contents                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.lock`                | The single-writer lock.                                                                                                                                                                                                                                                                                                                                   |
+| `events-NNNNNN.ndjson` | One event per line: `{ v: 1, seq, sid, eventId, ts, kind, source, …payload }`. `sid` (8 hex digits) names the writer session, so `"<sid>:<seq>"` locates an event across restarts. `eventId`, `"<sid>-<n>"`, is taken by the sender before the writer runs, so a finding can cite the event at once. `source` is `server`, `client:<clientId>`, or `cli`. |
+| `findings.ndjson`      | One line per persisted finding state; the last line for an id wins.                                                                                                                                                                                                                                                                                       |
+| `session.json`         | The clean-shutdown sentinel: `state` is `running`, then `stopping` once shutdown begins, then `clean`.                                                                                                                                                                                                                                                    |
+| `capabilities.json`    | `{ nativeDumps, osCrashRecords }`, written by the crash monitor detector.                                                                                                                                                                                                                                                                                 |
+| `crashes/`             | Minidumps `<uuid>.dmp` and their `<uuid>.json` sidecars.                                                                                                                                                                                                                                                                                                  |
 
 Retention keeps 7 days or 256 MB per profiler directory, dumps included. Anything
 older than 7 days goes first. Crash dumps then leave only when they alone exceed

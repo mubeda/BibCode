@@ -105,6 +105,32 @@ describe("Desktop project-data recovery contract", () => {
     });
   });
 
+  it("decodes a pre-compact backup from a compacted store", () => {
+    expect(
+      decodeProjectDataStatus({
+        environmentId: "primary",
+        label: "Local",
+        runningDistro: null,
+        status: "healthy",
+        requestedRoot: "/home/user/.bibcode",
+        effectiveRoot: "/home/user/.bibcode",
+        isFilesystemAlias: false,
+        storageInstanceId: "b102f72a-c63b-4801-8f14-fba7a16856b8",
+        issue: null,
+        backups: [
+          {
+            backupId: "7d0c4f53-8b2e-4f0a-9c55-2d8e5b1f6a10",
+            createdAt: "2026-11-01T09:00:00Z",
+            trigger: "pre-compact",
+            appVersion: "0.15.0",
+            schemaVersion: 62,
+            sizeBytes: 4096,
+          },
+        ],
+      }),
+    ).toMatchObject({ backups: [{ trigger: "pre-compact", sizeBytes: 4096 }] });
+  });
+
   it("keeps a committed recovery distinct from a restart failure", () => {
     expect(
       decodeProjectDataRecoveryResult({
