@@ -911,3 +911,114 @@ fn backup_manifest_never_serializes_the_effective_or_requested_root() {
     assert!(!json.contains("requested"));
     assert!(!json.contains("effective"));
 }
+
+/// Overwrites the b-tree header of `table`'s root page, so the file keeps its length and its
+/// migration ledger but fails `quick_check`.
+fn corrupt_table_root(database: &Path, table: &str) {
+    let (page_size, root_page) = {
+        let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("backup reader");
+        let page_size: i64 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page size");
+        let root_page: i64 = connection
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("root page");
+        (page_size, root_page)
+    };
+    let mut bytes = fs::read(database).expect("backup bytes");
+    let offset = usize::try_from((root_page - 1) * page_size).expect("offset");
+    bytes[offset..offset + 12].fill(0xFF);
+    fs::write(database, bytes).expect("corrupt backup in place");
+}
+
+#[tokio::test]
+async fn retention_keeps_the_last_good_generation_behind_corrupt_replacements() {
+    for corrupt in [true, false] {
+        let fixture = PersistedStoreFixture::current_schema_with_project("project-a");
+        let prepared = fixture.prepare().await.expect("current store opens");
+        let good = fixture
+            .create_backup_at(&prepared, 1, "retention-262")
+            .await;
+        let stale = fixture
+            .create_backup_at(&prepared, 2, "retention-262")
+            .await;
+        let mut refreshed = fixture
+            .create_backup_at(&prepared, 3, "retention-262")
+            .await;
+        if corrupt {
+            // B: content changed, manifest stale. C: content changed, manifest refreshed.
+            corrupt_table_root(&stale.database, "projection_projects");
+            corrupt_table_root(&refreshed.database, "projection_projects");
+            refresh_manifest_database_fingerprint(&mut refreshed);
+        }
+        prepared
+            .database
+            .call(|connection| {
+                connection.execute("DELETE FROM projection_projects", [])?;
+                Ok(())
+            })
+            .await
+            .expect("empty the live store");
+        let empty = fixture
+            .create_backup_at(&prepared, 4, "retention-262")
+            .await;
+        close_store(prepared).await;
+
+        if corrupt {
+            for backup in [&good, &stale, &refreshed, &empty] {
+                assert!(
+                    backup.directory.is_dir(),
+                    "corrupt replacements never justify a deletion"
+                );
+            }
+            bibcode_server::persistence::restore_backup(
+                fixture
+                    .config
+                    .resolved_data_root
+                    .as_ref()
+                    .expect("resolved root"),
+                good.manifest.backup_id,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("restore the last good generation");
+            let projects: i64 = Connection::open(&fixture.paths.database)
+                .expect("restored store")
+                .query_row(
+                    "SELECT COUNT(*) FROM projection_projects WHERE project_id = 'project-a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("project count");
+            assert_eq!(projects, 1, "the lost project is back");
+        } else {
+            assert!(
+                !good.directory.exists(),
+                "three healthy replacements expire it"
+            );
+            for backup in [&stale, &refreshed, &empty] {
+                assert!(backup.directory.is_dir());
+            }
+        }
+    }
+}
+
+/// Closes the store's file connection, so the data root can be recovered offline.
+async fn close_store(prepared: bibcode_server::persistence::PreparedStore) {
+    prepared
+        .database
+        .call(|connection| {
+            let replacement = Connection::open_in_memory()?;
+            let file_connection = std::mem::replace(connection, replacement);
+            file_connection.close().map_err(|(_, error)| error)?;
+            Ok(())
+        })
+        .await
+        .expect("close the store's file connection");
+    drop(prepared);
+}

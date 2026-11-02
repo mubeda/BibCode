@@ -21,10 +21,10 @@ use super::{
     BackupError, BackupTrigger, Database, PersistenceError, PreparedStore, RecoveryError,
     StatePaths, StorageInstanceId, StoreClassification, StoreInspectionStatus, StoreOperationGuard,
     backup::{
-        BACKUP_TIMEOUT, DatabaseStatsUnavailable, OfflineRecoveryGuard, RECOVERY_TIMEOUT,
-        classify_store_files, create_verified_backup, database_file_sizes, directory_volume,
-        file_link_count, is_reparse_point, path_entry_exists, sqlite_sidecars_present,
-        state_kind_name,
+        BackupRun, DatabaseStatsUnavailable, OfflineRecoveryGuard, RECOVERY_TIMEOUT, StoreIoBudget,
+        classify_store_files, create_backup_run, database_file_sizes, directory_volume,
+        file_link_count, format_bytes, format_duration_words, is_reparse_point, path_entry_exists,
+        sqlite_sidecars_present, state_kind_name,
     },
     database::{AutoVacuumMode, PageStats, VacuumOutcome, open_immutable, page_stats},
     migrations::validate_bibcode_schema,
@@ -42,7 +42,11 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// A phase of a real compaction, for progress lines.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactProgress {
-    BackingUp { bytes: u64 },
+    /// `budget` is how long the backup may take before compaction gives up on it.
+    BackingUp {
+        bytes: u64,
+        budget: std::time::Duration,
+    },
     Compacting,
     CheckingIntegrity,
 }
@@ -73,6 +77,14 @@ pub enum CompactTestHook {
     CancelDuringVacuum,
     /// Removing the stale `-shm` after a verified compaction fails.
     FailCleanup,
+    /// Cancels the token after the first online-backup step.
+    CancelDuringBackup,
+    /// Pauses after the backup's copy and replaces its budget, so a backup can outlast the
+    /// budget's base.
+    LongBackup {
+        pause: std::time::Duration,
+        budget: StoreIoBudget,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -331,8 +343,15 @@ async fn compact_with_connection(
     let space = check_free_space(paths, logical_bytes, live_bytes, file_bytes, hook)?;
 
     trace.step = "backup";
+    let (budget, pause_after_copy) = match hook {
+        CompactTestHook::LongBackup { pause, budget } => (budget, Some(pause)),
+        _ => (StoreIoBudget::LARGE_STORE, None),
+    };
+    let budget = budget.for_bytes(logical_bytes);
+    trace.backup_budget_ms = Some(duration_ms(budget));
     progress(CompactProgress::BackingUp {
         bytes: logical_bytes,
+        budget,
     });
     let started = Instant::now();
     let prepared = PreparedStore {
@@ -341,16 +360,29 @@ async fn compact_with_connection(
         classification: StoreClassification::Existing,
         paths: paths.clone(),
     };
-    let backup = create_verified_backup(
+    let after_step = (hook == CompactTestHook::CancelDuringBackup).then(|| {
+        let token = token.clone();
+        Arc::new(move || token.cancel()) as Arc<dyn Fn() + Send + Sync>
+    });
+    let backup = create_backup_run(
         database,
         &prepared,
         BackupTrigger::PreCompact,
         env!("CARGO_PKG_VERSION"),
+        BackupRun {
+            cancellation: token.clone(),
+            deadline: started + budget,
+            pause_after_copy,
+            after_step,
+        },
     )
     .await;
     drop(prepared);
     trace.backup_ms = Some(elapsed_ms(started));
-    let backup_id = backup.map_err(map_backup_error)?.manifest.backup_id;
+    let backup_id = backup
+        .map_err(|error| map_backup_error(error, budget, logical_bytes))?
+        .manifest
+        .backup_id;
     tracing::info!(%backup_id, "published the pre-compact backup");
     if hook == CompactTestHook::CancelAfterBackup {
         token.cancel();
@@ -636,18 +668,25 @@ fn failed_before_backup(
     }
 }
 
-fn map_backup_error(error: BackupError) -> RecoveryError {
+fn map_backup_error(
+    error: BackupError,
+    budget: std::time::Duration,
+    backup_bytes: u64,
+) -> RecoveryError {
+    if matches!(error, BackupError::Cancelled) {
+        return RecoveryError::Cancelled { backup_id: None };
+    }
     let message = match &error {
         BackupError::QuickCheck { .. } => {
             "The store failed its integrity check, so it was not compacted and the database was \
              not changed. Run `bibcode storage inspect` to see its state."
                 .to_owned()
         }
-        BackupError::DeadlineElapsed => backup_budget_message(),
+        BackupError::DeadlineElapsed => backup_budget_message(budget, backup_bytes),
         BackupError::Persistence(PersistenceError::BackupStopped(reason))
             if reason == "deadline elapsed" =>
         {
-            backup_budget_message()
+            backup_budget_message(budget, backup_bytes)
         }
         other => format!(
             "Could not take the pre-compact backup: {}; the database was not changed.",
@@ -661,12 +700,18 @@ fn map_backup_error(error: BackupError) -> RecoveryError {
     }
 }
 
-fn backup_budget_message() -> String {
+/// The refusal when the pre-compact backup outlasts its size-scaled budget.
+pub fn backup_budget_message(budget: std::time::Duration, backup_bytes: u64) -> String {
     format!(
-        "The pre-compact backup did not finish within {} seconds, so the database was not \
-         changed. Compacting stores this large is not supported yet.",
-        BACKUP_TIMEOUT.as_secs()
+        "The pre-compact backup did not finish within {}, the limit for a {} store, so the \
+         database was not changed. Check that the disk is not busy or failing, then retry.",
+        format_duration_words(budget),
+        format_bytes(backup_bytes)
     )
+}
+
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn ensure_not_cancelled(
@@ -875,7 +920,12 @@ fn plan(
         auto_vacuum_after: AutoVacuumMode::Incremental,
         required_free_bytes: space.required,
         available_free_bytes: space.available,
-        backup_budget_seconds: BACKUP_TIMEOUT.as_secs(),
+        backup_budget_seconds: StoreIoBudget::LARGE_STORE
+            .for_bytes(logical_bytes)
+            .as_millis()
+            .div_ceil(1_000)
+            .try_into()
+            .unwrap_or(u64::MAX),
         sqlite_lock,
     }
 }
@@ -937,6 +987,7 @@ struct Trace {
     before: Option<PageStats>,
     after: Option<PageStats>,
     backup_ms: Option<u64>,
+    backup_budget_ms: Option<u64>,
     vacuum_ms: Option<u64>,
 }
 
@@ -950,6 +1001,7 @@ impl Default for Trace {
             before: None,
             after: None,
             backup_ms: None,
+            backup_budget_ms: None,
             vacuum_ms: None,
         }
     }
@@ -1028,6 +1080,7 @@ impl Recorder {
                 "before": side(trace.before_file_bytes, trace.before),
                 "after": side(trace.after_file_bytes, trace.after),
                 "backupMs": trace.backup_ms,
+                "backupBudgetMs": trace.backup_budget_ms,
                 "vacuumMs": trace.vacuum_ms,
                 "durationMs": duration_ms,
             }),
@@ -1108,6 +1161,23 @@ mod tests {
         std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700))
             .expect("restore permissions");
         assert_eq!(chosen, writable);
+    }
+
+    #[test]
+    fn backup_budget_message_names_the_limit_and_size() {
+        assert_eq!(
+            backup_budget_message(
+                std::time::Duration::from_secs(1_710),
+                7 * 1024 * 1024 * 1024
+            ),
+            "The pre-compact backup did not finish within 29 minutes, the limit for a 7.5 GB \
+             store, so the database was not changed. Check that the disk is not busy or \
+             failing, then retry."
+        );
+        assert!(
+            backup_budget_message(std::time::Duration::from_secs(30), 0)
+                .contains("within 30 seconds, the limit for a 0 B store")
+        );
     }
 
     #[test]
