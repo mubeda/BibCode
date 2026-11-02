@@ -557,6 +557,40 @@ mod tests {
     }
 
     #[test]
+    fn storage_restore_takes_a_backup_id_or_resume() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let base_dir = temp.path().to_string_lossy().into_owned();
+        let backup_id = uuid::Uuid::new_v4().to_string();
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec!["bibcode", "storage", "restore", "--base-dir", &base_dir];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+
+        let action = parse(&["--backup-id", &backup_id])
+            .expect("parse restore --backup-id")
+            .into_action()
+            .expect("restore action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Restore { .. })
+        ));
+        let action = parse(&["--resume", "--json"])
+            .expect("parse restore --resume")
+            .into_action()
+            .expect("resume action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Resume { json: true, .. })
+        ));
+        assert!(parse(&[]).is_err(), "one of the two is required");
+        assert!(
+            parse(&["--resume", "--backup-id", &backup_id]).is_err(),
+            "they are exclusive"
+        );
+    }
+
+    #[test]
     fn cli_parses_open_url_without_data_root() {
         // Control: a relative explicit data root cannot be resolved.
         let unusable_root = "relative-root";
@@ -781,8 +815,12 @@ enum StorageSubcommand {
     },
     #[command(about = "Restore a verified backup into an offline store.")]
     Restore {
+        #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
+        backup_id: Option<uuid::Uuid>,
+        /// Finish a restore or start-empty that was interrupted after it began changing the
+        /// store.
         #[arg(long)]
-        backup_id: uuid::Uuid,
+        resume: bool,
         #[arg(long)]
         json: bool,
     },
@@ -978,6 +1016,11 @@ pub enum StorageCommand {
         backup_id: uuid::Uuid,
         json: bool,
     },
+    /// `storage restore --resume`.
+    Resume {
+        root: ResolvedDataRoot,
+        json: bool,
+    },
     StartEmpty {
         root: ResolvedDataRoot,
         json: bool,
@@ -1126,10 +1169,17 @@ impl Cli {
                 let root = crate::data_root::resolve_data_root(request)?;
                 return Ok(CliAction::Storage(match storage.command {
                     StorageSubcommand::Inspect { json } => StorageCommand::Inspect { root, json },
-                    StorageSubcommand::Restore { backup_id, json } => StorageCommand::Restore {
-                        root,
+                    StorageSubcommand::Restore {
                         backup_id,
+                        resume,
                         json,
+                    } => match backup_id {
+                        Some(backup_id) if !resume => StorageCommand::Restore {
+                            root,
+                            backup_id,
+                            json,
+                        },
+                        _ => StorageCommand::Resume { root, json },
                     },
                     StorageSubcommand::StartEmpty { json } => {
                         StorageCommand::StartEmpty { root, json }

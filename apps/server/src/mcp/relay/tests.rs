@@ -1201,3 +1201,39 @@ fn a_credential_carries_the_terminal_scope_only_with_terminals_on_at_full_access
     settings.access = McpAccess::AutoAcceptEdits;
     assert!(extra_scopes(settings, McpAccess::FullAccess).is_empty());
 }
+
+#[tokio::test]
+async fn open_store_refuses_during_an_interrupted_recovery() {
+    for interrupted in ["journal", "staging"] {
+        let root = tempfile::tempdir().expect("data root");
+        let options = options(root.path());
+        let paths = options.paths();
+        std::fs::create_dir_all(&paths.state_dir).expect("state directory");
+        std::fs::write(&paths.database, b"left by an interrupted restore").expect("database");
+        std::fs::write(paths.runtime_lock(), b"").expect("runtime lock");
+        if interrupted == "journal" {
+            std::fs::write(paths.recovery_journal(), b"{}\n").expect("journal");
+        } else {
+            std::fs::create_dir(paths.recovery_staging_dir(uuid::Uuid::new_v4())).expect("staging");
+        }
+
+        let error = open_store(&options)
+            .await
+            .expect_err("the MCP relay must refuse an interrupted recovery");
+
+        assert!(
+            error.contains(crate::persistence::RESUME_COMMAND),
+            "{interrupted}: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&paths.database).expect("database"),
+            b"left by an interrupted restore"
+        );
+        let mut wal = paths.database.as_os_str().to_os_string();
+        wal.push("-wal");
+        assert!(
+            !std::path::PathBuf::from(wal).exists(),
+            "{interrupted}: SQLite never opened"
+        );
+    }
+}

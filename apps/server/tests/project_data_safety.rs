@@ -6,7 +6,7 @@ use bibcode_server::{
     persistence::{
         AutoVacuumMode, BackupTrigger, CompactOptions, CompactReport, CompactTestHook,
         DatabaseStatsUnavailable, PreparedStore, RecoveryError, StatePaths, StorageInstanceId,
-        StoreClassification, StoreInspectionStatus, StoreStartupError,
+        StoreClassification, StoreInspectionStatus, StoreIoBudget, StoreStartupError,
         compact_store_for_integration_test, create_verified_backup, inspect_store,
         inspect_store_for_integration_test, inventory_verified_backups, prepare_store,
         preserve_and_start_empty, restore_backup, run_migrations,
@@ -864,6 +864,7 @@ async fn recovery_restore_preserves_the_live_store_before_installing_a_verified_
             .as_ref()
             .expect("resolved recovery root"),
         backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("restore verified generation");
@@ -922,6 +923,7 @@ async fn recovery_restore_rejects_a_backup_from_a_different_known_storage_identi
             .as_ref()
             .expect("resolved recovery root"),
         backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect_err("different known storage identity must block restore");
@@ -977,6 +979,7 @@ async fn recovery_restore_rejects_a_tampered_manifest_without_mutating_the_live_
             .as_ref()
             .expect("resolved recovery root"),
         backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect_err("tampered backup must block restore");
@@ -1043,6 +1046,7 @@ async fn recovery_restore_rejects_a_backup_from_the_other_state_kind_without_mut
             .as_ref()
             .expect("resolved userdata root"),
         dev_backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect_err("development backup must not restore into userdata");
@@ -1102,6 +1106,7 @@ async fn recovery_restore_rejects_a_checksum_valid_non_sqlite_backup_without_mut
             .as_ref()
             .expect("resolved recovery root"),
         backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect_err("checksum-valid non-SQLite backup must block restore");
@@ -1146,6 +1151,7 @@ async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified
             .as_ref()
             .expect("resolved recovery root"),
         backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("explicit verified restore repairs malformed marker");
@@ -1265,6 +1271,7 @@ async fn recovery_restore_with_an_existing_journal_performs_no_additional_filesy
             .as_ref()
             .expect("resolved recovery root"),
         backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect_err("existing journal must block a second recovery");
@@ -1616,9 +1623,13 @@ async fn restored_store_fixture() -> StoreFixture {
     .await
     .expect("restore fixture backup");
     close_prepared_store_for_offline_fixture(prepared).await;
-    restore_backup(root_of(&fixture.config), backup.manifest.backup_id)
-        .await
-        .expect("restore fixture");
+    restore_backup(
+        root_of(&fixture.config),
+        backup.manifest.backup_id,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("restore fixture");
     assert_eq!(journal_header_versions(&fixture.paths.database), (1, 1));
     assert!(!sqlite_sidecar(&fixture.paths.database, "-wal").exists());
     fixture
@@ -2577,9 +2588,13 @@ async fn pre_compact_backup_restores_with_restore_backup_id() {
         )
         .expect("change after compaction");
 
-    restore_backup(root_of(&fixture.config), backup_id)
-        .await
-        .expect("restore the pre-compact backup");
+    restore_backup(
+        root_of(&fixture.config),
+        backup_id,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("restore the pre-compact backup");
 
     assert_eq!(snapshot_file(&fixture.paths.database), rows_before);
     assert_eq!(storage_id(&fixture.paths), storage_instance_id);
@@ -2824,4 +2839,293 @@ async fn compact_cleanup_failure_names_the_pre_compact_backup() {
             .iter()
             .any(|backup| backup.manifest.backup_id == *backup_id)
     );
+}
+
+// --- Issue 262: compaction of stores whose backup outlasts 30 s ---------------------------
+
+fn budget_seconds(bytes: u64) -> u64 {
+    u64::try_from(
+        StoreIoBudget::LARGE_STORE
+            .for_bytes(bytes)
+            .as_millis()
+            .div_ceil(1_000),
+    )
+    .expect("budget seconds")
+}
+
+/// The `storage.compact` end events the offline profiler wrote for `paths`.
+fn compact_end_events(paths: &StatePaths) -> Vec<Value> {
+    let directory = paths.state_dir.join("profiler");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for entry in entries {
+        let path = entry.expect("profiler entry").path();
+        if !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("events-"))
+        {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path).expect("events file").lines() {
+            if let Ok(event) = serde_json::from_str::<Value>(line)
+                && event["kind"] == "storage.compact"
+                && event["phase"] == "end"
+            {
+                events.push(event);
+            }
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn compact_reports_a_size_scaled_backup_budget() {
+    let fixture = offline_store_with_free_pages();
+    std::fs::write(
+        fixture.paths.state_dir.join("settings.json"),
+        br#"{"enableProfiler":true}"#,
+    )
+    .expect("enable the profiler");
+
+    let dry = compact(&fixture.config, true, PLENTY)
+        .await
+        .expect("dry run");
+    assert_eq!(
+        dry.plan.backup_budget_seconds,
+        budget_seconds(dry.plan.backup_bytes)
+    );
+    let real = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("compact");
+    assert_eq!(
+        real.plan.backup_budget_seconds,
+        budget_seconds(real.plan.backup_bytes)
+    );
+
+    let events = compact_end_events(&fixture.paths);
+    let event = events.last().expect("storage.compact end event");
+    let budget_ms = event["backupBudgetMs"].as_u64().expect("backupBudgetMs");
+    assert_eq!(
+        u128::from(budget_ms),
+        StoreIoBudget::LARGE_STORE
+            .for_bytes(real.plan.backup_bytes)
+            .as_millis()
+    );
+}
+
+#[tokio::test]
+async fn compact_cancelled_during_the_backup_publishes_nothing() {
+    let clean = offline_store_with_free_pages();
+    let (_crashed_root, crashed_config, crashed_paths) = crashed_store_fixture(0);
+    for (config, paths) in [
+        (&clean.config, &clean.paths),
+        (&crashed_config, &crashed_paths),
+    ] {
+        let bytes_before = sqlite_bytes(&paths.database);
+
+        let error = compact(config, false, CompactTestHook::CancelDuringBackup)
+            .await
+            .expect_err("cancelled during the backup");
+
+        assert!(
+            matches!(error, RecoveryError::Cancelled { backup_id: None }),
+            "{error:?}"
+        );
+        assert!(
+            backup_entries(paths)
+                .iter()
+                .all(|entry| entry.components().count() <= 2),
+            "no generation and no staging entry: {:?}",
+            backup_entries(paths)
+        );
+        assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+    }
+    let inspection = inspect_store(root_of(&clean.config))
+        .await
+        .expect("inspect");
+    assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+}
+
+#[tokio::test]
+async fn a_pre_compact_backup_longer_than_its_base_budget_compacts_and_restores() {
+    let fixture = offline_store_with_free_pages();
+    let rows_before = snapshot_file(&fixture.paths.database);
+    let bytes_before = sqlite_bytes(&fixture.paths.database);
+    let budget = |per_gib: Duration| CompactTestHook::LongBackup {
+        pause: Duration::from_millis(1_500),
+        budget: StoreIoBudget {
+            base: Duration::from_secs(1),
+            per_gib,
+        },
+    };
+
+    let error = compact(&fixture.config, false, budget(Duration::ZERO))
+        .await
+        .expect_err("without the size term the backup outlasts its budget");
+    let RecoveryError::CompactFailed {
+        phase: "backup",
+        backup_id: None,
+        message,
+    } = &error
+    else {
+        panic!("unexpected error {error:?}");
+    };
+    assert!(message.contains("did not finish within"), "{message}");
+    assert_eq!(sqlite_bytes(&fixture.paths.database), bytes_before);
+    assert!(
+        backup_entries(&fixture.paths)
+            .iter()
+            .all(|entry| entry.components().count() <= 2),
+        "no staging entry: {:?}",
+        backup_entries(&fixture.paths)
+    );
+
+    let report = compact(
+        &fixture.config,
+        false,
+        budget(Duration::from_secs(48 * 60 * 60)),
+    )
+    .await
+    .expect("the size term covers the long backup");
+    let backup_id =
+        Uuid::parse_str(report.backup_id.as_deref().expect("backup id")).expect("backup UUID");
+    let inventory = inventory_verified_backups(&fixture.paths, storage_id(&fixture.paths))
+        .await
+        .expect("inventory");
+    let backup = inventory
+        .verified
+        .iter()
+        .find(|backup| backup.manifest.backup_id == backup_id)
+        .expect("the pre-compact backup is verified");
+    let created_at = time::OffsetDateTime::parse(
+        &backup.manifest.created_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("created_at");
+    let published = time::OffsetDateTime::from(
+        std::fs::metadata(&backup.directory)
+            .expect("generation")
+            .modified()
+            .expect("mtime"),
+    );
+    assert!(
+        (created_at - published).abs() < time::Duration::seconds(1),
+        "created_at {created_at} is the publication time {published}"
+    );
+
+    restore_backup(
+        root_of(&fixture.config),
+        backup_id,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("restore the pre-compact backup");
+    assert_eq!(snapshot_file(&fixture.paths.database), rows_before);
+    assert_eq!(
+        immutable_stats(&fixture.paths.database).3,
+        0,
+        "auto_vacuum none"
+    );
+}
+
+/// Makes a published generation a sparse 256 GiB file whose manifest size matches and whose
+/// hash is stale, so only a content read would notice.
+#[cfg(unix)]
+fn make_sparse_large(database: &Path, manifest_path: &Path) {
+    const LARGE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(database)
+        .expect("backup database")
+        .set_len(LARGE_BYTES)
+        .expect("sparse large backup");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(manifest_path).expect("manifest")).expect("JSON");
+    manifest["databaseSizeBytes"] = json!(LARGE_BYTES);
+    std::fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest JSON"),
+    )
+    .expect("rewrite manifest size");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn compact_beside_a_large_pre_compact_generation_expires_it_unread() {
+    let fixture = offline_store_with_free_pages();
+    let first = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("first compaction");
+    let first_id =
+        Uuid::parse_str(first.backup_id.as_deref().expect("backup id")).expect("backup UUID");
+    let store = fixture
+        .paths
+        .backup_store_dir(storage_id(&fixture.paths))
+        .join(first_id.to_string());
+    make_sparse_large(&store.join("state.sqlite"), &store.join("manifest.json"));
+
+    let second = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("second compaction beside the large generation");
+
+    assert!(
+        !store.exists(),
+        "the older pre-compact generation was deleted"
+    );
+    let second_id = second.backup_id.expect("second backup id");
+    let inventory = inventory_verified_backups(&fixture.paths, storage_id(&fixture.paths))
+        .await
+        .expect("inventory");
+    assert!(
+        inventory
+            .verified
+            .iter()
+            .any(|backup| backup.manifest.backup_id.to_string() == second_id)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inspection_and_a_pre_update_backup_succeed_beside_a_large_backup() {
+    let fixture = offline_store_with_free_pages();
+    let report = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("compaction");
+    let backup_id = report.backup_id.expect("backup id");
+    let generation = fixture
+        .paths
+        .backup_store_dir(storage_id(&fixture.paths))
+        .join(&backup_id);
+    make_sparse_large(
+        &generation.join("state.sqlite"),
+        &generation.join("manifest.json"),
+    );
+
+    let inspection = inspect_store(root_of(&fixture.config))
+        .await
+        .expect("inspection beside a large backup");
+    assert!(
+        inspection.backup_issues.is_empty(),
+        "{:?}",
+        inspection.backup_issues
+    );
+    assert!(
+        inspection
+            .backups
+            .iter()
+            .any(|backup| backup.manifest.backup_id.to_string() == backup_id)
+    );
+
+    let prepared = fixture.prepare().await.expect("prepare");
+    create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("pre-update backup within the fixed budget");
+    close_prepared_store_for_offline_fixture(prepared).await;
 }

@@ -754,11 +754,25 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn backup_to_cancellable(
         &self,
         destination: impl AsRef<Path>,
         cancellation: CancellationToken,
         deadline: Instant,
+    ) -> Result<()> {
+        self.backup_to_cancellable_with(destination, cancellation, deadline, None)
+            .await
+    }
+
+    /// [`Self::backup_to_cancellable`] with `after_step` run after every copied batch, a test
+    /// seam for cancelling mid-copy.
+    pub(crate) async fn backup_to_cancellable_with(
+        &self,
+        destination: impl AsRef<Path>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+        after_step: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<()> {
         const PAGES_PER_STEP: i32 = 128;
         const RETRY_DELAY: Duration = Duration::from_millis(2);
@@ -793,6 +807,9 @@ impl Database {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                if let Some(after_step) = &after_step {
+                    after_step();
+                }
                 ensure_backup_active(&cancellation, deadline)?;
                 match state {
                     StepResult::Done => break,
