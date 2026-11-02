@@ -70,11 +70,17 @@ export function reconcileCappedThreadPanelState(
   );
   const finish = () => {
     if (!isCurrent()) return;
-    const missing = offShellThreads.get(environmentId).missing;
+    const { missing, threads: resolved } = offShellThreads.get(environmentId);
     const removed = new Set<ThreadId>();
     for (const threadId of collectPersistedThreadIds(environmentId)) {
       if (retainedThreadIds.has(threadId)) continue;
-      if (archivedThreadIds.has(threadId) || missing.has(threadId)) removed.add(threadId);
+      // A lookup that finds a closed chat panel counts as the archived snapshot does: a panel
+      // closed elsewhere while left out changes no membership, so no snapshot is refetched.
+      const lookup = resolved.get(threadId);
+      const closedPanel = lookup?.kind === "panel" && lookup.archivedAt !== null;
+      if (archivedThreadIds.has(threadId) || missing.has(threadId) || closedPanel) {
+        removed.add(threadId);
+      }
     }
     const retained = new Set(
       [...collectPersistedThreadIds(environmentId)].filter((threadId) => !removed.has(threadId)),

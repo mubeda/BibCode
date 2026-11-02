@@ -928,14 +928,15 @@ older pages and threads looked up with `orchestration.getThreadShells`. Every
 removal item, snapshot, `unchanged` and session change bumps its generation,
 and a page or lookup reply sent under an older generation is dropped, so a
 reply that crossed a deletion never brings a row back. A new session empties
-it, `missing` included; within a session a thread stays `missing` until a
+it, `missing` included, and removing an environment drops its entry; within a session a thread stays `missing` until a
 snapshot lists it or a lookup returns it. One resolver serves
 every thread reader in the web app (`state/entities.ts`): the live shell, then
 that store, then, for a capped shell only, the server. It answers `missing`
 only from `getThreadShells`, and `unknown` for an old server's uncapped shell,
 where readers behave as before. Lifecycle cleanup of persisted panel state, for
 a capped shell, deletes only ids `getThreadShells` reports missing (and closed
-chat panels, as before); a removal item never deletes state. It looks up only
+chat panels, as before, including a panel a lookup finds archived); a removal
+item never deletes state. It looks up only
 threads the store has not resolved, so a streaming turn asks for nothing, and a
 lookup's answer applies only if no newer shell or archived snapshot arrived
 while it ran. Panel adoption likewise never closes a tracked chat panel's tab

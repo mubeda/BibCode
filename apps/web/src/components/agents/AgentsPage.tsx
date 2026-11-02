@@ -292,6 +292,9 @@ export function AgentsPage() {
                   );
                 })
               )}
+              {groupBy === "status" && !groups.some((group) => group.id === "status:done") ? (
+                <AgentsShowOlder standalone />
+              ) : null}
             </div>
           </div>
         </aside>
