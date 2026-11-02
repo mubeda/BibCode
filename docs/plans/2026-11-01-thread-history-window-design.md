@@ -295,7 +295,10 @@ on every read and computed by the same selectors the readers use:
   asks. It's the server's own open-request policy.
 - **Effective status.**
   - The row `deriveLatestContextWindowSnapshot` would return: the newest
-    `context-window.updated` with a valid `usedTokens`.
+    `context-window.updated` with a valid `usedTokens`, where "newest" means
+    last in canonical activity order (`sequence`, then `created_at`, then
+    `activity_id`, `repositories.rs:3398`). That's the same order the reader
+    scans backwards.
   - Per `providerInstanceId`, the row `deriveMcpStatusSnapshot` would return:
     the newest MCP status activity whose snapshot parses.
 
@@ -323,6 +326,13 @@ A checkpoint whose turn has no history row in the window is sent with
 200 for the rest. Its skeleton is about 200 bytes, counted in the open budget.
 
 A history page returns the full checkpoints of the turns its rows belong to.
+A page **only fills in file lists**. The window's checkpoint stays the
+authority for status, ref and completion (§8).
+
+A checkpoint can change after a page captured it. For example,
+`missing` → `ready` with files (`orchestration_effects.rs:1579`), or →
+`error`. In that case the window's entry changes, the page's copy no longer
+matches it, and the window's skeleton is shown until a matching copy arrives.
 
 ### 6. Wire contract (`packages/contracts`, schema only)
 
@@ -397,8 +407,13 @@ It's `None` unless the input has `history`.
   - With a valid `history.floor` whose `epoch` equals the thread's
     `history_epoch`, the server uses that floor instead. This keeps the pages
     the client already loaded contiguous across reconnects and restarts.
-  - If the rows at or above the client's floor would serialize over
-    `HISTORY_FLOOR_HONOUR_BYTES`, a fresh window is picked instead.
+  - The server picks a fresh window instead if the **complete candidate
+    value** under the client's floor would serialize over
+    `HISTORY_FLOOR_HONOUR_BYTES`. That value is every row that satisfies
+    `inWindow`: the `K` range, plus rows written after `openedAt`, plus live
+    rows. It also includes the carried rows and the turn index. A row that
+    streamed to 5 MiB below `floor.K` and then settled counts, so an honoured
+    floor never resends more than the cap.
   - A malformed or stale floor also gets a fresh window.
 - **Resume.** The logic is unchanged. The revision is computed over the window
   value, so a client that sends its floor and current revision gets
@@ -429,18 +444,27 @@ the same either way.
   - **Precedence:** window, then carried, then older. A copy from a
     lower-precedence source is dropped when a higher one holds the id. The
     window's copy is the server's current version.
-  - **Order:** older rows in page order, oldest page first, then carried rows
-    the window doesn't hold, then the window array in **its server order**.
-
-    Every row whose order the server defines by something other than
-    `createdAt` is a live message: queued messages sort by admission sequence
-    (`repositories.rs:3391`). Live messages are always in the window, and
-    neither pages nor `carried` hold messages, so the queue's admission order
-    reaches `selectQueuedMessages` unchanged. The queue head stays the head.
-    Activities, reasoning and plans already carry their own order keys, and
-    their readers sort or scan from the newest.
-  - **Checkpoints:** `window.checkpoints`, each replaced by
-    `older.checkpointsByTurnId[turnId]` when present.
+  - **Order:** each merged array is put in **the server's canonical order for
+    that collection**. Each source is already sorted, so this is a linear
+    merge of three sorted lists, not a concatenation:
+    - **Activities:** `sequence` (null first), then `createdAt`, then `id`,
+      as in `ACTIVITY_LIST_ORDER` (`repositories.rs:3398`). After a clock
+      correction, an effective status row can have the highest `sequence` but
+      a `createdAt` below the floor, so it's carried. It still lands last, and
+      the unchanged backward-scanning readers pick it.
+    - **Reasoning:** `createdAt`, then `id`.
+    - **Plans:** `id`, as in `in_canonical_order`.
+    - **Messages:** older rows, then the window array as the server ordered it.
+      Every row the server orders by something other than `createdAt` is a
+      live message: queued messages sort by admission sequence
+      (`repositories.rs:3391`). Live messages are always in the window, and
+      neither pages nor `carried` hold messages, so the queue's admission
+      order reaches `selectQueuedMessages` unchanged and the head stays the
+      head.
+  - **Checkpoints:** `window.checkpoints` is authoritative. A page's copy for
+    the same turn only supplies `files`, and only while its `checkpointRef`,
+    `status` and `filesTotal` all equal the window entry's. Otherwise the
+    window's entry is shown as it is.
   - **`history`:** `{ ...window.history, hasOlder, loadedFrom }`, where
     `loadedFrom` is the `K` of the oldest page row, or the window floor's `K`
     before any page loads, or `ALL` once nothing is older.
@@ -646,6 +670,9 @@ fixture, and the PR lowers that budget.
 - `written_sequence_survives_a_projection_rebuild`
 - `windowed_resubscribe_at_the_current_revision_sends_unchanged`
 - `windowed_resubscribe_with_its_floor_keeps_the_floor_after_a_change`
+- `a_resubscribe_whose_floor_admits_a_settled_oversized_row_gets_a_fresh_window`:
+  a row below `floor.K` streams past 4 MiB and settles, then the client
+  reconnects with its old floor.
 - `a_live_revert_rewindows_the_subscription`
 - `a_revert_lost_to_lag_rewindows_on_the_next_read`: overflow the broadcast
   receiver.
@@ -699,6 +726,12 @@ fixture, and the PR lowers that budget.
 - "a withdrawn queued message disappears and no page resurrects it"
 - "keeps the admission order of queued messages when one is backdated below
   the floor"
+- "merges activities in canonical order so a carried status with a higher
+  sequence wins". The clock-correction partition runs the real readers:
+  MCP `needs-auth` → `connected`, and context usage 2000 → 1000.
+- "a page checkpoint fills in files only while it matches the window's
+  checkpoint". A page captures `missing`, then the stream moves the window to
+  `ready` and to `error`.
 
 **Stale and duplicate answers:**
 
@@ -758,6 +791,32 @@ when unchanged", `reconnectRetention.test.ts` and `threads-atoms.test.ts`.
 - Manual: a remote environment at 3G. A long thread paints its last turns,
   scrolling up loads older ones without a jump, and a short thread looks as it
   did.
+
+## Verification by implementation
+
+The design is settled. The remaining edge cases are proven by these tests in
+the implementation PR. Each invariant names the test that fails if it breaks.
+
+| # | Invariant | Proving test |
+| --- | --- | --- |
+| 1 | Without `history`, the stream is byte-identical to today | `clients_without_the_history_flag_get_the_full_thread_byte_identical` |
+| 2 | The first payload stays within budget except for the bounded extras in §10 | `thread_window_over_budget_opens_under_the_byte_row_and_turn_budgets` |
+| 3 | Window plus pages equal the full thread: every row exactly once, in order | `history_pages_return_every_older_row_exactly_once_in_order` |
+| 4 | Rows only enter the window; nothing outside it is sent as removed | `windowed_stream_patches_a_new_message_and_never_removes_rows_outside_the_window` |
+| 5 | A row written after the window opened is in it, whatever its timestamp | `a_backdated_message_after_a_withdrawn_queued_message_joins_the_window` |
+| 6 | Every history write sets `written_sequence`, and a rebuild keeps it | `every_history_write_path_sets_written_sequence`, `written_sequence_survives_a_projection_rebuild` |
+| 7 | Live rows (streaming, deliveries) are always in the window, never in pages | `a_cold_open_includes_a_streaming_message_and_reasoning_row_that_predate_the_floor`, `history_pages_never_return_a_live_row` |
+| 8 | Every open request is available to the composer | `carried_rows_hold_every_open_request_below_the_floor`, `a_recovered_turnless_opencode_ask_below_the_floor_is_carried` |
+| 9 | Status readers select the same row as on a full thread | `carried_status_selection_matches_the_shared_fixture`, "merges activities in canonical order so a carried status with a higher sequence wins" |
+| 10 | The window's copy wins; a deleted row never comes back | "a window copy replaces the copy a page loaded", "a withdrawn queued message disappears and no page resurrects it" |
+| 11 | The queue keeps admission order | "keeps the admission order of queued messages when one is backdated below the floor" |
+| 12 | Window checkpoint metadata is authoritative | "a page checkpoint fills in files only while it matches the window's checkpoint" |
+| 13 | A revert, seen or missed, invalidates the window and the pages | `a_live_revert_rewindows_the_subscription`, `a_revert_lost_to_lag_rewindows_on_the_next_read`, `a_resubscribe_after_a_missed_revert_gets_a_fresh_window`, "drops loaded pages when a page answers stale" |
+| 14 | A stale or duplicate page answer is never applied | "drops a page that answers a superseded cursor or generation", "drops a page in flight when a snapshot moves the floor" |
+| 15 | Resume at the current revision answers `unchanged`, and loaded pages survive it | `windowed_resubscribe_at_the_current_revision_sends_unchanged`, "keeps loaded pages when a resubscribe is answered unchanged" |
+| 16 | An honoured floor never resends more than the reconnect cap | `a_resubscribe_whose_floor_admits_a_settled_oversized_row_gets_a_fresh_window` |
+| 17 | Paging makes progress and releases its loading state | "sends exactly N-1 page requests to reach the start of an N-page thread", the three `loadAllOlder` tests |
+| 18 | Loading a page keeps the reading position | "keeps the first visible row in place when an older page loads" |
 
 ## Options considered
 
@@ -860,3 +919,19 @@ when unchanged", `reconnectRetention.test.ts` and `threads-atoms.test.ts`.
    `carried-status.json` fixture runs against both the Rust selector and the
    web readers (§4). Tests: the malformed-newest test, the fixture parity
    tests, and the existing `contextWindow.test.ts` case.
+
+### Round 3 (`dc10cfdfe`)
+
+1. **A page's checkpoint overrode newer stream state.** Accepted. The window's
+   checkpoint is authoritative. A page copy only supplies `files` while its
+   ref, status and `filesTotal` match the window entry (§5, §8). Test: "a page
+   checkpoint fills in files only while it matches the window's checkpoint".
+2. **The merge could select stale status.** Accepted. Merged activities are
+   put back in canonical order (`sequence`, `createdAt`, `id`) by a linear
+   merge, and "newest valid" is defined in that same order (§4, §8). Test:
+   the clock-correction partition running the real readers.
+3. **The reconnect cap missed rows admitted by write sequence.** Accepted. The
+   cap measures the complete candidate value under the client's floor: the
+   `K` range, rows written after `openedAt`, live rows, carried rows and the
+   turn index (§7). Test:
+   `a_resubscribe_whose_floor_admits_a_settled_oversized_row_gets_a_fresh_window`.
