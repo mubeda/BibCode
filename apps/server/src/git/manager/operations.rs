@@ -2424,11 +2424,7 @@ pub async fn discard_paths(
     for path in &collapse_requested_paths(&request.paths) {
         // An entry stranded earlier in this batch is never touched again: its name now belongs
         // to something else, which a second trash or a permanent discard would remove.
-        if outcome
-            .kept_in_staging
-            .iter()
-            .any(|kept| path_matches(path, &kept.path) || path_matches(&kept.path, path))
-        {
+        if overlaps_stranded(path, &outcome.kept_in_staging) {
             continue;
         }
         let absolute_path = request.cwd.join(path);
@@ -2522,6 +2518,18 @@ pub async fn discard_paths(
         outcome.trash_unavailable.extend(kept);
     }
     Ok(outcome)
+}
+
+/// Whether `path` is, holds or lies inside an entry in `stranded`. Compared without regard to
+/// letter case on every platform: a case-insensitive volume (macOS, Windows) reaches the same
+/// replacement file through `X.txt` as through `x.txt`, and skipping more only leaves an entry
+/// in place.
+fn overlaps_stranded(path: &str, stranded: &[KeptInStaging]) -> bool {
+    let path = path.to_lowercase();
+    stranded.iter().any(|kept| {
+        let kept = kept.path.to_lowercase();
+        path_matches(&path, &kept) || path_matches(&kept, &path)
+    })
 }
 
 /// The requested paths, each once and in order, without the ones a requested folder covers: a
@@ -4917,6 +4925,27 @@ mod tests {
             "new\n",
             "the file that took the name survives"
         );
+    }
+
+    /// A path that overlaps an entry stranded earlier in the batch is skipped, whatever its case.
+    #[test]
+    fn a_path_overlapping_a_stranded_entry_is_skipped_without_regard_to_case() {
+        let stranded = [KeptInStaging {
+            path: "Dir/Victim.txt".into(),
+            staged_at: "bibcode-discard/0f3a/Victim.txt".into(),
+        }];
+        for overlapping in [
+            "Dir/Victim.txt",
+            "dir/victim.txt",
+            "DIR",
+            "dir",
+            "DIR/VICTIM.TXT/inner",
+        ] {
+            assert!(overlaps_stranded(overlapping, &stranded), "{overlapping}");
+        }
+        for apart in ["Dir/Other.txt", "Direct", "victim.txt"] {
+            assert!(!overlaps_stranded(apart, &stranded), "{apart}");
+        }
     }
 
     /// A path a requested folder covers, and one named twice, are discarded with the folder or
