@@ -59,7 +59,7 @@ fn every_client_tool_has_its_own_entry_in_the_mcp_reference() {
 }
 
 /// The lines of the `` #### `name` `` entry in `text`, up to the next heading.
-fn tool_section<'a>(text: &'a str, name: &str) -> String {
+fn tool_section(text: &str, name: &str) -> String {
     let heading = format!("#### `{name}`");
     text.lines()
         .skip_while(|line| *line != heading)
