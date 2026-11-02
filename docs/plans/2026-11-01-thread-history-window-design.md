@@ -543,7 +543,7 @@ the same either way.
 
 ### 10. Budget
 
-These are provisional, T3's numbers. They're confirmed from #225's p50/p99
+These are provisional numbers taken from a reference implementation. They're confirmed from #225's p50/p99
 big-thread sizes before code.
 
 | Constant                     | Value   | Covers                                                                                                        |
