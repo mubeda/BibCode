@@ -1,6 +1,6 @@
 # Codex MCP Registration Collision (#273)
 
-Status: Proposed 2026-11-02, awaiting Mauro's approval. Design for issue 273,
+Status: Approved by Mauro 2026-11-02, option A (Codex review rounds 1-3). Design for issue 273,
 verified against `main` at `fd98b4330` with codex-cli 0.166.0.
 
 ## Problem
@@ -116,6 +116,14 @@ These keep registration as it is and follow the issue's scope.
    last error as its reason, so an unrecognised deterministic failure can no
    longer launch processes without limit. A manual Retry starts the count again.
    Transient failures that clear sooner are unaffected.
+   - **Restart recovery.** A delivery left `sending` by a crash is reconciled
+     on restart, and today a Codex launch error there becomes `Unavailable`,
+     which keeps the row `sending` and retries without limit or attempt count
+     (`turn_delivery.rs`, `recover_sending`). A reconciliation launch that fails
+     with `ProviderConfiguration` instead gets its own outcome and moves the row
+     to `Uncertain` with the detail: whether the original send reached Codex is
+     unknown, so nothing is sent again automatically, and the existing Retry and
+     Dismiss actions decide. Other `Unavailable` cases keep today's behaviour.
 3. **Profiler.** A new `delivery.failing` finding, recorded once per delivery
    when it is rejected for a provider configuration error or reaches the attempt
    bound. Fields: provider, attempts, a redacted error class
@@ -137,6 +145,8 @@ These keep registration as it is and follow the issue's scope.
    - An `app-server` that exits before `initialize`, with or without a config
      message on stderr, stays transient and is failed by the attempt bound.
    - The attempt bound fails a delivery after the twentieth `DefinitelyNotSent`.
+   - Restart with a persisted `sending` row and a config-load failure: the row
+     becomes `Uncertain` with the detail after one launch, and no send repeats.
 
 ## Not in scope
 
@@ -175,3 +185,9 @@ Codex, round 2 (REVISE):
   fills `error` for `delivery_failed`, with a fresh-thread test.
 - P2, classifying an early exit from stderr races stdout's end: accepted. Early
   exits are no longer classified; the attempt bound ends them, with a test.
+
+Codex, round 3 (REVISE, final round):
+
+- P2, restart recovery of a `sending` row bypasses classification and the
+  bound: accepted and verified in `recover_sending`. Added the recovery bullet
+  and its restart test.
