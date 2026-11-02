@@ -1680,6 +1680,15 @@ mod tests {
                 Some("claude-native"),
             ),
             (
+                // `std::fs::canonicalize` returns the verbatim form on Windows.
+                "C:/Users/me/.local/bin/claude.exe",
+                Some("//?/C:/Users/me/.local/bin/claude.exe"),
+                &latest,
+                Some(LatestVersionSource::Claude(ClaudeReleaseChannel::Latest)),
+                Some("C:/Users/me/.local/bin/claude.exe update"),
+                Some("claude-native"),
+            ),
+            (
                 "/opt/homebrew/bin/claude",
                 Some("/opt/homebrew/Caskroom/claude-code/2.1.220/claude"),
                 &stable,
