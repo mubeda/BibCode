@@ -483,8 +483,8 @@ impl HistoryWindow {
 
     /// Applies the window to a full thread value `{snapshotSequence, thread}`.
     pub(super) fn apply(&mut self, full: &Value, marks: &ThreadHistoryMarks) -> (Value, bool) {
-        let metas = row_metas(&full["thread"], &marks);
-        let carried = carried_selection(&full["thread"], &marks);
+        let metas = row_metas(&full["thread"], marks);
+        let carried = carried_selection(&full["thread"], marks);
         let opened_at = full["snapshotSequence"].as_i64().unwrap_or(0);
         let fresh = |metas: &[RowMeta]| choose_floor(full, metas, &carried, opened_at, marks.epoch);
         let (floor, rewindowed) = match self.floor.take() {
