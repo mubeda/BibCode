@@ -1159,31 +1159,65 @@ fn shell_stream(
     engine: OrchestrationEngine,
     cancellation: CancellationToken,
 ) -> mpsc::Receiver<RpcStreamChunk> {
-    let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
     // Subscribe before loading the initial snapshot so an event committed in
     // between is queued for the stream instead of disappearing in that gap.
-    let mut events = engine.subscribe_events();
+    let events = engine.subscribe_events();
+    shell_stream_with_events(engine, events, cancellation)
+}
+
+/// `shell_stream` over the given event receiver; tests pass a small one to make it lag.
+fn shell_stream_with_events(
+    engine: OrchestrationEngine,
+    mut events: broadcast::Receiver<OrchestrationEvent>,
+    cancellation: CancellationToken,
+) -> mpsc::Receiver<RpcStreamChunk> {
+    let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
     tokio::spawn(async move {
-        if send_snapshot(&sender, shell_snapshot(&engine, false).await, None)
-            .await
-            .is_err()
-        {
+        // Random keys, secret to this stream, as for `HeldThread`.
+        let keys = std::hash::RandomState::new();
+        let first = shell_snapshot(&engine, false).await;
+        let mut held = first.as_ref().ok().map(|shell| HeldShell::of(shell, &keys));
+        if send_snapshot(&sender, first, None).await.is_err() {
             return;
         }
-        // A burst of events yields one trailing snapshot: every event changed the
-        // shell, but re-sending it per event saturated slow remote links (#89).
+        // A burst of events yields one trailing update: every event changed the shell, but
+        // re-sending it per event saturated slow remote links (#89).
         let mut due: Option<tokio::time::Instant> = None;
+        // Lost events: send a whole snapshot rather than trust a comparison.
+        let mut lagged = false;
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 () = async { tokio::time::sleep_until(due.expect("guarded")).await }, if due.is_some() => {
                     due = None;
-                    if send_snapshot(&sender, shell_snapshot(&engine, false).await, None).await.is_err() {
+                    let next = shell_snapshot(&engine, false).await;
+                    let next_held = next.as_ref().ok().map(|shell| HeldShell::of(shell, &keys));
+                    // Only the projects and threads that changed or left (#223): the whole
+                    // list per update re-sent every thread while one streamed.
+                    let delta = match (&next, &held, &next_held) {
+                        (Ok(next), Some(held), Some(next_held)) if !lagged => {
+                            held.delta(next, next_held)
+                        }
+                        _ => None,
+                    };
+                    lagged = false;
+                    let sent = match delta {
+                        // Nothing changed: the client keeps what it holds, sequence included.
+                        Some(items) if items.is_empty() => continue,
+                        Some(items) => sender.send(Ok(items)).await.map_err(|_| ()),
+                        None => send_snapshot(&sender, next, None).await,
+                    };
+                    if sent.is_err() {
                         return;
                     }
+                    held = next_held;
                 }
                 event = events.recv() => match event {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    Ok(_) => {
+                        due.get_or_insert_with(|| tokio::time::Instant::now() + SHELL_SNAPSHOT_COALESCE);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        lagged = true;
                         due.get_or_insert_with(|| tokio::time::Instant::now() + SHELL_SNAPSHOT_COALESCE);
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -1192,6 +1226,97 @@ fn shell_stream(
         }
     });
     receiver
+}
+
+/// What a shell subscriber keeps of the last shell it sent: a fingerprint of each project and
+/// thread by id, never the shell itself, and the sequence the client then holds.
+struct HeldShell {
+    projects: HashMap<String, u64>,
+    threads: HashMap<String, u64>,
+    sequence: i64,
+}
+
+impl HeldShell {
+    fn of(shell: &Value, keys: &std::hash::RandomState) -> Self {
+        let held = |list: &str| {
+            shell[list]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.to_owned();
+                    Some((id, shell_entry_fingerprint(keys, entry)))
+                })
+                .collect()
+        };
+        Self {
+            projects: held("projects"),
+            threads: held("threads"),
+            sequence: shell["snapshotSequence"].as_i64().unwrap_or(0),
+        }
+    }
+
+    /// The items that turn this shell into `next` (held as `next_held`): upserts for the
+    /// projects and threads that changed or appeared, then removals for those that left. They
+    /// take consecutive sequences ending at `next`'s, so the client's reducer, which drops an
+    /// item at or below the sequence it holds, applies each one. `None` when they do not fit
+    /// above the sequence the client holds; the caller then sends a snapshot.
+    fn delta(&self, next: &Value, next_held: &Self) -> Option<Vec<Value>> {
+        let mut items = Vec::new();
+        // Projects first, so a new thread's project is there when the thread arrives.
+        for (list, before, after, kind, field) in [
+            (
+                "projects",
+                &self.projects,
+                &next_held.projects,
+                "project-upserted",
+                "project",
+            ),
+            (
+                "threads",
+                &self.threads,
+                &next_held.threads,
+                "thread-upserted",
+                "thread",
+            ),
+        ] {
+            for entry in next[list].as_array().into_iter().flatten() {
+                let id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
+                if before.get(id) != after.get(id) {
+                    items.push(json!({ "kind": kind, field: entry }));
+                }
+            }
+        }
+        for (before, after, kind, field) in [
+            (
+                &self.threads,
+                &next_held.threads,
+                "thread-removed",
+                "threadId",
+            ),
+            (
+                &self.projects,
+                &next_held.projects,
+                "project-removed",
+                "projectId",
+            ),
+        ] {
+            items.extend(
+                before
+                    .keys()
+                    .filter(|id| !after.contains_key(*id))
+                    .map(|id| json!({ "kind": kind, field: id })),
+            );
+        }
+        let first = next_held.sequence - i64::try_from(items.len()).ok()? + 1;
+        if !items.is_empty() && first <= self.sequence {
+            return None;
+        }
+        for (sequence, item) in (first..).zip(&mut items) {
+            item["sequence"] = json!(sequence);
+        }
+        Some(items)
+    }
 }
 
 /// How long a thread stream gathers its events before one update; short enough
@@ -1345,6 +1470,22 @@ fn fingerprint(keys: &std::hash::RandomState, value: &Value) -> u64 {
     hasher.finish()
 }
 
+/// A shell project's or thread's fingerprint, without `lastActivityAgeMs`: that age grows on
+/// every rebuild, and the client ages it from its own receipt of the value.
+fn shell_entry_fingerprint(keys: &std::hash::RandomState, entry: &Value) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = keys.build_hasher();
+    for (key, field) in entry.as_object().into_iter().flatten() {
+        if key != "lastActivityAgeMs" {
+            hasher.write_usize(key.len());
+            hasher.write(key.as_bytes());
+            hasher.write_u64(fingerprint(keys, field));
+        }
+    }
+    hasher.finish()
+}
+
 /// The change from the thread snapshot a subscriber holds to `next`
 /// (`{snapshotSequence, thread}`), as a `patch` stream item, or `None` when nothing changed.
 /// Changed fields are replaced whole, except arrays: they send their new length and only the
@@ -1399,7 +1540,7 @@ fn thread_patch(held: &HeldThread, next: &Value) -> Option<Value> {
     }))
 }
 
-/// How long the shell stream gathers events before sending one snapshot.
+/// How long the shell stream gathers events before sending one update.
 const SHELL_SNAPSHOT_COALESCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn thread_stream(
@@ -1951,8 +2092,8 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
 }
 
 /// One pass over messages and activities so shell building stays
-/// O(messages + activities + threads) even though every engine event
-/// re-sends the full shell snapshot.
+/// O(messages + activities + threads) even though every coalesced shell update
+/// re-reads the whole live shell.
 fn build_conversation_previews(
     snapshot: &crate::orchestration::Snapshot,
 ) -> HashMap<&str, ConversationPreview> {
@@ -7448,7 +7589,7 @@ mod tests {
         replace(fixture, &stable)
     }
 
-    /// A burst of events yields one shell snapshot, not one per event.
+    /// A burst of events yields one shell update, not one per event.
     #[tokio::test]
     async fn shell_stream_coalesces_event_bursts() {
         let engine = migrated_engine().await;
@@ -7461,15 +7602,333 @@ mod tests {
             rename(&engine, &thread_id, index).await;
         }
         let latest = next_items(&mut stream).await;
-        assert_eq!(latest[0]["kind"], "snapshot");
+        assert_eq!(latest[0]["kind"], "thread-upserted");
         tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 3).await;
-        let mut snapshots = 1;
+        let mut updates = 1;
         while let Ok(Some(_)) = stream.try_recv().map(Some) {
-            snapshots += 1;
+            updates += 1;
         }
-        assert!(snapshots <= 2, "{snapshots} shell snapshots for one burst");
+        assert!(updates <= 2, "{updates} shell updates for one burst");
         cancellation.cancel();
         engine.shutdown().await;
+    }
+
+    /// Creates a live thread in the `project` of `created_project_thread`.
+    async fn create_thread(engine: &OrchestrationEngine, thread_id: &str) {
+        engine
+            .dispatch(decode_command(json!({
+                "type": "thread.create",
+                "commandId": format!("create-{thread_id}"),
+                "threadId": thread_id,
+                "projectId": "project",
+                "title": thread_id,
+                "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "runtimeMode": "full-access",
+                "branch": null,
+                "worktreePath": null,
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("thread created");
+    }
+
+    /// Waits past one coalesce window, then asserts the stream sent nothing.
+    async fn assert_shell_quiet(stream: &mut mpsc::Receiver<RpcStreamChunk>) {
+        tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 3).await;
+        let sent = stream.try_recv().ok();
+        assert!(sent.is_none(), "unexpected shell items: {sent:?}");
+    }
+
+    /// The shell a client holds after applying `items` to `shell`, as `applyShellStreamEvent`
+    /// does: a snapshot replaces it; an event applies only above the held sequence.
+    fn apply_shell_items(mut shell: Value, items: &[Value]) -> Value {
+        for item in items {
+            let kind = item["kind"].as_str().expect("item kind");
+            if kind == "snapshot" {
+                shell = item["snapshot"].clone();
+                continue;
+            }
+            let sequence = item["sequence"].as_i64().expect("item sequence");
+            if sequence <= shell["snapshotSequence"].as_i64().expect("held sequence") {
+                continue;
+            }
+            let (list, id, entry) = match kind {
+                "project-upserted" => ("projects", &item["project"]["id"], Some(&item["project"])),
+                "thread-upserted" => ("threads", &item["thread"]["id"], Some(&item["thread"])),
+                "project-removed" => ("projects", &item["projectId"], None),
+                "thread-removed" => ("threads", &item["threadId"], None),
+                other => panic!("unknown shell item {other}"),
+            };
+            let entries = shell[list].as_array_mut().expect("shell list");
+            let position = entries.iter().position(|held| held["id"] == *id);
+            match (position, entry) {
+                (Some(position), Some(entry)) => entries[position] = entry.clone(),
+                (None, Some(entry)) => entries.push(entry.clone()),
+                (Some(position), None) => {
+                    entries.remove(position);
+                }
+                (None, None) => {}
+            }
+            shell["snapshotSequence"] = json!(sequence);
+        }
+        shell
+    }
+
+    /// A shell without the fields that change with the clock, its lists sorted by id.
+    fn comparable_shell(mut shell: Value) -> Value {
+        shell.as_object_mut().expect("shell").remove("updatedAt");
+        for list in ["projects", "threads"] {
+            let entries = shell[list].as_array_mut().expect("shell list");
+            entries.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            for entry in entries {
+                entry
+                    .as_object_mut()
+                    .expect("entry")
+                    .remove("lastActivityAgeMs");
+            }
+        }
+        shell
+    }
+
+    /// After the first snapshot, renaming one thread sends that thread alone (#223): the
+    /// whole list per update re-sent every thread while only one changed.
+    #[tokio::test]
+    async fn shell_stream_sends_one_upsert_for_a_renamed_thread() {
+        let engine = migrated_engine().await;
+        let thread_id = created_project_thread(&engine).await;
+        create_thread(&engine, "other").await;
+        let cancellation = CancellationToken::new();
+        let mut stream = shell_stream(engine.clone(), cancellation.clone());
+        let first = next_items(&mut stream).await;
+        assert_eq!(first[0]["kind"], "snapshot");
+        let held = first[0]["snapshot"]["snapshotSequence"].as_i64().unwrap();
+
+        rename(&engine, &thread_id, 1).await;
+        let items = next_items(&mut stream).await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["kind"], "thread-upserted");
+        assert_eq!(items[0]["thread"]["id"], json!(thread_id));
+        assert_eq!(items[0]["thread"]["title"], "Title 1");
+        assert!(items[0]["sequence"].as_i64().unwrap() > held);
+        assert_shell_quiet(&mut stream).await;
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// Archiving or deleting a thread takes it out of the live shell with `thread-removed`.
+    #[tokio::test]
+    async fn shell_stream_removes_archived_and_deleted_threads() {
+        let engine = migrated_engine().await;
+        created_project_thread(&engine).await;
+        create_thread(&engine, "archived").await;
+        create_thread(&engine, "deleted").await;
+        let cancellation = CancellationToken::new();
+        let mut stream = shell_stream(engine.clone(), cancellation.clone());
+        assert_eq!(next_items(&mut stream).await[0]["kind"], "snapshot");
+
+        for (command, thread_id) in [("thread.archive", "archived"), ("thread.delete", "deleted")] {
+            engine
+                .dispatch(decode_command(json!({
+                    "type": command,
+                    "commandId": format!("{command}-{thread_id}"),
+                    "threadId": thread_id,
+                })))
+                .await
+                .expect("thread leaves the live shell");
+            let items = next_items(&mut stream).await;
+            assert_eq!(
+                items,
+                [json!({
+                    "kind": "thread-removed",
+                    "sequence": items[0]["sequence"],
+                    "threadId": thread_id,
+                })]
+            );
+        }
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// An event that changes nothing the live shell shows sends nothing: here a rename of an
+    /// archived thread, which only the archived shell lists.
+    #[tokio::test]
+    async fn shell_stream_sends_nothing_for_an_event_outside_the_shell() {
+        let engine = migrated_engine().await;
+        created_project_thread(&engine).await;
+        create_thread(&engine, "archived").await;
+        engine
+            .dispatch(decode_command(
+                json!({"type":"thread.archive","commandId":"archive","threadId":"archived"}),
+            ))
+            .await
+            .expect("thread archived");
+        let cancellation = CancellationToken::new();
+        let mut stream = shell_stream(engine.clone(), cancellation.clone());
+        assert_eq!(next_items(&mut stream).await[0]["kind"], "snapshot");
+
+        rename(&engine, "archived", 1).await;
+        assert_shell_quiet(&mut stream).await;
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// Thread shells that differ only by `lastActivityAgeMs`, which grows with the clock,
+    /// are unchanged: the client ages that value from its own receipt.
+    #[test]
+    fn shell_entry_fingerprints_ignore_the_activity_age() {
+        let keys = std::hash::RandomState::new();
+        let shell =
+            json!({ "id": "thread", "lastActivityAt": CREATED_AT, "lastActivityAgeMs": 10 });
+        let older =
+            json!({ "id": "thread", "lastActivityAt": CREATED_AT, "lastActivityAgeMs": 900 });
+        let moved = json!({ "id": "thread", "lastActivityAt": "2026-07-12T00:00:00.000Z", "lastActivityAgeMs": 10 });
+        assert_eq!(
+            shell_entry_fingerprint(&keys, &shell),
+            shell_entry_fingerprint(&keys, &older)
+        );
+        assert_ne!(
+            shell_entry_fingerprint(&keys, &shell),
+            shell_entry_fingerprint(&keys, &moved)
+        );
+    }
+
+    /// A receiver that lagged lost events; the stream answers with a whole snapshot instead
+    /// of trusting a comparison.
+    #[tokio::test]
+    async fn shell_stream_answers_a_lagged_receiver_with_a_snapshot() {
+        let engine = migrated_engine().await;
+        let thread_id = created_project_thread(&engine).await;
+        let mut tap = engine.subscribe_events();
+        let (events, receiver) = broadcast::channel(1);
+        let cancellation = CancellationToken::new();
+        let mut stream = shell_stream_with_events(engine.clone(), receiver, cancellation.clone());
+        assert_eq!(next_items(&mut stream).await[0]["kind"], "snapshot");
+
+        rename(&engine, &thread_id, 1).await;
+        let event = tap.recv().await.expect("rename event");
+        // Two sends into a channel of one: the stream's receiver lags by one.
+        events.send(event.clone()).expect("send");
+        events.send(event).expect("send");
+        let items = next_items(&mut stream).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "snapshot");
+        assert_eq!(
+            items[0]["snapshot"]["threads"][0]["title"], "Title 1",
+            "{items:?}"
+        );
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// Items carry strictly increasing sequences above the snapshot's, so the client's reducer
+    /// applies each one and drops a duplicate, and applying them rebuilds exactly the shell a
+    /// new subscriber would get.
+    #[tokio::test]
+    async fn shell_stream_item_sequences_increase_and_rebuild_the_shell() {
+        let engine = migrated_engine().await;
+        let thread_id = created_project_thread(&engine).await;
+        create_thread(&engine, "second").await;
+        create_thread(&engine, "removed").await;
+        let cancellation = CancellationToken::new();
+        let mut stream = shell_stream(engine.clone(), cancellation.clone());
+        let first = next_items(&mut stream).await;
+        let mut held = first[0]["snapshot"].clone();
+        let mut last = held["snapshotSequence"].as_i64().unwrap();
+
+        // One burst: two renames, a new thread and a deletion.
+        rename(&engine, &thread_id, 1).await;
+        rename(&engine, "second", 2).await;
+        create_thread(&engine, "added").await;
+        engine
+            .dispatch(decode_command(
+                json!({"type":"thread.delete","commandId":"delete","threadId":"removed"}),
+            ))
+            .await
+            .expect("thread deleted");
+        tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 3).await;
+        let mut items = Vec::new();
+        while let Ok(chunk) = stream.try_recv() {
+            items.extend(chunk.expect("a successful chunk"));
+        }
+        assert!(items.len() >= 4, "{items:?}");
+        assert!(
+            items.iter().all(|item| item["kind"] != "snapshot"),
+            "{items:?}"
+        );
+        for item in &items {
+            let sequence = item["sequence"].as_i64().unwrap();
+            assert!(sequence > last, "{items:?}");
+            last = sequence;
+        }
+        held = apply_shell_items(held, &items);
+        // Delivered twice, as after a duplicate: the second copy changes nothing.
+        assert_eq!(apply_shell_items(held.clone(), &items), held);
+        let fresh = shell_snapshot(&engine, false).await.unwrap();
+        assert_eq!(held["snapshotSequence"], fresh["snapshotSequence"]);
+        assert_eq!(comparable_shell(held), comparable_shell(fresh));
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// #223 baseline and result: what the shell stream sends while one thread streams for a
+    /// turn, at 30 and 150 threads. Prints counts, bytes and durations only; run with
+    /// `cargo test -p bibcode-server --lib shell_stream_traffic -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "simulates a 10 s turn per store size; run by hand for numbers"]
+    async fn shell_stream_traffic_during_a_streaming_turn() {
+        const TURN: Duration = Duration::from_secs(10);
+        const EVENT_INTERVAL: Duration = Duration::from_millis(50);
+        for threads in [30_usize, 150] {
+            let engine = migrated_engine().await;
+            let thread_id = created_project_thread(&engine).await;
+            for index in 1..threads {
+                create_thread(&engine, &format!("thread-{index:03}")).await;
+            }
+            let rebuilds = 5_u32;
+            let started = std::time::Instant::now();
+            for _ in 0..rebuilds {
+                shell_snapshot(&engine, false).await.expect("shell");
+            }
+            let rebuild = started.elapsed() / rebuilds;
+
+            let cancellation = CancellationToken::new();
+            let mut stream = shell_stream(engine.clone(), cancellation.clone());
+            let first = serde_json::to_vec(&next_items(&mut stream).await[0])
+                .unwrap()
+                .len();
+            let counter = tokio::spawn(async move {
+                let (mut items, mut bytes) = (0_usize, 0_usize);
+                while let Some(Ok(chunk)) = stream.recv().await {
+                    items += chunk.len();
+                    bytes += chunk
+                        .iter()
+                        .map(|item| serde_json::to_vec(item).unwrap().len())
+                        .sum::<usize>();
+                }
+                (items, bytes)
+            });
+            // A streaming turn: one thread's shell changes every 50 ms.
+            let started = std::time::Instant::now();
+            let mut index = 0;
+            while started.elapsed() < TURN {
+                rename(&engine, &thread_id, index).await;
+                index += 1;
+                tokio::time::sleep(EVENT_INTERVAL).await;
+            }
+            let elapsed = started.elapsed();
+            tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 2).await;
+            cancellation.cancel();
+            let (items, bytes) = counter.await.unwrap();
+            println!(
+                "{threads} threads: first snapshot {first} B; {index} events in {:.1} s sent \
+                 {items} items ({:.2}/s), {bytes} B ({} B/item); rebuild {:.1} ms",
+                elapsed.as_secs_f64(),
+                items as f64 / elapsed.as_secs_f64(),
+                bytes.checked_div(items).unwrap_or(0),
+                rebuild.as_secs_f64() * 1e3,
+            );
+            engine.shutdown().await;
+        }
     }
 
     /// Creates a thread and deletes it: a view that still shows it keeps subscribing.

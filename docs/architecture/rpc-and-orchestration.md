@@ -2681,7 +2681,27 @@ initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery. Live
 updates are coalesced: a thread stream re-reads its thread 100 ms after the
 first of a burst of its events, and the shell stream re-reads the shell
-500 ms after the first event of a burst. A thread subscriber that sends
+500 ms after the first event of a burst. After its first snapshot the shell
+stream sends only what changed (#223). Per subscription it keeps a keyed
+64-bit fingerprint of each project and thread shell it last sent, never the
+shell itself, and leaves `lastActivityAgeMs` out of it: that age grows on every
+re-read, and the client ages the status from its own receipt of the value. Each
+re-read sends, in one chunk, `project-upserted` and `thread-upserted` for the
+entries that changed or appeared, then `thread-removed` and `project-removed`
+for those that left the live shell (deleted, archived, or in a deleted
+project). A re-read that changes nothing sends nothing. The items take
+consecutive sequences ending at the re-read shell's `snapshotSequence`, so the
+client's reducer, which drops an item at or below the sequence it holds,
+applies each item once, drops a redelivered one, and ends at the sequence a new
+snapshot would carry. The stream sends a whole snapshot instead, which the
+client takes as is, when the items do not fit above the sequence the client
+holds, when its event receiver lagged, or after a failed re-read. Every
+subscription, including each one after a reconnect, starts with a snapshot, so
+a client cannot miss a delta between streams. Every released client decodes and
+applies these items (the union and its reducer predate them), so no input flag
+gates them; an older server keeps sending snapshots. The stream still re-reads
+the whole live shell for each update; only what it sends changed.
+A thread subscriber that sends
 `patches: true` then receives a `patch` item against the snapshot it holds:
 changed fields are replaced, removed fields listed, and each changed array
 sends its new length and only the entries that differ, by index, so an

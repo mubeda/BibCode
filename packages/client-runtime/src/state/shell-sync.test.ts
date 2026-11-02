@@ -2,6 +2,8 @@ import {
   EnvironmentId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
+  ProviderInstanceId,
+  ThreadId,
   type OrchestrationShellSnapshot,
   type OrchestrationShellStreamItem,
 } from "@bibcode/contracts";
@@ -388,6 +390,139 @@ describe("environment shell synchronization", () => {
         yield* TestClock.adjust("1 second");
         expect(yield* SubscriptionRef.get(shellState)).toBe(liveAfterDelta);
         expect(yield* Ref.get(savedSequences)).toEqual(savesBeforeIgnoredDeltas);
+      }),
+  );
+
+  it.effect(
+    "applies the server's delta items after its snapshot, drops their redelivery and takes a resync snapshot",
+    () =>
+      Effect.gen(function* () {
+        const events = yield* Queue.unbounded<OrchestrationShellStreamItem>();
+        const client = {
+          [ORCHESTRATION_WS_METHODS.subscribeShell]: () => Stream.fromQueue(events),
+        } as unknown as WsRpcProtocolClient;
+        const supervisorState = yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE);
+        const activeSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+          Option.some(session(client)),
+        );
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: supervisorState,
+          session: activeSession,
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const savedSequences = yield* Ref.make<ReadonlyArray<number>>([]);
+        const cache = Persistence.EnvironmentCacheStore.of({
+          loadShell: () => Effect.succeed(Option.none()),
+          saveShell: (_environmentId, snapshot) =>
+            Ref.update(savedSequences, (sequences) => [...sequences, snapshot.snapshotSequence]),
+          loadThread: () => Effect.succeed(Option.none()),
+          saveThread: () => Effect.void,
+          removeThread: () => Effect.void,
+          clear: () => Effect.void,
+        });
+        const shellState = yield* makeEnvironmentShellState().pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        );
+        yield* SubscriptionRef.set(supervisorState, {
+          desired: true,
+          network: "online",
+          phase: "connected",
+          stage: null,
+          attempt: 1,
+          generation: 1,
+          lastFailure: null,
+          retryAt: null,
+        });
+        yield* yieldForShell;
+        const thread = (id: string, title: string) => ({
+          id: ThreadId.make(id),
+          projectId: CACHED_PROJECT.id,
+          title,
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: null,
+          worktreePath: null,
+          latestTurn: null,
+          createdAt: "2026-06-01T00:00:00.000Z",
+          updatedAt: "2026-06-01T00:00:00.000Z",
+          archivedAt: null,
+          session: null,
+          latestUserMessageAt: null,
+          hasPendingApprovals: false,
+          hasPendingUserInput: false,
+          hasActionableProposedPlan: false,
+        });
+        const sequenceReaches = (sequence: number) =>
+          SubscriptionRef.changes(shellState).pipe(
+            Stream.filter(
+              (state) =>
+                Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === sequence,
+            ),
+            Stream.runHead,
+          );
+
+        yield* Queue.offer(events, {
+          kind: "snapshot",
+          snapshot: {
+            ...LIVE_SHELL_SNAPSHOT,
+            snapshotSequence: 4,
+            projects: [CACHED_PROJECT],
+            threads: [thread("streaming", "Before"), thread("archived", "Archived")],
+          },
+        });
+        yield* sequenceReaches(4);
+        const deltas: ReadonlyArray<OrchestrationShellStreamItem> = [
+          {
+            kind: "thread-upserted",
+            sequence: 6,
+            thread: {
+              ...thread("streaming", "During"),
+              lastActivityAt: "2026-06-01T00:00:05.000Z",
+              lastActivityAgeMs: 800,
+            },
+          },
+          { kind: "thread-removed", sequence: 7, threadId: ThreadId.make("archived") },
+        ];
+        yield* Queue.offerAll(events, deltas);
+        yield* sequenceReaches(7);
+        yield* TestClock.adjust("1 second");
+        const afterDeltas = yield* SubscriptionRef.get(shellState);
+        expect(afterDeltas.status).toBe("live");
+        expect(Option.getOrThrow(afterDeltas.snapshot).threads).toEqual([
+          expect.objectContaining({ id: "streaming", title: "During", lastActivityAgeMs: 800 }),
+        ]);
+        expect((yield* Ref.get(savedSequences)).at(-1)).toBe(7);
+
+        // A duplicate delivery publishes and persists nothing.
+        const savesBeforeDuplicate = yield* Ref.get(savedSequences);
+        yield* Queue.offerAll(events, deltas);
+        yield* yieldForShell;
+        yield* TestClock.adjust("1 second");
+        expect(yield* SubscriptionRef.get(shellState)).toBe(afterDeltas);
+        expect(yield* Ref.get(savedSequences)).toEqual(savesBeforeDuplicate);
+
+        // After the server's receiver lagged it sends a whole snapshot, which replaces the shell.
+        yield* Queue.offer(events, {
+          kind: "snapshot",
+          snapshot: {
+            ...LIVE_SHELL_SNAPSHOT,
+            snapshotSequence: 12,
+            projects: [CACHED_PROJECT],
+            threads: [thread("streaming", "Resynced")],
+          },
+        });
+        yield* sequenceReaches(12);
+        const resynced = yield* SubscriptionRef.get(shellState);
+        expect(resynced.status).toBe("live");
+        expect(Option.getOrThrow(resynced.snapshot).threads.map((entry) => entry.title)).toEqual([
+          "Resynced",
+        ]);
       }),
   );
 

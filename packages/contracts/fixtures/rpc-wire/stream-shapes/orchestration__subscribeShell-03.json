@@ -1,0 +1,49 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "thread-upserted",
+      "sequence": 4,
+      "thread": {
+        "id": "{bvEq4(Yke",
+        "projectId": "4294967295",
+        "title": "-1",
+        "modelSelection": {
+          "instanceId": "mLpO08M6oy",
+          "model": "",
+          "options": [
+            {
+              "id": "]f25iS:s57",
+              "value": "qGQjr:"
+            },
+            {
+              "id": ";xUg2;",
+              "value": "4294967295"
+            }
+          ]
+        },
+        "runtimeMode": "approval-required",
+        "interactionMode": "plan",
+        "branch": null,
+        "worktreePath": null,
+        "latestTurn": {
+          "turnId": "",
+          "state": "running",
+          "requestedAt": "😀",
+          "startedAt": "\"5|Y91//xO",
+          "completedAt": "FEb1ueIQ/3",
+          "assistantMessageId": null
+        },
+        "createdAt": "'RfU+'P",
+        "updatedAt": "+-Ff$T`@yt",
+        "archivedAt": "",
+        "session": null,
+        "latestUserMessageAt": null,
+        "hasPendingApprovals": true,
+        "hasPendingUserInput": true,
+        "hasActionableProposedPlan": true
+      }
+    }
+  ]
+}
