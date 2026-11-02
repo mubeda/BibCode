@@ -212,14 +212,30 @@ const MAX_SKILL_SCAN_ENTRIES: usize = 10_000;
 /// already walked tree costs nothing and the budget covers the whole scan.
 #[derive(Default)]
 struct SkillScan {
-    /// Shallowest depth each canonical folder was explored at. A folder is entered
-    /// again only from a shallower depth, because the depth limit may have cut off
-    /// part of it the first time.
-    visited: HashMap<PathBuf, usize>,
+    /// Each canonical folder's last visit. A folder whose walk the depth limit cut
+    /// off somewhere below it is entered again from a shallower depth; a fully
+    /// explored one never is.
+    visited: HashMap<PathBuf, Visit>,
     names: HashSet<String>,
     entries: usize,
     exhausted: bool,
     depth_reported: bool,
+}
+
+struct Visit {
+    depth: usize,
+    cut_off: bool,
+}
+
+/// Marks a folder and its ancestors in the current walk as cut off by the depth limit.
+fn mark_cut_off(scan: &mut SkillScan, chain: &[(Option<usize>, PathBuf)], mut node: Option<usize>) {
+    while let Some(index) = node {
+        let (parent, canonical) = &chain[index];
+        if let Some(visit) = scan.visited.get_mut(canonical) {
+            visit.cut_off = true;
+        }
+        node = *parent;
+    }
 }
 
 async fn scan_skills(
@@ -229,12 +245,15 @@ async fn scan_skills(
     capabilities: &mut CursorWorkspaceCapabilities,
 ) {
     let first = capabilities.skills.len();
-    let mut pending = vec![(root.to_path_buf(), 0)];
-    while let Some((folder, depth)) = pending.pop() {
+    // `chain[i]` is the i-th entered folder: its parent's index and canonical path.
+    let mut chain: Vec<(Option<usize>, PathBuf)> = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0, None)];
+    while let Some((folder, depth, parent)) = pending.pop() {
         if scan.exhausted {
             break;
         }
         if depth > MAX_SKILL_DEPTH {
+            mark_cut_off(scan, &chain, parent);
             if !std::mem::replace(&mut scan.depth_reported, true) {
                 capabilities.issues.push(format!(
                     "Skill list is incomplete: skipped folders deeper than {MAX_SKILL_DEPTH} under {}",
@@ -258,10 +277,23 @@ async fn scan_skills(
                 continue;
             }
         };
-        match scan.visited.get(&canonical) {
-            Some(&explored_at) if explored_at <= depth => continue,
-            _ => scan.visited.insert(canonical, depth),
-        };
+        if let Some(visit) = scan.visited.get(&canonical)
+            && !(visit.cut_off && depth < visit.depth)
+        {
+            if visit.cut_off {
+                mark_cut_off(scan, &chain, parent);
+            }
+            continue;
+        }
+        scan.visited.insert(
+            canonical.clone(),
+            Visit {
+                depth,
+                cut_off: false,
+            },
+        );
+        chain.push((parent, canonical));
+        let node = Some(chain.len() - 1);
         let path = folder.join("SKILL.md");
         match fs::metadata(&path).await {
             Ok(metadata) if metadata.is_file() => {
@@ -343,7 +375,12 @@ async fn scan_skills(
             }
         }
         children.sort();
-        pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
+        pending.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, depth + 1, node)),
+        );
     }
     capabilities.skills[first..]
         .sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
@@ -576,5 +613,25 @@ mod tests {
         scan_skills(&inner, "user", &mut scan, &mut found).await;
         assert_eq!(names(&found), ["review"]);
         assert_eq!(found.issues.len(), 1, "{:?}", found.issues);
+    }
+
+    #[tokio::test]
+    async fn a_fully_explored_folder_is_not_scanned_again_from_a_shallower_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("shared");
+        files(&inner.join("a-bulk"), 6_000);
+        skill(&inner, "z-known");
+        let later = tempfile::tempdir().unwrap();
+        skill(later.path(), "later");
+        let mut scan = SkillScan::default();
+        let mut found = CursorWorkspaceCapabilities::default();
+        scan_skills(outer.path(), "project", &mut scan, &mut found).await;
+        let charged = scan.entries;
+        scan_skills(&inner, "user", &mut scan, &mut found).await;
+        assert_eq!(scan.entries, charged, "scanned again");
+        // Charged again, the 6,000 files would exhaust the budget before `later`.
+        scan_skills(later.path(), "user", &mut scan, &mut found).await;
+        assert_eq!(names(&found), ["z-known", "later"]);
+        assert!(found.issues.is_empty(), "{:?}", found.issues);
     }
 }
