@@ -882,7 +882,23 @@ impl ProductionRuntime {
             })?;
         match resolved {
             ResolvedAsset::File(file) => {
+                let too_large = || {
+                    HttpRouteError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        json!({
+                            "_tag": "AssetTooLargeError",
+                            "message": "Asset exceeds the 10 MiB response limit."
+                        }),
+                    )
+                };
                 let file_handle = tokio::fs::File::open(&file).await.map_err(internal_error)?;
+                // Refuse by size before reading, so the Files panel's size probe stays cheap; the
+                // bounded read below still guards a file that grew since.
+                if file_handle.metadata().await.map_err(internal_error)?.len()
+                    > MAX_ATTACHMENT_BYTES as u64
+                {
+                    return Err(too_large());
+                }
                 let mut bytes = Vec::with_capacity(MAX_ATTACHMENT_BYTES.min(4096));
                 file_handle
                     .take((MAX_ATTACHMENT_BYTES + 1) as u64)
@@ -890,13 +906,7 @@ impl ProductionRuntime {
                     .await
                     .map_err(internal_error)?;
                 if bytes.len() > MAX_ATTACHMENT_BYTES {
-                    return Err(HttpRouteError::new(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        json!({
-                            "_tag": "AssetTooLargeError",
-                            "message": "Asset exceeds the 10 MiB response limit."
-                        }),
-                    ));
+                    return Err(too_large());
                 }
                 let content_type = mime_guess::from_path(&file)
                     .first_or_octet_stream()
@@ -3773,6 +3783,45 @@ mod tests {
                 .await
                 .is_err(),
             "the HTTP boundary must not return an oversized attachment body"
+        );
+
+        // Files-panel previews share the cap: an oversized workspace file answers 413 with the
+        // typed tag the panel keys its "too large" state on.
+        let preview_root = state.path().join("preview-project");
+        tokio::fs::create_dir_all(&preview_root)
+            .await
+            .expect("preview project should create");
+        std::fs::File::create(preview_root.join("big.mp3"))
+            .and_then(|file| file.set_len((10 * 1024 * 1024 + 1) as u64))
+            .expect("oversized workspace audio");
+        let issued = runtime
+            .asset_access
+            .issue(AssetIssueRequest {
+                resource: AssetResource::WorkspaceFile {
+                    thread_id: "runtime-thread".to_owned(),
+                    path: "big.mp3".to_owned(),
+                },
+                workspace_root: Some(preview_root),
+            })
+            .await
+            .expect("oversized workspace audio may receive a capability");
+        let mut asset_parts = issued.relative_url.rsplitn(2, '/');
+        let asset_path = asset_parts.next().expect("asset filename");
+        let asset_token = asset_parts.next().expect("asset token path");
+        let asset_token = asset_token.rsplit('/').next().expect("asset token");
+        let too_large = runtime
+            .asset(asset_token.to_owned(), asset_path.to_owned())
+            .await
+            .err()
+            .expect("oversized workspace file must not be served")
+            .into_response();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(too_large.into_body(), 4096)
+            .await
+            .expect("error body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("AssetTooLargeError"),
+            "{body:?}"
         );
 
         let favicon_root = state.path().join("favicon-project");

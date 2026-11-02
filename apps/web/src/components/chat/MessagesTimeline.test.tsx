@@ -1836,6 +1836,8 @@ describe("MessagesTimeline user message affordances", () => {
     expect(markup).toContain("1 selected element.");
     expect(markup).toContain("lucide-paintbrush");
     expect(markup).toContain("Annotated preview crop");
+    // Off-screen crops wait until they scroll near the viewport.
+    expect(markup).toMatch(/<img[^>]*alt="Annotated preview crop"[^>]*loading="lazy"/);
     expect(markup).toContain("Make the button blue");
     expect(markup).not.toContain("<preview_annotation>");
   });
@@ -2480,6 +2482,10 @@ describe("MessagesTimeline mounted interactions", () => {
     await click(revert!);
 
     expect(container.textContent).toContain("missing.png");
+    // Message attachments load only near the viewport, decoded off the main thread.
+    const image = container.querySelector<HTMLImageElement>('img[alt="screen.png"]');
+    expect(image?.getAttribute("loading")).toBe("lazy");
+    expect(image?.getAttribute("decoding")).toBe("async");
     expect(onImageExpand).toHaveBeenCalledWith(
       expect.objectContaining({
         index: 0,

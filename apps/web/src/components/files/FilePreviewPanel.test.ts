@@ -5,7 +5,7 @@ import {
   normalizeFileCommentRange,
   remapFileCommentAnnotations,
 } from "./fileCommentAnnotations";
-import { isMarkdownPreviewFile, setMarkdownTaskChecked } from "./filePreviewMode";
+import { filePreviewKind, isMarkdownPreviewFile, setMarkdownTaskChecked } from "./filePreviewMode";
 
 describe("file comment annotations", () => {
   it("normalizes and formats selected line ranges", () => {
@@ -78,5 +78,47 @@ describe("setMarkdownTaskChecked", () => {
   it("leaves the document unchanged for a stale or invalid marker offset", () => {
     expect(setMarkdownTaskChecked(markdown, 0, true)).toBe(markdown);
     expect(setMarkdownTaskChecked(markdown, 200, true)).toBe(markdown);
+  });
+});
+
+describe("file preview kind", () => {
+  it.each([
+    ["shot.png", "image"],
+    ["photo.JPG", "image"],
+    ["photo.jpeg", "image"],
+    ["anim.GIF", "image"],
+    ["pic.webp", "image"],
+    ["pic.avif", "image"],
+    ["favicon.ico", "image"],
+    ["logo.svg", "svg"],
+    ["LOGO.SVG", "svg"],
+    ["docs/Manual.PDF", "pdf"],
+    ["a.mp3", "audio"],
+    ["a.M4A", "audio"],
+    ["a.wav", "audio"],
+    ["a.ogg", "audio"],
+    ["a.oga", "audio"],
+    ["a.webm", "audio"],
+    ["a.flac", "audio"],
+    [String.raw`dir\win.png`, "image"],
+  ])("picks %s as %s from its extension", (path, kind) => {
+    expect(filePreviewKind(path)).toBe(kind);
+  });
+
+  it.each([
+    "src/app.ts",
+    "README.md",
+    "archive.zip",
+    "app.exe",
+    "clip.mp4",
+    "voice.aac",
+    "png",
+    ".png.bak",
+    "Makefile",
+    "dir.png/readme",
+    "constructor",
+    "a.constructor",
+  ])("reads %s as text", (path) => {
+    expect(filePreviewKind(path)).toBe("text");
   });
 });

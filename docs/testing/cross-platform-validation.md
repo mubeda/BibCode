@@ -3402,6 +3402,24 @@ sizes. Cover relevant:
   entry in the clicked nested folder while expanded folders stay expanded, a
   drag-move onto a folder row and onto the tree root, and a refused move (a name
   the target already holds) reported as an error with the tree resynced;
+- Files binary previews: from the Files tree open a PNG (check the pixel size and
+  the **Actual size** switch), an SVG whose markup contains a `<script>` that
+  would write to `document.title` or call `alert` (it must show as a picture, the
+  script must not run, **View source** must show the markup and the editor's
+  switch must return to the picture), a multi-page PDF (the viewer scrolls and
+  pages), an MP3 (the native player plays and seeks), and a file over 10 MiB
+  (a PDF or audio file renamed from a large file works; the panel says it is
+  too large and names **Open in**, with no raw status text); open an archive or
+  executable and verify "No preview for this file type". Repeat on a remote
+  environment, where the notices point at the machine the environment runs on.
+  On Linux record whether the webview shows PDFs inline or reports the file
+  unreadable. Scroll a long thread with image attachments with the network panel
+  open: off-screen images load only as they near the viewport. The packaged
+  `files-binary-preview` spec automates the PNG, SVG (its script must not run),
+  PDF and WAV steps and fails on any `securitypolicyviolation` event; the previews
+  load from `blob:` URLs, so check the console of a remote environment shows no
+  CSP violation for the PDF or audio either. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/files-binary-preview.e2e.ts`;
 - Files Download and Upload: right-click a folder → **Download** → pick a
   destination folder → verify the resulting `.zip`; right-click the tree
   background → **Upload Files…** → pick a file → verify it appears in the
@@ -3872,8 +3890,8 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
 - Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an
   HTML file shows a `content-security-policy` header of
   `sandbox allow-scripts allow-forms allow-popups`; for SVG, XML, and any other `+xml` type, of
-  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt` or raster
-  image asset has none. In the BiBCode browser, a script
+  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt`, raster
+  image, PDF or audio asset has none (every asset response has `x-content-type-options: nosniff`). In the BiBCode browser, a script
   in the HTML reads `localStorage` and `document.cookie` as unavailable.
 - Port attribution: start `python3 -m http.server 8123` in a thread's terminal;
   the port appears in that thread's and terminal's discovered ports (port

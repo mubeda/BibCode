@@ -325,7 +325,7 @@ impl HttpRouteError {
         self
     }
 
-    fn into_response(self) -> Response {
+    pub(crate) fn into_response(self) -> Response {
         json_response(self.status, self.headers, self.body)
     }
 
@@ -678,21 +678,23 @@ async fn asset(
         cancellation,
     };
     match (state.assets)(token, path, context).await {
-        Ok(asset) => {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, &asset.content_type)
-                .header(header::CACHE_CONTROL, asset.cache_control)
-                .header("x-content-type-options", "nosniff");
-            if let Some(policy) = asset_content_security_policy(&asset.content_type) {
-                builder = builder.header(header::CONTENT_SECURITY_POLICY, policy);
-            }
-            builder
-                .body(Body::from(asset.bytes))
-                .unwrap_or_else(|_| internal_error())
-        }
+        Ok(asset) => asset_response(asset),
         Err(error) => error.into_response(),
     }
+}
+
+fn asset_response(asset: AssetHttpResponse) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &asset.content_type)
+        .header(header::CACHE_CONTROL, asset.cache_control)
+        .header("x-content-type-options", "nosniff");
+    if let Some(policy) = asset_content_security_policy(&asset.content_type) {
+        builder = builder.header(header::CONTENT_SECURITY_POLICY, policy);
+    }
+    builder
+        .body(Body::from(asset.bytes))
+        .unwrap_or_else(|_| internal_error())
 }
 
 async fn transfer_download(
@@ -1065,6 +1067,46 @@ mod tests {
         assert_eq!(bad_request("invalid").status(), StatusCode::BAD_REQUEST);
         assert_eq!(internal_error().status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(payload_too_large().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn asset_responses_sandbox_scriptable_types_and_never_sniff() {
+        const XML_SANDBOX: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+        for (content_type, policy) in [
+            ("image/svg+xml", Some(XML_SANDBOX)),
+            ("IMAGE/SVG+XML; charset=utf-8", Some(XML_SANDBOX)),
+            ("application/xml", Some(XML_SANDBOX)),
+            ("application/atom+xml", Some(XML_SANDBOX)),
+            (
+                "text/html",
+                Some("sandbox allow-scripts allow-forms allow-popups"),
+            ),
+            ("image/png", None),
+            ("image/webp", None),
+            ("application/pdf", None),
+            ("audio/mpeg", None),
+            ("video/webm", None),
+        ] {
+            let response = asset_response(AssetHttpResponse {
+                content_type: content_type.to_owned(),
+                bytes: b"asset".to_vec(),
+                cache_control: "private, max-age=3600".to_owned(),
+            });
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert_eq!(
+                response.headers()["x-content-type-options"],
+                "nosniff",
+                "{content_type}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .map(|value| value.to_str().unwrap()),
+                policy,
+                "{content_type}"
+            );
+        }
     }
 
     fn bundles(logs: &std::path::Path) -> crate::diagnostic_bundle::DiagnosticBundleService {

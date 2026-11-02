@@ -75,7 +75,8 @@ import { FileEditingSessionRegistry } from "./fileEditingSessionRegistry";
 import { LocalCommentAnnotation } from "./LocalCommentAnnotation";
 import { projectFileCacheKey } from "./fileContentRevision";
 import { fileBreadcrumbs } from "./filePath";
-import { isMarkdownPreviewFile, setMarkdownTaskChecked } from "./filePreviewMode";
+import { FileMediaPreview } from "./FileMediaPreview";
+import { filePreviewKind, isMarkdownPreviewFile, setMarkdownTaskChecked } from "./filePreviewMode";
 import {
   clearProjectFileQueryData,
   confirmProjectFileQueryData,
@@ -788,7 +789,21 @@ export default function FilePreviewPanel({
   const openPreview = useAtomCommand(previewEnvironment.open, {
     reportFailure: false,
   });
-  const file = useProjectFileQuery(environmentId, cwd, relativePath);
+  // Which file the user switched to its source text (Markdown or SVG), as the editor shows it.
+  const [sourceView, setSourceView] = useState<{
+    path: string | null;
+    revealRequestId: number | null;
+  }>({ path: null, revealRequestId: null });
+  const previewKind = relativePath ? filePreviewKind(relativePath) : "text";
+  // An SVG is shown as an image unless the user asked for its source or a link points at a line.
+  // A choice made since the latest link (same reveal request) wins over that link.
+  const svgSource =
+    previewKind === "svg" &&
+    (sourceView.path === relativePath ||
+      (revealLine !== null && sourceView.revealRequestId !== revealRequestId));
+  const mediaKind = previewKind === "text" || svgSource ? null : previewKind;
+  // Media is fetched from the asset route, so the text read (which refuses binary files) is skipped.
+  const file = useProjectFileQuery(environmentId, cwd, mediaKind === null ? relativePath : null);
   const session = useFileEditingSession({
     editingSessions,
     environmentId,
@@ -801,14 +816,10 @@ export default function FilePreviewPanel({
   });
   useFileDiskWatch({ session, environmentId, cwd, diskCheckSignal });
   const [explorerOpen, setExplorerOpen] = useState(initialExplorerOpen);
-  const [markdownSourceView, setMarkdownSourceView] = useState<{
-    path: string | null;
-    revealRequestId: number | null;
-  }>({ path: null, revealRequestId: null });
   const breadcrumbRef = useRef<HTMLDivElement>(null);
   const isMarkdown = relativePath ? isMarkdownPreviewFile(relativePath) : false;
   const renderMarkdownSource =
-    isMarkdown && (markdownSourceView.path === relativePath || revealLine !== null);
+    isMarkdown && (sourceView.path === relativePath || revealLine !== null);
   const renderMarkdown = isMarkdown && !renderMarkdownSource && !file.data?.truncated;
   // A truncated read is shown read-only unless a guarded session kept the file's text.
   const truncatedPreview = file.data?.truncated === true && session === null;
@@ -825,6 +836,8 @@ export default function FilePreviewPanel({
   const canOpenInBrowser =
     relativePath !== null && canPreviewAnyUrlInRuntime() && isBrowserPreviewFile(relativePath);
   const absolutePath = relativePath ? resolvePathLinkTarget(relativePath, cwd) : null;
+  // The header's Open in menu only exists for the local environment.
+  const canOpenElsewhere = absolutePath !== null && environmentId === primaryEnvironmentId;
   const breadcrumbs = useMemo(
     () => (relativePath ? fileBreadcrumbs(projectName, relativePath) : []),
     [projectName, relativePath],
@@ -961,7 +974,7 @@ export default function FilePreviewPanel({
           </Tooltip>
         </div>
       ) : null}
-      {relativePath !== null ? (
+      {relativePath !== null && mediaKind === null ? (
         <FileEditorToolbar
           savePhase={sessionSnapshot.save.phase}
           confirmedRevision={sessionSnapshot.save.confirmedRevision}
@@ -979,13 +992,27 @@ export default function FilePreviewPanel({
               ? {
                   rendered: renderMarkdown,
                   onRenderedChange: (rendered) => {
-                    setMarkdownSourceView({
+                    setSourceView({
                       path: rendered ? null : relativePath,
                       revealRequestId: rendered ? null : revealRequestId,
                     });
                   },
                 }
-              : undefined
+              : previewKind === "svg"
+                ? {
+                    rendered: false,
+                    // The image reads the file from disk, so wait for edits to be saved; if the
+                    // save fails, stay on the source with the edits (the toolbar says so).
+                    onRenderedChange: () => {
+                      void (async () => {
+                        if ((await session?.settle()) === "failed") return;
+                        setSourceView({ path: null, revealRequestId });
+                      })();
+                    },
+                    showSourceLabel: "Show SVG source",
+                    showRenderedLabel: "Show SVG as image",
+                  }
+                : undefined
           }
           onSave={() => {
             if (session) void session.flush();
@@ -1019,12 +1046,39 @@ export default function FilePreviewPanel({
             relativePath ? "flex" : "hidden",
           )}
         >
-          {relativePath && deletedOnDisk ? (
+          {relativePath && mediaKind !== null ? (
+            <FileMediaPreview
+              kind={mediaKind}
+              environmentId={environmentId}
+              threadId={threadRef.threadId}
+              absolutePath={absolutePath}
+              httpBaseUrl={environmentHttpBaseUrl}
+              fileName={relativePath.slice(relativePath.lastIndexOf("/") + 1)}
+              canOpenElsewhere={canOpenElsewhere}
+              onViewSource={
+                mediaKind === "svg"
+                  ? () => setSourceView({ path: relativePath, revealRequestId })
+                  : undefined
+              }
+            />
+          ) : relativePath && deletedOnDisk ? (
             <div
               className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-xs leading-relaxed text-muted-foreground"
               data-file-deleted-on-disk
             >
               Deleted on disk. It reopens here if the file comes back.
+            </div>
+          ) : relativePath && file.failure === "binary_file" ? (
+            <div
+              className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1 px-6 text-center"
+              data-file-binary-notice
+            >
+              <p className="text-sm font-medium text-foreground">No preview for this file type</p>
+              <p className="max-w-sm text-xs leading-relaxed text-muted-foreground">
+                {canOpenElsewhere
+                  ? "It isn't text, an image, a PDF or audio. Use Open in above to open it in another app."
+                  : "It isn't text, an image, a PDF or audio. Open it from the machine this environment runs on."}
+              </p>
             </div>
           ) : relativePath && file.error && file.data === null ? (
             <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-xs leading-relaxed text-destructive">
