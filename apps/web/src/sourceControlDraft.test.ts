@@ -84,6 +84,32 @@ describe("sourceControlDraftKey", () => {
   });
 });
 
+describe("source control store loading", () => {
+  it("loads when the browser denies storage access", async () => {
+    const denied = vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+      throw new DOMException("Access is denied.", "SecurityError");
+    });
+    try {
+      vi.resetModules();
+      const { useSourceControlPanelStore: tabStore } = await import("./sourceControlPanelStore");
+      expect(tabStore.getState().byCwdKey).toEqual({});
+    } finally {
+      denied.mockRestore();
+    }
+  });
+
+  it("loads when the saved state is malformed", async () => {
+    window.localStorage.setItem(STORAGE_KEY, "{not json");
+    try {
+      vi.resetModules();
+      const { useSourceControlPanelStore: tabStore } = await import("./sourceControlPanelStore");
+      expect(tabStore.getState().byCwdKey).toEqual({});
+    } finally {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
+  });
+});
+
 describe("source control draft persistence", () => {
   it("migrates a v1 thread-keyed draft without losing the half-written message", async () => {
     persisted.set(
