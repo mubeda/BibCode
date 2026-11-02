@@ -710,3 +710,41 @@ A page copy or a resolved copy must not outlive its thread.
    `archivedAt` (§9).
 5. **P2, search misses threads without sessions.** A `search` scope over every
    unarchived thread of the environment, used by the palette (§3, §10).
+
+### Implementation review (Codex, after `e87a269a4`)
+
+1. **P1, panel adoption closed tabs on a capped reconnect.** Adoption never
+   closes a tracked panel's tab because a capped list left it out; the
+   reconciler drops it once the server reports it archived or missing.
+2. **P1, a delayed lookup deleted a reopened panel.** A capped cleanup applies
+   its lookup's answer only if no newer shell or archived snapshot arrived
+   meanwhile.
+3. **P2, `missing` outlived the session.** A new session empties the off-shell
+   store; a snapshot that lists a thread, or a lookup that returns it, clears
+   its `missing` mark.
+4. **P2, a failed re-read dropped sticky ids.** The stream keeps `held` across
+   the failure, so the recovery snapshot keeps every thread the client holds.
+5. **P2, item sequences past the engine's.** Items numbered past the engine's
+   sequence carry it as `engineSequence`; the client keeps it beside the
+   shell, the reconciler compares the archived snapshot with it, and a resume
+   sends it. Alternatives rejected: a snapshot whenever items outnumber events
+   (it clears every page on an archive), and holding items back until events
+   make room (a terminal's host would wait for the next event).
+6. **P2, streaming re-read resolved threads.** Cleanup looks up only threads
+   the off-shell store has not resolved.
+7. **P2, Done paging never rendered.** The Agents view matches the
+   `status:done` group; the Inbox's Done category ends with **Show older** too.
+8. **P2, N more chats was static.** It opens the checkout's chats, then a row
+   that loads the left-out ones a page at a time, with loading, failure and
+   offline states.
+9. **P2, palette search outcomes were silent.** Under the results it shows
+   **Searching older threads…**, **Couldn't search older threads.** with
+   **Retry**, and **Older threads are searched when <name> is connected.**
+10. **P2, no capped budget.** `transfer_budget.rs` measures a capped shell on
+    #225's fixture (one default thread per project, the rest workspace threads
+    without a worktree, and panels), and the streaming-turn benchmark measures
+    both subscriptions.
+11. **Found while fixing 5: every re-read widened the cap.** Forced (held and
+    included) threads were taken out of the newest-first ranking, so the
+    threads a stream held handed their 25 recent slots to older ones on the
+    first re-read. A forced thread now keeps its place in the ranking.

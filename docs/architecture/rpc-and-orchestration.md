@@ -2698,11 +2698,16 @@ applies each item once, drops a redelivered one, and ends at the sequence a new
 snapshot would carry. When a window had fewer events than items (an AI
 Terminal's agent started working, which is no orchestration event), the
 numbering continues past that sequence instead, always above what the client
-holds. The stream sends a whole snapshot instead when its event receiver
-lagged. A failed re-read sends nothing and
-keeps the stream open, because the client resubscribes only when its session
-changes: the stream logs a warning, re-reads 2 s later whether or not events
-arrive, and sends a whole snapshot once a read succeeds. Every
+holds, and each item past it carries the engine's sequence as
+`engineSequence`. The client keeps that value beside its shell: the lifecycle
+reconciler compares the archived snapshot's sequence with it, never with the
+item sequence, and a resume sends it as `snapshotSequence`. The stream sends a
+whole snapshot instead when its event receiver lagged. A failed re-read sends
+nothing and keeps the stream open, because the client resubscribes only when
+its session changes: the stream logs a warning, re-reads 2 s later whether or
+not events arrive, and sends a whole snapshot once a read succeeds. A capped
+stream keeps the ids it held across the failure, so that snapshot keeps them
+too. Every
 subscription, including each one after a reconnect, starts with a snapshot (or
 `unchanged`, below), so a client cannot miss a delta between streams. Every
 released client decodes and applies these items (the union and its reducer
@@ -2725,7 +2730,9 @@ left-out thread costs one row of the thread scan. The snapshot carries
 left-out non-panel threads, and its left-out chat panels per checkout, grouped
 as the left panel groups chats. The kept set is sticky within a subscription:
 each re-read and each fallback snapshot keeps every thread the client holds, so
-a thread never disappears for leaving the cap. Removals for left-out threads:
+a thread never disappears for leaving the cap. A held or included thread keeps
+its place in the newest-first ranking, so it never hands its slot to an older
+thread and a re-read never widens the cap. Removals for left-out threads:
 the stream collects the ids of the window's `thread.archived`,
 `thread.deleted` and `thread.unarchived` events and, at the tick, sends
 `thread-removed` for those that are not live-shell threads then (an archive
