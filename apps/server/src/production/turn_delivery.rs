@@ -43,6 +43,9 @@ const RETRY_AFTER_MAX: Duration = Duration::from_secs(30);
 /// start fails every attempt the same way, and each attempt costs a launch; capped at a second, it
 /// retried every second for as long as the turn stayed pending.
 const DELIVERY_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// The attempts a delivery that keeps ending not sent gets before it fails with its last error:
+/// about 8 minutes at the 30 s backoff cap. A Retry starts the count again.
+const DELIVERY_ATTEMPTS_MAX: i64 = 20;
 const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const FORCE_CANCEL_TASK_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const RECONCILIATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -774,8 +777,10 @@ async fn settle_dismissed_once(
                 ProviderReconciliationOutcome::Unavailable { .. } => Ok(true),
                 // A turn this runtime still holds, or a server that cannot report its status:
                 // the marker stays until a later pass finds the session idle.
+                // A relaunch refused for the provider's configuration is refused again: stop asking.
                 ProviderReconciliationOutcome::Found
-                | ProviderReconciliationOutcome::ConversationLost { .. } => Ok(false),
+                | ProviderReconciliationOutcome::ConversationLost { .. }
+                | ProviderReconciliationOutcome::ProviderConfiguration { .. } => Ok(false),
             }
         })
         .buffer_unordered(MAX_CONCURRENT_THREADS)
@@ -937,7 +942,10 @@ async fn recover_sending(
                 (TurnDeliveryState::Delivered, None)
             }
             ProviderReconciliationOutcome::Absent => (TurnDeliveryState::Pending, None),
-            ProviderReconciliationOutcome::ConversationLost { detail } => {
+            // Whether the original send arrived is unknown, and every relaunch is refused the same
+            // way: the user's Retry or Dismiss decides.
+            ProviderReconciliationOutcome::ConversationLost { detail }
+            | ProviderReconciliationOutcome::ProviderConfiguration { detail } => {
                 (TurnDeliveryState::Uncertain, Some(detail))
             }
             ProviderReconciliationOutcome::Unavailable { detail }
@@ -1540,6 +1548,27 @@ async fn deliver_claimed(
                 detail: format!("durable turn payload is invalid: {error}"),
             },
         },
+    };
+    // The last attempt a not-sent delivery gets fails it with its last error (#273).
+    let route_result = match route_result {
+        ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+            if row.attempts >= DELIVERY_ATTEMPTS_MAX =>
+        {
+            tracing::warn!(
+                command_id = %row.command_id,
+                provider = %row.provider_kind,
+                attempts = row.attempts,
+                %detail,
+                "provider delivery failed after its last attempt"
+            );
+            crate::diagnostics::profiler::provider_turns::record_delivery_failing(
+                &row.provider_kind,
+                row.attempts,
+                "attempts-exhausted",
+            );
+            ProviderDeliveryOutcome::Rejected { detail }
+        }
+        outcome => outcome,
     };
     let turn_id = match &route_result {
         ProviderDeliveryOutcome::Accepted { turn_id } if is_steer => {
@@ -2407,6 +2436,89 @@ mod tests {
         assert_eq!(row.state, TurnDeliveryState::Uncertain);
         assert_eq!(row.last_error.as_deref(), Some("conversation lost"));
         assert_eq!(routed.load(Ordering::SeqCst), 0);
+
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    /// #273: a Codex row left `sending` by a crash whose reconciliation launch is refused for
+    /// Codex's configuration kept the row `sending` and relaunched without limit. It becomes
+    /// uncertain with the reason after one launch, and nothing is sent again by itself.
+    #[tokio::test]
+    async fn restart_recovery_refused_for_provider_configuration_marks_the_row_uncertain() {
+        const DETAIL: &str = "Codex could not load its configuration: failed to load configuration: url is not supported for stdio in `mcp_servers.bibcode`";
+        let database = Database::open_in_memory().await.expect("database");
+        database.call(|connection| {
+            run_migrations(connection, None)?;
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('recover', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 0, 'accepted', NULL, 'digest')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('recover', 'thread-1', 'message-1', 'codex', 'codex', NULL, 'key', '{}', 'sending', 1, NULL, '2026-08-01T00:00:00Z', '2026-08-01T00:00:01Z')",
+                [],
+            )?;
+            Ok(())
+        }).await.expect("seed");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        let routed = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let routed = routed.clone();
+            move |_, _| {
+                routed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Accepted { turn_id: None }))
+            }
+        });
+        let launches = Arc::new(AtomicUsize::new(0));
+        let service = TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            1,
+            router,
+            Arc::new({
+                let launches = launches.clone();
+                move |_| {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(ready(
+                        ProviderReconciliationOutcome::ProviderConfiguration {
+                            detail: DETAIL.to_owned(),
+                        },
+                    ))
+                }
+            }),
+        );
+
+        let row = timeout(Duration::from_secs(5), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("recover".to_owned())
+                    .await
+                    .expect("outbox")
+                    .expect("delivery");
+                if row.state != TurnDeliveryState::Sending {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "recovery settles the row; {} launches",
+                launches.load(Ordering::SeqCst)
+            )
+        });
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(row.last_error.as_deref(), Some(DETAIL));
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            0,
+            "nothing is resent by itself"
+        );
 
         service.shutdown().await;
         engine.shutdown().await;
@@ -3436,6 +3548,106 @@ mod tests {
         assert_eq!(delays.last(), Some(&Duration::from_secs(30)));
         // A restarted server resumes the same schedule from the persisted attempt count.
         assert_eq!(retry_delay_for_attempts(20), Duration::from_secs(30));
+    }
+
+    /// #273: a failure BiBCode does not recognise as permanent, such as an app-server that
+    /// exits before `initialize`, launched a process every 30 seconds for as long as the turn
+    /// stayed pending. The twentieth not-sent attempt fails the delivery with its last error.
+    #[tokio::test]
+    async fn the_twentieth_not_sent_attempt_fails_the_delivery_with_its_last_error() {
+        const DETAIL: &str = "Codex could not start: the app-server exited before initialize";
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| Ok(run_migrations(connection, None)?))
+            .await
+            .expect("migrations");
+        seed_delivery(
+            &database,
+            "bounded",
+            "bounded-thread",
+            1,
+            TurnDeliveryState::Pending,
+            DELIVERY_ATTEMPTS_MAX - 1,
+        )
+        .await;
+        seed_delivery(
+            &database,
+            "unbounded",
+            "unbounded-thread",
+            2,
+            TurnDeliveryState::Pending,
+            DELIVERY_ATTEMPTS_MAX - 2,
+        )
+        .await;
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: DETAIL.to_owned(),
+                }))
+            }
+        });
+        let service = TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            2,
+            router,
+            Arc::new(|_| Box::pin(ready(ProviderReconciliationOutcome::Absent))),
+        );
+        service.wait_for_retries_scheduled(1).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (bounded, unbounded) = loop {
+            let read = |command_id: &str| {
+                let repositories = engine.repositories();
+                let command_id = command_id.to_owned();
+                async move {
+                    repositories
+                        .get_provider_turn_delivery(command_id)
+                        .await
+                        .expect("read")
+                        .expect("delivery")
+                }
+            };
+            let (bounded, unbounded) = (read("bounded").await, read("unbounded").await);
+            if bounded.state != TurnDeliveryState::Pending
+                && bounded.state != TurnDeliveryState::Sending
+                && unbounded.attempts == DELIVERY_ATTEMPTS_MAX - 1
+                && unbounded.state == TurnDeliveryState::Pending
+            {
+                break (bounded, unbounded);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bounded {bounded:?}, unbounded {unbounded:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(bounded.state, TurnDeliveryState::Failed);
+        assert_eq!(bounded.attempts, DELIVERY_ATTEMPTS_MAX);
+        assert_eq!(bounded.last_error.as_deref(), Some(DETAIL));
+        assert_eq!(unbounded.last_error.as_deref(), Some(DETAIL));
+        let recorded = crate::diagnostics::profiler::provider_turns::take_recorded();
+        assert_eq!(
+            recorded,
+            [(
+                "delivery.failing",
+                serde_json::json!({
+                    "provider": "codex",
+                    "attempts": DELIVERY_ATTEMPTS_MAX,
+                    "errorClass": "attempts-exhausted",
+                })
+            )],
+            "one finding, for the bounded delivery only, never its error text"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        service.shutdown().await;
+        engine.shutdown().await;
     }
 
     /// Retries that fail the same way change nothing the thread shows, so they emit no thread

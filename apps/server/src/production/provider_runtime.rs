@@ -353,6 +353,12 @@ pub enum ProviderReconciliationOutcome {
     ConversationLost {
         detail: String,
     },
+    /// The reconciliation launch was refused for the provider's configuration
+    /// ([`ProviderRuntimeError::ProviderConfiguration`]), which every relaunch repeats. Whether
+    /// the original send arrived is unknown, so the delivery waits for the user's Retry or Dismiss.
+    ProviderConfiguration {
+        detail: String,
+    },
 }
 
 pub struct ProviderDeliveryHandle {
@@ -605,6 +611,12 @@ pub enum ProviderRuntimeError {
     /// settings, so a delivery fails once with `detail` instead of being retried.
     #[error("{provider} provider operation failed: {detail}")]
     IncompatibleProvider { provider: String, detail: String },
+    /// The provider refused its own configuration (Codex: a `-32600` "failed to load
+    /// configuration" on `thread/start` or `thread/resume`). Every launch is refused the same
+    /// way until the user fixes that configuration, so a delivery fails once with `detail`, the
+    /// provider's message. The Display equals `Provider`'s, so logs and runtime rows read as before.
+    #[error("{provider} provider operation failed: {detail}")]
+    ProviderConfiguration { provider: String, detail: String },
     /// The selected model or session refuses one of the request's own options, so the same
     /// request is refused again on every retry. Raised by:
     /// - the shape checks of Claude, Codex and OpenCode: an option without an id, and a value of
@@ -2066,7 +2078,11 @@ async fn deliver_orchestration_turn_with_identity(
                     started_new_conversation = true;
                 }
                 Ok(None) => {}
-                Err(error) => return launch_failure_outcome(&error, &label),
+                Err(error) => {
+                    let attempts = frozen_delivery.as_ref().map_or(0, |row| row.attempts);
+                    note_provider_configuration_refusal(&error, attempts);
+                    return launch_failure_outcome(&error, &label);
+                }
             }
             if let Some(row) = frozen_delivery.as_ref() {
                 match engine
@@ -2137,15 +2153,17 @@ fn frozen_failure_outcome(
 }
 
 /// A durable turn is replayed unchanged, so a launch refused for the turn's own options fails the
-/// delivery once, and so does a provider this BiBCode cannot drive or whose executable is missing
-/// (each is refused again until its settings or installation change). Every other launch failure,
-/// such as another spawn error, is retried with backoff.
+/// delivery once, and so does a provider this BiBCode cannot drive, whose executable is missing,
+/// or that refuses its own configuration (each is refused again until its settings, installation
+/// or configuration change). Every other launch failure, such as another spawn error, is retried
+/// with backoff.
 fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(error, Some(label));
     match error {
         ProviderRuntimeError::InvalidOption { .. } => ProviderDeliveryOutcome::Refused { detail },
         ProviderRuntimeError::IncompatibleProvider { .. }
-        | ProviderRuntimeError::MissingExecutable { .. } => {
+        | ProviderRuntimeError::MissingExecutable { .. }
+        | ProviderRuntimeError::ProviderConfiguration { .. } => {
             ProviderDeliveryOutcome::Rejected { detail }
         }
         _ => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
@@ -2247,6 +2265,13 @@ pub(crate) fn delivery_detail(
         ProviderRuntimeError::Spawn { provider, detail } => {
             format!("{} could not start: {detail}", label(provider))
         }
+        ProviderRuntimeError::ProviderConfiguration { provider, detail } => format!(
+            // Raised only for Codex today. Turning off BiBCode's MCP server helps when the refused
+            // table is the one BiBCode adds (`mcp_servers.bibcode_thread`).
+            "{} could not start: {}. Fix that in Codex's config.toml (~/.codex/config.toml), or              turn off MCP server in Settings → Agents → Agent integrations, then retry.",
+            label(provider),
+            detail.trim().trim_end_matches('.')
+        ),
         ProviderRuntimeError::MissingExecutable { provider, binary } => format!(
             // Retry keeps the turn's original route, so it launches only once the executable
             // exists at the same path. A changed Binary path takes a new message, and the failed
@@ -2413,6 +2438,7 @@ fn delivery_detail_names_provider(error: &ProviderRuntimeError) -> bool {
         error,
         ProviderRuntimeError::Spawn { .. }
             | ProviderRuntimeError::MissingExecutable { .. }
+            | ProviderRuntimeError::ProviderConfiguration { .. }
             | ProviderRuntimeError::UnsupportedProvider { .. }
             | ProviderRuntimeError::UnsupportedCapability { .. }
             | ProviderRuntimeError::ActivityTargetUnsupported { .. }
@@ -2463,11 +2489,19 @@ pub async fn reconcile_orchestration_turn(
                     detail: error.to_string(),
                 };
             }
+            let label = request.provider_label.clone();
             match supervisor.launch_for_reconciliation(request).await {
                 Ok(()) => {}
                 Err(ProviderRuntimeError::FrozenConversationLost { .. }) => {
                     return ProviderReconciliationOutcome::ConversationLost {
                         detail: RECONCILED_CONVERSATION_LOST_DETAIL.to_owned(),
+                    };
+                }
+                // Every relaunch is refused the same way, so recovery stops relaunching.
+                Err(error @ ProviderRuntimeError::ProviderConfiguration { .. }) => {
+                    note_provider_configuration_refusal(&error, row.attempts);
+                    return ProviderReconciliationOutcome::ProviderConfiguration {
+                        detail: delivery_detail(&error, Some(&label)),
                     };
                 }
                 Err(error) => {
@@ -8157,7 +8191,8 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::Provider { .. }
         | ProviderRuntimeError::InvalidOption { .. }
         | ProviderRuntimeError::FrozenSessionUnavailable { .. }
-        | ProviderRuntimeError::IncompatibleProvider { .. } => "provider operation failure",
+        | ProviderRuntimeError::IncompatibleProvider { .. }
+        | ProviderRuntimeError::ProviderConfiguration { .. } => "provider operation failure",
         ProviderRuntimeError::Persistence(_) => "persistence failure",
         ProviderRuntimeError::Orchestration(_) => "projection failure",
     };
@@ -13282,11 +13317,15 @@ impl CodexDriver {
                     .unwrap_or(&mcp.authorization_header)
                     .to_owned(),
             );
+            // Never `mcp_servers.bibcode`: Codex merges `-c` overrides into the stdio `bibcode`
+            // table that one-click registration writes and then refuses its whole configuration
+            // (#273). `bibcode_thread` is BiBCode's own key (docs/reference/mcp.md).
             args.extend([
                 "-c".to_owned(),
-                format!("mcp_servers.bibcode.url={}", mcp.endpoint),
+                format!("mcp_servers.bibcode_thread.url={}", mcp.endpoint),
                 "-c".to_owned(),
-                "mcp_servers.bibcode.bearer_token_env_var=\"BIBCODE_MCP_BEARER_TOKEN\"".to_owned(),
+                "mcp_servers.bibcode_thread.bearer_token_env_var=\"BIBCODE_MCP_BEARER_TOKEN\""
+                    .to_owned(),
             ]);
         }
         args.push("app-server".to_owned());
@@ -13369,6 +13408,49 @@ impl CodexDriver {
     }
 }
 
+/// Codex refuses its whole configuration with `-32600` "failed to load configuration" when it
+/// opens a thread, and refuses every relaunch the same way until the user fixes it. An
+/// app-server that exits before `initialize` is not classified from its stderr, which can arrive
+/// after stdout's end; it stays retryable and the delivery attempt bound ends it.
+fn codex_start_error(error: crate::provider::codex::runtime::RuntimeError) -> ProviderRuntimeError {
+    match error {
+        crate::provider::codex::runtime::RuntimeError::Protocol(
+            crate::provider::codex::protocol::ProtocolError::RemoteRequest {
+                method,
+                code: -32600,
+                message,
+                ..
+            },
+        ) if matches!(method.as_str(), "thread/start" | "thread/resume")
+            && message.starts_with("failed to load configuration") =>
+        {
+            ProviderRuntimeError::ProviderConfiguration {
+                provider: "codex".to_owned(),
+                detail: message,
+            }
+        }
+        error => provider_error("codex")(error),
+    }
+}
+
+/// A delivery that fails for good because the provider refused its configuration: logged, and
+/// recorded once for the delivery as a `delivery.failing` finding without its text.
+fn note_provider_configuration_refusal(error: &ProviderRuntimeError, attempts: i64) {
+    if let ProviderRuntimeError::ProviderConfiguration { provider, .. } = error {
+        tracing::warn!(
+            %provider,
+            attempts,
+            %error,
+            "provider refused its configuration; failing the message delivery"
+        );
+        crate::diagnostics::profiler::provider_turns::record_delivery_failing(
+            provider,
+            attempts,
+            "provider-configuration",
+        );
+    }
+}
+
 /// `/compact` on its own asks Codex to compact the thread (`thread/compact/start`) instead of
 /// sending the text to the model. Codex takes no instructions for a compaction, so `/compact`
 /// with text or attachments is an ordinary message.
@@ -13405,11 +13487,7 @@ impl ProviderDriver for CodexDriver {
     }
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
-            let session = self
-                .runtime
-                .start()
-                .await
-                .map_err(provider_error("codex"))?;
+            let session = self.runtime.start().await.map_err(codex_start_error)?;
             Ok(StartedSession {
                 resume_cursor: session
                     .resume_cursor
@@ -21048,13 +21126,38 @@ lines.on("line", (line) => {
             }
             "codex" => {
                 r#"const fs = require("node:fs");
+const path = require("node:path");
 const readline = require("node:readline");
+const args = process.argv.slice(2);
+if (process.env.BIBCODE_TEST_CODEX_ARGS_CAPTURE) {
+  fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_ARGS_CAPTURE, `${args.join("\n")}\n`);
+}
+if (process.env.BIBCODE_TEST_CODEX_EXIT_BEFORE_INITIALIZE) {
+  process.stderr.write(`Error: failed to load configuration: ${process.env.BIBCODE_TEST_CODEX_EXIT_BEFORE_INITIALIZE}\n`);
+  process.exit(1);
+}
+// Like Codex 0.166.0: `-c mcp_servers.bibcode.*` merges into a registered stdio `bibcode` table,
+// and a table with both `command` and `url` fails the whole configuration.
+let configError = process.env.BIBCODE_TEST_CODEX_CONFIG_ERROR;
+const config = process.env.CODEX_HOME ? path.join(process.env.CODEX_HOME, "config.toml") : "";
+if (
+  args.some((arg) => arg.startsWith("mcp_servers.bibcode.")) &&
+  config &&
+  fs.existsSync(config) &&
+  /^\[mcp_servers\.bibcode\]/m.test(fs.readFileSync(config, "utf8"))
+) {
+  configError = "url is not supported for stdio in `mcp_servers.bibcode`";
+}
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
   if (process.env.BIBCODE_TEST_REQUEST_CAPTURE) {
     fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
   }
   const request = JSON.parse(line);
+  if (configError && (request.method === "thread/start" || request.method === "thread/resume")) {
+    process.stdout.write(`${JSON.stringify({ id: request.id, error: { code: -32600, message: `failed to load configuration: ${configError}` } })}\n`);
+    return;
+  }
   if (request.method === "initialize" && process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER) {
     fs.writeFileSync(process.env.BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_READY_MARKER, request.method);
     process.stderr.write("BIBCODE_TEST_CODEX_INITIALIZE_REQUEST_RECEIVED\n");
@@ -25541,9 +25644,28 @@ done
 
     #[cfg(unix)]
     const CODEX_FIXTURE: &str = r#"#!/bin/sh
+[ -z "$BIBCODE_TEST_CODEX_ARGS_CAPTURE" ] || printf '%s\n' "$@" > "$BIBCODE_TEST_CODEX_ARGS_CAPTURE"
+if [ -n "$BIBCODE_TEST_CODEX_EXIT_BEFORE_INITIALIZE" ]; then
+  printf 'Error: failed to load configuration: %s\n' "$BIBCODE_TEST_CODEX_EXIT_BEFORE_INITIALIZE" >&2
+  exit 1
+fi
+# Like Codex 0.166.0: `-c mcp_servers.bibcode.*` merges into a registered stdio `bibcode` table,
+# and a table with both `command` and `url` fails the whole configuration.
+config_error=$BIBCODE_TEST_CODEX_CONFIG_ERROR
+case " $* " in
+  *' mcp_servers.bibcode.'*)
+    grep -q '^\[mcp_servers\.bibcode\]' "$CODEX_HOME/config.toml" 2>/dev/null && config_error='url is not supported for stdio in `mcp_servers.bibcode`' ;;
+esac
 while IFS= read -r line; do
   [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -n "$config_error" ]; then
+    case "$line" in
+      *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+        printf '{"id":%s,"error":{"code":-32600,"message":"failed to load configuration: %s"}}\n' "$id" "$config_error"
+        continue ;;
+    esac
+  fi
   response_marker=
   case "$line" in
     *'"method":"initialize"'*)
@@ -31679,6 +31801,145 @@ done
                 .expect("reaped Codex fixture status")
                 .is_some(),
             "bounded cleanup must kill and reap the owned fixture child"
+        );
+    }
+
+    /// A Codex fixture launch with `environment` added to the request, BiBCode's MCP server
+    /// configured when `mcp` is set; returns what `start` did.
+    async fn start_codex_fixture(
+        name: &str,
+        environment: &[(&str, &std::path::Path)],
+        mcp: bool,
+        resume_cursor: Option<Value>,
+    ) -> Result<super::StartedSession, super::ProviderRuntimeError> {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let codex_fixture = executable_fixture(&temp, name, CODEX_FIXTURE);
+        let mut request = native_launch(&temp, "codex");
+        request.binary_path = codex_fixture.to_string_lossy().into_owned();
+        request.resume_cursor = resume_cursor;
+        for (key, value) in environment {
+            request
+                .environment
+                .insert((*key).to_owned(), value.to_string_lossy().into_owned());
+        }
+        if mcp {
+            request.mcp = Some(super::ProviderMcpConfig {
+                endpoint: "http://127.0.0.1:7777/mcp".to_owned(),
+                authorization_header: "Bearer secret".to_owned(),
+                provider_session_id: "session-1".to_owned(),
+            });
+        }
+        let driver = super::CodexDriver::spawn(
+            request,
+            factory.attachments.clone(),
+            factory.attribution.clone(),
+            true,
+        )
+        .await?;
+        let started = driver.start().await;
+        let _ = driver.shutdown().await;
+        started
+    }
+
+    /// #273: one-click registration writes a stdio `bibcode` server into Codex's config, and
+    /// Codex merges `-c mcp_servers.bibcode.*` into it and refuses its whole configuration. The
+    /// chat launch names its per-thread server `bibcode_thread`, so `thread/start` succeeds.
+    #[tokio::test]
+    async fn codex_chat_launch_names_its_mcp_server_bibcode_thread_beside_a_registered_bibcode() {
+        let temp = TempDir::new().expect("codex home directory");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("codex home");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[mcp_servers.bibcode]\ncommand = \"bibcode-desktop\"\nargs = [\"mcp\", \"--base-dir\", \"/nonexistent\"]\n",
+        )
+        .expect("registered config");
+        let arguments = temp.path().join("codex-arguments");
+        let started = start_codex_fixture(
+            "codex-registered-fixture",
+            &[
+                ("CODEX_HOME", &codex_home),
+                ("BIBCODE_TEST_CODEX_ARGS_CAPTURE", &arguments),
+            ],
+            true,
+            None,
+        )
+        .await;
+        let arguments = std::fs::read_to_string(&arguments).expect("captured arguments");
+        started.unwrap_or_else(|error| {
+            panic!("thread/start beside a registered bibcode: {error} ({arguments})")
+        });
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        assert!(
+            arguments.contains(&"mcp_servers.bibcode_thread.url=http://127.0.0.1:7777/mcp"),
+            "{arguments:?}"
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument
+                    .starts_with("mcp_servers.bibcode_thread.bearer_token_env_var=")),
+            "{arguments:?}"
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.starts_with("mcp_servers.bibcode.")),
+            "the launch never writes into the registered `bibcode` table: {arguments:?}"
+        );
+    }
+
+    /// Codex refuses its configuration the same way on every launch, so a `-32600` "failed to
+    /// load configuration" on `thread/start` or `thread/resume` fails the delivery once, with
+    /// Codex's message and what to do, instead of retrying it.
+    #[tokio::test]
+    async fn a_codex_configuration_load_error_fails_the_delivery_once() {
+        let message = std::path::Path::new("invalid transport in `mcp_servers.example`");
+        for resume_cursor in [None, Some(json!({ "threadId": "native-codex-thread" }))] {
+            let error = start_codex_fixture(
+                "codex-config-error-fixture",
+                &[("BIBCODE_TEST_CODEX_CONFIG_ERROR", message)],
+                false,
+                resume_cursor.clone(),
+            )
+            .await
+            .expect_err("Codex refuses its configuration");
+            let super::ProviderDeliveryOutcome::Rejected { detail } =
+                super::launch_failure_outcome(&error, "Work Codex")
+            else {
+                panic!("resume {resume_cursor:?}: a configuration error is permanent: {error:?}");
+            };
+            assert!(
+                detail.contains(
+                    "failed to load configuration: invalid transport in `mcp_servers.example`"
+                ),
+                "{detail}"
+            );
+            assert!(detail.starts_with("Work Codex "), "{detail}");
+            assert!(detail.contains("config.toml"), "{detail}");
+        }
+    }
+
+    /// An app-server that exits before answering `initialize` is not classified from its stderr,
+    /// which can arrive after stdout's end: it stays retryable, and the attempt bound ends it.
+    #[tokio::test]
+    async fn a_codex_that_exits_before_initialize_stays_retryable() {
+        let message = std::path::Path::new("url is not supported for stdio in `mcp_servers.x`");
+        let error = start_codex_fixture(
+            "codex-early-exit-fixture",
+            &[("BIBCODE_TEST_CODEX_EXIT_BEFORE_INITIALIZE", message)],
+            false,
+            None,
+        )
+        .await
+        .expect_err("the fixture exits before initialize");
+        assert!(
+            matches!(
+                super::launch_failure_outcome(&error, "Work Codex"),
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "{error:?}"
         );
     }
 

@@ -812,6 +812,8 @@ impl ToolCall<'_> {
             "hasPendingApprovals": thread.pending_approval_count > 0,
             "hasPendingUserInput": thread.pending_user_input_count > 0,
             "session": page.session,
+            // The delivery that holds the thread back and why (#273); null when none does.
+            "failedDelivery": page.failed_delivery,
             "messages": page.messages,
             "queuedMessages": page.queued,
             "queuedCount": page.queued_count,
@@ -1624,6 +1626,8 @@ pub(crate) fn thread_summary(thread: &Value) -> Value {
 
 pub(crate) struct MessagePage {
     pub(crate) session: Value,
+    /// `{ messageId, detail }` of the thread's oldest failed or uncertain delivery, or null.
+    pub(crate) failed_delivery: Value,
     pub(crate) messages: Vec<Value>,
     pub(crate) queued: Vec<Value>,
     pub(crate) queued_count: i64,
@@ -1644,9 +1648,28 @@ fn message_cursor(message: &Value) -> String {
     )
 }
 
+/// The thread's oldest failed or uncertain delivery, which holds back its later messages, as
+/// `(messageId, detail)`; with `message_id`, only that message's. It is read from the outbox, so
+/// it needs no session row.
+pub(crate) fn oldest_failed_delivery(
+    connection: &rusqlite::Connection,
+    thread_id: &str,
+    message_id: Option<&str>,
+) -> rusqlite::Result<Option<(String, Option<String>)>> {
+    connection
+        .query_row(
+            "SELECT message_id, last_error FROM provider_turn_outbox
+              WHERE thread_id = ?1 AND (?2 IS NULL OR message_id = ?2) AND state IN ('failed', 'uncertain')
+              ORDER BY created_at ASC, command_id ASC LIMIT 1",
+            params![thread_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+}
+
 /// One keyset page of a thread's delivered messages, newest `limit` before `before`, in one
-/// SQLite job, plus the session and at most 20 queued messages. Each text is cut at
-/// [`MESSAGE_TEXT_CHARS`] in SQL.
+/// SQLite job, plus the session, the oldest failed delivery and at most 20 queued messages. Each
+/// text is cut at [`MESSAGE_TEXT_CHARS`] in SQL.
 pub(crate) async fn read_message_page(
     repositories: &Repositories,
     thread_id: &str,
@@ -1728,6 +1751,10 @@ pub(crate) async fn read_message_page(
                 [&thread_id],
                 |row| row.get(0),
             )?;
+            let failed_delivery = oldest_failed_delivery(connection, &thread_id, None)?
+                .map_or(Value::Null, |(message_id, detail)| {
+                    json!({ "messageId": message_id, "detail": detail })
+                });
             let latest_turn_state = connection
                 .query_row(
                     "SELECT turn.state FROM projection_threads AS thread
@@ -1739,6 +1766,7 @@ pub(crate) async fn read_message_page(
                 .optional()?;
             Ok(MessagePage {
                 session,
+                failed_delivery,
                 messages,
                 queued,
                 queued_count,

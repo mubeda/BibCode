@@ -1618,6 +1618,12 @@ it.
   provider, trigger and reason) cites its `provider.compaction` event, which
   every settled compaction writes without any message or summary text. An event dropped by a full
   channel is never cited.
+- `delivery.failing` (#273) is recorded once for a message delivery that fails
+  for good without reaching its provider: the provider refused its own
+  configuration (`provider-configuration`, also when restart recovery meets
+  it), or the twentieth not-sent attempt (`attempts-exhausted`). It keeps the
+  provider, the attempt count and that class, never the error text, and cites
+  no event; each such failure also logs a `tracing::warn!`.
 - `server.getProfilerStatus` returns the 20 newest findings without evidence;
   the CLI and MCP readers return the evidence too.
 - **Versions (#98).** Every event line names the build that wrote it
