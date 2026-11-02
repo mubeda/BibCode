@@ -3319,8 +3319,10 @@ sizes. Cover relevant:
   On Linux record whether the webview shows PDFs inline or reports the file
   unreadable. Scroll a long thread with image attachments with the network panel
   open: off-screen images load only as they near the viewport. The packaged
-  `files-binary-preview` spec automates the PNG, SVG (its script must not run) and
-  PDF steps; rerun it alone with
+  `files-binary-preview` spec automates the PNG, SVG (its script must not run),
+  PDF and WAV steps and fails on any `securitypolicyviolation` event; the previews
+  load from `blob:` URLs, so check the console of a remote environment shows no
+  CSP violation for the PDF or audio either. Rerun it alone with
   `BIBCODE_E2E_SPEC=./specs/files-binary-preview.e2e.ts`;
 - Files Download and Upload: right-click a folder → **Download** → pick a
   destination folder → verify the resulting `.zip`; right-click the tree

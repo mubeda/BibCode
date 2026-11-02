@@ -796,11 +796,12 @@ export default function FilePreviewPanel({
   }>({ path: null, revealRequestId: null });
   const previewKind = relativePath ? filePreviewKind(relativePath) : "text";
   // An SVG is shown as an image unless the user asked for its source or a link points at a line.
-  const mediaKind =
-    previewKind === "text" ||
-    (previewKind === "svg" && (sourceView.path === relativePath || revealLine !== null))
-      ? null
-      : previewKind;
+  // A choice made since the latest link (same reveal request) wins over that link.
+  const svgSource =
+    previewKind === "svg" &&
+    (sourceView.path === relativePath ||
+      (revealLine !== null && sourceView.revealRequestId !== revealRequestId));
+  const mediaKind = previewKind === "text" || svgSource ? null : previewKind;
   // Media is fetched from the asset route, so the text read (which refuses binary files) is skipped.
   const file = useProjectFileQuery(environmentId, cwd, mediaKind === null ? relativePath : null);
   const session = useFileEditingSession({
@@ -1000,7 +1001,7 @@ export default function FilePreviewPanel({
               : previewKind === "svg"
                 ? {
                     rendered: false,
-                    onRenderedChange: () => setSourceView({ path: null, revealRequestId: null }),
+                    onRenderedChange: () => setSourceView({ path: null, revealRequestId }),
                     showSourceLabel: "Show SVG source",
                     showRenderedLabel: "Show SVG as image",
                   }

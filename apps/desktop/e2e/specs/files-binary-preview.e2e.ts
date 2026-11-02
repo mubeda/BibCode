@@ -23,6 +23,7 @@ const fixtureFiles = {
   png: "binary-preview-fixture.png",
   svg: "binary-preview-fixture.svg",
   pdf: "binary-preview-fixture.pdf",
+  wav: "binary-preview-fixture.wav",
 } as const;
 
 // A 2x1 red PNG.
@@ -44,6 +45,25 @@ const PDF_ONE_PAGE = [
   "%%EOF",
 ].join("\n");
 
+/** Half a second of 8 kHz mono silence: the shortest WAV every webview decodes. */
+function silentWav(): Buffer {
+  const samples = 4_000;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + samples, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(8_000, 24);
+  header.writeUInt32LE(8_000, 28);
+  header.writeUInt16LE(1, 32);
+  header.writeUInt16LE(8, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(samples, 40);
+  return Buffer.concat([header, Buffer.alloc(samples, 0x80)]);
+}
+
 function writeFixtureFiles(): void {
   NodeFS.writeFileSync(
     NodePath.join(preparedProjectPath, fixtureFiles.png),
@@ -51,6 +71,24 @@ function writeFixtureFiles(): void {
   );
   NodeFS.writeFileSync(NodePath.join(preparedProjectPath, fixtureFiles.svg), SVG_WITH_SCRIPT);
   NodeFS.writeFileSync(NodePath.join(preparedProjectPath, fixtureFiles.pdf), PDF_ONE_PAGE);
+  NodeFS.writeFileSync(NodePath.join(preparedProjectPath, fixtureFiles.wav), silentWav());
+}
+
+/** Records every content security policy violation the page reports from now on. */
+async function watchSecurityPolicyViolations(): Promise<void> {
+  await browser.execute(() => {
+    const target = window as unknown as { __cspViolations?: string[] };
+    target.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", (event) => {
+      target.__cspViolations?.push(`${event.violatedDirective} ${event.blockedURI}`);
+    });
+  });
+}
+
+async function securityPolicyViolations(): Promise<string[]> {
+  return browser.execute(
+    () => (window as unknown as { __cspViolations?: string[] }).__cspViolations ?? [],
+  );
 }
 
 async function saveEvidence(name: string): Promise<void> {
@@ -159,6 +197,7 @@ describe("packaged Files binary previews", () => {
     await setDesktopUiWindowSize(1_600, 1_000);
     await openFixtureWorkspace();
     await openFilesSurface();
+    await watchSecurityPolicyViolations();
 
     // PNG: an <img> from the asset route with its pixel size, and no read-error text.
     await openWorkspaceFile(fixtureFiles.png);
@@ -190,12 +229,30 @@ describe("packaged Files binary previews", () => {
       timeoutMsg: "The SVG image did not come back after viewing its source.",
     });
 
-    // PDF: embedded in the webview's own viewer, from the asset route.
+    // PDF: embedded in the webview's own viewer from a blob: URL the app made.
     await openWorkspaceFile(fixtureFiles.pdf);
     const pdf = browser.$(`${fileViewSelector} embed[type="application/pdf"]`);
     await pdf.waitForExist({ timeoutMsg: "The PDF viewer never mounted." });
-    expect(await pdf.getAttribute("src")).toContain("/api/assets/");
+    expect(await pdf.getAttribute("src")).toMatch(/^blob:/);
     await expect(browser.$(`${fileViewSelector} [data-file-media-notice]`)).not.toExist();
     await saveEvidence("files-binary-preview-pdf");
+
+    // Audio: the native player decodes the blob, so its metadata loads.
+    await openWorkspaceFile(fixtureFiles.wav);
+    const audio = browser.$(`${fileViewSelector} audio[controls]`);
+    await audio.waitForExist({ timeoutMsg: "The audio player never mounted." });
+    expect(await audio.getAttribute("src")).toMatch(/^blob:/);
+    await browser.waitUntil(
+      () =>
+        browser.execute((selector: string) => {
+          const element = document.querySelector<HTMLAudioElement>(selector);
+          return !!element && element.error === null && element.readyState >= 1;
+        }, `${fileViewSelector} audio[controls]`),
+      { timeoutMsg: "The audio player never loaded the file's metadata." },
+    );
+    await expect(browser.$(`${fileViewSelector} [data-file-media-notice]`)).not.toExist();
+
+    // None of the previews tripped the page's content security policy.
+    expect(await securityPolicyViolations()).toEqual([]);
   });
 });

@@ -1246,6 +1246,49 @@ describe("binary file previews", () => {
     });
   });
 
+  it("opens an SVG linked to a line as source, and lets an explicit image choice win until the next link", () => {
+    setFileData("<svg/>");
+    const seedChoice = (requestId: number | null) =>
+      harness.seedState(
+        (initial) =>
+          typeof initial === "object" && initial !== null && "revealRequestId" in initial,
+        { path: null, revealRequestId: requestId },
+      );
+
+    // A link to line 12 shows the markup.
+    let markup = renderPanel(
+      baseProps({ relativePath: "logo.svg", revealLine: 12, revealRequestId: 4 }),
+    );
+    expect(markup).not.toContain("data-file-media");
+    const markdownView = ui.find("FileEditorToolbar").markdownView as {
+      onRenderedChange: (rendered: boolean) => void;
+    };
+
+    // "Show SVG as image" records the choice against the current link.
+    markdownView.onRenderedChange(true);
+    expect(
+      harness.setStateCalls.some(
+        (call) =>
+          (call.next as { path?: string | null; revealRequestId?: number } | null)
+            ?.revealRequestId === 4 && (call.next as { path: string | null }).path === null,
+      ),
+    ).toBe(true);
+
+    // With the choice recorded for that link, the image shows even though the line is still set.
+    seedChoice(4);
+    markup = renderPanel(
+      baseProps({ relativePath: "logo.svg", revealLine: 12, revealRequestId: 4 }),
+    );
+    expect(markup).toContain('data-file-media="svg"');
+
+    // A newer link to the file shows the markup again.
+    seedChoice(4);
+    markup = renderPanel(
+      baseProps({ relativePath: "logo.svg", revealLine: 12, revealRequestId: 5 }),
+    );
+    expect(markup).not.toContain("data-file-media");
+  });
+
   it("does not offer a source switch for images that are not SVG", () => {
     renderPanel(baseProps({ relativePath: "shot.png" }));
     expect(ui.find("FileMediaPreview").onViewSource).toBeUndefined();
