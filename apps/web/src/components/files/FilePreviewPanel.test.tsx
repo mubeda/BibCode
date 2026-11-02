@@ -142,6 +142,7 @@ const testState = vi.hoisted(() => {
       isPending: boolean;
       refresh: () => void;
     },
+    fileQueryRequests: [] as Array<Array<unknown>>,
     getLocalStorageItem: vi.fn<(key: string) => unknown>(),
     setLocalStorageItem: vi.fn<(key: string, value: unknown) => void>(),
     primaryEnvironmentId: null as string | null,
@@ -495,6 +496,13 @@ vi.mock("~/state/use-atom-query-runner", () => ({
   useAtomQueryRunner: () => testState.createAssetUrl,
 }));
 
+vi.mock("./FileMediaPreview", () => ({
+  FileMediaPreview: (props: Record<string, unknown>) => {
+    ui.record("FileMediaPreview", props);
+    return <div data-file-media={props.kind as string} />;
+  },
+}));
+
 vi.mock("./FileBrowserPanel", () => ({
   default: (props: Record<string, unknown>) => {
     ui.record("FileBrowserPanel", props);
@@ -577,7 +585,10 @@ vi.mock("./FileDiskConflictBar", async (importOriginal) => {
 });
 
 vi.mock("./projectFilesQueryState", () => ({
-  useProjectFileQuery: () => testState.fileQuery,
+  useProjectFileQuery: (...args: Array<unknown>) => {
+    testState.fileQueryRequests.push(args);
+    return testState.fileQuery;
+  },
   setProjectFileQueryData: (...args: Array<unknown>) => testState.setProjectFileQueryData(...args),
   confirmProjectFileQueryData: (...args: Array<unknown>) =>
     testState.confirmProjectFileQueryData(...args),
@@ -725,6 +736,7 @@ beforeEach(() => {
   testState.getFileVersion.mockReset().mockResolvedValue({ _tag: "Failure" });
   testState.rereadProjectFile.mockReset().mockResolvedValue(null);
   testState.connection = null;
+  testState.fileQueryRequests.length = 0;
   testState.getLocalStorageItem.mockReset().mockReturnValue(null);
   testState.setLocalStorageItem.mockReset();
   testState.primaryEnvironmentId = null;
@@ -1152,6 +1164,114 @@ describe("markdown preview", () => {
     renderPanel(baseProps({ relativePath: "README.md", revealLine: 3, revealRequestId: 1 }));
     expect(ui.filter("ChatMarkdown")).toHaveLength(0);
     expect(ui.filter("File")).toHaveLength(1);
+  });
+});
+
+describe("binary file previews", () => {
+  beforeEach(() => {
+    testState.environmentHttpBaseUrl = "http://127.0.0.1:3773";
+    testState.primaryEnvironmentId = environmentId;
+    // What a text read of a binary file answers: it must never reach the screen.
+    testState.fileQuery = {
+      data: null,
+      disk: null,
+      error: "workspace file is binary: /workspace/demo/shot.png",
+      failure: "binary_file",
+      isPending: false,
+      refresh: vi.fn(),
+    } as unknown as typeof testState.fileQuery;
+  });
+
+  it.each([
+    ["shot.png", "image"],
+    ["art/SHOT.PNG", "image"],
+    ["photo.JPEG", "image"],
+    ["logo.svg", "svg"],
+    ["docs/manual.pdf", "pdf"],
+    ["Manual.PDF", "pdf"],
+    ["song.mp3", "audio"],
+    ["voice.M4A", "audio"],
+  ])("shows %s through the asset route instead of the text read", (relativePath, kind) => {
+    const markup = renderPanel(baseProps({ relativePath }));
+
+    expect(markup).toContain(`data-file-media="${kind}"`);
+    expect(markup).not.toContain("workspace file is binary");
+    expect(markup).not.toContain("data-file-binary-notice");
+    expect(ui.find("FileMediaPreview")).toMatchObject({
+      kind,
+      environmentId,
+      threadId: threadRef.threadId,
+      absolutePath: `/workspace/demo/${relativePath}`,
+      httpBaseUrl: "http://127.0.0.1:3773",
+      canOpenElsewhere: true,
+    });
+    // No text read, no editor, no save/undo toolbar for a file that is not text.
+    expect(testState.fileQueryRequests.at(-1)).toEqual([environmentId, "/workspace/demo", null]);
+    expect(ui.filter("FileEditorToolbar")).toHaveLength(0);
+    expect(ui.filter("File")).toHaveLength(0);
+  });
+
+  it("tells a remote environment's user where the file can be opened", () => {
+    testState.primaryEnvironmentId = otherEnvironmentId;
+    renderPanel(baseProps({ relativePath: "shot.png" }));
+    expect(ui.find("FileMediaPreview").canOpenElsewhere).toBe(false);
+  });
+
+  it("offers an SVG's source and opens it in the editor with its own switch back", () => {
+    renderPanel(baseProps({ relativePath: "logo.svg" }));
+    const onViewSource = ui.find("FileMediaPreview").onViewSource as () => void;
+    onViewSource();
+    expect(
+      harness.setStateCalls.some(
+        (call) => (call.next as { path?: string } | null)?.path === "logo.svg",
+      ),
+    ).toBe(true);
+
+    harness.seedState(
+      (initial) => typeof initial === "object" && initial !== null && "revealRequestId" in initial,
+      { path: "logo.svg", revealRequestId: 1 },
+    );
+    setFileData("<svg/>");
+    const markup = renderPanel(baseProps({ relativePath: "logo.svg" }));
+    expect(markup).not.toContain("data-file-media");
+    expect(testState.fileQueryRequests.at(-1)).toEqual([
+      environmentId,
+      "/workspace/demo",
+      "logo.svg",
+    ]);
+    expect(ui.find("FileEditorToolbar").markdownView).toMatchObject({
+      rendered: false,
+      showSourceLabel: "Show SVG source",
+      showRenderedLabel: "Show SVG as image",
+    });
+  });
+
+  it("does not offer a source switch for images that are not SVG", () => {
+    renderPanel(baseProps({ relativePath: "shot.png" }));
+    expect(ui.find("FileMediaPreview").onViewSource).toBeUndefined();
+  });
+
+  it("explains an unknown binary file instead of showing the read error", () => {
+    const markup = renderPanel(baseProps({ relativePath: "build/app.exe" }));
+
+    expect(markup).toContain("No preview for this file type");
+    expect(markup).toContain("Open in above");
+    expect(markup).not.toContain("workspace file is binary");
+    expect(ui.filter("FileMediaPreview")).toHaveLength(0);
+  });
+
+  it("keeps showing other read errors as they are", () => {
+    testState.fileQuery = {
+      data: null,
+      disk: null,
+      error: "Workspace query failed.",
+      failure: null,
+      isPending: false,
+      refresh: vi.fn(),
+    } as unknown as typeof testState.fileQuery;
+    const markup = renderPanel(baseProps({ relativePath: "src/app.ts" }));
+    expect(markup).toContain("Workspace query failed.");
+    expect(markup).not.toContain("No preview for this file type");
   });
 });
 

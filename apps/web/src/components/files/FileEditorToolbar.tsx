@@ -9,9 +9,13 @@ import type { FileSavePhase } from "./fileSaveCoordinator";
 
 const SAVED_INDICATOR_DURATION_MS = 1_500;
 
+/** A file shown either rendered (Markdown, SVG image) or as the source text in the editor. */
 export interface FileEditorMarkdownView {
   readonly rendered: boolean;
   readonly onRenderedChange: (rendered: boolean) => void;
+  /** Labels for the switch; Markdown's by default. */
+  readonly showSourceLabel?: string;
+  readonly showRenderedLabel?: string;
 }
 
 export interface FileEditorToolbarProps {
@@ -123,6 +127,9 @@ export function FileEditorToolbar({
   const statusClassName = saveFailed
     ? "ml-2 text-xs text-destructive"
     : "ml-2 text-xs text-muted-foreground";
+  const viewLabel = markdownView?.rendered
+    ? (markdownView.showSourceLabel ?? "Show markdown source")
+    : (markdownView?.showRenderedLabel ?? "Show rendered markdown");
   const saveEnabled = canSave && saveBlockedReason === null;
   const saveActionClassName = saveFailed
     ? "text-destructive hover:text-destructive"
@@ -185,9 +192,7 @@ export function FileEditorToolbar({
             <TooltipTrigger
               render={
                 <Toggle
-                  aria-label={
-                    markdownView.rendered ? "Show markdown source" : "Show rendered markdown"
-                  }
+                  aria-label={viewLabel}
                   pressed={markdownView.rendered}
                   size="xs"
                   variant="ghost"
@@ -201,9 +206,7 @@ export function FileEditorToolbar({
                 </Toggle>
               }
             />
-            <TooltipPopup>
-              {markdownView.rendered ? "Show markdown source" : "Show rendered markdown"}
-            </TooltipPopup>
+            <TooltipPopup>{viewLabel}</TooltipPopup>
           </Tooltip>
         </>
       ) : null}

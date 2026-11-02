@@ -1,5 +1,26 @@
 export const isMarkdownPreviewFile = (path: string): boolean => /\.(?:md|mdx)$/i.test(path);
 
+/**
+ * How the Files panel shows a file, chosen from its extension before any text read. The server's
+ * asset route serves exactly these types (images, SVG as an image, PDF, audio); anything else is
+ * read as text, and a binary one explains itself.
+ */
+export type FilePreviewKind = "text" | "image" | "svg" | "pdf" | "audio";
+
+const MEDIA_PREVIEW_KINDS: ReadonlyMap<string, Exclude<FilePreviewKind, "text">> = new Map([
+  ...["png", "jpg", "jpeg", "gif", "webp", "avif", "ico"].map((ext) => [ext, "image"] as const),
+  ["svg", "svg"],
+  ["pdf", "pdf"],
+  ...["mp3", "m4a", "wav", "ogg", "oga", "webm", "flac"].map((ext) => [ext, "audio"] as const),
+]);
+
+const FILE_EXTENSION_PATTERN = /\.([^./\\]+)$/;
+
+export function filePreviewKind(path: string): FilePreviewKind {
+  const extension = FILE_EXTENSION_PATTERN.exec(path)?.[1]?.toLowerCase();
+  return (extension && MEDIA_PREVIEW_KINDS.get(extension)) || "text";
+}
+
 export function setMarkdownTaskChecked(
   markdown: string,
   markerOffset: number,

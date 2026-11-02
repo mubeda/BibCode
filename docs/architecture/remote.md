@@ -307,7 +307,8 @@ File transfers use token-in-path URLs for the same reason asset previews do,
 so they work on every profile. On a pinned (E2EE) profile whose endpoint is
 plain `http://`, Files panel downloads and uploads (`/api/transfers/<token>`)
 and asset previews (`/api/assets/<capability>/<path>`: chat images, project
-icons, and HTML or PDF files opened in the integrated browser) travel outside
+icons, HTML or PDF files opened in the integrated browser, and the image, SVG,
+PDF and audio files the Files panel previews in place) travel outside
 the Noise channel, and only the RPC that issues their URLs is encrypted, so
 anyone on the network path can read and alter their contents, read the
 workspace paths encoded in those URLs, and reuse a captured URL until it

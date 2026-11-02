@@ -48,6 +48,7 @@ const desktopUiSpecFiles =
         "./specs/chat-reasoning-rows.e2e.ts",
         "./specs/pierre-diffs.e2e.ts",
         "./specs/mermaid-diagrams.e2e.ts",
+        "./specs/files-binary-preview.e2e.ts",
       ];
 const desktopUiSpecs = requestedSpec ? desktopUiSpecFiles : [desktopUiSpecFiles];
 

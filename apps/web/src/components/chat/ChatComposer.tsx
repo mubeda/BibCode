@@ -2632,6 +2632,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               <img
                                 src={attachment.previewUrl}
                                 alt={attachment.name}
+                                loading="lazy"
+                                decoding="async"
                                 className="h-full w-full object-cover"
                               />
                             </button>

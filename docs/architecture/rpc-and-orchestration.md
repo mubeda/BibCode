@@ -4837,6 +4837,27 @@ H.264 video does not travel over RPC. The ticket from
 - Device H.264 media is the only application traffic outside typed RPC. It is
   admitted by a single-use ticket minted over typed RPC and bound to that
   session, device, and channel, and it is Noise-encrypted on pinned profiles.
+- `GET /api/assets/{token}/{path}` serves workspace files, chat attachments and
+  project icons. `assets.createUrl` mints a one-hour HMAC capability for one
+  resource. A `workspace-file` request is checked at issue time: the path must
+  resolve to a regular file inside the thread's normalized workspace root (no
+  traversal, no link out of it) and have an allowed extension. Images (including
+  SVG) and audio (`flac`, `m4a`, `mp3`, `oga`, `ogg`, `wav`, `webm`) get an
+  exact-file capability that reaches no sibling; HTML and PDF get a sibling
+  capability for their directory. Every response is `nosniff` with a
+  `mime_guess` content type and at most 10 MiB (`MAX_ATTACHMENT_BYTES`): a file
+  over the cap is refused from its size before any read, as `413
+  AssetTooLargeError`, and the read is bounded again for a file that grew. HTML
+  gets `sandbox allow-scripts allow-forms allow-popups`; SVG and any XML type get
+  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; images, audio and
+  PDF get no policy. The Files panel (`FileMediaPreview`) points `<img>`,
+  `<audio>` and `<embed>` (PDF only) at these URLs and never fetches the
+  bytes into script. It renders SVG through `<img>` only, which runs no script
+  whatever the file holds. The signed URL is reissued by the asset atom's refresh
+  interval, well before the hour ends. A media element cannot see the status,
+  so after a load failure, and before it frames a PDF, the panel sends one
+  `HEAD` to tell a 413 (too large) from a broken file. No asset bytes or tokens
+  enter profiler records or logs.
 - `GET`/`POST /api/transfers/{token}` authenticate with a five-minute HMAC
   token minted by `projects.createDownloadUrl` (read scope) or
   `projects.createUploadUrl` (operate scope) while those RPCs hold the
