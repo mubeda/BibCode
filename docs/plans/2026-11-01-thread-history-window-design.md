@@ -49,6 +49,7 @@ few turns.
   - reasoning: by `created_at, reasoning_id`.
 
   The client sorts for display.
+
 - **Serialization.** `thread_snapshot_value` (`orchestration_rpc.rs:1599-1643`)
   runs `thread_detail_rows` (`:1772-1807`, every row) and `thread_detail`
   (`:1645-1760`). The detail holds:
@@ -60,6 +61,7 @@ few turns.
 
   None of these is bounded. Message text has no size limit
   (`packages/contracts/src/orchestration.ts:380`).
+
 - **First item.** It's `unchanged` when `resume.revision` matches and the
   sequence is not behind (`:1452-1467`). Otherwise it's a `snapshot`
   (`send_snapshot`, `:1523-1538`).
@@ -179,11 +181,11 @@ provisional and are settled against #225 before implementation starts.
 
 ### 1. Three kinds of content
 
-| Kind | What | On the wire |
-| --- | --- | --- |
-| **History rows** | messages, activities, reasoning, proposed plans | windowed (§2); older rows load in pages |
-| **State rows** | immutable activities, and plans, that current state needs but the window may not hold (§4) | in `thread.history.carried`, used by state readers only |
-| **Turn index** | checkpoints | every checkpoint, but `files` only for turns in the window or a loaded page (§5) |
+| Kind             | What                                                                                       | On the wire                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| **History rows** | messages, activities, reasoning, proposed plans                                            | windowed (§2); older rows load in pages                                          |
+| **State rows**   | immutable activities, and plans, that current state needs but the window may not hold (§4) | in `thread.history.carried`, used by state readers only                          |
+| **Turn index**   | checkpoints                                                                                | every checkpoint, but `files` only for turns in the window or a loaded page (§5) |
 
 Everything else on the thread is the fixed-size shell: title, session, latest
 turn, and so on.
@@ -280,7 +282,7 @@ sent as a removal, and:
 ### 4. Carried state rows
 
 Some current state comes from rows that never change and so never enter the
-window by the rule above. An open request is resolved by a *different*
+window by the rule above. An open request is resolved by a _different_
 activity, and a status reader keeps an older valid row when the newer ones
 aren't valid.
 
@@ -293,6 +295,7 @@ on every read and computed by the same selectors the readers use:
 
   This covers any turn, a completed turn, and turnless recovered OpenCode
   asks. It's the server's own open-request policy.
+
 - **Effective status.**
   - The row `deriveLatestContextWindowSnapshot` would return: the newest
     `context-window.updated` with a valid `usedTokens`, where "newest" means
@@ -307,6 +310,7 @@ on every read and computed by the same selectors the readers use:
   lists valid and malformed payloads, including a malformed newest row over a
   valid older one. The Rust test and the web reader tests both run against it,
   so the two can't drift apart.
+
 - **Plans.** The newest proposed plan, plus any plan named as
   `source_proposed_plan_id` by a turn in state `running`.
 
@@ -476,6 +480,7 @@ the same either way.
   So every state reader (approvals, user input, queue, MCP status, context
   window, plans) reads one thread with no change. `shareUnchanged` keeps
   unchanged entries by identity.
+
 - **Persistence.** Only `window` is persisted.
 - **Resubscribe input.** `{ threadId, patches: true, history: { floor? }, resume? }`.
 - **`snapshot`.** Set `window`. If `history.floor` changed, or `history` is
@@ -513,6 +518,7 @@ the same either way.
   skewed-clock message, appears at the top of the loaded region, in
   `createdAt` order, just under "Load earlier messages". Find in thread, the
   folds and the minimap read these entries, so they agree.
+
 - **`MessagesTimeline`.**
   - When `hasOlder`, a first row `history-start` shows "Load earlier messages
     (N more)" as a button. While loading it reads "Loading earlier messages…".
@@ -540,14 +546,14 @@ the same either way.
 These are provisional, T3's numbers. They're confirmed from #225's p50/p99
 big-thread sizes before code.
 
-| Constant | Value | Covers |
-| --- | --- | --- |
-| `HISTORY_OPEN_BYTES` | 1 MiB | the **whole** first thread value: shell + carried + turn index + history rows, serialized JSON before deflate |
-| `HISTORY_WINDOW_ROWS` | 500 | history rows |
-| `HISTORY_WINDOW_TURNS` | 10 | user messages |
-| `HISTORY_PAGE_ROWS` | 75 | rows |
-| `HISTORY_PAGE_BYTES` | 512 KiB | always ≥ 1 row |
-| `HISTORY_FLOOR_HONOUR_BYTES` | 4 MiB | reconnect with a client floor |
+| Constant                     | Value   | Covers                                                                                                        |
+| ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
+| `HISTORY_OPEN_BYTES`         | 1 MiB   | the **whole** first thread value: shell + carried + turn index + history rows, serialized JSON before deflate |
+| `HISTORY_WINDOW_ROWS`        | 500     | history rows                                                                                                  |
+| `HISTORY_WINDOW_TURNS`       | 10      | user messages                                                                                                 |
+| `HISTORY_PAGE_ROWS`          | 75      | rows                                                                                                          |
+| `HISTORY_PAGE_BYTES`         | 512 KiB | always ≥ 1 row                                                                                                |
+| `HISTORY_FLOOR_HONOUR_BYTES` | 4 MiB   | reconnect with a client floor                                                                                 |
 
 **What can still push the first payload over budget**, each bounded by
 something other than history length:
@@ -563,12 +569,12 @@ fixture, and the PR lowers that budget.
 
 ### 11. Compatibility matrix
 
-| Client | Server | Result |
-| --- | --- | --- |
-| old | old | today |
-| old (no `history`) | new | full thread, byte-identical to today |
-| new | old | server ignores `history`; full thread; no `history` field; the page RPC is never called |
-| new | new | window, carried state rows and pages |
+| Client             | Server | Result                                                                                  |
+| ------------------ | ------ | --------------------------------------------------------------------------------------- |
+| old                | old    | today                                                                                   |
+| old (no `history`) | new    | full thread, byte-identical to today                                                    |
+| new                | old    | server ignores `history`; full thread; no `history` field; the page RPC is never called |
+| new                | new    | window, carried state rows and pages                                                    |
 
 - **Downgraded client.** An old client decodes a cached window as a thread,
   because `Struct` ignores the extra key. Its first snapshot is full and
@@ -591,6 +597,7 @@ fixture, and the PR lowers that budget.
   (`migrations.rs:1038`, `:1134`, `:1927`, `:2609`). Live rows are found
   through the existing streaming index (`:2612`) and the `delivery_state`
   filter.
+
 - **Client.** The cache holds the window. Older pages are never written.
 
 ### 13. Profiler, crash and trace coverage
@@ -801,26 +808,26 @@ when unchanged", `reconnectRetention.test.ts` and `threads-atoms.test.ts`.
 The design is settled. The remaining edge cases are proven by these tests in
 the implementation PR. Each invariant names the test that fails if it breaks.
 
-| # | Invariant | Proving test |
-| --- | --- | --- |
-| 1 | Without `history`, the stream is byte-identical to today | `clients_without_the_history_flag_get_the_full_thread_byte_identical` |
-| 2 | The first payload stays within budget except for the bounded extras in §10 | `thread_window_over_budget_opens_under_the_byte_row_and_turn_budgets` |
-| 3 | Window plus pages equal the full thread: every row exactly once, in order | `history_pages_return_every_older_row_exactly_once_in_order` |
-| 4 | Rows only enter the window; nothing outside it is sent as removed | `windowed_stream_patches_a_new_message_and_never_removes_rows_outside_the_window` |
-| 5 | A row written after the window opened is in it, whatever its timestamp | `a_backdated_message_after_a_withdrawn_queued_message_joins_the_window` |
-| 6 | Every history write sets `written_sequence`, and a rebuild keeps it | `every_history_write_path_sets_written_sequence`, `written_sequence_survives_a_projection_rebuild` |
-| 7 | Live rows (streaming, deliveries) are always in the window, never in pages | `a_cold_open_includes_a_streaming_message_and_reasoning_row_that_predate_the_floor`, `history_pages_never_return_a_live_row` |
-| 8 | Every open request is available to the composer | `carried_rows_hold_every_open_request_below_the_floor`, `a_recovered_turnless_opencode_ask_below_the_floor_is_carried` |
-| 9 | Status readers select the same row as on a full thread | `carried_status_selection_matches_the_shared_fixture`, "merges activities in canonical order so a carried status with a higher sequence wins" |
-| 10 | The window's copy wins; a deleted row never comes back | "a window copy replaces the copy a page loaded", "a withdrawn queued message disappears and no page resurrects it" |
-| 11 | The queue keeps admission order | "keeps the admission order of queued messages when one is backdated below the floor" |
-| 12 | Window checkpoint metadata is authoritative | "a page checkpoint fills in files only while it matches the window's checkpoint" |
-| 13 | A revert, seen or missed, invalidates the window and the pages | `a_live_revert_rewindows_the_subscription`, `a_revert_lost_to_lag_rewindows_on_the_next_read`, `a_resubscribe_after_a_missed_revert_gets_a_fresh_window`, "drops loaded pages when a page answers stale" |
-| 14 | A stale or duplicate page answer is never applied | "drops a page that answers a superseded cursor or generation", "drops a page in flight when a snapshot moves the floor" |
-| 15 | Resume at the current revision answers `unchanged`, and loaded pages survive it | `windowed_resubscribe_at_the_current_revision_sends_unchanged`, "keeps loaded pages when a resubscribe is answered unchanged" |
-| 16 | An honoured floor never resends more than the reconnect cap | `a_resubscribe_whose_floor_admits_a_settled_oversized_row_gets_a_fresh_window` |
-| 17 | Paging makes progress and releases its loading state | "sends exactly N-1 page requests to reach the start of an N-page thread", the three `loadAllOlder` tests |
-| 18 | Loading a page keeps the reading position | "keeps the first visible row in place when an older page loads" |
+| #   | Invariant                                                                       | Proving test                                                                                                                                                                                             |
+| --- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Without `history`, the stream is byte-identical to today                        | `clients_without_the_history_flag_get_the_full_thread_byte_identical`                                                                                                                                    |
+| 2   | The first payload stays within budget except for the bounded extras in §10      | `thread_window_over_budget_opens_under_the_byte_row_and_turn_budgets`                                                                                                                                    |
+| 3   | Window plus pages equal the full thread: every row exactly once, in order       | `history_pages_return_every_older_row_exactly_once_in_order`                                                                                                                                             |
+| 4   | Rows only enter the window; nothing outside it is sent as removed               | `windowed_stream_patches_a_new_message_and_never_removes_rows_outside_the_window`                                                                                                                        |
+| 5   | A row written after the window opened is in it, whatever its timestamp          | `a_backdated_message_after_a_withdrawn_queued_message_joins_the_window`                                                                                                                                  |
+| 6   | Every history write sets `written_sequence`, and a rebuild keeps it             | `every_history_write_path_sets_written_sequence`, `written_sequence_survives_a_projection_rebuild`                                                                                                       |
+| 7   | Live rows (streaming, deliveries) are always in the window, never in pages      | `a_cold_open_includes_a_streaming_message_and_reasoning_row_that_predate_the_floor`, `history_pages_never_return_a_live_row`                                                                             |
+| 8   | Every open request is available to the composer                                 | `carried_rows_hold_every_open_request_below_the_floor`, `a_recovered_turnless_opencode_ask_below_the_floor_is_carried`                                                                                   |
+| 9   | Status readers select the same row as on a full thread                          | `carried_status_selection_matches_the_shared_fixture`, "merges activities in canonical order so a carried status with a higher sequence wins"                                                            |
+| 10  | The window's copy wins; a deleted row never comes back                          | "a window copy replaces the copy a page loaded", "a withdrawn queued message disappears and no page resurrects it"                                                                                       |
+| 11  | The queue keeps admission order                                                 | "keeps the admission order of queued messages when one is backdated below the floor"                                                                                                                     |
+| 12  | Window checkpoint metadata is authoritative                                     | "a page checkpoint fills in files only while it matches the window's checkpoint"                                                                                                                         |
+| 13  | A revert, seen or missed, invalidates the window and the pages                  | `a_live_revert_rewindows_the_subscription`, `a_revert_lost_to_lag_rewindows_on_the_next_read`, `a_resubscribe_after_a_missed_revert_gets_a_fresh_window`, "drops loaded pages when a page answers stale" |
+| 14  | A stale or duplicate page answer is never applied                               | "drops a page that answers a superseded cursor or generation", "drops a page in flight when a snapshot moves the floor"                                                                                  |
+| 15  | Resume at the current revision answers `unchanged`, and loaded pages survive it | `windowed_resubscribe_at_the_current_revision_sends_unchanged`, "keeps loaded pages when a resubscribe is answered unchanged"                                                                            |
+| 16  | An honoured floor never resends more than the reconnect cap                     | `a_resubscribe_whose_floor_admits_a_settled_oversized_row_gets_a_fresh_window`                                                                                                                           |
+| 17  | Paging makes progress and releases its loading state                            | "sends exactly N-1 page requests to reach the start of an N-page thread", the three `loadAllOlder` tests                                                                                                 |
+| 18  | Loading a page keeps the reading position                                       | "keeps the first visible row in place when an older page loads"                                                                                                                                          |
 
 ## Options considered
 
@@ -919,7 +926,7 @@ the implementation PR. Each invariant names the test that fails if it breaks.
    they stay in the window, and the timeline always shows window rows (§2,
    §9). Tests: the cold-open and through-settlement tests.
 4. **Carry the effective status.** Accepted. The server carries the row each
-   reader would select: the newest *valid* one. A shared
+   reader would select: the newest _valid_ one. A shared
    `carried-status.json` fixture runs against both the Rust selector and the
    web readers (§4). Tests: the malformed-newest test, the fixture parity
    tests, and the existing `contextWindow.test.ts` case.
