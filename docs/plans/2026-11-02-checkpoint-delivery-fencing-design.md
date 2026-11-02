@@ -1,6 +1,6 @@
 # Checkpoint Delivery Fencing (#261)
 
-Status: Approved 2026-11-02 (Codex review, 3 rounds)
+Status: Approved by Mauro 2026-11-02 (Codex review rounds 1-3)
 
 Follow-up to #234, #235 and #236 (PR #247): option D of
 `docs/plans/2026-11-01-turn-checkpoint-residuals-design.md`. Verified at `main`
