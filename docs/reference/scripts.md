@@ -348,7 +348,8 @@ performing a production install.
   the proxy's 3g preset and new-connection option, starts the server on the large-thread fixture
   that `cargo build -p bibcode-server --example write_load_fixture` writes (`--fixture-bin`,
   default `target/debug/examples/write_load_fixture`), and runs only the load scenarios (cold
-  connect onto the big thread, sidebar open with no cache, switch back, reconnect). Each row also
+  connect onto the big thread, sidebar open with no cache, switch back, reconnect, reload with the
+  thread cached). Each row also
   reports the decoded bytes next to the received ones. It serves the web build from
   `--static-dir` (default `apps/web/dist`) itself, so only server traffic is
   delayed; build that with `VITE_HOSTED_APP_URL=https://hosted.invalid` so

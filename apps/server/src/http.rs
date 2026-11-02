@@ -1219,10 +1219,15 @@ async fn stream_file(
             StatusCode::OK
         })
         .header(CONTENT_TYPE, content_type.as_ref())
-        .header(CONTENT_LENGTH, metadata.len())
         .header(CACHE_CONTROL, cache_control)
+        // The static fallback gzips for clients that accept it (#227): every answer, a 304
+        // included, varies by encoding, and a 304 carries no length since the encoding sets it.
+        .header(VARY, "accept-encoding")
         .header("x-content-type-options", "nosniff")
         .header("content-security-policy", content_security_policy(headers));
+    if !not_modified {
+        response = response.header(CONTENT_LENGTH, metadata.len());
+    }
     if let Some(etag) = etag {
         response = response.header(ETAG, etag);
     }

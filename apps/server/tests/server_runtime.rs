@@ -1297,6 +1297,8 @@ async fn compresses_static_assets_for_clients_that_accept_gzip() {
         );
         assert_eq!(conditional.headers()["etag"], etag);
         assert!(!conditional.headers().contains_key("content-encoding"));
+        assert_eq!(conditional.headers()["vary"], "accept-encoding");
+        assert!(!conditional.headers().contains_key("content-length"));
     }
 
     let credential = handle
