@@ -253,10 +253,14 @@ fn write_fake_ssh(path: &Path, record: &Path, control: &Path, bare: &Path) {
         format!(r#"for argument in "$@"; do printf '%s\n' "$argument"; done >> '{record}'"#),
         format!(r#"printf 'SSH_AUTH_SOCK=%s\n' "${{SSH_AUTH_SOCK-}}" >> '{record}'"#),
         format!("if [ -f '{control}/stderr' ]; then cat '{control}/stderr' >&2; exit 255; fi"),
-        // The sleeping child's pid, as the OS knows it (MSYS keeps the Windows pid apart).
+        // The sleeping child's pid, as the OS knows it. MSYS keeps the Windows pid apart and
+        // changes it when the forked child execs `sleep`, so it is read once the child runs
+        // `sleep` (bounded to 10 s).
         format!(
             "if [ -f '{control}/sleep' ]; then sleep 600 & child=$!; \
-             if [ -r /proc/$child/winpid ]; then cat /proc/$child/winpid > '{control}/pid'; \
+             if [ -r /proc/$child/winpid ]; then i=0; while [ $i -lt 100 ]; do \
+             case \"$(cat /proc/$child/exename 2>/dev/null)\" in *sleep|*sleep.exe) break;; esac; \
+             sleep 0.1; i=$((i+1)); done; cat /proc/$child/winpid > '{control}/pid'; \
              else echo $child > '{control}/pid'; fi; wait $child; exit 1; fi"
         ),
         format!("exec git upload-pack '{bare}'"),
