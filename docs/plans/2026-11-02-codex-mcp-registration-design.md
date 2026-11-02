@@ -91,17 +91,26 @@ entry the user added by hand as `bibcode`. Not recommended.
 
 These keep registration as it is and follow the issue's scope.
 
-1. **Config-load errors are permanent.** A Codex launch that fails with
-   JSON-RPC `-32600` whose message starts with `failed to load configuration`,
-   or an `app-server` that exits before answering `initialize` with a config
-   error on stderr, becomes a new `ProviderRuntimeError::ProviderConfiguration
-   { provider, detail }`. `launch_failure_outcome` maps it to `Rejected { detail }`,
-   like `MissingExecutable`, so the delivery fails once through the existing
-   path: `failure_reason` keeps its typed category, and Codex's message is the
-   delivery detail (`last_error`, `delivery.detail`) that the panel already
-   shows. No persisted or wire shape changes. The detail adds what to do: fix
-   `~/.codex/config.toml`, or turn off BiBCode's MCP server. `read_thread` and `wait_for_thread` report the same failed state
-   and reason that the panel shows, with a contract test each.
+1. **Config-load errors are permanent.** A Codex launch whose `thread/start`
+   (or `thread/resume`) fails with JSON-RPC `-32600` and a message starting
+   `failed to load configuration` becomes a new
+   `ProviderRuntimeError::ProviderConfiguration { provider, detail }`.
+   `launch_failure_outcome` maps it to `Rejected { detail }`, like
+   `MissingExecutable`, so the delivery fails once through the existing path:
+   `failure_reason` keeps its typed category, and Codex's message, followed by
+   what to do (fix `~/.codex/config.toml`, or turn off BiBCode's MCP server), is
+   the delivery detail (`last_error`, `delivery.detail`) the panel already
+   shows. No persisted shape changes.
+   - An `app-server` that exits before answering `initialize` is not classified
+     from its stderr: stdout's end can be read before the stderr diagnostic, so
+     the verdict would depend on ordering. That case stays transient and is
+     ended by the attempt bound (part 2), whose detail is the last error.
+   - **MCP output (additive).** `read_thread` gains `failedDelivery`: `null`, or
+     `{ "messageId", "detail" }` for the thread's oldest failed delivery, read
+     from `provider_turn_outbox` whether or not a session row exists.
+     `wait_for_thread` fills its existing `error` field from that detail when it
+     reports `delivery_failed` (today it does so only for `error`). Both are
+     documented in `docs/reference/mcp.md`; old clients ignore the new field.
 2. **Retries are bounded.** A delivery that keeps ending `DefinitelyNotSent`
    fails after 20 attempts (about 8 minutes with the 30 s backoff cap) with the
    last error as its reason, so an unrecognised deterministic failure can no
@@ -123,7 +132,10 @@ These keep registration as it is and follow the issue's scope.
    - The provider credential's `tools/list` through `bibcode_thread` still
      lists the preview and device tools (the existing scope test, kept).
    - A config-load `-32600` ends the delivery `failed` with the reason visible
-     through the thread read, `read_thread` and `wait_for_thread`.
+     through the thread read, `read_thread` (`failedDelivery`) and
+     `wait_for_thread` (`error`), on a fresh thread with no session row.
+   - An `app-server` that exits before `initialize`, with or without a config
+     message on stderr, stays transient and is failed by the attempt bound.
    - The attempt bound fails a delivery after the twentieth `DefinitelyNotSent`.
 
 ## Not in scope
@@ -154,3 +166,12 @@ Codex, round 1 (REVISE):
   accepted; part 1 uses the existing `Rejected { detail }` path.
 - P2, the config read races a registration removal: resolved by dropping the
   config read and `enabled=false` altogether.
+
+Codex, round 2 (REVISE):
+
+- P2, `read_thread` and `wait_for_thread` cannot report a failed delivery's
+  reason: accepted. Verified at `mcp/wait.rs` (`error` only for `error`) and
+  `mcp/tools/threads.rs` (session row only). Part 1 adds `failedDelivery` and
+  fills `error` for `delivery_failed`, with a fresh-thread test.
+- P2, classifying an early exit from stderr races stdout's end: accepted. Early
+  exits are no longer classified; the attempt bound ends them, with a test.
