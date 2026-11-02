@@ -559,6 +559,7 @@ fn event_fields(kind: &str) -> &'static [&'static str] {
             "before",
             "after",
             "backupMs",
+            "backupBudgetMs",
             "vacuumMs",
             "durationMs",
         ],

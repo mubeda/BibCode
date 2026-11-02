@@ -1,0 +1,176 @@
+{
+  "issue": 262,
+  "date": "2026-11-02",
+  "commit": "c3dec1cbc",
+  "build": "cargo build --release -p bibcode-server --bin bibcode with CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16",
+  "store": "one server start on a scratch data root, then 48,319 rows of 100 KB incompressible text in projection_projects, 40 % deleted",
+  "budget": "StoreIoBudget::LARGE_STORE = 30 s + 240 s per GiB",
+  "runs": [
+    {
+      "platform": "Windows 11 Pro x64, AMD Ryzen 5 7600, 32 GB RAM, NVMe SSD (NTFS)",
+      "wallSeconds": {
+        "inspect-before": {
+          "status": 0,
+          "seconds": 1.97
+        },
+        "compact": {
+          "status": 0,
+          "seconds": 41.39
+        },
+        "inspect-after": {
+          "status": 0,
+          "seconds": 1.92
+        },
+        "restore": {
+          "status": 0,
+          "seconds": 12.98
+        }
+      },
+      "storageCompactEnd": {
+        "after": {
+          "autoVacuum": "incremental",
+          "fileBytes": 2915631104,
+          "freelistCount": 0
+        },
+        "backupBudgetMs": 1116131,
+        "backupMs": 18052,
+        "before": {
+          "autoVacuum": "incremental",
+          "fileBytes": 4859265024,
+          "freelistCount": 468681
+        },
+        "bibcode": "0.14.0",
+        "durationMs": 41317,
+        "failedStep": null,
+        "kind": "storage.compact",
+        "outcome": "compacted",
+        "pageSize": 4096,
+        "phase": "end",
+        "source": "cli",
+        "stateKind": "userdata",
+        "v": 1,
+        "vacuumMs": 21183
+      },
+      "compactReport": {
+        "before": {
+          "autoVacuum": "incremental",
+          "fileBytes": 4859265024,
+          "freelistCount": 468681,
+          "pageCount": 1186344,
+          "pageSize": 4096,
+          "walBytes": 0
+        },
+        "plan": {
+          "autoVacuumAfter": "incremental",
+          "availableFreeBytes": {
+            "store": 382037786624,
+            "temp": 382037786624
+          },
+          "backupBudgetSeconds": 1117,
+          "backupBytes": 4859265024,
+          "estimatedCompactedBytes": 2968943125,
+          "estimatedReclaimBytes": 1919717376,
+          "requiredFreeBytes": {
+            "sameVolume": true,
+            "store": 10931369002,
+            "temp": 3036051989
+          },
+          "sqliteLock": "locked"
+        },
+        "after": {
+          "autoVacuum": "incremental",
+          "fileBytes": 2915631104,
+          "freelistCount": 0,
+          "pageCount": 711824,
+          "pageSize": 4096,
+          "walBytes": 0
+        },
+        "reclaimedBytes": 1943633920,
+        "checkpoint": "complete"
+      }
+    },
+    {
+      "platform": "Linux 6.18 (WSL2) in Docker rust:latest, 12 CPUs, 16 GB VM, ext4 virtual disk on the same NVMe host",
+      "wallSeconds": {
+        "inspect-before": {
+          "status": 0,
+          "seconds": 0.95
+        },
+        "compact": {
+          "status": 0,
+          "seconds": 44.2
+        },
+        "inspect-after": {
+          "status": 0,
+          "seconds": 0.93
+        },
+        "restore": {
+          "status": 0,
+          "seconds": 17.48
+        }
+      },
+      "storageCompactEnd": {
+        "after": {
+          "autoVacuum": "incremental",
+          "fileBytes": 2915631104,
+          "freelistCount": 0
+        },
+        "backupBudgetMs": 1116131,
+        "backupMs": 21919,
+        "before": {
+          "autoVacuum": "incremental",
+          "fileBytes": 4859265024,
+          "freelistCount": 468681
+        },
+        "bibcode": "0.14.0",
+        "durationMs": 44174,
+        "failedStep": null,
+        "kind": "storage.compact",
+        "outcome": "compacted",
+        "pageSize": 4096,
+        "phase": "end",
+        "source": "cli",
+        "stateKind": "userdata",
+        "v": 1,
+        "vacuumMs": 21326
+      },
+      "compactReport": {
+        "before": {
+          "autoVacuum": "incremental",
+          "fileBytes": 4859265024,
+          "freelistCount": 468681,
+          "pageCount": 1186344,
+          "pageSize": 4096,
+          "walBytes": 0
+        },
+        "plan": {
+          "autoVacuumAfter": "incremental",
+          "availableFreeBytes": {
+            "store": 1008840527872,
+            "temp": 1008840527872
+          },
+          "backupBudgetSeconds": 1117,
+          "backupBytes": 4859265024,
+          "estimatedCompactedBytes": 2968943125,
+          "estimatedReclaimBytes": 1919717376,
+          "requiredFreeBytes": {
+            "sameVolume": false,
+            "store": 7895317013,
+            "temp": 3036051989
+          },
+          "sqliteLock": "locked"
+        },
+        "after": {
+          "autoVacuum": "incremental",
+          "fileBytes": 2915631104,
+          "freelistCount": 0,
+          "pageCount": 711824,
+          "pageSize": 4096,
+          "walBytes": 0
+        },
+        "reclaimedBytes": 1943633920,
+        "checkpoint": "complete"
+      }
+    }
+  ]
+}

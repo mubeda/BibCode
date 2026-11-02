@@ -139,8 +139,8 @@ needs on the data-root volume and on the volume that holds SQLite's temporary
 files. It refuses, with the same error and exit status as the real run, when a
 BiBCode process owns the store, the store is not in a compactable state, the
 schema is not recognized, or there is not enough free space. It does not check
-whether another program has the database open, and it cannot predict whether
-the backup fits its time budget.
+whether another program has the database open. `plan.backupBudgetSeconds` is
+the time the backup may take: 30 seconds plus 4 minutes per GiB of the store.
 
 Then compact:
 
@@ -156,7 +156,9 @@ The command:
    it open; changes left in `state.sqlite-wal` by a crash are written back
    under this lock, as a server start would;
 3. checks the free space and refuses with the numbers if there is not enough;
-4. takes a verified `pre-compact` backup of the whole store;
+4. takes a verified `pre-compact` backup of the whole store, within 30 seconds
+   plus 4 minutes per GiB; it says how long that can take, and prints a
+   "still backing up" line every 30 seconds;
 5. runs `VACUUM`, which also switches the store to `auto_vacuum = incremental`,
    then checks its integrity.
 
@@ -170,8 +172,11 @@ remove the extra name and retry. If a cancelled or failed `VACUUM` had already s
 `auto_vacuum = full` store to `incremental`, it switches it back. Every refusal
 before the backup leaves `state.sqlite` and its sidecars exactly as they were. Progress goes to stderr; stdout carries one JSON report with
 `before`, `plan`, `backupId`, `after` and `reclaimedBytes`. Press Ctrl-C to
-cancel: before or during `VACUUM` the database is left as it was, and the
-pre-compact backup is kept.
+cancel: during the backup nothing is published and the database is left as it
+was; before or during `VACUUM` the database is left as it was, and the
+pre-compact backup is kept. If the backup does not finish within its limit, the
+command stops, removes the unfinished copy and leaves the database unchanged;
+check that the disk is not busy or failing, then retry.
 
 Compaction temporarily uses more disk, not less: right after it, the store
 uses its compacted size plus the pre-compact backup, which is as large as the
@@ -187,9 +192,40 @@ bibcode storage restore --backup-id <backup-id>
 
 Stores created by this release start with `auto_vacuum = incremental`.
 Existing stores report `none` until they are compacted. BiBCode does not yet
-return free pages in the background, and compaction of a store whose backup
-takes more than 30 seconds is not supported yet; such a store is refused before
-anything is written.
+return free pages in the background.
+
+## Restore time limits and interrupted restores
+
+`bibcode storage restore --backup-id <backup-id>` checks the selected backup's
+checksum and SQLite integrity, copies it, and checks the copy again before it
+touches the current database. It may take 30 seconds plus 4 minutes per GiB of
+the backup, and prints a "still restoring" line every 30 seconds. Press Ctrl-C
+to stop it before the current database is replaced; a stopped or failed restore
+removes its unfinished copy and leaves the current database as it was.
+
+The backup list in `inspect` and in the desktop checks each backup's location,
+manifest, size and migration history, which takes the same time however large
+the backup is. A backup that was damaged after it was made is still listed;
+restoring it fails before anything changes, so choose an older one. Retention
+never deletes a backup because of a damaged newer one.
+
+Once a restore or **Start empty** starts replacing the current files, it is
+recorded in a recovery journal, `.bibcode-recovery-userdata.json` (or
+`-dev.json`) in the data root. If it is interrupted then, by a crash, a closed
+terminal, a full disk or the desktop's WSL time limit, BiBCode and its pairing
+and MCP commands refuse to open the store and say:
+
+> An interrupted project-data recovery must be finished before BiBCode can open
+> this store. Quit BiBCode, then run `bibcode storage restore --resume`.
+
+Run that command (inside the WSL distribution for a WSL store, with the same
+`--base-dir` if you use one). It finishes the interrupted operation: the
+previous files end up in `recovery/`, and the restored backup is installed. If
+the journal or the files are not what it expects, it refuses and changes
+nothing; keep every file in the data root and export diagnostics before you
+change anything by hand. With no journal, `--resume` clears a restore that was
+stopped before it changed anything, or reports that there is nothing to
+resume.
 
 ## Limits and unrelated leftovers
 

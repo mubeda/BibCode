@@ -667,9 +667,14 @@ before the migration transaction begins. SQLite's online backup API copies the
 live connection, including committed WAL data, in bounded cancellable page
 batches into a same-filesystem staging directory. The server then closes and
 checks the staged database, records its pre-migration ledger version, hashes it
-with SHA-256, writes a path-free manifest, flushes both files and supported
-directories, atomically renames the generation, and reloads it for checksum and
-`quick_check` verification. Unix backup directories and files use `0700` and
+with SHA-256, writes a path-free manifest whose `createdAt` is taken just before
+it is written, flushes both files and supported directories, atomically renames
+the generation, and reloads it for checksum and `quick_check` verification. A
+creation that fails or is cancelled before the rename removes its staging
+directory (only the files it wrote, then the empty directory). Pre-update and
+pre-migration backups have 30 seconds; the pre-compact backup's deadline is 30
+seconds plus 4 minutes per GiB of the store (`StoreIoBudget`) and follows the
+caller's cancellation. Unix backup directories and files use `0700` and
 `0600`; Windows generations inherit the private data-root ACL. Only after that
 publication is verified may migration start or retention remove older verified
 generations. Every backup ancestor is identity-bound beneath the effective root,
@@ -678,12 +683,20 @@ writes. Verified generations contain exactly one singly-linked `state.sqlite`
 and one singly-linked `manifest.json`; their manifest ledger version must match
 an exact migration prefix recognized by the running binary, and their canonical
 UTC creation time must agree with the generation's filesystem publication time.
-Retention keeps the newest three for the store and state kind, ordered by that
-filesystem time with a backup-ID tie-break. Publishing a `pre-compact`
+Listing and deletion check only what does not grow with the file: those
+structural rules, the size from metadata and the ledger version. The checksum
+and `quick_check` run when a generation is published, when retention counts it
+as a replacement, and when restore selects it, so a backup that rots later is
+refused at restore before any live file moves. Retention keeps the newest three
+for the store and state kind, ordered by that filesystem time with a backup-ID
+tie-break, and deletes an older generation only behind three newer ones that
+pass the checksum and `quick_check` now; a generation that fails is kept and
+never counts. If the creation's deadline or token ends first, retention deletes
+nothing and the creation still succeeds. Publishing a `pre-compact`
 generation first expires the older `pre-compact` generations, so at most one is
-kept and repeated compaction displaces at most one other generation. It reopens and revalidates each
-expired generation, deletes only the two bound files, and removes the now-empty
-directory without recursive deletion. Staging entries, extra or linked content,
+kept and repeated compaction displaces at most one other generation. It reopens and revalidates the
+identity of each expired generation, deletes only the two bound files, and
+removes the now-empty directory without recursive deletion. Staging entries, extra or linked content,
 malformed manifests, location or identity mismatches, future-schema ledgers,
 implausible timestamps, and failed verification are reported and never selected
 for deletion. Newly created backup ancestors and their parents are flushed
@@ -701,7 +714,10 @@ sidecar exists and the plain read-only path only when both sidecars exist under
 its lock; any other sidecar state is reported as unsafe without opening SQLite.
 It releases the lock before the backup inventory, which reads only `backups/`.
 Restore verifies only the selected generation, not every generation of its
-identity. `bibcode storage restore --backup-id`
+identity, under a deadline of 30 seconds plus 4 minutes per GiB of that
+generation's length, read from metadata first; the CLI cancels it on Ctrl-C
+until its journal is published, and a failure before then removes its staging
+directory, temporary journal and empty preserved directory. `bibcode storage restore --backup-id`
 accepts only a selected generation whose manifest, location, storage identity,
 checksum, SQLite integrity, and migration prefix verify for that same state
 kind. Restore reopens the verified database through a no-follow, read-capable
@@ -709,15 +725,27 @@ file handle before copying it into recovery staging; on Windows, directories
 remain attributes-only while database files explicitly request generic read
 access. `bibcode storage start-empty` is the separate destructive choice. Both
 mutating commands first acquire an exclusive runtime lock and the storage
-operation lock, write and flush a recovery journal, and preserve every existing
-database, WAL, SHM, and marker entry in a private recovery generation before
+operation lock, publish a version-2 recovery journal (written to a temporary
+file, synced, then renamed into place), and preserve every existing database,
+WAL, SHM, and marker entry in a private recovery generation, syncing it, before
 installing a verified database or allowing the next startup to create a new
-store. Normal server handles hold the runtime lock shared, so multiple
-established servers remain supported while offline recovery fails closed if any
-server owns the root. Startup refuses to create or open SQLite while a recovery
-journal or strict recovery-staging entry remains. A crash or cancellation after
-preservation therefore leaves recoverable files and an explicit incomplete
-operation instead of silently converting the root into a first-run store.
+store. The journal rename is the commit point: after it, no failure removes the
+journal, the staging entry or a staged file. Before it, the next restore or
+start-empty clears a staging entry that holds only a staged database and marker
+when no journal of either state kind exists. Normal server handles hold the
+runtime lock shared, so multiple established servers remain supported while
+offline recovery fails closed if any server owns the root. Startup, the pairing
+CLI and the MCP relay call `ensure_no_interrupted_recovery` under the shared
+runtime lock and refuse to open SQLite while a recovery journal or strict
+recovery-staging entry remains; the refusal names
+`bibcode storage restore --resume`. That command, under both locks, finishes the
+operation from the files: it preserves every live file whose identity is not one
+the journal recorded as staged, syncs the preserved directory, installs the
+staged files and removes staging and the journal, or refuses and changes nothing
+when the journal or files match no known state. A crash, kill or cancellation
+after the commit point therefore leaves recoverable files and an explicit
+incomplete operation instead of silently converting the root into a first-run
+store.
 
 `bibcode storage compact` takes the same two locks, then checks the store from
 its files (a marked store, no symbolic link or junction for the state directory
@@ -732,8 +760,9 @@ it until a compaction verifies, so every refusal before the backup leaves the
 database and its sidecars byte for byte as found. It then checks the schema,
 measures the logical size, checks free space on the data-root and SQLite
 temporary-file volumes, publishes a verified `pre-compact` backup through the
-online-backup API on that connection under the unchanged 30-second budget, and
-runs a cancellable `VACUUM` into `auto_vacuum = INCREMENTAL`. After a verified
+online-backup API on that connection under a deadline of 30 seconds plus 4
+minutes per GiB of its logical size, cancelled by Ctrl-C within one copy step,
+and runs a cancellable `VACUUM` into `auto_vacuum = INCREMENTAL`. After a verified
 compaction it removes a crash-left `-shm` that no WAL needs any more. It needs
 no recovery journal: there is no rename, `VACUUM` is one SQLite transaction,
 and backup publication is already atomic. `--dry-run` takes only the
@@ -1568,8 +1597,10 @@ are listed in the
   still holds it. Dropping it waits at most 2 s for the writer to finish, and a
   writer stuck on disk keeps its lock until it does.
   It records `storage.compact` `start` and `end` (outcome, failed step, page
-  size, before and after sizes, free pages and `auto_vacuum`, and timings),
-  never paths, IDs or error text. A refusal because BiBCode owns the store is
+  size, before and after sizes, free pages and `auto_vacuum`, timings, and the
+  pre-compact backup's size-scaled deadline as `backupBudgetMs`), never paths,
+  IDs or error text. `bibcode storage restore` and `--resume` record no
+  profiler event. A refusal because BiBCode owns the store is
   not recorded, and the dry run starts no writer.
 - `ProductionRuntime::start` starts the runtime on a blocking thread, because it
   replays `findings.ndjson`, before the orchestration engine starts.

@@ -82,7 +82,7 @@ pub enum StoreStartupError {
         #[source]
         source: std::io::Error,
     },
-    #[error("an incomplete project-data recovery operation remains at {path}")]
+    #[error("{} ({})", super::backup::interrupted_recovery_message(), path.display())]
     RecoveryIncomplete { path: PathBuf },
     #[error("failed to read storage instance marker {path}")]
     MarkerRead {
@@ -135,14 +135,7 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
     let _operation_guard = StoreOperationGuard::acquire_for_startup(&paths)
         .await
         .map_err(StoreStartupError::Backup)?;
-    if try_exists(&paths.recovery_journal())? {
-        return Err(StoreStartupError::RecoveryIncomplete {
-            path: paths.recovery_journal(),
-        });
-    }
-    if let Some(path) = recovery_staging_entry(&paths)? {
-        return Err(StoreStartupError::RecoveryIncomplete { path });
-    }
+    ensure_no_interrupted_recovery(&paths)?;
     let database_exists = try_exists(&paths.database)?;
     let marker_exists = try_exists(&paths.environment_id)?;
     let marker = marker_exists
@@ -160,6 +153,21 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
             prepare_existing(paths, storage_instance_id, &resolved_config.server_version).await
         }
     }
+}
+
+/// Refuses while a recovery journal or recovery-staging entry exists. Every writable opener calls
+/// it after taking the runtime lock; an interrupted recovery is finished only by
+/// `bibcode storage restore --resume`, which holds that lock exclusively.
+pub fn ensure_no_interrupted_recovery(paths: &StatePaths) -> Result<(), StoreStartupError> {
+    if try_exists(&paths.recovery_journal())? {
+        return Err(StoreStartupError::RecoveryIncomplete {
+            path: paths.recovery_journal(),
+        });
+    }
+    if let Some(path) = recovery_staging_entry(paths)? {
+        return Err(StoreStartupError::RecoveryIncomplete { path });
+    }
+    Ok(())
 }
 
 fn recovery_staging_entry(paths: &StatePaths) -> Result<Option<PathBuf>, StoreStartupError> {
