@@ -253,10 +253,7 @@ async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
         .expect("run unsafe start-empty");
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("project-data store is currently owned by a running server")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("BiBCode is using this data root"));
     assert_eq!(
         std::fs::read(&paths.database).expect("active database remains"),
         database_before
