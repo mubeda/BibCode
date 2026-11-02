@@ -1,5 +1,6 @@
 import type { ConnectionCatalogEntry } from "@bibcode/client-runtime/connection";
 import type { ServerConfig } from "@bibcode/contracts";
+import { updateSubjects } from "@bibcode/client-runtime/state/server-tools";
 import { useAtomValue } from "@effect/atom-react";
 import { useMemo } from "react";
 
@@ -99,7 +100,7 @@ export function useLocalEnvironmentUpdateGroups(): {
         connectionState: isPrimary
           ? "ready"
           : normalizeConnectionState(environment.connection.phase),
-        providers: serverConfig?.providers ?? [],
+        providers: serverConfig === null ? [] : updateSubjects(serverConfig),
       });
     }
 
@@ -146,7 +147,8 @@ export function useProviderUpdateEnvironments(): ReadonlyArray<ProviderUpdateEnv
             environmentId: environment.environmentId,
             label: environmentUpdateLabel(environment, isPrimary),
             connected: environment.connection.phase === "connected",
-            providers: environment.serverConfig?.providers ?? [],
+            providers:
+              environment.serverConfig === null ? [] : updateSubjects(environment.serverConfig),
           };
           return {
             isPrimary,

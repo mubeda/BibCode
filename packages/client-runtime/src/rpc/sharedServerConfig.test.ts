@@ -131,3 +131,38 @@ describe("applyServerConfigEvent", () => {
     ).toBeNull();
   });
 });
+
+describe("applyServerConfigEvent tools", () => {
+  const tool = {
+    toolId: "codegraph",
+    displayName: "CodeGraph",
+    installed: true,
+    version: "1.6.2",
+    checkedAt: "2026-11-02T00:00:00.000Z",
+  };
+
+  it("keeps the tools of a status event that carries none, and replaces them when it does", () => {
+    const withTools = { ...CONFIG, tools: [tool] } as unknown as ServerConfig;
+    const providersOnly = applyServerConfigEvent(withTools, {
+      version: 1,
+      type: "providerStatuses",
+      payload: { providers: [] },
+    });
+    expect(providersOnly?.tools).toEqual([tool]);
+    const updated = applyServerConfigEvent(withTools, {
+      version: 1,
+      type: "providerStatuses",
+      payload: { providers: [], tools: [{ ...tool, version: "1.6.3" }] },
+    });
+    expect(updated?.tools?.[0]?.version).toBe("1.6.3");
+  });
+
+  it("does not invent tools for a server that never reports them", () => {
+    const next = applyServerConfigEvent(CONFIG, {
+      version: 1,
+      type: "providerStatuses",
+      payload: { providers: [] },
+    });
+    expect(next).not.toHaveProperty("tools");
+  });
+});
