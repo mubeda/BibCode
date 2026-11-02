@@ -9424,7 +9424,7 @@ mod tests {
             .unwrap();
         manager.clear("thread-unit", "term-unit").await.unwrap();
         // The write and resize above can publish output, resize, or activity events first.
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match attachment.recv().await {
                     Some(AttachmentItem::Event(TerminalEvent::Cleared { .. })) => break,
