@@ -720,32 +720,46 @@ export const OrchestrationShellSnapshot = Schema.Struct({
   capped: Schema.optional(Schema.Boolean),
   /** The revision of this shell, kept by the client to resume; never sent inside a snapshot. */
   revision: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * The engine's sequence when `snapshotSequence` ran past it (#223): kept by the client from
+   * an item that carries one, never sent inside a snapshot.
+   */
+  engineSequence: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationShellSnapshot = typeof OrchestrationShellSnapshot.Type;
 
+/**
+ * A delta item. `sequence` only orders items for the client's reducer; when an update has more
+ * items than events (a terminal's agent started working, say), it runs past the engine's
+ * sequence, and the items past it carry that sequence as `engineSequence`.
+ */
 export const OrchestrationShellStreamEvent = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("project-upserted"),
     sequence: NonNegativeInt,
     revision: Schema.optional(TrimmedNonEmptyString),
+    engineSequence: Schema.optional(NonNegativeInt),
     project: OrchestrationProjectShell,
   }),
   Schema.Struct({
     kind: Schema.Literal("project-removed"),
     sequence: NonNegativeInt,
     revision: Schema.optional(TrimmedNonEmptyString),
+    engineSequence: Schema.optional(NonNegativeInt),
     projectId: ProjectId,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread-upserted"),
     sequence: NonNegativeInt,
     revision: Schema.optional(TrimmedNonEmptyString),
+    engineSequence: Schema.optional(NonNegativeInt),
     thread: OrchestrationThreadShell,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread-removed"),
     sequence: NonNegativeInt,
     revision: Schema.optional(TrimmedNonEmptyString),
+    engineSequence: Schema.optional(NonNegativeInt),
     threadId: ThreadId,
   }),
 ]);

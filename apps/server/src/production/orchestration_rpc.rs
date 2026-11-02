@@ -1381,12 +1381,14 @@ fn shell_stream_with(
                         }
                         // A failed re-read would end the stream, and the client does not
                         // resubscribe until its session changes: keep the stream, retry, and
-                        // send a whole snapshot once a read succeeds (`held` is cleared).
+                        // send a whole snapshot once a read succeeds. `held` stays, so its ids
+                        // stay sticky in that snapshot.
                         (None, Err(error)) => {
                             let message = error.get("message").and_then(Value::as_str);
                             tracing::warn!(error = message.unwrap_or("unknown"), "shell re-read failed; retrying");
                             due = Some(tokio::time::Instant::now() + SHELL_READ_RETRY);
-                            Ok(())
+                            lagged = true;
+                            continue;
                         }
                         (None, Ok(next)) => {
                             let revision = next_held.as_ref().and_then(revision_of);
@@ -1852,8 +1854,10 @@ impl HeldShell {
     /// for the left-out threads in `removed`. They take consecutive sequences ending at
     /// `next`'s, so the client's reducer, which drops an item at or below the sequence it
     /// holds, applies each one; when the window had fewer events than items (a terminal's
-    /// agent started working, say), they continue past it instead. `next_held` takes the
-    /// last one, the sequence the client then holds.
+    /// agent started working, say), they continue past it instead, and each item past it
+    /// carries the engine's sequence as `engineSequence`, which the client compares with the
+    /// archived snapshot's and resumes from. `next_held` takes the last one, the sequence the
+    /// client then holds.
     fn delta(&self, next: &Value, next_held: &mut Self, removed: &[String]) -> Vec<Value> {
         let mut items = Vec::new();
         // Projects first, so a new thread's project is there when the thread arrives.
@@ -1907,9 +1911,13 @@ impl HeldShell {
                 .map(|id| json!({ "kind": "thread-removed", "threadId": id })),
         );
         let count = i64::try_from(items.len()).unwrap_or(i64::MAX);
-        let first = (next_held.sequence - count + 1).max(self.sequence + 1);
+        let engine_sequence = next_held.sequence;
+        let first = (engine_sequence - count + 1).max(self.sequence + 1);
         for (sequence, item) in (first..).zip(&mut items) {
             item["sequence"] = json!(sequence);
+            if sequence > engine_sequence {
+                item["engineSequence"] = json!(engine_sequence);
+            }
             next_held.sequence = sequence;
         }
         items
@@ -9121,6 +9129,145 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// A re-read keeps the cap: the threads the stream holds keep their places among the
+    /// newest, so they never hand their slots to older threads.
+    #[tokio::test]
+    async fn shell_stream_re_read_sends_only_what_changed_under_the_cap() {
+        let (engine, _) = capped_engine(30).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        next_items(&mut stream).await;
+        rename(&engine, "t010", 1).await;
+        let items = next_items(&mut stream).await;
+        let kinds = items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {}",
+                    item["kind"].as_str().unwrap(),
+                    item["thread"]["id"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["thread-upserted t010"], "{items:?}");
+        engine.shutdown().await;
+    }
+
+    /// A failed re-read keeps the ids the client holds: the snapshot that recovers it still has
+    /// a thread newer ones pushed out of the cap.
+    #[tokio::test]
+    async fn shell_stream_recovery_snapshot_after_a_failed_read_keeps_held_threads() {
+        let (engine, _) = capped_engine(25).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        assert!(thread_ids_of(&next_items(&mut stream).await[0]["snapshot"]).contains("t000"));
+        for index in 0..3 {
+            create_keyed_thread(&engine, &format!("new-{index}"), 1_000 + index).await;
+        }
+        tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 3).await;
+        while stream.try_recv().is_ok() {}
+        let database = engine.repositories().database().clone();
+        let rename_table = |from: &'static str, to: &'static str| {
+            let database = database.clone();
+            async move {
+                database
+                    .call(move |connection| {
+                        connection.execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("rename table");
+            }
+        };
+        rename(&engine, "t010", 1).await;
+        rename_table("projection_projects", "projection_projects_hidden").await;
+        tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 2).await;
+        rename_table("projection_projects_hidden", "projection_projects").await;
+        let items = tokio::time::timeout(SHELL_READ_RETRY * 3, stream.recv())
+            .await
+            .expect("a retry")
+            .expect("an open stream")
+            .expect("a successful chunk");
+        assert_eq!(items[0]["kind"], "snapshot");
+        assert!(
+            thread_ids_of(&items[0]["snapshot"]).contains("t000"),
+            "{:?}",
+            thread_ids_of(&items[0]["snapshot"])
+        );
+        engine.shutdown().await;
+    }
+
+    /// Items past the engine's sequence (a terminal's agent started working; no event) carry
+    /// that sequence, and a client resuming from it gets `unchanged`.
+    #[tokio::test]
+    async fn shell_stream_items_past_the_engine_carry_its_sequence() {
+        let (engine, _) = capped_engine(30).await;
+        let (updates, receiver) = broadcast::channel(8);
+        let attachment =
+            crate::terminal::TerminalMetadataAttachment::for_test(Vec::new(), receiver);
+        let mut stream = shell_stream_with(
+            engine.clone(),
+            Some(ShellTerminals::Attached(attachment)),
+            SubscribeShellInput {
+                cap: Some(ShellCapInput::default()),
+                resume: None,
+            },
+            engine.subscribe_events(),
+            CancellationToken::new(),
+            default_thread_revision_keys(),
+        );
+        let first = next_items(&mut stream).await.remove(0);
+        let engine_sequence = first["snapshot"]["snapshotSequence"].clone();
+        updates
+            .send(TerminalMetadataEvent::Upsert {
+                terminal: Box::new(terminal_summary("t001", "working")),
+            })
+            .unwrap();
+        let items = next_items(&mut stream).await;
+        assert!(!items.is_empty());
+        for item in &items {
+            assert!(
+                item["sequence"].as_i64() > engine_sequence.as_i64(),
+                "{items:?}"
+            );
+            assert_eq!(item["engineSequence"], engine_sequence, "{items:?}");
+        }
+        // A client resuming at the engine's sequence, with the same live terminal, holds the
+        // current shell.
+        let (_updates, receiver) = broadcast::channel(8);
+        let attachment = crate::terminal::TerminalMetadataAttachment::for_test(
+            vec![terminal_summary("t001", "working")],
+            receiver,
+        );
+        let mut resumed = shell_stream_with(
+            engine.clone(),
+            Some(ShellTerminals::Attached(attachment)),
+            SubscribeShellInput {
+                cap: Some(ShellCapInput::default()),
+                resume: Some(ShellResumeInput {
+                    revision: items.last().unwrap()["revision"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    snapshot_sequence: engine_sequence.as_i64().unwrap(),
+                }),
+            },
+            engine.subscribe_events(),
+            CancellationToken::new(),
+            default_thread_revision_keys(),
+        );
+        assert_eq!(next_items(&mut resumed).await[0]["kind"], "unchanged");
+        engine.shutdown().await;
+    }
+
     /// A resubscribe with the revision the client holds is answered `unchanged`, with each
     /// kept thread's activity age now.
     #[tokio::test]
@@ -9467,7 +9614,7 @@ mod tests {
     }
 
     /// #223 baseline and result: what the shell stream sends while one thread streams a turn,
-    /// at 30 and 150 threads. Every thread has a finished turn, a session, a prompt and a reply,
+    /// at 30 and 150 threads, uncapped and capped. Every thread has a finished turn, a session, a prompt and a reply,
     /// so each shell carries previews; the streaming thread has a running session and turn, and
     /// every 50 ms its reply grows by a delta, its provider progress time moves, and every
     /// fourth tick it adds a tool activity, each followed by an engine event as the provider
@@ -9494,6 +9641,8 @@ mod tests {
                 let live = index == 0;
                 let turn_id = if live { "turn-live" } else { "turn-done" };
                 let mut thread = store_thread(&thread_id, "project", Some(turn_id));
+                // Workspace threads without a worktree: what a capped shell may leave out.
+                thread.kind = "workspace".to_owned();
                 thread.last_activity_at = Some(CREATED_AT.to_owned());
                 repositories.upsert_thread(thread.clone()).await.unwrap();
                 let mut turn = store_turn(
@@ -9553,72 +9702,87 @@ mod tests {
             }
             let rebuild = started.elapsed() / rebuilds;
 
-            let (events, receiver) = broadcast::channel(1_024);
-            let cancellation = CancellationToken::new();
-            let mut stream =
-                shell_stream_with_events(engine.clone(), receiver, cancellation.clone());
-            let first = serde_json::to_vec(&next_items(&mut stream).await[0])
-                .unwrap()
-                .len();
-            let counter = tokio::spawn(async move {
-                let (mut items, mut bytes) = (0_usize, 0_usize);
-                while let Some(Ok(chunk)) = stream.recv().await {
-                    items += chunk.len();
-                    bytes += chunk
-                        .iter()
-                        .map(|item| serde_json::to_vec(item).unwrap().len())
-                        .sum::<usize>();
+            // Each turn is measured twice: as an older client subscribes (`{}`, every thread)
+            // and as the app does since #223 (`cap`, the kept set).
+            let mut applied = 0;
+            for capped in [false, true] {
+                let (events, receiver) = broadcast::channel(1_024);
+                let cancellation = CancellationToken::new();
+                let mut stream = shell_stream_with(
+                    engine.clone(),
+                    None,
+                    SubscribeShellInput {
+                        cap: capped.then(ShellCapInput::default),
+                        resume: None,
+                    },
+                    receiver,
+                    cancellation.clone(),
+                    default_thread_revision_keys(),
+                );
+                let first = serde_json::to_vec(&next_items(&mut stream).await[0])
+                    .unwrap()
+                    .len();
+                let counter = tokio::spawn(async move {
+                    let (mut items, mut bytes) = (0_usize, 0_usize);
+                    while let Some(Ok(chunk)) = stream.recv().await {
+                        items += chunk.len();
+                        bytes += chunk
+                            .iter()
+                            .map(|item| serde_json::to_vec(item).unwrap().len())
+                            .sum::<usize>();
+                    }
+                    (items, bytes)
+                });
+                let started = std::time::Instant::now();
+                let mut ticks = 0;
+                while started.elapsed() < TURN {
+                    assistant.text.push_str(DELTA);
+                    assistant.updated_at = now_iso();
+                    repositories
+                        .upsert_message(assistant.clone())
+                        .await
+                        .unwrap();
+                    if ticks % 4 == 0 {
+                        let mut activity = store_activity(
+                            &format!("tool-{applied:04}"),
+                            &thread.thread_id,
+                            "turn-live",
+                            "tool",
+                            Some(applied),
+                            &now_iso(),
+                        );
+                        activity.summary = format!("Ran cargo test, step {applied}");
+                        repositories.upsert_activity(activity).await.unwrap();
+                    }
+                    thread.last_activity_at = Some(now_iso());
+                    repositories.upsert_thread(thread.clone()).await.unwrap();
+                    // Each provider event is a durable event the projection applies.
+                    applied += 1;
+                    repositories
+                        .upsert_projection_state(crate::persistence::ProjectionState {
+                            projector: "streaming-turn".to_owned(),
+                            last_applied_sequence: event.sequence + applied,
+                            updated_at: now_iso(),
+                        })
+                        .await
+                        .unwrap();
+                    events.send(event.clone()).expect("the stream listens");
+                    ticks += 1;
+                    tokio::time::sleep(EVENT_INTERVAL).await;
                 }
-                (items, bytes)
-            });
-            let started = std::time::Instant::now();
-            let mut ticks = 0;
-            while started.elapsed() < TURN {
-                assistant.text.push_str(DELTA);
-                assistant.updated_at = now_iso();
-                repositories
-                    .upsert_message(assistant.clone())
-                    .await
-                    .unwrap();
-                if ticks % 4 == 0 {
-                    let mut activity = store_activity(
-                        &format!("tool-{ticks:04}"),
-                        &thread.thread_id,
-                        "turn-live",
-                        "tool",
-                        Some(ticks),
-                        &now_iso(),
-                    );
-                    activity.summary = format!("Ran cargo test, step {ticks}");
-                    repositories.upsert_activity(activity).await.unwrap();
-                }
-                thread.last_activity_at = Some(now_iso());
-                repositories.upsert_thread(thread.clone()).await.unwrap();
-                // Each provider event is a durable event the projection applies.
-                repositories
-                    .upsert_projection_state(crate::persistence::ProjectionState {
-                        projector: "streaming-turn".to_owned(),
-                        last_applied_sequence: event.sequence + ticks + 1,
-                        updated_at: now_iso(),
-                    })
-                    .await
-                    .unwrap();
-                events.send(event.clone()).expect("the stream listens");
-                ticks += 1;
-                tokio::time::sleep(EVENT_INTERVAL).await;
+                let elapsed = started.elapsed();
+                tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 2).await;
+                cancellation.cancel();
+                let (items, bytes) = counter.await.unwrap();
+                println!(
+                    "{threads} threads{}: first snapshot {first} B; {ticks} events in {:.1} s                      sent {items} items ({:.2}/s), {bytes} B ({} B/item); rebuild {:.1} ms",
+                    if capped { ", capped" } else { "" },
+                    elapsed.as_secs_f64(),
+                    items as f64 / elapsed.as_secs_f64(),
+                    bytes.checked_div(items).unwrap_or(0),
+                    rebuild.as_secs_f64() * 1e3,
+                );
             }
-            let elapsed = started.elapsed();
-            tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 2).await;
-            cancellation.cancel();
-            let (items, bytes) = counter.await.unwrap();
-            println!(
-                "{threads} threads: first snapshot {first} B; {ticks} events in {:.1} s sent \
-                 {items} items ({:.2}/s), {bytes} B ({} B/item); rebuild {:.1} ms",
-                elapsed.as_secs_f64(),
-                items as f64 / elapsed.as_secs_f64(),
-                bytes.checked_div(items).unwrap_or(0),
-                rebuild.as_secs_f64() * 1e3,
-            );
             engine.shutdown().await;
         }
     }
