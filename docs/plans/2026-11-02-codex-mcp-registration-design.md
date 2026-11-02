@@ -1,6 +1,6 @@
 # Codex MCP Registration Collision (#273)
 
-Status: Approved by Mauro 2026-11-02, option A (Codex review rounds 1-3). Design for issue 273,
+Status: Approved by Mauro 2026-11-02 (option A; Codex review rounds 1-3). Design for issue 273,
 verified against `main` at `fd98b4330` with codex-cli 0.166.0.
 
 ## Problem
@@ -29,15 +29,15 @@ the table that `codex mcp add` writes:
     command = "bibcode-desktop"
     args = ["mcp", "--base-dir", "/nonexistent"]
 
-| Home | `-c` overrides | Result |
-|---|---|---|
-| registered | `bibcode.url`, `bibcode.bearer_token_env_var` (today) | `-32600: failed to load configuration: url is not supported for stdio in mcp_servers.bibcode` |
-| empty | same | `thread/start` OK |
-| registered | none | `thread/start` OK |
-| registered | `mcp_servers.bibcode={url=…,bearer_token_env_var=…}` (whole inline table) | the same `-32600`: an inline table is merged too |
-| registered | `bibcode_thread.url`, `bibcode_thread.bearer_token_env_var` | OK |
-| registered | `bibcode.enabled=false` plus the `bibcode_thread` pair | OK |
-| empty | `bibcode.enabled=false` | the process exits before `initialize`: `invalid transport in mcp_servers.bibcode` |
+| Home       | `-c` overrides                                                            | Result                                                                                        |
+| ---------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| registered | `bibcode.url`, `bibcode.bearer_token_env_var` (today)                     | `-32600: failed to load configuration: url is not supported for stdio in mcp_servers.bibcode` |
+| empty      | same                                                                      | `thread/start` OK                                                                             |
+| registered | none                                                                      | `thread/start` OK                                                                             |
+| registered | `mcp_servers.bibcode={url=…,bearer_token_env_var=…}` (whole inline table) | the same `-32600`: an inline table is merged too                                              |
+| registered | `bibcode_thread.url`, `bibcode_thread.bearer_token_env_var`               | OK                                                                                            |
+| registered | `bibcode.enabled=false` plus the `bibcode_thread` pair                    | OK                                                                                            |
+| empty      | `bibcode.enabled=false`                                                   | the process exits before `initialize`: `invalid transport in mcp_servers.bibcode`             |
 
 So no `-c` spelling can replace or delete the user's `bibcode` table. Any fix of
 the collision changes a key name or which entry wins, which is why this needs
