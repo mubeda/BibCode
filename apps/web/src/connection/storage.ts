@@ -64,6 +64,10 @@ const StoredThreadSnapshot = Schema.Struct({
   environmentId: EnvironmentId,
   threadId: ThreadId,
   thread: OrchestrationThread,
+  // The revision the thread was at (#227). Records written before it was saved have none.
+  resumeFrom: Schema.optional(
+    Schema.NullOr(Schema.Struct({ revision: Schema.String, snapshotSequence: Schema.Number })),
+  ),
 });
 const StoredThreadSnapshotJson = Schema.fromJsonString(StoredThreadSnapshot);
 const ConnectionCatalogDocumentJson = Schema.fromJsonString(ConnectionCatalogDocument);
@@ -935,7 +939,7 @@ export const connectionStorageLayer = Layer.effectContext(
               Effect.mapError((cause) => persistenceError("load-thread", cause)),
               Effect.map((stored) =>
                 stored.environmentId === environmentId && stored.threadId === threadId
-                  ? Option.some(stored.thread)
+                  ? Option.some({ thread: stored.thread, resumeFrom: stored.resumeFrom ?? null })
                   : Option.none(),
               ),
             );
@@ -946,13 +950,14 @@ export const connectionStorageLayer = Layer.effectContext(
               : persistenceError("load-thread", cause),
           ),
         ),
-      saveThread: (environmentId, thread) =>
+      saveThread: (environmentId, { thread, resumeFrom }) =>
         Effect.gen(function* () {
           const encoded = yield* encodeStoredThreadSnapshot({
             schemaVersion: 1,
             environmentId,
             threadId: thread.id,
             thread,
+            resumeFrom,
           }).pipe(Effect.mapError((cause) => persistenceError("save-thread", cause)));
           yield* writeDatabaseValue(
             database,

@@ -91,6 +91,7 @@ function awaitThreadState(
 
 const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (options?: {
   readonly cached?: OrchestrationThread;
+  readonly cachedResumeFrom?: Persistence.ThreadResumePoint;
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -98,7 +99,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const retryCount = yield* Ref.make(0);
   const subscriptionCount = yield* Ref.make(0);
   const subscribeInputs = yield* Ref.make<ReadonlyArray<unknown>>([]);
-  const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThread>>([]);
+  const savedThreads = yield* Ref.make<ReadonlyArray<Persistence.CachedThread>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
   const supervisorState = yield* SubscriptionRef.make<SupervisorConnectionState>(
     AVAILABLE_CONNECTION_STATE,
@@ -137,11 +138,14 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     loadThread: (_environmentId, threadId) =>
       Effect.succeed(
         threadId === THREAD_ID && options?.cached !== undefined
-          ? Option.some(options.cached)
+          ? Option.some({
+              thread: options.cached,
+              resumeFrom: options.cachedResumeFrom ?? null,
+            })
           : Option.none(),
       ),
-    saveThread: (_environmentId, thread) =>
-      Ref.update(savedThreads, (current) => [...current, thread]),
+    saveThread: (_environmentId, cached) =>
+      Ref.update(savedThreads, (current) => [...current, cached]),
     removeThread: (_environmentId, threadId) =>
       Ref.update(removedThreads, (current) => [...current, threadId]),
     clear: () => Effect.void,
@@ -254,7 +258,7 @@ describe("EnvironmentThreads", () => {
       yield* Effect.yieldNow;
 
       expect(Option.getOrThrow(state.data).title).toBe("Live title");
-      expect((yield* Ref.get(harness.savedThreads)).at(-1)?.title).toBe("Live title");
+      expect((yield* Ref.get(harness.savedThreads)).at(-1)?.thread.title).toBe("Live title");
     }),
   );
 
@@ -513,5 +517,131 @@ describe("EnvironmentThreads", () => {
         expect(yield* resubscribe(harness)).toEqual({ threadId: THREAD_ID, patches: true });
       }),
     );
+
+    // A reload or an app restart against a server that kept running (#227).
+    describe("after a cold start", () => {
+      const firstSubscribe = Effect.fn("TestEnvironmentThreads.firstSubscribe")(function* (
+        harness: Effect.Success<ReturnType<typeof makeHarness>>,
+      ) {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if ((yield* Ref.get(harness.subscriptionCount)) > 0) break;
+          yield* Effect.yieldNow;
+        }
+        return (yield* Ref.get(harness.subscribeInputs))[0];
+      });
+      const lastSaved = Effect.fn("TestEnvironmentThreads.lastSaved")(function* (
+        harness: Effect.Success<ReturnType<typeof makeHarness>>,
+      ) {
+        yield* TestClock.adjust("500 millis");
+        yield* Effect.yieldNow;
+        return (yield* Ref.get(harness.savedThreads)).at(-1);
+      });
+
+      it.effect("resumes from the cached revision and keeps the cached thread when unchanged", () =>
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            cached: BASE_THREAD,
+            cachedResumeFrom: { revision: "rev-1", snapshotSequence: 3 },
+          });
+          const cached = yield* awaitThreadState(
+            harness.observed,
+            (value) => value.status === "cached",
+          );
+          expect(yield* firstSubscribe(harness)).toEqual({
+            threadId: THREAD_ID,
+            patches: true,
+            resume: { revision: "rev-1", snapshotSequence: 3 },
+          });
+
+          yield* Queue.offer(harness.inputs, {
+            kind: "unchanged",
+            snapshotSequence: 5,
+            revision: "rev-1",
+          });
+          const resumed = yield* awaitThreadState(
+            harness.observed,
+            (value) => value.status === "live",
+          );
+          expect(Option.getOrThrow(resumed.data)).toBe(Option.getOrThrow(cached.data));
+          // Nothing changed, so the cached thread is not written again.
+          expect(yield* lastSaved(harness)).toBeUndefined();
+        }),
+      );
+
+      it.effect("subscribes without resume from a cache written before revisions were saved", () =>
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({ cached: BASE_THREAD });
+          expect(yield* firstSubscribe(harness)).toEqual({ threadId: THREAD_ID, patches: true });
+        }),
+      );
+
+      it.effect("saves the revision with the thread it describes", () =>
+        Effect.gen(function* () {
+          const harness = yield* makeHarness();
+          yield* Queue.offer(harness.inputs, { ...snapshot(BASE_THREAD), revision: "rev-1" });
+          yield* Queue.offer(harness.inputs, {
+            kind: "patch",
+            snapshotSequence: 4,
+            patch: { set: { title: "Patched" }, unset: [], arrays: {} },
+            revision: "rev-2",
+          });
+          yield* awaitThreadState(harness.observed, live("Patched"));
+          expect(yield* lastSaved(harness)).toMatchObject({
+            thread: { title: "Patched" },
+            resumeFrom: { revision: "rev-2", snapshotSequence: 4 },
+          });
+        }),
+      );
+
+      it.effect("clears the saved revision after a snapshot without one", () =>
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            cached: BASE_THREAD,
+            cachedResumeFrom: { revision: "rev-1", snapshotSequence: 3 },
+          });
+          yield* Queue.offer(harness.inputs, snapshot({ ...BASE_THREAD, title: "Fresh" }));
+          yield* awaitThreadState(harness.observed, live("Fresh"));
+          expect(yield* lastSaved(harness)).toMatchObject({
+            thread: { title: "Fresh" },
+            resumeFrom: null,
+          });
+        }),
+      );
+
+      it.effect("clears the saved revision after a change no revision describes", () =>
+        Effect.gen(function* () {
+          const harness = yield* makeHarness();
+          yield* Queue.offer(harness.inputs, { ...snapshot(BASE_THREAD), revision: "rev-1" });
+          yield* Queue.offer(harness.inputs, titleUpdated("Evented"));
+          yield* awaitThreadState(harness.observed, live("Evented"));
+          expect(yield* lastSaved(harness)).toMatchObject({
+            thread: { title: "Evented" },
+            resumeFrom: null,
+          });
+        }),
+      );
+
+      it.effect("clears the saved revision even when the change leaves the thread as it was", () =>
+        Effect.gen(function* () {
+          const harness = yield* makeHarness();
+          yield* Queue.offer(harness.inputs, {
+            kind: "snapshot",
+            snapshot: { snapshotSequence: 5, thread: BASE_THREAD },
+            revision: "rev-1",
+          });
+          yield* awaitThreadState(harness.observed, live(BASE_THREAD.title));
+          expect(yield* lastSaved(harness)).toMatchObject({ resumeFrom: { revision: "rev-1" } });
+          // A replayed event changes nothing but no longer matches a revision.
+          yield* Queue.offer(harness.inputs, titleUpdated("Replayed", 2));
+          for (let index = 0; index < 10; index += 1) {
+            yield* Effect.yieldNow;
+          }
+          expect(yield* lastSaved(harness)).toMatchObject({
+            thread: { title: BASE_THREAD.title },
+            resumeFrom: null,
+          });
+        }),
+      );
+    });
   });
 });

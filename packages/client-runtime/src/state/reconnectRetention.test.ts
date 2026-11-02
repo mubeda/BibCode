@@ -176,7 +176,7 @@ const makeHarness = Effect.fn("ReconnectRetention.makeHarness")(function* () {
     saveShell: () => Effect.void,
     loadThread: () => Effect.succeed(Option.none()),
     // The web store saves an encoded string; encoding here keeps nothing either.
-    saveThread: (_environmentId, thread) => Effect.sync(() => void JSON.stringify(thread)),
+    saveThread: (_environmentId, cached) => Effect.sync(() => void JSON.stringify(cached)),
     removeThread: () => Effect.void,
     clear: () => Effect.void,
   });
