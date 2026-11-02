@@ -6,7 +6,9 @@ import {
   type ThreadId as ThreadIdType,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -21,19 +23,41 @@ import {
   type CachedThread,
   type ThreadResumePoint,
 } from "../platform/persistence.ts";
-import { subscribe } from "../rpc/client.ts";
+import {
+  request,
+  subscribe,
+  type EnvironmentRpcFailure,
+  type EnvironmentRpcUnavailableError,
+} from "../rpc/client.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyThreadPatch } from "./threadPatch.ts";
+import { appendHistoryPage, mergeThreadHistory, type OlderHistory } from "./threadHistory.ts";
 import { applyThreadDetailEvent } from "./threadReducer.ts";
 import { THREAD_STATE_IDLE_TTL_MS } from "./threadRetention.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
 
 export type EnvironmentThreadStatus = "empty" | "cached" | "synchronizing" | "live" | "deleted";
 
+/** Why an older history page did not load. */
+export type ThreadHistoryPageFailure =
+  | EnvironmentRpcFailure<typeof ORCHESTRATION_WS_METHODS.getThreadHistoryPage>
+  | EnvironmentRpcUnavailableError;
+
+/** Loading of a windowed thread's older history (#226). */
+export interface ThreadOlderHistory {
+  readonly status: "idle" | "loading" | "error";
+  /** Loads the next older page. Single-flight: a call while one loads waits for that one. */
+  readonly loadOlder: Effect.Effect<void, ThreadHistoryPageFailure>;
+  /** Loads every older page; stops at, and fails with, the first failure. */
+  readonly loadAllOlder: Effect.Effect<void, ThreadHistoryPageFailure>;
+}
+
 export interface EnvironmentThreadState {
   readonly data: Option.Option<OrchestrationThread>;
   readonly status: EnvironmentThreadStatus;
   readonly error: Option.Option<string>;
+  /** Present on the state of a subscription; it has older history when `data.history.hasOlder`. */
+  readonly olderHistory?: ThreadOlderHistory;
 }
 
 export const EMPTY_ENVIRONMENT_THREAD_STATE: EnvironmentThreadState = {
@@ -72,8 +96,34 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     ),
   );
   const cachedThread = Option.map(cached, (entry) => entry.thread);
+  // The server-held thread, which patches apply to by index; a windowed one holds recent
+  // history (#226). `older` is the older pages loaded since, never persisted. `data` publishes
+  // the two merged, so every state reader reads one thread.
+  let window: Option.Option<OrchestrationThread> = cachedThread;
+  let older: OlderHistory | null = null;
+  // Bumped whenever `older` stops matching the window: a page answering an earlier generation
+  // is dropped.
+  let generation = 0;
+  let inFlight: Deferred.Deferred<void, ThreadHistoryPageFailure> | null = null;
+  let olderStatus: ThreadOlderHistory["status"] = "idle";
+  let merged: {
+    window: OrchestrationThread;
+    older: OlderHistory | null;
+    thread: OrchestrationThread;
+  } | null = null;
+  const publishedThread = (thread: OrchestrationThread) => {
+    if (merged === null || merged.window !== thread || merged.older !== older) {
+      merged = { window: thread, older, thread: mergeThreadHistory(thread, older) };
+    }
+    return merged.thread;
+  };
+  const resetOlder = () => {
+    generation += 1;
+    older = null;
+    olderStatus = "idle";
+  };
   const state = yield* SubscriptionRef.make<EnvironmentThreadState>({
-    data: cachedThread,
+    data: Option.map(cachedThread, publishedThread),
     status: statusWithoutLiveData(cachedThread),
     error: Option.none(),
   });
@@ -141,20 +191,34 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const setThread = Effect.fn("EnvironmentThreadState.setThread")(function* (
     thread: OrchestrationThread,
   ) {
-    yield* SubscriptionRef.set(state, {
-      data: Option.some(thread),
-      status: "live",
+    window = Option.some(thread);
+    yield* SubscriptionRef.update(state, (current) => ({
+      ...current,
+      data: Option.some(publishedThread(thread)),
+      status: "live" as const,
       error: Option.none(),
-    });
+    }));
   });
+
+  // Publishes `older` and its loading status against the current window.
+  const publishOlder = SubscriptionRef.update(state, (current) => ({
+    ...current,
+    data: Option.map(window, publishedThread),
+    ...(current.olderHistory === undefined
+      ? {}
+      : { olderHistory: { ...current.olderHistory, status: olderStatus } }),
+  }));
 
   const setDeleted = Effect.fn("EnvironmentThreadState.setDeleted")(function* () {
     resumeFrom = null;
-    yield* SubscriptionRef.set(state, {
+    window = Option.none();
+    resetOlder();
+    yield* SubscriptionRef.update(state, (current) => ({
+      ...current,
       data: Option.none(),
-      status: "deleted",
+      status: "deleted" as const,
       error: Option.none(),
-    });
+    }));
     yield* cache.removeThread(environmentId, threadId).pipe(
       Effect.catch((error) =>
         Effect.logWarning("Could not remove the cached thread.").pipe(
@@ -172,20 +236,27 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     item: OrchestrationThreadStreamItem,
   ) {
     if (item.kind === "snapshot") {
+      // A new floor, or a whole thread from an older server, makes the loaded pages stale.
+      const history = item.snapshot.thread.history;
+      if (
+        history === undefined ||
+        history.floor !== Option.getOrUndefined(window)?.history?.floor
+      ) {
+        resetOlder();
+      }
       yield* SubscriptionRef.set(lastSequence, item.snapshot.snapshotSequence);
       yield* setThread(item.snapshot.thread);
       resumeAt(item.revision, item.snapshot.snapshotSequence);
       return;
     }
     if (item.kind === "patch") {
-      // Computed against the snapshot this subscription holds, so it always applies.
-      const current = yield* SubscriptionRef.get(state);
-      if (Option.isNone(current.data)) {
+      // Computed against the window this subscription holds, so it always applies.
+      if (Option.isNone(window)) {
         resumeFrom = null;
         return;
       }
       yield* SubscriptionRef.set(lastSequence, item.snapshotSequence);
-      yield* setThread(applyThreadPatch(current.data.value, item.patch));
+      yield* setThread(applyThreadPatch(window.value, item.patch));
       resumeAt(item.revision, item.snapshotSequence);
       return;
     }
@@ -208,14 +279,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
     yield* SubscriptionRef.set(lastSequence, item.event.sequence);
 
-    const current = yield* SubscriptionRef.get(state);
-    if (Option.isNone(current.data)) {
+    if (Option.isNone(window)) {
       if (item.event.type === "thread.deleted") {
         yield* setDeleted();
       }
       return;
     }
-    const result = applyThreadDetailEvent(current.data.value, item.event);
+    const result = applyThreadDetailEvent(window.value, item.event);
     if (result.kind === "updated") {
       yield* setThread(result.thread);
     } else if (result.kind === "deleted") {
@@ -225,17 +295,76 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   // Caches the thread with its revision whenever either changes. A new snapshot sequence under
   // the same revision is not worth rewriting the thread: the server accepts the older one.
+  // Only the window is cached; older pages are session only.
   const applyItem = Effect.fn("EnvironmentThreadState.applyItem")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
-    const before = (yield* SubscriptionRef.get(state)).data;
+    const before = window;
     const revisionBefore = resumeFrom?.revision;
     yield* applyStreamItem(item);
-    const after = (yield* SubscriptionRef.get(state)).data;
+    const after = window;
     if (Option.isSome(after) && (after !== before || resumeFrom?.revision !== revisionBefore)) {
       yield* Queue.offer(persistence, { thread: after.value, resumeFrom });
     }
   });
+
+  // The cursor of the next older page: the window's floor until a page loads.
+  const nextCursor = (): string | null => {
+    if (older !== null) return older.cursor;
+    const history = Option.getOrUndefined(window)?.history;
+    return history?.hasOlder === true ? history.floor : null;
+  };
+  const services = yield* Effect.context<EnvironmentSupervisor>();
+  const fetchPage = (cursor: string) =>
+    request(ORCHESTRATION_WS_METHODS.getThreadHistoryPage, { threadId, cursor }).pipe(
+      Effect.provideContext(services),
+    );
+  const loadOlder: Effect.Effect<void, ThreadHistoryPageFailure> = Effect.suspend(() => {
+    if (inFlight !== null) return Deferred.await(inFlight);
+    const cursor = nextCursor();
+    if (cursor === null) return Effect.void;
+    const requested = generation;
+    return Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const done = yield* Deferred.make<void, ThreadHistoryPageFailure>();
+        inFlight = done;
+        olderStatus = "loading";
+        yield* publishOlder;
+        const exit = yield* Effect.exit(restore(fetchPage(cursor)));
+        inFlight = null;
+        if (Exit.isSuccess(exit)) {
+          // A page for a floor or cursor this state no longer holds is stale or a duplicate.
+          if (requested === generation && nextCursor() === cursor) {
+            older = appendHistoryPage(older, exit.value);
+          }
+          olderStatus = "idle";
+        } else if (
+          Option.getOrUndefined(Cause.findErrorOption(exit.cause))?._tag ===
+          "OrchestrationThreadHistoryStaleError"
+        ) {
+          // A revert this state missed: the next re-read or resubscribe brings the new window.
+          resetOlder();
+        } else {
+          olderStatus = Cause.hasInterruptsOnly(exit.cause) ? "idle" : "error";
+        }
+        yield* publishOlder;
+        yield* Deferred.done(done, Exit.isSuccess(exit) ? Exit.void : exit);
+        return yield* exit;
+      }),
+    ).pipe(Effect.asVoid);
+  });
+  const loadAllOlder: Effect.Effect<void, ThreadHistoryPageFailure> = Effect.gen(function* () {
+    // Each round either moves the cursor or fails, so this can't spin. A page another caller
+    // started and then dropped is only retried.
+    while (nextCursor() !== null) {
+      const exit = yield* Effect.exit(loadOlder);
+      if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) return yield* exit;
+    }
+  });
+  yield* SubscriptionRef.update(state, (current) => ({
+    ...current,
+    olderHistory: { status: olderStatus, loadOlder, loadAllOlder },
+  }));
 
   yield* SubscriptionRef.changes(supervisor.state).pipe(
     Stream.runForEach((connectionState) => {
@@ -255,11 +384,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   yield* subscribe(
     ORCHESTRATION_WS_METHODS.subscribeThread,
     // Updates arrive as patches against the snapshot this subscription holds; a resubscribe
-    // names the revision it holds, so an unchanged thread is not sent again.
-    () =>
-      resumeFrom === null
-        ? { threadId, patches: true }
-        : { threadId, patches: true, resume: resumeFrom },
+    // names the revision it holds, so an unchanged thread is not sent again. It asks for a
+    // history window (#226) and echoes the floor of the window it holds.
+    () => {
+      const floor = Option.getOrUndefined(window)?.history?.floor;
+      const history = floor === undefined ? {} : { floor };
+      return resumeFrom === null
+        ? { threadId, patches: true, history }
+        : { threadId, patches: true, history, resume: resumeFrom };
+    },
     {
       onExpectedFailure: setStreamError,
       // A thread can appear just after its view subscribes, so a failure is retried soon. A
@@ -274,13 +407,11 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   ).pipe(Stream.runForEach(applyItem), Effect.forkScoped);
 
   yield* Effect.addFinalizer(() =>
-    SubscriptionRef.get(state).pipe(
-      Effect.flatMap((current) =>
-        Option.match(current.data, {
-          onNone: () => Effect.void,
-          onSome: (thread) => persist({ thread, resumeFrom }),
-        }),
-      ),
+    Effect.suspend(() =>
+      Option.match(window, {
+        onNone: () => Effect.void,
+        onSome: (thread) => persist({ thread, resumeFrom }),
+      }),
     ),
   );
 
@@ -320,5 +451,6 @@ export * from "./checkpointDiff.ts";
 export * from "./composerPathSearch.ts";
 export * from "./threadCommands.ts";
 export * from "./threadDetail.ts";
+export * from "./threadHistory.ts";
 export * from "./threadReducer.ts";
 export * from "./threadShell.ts";
