@@ -1,10 +1,9 @@
 # Storage Compaction
 
-Status: Proposed 2026-11-01, revision 7, awaiting approval. Design for issue
-230, verified against `9c8799b80` (v0.14.0). Implementation must not start
-before approval (AGENTS.md, Architectural Decision Standards): it changes a
-persisted shape (`auto_vacuum` on new stores, a new manifest trigger, a
-retention rule) and adds a CLI write path.
+Status: Approved 2026-11-01 (Codex review, 7 rounds). Design for issue 230,
+verified against `9c8799b80` (v0.14.0), revision 7. It changes a persisted
+shape (`auto_vacuum` on new stores, a new manifest trigger, a retention rule)
+and adds a CLI write path.
 
 Revision 3 replanned after two review rounds; revision 4 narrowed the
 inspection lock scope and fixed the space check (round 3); revisions 5 to 7 keep
@@ -281,6 +280,7 @@ real run (the dry run is D8):
    way ("another program left an interrupted write"), because the first
    access would roll that hot journal back into the file. BiBCode itself
    never writes in rollback mode.
+
 4. **Open one writable maintenance connection and lock it.** A new
    `Database::open_for_maintenance` opens `state.sqlite` and sets, in this
    order, before anything reads the database:
@@ -330,8 +330,8 @@ real run (the dry run is D8):
      this open is empty and removed by the close. So every refusal in steps
      4 to 8 leaves `state.sqlite`, `-wal` and `-shm` byte for byte as they
      were, and a sidecar that was absent stays absent.
-   From here, every step uses this one connection, so the exclusive lock does
-   not block our own backup.
+     From here, every step uses this one connection, so the exclusive lock does
+     not block our own backup.
 5. **Schema check on that connection.** The ledger-prefix and core-table checks
    that both validators already run move into
    `validate_bibcode_schema(&Connection, …)` in `migrations.rs`, called by the
@@ -354,25 +354,25 @@ real run (the dry run is D8):
    failed its integrity check; run `bibcode storage inspect`". A
    `DeadlineElapsed` refuses with the scope-down message (D5).
 9. **`VACUUM` in the SQLite worker.** One `Database::call` closure, so the
-    checks and the statement run on the same thread with nothing queued
-    between them:
-    - return `Cancelled` if the token is already cancelled. This closes the
-      gap between the backup and `VACUUM`: `sqlite3_interrupt` called while
-      no statement runs is a no-op and does not affect a later statement
-      ([sqlite3_interrupt](https://www.sqlite.org/c3ref/interrupt.html)), so
-      an interrupt-only design would lose a Ctrl-C pressed in that gap
-      (review finding 6);
-    - `PRAGMA journal_mode = WAL`, which converts a restored `DELETE`-mode
-      store, as a server start would, and is a no-op otherwise;
-    - install `progress_handler(1_000, || token.is_cancelled())`, the pattern
-      the validators and `quick_check_database` already use. VACUUM copies
-      rows with ordinary statements on this connection, so the handler fires
-      throughout that copy, and a non-zero return interrupts it
-      ([progress handler](https://www.sqlite.org/c3ref/progress_handler.html)).
-      The final page copy back into the main file runs outside the VM and is
-      not interruptible; it is bounded by the compacted size;
-    - `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`, then remove the handler.
-    No interrupt handle is needed.
+   checks and the statement run on the same thread with nothing queued
+   between them:
+   - return `Cancelled` if the token is already cancelled. This closes the
+     gap between the backup and `VACUUM`: `sqlite3_interrupt` called while
+     no statement runs is a no-op and does not affect a later statement
+     ([sqlite3_interrupt](https://www.sqlite.org/c3ref/interrupt.html)), so
+     an interrupt-only design would lose a Ctrl-C pressed in that gap
+     (review finding 6);
+   - `PRAGMA journal_mode = WAL`, which converts a restored `DELETE`-mode
+     store, as a server start would, and is a no-op otherwise;
+   - install `progress_handler(1_000, || token.is_cancelled())`, the pattern
+     the validators and `quick_check_database` already use. VACUUM copies
+     rows with ordinary statements on this connection, so the handler fires
+     throughout that copy, and a non-zero return interrupts it
+     ([progress handler](https://www.sqlite.org/c3ref/progress_handler.html)).
+     The final page copy back into the main file runs outside the VM and is
+     not interruptible; it is bounded by the compacted size;
+   - `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`, then remove the handler.
+     No interrupt handle is needed.
 10. **`PRAGMA wal_checkpoint(TRUNCATE)`**, the explicit checkpoint. With the
     exclusive lock it cannot be busy; if it is, report the step and keep
     going, because the data is committed and step 12's close checkpoints it.
@@ -639,10 +639,24 @@ the sibling commands do.
 ```json
 {
   "dryRun": false,
-  "before": { "fileBytes": 0, "walBytes": 0, "pageSize": 0, "pageCount": 0, "freelistCount": 0, "autoVacuum": "none" },
-  "plan": { "backupBytes": 0, "estimatedCompactedBytes": 0, "estimatedReclaimBytes": 0, "autoVacuumAfter": "incremental",
-            "requiredFreeBytes": { "store": 0, "temp": 0, "sameVolume": true }, "availableFreeBytes": { "store": 0, "temp": 0 },
-            "backupBudgetSeconds": 30, "sqliteLock": "locked | not-checked (dry run)" },
+  "before": {
+    "fileBytes": 0,
+    "walBytes": 0,
+    "pageSize": 0,
+    "pageCount": 0,
+    "freelistCount": 0,
+    "autoVacuum": "none"
+  },
+  "plan": {
+    "backupBytes": 0,
+    "estimatedCompactedBytes": 0,
+    "estimatedReclaimBytes": 0,
+    "autoVacuumAfter": "incremental",
+    "requiredFreeBytes": { "store": 0, "temp": 0, "sameVolume": true },
+    "availableFreeBytes": { "store": 0, "temp": 0 },
+    "backupBudgetSeconds": 30,
+    "sqliteLock": "locked | not-checked (dry run)"
+  },
   "backupId": "uuid | null (dry run)",
   "after": { "...": "same shape as before; null for a dry run" },
   "reclaimedBytes": 0,
@@ -669,7 +683,7 @@ a verified backup, and errors after the backup always carry its ID.
   starts a `ProfilerStore` with a fresh `sid` and source `"cli"` for the
   command's lifetime, and flushes within 2 s on drop. It writes no
   `session.json`, so crash and clean-shutdown detection are untouched. It is
-  started only *after* the exclusive runtime lock is held, so it is never a
+  started only _after_ the exclusive runtime lock is held, so it is never a
   second writer beside a live server. The dry run starts no writer, because
   it must leave the root unchanged (D8). One kind, `storage.compact`, has
   `phase: "start" | "end"`. The end event carries `outcome` (`compacted`,
@@ -960,7 +974,7 @@ weakened.
 - Inspection of an offline store with both sidecars can still race a
   third-party SQLite program that closes the database at that moment (D1).
   The recovery guide forbids such programs while BiBCode data is in use.
-- The pre-compact backup temporarily *raises* total disk use. The dry run and
+- The pre-compact backup temporarily _raises_ total disk use. The dry run and
   the guide say so.
 - Older-desktop and newer-WSL skew fails closed (D10).
 
