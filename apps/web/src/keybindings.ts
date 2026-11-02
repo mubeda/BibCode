@@ -330,6 +330,15 @@ export function chatFindShortcutLabel(
   return formatShortcutLabel(CHAT_FIND_FALLBACK_SHORTCUT, platform);
 }
 
+/** The context of a keydown inside a diff view: Compare, or the Git Manager's Changes diff. */
+export const DIFF_FOCUS_CONTEXT = {
+  diffFocus: true,
+  terminalFocus: false,
+  terminalOpen: false,
+  previewFocus: false,
+  previewOpen: false,
+} as const;
+
 type DiffChangeCommand = "diff.nextChange" | "diff.previousChange";
 
 /**

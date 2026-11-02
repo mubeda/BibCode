@@ -916,6 +916,19 @@ trailers, amend, and eligible undo. Binary, submodule, and oversized content use
 explicit interstitials; repository-owned image bytes can be viewed as 2-up,
 swipe, onion-skin, or difference without loading an external image.
 
+The file list, the selected file's diff and the commit form are stacked panes.
+Drag the handle between the list and the diff, or the one above the commit form,
+or focus a handle and use Up and Down (Home and End jump to the smallest and
+largest size); double-click a handle to reset it. The list height and the commit
+form's maximum height are remembered per browser, and a taller commit form
+scrolls instead of taking the diff's room. **Previous change** and **Next
+change** above the diff (**F7** and **Shift+F7** by default, see
+[keybindings](keybindings.md)) move through the blocks of changes in the
+selected file and then into the next or previous file of the list, landing on
+its first or last change; a file with nothing to step through (binary, too large)
+is passed over. They stop at the first and last change of the list, and the
+disabled button says so.
+
 The **History** tab pages a flat commit list and shows the selected commit's
 metadata, changed files, and diff. New repository generations are spliced above
 the loaded tip-pinned snapshot; repositories beyond the pin limit show the
