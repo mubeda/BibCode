@@ -46,6 +46,7 @@ const desktopUiSpecFiles =
         "./specs/composer-message-queue.e2e.ts",
         "./specs/chat-activity-panel.e2e.ts",
         "./specs/chat-reasoning-rows.e2e.ts",
+        "./specs/chat-huge-thread-scroll.e2e.ts",
         "./specs/pierre-diffs.e2e.ts",
         "./specs/mermaid-diagrams.e2e.ts",
       ];

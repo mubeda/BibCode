@@ -3352,6 +3352,24 @@ anchoring a sent turn (the sent row glides to `CHAT_LIST_ANCHOR_OFFSET`, 16 px
 below the top, and the turn's end is revealed as the reply grows past the
 view), or free scrolling.
 
+- **Row estimates.** LegendList places a row it has not measured at the
+  average measured size of rows of its item type. `resolveTimelineItemType`
+  buckets message rows by role and text length (up to 2,000 characters, then
+  one bucket per doubling), so a short reply never takes its estimate from very
+  long ones. With one type for every reply, scrolling up past short replies
+  placed at a long reply's average shrank the list on each measurement and
+  pulled the next row in within the same layout pass, until React threw
+  "Maximum update depth exceeded" (#228). A row keeps the first type it
+  resolves to for the life of the timeline (`createStickyTimelineItemType`),
+  even after it leaves the rows, as a folded turn's rows do: LegendList keeps a
+  row's measured size and moves it into a new type's average without counting
+  it there, so a streaming reply crossing a bucket, or a folded row coming back
+  under another one, would inflate that bucket's estimate. The timeline is
+  keyed by thread, so a new thread starts both afresh. A row first seen
+  streaming takes a type of its own (`message:<role>:live:<row id>`), so a reply
+  that streams long sets no other row's estimate: an unmeasured live row gets
+  the default estimate. LegendList still reuses containers across types.
+  History loads with its full text and takes its own bucket.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,

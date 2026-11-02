@@ -102,6 +102,7 @@ import {
   TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  createStickyTimelineItemType,
   resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMaintainVisibleContentPosition,
   resolveTimelineMinimapHasPersistentGutter,
@@ -460,6 +461,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     revertTurnCountByUserMessageId,
   ]);
   const rows = useStableRows(rawRows);
+  // Lives as long as the list: see `createStickyTimelineItemType`.
+  const [getItemType] = useState(createStickyTimelineItemType);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
@@ -908,10 +911,6 @@ function useStableAnchorCallbacks(
 
 function keyExtractor(item: MessagesTimelineRow) {
   return item.id;
-}
-
-function getItemType(item: MessagesTimelineRow) {
-  return item.kind === "message" ? `message:${item.message.role}` : item.kind;
 }
 
 interface TimelineMinimapItem {

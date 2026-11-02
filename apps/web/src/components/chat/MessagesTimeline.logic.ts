@@ -72,6 +72,44 @@ export function resolveTimelineMaintainVisibleContentPosition(
   return nativeScrollPending ? TIMELINE_KEEPS_NO_CONTENT_POSITION : TIMELINE_KEEPS_CONTENT_POSITION;
 }
 
+/**
+ * LegendList estimates an unmeasured row from measured rows of the same type, so message rows are
+ * bucketed by text length (up to 2,000 characters, then one bucket per doubling): a short reply
+ * never takes its estimate from a very long one, which looped the list while scrolling up (#228).
+ */
+export function resolveTimelineItemType(item: MessagesTimelineRow): string {
+  if (item.kind !== "message") return item.kind;
+  const lengthBucket = Math.max(0, Math.floor(Math.log2(item.message.text.length / 1000)));
+  return `message:${item.message.role}:${lengthBucket}`;
+}
+
+/**
+ * The item type LegendList sees: the first type a row resolves to, for the life of the list.
+ * LegendList moves a measured row's size into its new type's average without counting it there,
+ * and keeps a row's measured size after the row leaves the data (a folded turn), so a row whose
+ * type changed while it streamed, or after it came back, would inflate that type's estimate for
+ * every unmeasured row (#228). A row first seen streaming takes a type of its own, so a reply
+ * that streams long sets no other row's estimate, live or history; LegendList still reuses
+ * containers across types, and live rows are few. The map is never
+ * pruned: `MessagesTimeline` is keyed by thread, so a new thread drops it with the list's
+ * measurements, and it holds one short string per row.
+ */
+export function createStickyTimelineItemType(): (item: MessagesTimelineRow) => string {
+  const types = new Map<string, string>();
+  return (item) => {
+    let type = types.get(item.id);
+    if (type === undefined) {
+      // A reply first seen streaming can grow past any bucket, so it estimates only from itself.
+      type =
+        item.kind === "message" && item.message.streaming
+          ? `message:${item.message.role}:live:${item.id}`
+          : resolveTimelineItemType(item);
+      types.set(item.id, type);
+    }
+    return type;
+  };
+}
+
 export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boolean | undefined {
   return state?.isNearEnd ?? state?.isAtEnd;
 }
