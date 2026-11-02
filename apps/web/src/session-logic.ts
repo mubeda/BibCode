@@ -6,6 +6,7 @@ import {
   type OrchestrationLatestTurn,
   type OrchestrationReasoning,
   type OrchestrationThreadActivity,
+  type OrchestrationThreadHistory,
   type OrchestrationProposedPlanId,
   ProviderDriverKind,
   type ToolLifecycleItemType,
@@ -14,6 +15,7 @@ import {
   type TurnId,
 } from "@bibcode/contracts";
 import { reasoningLabel } from "@bibcode/client-runtime/state/reasoning";
+import { HISTORY_RANK, isUnreachedCarriedRow } from "@bibcode/client-runtime/state/thread-history";
 
 import type {
   ChatMessage,
@@ -1359,10 +1361,16 @@ function compareActivityLifecycleRank(kind: string): number {
   return 1;
 }
 
+/**
+ * The timeline's entries. On a windowed thread (#226) a carried state row is left out until
+ * older history reaches its place; every other row, a window row that sorts below the loaded
+ * history included, is shown.
+ */
 export function deriveTimelineEntries(
   messages: ReadonlyArray<ChatMessage>,
   proposedPlans: ReadonlyArray<ProposedPlan>,
   workEntries: ReadonlyArray<WorkLogEntry>,
+  history?: OrchestrationThreadHistory,
 ): TimelineEntry[] {
   const messageRows: TimelineEntry[] = messages.map((message) => ({
     id: message.id,
@@ -1370,18 +1378,22 @@ export function deriveTimelineEntries(
     createdAt: message.createdAt,
     message,
   }));
-  const proposedPlanRows: TimelineEntry[] = proposedPlans.map((proposedPlan) => ({
-    id: proposedPlan.id,
-    kind: "proposed-plan",
-    createdAt: proposedPlan.createdAt,
-    proposedPlan,
-  }));
-  const workRows: TimelineEntry[] = workEntries.map((entry) => ({
-    id: entry.id,
-    kind: "work",
-    createdAt: entry.createdAt,
-    entry,
-  }));
+  const proposedPlanRows: TimelineEntry[] = proposedPlans
+    .filter((proposedPlan) => !isUnreachedCarriedRow(history, HISTORY_RANK.plan, proposedPlan))
+    .map((proposedPlan) => ({
+      id: proposedPlan.id,
+      kind: "proposed-plan",
+      createdAt: proposedPlan.createdAt,
+      proposedPlan,
+    }));
+  const workRows: TimelineEntry[] = workEntries
+    .filter((entry) => !isUnreachedCarriedRow(history, HISTORY_RANK.activity, entry))
+    .map((entry) => ({
+      id: entry.id,
+      kind: "work",
+      createdAt: entry.createdAt,
+      entry,
+    }));
   return [...messageRows, ...proposedPlanRows, ...workRows].toSorted((a, b) =>
     a.createdAt.localeCompare(b.createdAt),
   );

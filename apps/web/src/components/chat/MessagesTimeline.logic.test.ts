@@ -2604,3 +2604,62 @@ describe("resolveTimelineMaintainScrollAtEnd", () => {
     expect(resolveTimelineMaintainScrollAtEnd({ anchored: true, followsEnd: true })).toBe(false);
   });
 });
+
+// The thread history window (#226): the oldest loaded turn can start before the loaded history.
+describe("deriveMessagesTimelineRows with older history", () => {
+  const message = (id: string, role: "user" | "assistant", at: string, turnId: string | null) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at,
+    message: {
+      id: id as never,
+      role,
+      text: `${id} text`,
+      turnId: turnId as never,
+      createdAt: at,
+      updatedAt: at,
+      streaming: false,
+    },
+  });
+  const work = (id: string, at: string, turnId: string) => ({
+    id: `${id}-entry`,
+    kind: "work" as const,
+    createdAt: at,
+    entry: {
+      id,
+      createdAt: at,
+      turnId: turnId as never,
+      label: "Ran command",
+      tone: "tool" as const,
+    },
+  });
+  // The first loaded rows belong to a turn whose user message is still on the server.
+  const timelineEntries = [
+    work("old-work", "2026-01-01T00:00:10Z", "turn-old"),
+    message("old-answer", "assistant", "2026-01-01T00:00:40Z", "turn-old"),
+    message("question", "user", "2026-01-01T00:01:00Z", null),
+    work("new-work", "2026-01-01T00:01:05Z", "turn-new"),
+    message("new-answer", "assistant", "2026-01-01T00:01:20Z", "turn-new"),
+  ];
+  const folds = (hasOlderHistory: boolean) =>
+    deriveMessagesTimelineRows({
+      timelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+      hasOlderHistory,
+    }).flatMap((row) => (row.kind === "turn-fold" ? [[row.turnId, row.label]] : []));
+
+  it("labels the partial oldest turn Worked without a duration", () => {
+    expect(folds(true)).toEqual([
+      ["turn-old", "Worked"],
+      ["turn-new", "Worked for 20s"],
+    ]);
+    // Once nothing is older, the turn is whole and has its duration.
+    expect(folds(false)).toEqual([
+      ["turn-old", "Worked for 30s"],
+      ["turn-new", "Worked for 20s"],
+    ]);
+  });
+});

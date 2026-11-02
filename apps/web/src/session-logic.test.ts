@@ -4,6 +4,7 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationThreadActivity,
+  type OrchestrationThreadHistoryKey,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -1602,6 +1603,68 @@ describe("deriveTimelineEntries", () => {
         implementationThreadId: null,
       },
     });
+  });
+});
+
+// The thread history window (#226): carried state rows stay out of the timeline.
+describe("deriveTimelineEntries on a windowed thread", () => {
+  const at = (minute: number) => `2026-02-23T00:${String(minute).padStart(2, "0")}:00.000Z`;
+  const ask = {
+    id: EventId.make("ask"),
+    tone: "approval" as const,
+    kind: "user-input.requested",
+    summary: "Question",
+    payload: { requestId: "q1" },
+    turnId: null,
+    sequence: 2,
+    createdAt: at(1),
+  };
+  const history = (loadedFrom: OrchestrationThreadHistoryKey | null) => ({
+    floor: "floor",
+    hasOlder: loadedFrom !== null,
+    olderRows: loadedFrom === null ? 0 : 3,
+    carried: { activities: [ask], proposedPlans: [] },
+    loadedFrom,
+  });
+  const work = (id: string, minute: number) => ({
+    id,
+    createdAt: at(minute),
+    label: id,
+    tone: "tool" as const,
+  });
+  const message = (id: string, minute: number) => ({
+    id: MessageId.make(id),
+    role: "assistant" as const,
+    text: id,
+    turnId: null,
+    createdAt: at(minute),
+    updatedAt: at(minute),
+    streaming: false,
+  });
+
+  it("deriveTimelineEntries leaves out carried rows below the loaded history", () => {
+    const entries = (loadedFrom: OrchestrationThreadHistoryKey | null) =>
+      deriveTimelineEntries(
+        [message("recent", 10)],
+        [],
+        [work("ask", 1), work("tool", 11)],
+        history(loadedFrom),
+      ).map((entry) => entry.id);
+    expect(entries({ createdAt: at(10), rank: 0, id: "recent" })).toEqual(["recent", "tool"]);
+    // A page reached its place: it shows where it belongs.
+    expect(entries({ createdAt: at(0), rank: 0, id: "older" })).toEqual(["ask", "recent", "tool"]);
+    expect(entries(null)).toEqual(["ask", "recent", "tool"]);
+  });
+
+  it("deriveTimelineEntries keeps a window row that sorts below the floor", () => {
+    // A streaming reply or a skewed-clock message the window holds below its floor.
+    const entries = deriveTimelineEntries(
+      [message("skewed", 0), message("recent", 10)],
+      [],
+      [work("tool", 11)],
+      history({ createdAt: at(10), rank: 0, id: "recent" }),
+    );
+    expect(entries.map((entry) => entry.id)).toEqual(["skewed", "recent", "tool"]);
   });
 });
 
