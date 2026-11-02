@@ -2522,7 +2522,12 @@ starts.
    explicit confirmation, and confirm the message and changes return without
    deleting files. Exercise whole-file discard and **Discard All**; tracked
    content must restore, an untracked path must use OS trash when available, and
-   a trash failure must require the separate permanent-discard confirmation.
+   a trash failure must require the separate permanent-discard confirmation. The
+   one exception is an entry the trash refused whose name something else took
+   meanwhile: it is kept in the Git directory, the Changes view shows where
+   (until dismissed, also across a permanent-discard confirmation for other
+   files), and no permanent discard is offered for it. That race cannot be
+   reproduced by hand; its automated tests run on Linux and macOS.
    While two or more files are changed, drag the handles above the diff and
    above the commit form and move them with the arrow keys; confirm the sizes
    return after reopening the tab and both handles take keyboard focus. Press **F7** and **Shift+F7** (and the **Next change** / **Previous

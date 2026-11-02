@@ -183,7 +183,10 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   folder is, or turns into, a symlink is kept too, whatever `permanent` says. On macOS and
   Linux, BiBCode first moves each file into a folder of its own in the repository's Git
   directory (`bibcode-discard`), and the trash takes it from there. **Put Back** in the Trash
-  therefore does not return a file to the checkout; drag it back instead.
+  therefore does not return a file to the checkout; drag it back instead. If the trash
+  refuses a file and something else took its name meanwhile, the file is not in the folder:
+  it stays in that directory and `keptInStaging` says where. BiBCode moves it back on the
+  next discard in that repository once its name is free.
 
 #### Reading history and suggesting a commit message
 
