@@ -842,9 +842,10 @@ range from `review.getDiffPreview`, and a turn or the whole thread from
 
 ### Turn checkpoints
 
-A checkpoint is a commit of the whole checkout, written by the orchestration
-effects worker (`orchestration_effects.rs`) through a temporary index, so the
-person's own index and branches are untouched. `refs/bibcode/checkpoints/<base64
+A checkpoint is a commit of the whole checkout, written through a temporary
+index, so the person's own index and branches are untouched. The orchestration
+effects worker (`orchestration_effects.rs`) writes every numbered ref; turn
+delivery writes ref 0. `refs/bibcode/checkpoints/<base64
 thread id>/turn/<n>` is the checkout after turn `n`; ref 0 is the checkout
 before the thread's first recorded turn. Turn `n`'s patch is ref `n - 1` to ref
 `n`, and the read model's `projection_turns.checkpoint_*` columns hold each
@@ -857,15 +858,27 @@ numbered ref is written only by that turn's own capture, while the turn's hold
 keeps every later turn out of the checkout. That is the only time the checkout
 is known to be the turn's end state.
 
-1. **Turn start.** `thread.turn-start-requested` (and a non-imported user
-   `thread.message-sent`) captures ref 0 if it is missing and no turn before
-   the starting one has a number. A turn start never writes a numbered ref: a
-   baseline runs on the effects worker, unordered with the delivery of the turn
-   it is for, so the checkout may already hold that turn's edits. A thread with
-   settled turns but no recorded checkpoint, whose turns predate turn
-   checkpoints, captures ref 0 again on `thread.turn-start-requested` unless
-   another turn runs, so its first recorded turn does not reach back to the
-   thread's first turn.
+1. **Turn start.** Turn delivery captures ref 0 before it first claims a start
+   (attempt 0) of a thread with no numbered turn (#261), so ref 0 is the
+   checkout before that turn. A baseline stage in the delivery loop
+   (`FirstTurnBaselines` in `turn_delivery.rs`) runs the capture
+   (`ensure_first_turn_baseline`) outside the delivery slots, at most four at a
+   time and one per thread. The row takes a slot only once the stage has
+   ended. A start with a `bootstrap` runs it in a slot first, then releases the
+   slot, so its baseline is taken in the checkout the bootstrap set up. A thread
+   with a numbered turn costs one read and no Git, and a project outside Git
+   costs a filesystem probe. Every step is bounded by the checkpoint hold limit.
+   A failure or timeout is logged and shown once as a
+   `checkpoint.capture.failed` activity (`turnCount: 0`, no turn id). The turn
+   still goes, and its capture is then `ready` without a diff. Shutdown cancels
+   the stage, which leaves the row pending and unclaimed. A row claimed before
+   (attempt 1 or later) never captures, because the checkout may hold its
+   edits. Every Git command whose output ref 0 holds finishes before the claim.
+   Only `update-ref` can outlive a timeout (a stalled Windows spawn), and it
+   publishes a commit fixed before the claim. A turn start never writes a
+   numbered ref. A thread with settled turns but no recorded checkpoint, whose
+   turns predate turn checkpoints, captures ref 0 again at that first claim, so
+   its first recorded turn does not reach back to the thread's first turn.
 2. **Turn end.** Provider ingestion's `turn.completed` (not a compaction's own
    turn) records the turn's number, the latest plus one, with status `missing`
    before the session settles (`record_turn_end`). A turn that already has a
@@ -911,7 +924,9 @@ is known to be the turn's end state.
    `missing`, without a capture, when the thread already has a recorded
    checkpoint, so the numbers stay dense and a revert's provider rewind
    (current number minus target) still counts every turn. No baseline writes
-   that turn's ref, so the next turn is captured without a diff.
+   that turn's ref, so the next turn is captured without a diff. A first turn
+   still pending at the restart passes the baseline stage before its first
+   claim, even though the effects worker never replays its start event.
 
 A provider stream that ends mid-turn synthesizes a failed `turn.completed`, so
 that turn is recorded too. The turn-diff projector keeps a turn's `interrupted` or `error` state and its answer

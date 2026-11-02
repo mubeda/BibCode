@@ -241,34 +241,6 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
     panic!("condition was not met");
 }
 
-async fn wait_for_git_ref(cwd: &Path, reference: &str) {
-    let cwd = cwd.to_path_buf();
-    let reference = reference.to_owned();
-    let diagnostic_reference = reference.clone();
-    tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, async move {
-        loop {
-            let probe_cwd = cwd.clone();
-            let probe_reference = reference.clone();
-            let exists = tokio::task::spawn_blocking(move || {
-                git_succeeds(
-                    &probe_cwd,
-                    &["rev-parse", "--verify", "--quiet", &probe_reference],
-                )
-            })
-            .await
-            .expect("Git ref probe task completes");
-            if exists {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("Git ref {diagnostic_reference} was not created before the fixture deadline")
-    });
-}
-
 async fn wait_for_event(
     receiver: &mut broadcast::Receiver<OrchestrationEvent>,
     event_type: &str,
@@ -663,81 +635,6 @@ async fn bootstrap_admission_does_not_fetch_origin_before_delivery() {
     engine.shutdown().await;
 }
 
-#[tokio::test]
-async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff() {
-    let repository = initialize_repository().await;
-    let engine = engine(repository.path()).await;
-    let callbacks = Arc::new(CallbackState::default());
-    *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
-    let effects = OrchestrationEffects::start(
-        engine.clone(),
-        Arc::new(GitRepository::default()),
-        callbacks,
-        EffectsOptions::default(),
-    )
-    .await
-    .unwrap();
-
-    dispatch(
-        &engine,
-        json!({
-            "type":"thread.turn.start", "commandId":"turn-start", "threadId":"t1",
-            "message":{"messageId":"m1","role":"user","text":"change it","attachments":[]},
-            "createdAt":NOW
-        }),
-    )
-    .await;
-    let baseline_ref = orchestration_effects::checkpoint_ref("t1", 0);
-    wait_for_git_ref(repository.path(), &baseline_ref).await;
-
-    std::fs::write(repository.path().join("tracked.txt"), "changed\n").unwrap();
-    std::fs::write(repository.path().join("new.txt"), "new\n").unwrap();
-    let checkpoint_ref = orchestration_effects::checkpoint_ref("t1", 1);
-    let mut events = engine.subscribe_events();
-    dispatch(
-        &engine,
-        json!({
-            "type":"thread.turn.diff.complete", "commandId":"placeholder", "threadId":"t1",
-            "turnId":"turn-1", "checkpointTurnCount":1,
-            "checkpointRef":"missing", "status":"missing", "files":[],
-            "assistantMessageId":"assistant-1", "completedAt":NOW, "createdAt":NOW
-        }),
-    )
-    .await;
-    wait_for_event(&mut events, "thread.turn-diff-completed", |event| {
-        event.event.payload["threadId"] == "t1"
-            && event.event.payload["status"] == "ready"
-            && event.event.payload["checkpointRef"] == checkpoint_ref
-    })
-    .await;
-
-    let checkpoint = engine
-        .repositories()
-        .get_checkpoint("t1".to_owned(), 1)
-        .await
-        .unwrap()
-        .expect("real checkpoint was projected");
-    assert_eq!(checkpoint.status, "ready");
-    assert_eq!(checkpoint.checkpoint_ref, checkpoint_ref);
-    let files = checkpoint.files;
-    assert!(
-        files
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|file| file["path"] == "tracked.txt")
-    );
-    assert!(
-        files
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|file| file["path"] == "new.txt")
-    );
-    effects.shutdown().await;
-    engine.shutdown().await;
-}
-
 /// A turn captured after its baseline went missing is `ready` without a diff: its own ref is
 /// its end state, so it can be reverted to, but no patch is read against a missing ref.
 #[tokio::test]
@@ -828,65 +725,6 @@ async fn a_turn_without_its_baseline_is_ready_without_a_diff_and_can_be_reverted
             .replace("\r\n", "\n"),
         "two\n"
     );
-    effects.shutdown().await;
-    engine.shutdown().await;
-}
-
-/// A thread whose turns predate turn checkpoints keeps the ref 0 of its very first turn. The
-/// first turn it starts afterwards captures ref 0 again, so that turn's diff, and a revert to
-/// 0, cover that turn alone rather than everything since the thread began.
-#[tokio::test]
-async fn a_thread_with_turns_before_checkpoints_starts_them_from_its_next_turn() {
-    let repository = initialize_repository().await;
-    let engine = engine(repository.path()).await;
-    orchestration_effects::capture_checkpoint(repository.path(), "t1", 0)
-        .await
-        .unwrap();
-    let baseline_ref = orchestration_effects::checkpoint_ref("t1", 0);
-    let session = |status: &str, active: Option<&str>| {
-        json!({
-            "type":"thread.session.set", "commandId":format!("session-{status}"), "threadId":"t1",
-            "session":{
-                "threadId":"t1", "status":status, "providerName":"codex",
-                "providerInstanceId":"codex", "runtimeMode":"full-access",
-                "activeTurnId":active, "lastError":null, "updatedAt":NOW
-            },
-            "createdAt":NOW
-        })
-    };
-    // A turn that ran before this version: settled, with no checkpoint.
-    dispatch(&engine, session("running", Some("old-turn"))).await;
-    dispatch(&engine, session("ready", None)).await;
-    std::fs::write(repository.path().join("tracked.txt"), "changed since\n").unwrap();
-    let callbacks = Arc::new(CallbackState::default());
-    *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
-    let effects = OrchestrationEffects::start(
-        engine.clone(),
-        Arc::new(GitRepository::default()),
-        callbacks,
-        EffectsOptions::default(),
-    )
-    .await
-    .unwrap();
-
-    dispatch(
-        &engine,
-        json!({
-            "type":"thread.turn.start", "commandId":"turn-start", "threadId":"t1",
-            "message":{"messageId":"m1","role":"user","text":"change it","attachments":[]},
-            "createdAt":NOW
-        }),
-    )
-    .await;
-    let baseline_file = format!("{baseline_ref}:tracked.txt");
-    tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, async {
-        while git(repository.path(), &["show", &baseline_file]) != "changed since" {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("ref 0 is captured again when the next turn starts");
-
     effects.shutdown().await;
     engine.shutdown().await;
 }

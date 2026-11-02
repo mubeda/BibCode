@@ -35,6 +35,8 @@ use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmis
 const DELETED_THREAD_DETAIL: &str =
     "This thread was deleted before the message could be delivered.";
 const MAX_CONCURRENT_THREADS: usize = 4;
+/// First-turn checkpoint baselines captured at once, apart from the delivery slots (#261).
+const MAX_CONCURRENT_BASELINES: usize = 4;
 const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
 /// The longest a provider's `Retry-After` holds a delivery back, so a far-off value cannot park it.
@@ -459,6 +461,7 @@ async fn run(
     #[cfg(test)] retry_probe: Arc<DeliveryRetryProbe>,
 ) {
     let mut tasks = JoinSet::new();
+    let mut baselines = FirstTurnBaselines::default();
     let mut recovery_task = None;
     let mut in_flight_commands = HashSet::new();
     let mut in_flight_threads = HashSet::new();
@@ -521,6 +524,7 @@ async fn run(
             &mut in_flight_commands,
             &mut in_flight_threads,
             &mut retry_backoffs,
+            &mut baselines,
             &stop_claiming,
             &force_cancel,
             &permits,
@@ -545,6 +549,7 @@ async fn run(
 
         match wait_for_dispatch_signal(
             &mut tasks,
+            &mut baselines.stages,
             &mut recovery_task,
             &stop_claiming,
             &wake,
@@ -553,6 +558,7 @@ async fn run(
         .await
         {
             DispatchWait::Continue => {}
+            DispatchWait::Baseline(joined) => baselines.finish(joined),
             DispatchWait::Completion(completion) => {
                 if let Some(completion) =
                     remove_completion(completion, &mut in_flight_commands, &mut in_flight_threads)
@@ -561,6 +567,10 @@ async fn run(
                     match completion.result {
                         Ok(DeliveryTaskOutcome::Finished) => {
                             retry_backoffs.remove(&command_id);
+                        }
+                        Ok(DeliveryTaskOutcome::Bootstrapped) => {
+                            retry_backoffs.remove(&command_id);
+                            baselines.bootstrapped.insert(command_id);
                         }
                         Ok(DeliveryTaskOutcome::DefinitelyNotSent) => {
                             schedule_retry(&mut retry_backoffs, command_id, Duration::ZERO);
@@ -620,6 +630,7 @@ async fn run(
                     let _ = task.await;
                 }
                 settlement.stop().await;
+                baselines.stop(shutdown_grace).await;
                 stop_tasks(
                     &mut tasks,
                     &force_cancel,
@@ -818,6 +829,7 @@ fn schedule_retry(
 
 enum DispatchWait {
     Continue,
+    Baseline(Result<(String, String, bool), tokio::task::JoinError>),
     Completion(Option<Result<DeliveryCompletion, tokio::task::JoinError>>),
     Recovery(Result<RecoveryCompletion, tokio::task::JoinError>),
     Shutdown,
@@ -830,6 +842,7 @@ struct RecoveryCompletion {
 
 async fn wait_for_dispatch_signal(
     tasks: &mut JoinSet<DeliveryCompletion>,
+    stages: &mut JoinSet<(String, String, bool)>,
     recovery_task: &mut Option<JoinHandle<RecoveryCompletion>>,
     shutdown: &CancellationToken,
     wake: &Notify,
@@ -853,6 +866,7 @@ async fn wait_for_dispatch_signal(
         () = shutdown.cancelled() => DispatchWait::Shutdown,
         () = wake.notified() => DispatchWait::Continue,
         completion = tasks.join_next(), if !tasks.is_empty() => DispatchWait::Completion(completion),
+        Some(joined) = stages.join_next(), if !stages.is_empty() => DispatchWait::Baseline(joined),
         completion = &mut recovery_wait => DispatchWait::Recovery(completion),
         () = &mut retry_wait => DispatchWait::Continue,
     }
@@ -987,6 +1001,7 @@ async fn fill_available_slots(
     in_flight_commands: &mut HashSet<String>,
     in_flight_threads: &mut HashSet<String>,
     retry_backoffs: &mut HashMap<String, DeliveryRetry>,
+    baselines: &mut FirstTurnBaselines,
     stop_claiming: &CancellationToken,
     force_cancel: &CancellationToken,
     permits: &Arc<Semaphore>,
@@ -994,6 +1009,7 @@ async fn fill_available_slots(
     if stop_claiming.is_cancelled() {
         return Ok(FillResult { retry_delay: None });
     }
+    baselines.collect();
     promote_settled_threads(engine, stop_claiming).await?;
     let available = max_concurrent_threads.saturating_sub(tasks.len());
     if available == 0 {
@@ -1015,6 +1031,7 @@ async fn fill_available_slots(
         .map(|row| row.command_id.as_str())
         .collect::<HashSet<_>>();
     retry_backoffs.retain(|command_id, _| active_commands.contains(command_id.as_str()));
+    baselines.retain_active(&active_commands);
     let now = Instant::now();
     for row in rows
         .iter()
@@ -1074,6 +1091,27 @@ async fn fill_available_slots(
         }
         candidates.push(row);
     }
+    // A thread's first turn takes a slot only once its checkpoint baseline (ref 0) is settled,
+    // captured by a stage that holds no slot.
+    let mut ready = Vec::with_capacity(candidates.len());
+    for row in candidates {
+        if !in_flight_commands.contains(&row.command_id)
+            && !in_flight_threads.contains(&row.thread_id)
+            && baselines.pending(engine, &row)
+            // A bootstrap sets up the checkout first, in a slot that it then releases.
+            && (row.payload.get("bootstrap").is_none_or(serde_json::Value::is_null)
+                || baselines.bootstrapped.contains(&row.command_id))
+        {
+            if first_turn_baseline_settled(engine, &row).await? {
+                baselines.settled.insert(row.command_id.clone());
+            } else {
+                baselines.start(engine, &row, stop_claiming);
+                continue;
+            }
+        }
+        ready.push(row);
+    }
+    let candidates = ready;
     let retry_delay = candidates
         .iter()
         .filter(|row| {
@@ -1109,6 +1147,10 @@ async fn fill_available_slots(
         }
         in_flight_commands.insert(row.command_id.clone());
         in_flight_threads.insert(row.thread_id.clone());
+        let stages = TaskStages {
+            skip_bootstrap: baselines.bootstrapped.contains(&row.command_id),
+            baseline_pending: baselines.pending(engine, &row),
+        };
         let engine = engine.clone();
         let router = router.clone();
         let stop_claiming = stop_claiming.clone();
@@ -1120,10 +1162,173 @@ async fn fill_available_slots(
         }
         tasks.spawn(async move {
             let _permit = permit;
-            prepare_claim_and_deliver(engine, router, row, stop_claiming, force_cancel).await
+            prepare_claim_and_deliver(engine, router, row, stop_claiming, force_cancel, stages)
+                .await
         });
     }
     Ok(FillResult { retry_delay })
+}
+
+/// The checkpoint baselines (ref 0) of threads' first turns, each captured before that turn is
+/// first claimed (#261), by stages that hold no delivery slot: a slow or hung Git then delays
+/// only its own thread's first turn, never a thread that already has its baseline.
+#[derive(Default)]
+struct FirstTurnBaselines {
+    /// Commands whose baseline is settled: captured, not needed, or failed and reported.
+    settled: HashSet<String>,
+    /// Commands whose bootstrap ran in a slot, released before their baseline.
+    bootstrapped: HashSet<String>,
+    /// Threads whose stage runs.
+    running: HashSet<String>,
+    /// Each stage's command, thread, and whether it settled (it was not cancelled).
+    stages: JoinSet<(String, String, bool)>,
+}
+
+impl FirstTurnBaselines {
+    /// Whether `row` must wait for its thread's baseline: a first attempt to start a turn while
+    /// the effects worker records checkpoints. A row claimed before may already have edited the
+    /// checkout, so it never captures one.
+    fn pending(&self, engine: &OrchestrationEngine, row: &ProviderTurnDelivery) -> bool {
+        row.mode == TurnDeliveryMode::Start
+            && row.attempts == 0
+            && !self.settled.contains(&row.command_id)
+            && engine.checkpoint_hold_limit().is_some()
+            && engine.bootstrap_effects().is_some()
+    }
+
+    /// Starts `row`'s stage unless its thread's runs or every stage is busy; the delivery loop
+    /// waits on its end like a task's.
+    fn start(
+        &mut self,
+        engine: &OrchestrationEngine,
+        row: &ProviderTurnDelivery,
+        stop_claiming: &CancellationToken,
+    ) {
+        if self.running.contains(&row.thread_id) || self.running.len() >= MAX_CONCURRENT_BASELINES {
+            return;
+        }
+        self.running.insert(row.thread_id.clone());
+        let (engine, stop_claiming) = (engine.clone(), stop_claiming.clone());
+        let (command_id, thread_id, message_id) = (
+            row.command_id.clone(),
+            row.thread_id.clone(),
+            row.message_id.clone(),
+        );
+        self.stages.spawn(async move {
+            let settled =
+                capture_first_turn_baseline(&engine, &thread_id, &message_id, &stop_claiming)
+                    .await
+                    .is_ok();
+            (command_id, thread_id, settled)
+        });
+    }
+
+    /// Takes in the stages that have ended.
+    fn collect(&mut self) {
+        while let Some(joined) = self.stages.try_join_next() {
+            self.finish(joined);
+        }
+    }
+
+    /// Takes in one ended stage.
+    fn finish(&mut self, joined: Result<(String, String, bool), tokio::task::JoinError>) {
+        match joined {
+            Ok((command_id, thread_id, settled)) => {
+                self.running.remove(&thread_id);
+                if settled {
+                    self.settled.insert(command_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "a first turn's checkpoint baseline task failed");
+                self.running.clear();
+            }
+        }
+    }
+
+    fn retain_active(&mut self, active_commands: &HashSet<&str>) {
+        self.settled
+            .retain(|command_id| active_commands.contains(command_id.as_str()));
+        self.bootstrapped
+            .retain(|command_id| active_commands.contains(command_id.as_str()));
+    }
+
+    /// Waits for the stages, which `stop_claiming` has cancelled, then drops any left.
+    async fn stop(&mut self, grace: Duration) {
+        let _ = timeout(grace, async {
+            while self.stages.join_next().await.is_some() {}
+        })
+        .await;
+        self.stages.shutdown().await;
+    }
+}
+
+/// Whether `row`'s thread already has a numbered turn, so its baseline is long settled: one read,
+/// and no Git.
+async fn first_turn_baseline_settled(
+    engine: &OrchestrationEngine,
+    row: &ProviderTurnDelivery,
+) -> Result<bool, String> {
+    let turns = engine
+        .repositories()
+        .list_turns_by_thread(row.thread_id.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(
+        crate::production::orchestration_effects::an_earlier_turn_is_numbered(
+            &turns,
+            &row.message_id,
+        ),
+    )
+}
+
+/// Captures `thread_id`'s checkpoint ref 0 before its first turn, the one `message_id` starts,
+/// is first claimed, within the checkpoint hold limit. A failure or timeout is logged and shown
+/// as a `checkpoint.capture.failed` activity, and the turn still goes: its own capture is then
+/// recorded without a diff. `Err` only when `cancellation` fired, so the turn stays unclaimed.
+pub(crate) async fn capture_first_turn_baseline(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    message_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let (Some(limit), Some(effects)) = (engine.checkpoint_hold_limit(), engine.bootstrap_effects())
+    else {
+        return Ok(());
+    };
+    let Some(reason) = effects
+        .capture_first_turn_baseline(thread_id, message_id, limit, cancellation)
+        .await?
+    else {
+        return Ok(());
+    };
+    let created_at = now();
+    let appended = engine
+        .dispatch(OrchestrationCommand::ThreadActivityAppend {
+            command_id: format!("server:first-turn-baseline:{message_id}"),
+            thread_id: thread_id.to_owned(),
+            activity: crate::orchestration::engine::ActivityInput {
+                id: uuid::Uuid::new_v4().to_string(),
+                tone: "error".to_owned(),
+                kind: "checkpoint.capture.failed".to_owned(),
+                summary: "Checkpoint capture failed".to_owned(),
+                payload: serde_json::json!({
+                    "turnCount": 0,
+                    "detail": format!(
+                        "The checkout before this thread's first turn could not be recorded ({reason}), so that turn's changes cannot be shown. Check that Git works in this folder."
+                    ),
+                }),
+                turn_id: None,
+                sequence: None,
+                created_at: created_at.clone(),
+            },
+            created_at,
+        })
+        .await;
+    if let Err(error) = appended {
+        tracing::warn!(thread_id, %error, "a first turn's baseline failure could not be shown");
+    }
+    Ok(())
 }
 
 /// The guard: before a pending start is claimed, compacts the conversation it continues when the
@@ -1270,6 +1475,9 @@ struct DeliveryCompletion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryTaskOutcome {
     Finished,
+    /// The start's bootstrap ran and the row was not claimed: its slot is released while its
+    /// first-turn baseline is captured, and the row is claimed later without a second bootstrap.
+    Bootstrapped,
     DefinitelyNotSent,
     /// Not sent; the next attempt waits at least this long.
     RetryAfter(Duration),
@@ -1372,18 +1580,33 @@ fn claimable_oldest_per_thread(rows: Vec<ProviderTurnDelivery>) -> Vec<ProviderT
         .collect()
 }
 
+/// What a delivery task runs before its claim.
+#[derive(Clone, Copy, Default)]
+struct TaskStages {
+    /// The start's bootstrap already ran in an earlier task of this loop.
+    skip_bootstrap: bool,
+    /// The row's first-turn baseline is still to be captured: the task runs only the bootstrap.
+    baseline_pending: bool,
+}
+
 async fn prepare_claim_and_deliver(
     engine: OrchestrationEngine,
     router: ProviderDeliveryRouter,
     row: ProviderTurnDelivery,
     stop_claiming: CancellationToken,
     force_cancel: CancellationToken,
+    stages: TaskStages,
 ) -> DeliveryCompletion {
     let command_id = row.command_id.clone();
     let thread_id = row.thread_id.clone();
     let result = async {
-        if row.mode == TurnDeliveryMode::Start {
+        if row.mode == TurnDeliveryMode::Start && !stages.skip_bootstrap {
             execute_bootstrap_prerequisites(&engine, &row, &force_cancel).await?;
+        }
+        // The baseline is captured in the checkout the bootstrap set up, by a stage that holds
+        // no slot.
+        if stages.baseline_pending {
+            return Ok(DeliveryTaskOutcome::Bootstrapped);
         }
         if stop_claiming.is_cancelled() {
             return Err("provider delivery claim cancelled".to_owned());
@@ -4476,6 +4699,7 @@ mod tests {
             activity_failure,
             CancellationToken::new(),
             CancellationToken::new(),
+            TaskStages::default(),
         )
         .await;
         assert!(
