@@ -1,13 +1,12 @@
 # Shell Finished-Thread Cap, Older Threads and Shell Resume
 
-Status: Revised for Codex review round 3 (2026-11-02). Round 1 (`e724d358d`)
-returned REVISE with one P1 and seven P2 findings, round 2 (`38a523683`) with
-one P1 and four P2; [Review resolutions](#review-resolutions) maps each to its
-change. The coordinator
-settled the open questions: caps of 25 overall plus 3 per project, workspace
-threads without a worktree are capped too, and search matches titles only.
-Issue #223, the 2026-10-31 addendum (proposed changes 6 to 9). No code until
-this is approved.
+Status: Approved 2026-11-02 (user decision + Codex review, 3 rounds). Round 1
+(`e724d358d`) returned REVISE with one P1 and seven P2 findings, round 2
+(`38a523683`) with one P1 and four P2; [Review resolutions](#review-resolutions)
+maps each to its change. The coordinator settled the open questions: caps of 25
+overall plus 3 per project, workspace threads without a worktree are capped
+too, and search matches titles only. Issue #223, the 2026-10-31 addendum
+(proposed changes 6 to 9).
 
 Revision 2 rests on one rule:
 

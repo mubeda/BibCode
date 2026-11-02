@@ -911,6 +911,28 @@ are ignored until that snapshot arrives; afterward only strictly newer deltas
 may update state or the persistence queue. Duplicate and stale deltas publish
 nothing.
 
+The client subscribes with the finished-thread cap (#223): `cap.include` names
+its routed thread, its open chat panels' hosts and its pinned and unread
+threads, and `resume` sends the revision of the cached shell. An `unchanged`
+answer from the current session and generation makes the cached shell `live`
+and re-ages its threads from `activityAges`. The cached shell keeps its
+`revision` and `capped` marker; an item without a revision clears it.
+
+**Absence from a capped shell never means a thread is gone.** Threads the
+shell left out live in a session-only store (`state/offShellThreads.ts`):
+older pages and threads looked up with `orchestration.getThreadShells`. Every
+removal item, snapshot, `unchanged` and session change bumps its generation,
+and a page or lookup reply sent under an older generation is dropped, so a
+reply that crossed a deletion never brings a row back. One resolver serves
+every thread reader in the web app (`state/entities.ts`): the live shell, then
+that store, then, for a capped shell only, the server. It answers `missing`
+only from `getThreadShells`, and `unknown` for an old server's uncapped shell,
+where readers behave as before. Lifecycle cleanup of persisted panel state, for
+a capped shell, deletes only ids `getThreadShells` reports missing (and closed
+chat panels, as before); a removal item never deletes state. The thread route
+never runs its 1 s missing-thread redirect for a capped shell: it redirects
+only when the resolver reports the routed thread missing.
+
 ## Data boundary
 
 A session becomes ready only after the socket connects and the first
