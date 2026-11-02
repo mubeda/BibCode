@@ -9775,7 +9775,7 @@ mod tests {
                 cancellation.cancel();
                 let (items, bytes) = counter.await.unwrap();
                 println!(
-                    "{threads} threads{}: first snapshot {first} B; {ticks} events in {:.1} s                      sent {items} items ({:.2}/s), {bytes} B ({} B/item); rebuild {:.1} ms",
+                    "{threads} threads{}: first snapshot {first} B; {ticks} events in {:.1} s sent {items} items ({:.2}/s), {bytes} B ({} B/item); rebuild {:.1} ms",
                     if capped { ", capped" } else { "" },
                     elapsed.as_secs_f64(),
                     items as f64 / elapsed.as_secs_f64(),
