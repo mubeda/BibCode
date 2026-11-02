@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
