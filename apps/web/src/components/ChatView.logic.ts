@@ -37,6 +37,7 @@ import {
 } from "@bibcode/client-runtime/connection";
 import type { AttachmentSource, AttachmentStagingResult } from "@bibcode/client-runtime/operations";
 import { settlePromise, type AtomCommandResult } from "@bibcode/client-runtime/state/runtime";
+import { threadHasMessages } from "@bibcode/client-runtime/state/thread-history";
 import { AsyncResult } from "effect/reactivity";
 import type { StagedUploadChatAttachment, UploadChatAttachment } from "@bibcode/contracts";
 
@@ -419,7 +420,7 @@ export function buildExpiredTerminalContextToastCopy(
 
 export function threadHasStarted(thread: Thread | null | undefined): boolean {
   return Boolean(
-    thread && (thread.latestTurn !== null || thread.messages.length > 0 || thread.session !== null),
+    thread && (thread.latestTurn !== null || threadHasMessages(thread) || thread.session !== null),
   );
 }
 

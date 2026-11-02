@@ -287,7 +287,18 @@ export function applyTimelineDisclosureChange(
     : { turns, groups, entries };
 }
 
+/** The id of the row that loads older history (#226). */
+export const HISTORY_START_ROW_ID = "history-start";
+
 export type MessagesTimelineRow =
+  | {
+      /** The top row while older history is on the server (#226): it loads the next page. */
+      kind: "history-start";
+      id: string;
+      createdAt: string;
+      olderRows: number;
+      status: "idle" | "loading" | "error";
+    }
   | {
       kind: "queued-message";
       id: string;
@@ -528,6 +539,7 @@ function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestTurn: TimelineLatestTurn | null;
   unsettledTurnId: TurnId | null;
+  hasOlderHistory: boolean;
 }): TurnFolds {
   interface TurnGroup {
     entries: Array<TimelineEntry>;
@@ -545,8 +557,13 @@ function deriveTurnFolds(input: {
   const groupsByTurnId = new Map<TurnId, TurnGroup>();
 
   let pendingUserBoundary: string | null = null;
+  // While older history is still on the server, a turn that begins before the first loaded user
+  // message may have begun earlier still: it is partial, so it gets no duration (#226).
+  let partialTurnId: TurnId | null = null;
+  let sawUserMessage = !input.hasOlderHistory;
   for (const entry of input.timelineEntries) {
     if (entry.kind === "message" && entry.message.role === "user") {
+      sawUserMessage = true;
       const existingGroup = entry.message.turnId
         ? groupsByTurnId.get(entry.message.turnId)
         : undefined;
@@ -578,6 +595,7 @@ function deriveTurnFolds(input: {
         startBoundary: pendingUserBoundary,
       };
       pendingUserBoundary = null;
+      if (!sawUserMessage && partialTurnId === null) partialTurnId = turnId;
       groupsByTurnId.set(turnId, group);
     }
     group.entries.push(entry);
@@ -667,10 +685,13 @@ function deriveTurnFolds(input: {
             maxIsoTimestamp(input.latestTurn.completedAt, lateOutputEnd) ??
               input.latestTurn.completedAt,
           )
-        : computeElapsedMs(
-            group.startBoundary ?? firstEntry.createdAt,
-            maxIsoTimestamp(terminalEntry?.message.updatedAt ?? null, lastEntryEnd) ?? lastEntryEnd,
-          );
+        : turnId === partialTurnId
+          ? null
+          : computeElapsedMs(
+              group.startBoundary ?? firstEntry.createdAt,
+              maxIsoTimestamp(terminalEntry?.message.updatedAt ?? null, lastEntryEnd) ??
+                lastEntryEnd,
+            );
     const duration = elapsedMs !== null ? formatDuration(elapsedMs) : null;
     const label = isLatestInterruptedTurn
       ? duration
@@ -707,6 +728,8 @@ export interface TimelineDisclosureInput {
    * rows so one click folds them. The turn still running is the same either way.
    */
   verboseChat?: boolean;
+  /** Older history is still on the server (#226): the oldest loaded turn may be partial. */
+  hasOlderHistory?: boolean;
 }
 
 interface TimelineLayout {
@@ -728,6 +751,7 @@ function deriveTimelineLayout(input: TimelineDisclosureInput): TimelineLayout {
     timelineEntries,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
+    hasOlderHistory: input.hasOlderHistory === true,
   });
   return { timelineEntries, unsettledTurnId, turnFolds };
 }
@@ -1155,6 +1179,10 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
   if (a.kind !== b.kind || a.id !== b.id) return false;
 
   switch (a.kind) {
+    case "history-start": {
+      const bh = b as typeof a;
+      return a.olderRows === bh.olderRows && a.status === bh.status;
+    }
     case "queued-message": {
       const bq = b as typeof a;
       return (

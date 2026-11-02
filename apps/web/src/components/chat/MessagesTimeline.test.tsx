@@ -2957,3 +2957,106 @@ describe("MessagesTimeline thinking rows", () => {
     expect(scrollTop).toBe(2_000);
   });
 });
+
+// The thread history window (#226).
+describe("MessagesTimeline older history", () => {
+  const turn = (index: number) => {
+    const createdAt = `2026-03-17T19:${String(index).padStart(2, "0")}:00.000Z`;
+    return [
+      {
+        ...buildUserTimelineEntry(`Question ${index}`),
+        id: `user-${index}`,
+        createdAt,
+        message: {
+          ...buildUserTimelineEntry(`Question ${index}`).message,
+          id: MessageId.make(`user-${index}`),
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      buildAssistantTimelineEntry({
+        id: `answer-${index}`,
+        messageId: `answer-${index}`,
+        text: `Answer ${index}`,
+        createdAt,
+      }),
+    ];
+  };
+  const olderHistory = (
+    status: "idle" | "loading" | "error",
+    onLoadOlder: () => void = () => {},
+  ) => ({ olderRows: 42, status, onLoadOlder });
+  const rowIds = () =>
+    (h.legendListProps?.data as ReadonlyArray<{ id: string }> | undefined)?.map((row) => row.id) ??
+    [];
+
+  it("keeps the first visible row in place when an older page loads", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mountedTrees.push({ container, root });
+    const render = (entries: ReturnType<typeof turn>) =>
+      act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={entries}
+            olderHistory={olderHistory("idle")}
+          />,
+        ),
+      );
+    await render([...turn(10), ...turn(11)]);
+    const before = rowIds();
+    expect(before[0]).toBe("history-start");
+    const firstVisible = before[1];
+
+    await render([...turn(8), ...turn(9), ...turn(10), ...turn(11)]);
+    const after = rowIds();
+    // The rows already shown keep their keys and order, and LegendList holds the first visible
+    // one in place as the page lands above it.
+    expect(after.slice(after.indexOf(firstVisible!))).toEqual(before.slice(1));
+    expect(after.indexOf(firstVisible!)).toBeGreaterThan(1);
+    expect(h.legendListProps?.maintainVisibleContentPosition).toMatchObject({ data: true });
+  });
+
+  it("loads earlier messages from the top row without scrolling", async () => {
+    const onLoadOlder = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("idle", onLoadOlder),
+    });
+    const button = [...container.querySelectorAll("button")].find(
+      (element) => element.textContent === "Load earlier messages (42 more)",
+    );
+    expect(button).toBeDefined();
+    await click(button!);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    // Scrolling within a viewport of the top loads it too.
+    expect(h.legendListProps?.onStartReached).toBe(onLoadOlder);
+    expect(h.legendListProps?.onStartReachedThreshold).toBe(1);
+  });
+
+  it("offers a retry when an older page fails", async () => {
+    const onLoadOlder = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("error", onLoadOlder),
+    });
+    expect(container.textContent).toContain("Couldn't load earlier messages.");
+    const retry = [...container.querySelectorAll("button")].find(
+      (element) => element.textContent === "Retry",
+    );
+    await click(retry!);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    // A failed page is not retried by scrolling, only by the button.
+    expect(h.legendListProps?.onStartReached).toBeUndefined();
+
+    const loading = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("loading"),
+    });
+    expect(loading.textContent).toContain("Loading earlier messages…");
+    expect(h.legendListProps?.onStartReached).toBeUndefined();
+  });
+});
