@@ -497,7 +497,7 @@ describe("thread subscription requests per reconnect (#197)", () => {
           // The request leaves while configuring, before the config arrives.
           respond({ config: false });
           yield* settle;
-          expect(threadRequests(first)).toEqual([{ threadId: THREAD_ID, patches: true }]);
+          expect(threadRequests(first)).toEqual([{ threadId: THREAD_ID, patches: true, history: {} }]);
           yield* answerAll(respond);
           yield* stack.awaitPhase("connected");
           // The verified session does not subscribe again, and neither does the retry window.
@@ -518,6 +518,7 @@ describe("thread subscription requests per reconnect (#197)", () => {
             {
               threadId: THREAD_ID,
               patches: true,
+              history: {},
               resume: { revision: "r1", snapshotSequence: 1 },
             },
           ]);
@@ -550,7 +551,7 @@ describe("thread subscription requests per reconnect (#197)", () => {
       yield* answerAll(makeResponder(third, threads));
       yield* stack.awaitPhase("connected");
       expect(threadRequests(third)).toEqual([
-        { threadId: THREAD_ID, patches: true, resume: { revision: "r2", snapshotSequence: 1 } },
+        { threadId: THREAD_ID, patches: true, history: {}, resume: { revision: "r2", snapshotSequence: 1 } },
       ]);
     }).pipe(Effect.scoped),
   );
@@ -608,7 +609,7 @@ describe("thread subscription requests per reconnect (#197)", () => {
       yield* answerAll(makeResponder(third, threads));
       yield* stack.awaitPhase("connected");
       expect(threadRequests(third)).toEqual([
-        { threadId: THREAD_ID, patches: true, resume: { revision: "r1", snapshotSequence: 1 } },
+        { threadId: THREAD_ID, patches: true, history: {}, resume: { revision: "r1", snapshotSequence: 1 } },
       ]);
       expect(liveData(yield* SubscriptionRef.get(state))?.title).toBe("Unverified");
     }).pipe(Effect.scoped),

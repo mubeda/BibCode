@@ -175,6 +175,10 @@
       "types": "./src/state/threads.ts",
       "default": "./src/state/threads.ts"
     },
+    "./state/thread-history": {
+      "types": "./src/state/threadHistory.ts",
+      "default": "./src/state/threadHistory.ts"
+    },
     "./state/thread-sort": {
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"
