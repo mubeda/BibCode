@@ -1968,7 +1968,12 @@ impl GitVcsRpcServices {
                     .as_str()
                     .or_else(|| error["message"].as_str())
                     .unwrap_or("The clone failed.");
-                source_control_error(&provider, "cloneRepository", detail)
+                let mut failure = source_control_error(&provider, "cloneRepository", detail);
+                // An agent's SSH clone keeps its `reason` (#217), as the plan's refusals do.
+                if let Some(reason) = error.get("reason") {
+                    failure["reason"] = reason.clone();
+                }
+                failure
             })?;
         Ok(json!({ "cwd": display_path(cwd), "remoteUrl": remote_url, "repository": Value::Null }))
     }

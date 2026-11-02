@@ -253,7 +253,12 @@ fn write_fake_ssh(path: &Path, record: &Path, control: &Path, bare: &Path) {
         format!(r#"for argument in "$@"; do printf '%s\n' "$argument"; done >> '{record}'"#),
         format!(r#"printf 'SSH_AUTH_SOCK=%s\n' "${{SSH_AUTH_SOCK-}}" >> '{record}'"#),
         format!("if [ -f '{control}/stderr' ]; then cat '{control}/stderr' >&2; exit 255; fi"),
-        format!("if [ -f '{control}/sleep' ]; then exec sleep 600; fi"),
+        // The sleeping child's pid, as the OS knows it (MSYS keeps the Windows pid apart).
+        format!(
+            "if [ -f '{control}/sleep' ]; then sleep 600 & child=$!; \
+             if [ -r /proc/$child/winpid ]; then cat /proc/$child/winpid > '{control}/pid'; \
+             else echo $child > '{control}/pid'; fi; wait $child; exit 1; fi"
+        ),
         format!("exec git upload-pack '{bare}'"),
     ];
     std::fs::write(path, script.join("\n") + "\n").expect("fake ssh");
@@ -1675,6 +1680,21 @@ async fn ssh_refusals_come_back_with_what_to_do() {
         assert!(message.contains(advice), "{advice} in {message}");
         assert_eq!(error["reason"].as_str(), expected_reason, "{result}");
         assert!(!fixture.projects.join("refused").exists());
+        // The direct RPC keeps the reason too.
+        let direct = fixture
+            .rpc(
+                "sourceControl.cloneRepository",
+                json!({
+                    "remoteUrl": fixture.ssh_url(),
+                    "destinationPath": fixture.projects.join("refused-direct"),
+                }),
+                fixture.agent_context(&agent),
+            )
+            .await
+            .expect_err("ssh refused");
+        assert_eq!(direct["_tag"], "SourceControlRepositoryError", "{direct}");
+        assert_eq!(direct["reason"].as_str(), expected_reason, "{direct}");
+        assert!(!fixture.projects.join("refused-direct").exists());
     }
     fixture.harness.shutdown().await;
 }
@@ -1699,6 +1719,18 @@ async fn cancel_clone_stops_a_waiting_ssh_and_removes_the_folder() {
     let folder = fixture.projects.join("waiting");
     wait_until(|| folder.exists(), "the clone reserved its folder").await;
     wait_until(|| !fixture.ssh_record().is_empty(), "ssh started").await;
+    let pid_file = fixture.ssh_control.join("pid");
+    let pid = || {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    wait_until(|| pid().is_some(), "ssh's child recorded its pid").await;
+    let pid = pid().unwrap();
+    assert!(
+        running(pid),
+        "ssh's child {pid} is not running before the cancel"
+    );
     let cancelled = fixture
         .harness
         .call(&agent, "cancel_clone", json!({ "cloneId": clone_id }))
@@ -1709,7 +1741,22 @@ async fn cancel_clone_stops_a_waiting_ssh_and_removes_the_folder() {
         "the cancelled clone's folder is removed",
     )
     .await;
+    wait_until(|| !running(pid), "ssh's child exited").await;
     fixture.harness.shutdown().await;
+}
+
+/// Whether `pid` runs (a zombie waiting for its reaper counts as exited).
+fn running(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(pid)
+        .is_some_and(|process| process.status() != sysinfo::ProcessStatus::Zombie)
 }
 
 /// #217: SSH has no counterpart of Git's HTTP low-speed guard, so ssh's own timeouts end a
