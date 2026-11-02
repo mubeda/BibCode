@@ -5,7 +5,7 @@
 //! not normalize or regenerate them while reading an existing database.
 
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -522,55 +522,194 @@ impl Repositories {
                         decode_projection_state,
                     )?,
                 };
-                let mut session =
-                    connection.prepare(&format!("{THREAD_SESSION_SELECT} WHERE thread_id = ?"))?;
-                let mut newest_messages = connection.prepare(&format!(
-                    "{MESSAGE_SELECT} WHERE thread_id = ?1 AND role = ?2 AND created_at = \
-                     (SELECT created_at FROM projection_thread_messages WHERE thread_id = ?1 \
-                      AND role = ?2 ORDER BY created_at DESC LIMIT 1){MESSAGE_LIST_ORDER}"
+                read_shell_thread_rows(connection, &mut rows)?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// The live shell capped for #223: every live, card-backing or `forced` thread and the
+    /// most recent finished ones, with the per-thread reads for those only, and what each
+    /// project and checkout left out.
+    pub async fn load_capped_shell_snapshot_rows(
+        &self,
+        forced: HashSet<String>,
+    ) -> Result<(ShellSnapshotRows, Vec<ShellOlderCount>)> {
+        self.database
+            .call(move |connection| {
+                let threads = live_shell_threads(connection)?;
+                let kept = shell_kept_ids(&threads, &shell_live_thread_ids(connection)?, &forced);
+                let mut older = HashMap::<(String, Option<Option<String>>), usize>::new();
+                let mut kept_threads = Vec::new();
+                for thread in threads {
+                    if kept.contains(&thread.thread_id) {
+                        kept_threads.push(thread);
+                        continue;
+                    }
+                    let chats_in = (thread.kind == "panel").then(|| thread.worktree_path.clone());
+                    *older.entry((thread.project_id, chats_in)).or_default() += 1;
+                }
+                let mut rows = ShellSnapshotRows {
+                    projects: collect(
+                        connection,
+                        &format!("{PROJECT_SELECT}{PROJECT_LIST_ORDER}"),
+                        [],
+                        decode_project,
+                    )?,
+                    threads: kept_threads,
+                    sessions: Vec::new(),
+                    latest_turns: Vec::new(),
+                    preview_messages: Vec::new(),
+                    preview_activities: Vec::new(),
+                    states: collect(
+                        connection,
+                        PROJECTION_STATE_LIST,
+                        [],
+                        decode_projection_state,
+                    )?,
+                };
+                read_shell_thread_rows(connection, &mut rows)?;
+                let mut older = older
+                    .into_iter()
+                    .map(|((project_id, chats_in), count)| ShellOlderCount {
+                        project_id,
+                        chats_in,
+                        count,
+                    })
+                    .collect::<Vec<_>>();
+                older.sort_by(|left, right| {
+                    (&left.project_id, &left.chats_in).cmp(&(&right.project_id, &right.chats_in))
+                });
+                Ok((rows, older))
+            })
+            .await
+    }
+
+    /// One page of the threads a capped shell leaves out (or, with `query`, of every unarchived
+    /// thread of the scope), newest first after `after`, with the shell's per-thread reads for
+    /// the page. The flag says whether more remain.
+    pub async fn list_older_thread_rows(
+        &self,
+        scope: OlderThreadsScope,
+        query: Option<String>,
+        after: Option<(String, String)>,
+        limit: usize,
+        forced: HashSet<String>,
+    ) -> Result<(ShellSnapshotRows, bool)> {
+        self.database
+            .call(move |connection| {
+                let threads = live_shell_threads(connection)?;
+                let kept = shell_kept_ids(&threads, &shell_live_thread_ids(connection)?, &forced);
+                let with_session = if matches!(scope, OlderThreadsScope::Agents) {
+                    let mut statement =
+                        connection.prepare("SELECT thread_id FROM projection_thread_sessions")?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<HashSet<_>>>()?
+                } else {
+                    HashSet::new()
+                };
+                let needle = query.map(|query| query.to_lowercase());
+                let mut page = threads
+                    .into_iter()
+                    .filter(|thread| {
+                        let in_scope = match &scope {
+                            OlderThreadsScope::Project(project_id) => {
+                                thread.project_id == *project_id && thread.kind != "panel"
+                            }
+                            OlderThreadsScope::Checkout(project_id, worktree_path) => {
+                                thread.project_id == *project_id
+                                    && thread.kind == "panel"
+                                    && thread.worktree_path == *worktree_path
+                            }
+                            OlderThreadsScope::Agents => with_session.contains(&thread.thread_id),
+                            OlderThreadsScope::Search => true,
+                        };
+                        in_scope
+                            && match &needle {
+                                // A search finds kept threads too: the caller merges by id.
+                                Some(needle) => thread.title.to_lowercase().contains(needle),
+                                None => !kept.contains(&thread.thread_id),
+                            }
+                    })
+                    .filter(|thread| match &after {
+                        Some((key, thread_id)) => {
+                            (shell_recency_key(thread), thread.thread_id.as_str())
+                                < (key.as_str(), thread_id.as_str())
+                        }
+                        None => true,
+                    })
+                    .collect::<Vec<_>>();
+                page.sort_by(newest_shell_thread_first);
+                let more = page.len() > limit;
+                page.truncate(limit);
+                let mut rows = ShellSnapshotRows {
+                    projects: Vec::new(),
+                    threads: page,
+                    sessions: Vec::new(),
+                    latest_turns: Vec::new(),
+                    preview_messages: Vec::new(),
+                    preview_activities: Vec::new(),
+                    states: Vec::new(),
+                };
+                read_shell_thread_rows(connection, &mut rows)?;
+                Ok((rows, more))
+            })
+            .await
+    }
+
+    /// The named threads, live or archived, that are undeleted and have a project row, with
+    /// the shell's per-thread reads.
+    pub async fn load_thread_shell_rows(
+        &self,
+        thread_ids: Vec<String>,
+    ) -> Result<ShellSnapshotRows> {
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(&format!(
+                    "{THREAD_SELECT} WHERE thread_id = ? AND deleted_at IS NULL \
+                     AND project_id IN (SELECT project_id FROM projection_projects)"
                 ))?;
-                // (thread_id, turn_id) is unique, so this is at most one row.
-                let mut latest_turn = connection.prepare(&format!(
-                    "{TURN_SELECT} WHERE thread_id = ? AND turn_id = ?"
-                ))?;
-                let mut newest_tools = connection.prepare(&format!(
-                    "{ACTIVITY_SELECT} WHERE thread_id = ?1 AND turn_id = ?2 AND tone = 'tool' \
-                     AND created_at = (SELECT created_at FROM projection_thread_activities \
-                      WHERE thread_id = ?1 AND turn_id = ?2 AND tone = 'tool' \
-                      ORDER BY created_at DESC LIMIT 1){ACTIVITY_LIST_ORDER}"
-                ))?;
-                for thread in &rows.threads {
-                    rows.sessions.extend(
-                        session
-                            .query_row([&thread.thread_id], decode_thread_session)
+                let mut threads = Vec::new();
+                for thread_id in &thread_ids {
+                    threads.extend(statement.query_row([thread_id], decode_thread).optional()?);
+                }
+                let mut rows = ShellSnapshotRows {
+                    projects: Vec::new(),
+                    threads,
+                    sessions: Vec::new(),
+                    latest_turns: Vec::new(),
+                    preview_messages: Vec::new(),
+                    preview_activities: Vec::new(),
+                    states: Vec::new(),
+                };
+                read_shell_thread_rows(connection, &mut rows)?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// Which of `thread_ids` are in the live shell now: undeleted, unarchived, with a project.
+    pub async fn live_shell_thread_ids_among(
+        &self,
+        thread_ids: Vec<String>,
+    ) -> Result<HashSet<String>> {
+        self.database
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT thread_id FROM projection_threads WHERE thread_id = ? \
+                     AND deleted_at IS NULL AND archived_at IS NULL \
+                     AND project_id IN (SELECT project_id FROM projection_projects)",
+                )?;
+                let mut live = HashSet::new();
+                for thread_id in &thread_ids {
+                    live.extend(
+                        statement
+                            .query_row([thread_id], |row| row.get::<_, String>(0))
                             .optional()?,
                     );
-                    for role in ["user", "assistant"] {
-                        for message in newest_messages
-                            .query_map(params![thread.thread_id, role], decode_message)?
-                        {
-                            rows.preview_messages.push(message?);
-                        }
-                    }
-                    let Some(turn_id) = &thread.latest_turn_id else {
-                        continue;
-                    };
-                    let Some(turn) = latest_turn
-                        .query_row(params![thread.thread_id, turn_id], decode_turn)
-                        .optional()?
-                    else {
-                        continue;
-                    };
-                    if turn.state == "running" {
-                        for activity in newest_tools
-                            .query_map(params![thread.thread_id, turn_id], decode_activity)?
-                        {
-                            rows.preview_activities.push(activity?);
-                        }
-                    }
-                    rows.latest_turns.push(turn);
                 }
-                Ok(rows)
+                Ok(live)
             })
             .await
     }
@@ -3666,6 +3805,181 @@ fn insert_auth_session_on(
     mcp_resource: Option<&str>,
 ) -> Result<()> {
     connection.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_resource) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str(),row.mcp_access,mcp_resource])?;
+    Ok(())
+}
+
+/// How many finished threads a capped shell keeps across the environment (#223).
+pub const SHELL_RECENT_FINISHED: usize = 25;
+/// How many of each project's newest non-panel finished threads a capped shell keeps.
+pub const SHELL_RECENT_PER_PROJECT: usize = 3;
+
+/// The threads one project left out of a capped shell: its non-panel threads
+/// (`chats_in: None`), or its chat panels in one checkout (`Some(worktree_path)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellOlderCount {
+    pub project_id: String,
+    pub chats_in: Option<Option<String>>,
+    pub count: usize,
+}
+
+/// Which left-out threads an older-threads page lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OlderThreadsScope {
+    /// A project's non-panel threads.
+    Project(String),
+    /// A project's chat panels in one checkout (`None`: the main checkout).
+    Checkout(String, Option<String>),
+    /// Every thread with a session, panels included, as the Agents rows list them.
+    Agents,
+    /// Every unarchived thread; only with a query.
+    Search,
+}
+
+/// The newest-first key of a capped shell and of older pages: the last user message, or the
+/// last update of a thread that has none.
+pub fn shell_recency_key(thread: &ProjectionThread) -> &str {
+    thread
+        .latest_user_message_at
+        .as_deref()
+        .unwrap_or(&thread.updated_at)
+}
+
+fn newest_shell_thread_first(
+    left: &ProjectionThread,
+    right: &ProjectionThread,
+) -> std::cmp::Ordering {
+    (shell_recency_key(right), right.thread_id.as_str())
+        .cmp(&(shell_recency_key(left), left.thread_id.as_str()))
+}
+
+/// Every thread of the live shell: undeleted, unarchived, with a project row.
+fn live_shell_threads(connection: &Connection) -> Result<Vec<ProjectionThread>> {
+    collect(
+        connection,
+        &format!(
+            "{THREAD_SELECT} WHERE deleted_at IS NULL AND archived_at IS NULL \
+             AND project_id IN (SELECT project_id FROM projection_projects) \
+             ORDER BY thread_id ASC"
+        ),
+        [],
+        decode_thread,
+    )
+}
+
+/// Threads live by rows beside their own: a starting or running session, a running latest
+/// turn, or a queued message.
+fn shell_live_thread_ids(connection: &Connection) -> Result<HashSet<String>> {
+    let mut live = HashSet::new();
+    for sql in [
+        "SELECT thread_id FROM projection_thread_sessions WHERE status IN ('starting', 'running')",
+        "SELECT threads.thread_id FROM projection_threads AS threads \
+         JOIN projection_turns AS turns ON turns.thread_id = threads.thread_id \
+         AND turns.turn_id = threads.latest_turn_id WHERE turns.state = 'running'",
+        "SELECT DISTINCT thread_id FROM projection_thread_messages WHERE delivery_state = 'queued'",
+    ] {
+        let mut statement = connection.prepare(sql)?;
+        for thread_id in statement.query_map([], |row| row.get::<_, String>(0))? {
+            live.insert(thread_id?);
+        }
+    }
+    Ok(live)
+}
+
+/// The ids a capped shell keeps (#223): live threads, card-backing ones (`default`, and
+/// `workspace` with a worktree), `forced` ones, then of the rest the newest
+/// [`SHELL_RECENT_FINISHED`] plus the newest [`SHELL_RECENT_PER_PROJECT`] non-panel threads of
+/// each project.
+pub fn shell_kept_ids(
+    threads: &[ProjectionThread],
+    live: &HashSet<String>,
+    forced: &HashSet<String>,
+) -> HashSet<String> {
+    let mut kept = HashSet::new();
+    let mut rest = Vec::new();
+    for thread in threads {
+        let card = thread.kind == "default"
+            || (thread.kind == "workspace" && thread.worktree_path.is_some());
+        let live_row = thread.pending_approval_count > 0
+            || thread.pending_user_input_count > 0
+            || thread.unresolved_delivery_state.is_some()
+            || thread.compaction.is_some();
+        if card
+            || live_row
+            || live.contains(&thread.thread_id)
+            || forced.contains(&thread.thread_id)
+        {
+            kept.insert(thread.thread_id.clone());
+        } else {
+            rest.push(thread);
+        }
+    }
+    rest.sort_by(|left, right| newest_shell_thread_first(left, right));
+    let mut per_project = HashMap::<&str, usize>::new();
+    for (index, thread) in rest.into_iter().enumerate() {
+        let project_slot = thread.kind != "panel" && {
+            let seen = per_project.entry(&thread.project_id).or_default();
+            *seen += 1;
+            *seen <= SHELL_RECENT_PER_PROJECT
+        };
+        if index < SHELL_RECENT_FINISHED || project_slot {
+            kept.insert(thread.thread_id.clone());
+        }
+    }
+    kept
+}
+
+/// Reads, for each of `rows.threads`, its session, the messages tied for its newest `user` and
+/// `assistant` message, its latest turn and, while that turn runs, the `tool` activities tied
+/// for its newest.
+fn read_shell_thread_rows(connection: &Connection, rows: &mut ShellSnapshotRows) -> Result<()> {
+    let mut session =
+        connection.prepare(&format!("{THREAD_SESSION_SELECT} WHERE thread_id = ?"))?;
+    let mut newest_messages = connection.prepare(&format!(
+        "{MESSAGE_SELECT} WHERE thread_id = ?1 AND role = ?2 AND created_at = \
+         (SELECT created_at FROM projection_thread_messages WHERE thread_id = ?1 \
+          AND role = ?2 ORDER BY created_at DESC LIMIT 1){MESSAGE_LIST_ORDER}"
+    ))?;
+    // (thread_id, turn_id) is unique, so this is at most one row.
+    let mut latest_turn = connection.prepare(&format!(
+        "{TURN_SELECT} WHERE thread_id = ? AND turn_id = ?"
+    ))?;
+    let mut newest_tools = connection.prepare(&format!(
+        "{ACTIVITY_SELECT} WHERE thread_id = ?1 AND turn_id = ?2 AND tone = 'tool' \
+         AND created_at = (SELECT created_at FROM projection_thread_activities \
+          WHERE thread_id = ?1 AND turn_id = ?2 AND tone = 'tool' \
+          ORDER BY created_at DESC LIMIT 1){ACTIVITY_LIST_ORDER}"
+    ))?;
+    for thread in &rows.threads {
+        rows.sessions.extend(
+            session
+                .query_row([&thread.thread_id], decode_thread_session)
+                .optional()?,
+        );
+        for role in ["user", "assistant"] {
+            for message in
+                newest_messages.query_map(params![thread.thread_id, role], decode_message)?
+            {
+                rows.preview_messages.push(message?);
+            }
+        }
+        let Some(turn_id) = &thread.latest_turn_id else {
+            continue;
+        };
+        let Some(turn) = latest_turn
+            .query_row(params![thread.thread_id, turn_id], decode_turn)
+            .optional()?
+        else {
+            continue;
+        };
+        if turn.state == "running" {
+            for activity in
+                newest_tools.query_map(params![thread.thread_id, turn_id], decode_activity)?
+            {
+                rows.preview_activities.push(activity?);
+            }
+        }
+        rows.latest_turns.push(turn);
+    }
     Ok(())
 }
 

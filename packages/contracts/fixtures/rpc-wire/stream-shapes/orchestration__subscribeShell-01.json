@@ -4,68 +4,20 @@
   "values": [
     {
       "kind": "project-upserted",
-      "sequence": 43,
+      "sequence": 0,
       "project": {
-        "id": "",
-        "title": "4294967295",
-        "workspaceRoot": "3Az9R@h0M,",
-        "defaultModelSelection": {
-          "instanceId": "zAxsm",
-          "model": "😀"
-        },
-        "scripts": [
-          {
-            "id": "",
-            "name": "�",
-            "command": ")/8<c7X:El",
-            "icon": "configure",
-            "runOnWorktreeCreate": false,
-            "previewUrl": "s",
-            "autoOpenPreview": false
-          },
-          {
-            "id": "z",
-            "name": "2",
-            "command": "h31J!",
-            "icon": "debug",
-            "runOnWorktreeCreate": false
-          },
-          {
-            "id": "s",
-            "name": "0",
-            "command": "6",
-            "icon": "configure",
-            "runOnWorktreeCreate": false
-          },
-          {
-            "id": "prototype",
-            "name": "�",
-            "command": "g_^(0bHFd",
-            "icon": "lint",
-            "runOnWorktreeCreate": false
-          },
-          {
-            "id": "�",
-            "name": "�",
-            "command": "x!A#45kEaj",
-            "icon": "lint",
-            "runOnWorktreeCreate": false
-          },
-          {
-            "id": "prototype",
-            "name": "�",
-            "command": "V",
-            "icon": "debug",
-            "runOnWorktreeCreate": false
-          }
-        ],
+        "id": "4294967295",
+        "title": "3Az9R@h0M,",
+        "workspaceRoot": "",
+        "defaultModelSelection": null,
+        "scripts": [],
         "worktreeDiscovery": {
           "visibility": "shown",
           "initialPromptDismissedAt": null,
-          "baselinePaths": ["I?J79", "�", "😀", "😀"]
+          "baselinePaths": []
         },
-        "createdAt": "\u0000",
-        "updatedAt": " "
+        "createdAt": "=j/zPWh9H",
+        "updatedAt": "\n"
       }
     }
   ]

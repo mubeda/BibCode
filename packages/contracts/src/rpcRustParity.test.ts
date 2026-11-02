@@ -72,6 +72,7 @@ describe("Rust RPC fixture parity", () => {
       "snapshot",
       "thread-removed",
       "thread-upserted",
+      "unchanged",
     ]);
   });
 

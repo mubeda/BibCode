@@ -33,6 +33,8 @@ export const ORCHESTRATION_WS_METHODS = {
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  listOlderThreads: "orchestration.listOlderThreads",
+  getThreadShells: "orchestration.getThreadShells",
 } as const;
 
 export const ProviderApprovalPolicy = Schema.Literals([
@@ -619,6 +621,22 @@ export const OrchestrationProjectShell = Schema.Struct({
   ),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  /**
+   * What a capped shell left out of this project (#223): its non-panel threads, and its chat
+   * panels per checkout as the left panel groups them. Absent from an uncapped shell and from
+   * older servers.
+   */
+  olderThreads: Schema.optional(
+    Schema.Struct({
+      count: NonNegativeInt,
+      chats: Schema.Array(
+        Schema.Struct({
+          worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+          count: NonNegativeInt,
+        }),
+      ),
+    }),
+  ),
 });
 export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
 
@@ -695,6 +713,13 @@ export const OrchestrationShellSnapshot = Schema.Struct({
   projects: Schema.Array(OrchestrationProjectShell),
   threads: Schema.Array(OrchestrationThreadShell),
   updatedAt: IsoDateTime,
+  /**
+   * The server left finished threads out (#223): a thread missing here may still exist. Absent
+   * from an uncapped shell and from older servers, whose list stays authoritative.
+   */
+  capped: Schema.optional(Schema.Boolean),
+  /** The revision of this shell, kept by the client to resume; never sent inside a snapshot. */
+  revision: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationShellSnapshot = typeof OrchestrationShellSnapshot.Type;
 
@@ -702,21 +727,25 @@ export const OrchestrationShellStreamEvent = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("project-upserted"),
     sequence: NonNegativeInt,
+    revision: Schema.optional(TrimmedNonEmptyString),
     project: OrchestrationProjectShell,
   }),
   Schema.Struct({
     kind: Schema.Literal("project-removed"),
     sequence: NonNegativeInt,
+    revision: Schema.optional(TrimmedNonEmptyString),
     projectId: ProjectId,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread-upserted"),
     sequence: NonNegativeInt,
+    revision: Schema.optional(TrimmedNonEmptyString),
     thread: OrchestrationThreadShell,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread-removed"),
     sequence: NonNegativeInt,
+    revision: Schema.optional(TrimmedNonEmptyString),
     threadId: ThreadId,
   }),
 ]);
@@ -731,10 +760,82 @@ export const OrchestrationShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     snapshot: OrchestrationShellSnapshot,
+    /** The shell's revision, for a client that opted into the cap or resume. */
+    revision: Schema.optional(TrimmedNonEmptyString),
   }),
   ...OrchestrationShellStreamEvent.members,
+  /**
+   * The shell the client resumed from is current. `activityAges` re-ages each kept thread's
+   * provider progress, which a cached shell cannot age itself.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("unchanged"),
+    snapshotSequence: NonNegativeInt,
+    revision: TrimmedNonEmptyString,
+    activityAges: Schema.Record(ThreadId, NonNegativeInt),
+  }),
 ]);
 export type OrchestrationShellStreamItem = typeof OrchestrationShellStreamItem.Type;
+
+export const OrchestrationSubscribeShellInput = Schema.Struct({
+  /** Leave finished threads out, keeping these too; older servers ignore it. */
+  cap: Schema.optional(
+    Schema.Struct({
+      include: Schema.optional(Schema.Array(ThreadId)),
+    }),
+  ),
+  /** The revision and sequence of the cached shell; older servers ignore it. */
+  resume: Schema.optional(
+    Schema.Struct({
+      revision: TrimmedNonEmptyString,
+      snapshotSequence: NonNegativeInt,
+    }),
+  ),
+});
+export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShellInput.Type;
+
+export const OrchestrationOlderThreadsScope = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("project"), projectId: ProjectId }),
+  Schema.Struct({
+    kind: Schema.Literal("checkout"),
+    projectId: ProjectId,
+    worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({ kind: Schema.Literal("agents") }),
+  Schema.Struct({ kind: Schema.Literal("search") }),
+]);
+export type OrchestrationOlderThreadsScope = typeof OrchestrationOlderThreadsScope.Type;
+
+export const OrchestrationListOlderThreadsInput = Schema.Struct({
+  scope: OrchestrationOlderThreadsScope,
+  /** A title substring, case-insensitive; required by the `search` scope. */
+  query: Schema.optional(TrimmedNonEmptyString),
+  cursor: Schema.optional(TrimmedNonEmptyString),
+  limit: Schema.optional(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(100)),
+  ),
+});
+export type OrchestrationListOlderThreadsInput = typeof OrchestrationListOlderThreadsInput.Type;
+
+export const OrchestrationListOlderThreadsResult = Schema.Struct({
+  threads: Schema.Array(OrchestrationThreadShell),
+  /** Null when nothing older remains. */
+  cursor: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type OrchestrationListOlderThreadsResult = typeof OrchestrationListOlderThreadsResult.Type;
+
+export const OrchestrationGetThreadShellsInput = Schema.Struct({
+  threadIds: Schema.Array(ThreadId).check(Schema.isMinLength(1), Schema.isMaxLength(100)),
+});
+export type OrchestrationGetThreadShellsInput = typeof OrchestrationGetThreadShellsInput.Type;
+
+export const OrchestrationGetThreadShellsResult = Schema.Struct({
+  /** Live or archived (`archivedAt` set). */
+  threads: Schema.Array(OrchestrationThreadShell),
+  /** Deleted, or never existed: the only evidence that a thread is gone. */
+  missing: Schema.Array(ThreadId),
+});
+export type OrchestrationGetThreadShellsResult = typeof OrchestrationGetThreadShellsResult.Type;
 
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
@@ -1879,13 +1980,29 @@ export const OrchestrationRpcSchemas = {
     output: OrchestrationThreadStreamItem,
   },
   subscribeShell: {
-    input: Schema.Struct({}),
+    input: OrchestrationSubscribeShellInput,
     output: OrchestrationShellStreamItem,
+  },
+  listOlderThreads: {
+    input: OrchestrationListOlderThreadsInput,
+    output: OrchestrationListOlderThreadsResult,
+  },
+  getThreadShells: {
+    input: OrchestrationGetThreadShellsInput,
+    output: OrchestrationGetThreadShellsResult,
   },
 } as const;
 
 export class OrchestrationGetSnapshotError extends Schema.TaggedError<OrchestrationGetSnapshotError>()(
   "OrchestrationGetSnapshotError",
+  {
+    message: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+export class OrchestrationListOlderThreadsError extends Schema.TaggedError<OrchestrationListOlderThreadsError>()(
+  "OrchestrationListOlderThreadsError",
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
