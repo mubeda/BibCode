@@ -1,6 +1,6 @@
 # Checkpoint Delivery Fencing (#261)
 
-Status: Revised for Codex review round 2 (2026-11-02)
+Status: Approved 2026-11-02 (Codex review, 3 rounds)
 
 Follow-up to #234, #235 and #236 (PR #247): option D of
 `docs/plans/2026-11-01-turn-checkpoint-residuals-design.md`. Verified at `main`
@@ -64,8 +64,8 @@ captured.
 
 - R1: the first turn of a thread (ref 0 missing) is claimed only after its ref 0 is
   captured, or after the capture has failed or timed out and that was reported.
-- R2: once the delivery is claimed, nothing writes ref 0 for the thread, so a ref 0 always
-  shows the checkout before the turn.
+- R2: whatever writes ref 0, and whenever it lands, ref 0 always
+  shows the checkout before the turn. No ref-0 write is requested after the claim.
 - R3: every wait is bounded, and a failure is shown to the person without losing the turn.
 - R4: no Git call and no wait when the thread already has a numbered turn (the issue's "no
   added latency when the baseline already exists"). That includes not waiting behind other
@@ -75,13 +75,13 @@ captured.
 
 ## Options
 
-| Option                                                                                                                                                                                                                                                                                                                                                                 | Trade-offs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **A. Delivery waits on a per-thread barrier the worker clears.** The engine marks the thread "baseline pending" when it commits a baseline event. Delivery skips the thread, as it does for a checkpoint hold, until `ensure_baseline` clears the mark or the bound expires.                                                                                           | Git stays on the worker, which remains the only writer. But the mark is in memory and history is not replayed. A restart needs a new startup pass that finds pending first turns and queues their baselines. The decider cannot cheaply tell whether a baseline is needed (Git, turn numbers), so it marks every turn start, and each one waits for the worker. That adds latency to every turn, which breaks R4 unless the marking is made more complex. The worker is serial, so one thread's hung Git delays every other thread's first turn up to the bound. When the bound expires, the worker still captures later, from a checkout that may hold edits, which breaks R2 unless it also checks the row's claim state. Three new mechanisms. |
-| **B. Delivery captures ref 0 itself, before the first claim (recommended).** A per-thread baseline stage in the delivery loop captures ref 0 outside the delivery slots. The row is selected for a slot only after that stage has ended. The worker's two baseline arms are deleted, so delivery is the only writer, and a lock-file tombstone refuses any late write. | R1, R5 and R6 follow from where the stage sits: every pending row passes it before its first claim. R2 comes from the tombstone together with the snapshot-before-claim rule. A worktree bootstrap runs first, so the worktree case is fixed. Git (2–6 processes) runs only for a thread with no numbered turn. It runs per thread, and it neither queues behind other threads on the serial worker nor holds a delivery slot. Costs: one more in-memory stage in the delivery loop, and a tombstone file per thread whose baseline failed. The tests that sync with the worker through a new thread's ref 0 also need another sync point.                                                                                                        |
-| **C. Ref 0 from the pre-turn state the provider reports.**                                                                                                                                                                                                                                                                                                             | No provider reports the checkout before a turn. Rebuilding it by reversing the reported file changes misses edits made by shell commands, formatters and setup scripts. It would also differ between Codex, Claude and OpenCode. Rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| B′. B, keeping the worker's arm as a fallback.                                                                                                                                                                                                                                                                                                                         | After a failed or timed-out delivery capture, the worker would still write ref 0 later, possibly from an edited checkout, which is today's bug. Guarding against that means the worker takes the thread reservation and checks the row is unclaimed. That blocks the serial worker on a provider handoff. Rejected: two writers for one ref.                                                                                                                                                                                                                                                                                                                                                                                                      |
-| B″. B, with the capture inline in the delivery slot (the first revision).                                                                                                                                                                                                                                                                                              | Four slow captures take all four slots, and selection stops when the slots are full, so a thread that already has its baseline waits up to the bound (review round 1). Rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Option                                                                                                                                                                                                                                                                                                                                                                    | Trade-offs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A. Delivery waits on a per-thread barrier the worker clears.** The engine marks the thread "baseline pending" when it commits a baseline event. Delivery skips the thread, as it does for a checkpoint hold, until `ensure_baseline` clears the mark or the bound expires.                                                                                              | Git stays on the worker, which remains the only writer. But the mark is in memory and history is not replayed. A restart needs a new startup pass that finds pending first turns and queues their baselines. The decider cannot cheaply tell whether a baseline is needed (Git, turn numbers), so it marks every turn start, and each one waits for the worker. That adds latency to every turn, which breaks R4 unless the marking is made more complex. The worker is serial, so one thread's hung Git delays every other thread's first turn up to the bound. When the bound expires, the worker still captures later, from a checkout that may hold edits, which breaks R2 unless it also checks the row's claim state. Three new mechanisms. |
+| **B. Delivery captures ref 0 itself, before the first claim (recommended).** A per-thread baseline stage in the delivery loop captures ref 0 outside the delivery slots. The row is selected for a slot only after that stage has ended. The worker's two baseline arms are deleted, so delivery is the only writer. A late write can only publish the pre-turn snapshot. | R1, R5 and R6 follow from where the stage sits: every pending row passes it before its first claim. R2 comes from the snapshot-before-claim rule. A worktree bootstrap runs first, so the worktree case is fixed. Git (2–6 processes) runs only for a thread with no numbered turn. It runs per thread, and it neither queues behind other threads on the serial worker nor holds a delivery slot. Costs: one more in-memory stage in the delivery loop. The tests that sync with the worker through a new thread's ref 0 also need another sync point.                                                                                                                                                                                           |
+| **C. Ref 0 from the pre-turn state the provider reports.**                                                                                                                                                                                                                                                                                                                | No provider reports the checkout before a turn. Rebuilding it by reversing the reported file changes misses edits made by shell commands, formatters and setup scripts. It would also differ between Codex, Claude and OpenCode. Rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| B′. B, keeping the worker's arm as a fallback.                                                                                                                                                                                                                                                                                                                            | After a failed or timed-out delivery capture, the worker would still write ref 0 later, possibly from an edited checkout, which is today's bug. Guarding against that means the worker takes the thread reservation and checks the row is unclaimed. That blocks the serial worker on a provider handoff. Rejected: two writers for one ref.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| B″. B, with the capture inline in the delivery slot (the first revision).                                                                                                                                                                                                                                                                                                 | Four slow captures take all four slots, and selection stops when the slots are full, so a thread that already has its baseline waits up to the bound (review round 1). Rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ## Recommendation: B
 
@@ -120,12 +120,15 @@ captured.
    - A finished stage puts its command id into `baselined`, except when it was `Cancelled`.
      It then leaves `baselining` and wakes the loop. Only then can the row take a slot.
      `baselined` is pruned to active commands, like `retry_backoffs` (`:1017`).
-   - A start that prepares a worktree (`bootstrap.prepareWorktree`) is the exception. Its
-     baseline must be taken in the new worktree, which `prepare_claim_and_deliver` creates
-     inside its slot (`:1386`). That row skips the stage, and the same function runs inline
-     after the bootstrap and before the claim (`:1401-1406`). That slot is already busy with
-     the bootstrap's own Git (`fetch`, `worktree add`), and a fresh worktree captures
-     quickly.
+   - A start with a `bootstrap` (it may prepare a worktree) needs its baseline taken after
+     the bootstrap, in the checkout the bootstrap set up. `prepare_claim_and_deliver` runs
+     the bootstrap in its slot as today (`:1386`). When the row still needs its baseline,
+     the task then returns `DeliveryTaskOutcome::Bootstrapped` without claiming, which
+     releases the slot. The loop records the command id in `bootstrapped`. The row then
+     goes through the baseline stage like any other first turn. When it takes a slot again,
+     `prepare_claim_and_deliver` skips the bootstrap it already ran. After a restart,
+     `bootstrapped` starts empty, and the bootstrap runs again, as it already does for a
+     retry.
    - The stage runs only before a row's first claim (`attempts == 0`). A steer joins a turn
      that already has its baseline. A row with `attempts > 0` may already have edited the
      checkout, so it never captures (R2 across retries and restarts).
@@ -152,8 +155,8 @@ captured.
 6. **The fence (R2).** Awaiting the stage is not enough on its own. After a stalled spawn,
    the runner returns `Timeout` while a detached task still waits for the child, and only
    afterwards terminates it (`process/supervised.rs:151-169`). So a Git process may start,
-   and run briefly, after the stage has returned and the turn has been claimed. Two layers
-   make that harmless.
+   and run briefly, after the stage has returned and the turn has been claimed. That is
+   harmless.
    - **Snapshot before claim.** The only command that writes a ref is `update-ref`, and its
      arguments are fixed when it is spawned. The commit it names was built by
      `read-tree`/`add -A`/`write-tree`/`commit-tree` runs that all finished, and were
@@ -161,21 +164,13 @@ captured.
      `add`, `write-tree` or `commit-tree` writes only the temporary index or unreachable
      objects. A late `update-ref` can therefore only publish a snapshot of the checkout
      before the turn.
-   - **A tombstone refuses late writes.** When the stage ends `TimedOut` or `Failed` after
-     it has learned the common directory (the capture's first step), delivery creates
-     `<common-dir>/<ref 0>.lock` with an exclusive create before the claim. That is the
-     lock file Git's `update-ref` creates for that ref, and `lock_ref` already uses it in
-     tests. Any later `update-ref` of ref 0 then fails with "File exists", so nothing writes
-     ref 0 once the turn has started. If the create finds the lock already there, a writer
-     is in the middle of a write (or was killed and left its lock behind). That write is a
-     pre-claim snapshot, and the leftover lock serves as the tombstone. The file is never
-     removed. No code writes ref 0 for that thread again, because the stage only runs at
-     `attempts == 0` before turn 1 is numbered, and refs are not cleaned up today when a
-     thread is deleted. In a repository that uses the reftable backend (a `reftable/`
-     directory in the common directory), there are no per-ref lock files. There the
-     snapshot rule alone holds R2.
-   - Before the common directory is known, only `rev-parse --git-common-dir` can be running,
-     and it writes nothing.
+   - **No tombstone.** Round 2 proposed a permanent `<ref 0>.lock` file to refuse late
+     writes. It was dropped: a leftover ref lock blocks `pack-refs --all` pruning,
+     `reflog expire --all` and automatic gc in the person's repository. The snapshot rule
+     needs no file, and it works the same in a reftable repository.
+   - A late ref 0 lands after turn 1 may already have been captured. That turn then stays
+     `ready` with `diffAvailable: false`, as it was recorded. A diff is never computed from
+     a ref that could hold the turn's own edits.
 7. **Error (R3).** `Failed(reason)` and `TimedOut` are reported once.
    - `tracing::warn!(thread_id, elapsed_ms, error, "a first turn's checkpoint baseline was
      not captured; the turn goes on without one")`.
@@ -191,7 +186,7 @@ captured.
 
 8. **Cancellation (R6).** When `stop_claiming` fires (shutdown), the stage returns
    `Cancelled`. Its Git children are stopped through the token, which waits for them to
-   exit through the runner's cancellation branch. No tombstone or activity is written, the
+   exit through the runner's cancellation branch. No activity is written, the
    row stays `pending` with `attempts = 0`, and the next start runs the stage again.
    Delivery shutdown closes and drains `baselines` along with its delivery tasks. A thread
    deleted during the stage has its row settled by the existing deletion paths.
@@ -214,7 +209,7 @@ captured.
   is a background task, not a handler.
 - Child processes: the capture uses the existing `run_git` and `ProcessRunner` path
   (supervised, cancellable), which is unchanged. A late child after a stalled spawn is still
-  reaped by the runner's own detached cleanup, and the tombstone (step 6) makes it
+  reaped by the runner's own detached cleanup, and the snapshot rule (step 6) makes it
   harmless.
 - Trace: `tracing::warn!` on failure or timeout (step 7), and `tracing::debug!(thread_id,
   elapsed_ms)` when a capture succeeds, so slow first-turn baselines show up in the native
@@ -270,6 +265,9 @@ They gain a thread parameter. `GatedRewind` also gains:
    `workspace_entered` have fired: the baseline permits are full, and `n5` waits for one.
    Enqueue a turn for `t`. Assert that it is received within 3 s and that no `n*` turn was
    received. Release the holds. Assert that every `n*` is received after its ref 0 resolves.
+   A second case uses four first turns that each carry a `bootstrap`, and runs their
+   bootstraps in their slots. Each releases its slot before its capture, the four captures
+   hang, and `t` is still received within 3 s.
 5. `a_first_turn_baseline_that_fails_is_reported_and_the_turn_still_goes` (R3). Lock ref
    `n/0` (`lock_ref`) so `update-ref` fails. Enqueue `n-first`. Assert that it is received,
    that there is exactly one `checkpoint.capture.failed` activity with `turnCount: 0`, and
@@ -277,8 +275,7 @@ They gain a thread parameter. `GatedRewind` also gains:
    `diffAvailable: false`.
 6. `a_hung_workspace_lookup_is_given_up_at_the_limit` (R3). Use a 200 ms limit and hold
    `n`'s lookup. Assert that the turn is received within the limit plus the usual slack,
-   that the activity says the capture timed out, and that no tombstone exists, since no Git
-   ran. Release the hold and sync with the worker. Assert that ref `n/0` never resolves.
+   and that the activity says the capture timed out. Release the hold and sync with the worker. Assert that ref `n/0` never resolves.
 7. `a_hung_checkout_probe_is_given_up_at_the_limit` (R3, for `in_git_checkout`). Use a 200 ms
    limit and set `checkout_probe_gate`. Assert the same as in test 6, then release the gate.
 8. `a_live_ref_zero_writer_is_stopped_before_the_claim` (live-child cancellation). Install a
@@ -288,22 +285,20 @@ They gain a thread parameter. `GatedRewind` also gains:
    - Assert that the turn is received only after the limit, with one timed-out activity.
    - Write the marker, wait twice the cleanup wait, and assert that ref `n/0` does not
      resolve: the child and its hook were stopped before the claim.
-   - Assert that `<ref n/0>.lock` exists, as a tombstone or as the killed writer's lock.
-9. `a_late_ref_zero_writer_after_the_claim_is_refused` (stalled spawn). A stalled
-   `CreateProcess` cannot be reproduced in a test, so this test reproduces its consequence:
-   a writer that runs after the claim. Time out `n`'s stage after Git has started. Hold the
-   `reference-transaction` hook as in test 8, then remove the leftover lock and create the
-   tombstone through the production function under test.
-   - After the turn is received, run `git update-ref <ref n/0> HEAD` in the test, as a late
-     child would.
-   - Assert that it fails on the lock, that ref `n/0` does not resolve, and that turn 1 ends
-     `ready` with `diffAvailable: false`.
-   - A unit test of the tombstone function covers the outcomes "created" and "already
-     there".
+9. `a_late_ref_zero_write_after_the_claim_publishes_the_pre_turn_checkout` (stalled spawn).
+   A stalled `CreateProcess` cannot be reproduced in a test, so this test reproduces its
+   consequence: an `update-ref` that runs after the claim.
+   - Hold `n`'s capture in the `reference-transaction` hook as in test 8, and record the
+     commit the hook was asked to publish.
+   - The stage times out, and the turn is received and edits `tracked.txt`.
+   - Run `git update-ref <ref n/0> <recorded commit>` in the test, as the late child would.
+   - Assert that ref `n/0`'s `tracked.txt` is the pre-turn `two\n`, not the edit. Assert
+     that turn 1, once ended, is `ready` with `diffAvailable: false`, as recorded when it
+     was captured.
 10. `a_shutdown_during_a_first_turn_baseline_leaves_the_turn_unclaimed` (R6). Hold `n`'s
     lookup, enqueue `n-first`, and wait for `workspace_entered`. Shut down the service and
     assert that it returns promptly. Assert that the row is `pending` with `attempts == 0`,
-    that there is no activity, no tombstone and no ref `n/0`. Start a new service without
+    that there is no activity and no ref `n/0`. Start a new service without
     the hold, and assert that ref `n/0` resolves before the turn is received.
 11. `a_redelivered_first_turn_never_captures_a_baseline` (R2 across retries). Set row
     `n-first` to `attempts = 1` (SQL through `database().call`, as `fail_stale_records`
@@ -329,7 +324,9 @@ They gain a thread parameter. `GatedRewind` also gains:
       - `start_turn` now calls the public `OrchestrationEffects::capture_first_turn_baseline`
         between `dispatch` and `handle_orchestration`, the order delivery uses.
       - `a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is` keeps its ref-0
-        lock and its assertions. Its ref-0 failure is now reported by that call.
+        lock. Its ref-0 failure is now reported by that call. It is updated to PR #247's
+        rule: turn 1 is `ready` with `diffAvailable: false`, and a revert to it succeeds.
+        It is renamed `a_turn_without_a_baseline_is_ready_without_a_diff_and_revertible`.
       - `a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_captured`
         holds the worker on the turn's capture instead of its start. Its assertions stay:
         numbered while the worker is behind, `ready` after the release.
@@ -361,8 +358,8 @@ Validation:
   checkpoint is "written by the orchestration effects worker") gains "except ref 0". Step
   1 becomes: turn delivery captures ref 0 in a baseline stage before a thread's first turn
   is first claimed. The stage runs outside the delivery slots, is bounded by the hold
-  limit, is reported as `checkpoint.capture.failed` if it fails, and is fenced by the ref-0
-  tombstone. Step 4 covers restarts.
+  limit, and is reported as `checkpoint.capture.failed` if it fails. A late write can only
+  publish the pre-turn snapshot. Step 4 covers restarts.
 - `docs/testing/`: no commands or targets change. Review it, and expect it to stay accurate.
 
 ### Residual risks
@@ -373,9 +370,9 @@ Validation:
 - A first turn now waits for a few Git processes before it starts, typically tens to
   hundreds of milliseconds, plus one delivery-loop wake. Before, that time was spent on the
   worker. Later turns pay nothing.
-- A tombstone is an empty file left in the common directory, one per thread whose first
-  baseline failed or timed out. In a reftable repository there is no tombstone, and R2
-  rests on the snapshot-before-claim rule (step 6).
+- After a stalled spawn, ref 0 can appear after its failure was reported. It holds the
+  pre-turn checkout (step 6), but turn 1 keeps the `diffAvailable: false` it was captured
+  with.
 - A setup script that the bootstrap started may still be writing files during the capture.
   Ignored output is not captured. Tracked or untracked non-ignored output may land in ref 0
   or in turn 1, as before.
