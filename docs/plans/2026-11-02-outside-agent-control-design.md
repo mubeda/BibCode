@@ -6,6 +6,14 @@ amends one answer of the approved
 [Decision 2](#decision-2-a-stable-identity-across-runs)). Verified at `fd98b433068b`
 (`main`, the merge of #241). Line references are to that commit.
 
+**Revision 1 (2026-11-02)** answers the first Codex review. See
+[Review findings and resolutions](#review-findings-and-resolutions). It changes two things:
+
+- The bearer token is published in the same row update as the URL.
+- **Named clients are split out of this batch.** Their decision stands, but building them
+  touches auth, recorded outcomes, Stop and the UI's id joins. That is out of proportion
+  next to the urgent P0, so they get their own issue, a re-review and a later release.
+
 The stale-doc fix and the `input.*` webhook events change no decision, so they form the
 first slice and may land before this note is approved. Every other slice waits for
 approval.
@@ -34,14 +42,19 @@ secret in client state.
 
 ### Decision 2: a stable identity across runs
 
-**Recommended: a named client.** `bibcode mcp --client <name>` attaches each run's
-credential to a durable, non-secret identity row. Retries, panel ownership, the actor's
-`clientId` and webhook pairing key on that identity. Each run still mints its own
-credential and revokes it on exit, and the orphan sweep still runs. No token is stored.
+**Recommended: a named client, built in a later release.** `bibcode mcp --client <name>`
+attaches each run's credential to a durable, non-secret identity row. Retries, recorded
+outcomes, panel ownership and webhook pairing key on that identity. Each run still mints
+its own credential and revokes it on exit, and the orphan sweep still runs. No token is
+stored.
+
+**Until then**, an agent that restarts can leave its endpoint unpaired. An unpaired
+endpoint is never turned off for its client (`docs/reference/webhooks.md:62-64`). It loses
+only retries and panel ownership across runs, which is today's documented behavior.
 
 | Option                                                               | For                                                                       | Against                                                                                                                                                                                                                                                                                                                                                                               |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **A named client row, opt-in with `--client`** (chosen)              | Durable identity with no bearer at rest. A person's Revoke still ends it. | One table and two columns.                                                                                                                                                                                                                                                                                                                                                            |
+| **A named client row, opt-in with `--client`** (chosen)              | Durable identity with no bearer at rest. A person's Revoke still ends it. | One table and two columns, plus a scope helper on every keyed path, an actor field for Stop, and fenced session issuance (review findings 2 to 4). It is split to a later release.                                                                                                                                                                                                    |
 | The label-keyed scope the issue proposes (`MCP · <name>` as the key) | No new table.                                                             | It collides: an unnamed relay is already labelled `MCP · <clientInfo.name>` (`relay.rs:541-554`), so `--client "Claude Code"` would share retries and panels with every unnamed Claude Code relay. A label cannot tell a relay that exited from a person's **Revoke**, so a paired endpoint must either survive both or die with both. It still needs a column to fix either problem. |
 | A long-lived credential a person issues                              | One step, and works without the relay.                                    | It puts a live bearer at rest in the agent's config, which 2026-10-24 rejected (`:634-637`, and R2 at `:217-221`). It adds nothing locally: the relay already authenticates with data-root authority. Remote agents already keep one session for a grant's life, because a refresh reuses the session (`auth/service.rs:2162`).                                                       |
 | Key every relay by `clientInfo.name`, with no flag                   | No flag to learn.                                                         | It merges every instance of one product (all Claude Code sessions). This is option (a) that 2026-10-24 rejected (`:1373-1374`).                                                                                                                                                                                                                                                       |
@@ -53,14 +66,13 @@ agent.
 
 **The name comes from `--client` only.** `clientInfo.name` stays the label of unnamed runs.
 Rules: 1 to 40 characters of `a-z 0-9 . _ -`, starting with a letter or digit. A bad name
-exits 1 before any credential is minted. `bibcode-thread` is reserved.
+exits 1 before any credential is minted.
 
-**Fold `bibcode thread` into it.** The CLI becomes the reserved named client
-`bibcode-thread`, labelled `CLI · bibcode thread` as today. Then the three copies of the
-label rule (`mcp/control.rs:1255`, `mcp/activity.rs:556`, `:596`) become one
-`COALESCE(mcp_named_client_id, session_id)`. The CLI also keeps panel ownership across
-runs. This settles the "Pending approval" CLI scope of 2026-10-24 (`:1382`): approving this
-note approves it in this form.
+**`bibcode thread` keeps its label scope.** Revision 0 folded it into a reserved named
+client. That would need a migration of its retained request rows to keep the 24-hour
+retry promise (`docs/reference/mcp.md:192-195`), and it buys nothing a user asked for. The
+scope expression becomes "named client, else the CLI label, else the session"
+([P1c](#p1c-named-clients-split-to-a-later-release)).
 
 ## Open questions
 
@@ -69,10 +81,10 @@ note approves it in this form.
 | Can Bridge verify `X-BibCode-Signature` or take a URL token?              | Build P0 either way. `Authorization` is the usual receiver contract, and a URL token is unmasked. Bridge should also verify the signature, which every request keeps.                                        | **Yes**: depends on Bridge's receiver. It sets P0's urgency, not its shape.      |
 | One bearer, or custom headers? Hint?                                      | One bearer. `bearerTokenSet` only, with no hint ([Decision 1](#decision-1-the-webhook-auth-header)).                                                                                                         | Only if Bridge needs a non-`Authorization` header, or the maintainer wants a last-4 hint. |
 | `approvals` or a new `questions` category?                                | A new `questions` category, labelled **Questions**. A question is not an approval, and the feed names them apart (`input.*`).                                                                                | No                                                                               |
-| Label scope or person-issued credential? `--client` or `clientInfo.name`? | A named client row, from `--client` only ([Decision 2](#decision-2-a-stable-identity-across-runs)).                                                                                                          | Approval of this note                                                            |
+| Label scope or person-issued credential? `--client` or `clientInfo.name`? | A named client row, from `--client` only ([Decision 2](#decision-2-a-stable-identity-across-runs)), built in a later release.                                                                                | Approval of this note, and of the split                                          |
 | Was leaving `projectId` out a privacy choice?                             | No reason is recorded. The X8 payload list never had it (`2026-10-30-mcp-remaining-slices-design.md`, Payload), and `events.rs:57` states only the fact. A project id is as opaque as `threadId`, so add it. | No                                                                               |
 | Tags, or is `purpose` enough?                                             | `purpose` is enough. Add no tags until a concrete case needs one, such as a list filter by tag.                                                                                                              | **Yes**: ask Bridge for its case.                                                |
-| Is the CLI's shared retry scope approved?                                 | It is replaced by the reserved named client. Approving this note approves that.                                                                                                                              | **Yes** (approval of this note)                                                  |
+| Is the CLI's shared retry scope approved?                                 | Treat it as approved: it shipped, its test exists (`threads.rs:278`), and this note keeps it unchanged. Approving this note records that.                                                                    | **Yes** (approval of this note)                                                  |
 
 ## Requirements
 
@@ -84,7 +96,7 @@ test names are proposals. Contract and Rust shapes change together, and
 
 - **Change.** Rewrite `docs/reference/mcp.md:200-202`: `bibcode thread` runs share one
   `clientRequestId` scope (as `:192-195` says). Only `send_panel_message`'s "thread you
-  opened or last drove" rule does not carry over between runs. Slice 3 changes this again.
+  opened or last drove" rule does not carry over between runs.
 - **Tests.** None new. `reference_docs.rs` keeps passing.
 
 ### P1b: `input.requested` and `input.resolved` events (slice 1)
@@ -119,31 +131,50 @@ test names are proposals. Contract and Rust shapes change together, and
   word Bearer." Other refusals say "The token must be 1 to 1,024 visible ASCII characters
   with no spaces." No message ever contains the value. A string field cannot be echoed by
   serde's type errors.
-- **Storage.** The token goes in `SecretStore` as `webhook-bearer-<endpoint id>`, next to
-  `webhook-<id>`. A new column `webhook_endpoints.has_bearer_token INTEGER NOT NULL DEFAULT
-  0` (the next migration number at merge) is the only thing the list and the sender read
-  to learn that a token exists.
-  - Setting: write the file, then set the flag.
-  - Clearing: clear the flag, then remove the file.
-  - A crash between the two steps leaves at worst a stray file with the flag off, which
-    sends nothing.
-  - Create: signing secret, then token, then row. If the insert fails, remove both, as
-    `rpc.rs:315-316` does today.
-  - Delete removes both files.
-  - A failed token write answers `storage`. The other edits are already saved, and the
-    message says "Its token was not changed. Try again."
-- **Edits.** Setting, replacing or clearing the token is not a new revision. The
-  destination and filters are unchanged, so the queue is kept and the next attempt reads
-  the new token. A request already in flight finishes with the token it read.
+- **Storage: the row names the token file.** Each token value gets a new file in
+  `SecretStore`, `webhook-bearer-<endpoint id>-<32 hex>` (84 bytes, within the 128-byte
+  name limit). A new nullable column `webhook_endpoints.bearer_secret` (the next migration
+  number at merge) names the current file. That column is the only thing the list and the
+  sender read. Because the URL and the token reference sit in one row, one commit
+  publishes both, and no state pairs a destination with another destination's token.
+  - **Set or replace:** write the new file, then commit the row. The commit stores the new
+    name, together with any URL, filter or enabled change, in one transaction, and
+    returns the name it replaced. Only after that commit is the replaced file removed.
+  - **Clear:** commit `bearer_secret = NULL`, then remove the replaced file.
+  - **A failed commit** removes the new file and answers `storage`. Nothing changed: the
+    old URL and old token stay paired.
+  - **A crash** between the file write and the commit leaves an unreferenced file. The
+    dispatcher's start removes every `webhook-bearer-*` file that no row names
+    (`SecretStore::prune_records_with_prefix`, `secret_store.rs:302`).
+  - **Create:** signing secret, token file, then row. If the insert fails, remove both, as
+    `rpc.rs:315-316` does today. Delete removes the signing secret and the named file.
+  - **One edit at a time per endpoint.** Every upsert and delete of an endpoint holds a
+    per-endpoint edit mutex from the file write through the removal of the replaced file.
+    `update_endpoint` writes `bearer_secret` only when the upsert carries `bearerToken`,
+    so a rename can never write back a reference it read earlier. One server process owns
+    the store, so an in-process mutex is enough.
+  - **A replaced file is removed under the endpoint's send lock,** waited for and not
+    cancelled. Senders read the row and then the file while holding that lock
+    (`mod.rs:496-509`, `rpc.rs:462-464`), so no sender reads a reference whose file is
+    then removed.
+- **A URL change must restate the token.** If an endpoint has a token and an upsert changes
+  its URL without `bearerToken`, the upsert is refused (`invalid`): "Enter the token for
+  the new URL, or remove it." Keeping the token would send receiver A's credential to
+  receiver B. The form asks for this as soon as the URL is edited.
+- **Edits.** A token change without a URL change is not a new revision. The destination
+  and filters are unchanged, so the queue is kept and the next attempt reads the new
+  token. A URL change is already a new revision (`rpc.rs:267-270`), which runs under
+  `under_send_lock`: it cancels the request in flight and abandons the old queue.
 - **Sending.** `delivery::Headers` gains `authorization: Option<&str>`, filled in
-  `send_signed` (`mod.rs:436-466`). That function is the one path for queued deliveries,
-  retries, redeliveries and test events, so all four carry the header. The header value is
-  built with `HeaderValue::from_str` and `set_sensitive(true)`. If the flag is set but the
-  file is missing or unreadable, the delivery fails as a new `Failure::TokenMissing`
-  (`token_missing`). It is not retried and is never sent without the token, as with
-  `secret_missing`. The HMAC is unchanged and does not cover `Authorization`.
+  `send_signed` (`mod.rs:436-466`) from the `bearer_secret` of the row the sender read.
+  That function is the one path for queued deliveries, retries, redeliveries and test
+  events, so all four carry the header. The header value is built with
+  `HeaderValue::from_str` and `set_sensitive(true)`. If the row names a file that cannot
+  be read, the delivery fails as a new `Failure::TokenMissing` (`token_missing`). It is
+  not retried and is never sent without the token, as with `secret_missing`. The HMAC is
+  unchanged and does not cover `Authorization`.
 - **Output.** `endpoint_view` and the `WebhookEndpoint` contract gain
-  `bearerTokenSet: boolean`. `WebhookDelivery.lastError` documents `token_missing`.
+  `bearerTokenSet: boolean` (`bearer_secret IS NOT NULL`). `WebhookDelivery.lastError` documents `token_missing`.
 - **Fixtures.** Webhooks have only typed-failure and manifest fixtures today
   (`fixtures/rpc-wire/typed-failures/webhooks__*.json`), so a new field regenerates
   nothing. Add three `contract-shapes/webhooks__upsert-*-request.json` fixtures (token
@@ -156,7 +187,9 @@ test names are proposals. Contract and Rust shapes change together, and
 - **UI** (`WebhooksTab.tsx`). Add a **Bearer token** field (`type="password"`,
   `autoComplete="off"`).
   - Editing: the field is empty, with "A token is set" and **Replace** and **Remove**.
-    Leaving it untouched omits `bearerToken`. **Remove** sends `null`.
+    Leaving it untouched omits `bearerToken`. **Remove** sends `null`. Editing the URL of
+    an endpoint with a token opens the field and says "Enter the token for the new URL, or
+    remove it." Save stays disabled, with that reason, until one is chosen.
   - After save, the field state is cleared and the value is never put in an atom or the
     query cache.
   - The form says the token is sent as `Authorization: Bearer` and never shown again.
@@ -165,6 +198,17 @@ test names are proposals. Contract and Rust shapes change together, and
     `a_bearer_token_is_never_listed_or_logged` (captures `tracing` output and checks
     `list` and `listDeliveries`), and `an_upsert_without_the_token_keeps_it_and_null_clears_it`.
   - New: `a_set_token_that_is_missing_fails_the_delivery_unsent`.
+  - New: `a_failed_commit_of_a_url_and_token_change_keeps_the_old_url_with_the_old_token`.
+    It injects a store failure into the row commit, then checks that receiver A gets only
+    token A and receiver B gets nothing.
+  - New: `a_url_change_without_the_token_is_refused_while_one_is_set`.
+  - New: `a_token_file_left_by_a_crash_before_the_commit_is_removed_at_start_and_never_sent`.
+    It writes the file, skips the commit and restarts the dispatcher.
+  - New: `concurrent_clear_and_replace_leave_a_readable_token_or_none`. Pause hooks hold one
+    upsert after its file write while the other commits, in both orders. The row then
+    names a readable file or none, and no delivery fails as `token_missing`.
+  - New: `a_replaced_token_file_is_not_removed_under_a_sender_that_read_it`. A pause hook
+    holds a sender after its row read.
   - `rpc.rs` unit test: control characters, a space, over 1,024 bytes and a `Bearer `
     prefix are refused, and the message holds no part of the value.
   - The existing signature and `send_test_redeliver_rotate_and_delete` tests pass.
@@ -180,66 +224,94 @@ test names are proposals. Contract and Rust shapes change together, and
 - **Bearer receiver preset (P2).** Dropped. With one token field there is nothing for a
   preset to fill.
 
-### P1c: named clients (slice 3)
+### P1c: named clients (split to a later release)
+
+**Not in this batch.** This is the design the split-off issue starts from. It must be
+re-reviewed before any code. Revision 1 adds the parts the first review found missing
+(findings 2 to 4), and they are why it is split: each touches a separate owner (auth,
+recorded outcomes, Stop, the UI).
 
 - **Persistence** (next migration):
   - `mcp_named_clients (client_id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT
     NOT NULL, revoked_at TEXT)`, with a unique index on `name WHERE revoked_at IS NULL`.
     The id is `nc_` plus a UUID, so it never collides with a session id.
-  - `auth_sessions.mcp_named_client_id` and `auth_pairing_links.mcp_named_client_id`. The
-    exchange copies it from link to session, as it copies `mcp_access`.
+  - `auth_sessions.mcp_named_client_id` and `auth_pairing_links.mcp_named_client_id`.
   - Revoked rows are kept (shortcut: never pruned; a person's revokes bound their number).
 - **Relay.** `McpArgs` gains `--client <name>`. `mint` (`relay.rs:739-753`) runs
   `INSERT ... ON CONFLICT DO NOTHING` and then `SELECT` for the live row of that name, in
-  one transaction under the existing store guard, so two relays starting at once get the
-  same row. The label is `MCP · <name>`. EOF, signals and the orphan sweep revoke the
-  session only, never the named client. A store without the table (a server older than
-  the relay) exits 1 with "Update the BiBCode server to use --client".
-- **Scope key.** `COALESCE(mcp_named_client_id, session_id)` replaces the three label
-  `CASE` expressions. The CLI uses the reserved `bibcode-thread` named client. Shortcut: at
-  upgrade, CLI retry rows from the previous 24 hours (`REQUEST_ROW_TTL_SECONDS`) stop
-  matching. Upgrades restart the server anyway.
-- **Actor.** `principal_actor` (`activity.rs:69-80`) uses the named id as `clientId`. The
-  feed's `agent.call` actor (`feed.rs:396`) joins `auth_sessions` to do the same, and the
-  activity row keeps its session id. `send_panel_message`'s ownership check
-  (`panels.rs:410-415`) and its last-sender check compare against the caller's actor
-  `clientId`, not `principal.session_id`. Webhook `actor.clientId` follows from that.
-- **Pairing.** `pairedClientId` takes a session id. When that session has a named client,
-  the endpoint stores the named id (the column keeps its name and gets a comment).
-  `is_live_agent_session` (`store.rs:363`) and `orphaned_pairings` (`:344-359`) accept a
-  live named client. `endpoint_view` adds `pairedClientName` so the picker can label an
-  idle named client.
-- **Revoke.** A person's **Revoke** and **Revoke others** (`AuthService::revoke_client`,
-  `revoke_other_clients`; HTTP `/api/auth/clients/revoke*`) also revoke the session's named
-  client and all of its live sessions. Its paired endpoints then turn off as
-  `client-revoked`. The next `--client` run with that name creates a new identity, which a
-  person pairs again.
-- **Contract.** `AuthClientSession` gains `mcpNamedClient: optionalKey({ id, name })`, and
-  `WebhookEndpoint` gains `pairedClientName: NullOr(String)`.
-- **UI.** The Authorized clients row of a named client says "Keeps its identity across
-  runs." The **Revoke** confirmation says that its paired webhooks turn off and its next
-  run starts fresh. The Webhooks picker matches `mcpNamedClient.id ?? sessionId`.
-- **Tests.**
-  - `mcp_tools_tests/threads.rs`: `a_named_client_keeps_its_request_ids_across_runs`,
+  one transaction under the existing store guard. The label is `MCP · <name>`. EOF, signals
+  and the orphan sweep revoke the session only. A store without the table exits 1 with
+  "Update the BiBCode server to use --client".
+- **Fencing a run against revocation.** The link is minted (`relay.rs:739-753`), the grant
+  is consumed (`consume_grant`, `auth/service.rs:2781`), and the session is inserted
+  (`create_auth_session`, `:2751`) in separate steps. A person's revoke can land between
+  any two of them.
+  - Revoking a named client revokes its unconsumed pairing links and its live sessions in
+    the same transaction that sets `revoked_at`.
+  - The session insert for a link that carries a named id is
+    `INSERT ... SELECT ... WHERE EXISTS (SELECT 1 FROM mcp_named_clients WHERE client_id =
+    ? AND revoked_at IS NULL)`. Zero rows fails the exchange as `invalid_grant`, and the
+    relay reports `McpSignInError`.
+  - Tests: `a_named_client_revoked_before_its_link_is_consumed_gets_no_session` and
+    `a_named_client_revoked_after_consumption_but_before_the_session_insert_gets_no_session`,
+    each with a pause hook at that step.
+- **One scope, every keyed path.** One helper, `request_scope(session_id)`, returns the
+  named id, else the CLI label (unchanged), else the session. The scope must be applied
+  everywhere a `clientRequestId` is keyed:
+  - `stored_request` (`control.rs:1255`) and both `activity.rs` queries (`:556`, `:596`);
+  - the recorded outcomes in `mcp/outcome.rs`: `read_row` (`:624-640`) and
+    `insert_running`, which use `RequestKey.session_id` directly today;
+  - the in-process claim map (`outcome.rs:603-621`), so two live runs of one name share
+    one claim.
+  - `RequestKey` gains `scope` beside `session_id`. Cancellation, the live controls and
+    Stop stay keyed by the session.
+  - Tests: `a_named_agent_retrying_git_undo_commit_after_a_restart_replays_the_recorded_outcome`
+    (it must not undo a second commit), `two_live_runs_of_one_named_client_share_one_claim`,
+    `a_named_client_keeps_its_request_ids_across_runs`,
     `two_named_clients_do_not_share_request_ids`, and
     `an_unnamed_relay_with_the_same_client_info_name_does_not_join_a_named_scope`. Keep
     `only_bibcode_thread_credentials_share_their_client_request_ids`.
-  - Panels: `a_named_client_still_owns_the_panels_it_opened_after_a_restart`.
-  - `webhooks/tests.rs`: `an_endpoint_paired_with_a_named_client_survives_its_relay_exiting`
-    and `a_person_revoking_a_named_clients_row_disables_its_endpoints_and_ends_every_run`.
-    Keep `revoking_a_paired_client_disables_its_endpoints`. New:
-    `an_endpoint_paired_with_an_unnamed_relay_turns_off_when_it_exits`, the current
-    behavior, which no test covers yet.
+- **Actor: `clientId` keeps meaning the session.** Revision 0 changed `clientId` to the
+  named id. That breaks Stop: the handler gets the session (`auth/service.rs:2004`) and
+  matches `actor_json.clientId` (`activity.rs:754-766`). It also breaks the UI joins on
+  `sessionId === clientId` (`McpAgentsPanel.tsx:110`, `McpAgentIndicator.tsx:26`).
+  Instead, the actor gains an optional `namedClientId`, written by `principal_actor`
+  (`activity.rs:69-80`) and by the feed's `agent.call` row (`feed.rs:396`, through a join).
+  - `send_panel_message` ownership (`panels.rs:410-415`) and its last-sender check accept
+    the same session, or the same `namedClientId`.
+  - **Stop** on a named client's row interrupts turns whose actor `clientId` is that
+    session, or whose `namedClientId` is its named client. That covers turns started by an
+    earlier run that has exited.
+  - The UI joins are unchanged. `redacted_actor` (`events.rs`) also passes an id-shaped
+    `namedClientId`.
+  - Tests: `stop_on_a_named_clients_row_interrupts_turns_of_its_earlier_run_after_the_relay_exited`,
+    `stop_on_an_unnamed_session_is_unchanged`, and
+    `a_named_client_still_owns_the_panels_it_opened_after_a_restart`.
+- **Pairing.** `pairedClientId` takes a session id. When that session has a named client,
+  the endpoint stores the named id. `is_live_agent_session` (`store.rs:363`) and
+  `orphaned_pairings` (`:344-359`) accept a live named client. `endpoint_view` adds
+  `pairedClientName`.
+- **Revoke.** A person's **Revoke** and **Revoke others** (`AuthService::revoke_client`,
+  `revoke_other_clients`) also revoke the named client, as above. Its paired endpoints
+  turn off as `client-revoked`. The next `--client` run with that name creates a new
+  identity.
+- **Contract and UI.** `AuthClientSession` gains `mcpNamedClient: optionalKey({ id, name })`.
+  `WebhookEndpoint` gains `pairedClientName`, and the actor gains `namedClientId`. The
+  Authorized clients row says "Keeps its identity across runs", and **Revoke** says that
+  its paired webhooks turn off and its next run starts fresh.
+- **Other tests.**
+  - `webhooks/tests.rs`: `an_endpoint_paired_with_a_named_client_survives_its_relay_exiting`,
+    `a_person_revoking_a_named_clients_row_disables_its_endpoints_and_ends_every_run`, and
+    `an_endpoint_paired_with_an_unnamed_relay_turns_off_when_it_exits`. Keep
+    `revoking_a_paired_client_disables_its_endpoints`.
   - `relay/tests.rs`: `the_relay_labels_a_named_client_and_still_revokes_on_eof` and
     `a_bad_client_name_exits_before_any_credential`.
-  - A migration test for the new columns.
-- **Docs.**
-  - `docs/reference/mcp.md`: `:98-113`, `:172-202`, the credential (`:554-571`), retries
-    (`:763-764`), actors (`:936-941`, `:1137`) and `send_panel_message` (`:1953`, `:1982`).
-  - `docs/reference/webhooks.md:62-64`, `docs/user/mcp.md`, and the `bibcode-mcp` skill.
-  - `docs/architecture/overview.md`, if it names the per-run identity.
+  - A migration test.
+- **Docs.** `docs/reference/mcp.md` (`:98-113`, `:172-202`, `:554-571`, `:763-764`,
+  `:936-941`, `:1137`, `:1953`, `:1982`), `docs/reference/webhooks.md:62-64`,
+  `docs/user/mcp.md` and the `bibcode-mcp` skill.
 
-### P1d: more `bibcode thread` subcommands (slice 4)
+### P1d: more `bibcode thread` subcommands (slice 3)
 
 | Command                                                                | Tool                                               | Flags                                                                                |
 | ---------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
@@ -260,11 +332,11 @@ test names are proposals. Contract and Rust shapes change together, and
 - **Docs.** The table at `docs/reference/mcp.md:172-202`, the `bibcode-mcp` skill, and
   step 7 of `docs/testing/cross-platform-validation.md` (review it).
 
-### P2a: `bibcode mcp call` and `bibcode mcp tools` (slice 7)
+### P2a: `bibcode mcp call` and `bibcode mcp tools` (slice 6)
 
 - **Change.** Add them as subcommands of `bibcode mcp`, beside `authorize`
   (`config.rs:723-729`), rather than as top-level `call` and `tools`. That keeps the top
-  level small and gives them `--access` and `--client`.
+  level small and gives them `--access`, and `--client` once named clients ship.
   - `call <tool> [<arguments-json>|-]` prints the tool result.
   - `tools` prints the tool list the credential sees.
   - Exit codes: 0 success; 1 a tool error, unknown tool or transport failure; 2 a result
@@ -273,7 +345,7 @@ test names are proposals. Contract and Rust shapes change together, and
   an unknown tool.
 - **Docs.** `docs/reference/mcp.md` (transports) and the skill.
 
-### P2b: remote OAuth with a hosted client (slice 8)
+### P2b: remote OAuth with a hosted client (slice 7)
 
 - **Change.** No server change is expected: `registrable_redirect_uri` already accepts
   `https` (`auth/oauth.rs:252-272`). Add **Copy URL** to the Remote agents row
@@ -284,7 +356,7 @@ test names are proposals. Contract and Rust shapes change together, and
   Copy URL case.
 - **Docs.** `docs/reference/mcp.md:210-216`.
 
-### P2c: requester in lists, purpose in the feed (slice 6)
+### P2c: requester in lists, purpose in the feed (slice 5)
 
 - **Change.**
   - Move `summary["requester"] = ...` from `panels.rs:254` into `thread_summary`
@@ -297,7 +369,7 @@ test names are proposals. Contract and Rust shapes change together, and
   `production/mcp_tools_tests/`, plus a webhook payload check that `purpose` is absent.
 - **Docs.** `docs/reference/mcp.md:1129-1138` and `:1267`.
 
-### P2d: `projectId` in payloads, and a status-kind filter (slice 5)
+### P2d: `projectId` in payloads, and a status-kind filter (slice 4)
 
 - **Change.**
   - `Event::body` (`events.rs:66-79`) writes `projectId` when the route names one.
@@ -316,24 +388,18 @@ test names are proposals. Contract and Rust shapes change together, and
   `HeaderValue::from_str` cannot fail at send time. If it does, the delivery fails as
   `token_missing`, never unauthenticated.
 - **Keep and clear.** Absent keeps the token, `null` clears it and a string replaces it.
-  The set and clear steps are ordered so that a crash never sends a stale token: at worst
-  it sends none.
+  A URL change must restate it.
+- **Crossing receivers.** The URL and the token reference change in one row commit. A
+  failed commit, or a crash before it, leaves the old URL with the old token. A crash
+  after it leaves only an unreferenced file, which is removed at start.
+- **Concurrent edits.** A per-endpoint edit mutex orders upserts. A replaced file is
+  removed only after its replacement is committed, and under the send lock, so the row
+  always names a readable file or none.
 - **Retries.** A `401` or `403` from a wrong token is a non-retryable `4xx`, as today, and
   counts toward the ten-failure disable.
-- **Named-client races.** Concurrent first runs of one name meet on the unique index. Two
-  live runs share retries and panels, the trade-off the CLI scope already accepted for one
-  operator (2026-10-24 `:1378-1382`).
-- **Revoke and exit.**
-  - A person's revoke ends the identity and every one of its runs, and it is durable in
-    `mcp_named_clients.revoked_at`, so a missed notice is caught on the dispatcher's next
-    pass (`reconcile_pairings`, `mod.rs:881-890`).
-  - A relay's EOF, a signal or a crash revokes only that run's session.
-  - A failed revoke on exit leaves the session live until the next sweep, as today.
-- **Server restart.** Sessions and named clients are durable, and the relay rediscovers the
-  server as before.
-- **Trust.** `--client` needs data-root authority, which already lets its holder mint any
-  credential, so a chosen name gains nothing new. Remote OAuth sessions cannot take a named
-  client: only `mint` sets the column.
+- **Named clients.** Their concurrency, revoke, Stop and restart rules are in
+  [P1c](#p1c-named-clients-split-to-a-later-release), for the later release. Nothing in
+  this batch changes credential minting, revocation or the 2026-10-24 per-launch rule.
 
 ## Profiler, crash and trace coverage
 
@@ -355,18 +421,36 @@ test names are proposals. Contract and Rust shapes change together, and
 
 1. **Slice 1** (may land before approval): P1a doc fix and P1b input events.
 2. **Slice 2**: P0 bearer token.
-3. **Slice 3**: P1c named clients, with the CLI folded in.
-4. **Slice 4**: P1d CLI subcommands. Merge it after slice 3, because both touch
-   `thread_cli.rs`.
-5. **Slice 5**: P2d `projectId` and the status-kind filter (one webhooks contract change).
-6. **Slice 6**: P2c requester and purpose.
-7. **Slice 7**: P2a `bibcode mcp call` and `tools`. Merge it after slice 3 for `--client`.
-8. **Slice 8**: P2b hosted OAuth test and **Copy URL**.
+3. **Slice 3**: P1d CLI subcommands.
+4. **Slice 4**: P2d `projectId` and the status-kind filter (one webhooks contract change).
+5. **Slice 5**: P2c requester and purpose.
+6. **Slice 6**: P2a `bibcode mcp call` and `tools`.
+7. **Slice 7**: P2b hosted OAuth test and **Copy URL**.
+8. **Later release, own issue**: P1c named clients, after a re-review of its section.
 
 Every slice runs the gates listed in the issue. No `apps/desktop/e2e` spec covers webhooks
 or MCP. Unit, flow and DOM tests cover each slice, so each PR says why no desktop spec is
-added. UI slices (1, 2, 3, 5, 8) are reviewed against `UI.md` and the Vercel React
+added. UI slices (1, 2, 4, 7) are reviewed against `UI.md` and the Vercel React
 best-practices skill.
+
+## Review findings and resolutions
+
+Codex review, round 1, of revision 0. Each finding was checked against the source at
+`fd98b433068b` before it was accepted. None was refuted.
+
+| #   | Finding                                                                                                                                    | Checked in source                                                                                                                                                                                                                 | Resolution                                                                                                                                                                                                                                                                                  |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | P1: a failed token write after the endpoint edit commits can send token A to new receiver B.                                               | Confirmed. `upsert` commits the row in `update_endpoint` (`rpc.rs:281`), separately from any secret write.                                                                                                                        | **Fixed (P0).** Each token value is its own file, and the row's `bearer_secret` names it, so the URL and the token change in one commit. A URL change must restate the token. Tests cover a failed commit and a crash before it.                                                            |
+| 2   | P1: recorded outcomes key on the session, so a named agent retrying `git_undo_commit` after a restart would undo another commit.           | Confirmed. `outcome.rs` `claim` (`:603-621`) and `read_row` (`:624-640`) use `RequestKey.session_id` directly. Only `stored_request` and the `activity.rs` reads apply the label rule.                                            | **Fixed in P1c, which is split.** One `request_scope` covers stored requests, recorded outcomes and the claim map. Cancellation stays per session. Tests are named.                                                                                                                         |
+| 3   | P1: a named `clientId` breaks Stop and the UI joins.                                                                                       | Confirmed. Stop passes the session (`auth/service.rs:2004`), running turns match `actor_json.clientId` (`activity.rs:754-766`), and the UI joins `sessionId === clientId` (`McpAgentsPanel.tsx:110`, `McpAgentIndicator.tsx:26`). | **Fixed in P1c, which is split.** `clientId` keeps meaning the session. A new optional `actor.namedClientId` carries the identity. Stop matches either, including turns of an earlier run that has exited. Tests are named.                                                                 |
+| 4   | P2: a revoke races a run between link mint, grant consumption and session insert.                                                          | Confirmed. `consume_grant` (`auth/service.rs:2781`) and `create_auth_session` (`:2751`) are separate steps.                                                                                                                       | **Fixed in P1c, which is split.** A revoke also revokes the named client's unconsumed links. The session insert is conditional on the named client being live. There is a test before and a test after consumption.                                                                         |
+| 5   | P2: a concurrent clear and replace can leave the flag set with no file, which gives `token_missing` failures and then a disabled endpoint. | Confirmed for revision 0's flag and fixed file name. A whole-row `update_endpoint` could also write back a stale value.                                                                                                           | **Fixed (P0).** There is no separate flag: the row names the file. A per-endpoint edit mutex orders edits. `update_endpoint` touches `bearer_secret` only when a token is given. A replaced file is removed after the commit, under the send lock. A controlled-interleaving test is named. |
+| 6   | P2: folding the CLI into a reserved identity breaks the 24-hour retry promise at upgrade.                                                  | Confirmed. The rows are keyed `CLI · bibcode thread` (`control.rs:1255`), and `docs/reference/mcp.md:192-195` promises 24 hours.                                                                                                  | **Removed.** The CLI keeps its label scope, so no rows move and nothing needs migrating. This is the smaller design.                                                                                                                                                                        |
+
+**Proportion.** Findings 2 to 4 show that named clients reach into auth issuance, recorded
+outcomes, Stop and two UI joins. Next to the urgent P0, that is disproportionate. They are
+split into their own issue and a later release (see the status note). Every other item
+stays in this batch.
 
 ## Corrections to the issue
 
