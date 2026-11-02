@@ -2603,12 +2603,10 @@ mod device_tools {
             .tools
             .call(&scope(), "open", json!({}), CancellationToken::new())
             .await;
-        assert_eq!(result["isError"], true);
+        assert_eq!(result["isError"], true, "{result}");
         assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Pass imageId as one of: Pixel, Tablet")
+            text(&result).contains("Pass imageId as one of: Pixel, Tablet"),
+            "{result}"
         );
     }
 

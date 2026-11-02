@@ -40,3 +40,34 @@ impl ProcessCleanupReport {
             .extend(other.failures.into_iter().take(remaining));
     }
 }
+
+/// `EPERM` on Linux and macOS, spelled out so the classification below is testable on Windows.
+const EPERM: i32 = 1;
+#[cfg(unix)]
+const _: () = assert!(EPERM == libc::EPERM);
+
+/// Whether a refused kill of an owned process group leaves nothing to stop. macOS refuses
+/// (`EPERM`) a `killpg` whose members have all exited but are not yet reaped, where Linux
+/// signals them, and a root that exited on its own and is still unreaped leaves its group just
+/// so. `EPERM` means no member could be signalled, so once the root has exited the group counts
+/// as stopped. While the root still runs, `EPERM` is a real failure.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn group_kill_refusal_is_stopped(errno: Option<i32>, root_exited: bool) -> bool {
+    root_exited && errno == Some(EPERM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EPERM, group_kill_refusal_is_stopped};
+
+    #[test]
+    fn only_eperm_after_the_root_exited_counts_as_stopped() {
+        assert!(group_kill_refusal_is_stopped(Some(EPERM), true));
+        assert!(!group_kill_refusal_is_stopped(Some(EPERM), false));
+        // ESRCH and other errors keep their own handling; no errno is not a refusal.
+        for errno in [Some(3), Some(13), None] {
+            assert!(!group_kill_refusal_is_stopped(errno, true), "{errno:?}");
+            assert!(!group_kill_refusal_is_stopped(errno, false), "{errno:?}");
+        }
+    }
+}

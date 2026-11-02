@@ -2299,13 +2299,16 @@ async fn request(socket: &mut TestSocket, id: &str, tag: &str, payload: Value) -
 }
 
 fn assert_success(message: ServerMessage) {
-    assert!(matches!(
-        message,
-        ServerMessage::Exit {
-            exit: RpcExit::Success { .. },
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            message,
+            ServerMessage::Exit {
+                exit: RpcExit::Success { .. },
+                ..
+            }
+        ),
+        "expected a successful response, got {message:?}"
+    );
 }
 
 fn assert_error_tag(message: ServerMessage, expected_tag: &str) {

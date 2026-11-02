@@ -2401,18 +2401,22 @@ describe("seeded packaged desktop upgrade harness", () => {
       NodePath.join(NodeOS.tmpdir(), "bibcode-command-close-"),
     );
     const finishedPath = NodePath.join(root, "writer-finished");
+    const writerPidPath = NodePath.join(root, "writer-pid");
     const writerSource = `
       setTimeout(() => {
         process.stdout.write("late-tail");
         require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
       }, 125);
     `;
+    // Detached: on Windows, Node puts children in a kill-on-close job, so an
+    // attached writer dies with its parent and never writes the late tail.
     const parentSource = `
       const writer = require("node:child_process").spawn(
         process.execPath,
         ["-e", ${JSON.stringify(writerSource)}],
-        { stdio: ["ignore", "inherit", "inherit"] }
+        { detached: true, stdio: ["ignore", "inherit", "inherit"] }
       );
+      require("node:fs").writeFileSync(${JSON.stringify(writerPidPath)}, String(writer.pid));
       writer.once("spawn", () => {
         process.stdout.write("early|");
         process.exit(0);
@@ -2423,20 +2427,22 @@ describe("seeded packaged desktop upgrade harness", () => {
         command: process.execPath,
         args: ["-e", parentSource],
         cwd: root,
-        timeoutMs: 2_000,
+        // Two Node startups on a loaded host; the bound only stops a hung test.
+        timeoutMs: 20_000,
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe("early|late-tail");
       expect(NodeFS.existsSync(finishedPath)).toBe(true);
     } finally {
-      // Even the old exit-only counterexample owns its bounded writer until
-      // completion, before removing the directory that writer uses.
-      await waitForUpgradeCondition({
-        description: "synthetic writer completion",
-        intervalMs: 10,
-        timeoutMs: 2_000,
-        probe: async () => NodeFS.existsSync(finishedPath),
-      });
+      // The detached writer has no job or parent to end it, so a failed run
+      // stops it before removing the directory it writes to. A finished writer
+      // is already gone: the command waited for its stdout to close.
+      const writerPid = NodeFS.existsSync(writerPidPath)
+        ? Number(NodeFS.readFileSync(writerPidPath, "utf8"))
+        : undefined;
+      if (writerPid !== undefined && !NodeFS.existsSync(finishedPath)) {
+        await stopDetachedWriter(writerPid);
+      }
       await NodeFS.promises.rm(root, { recursive: true, force: true });
     }
   });
@@ -2662,3 +2668,32 @@ describe("waitForWindowsRelaunchedApplication", () => {
     ).rejects.toThrow("ENOENT");
   });
 });
+
+const processIsAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Ends a detached test writer and its tree, then waits up to 5 s for it to go. */
+const stopDetachedWriter = async (pid: number): Promise<void> => {
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- the real host decides how to end this real child.
+  const treeKill = ownedChildTreeKillCommand(process.platform, pid);
+  try {
+    if (treeKill === undefined) process.kill(pid, "SIGKILL");
+    else
+      NodeChildProcess.spawnSync(treeKill.command, [...treeKill.args], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+  } catch {
+    // Already gone.
+  }
+  const deadline = Date.now() + 5_000;
+  while (processIsAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
