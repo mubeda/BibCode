@@ -354,7 +354,12 @@ it was already open):
    and its next call after Stop says its access ended. Ask it for `files_download`: the URL
    names the host's loopback address, so the desktop agent cannot open it; `scp` the file
    instead, as the [MCP reference](../reference/mcp.md#over-ssh) says.
-6. Exit the agent and check that the host lists no **MCP · …** row in Authorized
+6. With **Terminals** on at Full access and the agent connected with terminals, ask it to
+   clone an `ssh://` URL on the host. A server the desktop started over SSH has an SSH agent
+   only when its own environment carries `SSH_AUTH_SOCK`: record whether it does. Without
+   one the clone is `clone_ssh_unavailable` naming `SSH_AUTH_SOCK`; with one it clones. An
+   `https://` clone of a public repository works either way.
+7. Exit the agent and check that the host lists no **MCP · …** row in Authorized
    clients and no file in `<state dir>/mcp-clients/`.
 
 ### Cleanup

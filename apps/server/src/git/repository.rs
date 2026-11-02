@@ -7550,6 +7550,10 @@ impl ReservedClone {
                     )
                     .into();
                 }
+                // An agent's SSH clone: what to do about ssh's own refusal.
+                if let Some(advice) = plan.and_then(|plan| plan.explain_failure(&error.detail)) {
+                    error.detail = format!("{}\n{advice}", error.detail).into();
+                }
                 error
             })?;
         Ok(self.destination.path().to_path_buf())

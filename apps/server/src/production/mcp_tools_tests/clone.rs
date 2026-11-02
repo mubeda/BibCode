@@ -25,7 +25,10 @@ use super::{CREATED_AT, Harness, command, error_tag, structured};
 use crate::{
     git::{
         GitRepository,
-        clone_policy::{ClonePolicy, FixtureAllowance, tests::resolver},
+        clone_policy::{
+            ClonePolicy, FixtureAllowance, SSH_TIMEOUTS, SshClient, SshTimeouts,
+            tests::{real_ssh_clients, resolver},
+        },
     },
     mcp::{
         control::{ClientPrincipal, McpAccess, McpServerSettings},
@@ -186,8 +189,25 @@ struct Fixture {
     /// The bare repository's folder, for a person's `file://` clone.
     bare: PathBuf,
     server: HttpFixture,
+    /// What the fake ssh records: its arguments, one per line, then its `SSH_AUTH_SOCK`.
+    ssh_record: PathBuf,
+    /// The fake ssh's switches: `stderr` (print it and exit 255) and `sleep`.
+    ssh_control: PathBuf,
     _root: tempfile::TempDir,
 }
+
+/// The ssh an agent's SSH clone runs in these tests.
+#[derive(Clone, Copy)]
+enum Ssh {
+    /// A script that records its arguments and serves the fixture's bare repository with a
+    /// local `git upload-pack`, so an SSH clone runs end to end without a network.
+    Fake,
+    /// The real client, with these timeouts.
+    Real(SshTimeouts),
+}
+
+/// The agent socket the fake ssh is given.
+const FAKE_AGENT: &str = "fixture-agent-socket";
 
 struct Options {
     /// Admit the fixture's `http://` and loopback addresses.
@@ -201,6 +221,8 @@ struct Options {
     parent_repo_config: Option<String>,
     /// Adds files to the source repository before its one commit.
     source: Box<dyn FnOnce(&Path)>,
+    /// The ssh an SSH clone runs.
+    ssh: Ssh,
 }
 
 impl Default for Options {
@@ -211,7 +233,43 @@ impl Default for Options {
             environment: Vec::new(),
             parent_repo_config: None,
             source: Box::new(|_| {}),
+            ssh: Ssh::Fake,
         }
+    }
+}
+
+/// `path` as a shell script names it: `/` on Windows, where Git's `sh` runs it.
+fn shell_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Writes the fake ssh: it records its arguments and `SSH_AUTH_SOCK`, then fails with the
+/// `stderr` switch's text, waits under the `sleep` switch, or serves `bare` (the requested
+/// path is ignored).
+fn write_fake_ssh(path: &Path, record: &Path, control: &Path, bare: &Path) {
+    let (record, control, bare) = (shell_path(record), shell_path(control), shell_path(bare));
+    let script = [
+        "#!/bin/sh".to_owned(),
+        format!(r#"for argument in "$@"; do printf '%s\n' "$argument"; done >> '{record}'"#),
+        format!(r#"printf 'SSH_AUTH_SOCK=%s\n' "${{SSH_AUTH_SOCK-}}" >> '{record}'"#),
+        format!("if [ -f '{control}/stderr' ]; then cat '{control}/stderr' >&2; exit 255; fi"),
+        // The sleeping child's pid, as the OS knows it. MSYS keeps the Windows pid apart and
+        // changes it when the forked child execs `sleep`, so it is read once the child runs
+        // `sleep` (bounded to 10 s).
+        format!(
+            "if [ -f '{control}/sleep' ]; then sleep 600 & child=$!; \
+             if [ -r /proc/$child/winpid ]; then i=0; while [ $i -lt 100 ]; do \
+             case \"$(cat /proc/$child/exename 2>/dev/null)\" in *sleep|*sleep.exe) break;; esac; \
+             sleep 0.1; i=$((i+1)); done; cat /proc/$child/winpid > '{control}/pid'; \
+             else echo $child > '{control}/pid'; fi; wait $child; exit 1; fi"
+        ),
+        format!("exec git upload-pack '{bare}'"),
+    ];
+    std::fs::write(path, script.join("\n") + "\n").expect("fake ssh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("mode");
     }
 }
 
@@ -263,7 +321,7 @@ async fn fixture(options: Options) -> Fixture {
         git(&projects, &["init", "-q"]);
         let local = projects.join(".git/config");
         let mut text = std::fs::read_to_string(&local).expect("local config");
-        text.push_str(config);
+        text.push_str(&config.replace("{BARE}", &shell_path(&bare)));
         std::fs::write(&local, text).expect("local config");
     }
     let mut environment = vec![
@@ -279,6 +337,27 @@ async fn fixture(options: Options) -> Fixture {
             .iter()
             .map(|(key, value)| ((*key).into(), value.into())),
     );
+    let ssh_record = base.join("ssh-record");
+    let ssh_control = base.join("ssh-control");
+    std::fs::create_dir_all(&ssh_control).expect("ssh control");
+    let ssh = match options.ssh {
+        Ssh::Fake => {
+            let fake = base.join("fake-ssh");
+            write_fake_ssh(&fake, &ssh_record, &ssh_control, &bare);
+            SshClient {
+                program: shell_path(&fake),
+                agent: Some(FAKE_AGENT.into()),
+                home: home.clone(),
+                timeouts: SSH_TIMEOUTS,
+            }
+        }
+        Ssh::Real(timeouts) => SshClient {
+            program: "ssh".to_owned(),
+            agent: None,
+            home: home.clone(),
+            timeouts,
+        },
+    };
     let policy = ClonePolicy::admitting_fixture(
         resolver(&[
             (HOST, "127.0.0.1"),
@@ -288,6 +367,7 @@ async fn fixture(options: Options) -> Fixture {
         FixtureAllowance {
             environment,
             admit_local: options.admit_local,
+            ssh: Some(ssh),
         },
     );
 
@@ -319,7 +399,10 @@ async fn fixture(options: Options) -> Fixture {
         .expect("project");
     let vcs =
         GitVcsRpcServices::for_agent_clones(Arc::new(GitRepository::default()), store, policy);
-    let harness = Harness::with_methods(move |registry| register_git_vcs_rpc(registry, vcs)).await;
+    let harness = Harness::with_settings_and_methods(move |registry, settings| {
+        register_git_vcs_rpc(registry, vcs.with_mcp_settings(settings));
+    })
+    .await;
     harness
         .engine
         .dispatch(command(json!({
@@ -335,6 +418,8 @@ async fn fixture(options: Options) -> Fixture {
         projects,
         bare,
         server,
+        ssh_record,
+        ssh_control,
         _root: root,
     }
 }
@@ -342,6 +427,43 @@ async fn fixture(options: Options) -> Fixture {
 impl Fixture {
     fn url(&self) -> String {
         format!("http://{HOST}:{}/repo.git", self.server.port)
+    }
+
+    /// The fixture repository over SSH, on port 2222 (the fake ssh serves it on any).
+    fn ssh_url(&self) -> String {
+        format!("ssh://git@{HOST}:2222/repo.git")
+    }
+
+    /// An agent that passes the Terminals gate once Terminals is on: Full access and
+    /// `terminal:operate`, as the relay mints one.
+    async fn terminal_agent(&self) -> ClientPrincipal {
+        self.harness
+            .agent_with_scopes(
+                "MCP · ssh",
+                McpAccess::FullAccess,
+                &[crate::auth::SCOPE_TERMINAL_OPERATE],
+            )
+            .await
+            .0
+    }
+
+    fn set_terminals(&self, on: bool) {
+        self.harness
+            .settings
+            .send_modify(|settings| settings.capabilities.terminals = on);
+    }
+
+    /// What the fake ssh recorded, one argument per line; empty when it never ran.
+    fn ssh_record(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.ssh_record)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn forget_ssh_record(&self) {
+        let _ = std::fs::remove_file(&self.ssh_record);
     }
 
     async fn clone(&self, agent: &ClientPrincipal, arguments: Value) -> Value {
@@ -591,14 +713,15 @@ async fn agents_clone_over_https_from_public_hosts_only() {
     // A plain path, which Git clones from on every platform.
     let bare = fixture.bare.display().to_string();
     for (url, expected) in [
-        // Revision 4: every transport but HTTPS, SSH included.
+        // SSH needs the Terminals gate (#217), which this agent does not pass; every other
+        // transport but HTTPS is refused.
         (
             "ssh://public.example.com/owner/repo.git",
-            "clone_url_refused",
+            "clone_ssh_not_allowed",
         ),
         (
             "ssh://git@public.example.com/owner/repo.git",
-            "clone_url_refused",
+            "clone_ssh_not_allowed",
         ),
         ("git@public.example.com:owner/repo.git", "clone_url_refused"),
         (
@@ -639,12 +762,21 @@ async fn agents_clone_over_https_from_public_hosts_only() {
             .await;
         assert_eq!(error_tag(&result), "GitCommandError", "{url}: {result}");
         assert_eq!(reason(&result), expected, "{url}: {result}");
-        // A transport other than HTTPS is refused for being one, not by a later rule.
-        if !url.starts_with("https://") && !url.starts_with("--") {
-            let message = result["structuredContent"]["error"]["message"]
-                .as_str()
-                .unwrap_or_default();
-            assert!(message.contains("over HTTPS only"), "{url}: {message}");
+        // A transport other than HTTPS or SSH is refused for being one, not by a later rule;
+        // the scp-like form is told its ssh:// spelling.
+        let message = result["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        if url.starts_with("git@") {
+            assert_eq!(
+                message, "Write the SSH URL as ssh://git@public.example.com/owner/repo.git.",
+                "{url}"
+            );
+        } else if expected == "clone_url_refused"
+            && !url.starts_with("https://")
+            && !url.starts_with("--")
+        {
+            assert!(message.contains("from https:// URLs"), "{url}: {message}");
         }
     }
     let result = fixture
@@ -1262,4 +1394,429 @@ async fn an_inherited_server_environment_never_reaches_an_agent_clone() {
     assert!(isolated.contains("PATH"), "an agent clone lost PATH");
 
     child.complete();
+}
+
+/// The value after `-o` in what the fake ssh recorded.
+fn ssh_options(record: &[String]) -> Vec<&str> {
+    record
+        .windows(2)
+        .filter(|pair| pair[0] == "-o")
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+/// #217, option A1: an agent clones over SSH only when it passes the Terminals gate (Terminals
+/// on, Full access, `terminal:operate`), read live; it then runs BiBCode's own pinned ssh
+/// command, whatever `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_SSH_VARIANT` or `core.sshCommand` the
+/// server or the repository around the folder name. A person's SSH clone gets no plan.
+#[tokio::test]
+async fn an_agent_clones_over_ssh_only_through_the_terminals_gate_with_bibcodes_pinned_command() {
+    let programs = tempfile::tempdir().unwrap();
+    let marker = programs.path().join("their-ssh-ran");
+    let theirs = format!("touch '{}'; false", shell_path(&marker));
+    let fixture = fixture(Options {
+        environment: vec![
+            ("GIT_SSH_COMMAND", theirs.clone()),
+            ("GIT_SSH", shell_path(&programs.path().join("missing-ssh"))),
+            ("GIT_SSH_VARIANT", "plink".to_owned()),
+        ],
+        parent_repo_config: Some(format!("[core]\n\tsshCommand = {theirs}\n")),
+        ..Options::default()
+    })
+    .await;
+    let url = fixture.ssh_url();
+    let not_allowed = |result: &Value, instead: &str| {
+        assert_eq!(error_tag(result), "GitCommandError", "{result}");
+        assert_eq!(reason(result), "clone_ssh_not_allowed", "{result}");
+        let message = result["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains(&format!("Clone {instead} instead")),
+            "{message}"
+        );
+    };
+
+    // Terminals off, or an agent without Full access or `terminal:operate`: refused, naming
+    // the https:// form (before anything resolves: github.com is not in the test resolver).
+    let terminal_agent = fixture.terminal_agent().await;
+    let full_without_scope = fixture.harness.agent(McpAccess::FullAccess).await.0;
+    for agent in [&fixture.agent, &terminal_agent] {
+        let result = fixture
+            .clone(
+                agent,
+                json!({ "url": "ssh://git@github.com/owner/repo.git" }),
+            )
+            .await;
+        not_allowed(&result, "https://github.com/owner/repo.git");
+    }
+    fixture.set_terminals(true);
+    for agent in [&fixture.agent, &full_without_scope] {
+        let result = fixture.clone(agent, json!({ "url": url })).await;
+        not_allowed(&result, "the repository's https:// URL");
+    }
+    assert!(
+        fixture.ssh_record().is_empty(),
+        "ssh ran for a refused clone"
+    );
+
+    // Through the gate: the clone runs BiBCode's command, pinned to the checked address.
+    let result = fixture.clone(&terminal_agent, json!({ "url": url })).await;
+    let done = structured(&result);
+    assert_eq!(done["state"], "done", "{result}");
+    assert!(fixture.projects.join("repo/README.md").is_file());
+    assert!(
+        !marker.exists(),
+        "the server's or repository's ssh command ran"
+    );
+    let record = fixture.ssh_record();
+    assert_eq!(record[..3], ["-F", "none", "-o"], "{record:?}");
+    let options = ssh_options(&record);
+    for expected in [
+        "HostName=127.0.0.1",
+        &format!("HostKeyAlias=[{HOST}]:2222"),
+        "StrictHostKeyChecking=yes",
+        "BatchMode=yes",
+        "UpdateHostKeys=no",
+        "IdentityFile=none",
+        "IdentityAgent=SSH_AUTH_SOCK",
+        "ProxyCommand=none",
+        "ControlPath=none",
+        "ForwardAgent=no",
+        "ConnectTimeout=30",
+    ] {
+        assert!(options.contains(&expected), "{expected} in {record:?}");
+    }
+    // Git's own arguments: the checked port and the URL's user and host.
+    assert!(
+        record.windows(2).any(|pair| pair == ["-p", "2222"]),
+        "{record:?}"
+    );
+    assert!(record.contains(&format!("git@{HOST}")), "{record:?}");
+    assert_eq!(
+        record.last().map(String::as_str),
+        Some(format!("SSH_AUTH_SOCK={FAKE_AGENT}").as_str())
+    );
+
+    // A person turning Terminals off applies to the next clone, through the tool and the RPC.
+    fixture.set_terminals(false);
+    fixture.forget_ssh_record();
+    let result = fixture
+        .clone(
+            &terminal_agent,
+            json!({ "url": url, "directoryName": "again" }),
+        )
+        .await;
+    not_allowed(&result, "the repository's https:// URL");
+    let direct = fixture
+        .rpc(
+            "vcs.clone",
+            json!({ "url": url, "parentDir": fixture.projects, "directoryName": "direct" }),
+            fixture.agent_context(&terminal_agent),
+        )
+        .await
+        .expect_err("refused");
+    assert_eq!(direct["reason"], "clone_ssh_not_allowed", "{direct}");
+    // So does a Take over, which leaves the credential's scope in place.
+    fixture.set_terminals(true);
+    fixture
+        .harness
+        .auth
+        .set_mcp_access(&terminal_agent.principal.session_id, "read-only")
+        .await
+        .expect("take over");
+    let direct = fixture
+        .rpc(
+            "sourceControl.cloneRepository",
+            json!({ "remoteUrl": url, "destinationPath": fixture.projects.join("taken") }),
+            fixture.agent_context(&terminal_agent),
+        )
+        .await
+        .expect_err("refused");
+    assert_eq!(direct["reason"], "clone_ssh_not_allowed", "{direct}");
+    assert!(
+        fixture.ssh_record().is_empty(),
+        "ssh ran for a refused clone"
+    );
+
+    // A person's SSH clone gets no plan: Git, not the policy, answers, and the fake never runs.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let person = fixture
+        .rpc(
+            "vcs.clone",
+            json!({ "url": url, "parentDir": elsewhere.path(), "directoryName": "mine" }),
+            RpcSessionContext::unauthenticated(),
+        )
+        .await
+        .expect_err("fixture.invalid does not resolve for a person's ssh");
+    assert_eq!(person["_tag"], "GitCommandError", "{person}");
+    assert!(person.get("reason").is_none(), "{person}");
+    assert!(fixture.ssh_record().is_empty());
+    fixture.harness.shutdown().await;
+}
+
+/// #217: `git clone` reads no repository around the folder, so an agent's SSH clone takes its
+/// transport and pin from the URL as written. An SSH URL a `url.insteadOf` rule there rewrites
+/// (to another SSH URL, a private host or HTTPS), and an HTTPS URL rewritten to SSH, are
+/// refused before ssh runs; an SSH URL left as written clones, pinned to its own host.
+#[tokio::test]
+async fn an_ssh_url_is_cloned_as_written_and_a_rewrite_of_it_is_refused() {
+    let fixture = fixture(Options {
+        parent_repo_config: Some(format!(
+            "[url \"ssh://git@public.example.com/other/\"]\n\tinsteadOf = ssh://git@{HOST}:2222/to-ssh/\n\
+             [url \"ssh://git@10.1.2.3/\"]\n\tinsteadOf = ssh://git@{HOST}:2222/to-private/\n\
+             [url \"https://public.example.com/\"]\n\tinsteadOf = ssh://git@{HOST}:2222/to-https/\n\
+             [url \"ssh://git@{HOST}:2222/\"]\n\tinsteadOf = https://public.example.com/to-ssh/\n\
+             [url \"{{BARE}}\"]\n\tinsteadOf = https://example.invalid/r.git\n",
+        )),
+        ..Options::default()
+    })
+    .await;
+    fixture.set_terminals(true);
+    let agent = fixture.terminal_agent().await;
+    for url in [
+        format!("ssh://git@{HOST}:2222/to-ssh/repo.git"),
+        format!("ssh://git@{HOST}:2222/to-private/repo.git"),
+        format!("ssh://git@{HOST}:2222/to-https/repo.git"),
+        "https://public.example.com/to-ssh/repo.git".to_owned(),
+    ] {
+        let result = fixture
+            .clone(&agent, json!({ "url": url, "directoryName": "x" }))
+            .await;
+        assert_eq!(reason(&result), "clone_url_refused", "{url}: {result}");
+        let message = result["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(message.contains("url.insteadOf"), "{url}: {message}");
+    }
+    assert!(
+        fixture.ssh_record().is_empty(),
+        "ssh ran for a rewritten URL"
+    );
+    assert!(!fixture.projects.join("x").exists());
+
+    let result = fixture
+        .clone(&agent, json!({ "url": fixture.ssh_url() }))
+        .await;
+    assert_eq!(structured(&result)["state"], "done", "{result}");
+    let record = fixture.ssh_record();
+    let options = ssh_options(&record);
+    assert!(options.contains(&"HostName=127.0.0.1"), "{record:?}");
+    assert!(
+        options.contains(&format!("HostKeyAlias=[{HOST}]:2222").as_str()),
+        "{record:?}"
+    );
+
+    // Fact 8: in that repository, `ls-remote --get-url` applies a rewrite that `git clone`
+    // does not. If a Git starts applying it, the plan no longer matches the transfer.
+    let isolated = |args: &[&str]| {
+        let mut command = Command::new("git");
+        for name in INHERITED {
+            command.env_remove(name);
+        }
+        command
+            .args(args)
+            .current_dir(&fixture.projects)
+            .env("HOME", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git starts")
+    };
+    let expanded = isolated(&["ls-remote", "--get-url", "https://example.invalid/r.git"]);
+    assert_eq!(
+        String::from_utf8_lossy(&expanded.stdout).trim(),
+        shell_path(&fixture.bare)
+    );
+    let cloned = isolated(&["clone", "https://example.invalid/r.git", "fact-8"]);
+    assert!(!cloned.status.success(), "git clone applied the rewrite");
+    let stderr = String::from_utf8_lossy(&cloned.stderr);
+    assert!(stderr.contains("example.invalid"), "{stderr}");
+    fixture.harness.shutdown().await;
+}
+
+/// #217: ssh's own refusals come back with what to do, built from the plan's alias, port and
+/// known_hosts file; an ssh without an option the clone needs is `clone_ssh_unavailable`. The
+/// folder is removed each time.
+#[tokio::test]
+async fn ssh_refusals_come_back_with_what_to_do() {
+    let fixture = fixture(Options::default()).await;
+    fixture.set_terminals(true);
+    let agent = fixture.terminal_agent().await;
+    for (stderr, advice, expected_reason) in [
+        (
+            "No ED25519 host key is known for [fixture.invalid]:2222 and you have requested strict checking.\nHost key verification failed.",
+            "To trust it, run `ssh -F none -p 2222 -o 'HostKeyAlias=[fixture.invalid]:2222' -T git@fixture.invalid` yourself",
+            None,
+        ),
+        (
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.",
+            "does not have the key you trust for fixture.invalid",
+            None,
+        ),
+        (
+            "git@127.0.0.1: Permission denied (publickey).",
+            "No key in your SSH agent is accepted by fixture.invalid.",
+            None,
+        ),
+        (
+            "command-line: line 0: Bad configuration option: updatehostkeys",
+            "This server's ssh does not support updatehostkeys.",
+            Some("clone_ssh_unavailable"),
+        ),
+    ] {
+        std::fs::write(fixture.ssh_control.join("stderr"), format!("{stderr}\n")).unwrap();
+        let result = fixture
+            .clone(
+                &agent,
+                json!({ "url": fixture.ssh_url(), "directoryName": "refused" }),
+            )
+            .await;
+        assert_eq!(error_tag(&result), "GitCommandError", "{result}");
+        let error = &result["structuredContent"]["error"];
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(message.contains(advice), "{advice} in {message}");
+        assert_eq!(error["reason"].as_str(), expected_reason, "{result}");
+        assert!(!fixture.projects.join("refused").exists());
+        // The direct RPC keeps the reason too.
+        let direct = fixture
+            .rpc(
+                "sourceControl.cloneRepository",
+                json!({
+                    "remoteUrl": fixture.ssh_url(),
+                    "destinationPath": fixture.projects.join("refused-direct"),
+                }),
+                fixture.agent_context(&agent),
+            )
+            .await
+            .expect_err("ssh refused");
+        assert_eq!(direct["_tag"], "SourceControlRepositoryError", "{direct}");
+        assert_eq!(direct["reason"].as_str(), expected_reason, "{direct}");
+        assert!(!fixture.projects.join("refused-direct").exists());
+    }
+    fixture.harness.shutdown().await;
+}
+
+/// #217: cancelling an agent's SSH clone that waits in ssh stops Git and ssh (one process
+/// group) and removes the folder.
+#[tokio::test]
+async fn cancel_clone_stops_a_waiting_ssh_and_removes_the_folder() {
+    let fixture = fixture(Options::default()).await;
+    fixture.set_terminals(true);
+    let agent = fixture.terminal_agent().await;
+    std::fs::write(fixture.ssh_control.join("sleep"), "").unwrap();
+    let started = fixture
+        .clone_briefly(
+            &agent,
+            json!({ "url": fixture.ssh_url(), "directoryName": "waiting" }),
+        )
+        .await;
+    let started = structured(&started);
+    assert_eq!(started["state"], "running", "{started}");
+    let clone_id = started["cloneId"].as_str().unwrap().to_owned();
+    let folder = fixture.projects.join("waiting");
+    wait_until(|| folder.exists(), "the clone reserved its folder").await;
+    wait_until(|| !fixture.ssh_record().is_empty(), "ssh started").await;
+    let pid_file = fixture.ssh_control.join("pid");
+    let pid = || {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    wait_until(|| pid().is_some(), "ssh's child recorded its pid").await;
+    let pid = pid().unwrap();
+    assert!(
+        running(pid),
+        "ssh's child {pid} is not running before the cancel"
+    );
+    let cancelled = fixture
+        .harness
+        .call(&agent, "cancel_clone", json!({ "cloneId": clone_id }))
+        .await;
+    assert_eq!(structured(&cancelled)["cancelled"], true, "{cancelled}");
+    wait_until(
+        || !folder.exists(),
+        "the cancelled clone's folder is removed",
+    )
+    .await;
+    wait_until(|| !running(pid), "ssh's child exited").await;
+    fixture.harness.shutdown().await;
+}
+
+/// Whether `pid` runs (a zombie waiting for its reaper counts as exited).
+fn running(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(pid)
+        .is_some_and(|process| process.status() != sysinfo::ProcessStatus::Zombie)
+}
+
+/// #217: SSH has no counterpart of Git's HTTP low-speed guard, so ssh's own timeouts end a
+/// silent server: one that accepts and never answers (`ConnectTimeout`), and one that sends
+/// its banner and then goes silent (`ServerAlive*`, which covers key exchange). The real ssh
+/// runs the generated command with short timeouts; the clone fails without a cancel, its
+/// folder is removed, and the slot is free for the next clone of the same folder.
+#[tokio::test]
+async fn a_silent_ssh_server_ends_the_clone_without_a_cancel() {
+    if !real_ssh_clients().iter().any(|client| client == "ssh") {
+        return;
+    }
+    let fixture = fixture(Options {
+        ssh: Ssh::Real(SshTimeouts {
+            connect: 2,
+            alive_interval: 1,
+            alive_count: 2,
+        }),
+        ..Options::default()
+    })
+    .await;
+    fixture.set_terminals(true);
+    let agent = fixture.terminal_agent().await;
+    for banner in [None, Some(&b"SSH-2.0-OpenSSH_9.9\r\n"[..])] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let silent = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                let mut held = Vec::new();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    if let Some(banner) = banner {
+                        let _ = stream.write_all(banner).await;
+                    }
+                    held.push(stream);
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = fixture
+            .clone(
+                &agent,
+                json!({ "url": format!("ssh://git@{HOST}:{port}/repo.git"), "directoryName": "stall" }),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        silent.abort();
+        // ssh reached the server and Git failed: not a policy refusal.
+        assert_eq!(error_tag(&result), "GitCommandError", "{result}");
+        assert!(reason(&result).is_empty(), "{result}");
+        assert!(accepted.load(Ordering::SeqCst) > 0, "ssh never connected");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the silent server held the clone for {elapsed:?}"
+        );
+        assert!(!fixture.projects.join("stall").exists());
+    }
+    fixture.harness.shutdown().await;
 }

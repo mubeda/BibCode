@@ -257,6 +257,9 @@ pub struct GitVcsRpcServices {
     clone_operations: CloneRuntime,
     /// Where an outside agent's clone may go and what it runs with (#139 slice X6).
     clone_policy: ClonePolicy,
+    /// The live MCP settings, for the Terminals gate an agent's SSH clone needs (#217). Without
+    /// them no agent may clone over SSH.
+    mcp_settings: Option<watch::Receiver<crate::mcp::control::McpServerSettings>>,
     #[cfg(test)]
     status_stream_enrichment_test_hook: Option<Arc<StatusStreamEnrichmentTestHook>>,
 }
@@ -412,6 +415,7 @@ impl GitVcsRpcServices {
             worktree_removal_tasks: WorktreeRemovalTaskTracker::default(),
             clone_operations,
             clone_policy: ClonePolicy::default(),
+            mcp_settings: None,
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
@@ -494,6 +498,16 @@ impl GitVcsRpcServices {
         observer: Arc<dyn CreatedRequestObserver>,
     ) -> Self {
         self.created_request_observer = Some(observer);
+        self
+    }
+
+    /// The live MCP settings an agent's SSH clone is gated on (#217).
+    #[must_use]
+    pub fn with_mcp_settings(
+        mut self,
+        settings: watch::Receiver<crate::mcp::control::McpServerSettings>,
+    ) -> Self {
+        self.mcp_settings = Some(settings);
         self
     }
 
@@ -1809,10 +1823,36 @@ impl GitVcsRpcServices {
                 CloneRefusal::new(DESTINATION_REFUSED, OUTSIDE_PROJECTS).into_error(parent_dir)
             );
         }
+        let ssh_allowed = self.agent_acts_as_server_user(context).await;
         self.clone_policy
-            .plan(&self.repository, url, leaf, parent_dir, cancellation)
+            .plan(
+                &self.repository,
+                url,
+                leaf,
+                parent_dir,
+                ssh_allowed,
+                cancellation,
+            )
             .await
             .map(|plan| Some(Arc::new(plan)))
+    }
+
+    /// Whether the agent behind `context` passes the Terminals gate now, read live from the
+    /// MCP settings and its session (a Take over or a person turning Terminals off applies to
+    /// the next clone), never from the scope alone.
+    async fn agent_acts_as_server_user(&self, context: &RpcSessionContext) -> bool {
+        let (Some(settings), Some(principal), Some(auth)) =
+            (&self.mcp_settings, context.principal(), context.auth())
+        else {
+            return false;
+        };
+        let Some(access) = auth.mcp_client_access(&principal.session_id).await else {
+            return false;
+        };
+        let ceiling = crate::mcp::control::McpAccess::parse(&access)
+            .unwrap_or(crate::mcp::control::McpAccess::ReadOnly);
+        let settings = *settings.borrow();
+        crate::mcp::control::acts_as_server_user(settings, ceiling, &principal.scopes)
     }
 
     /// Whether `parent_dir` (canonical) is the folder that holds a registered project.
@@ -1928,7 +1968,12 @@ impl GitVcsRpcServices {
                     .as_str()
                     .or_else(|| error["message"].as_str())
                     .unwrap_or("The clone failed.");
-                source_control_error(&provider, "cloneRepository", detail)
+                let mut failure = source_control_error(&provider, "cloneRepository", detail);
+                // An agent's SSH clone keeps its `reason` (#217), as the plan's refusals do.
+                if let Some(reason) = error.get("reason") {
+                    failure["reason"] = reason.clone();
+                }
+                failure
             })?;
         Ok(json!({ "cwd": display_path(cwd), "remoteUrl": remote_url, "repository": Value::Null }))
     }

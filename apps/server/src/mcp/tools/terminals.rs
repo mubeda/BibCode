@@ -373,9 +373,10 @@ fn escape_end(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 impl ToolCall<'_> {
-    /// Gate 3: terminals run any command, as a Full access thread does.
+    /// Gate 3: terminals run any command, as a Full access thread does. `call` has already
+    /// checked the set and the scope, so the shared predicate fails here on the ceiling alone.
     fn check_full_access(&self) -> Result<(), Value> {
-        if self.control.effective_ceiling(self.principal) == McpAccess::FullAccess {
+        if self.control.acts_as_server_user(self.principal) {
             return Ok(());
         }
         let restart = if self.principal.ceiling < McpAccess::FullAccess {
