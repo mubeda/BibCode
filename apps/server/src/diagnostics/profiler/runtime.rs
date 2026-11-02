@@ -312,7 +312,7 @@ impl Drop for UninstallOnDrop {
 
 /// Takes the exclusive directory lock, retrying briefly while it is held. A lock still held
 /// after that is an error, like any I/O failure.
-fn lock_dir(dir: &Path) -> io::Result<File> {
+pub(super) fn lock_dir(dir: &Path) -> io::Result<File> {
     std::fs::create_dir_all(dir)?;
     let file = OpenOptions::new()
         .create(true)
