@@ -1059,7 +1059,8 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         .expect("CSP header")
         .to_owned();
     for directive in [
-        "object-src 'none'",
+        "object-src blob:",
+        "media-src 'self' blob:",
         "base-uri 'self'",
         "frame-ancestors 'none'",
         // Browser mode frames this host's preview gateways, each on its own port.
