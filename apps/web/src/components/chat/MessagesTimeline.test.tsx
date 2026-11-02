@@ -3039,18 +3039,35 @@ describe("MessagesTimeline older history", () => {
           />,
         ),
       );
+    // LegendList's data-change anchor: the first row in view it may restore (its fallback when
+    // no anchor is locked), here with every row in view.
+    const anchor = (inView: ReadonlyArray<string>) => {
+      const rows = h.legendListProps?.data as ReadonlyArray<{ id: string }>;
+      const keep = (
+        h.legendListProps?.maintainVisibleContentPosition as {
+          data?: boolean;
+          shouldRestorePosition?: (item: { id: string }, index: number, data: unknown) => boolean;
+        }
+      ).shouldRestorePosition;
+      return inView.find((id) => {
+        const index = rows.findIndex((row) => row.id === id);
+        return index >= 0 && (keep === undefined || keep(rows[index]!, index, rows));
+      });
+    };
     await render([...turn(10), ...turn(11)]);
     const before = rowIds();
     expect(before[0]).toBe("history-start");
-    const firstVisible = before[1];
+    expect(h.legendListProps?.maintainVisibleContentPosition).toMatchObject({ data: true });
+    // The control at the top is never the anchor: the first message being read is.
+    expect(anchor(before)).toBe("user-10");
 
     await render([...turn(8), ...turn(9), ...turn(10), ...turn(11)]);
     const after = rowIds();
-    // The rows already shown keep their keys and order, and LegendList holds the first visible
-    // one in place as the page lands above it.
-    expect(after.slice(after.indexOf(firstVisible!))).toEqual(before.slice(1));
-    expect(after.indexOf(firstVisible!)).toBeGreaterThan(1);
-    expect(h.legendListProps?.maintainVisibleContentPosition).toMatchObject({ data: true });
+    // The rows already shown keep their keys and order, the page lands between the control and
+    // them, and the anchor is still the message that was being read.
+    expect(after.slice(after.indexOf("user-10"))).toEqual(before.slice(1));
+    expect(after.indexOf("user-10")).toBeGreaterThan(1);
+    expect(anchor(before)).toBe("user-10");
   });
 
   it("loads earlier messages from the top row without scrolling", async () => {
