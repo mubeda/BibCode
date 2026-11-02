@@ -52,7 +52,8 @@ pub struct StoreIoBudget {
 impl StoreIoBudget {
     /// 30 s, then 4 minutes per GiB: six passes (copy, `quick_check`, hash and their
     /// verification) at 25.6 MiB/s each.
-    // shortcut: 240 s per GiB is unmeasured; raise it if #262's measurement shows a slower disk.
+    // Measured at about 4 to 5 s per GiB on NVMe (docs/architecture/measurements/
+    // large-store-compaction-20261102.md); the rest is margin for slow or cold disks.
     pub const LARGE_STORE: Self = Self {
         base: Duration::from_secs(30),
         per_gib: Duration::from_secs(240),

@@ -35,6 +35,7 @@ performance comparison above:
 
 - [Linux WebKitGTK resource attribution, 2026-08-11](measurements/linux-webkitgtk-resource-attribution-20260811.md)
 - [Remote latency at a 250 ms round trip, 2026-10-17](measurements/remote-latency-250ms-20261017.md)
+- [Large-store compaction, backup and restore, 2026-11-02](measurements/large-store-compaction-20261102.md)
 
 ## Results
 
