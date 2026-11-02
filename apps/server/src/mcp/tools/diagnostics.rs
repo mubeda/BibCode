@@ -872,6 +872,7 @@ fn evidence_fields(kind: &str) -> Vec<&'static str> {
             CRASH_RECORD,
         ],
         "provider.turn-failed" => &[&["provider", "terminalReason", "errorClass"]],
+        "delivery.failing" => &[&["provider", "attempts", "errorClass"]],
         "provider.compaction-failed" => {
             &[&["provider", "trigger", "outcome", "reason", "durationMs"]]
         }
