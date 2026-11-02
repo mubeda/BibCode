@@ -1,7 +1,7 @@
 # Large-Store Compaction
 
-Status: Proposed 2026-11-02. Revised for Codex review round 2 (see "Review
-findings and resolutions" at the end). Design for issue 262, verified against
+Status: Approved 2026-11-02 (user decision + Codex review, 3 rounds; see
+"Review findings and resolutions" at the end). Design for issue 262, verified against
 PR #248 (`origin/v015/230-storage-compact` at `4923e9be2`) merged onto `main`
 at `fd98b4330`. It builds on the approved
 [storage compaction design](2026-11-01-storage-compaction-design.md) (called
@@ -229,7 +229,7 @@ the staging entry behind, so the next `restore` or `start-empty`, under both
 locks, clears a `.<uuid>.recovery-staging` entry and its temporary journal
 when no published recovery journal exists and the entry holds nothing but
 those two plain files. Any other content keeps today's `RecoveryInProgress`
-refusal; a published journal is completed by O7. This is safe because the
+refusal; a published journal is finished by `--resume` (O7). This is safe because the
 journal is published (renamed into place and synced) before the first live
 file moves, and the staging entry is removed before the journal, so "staging
 without a published journal" always means the live store was never touched.
@@ -247,9 +247,9 @@ For WSL, the desktop's restore timeout becomes
 deadline and cleanup fire first in the normal case, but it is a watchdog, not
 a guarantee: the commit's syncs are unbounded, so the desktop can still kill
 the process after the journal is published, and the server binary inside WSL
-may outlive `wsl.exe` or not. Both cases are recovered by O7: if the restore
-is still running, the next start waits on its locks and then finds no
-journal; if it was killed, the next start completes it. The desktop reports
+may outlive `wsl.exe` or not. If the restore is still running, the next start
+waits on its locks and then finds no journal; if it was killed, the next start
+refuses and names `bibcode storage restore --resume` (O7). The desktop reports
 "WSL recovery timed out" and then shows the status the next inspection finds.
 Inspection and start-empty keep 30 s.
 
@@ -343,52 +343,78 @@ commit may have started. The journal is instead published atomically:
    writes it) and `rename` the temporary file onto it;
 4. sync the data-root directory.
 
-Any error in steps 1 to 4 removes the owned temporary file (after an identity
-check) and runs O4's cleanup; the live store has not been touched. A crash in
-the same window leaves at most a temporary file beside a staging entry, which
-O4's rule clears. Startup never reads a temporary journal.
+An error before the rename succeeds (steps 1 to 3) removes the owned
+temporary file (after an identity check) and runs O4's cleanup; the live store
+has not been touched. A crash in the same window leaves at most a temporary
+file beside a staging entry, which O4's rule clears. Startup never reads a
+temporary journal.
 
-**Completion.** After publication the commit renames the live files into the
-preserved directory, the staged files into place, and removes the staging
-entry and then the journal. A kill or crash anywhere in it, including the
-desktop's WSL watchdog, leaves the journal. Today nothing reads it, and the
-data root stays `RecoveryIncomplete` until a person intervenes. The journal now
-drives a roll-forward:
+**The rename is the commit point.** Once it succeeds, no failure path removes
+the journal, the staging entry or a staged file: an error in the directory
+sync, a rename or a sync after it returns the error and leaves the operation
+for `--resume` (below). So no journal is ever left whose files were cleaned
+away.
 
-- The journal gains `version: 2` and, for a restore, the file identities of
-  the staged `state.sqlite` and `environment-id`. The preserved and staging
-  directories are already named from its `operationId`.
-- `complete_interrupted_recovery(paths)` runs under the storage-operation lock
-  at startup (`store.rs:134` already takes it before the journal check), and
-  under both locks at the start of `restore` and `start-empty`. Every
-  started server and `bibcode` process either completes or refuses before it
-  opens SQLite, and a restore still running holds the exclusive runtime lock,
-  so it cannot be completed by someone else.
-- It preserves every live `state.sqlite`, `-wal`, `-shm` and `environment-id`
-  whose identity is not a staged one into the preserved directory (refusing if
-  that name is already taken there), moves any staged file still in staging
-  into place, syncs the state directory, removes the empty staging directory,
+**Completion is explicit (user decision).** After publication the commit
+renames the live files into the preserved directory, syncs it, renames the
+staged files into place, syncs the state directory, removes the staging entry
+and then the journal. A kill, crash or error anywhere in it, including the
+desktop's WSL watchdog, leaves the published journal. Startup keeps refusing
+with `RecoveryIncomplete`, as today, and moves no file. Its message now names
+the one command that finishes the operation:
+
+> An interrupted project-data recovery must be finished before BiBCode can
+> open this store. Quit BiBCode, then run `bibcode storage restore --resume`.
+
+The desktop shows that message as the store's issue. `restore --backup-id`
+and `start-empty` keep refusing with `RecoveryInProgress`, whose message names
+the same command.
+
+- The journal gains `version: 2` and, for a restore, the file identities
+  (volume and file ID) of the staged `state.sqlite` and `environment-id`. The
+  preserved and staging directories are already named from its `operationId`.
+- `bibcode storage restore --resume` (instead of `--backup-id`) takes the
+  exclusive runtime lock and the storage-operation lock, as restore does, and
+  runs `resume_interrupted_recovery`. It preserves every live `state.sqlite`,
+  `-wal`, `-shm` and `environment-id` whose identity is not a staged one into
+  the preserved directory (refusing if that name is already taken there),
+  syncs the preserved directory, moves any staged file still in staging into
+  place, syncs the state directory, removes the empty staging directory,
   removes the journal and syncs the data root. Each step is a rename decided
-  from the files, so an interruption of the completion is completed the same
-  way next time. A start-empty journal only finishes preserving.
-- It refuses, leaving every file as it is and `RecoveryIncomplete` as today,
-  when the journal is not version 2, does not parse, names another state kind,
-  or the files match none of the states above: an unexpected entry in staging,
-  a live file that is neither old nor staged in an impossible combination, or
-  a staged file whose identity differs.
+  from the files, so an interrupted `--resume` is finished by the next one. A
+  start-empty journal only finishes preserving. With no journal it reports
+  that there is nothing to resume and changes nothing.
+- It refuses, leaving every file as it is, when the journal is not version 2,
+  does not parse, names another state kind, or the files match none of the
+  states above: an unexpected entry in staging, or a staged file whose
+  identity differs.
 
 Roll-forward rather than rollback: the staged copy was `Content`-verified and
 synced before the journal was published, so finishing is always possible, and
 it is what the user chose. A rollback would run the same renames in reverse
 and leave a long restore to be redone.
 
-`restore` and `start-empty` called while a journal exists first complete it,
-then run as asked; the completed result is preserved like any live store, so
-nothing is lost. The existing
+**The preserved directory is synced** after the last live file is moved into
+it and before any staged file moves or the journal is removed, in the restore
+commit, the start-empty commit and `--resume`, as `backup.rs:1264` does today.
+A failed sync is an error after the commit point, so the journal stays.
+
+**Every writable opener checks the recovery state.** Startup refuses while a
+journal or recovery-staging entry exists (`store.rs:138-145`), but the pairing
+CLI's `open_existing_data_root` (`lib.rs:376`) and the MCP relay's `open_store`
+(`mcp/relay.rs:711`) open the database writable under only the shared runtime
+lock and never look. During an interrupted restore they would write into
+whatever `state.sqlite` the commit left. The startup check moves into one
+`persistence::ensure_no_interrupted_recovery(&paths)`, called by all three
+after the shared runtime lock is held (a restore or `--resume` holds it
+exclusively, so the state cannot change under the opener), with the same
+`RecoveryIncomplete` error and message.
+
+The existing
 `restore_failure_after_preservation_keeps_the_journal_and_recoverable_live_files`
-keeps its assertions up to the failure; its last assertion, that startup then
-refuses, becomes "startup completes the restore" (test 21). That is the
-intended behavior change of this option.
+keeps every assertion, including that startup refuses; a new assertion checks
+that the message names `bibcode storage restore --resume`, and `--resume` then
+finishes the restore (test 21).
 
 **Adopted.**
 
@@ -396,20 +422,20 @@ intended behavior change of this option.
 
 Compaction steps 1 to 7 and 9 to 12 are unchanged from #230 D9.
 
-| Path                                                                       | State left                                                                                                                                                                                     | Reported                                                                                    |
-| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Pre-compact backup fails or hits its deadline                              | Live store as found (the copy only reads). Staging removed. No generation.                                                                                                                     | `CompactFailed { phase: "backup", backupId: null }` with the cause.                         |
-| Ctrl-C during the backup                                                   | Same. The token stops the copy, hash or `quick_check` within one step.                                                                                                                         | `Cancelled { backupId: null }`: "the database was not changed".                             |
-| Disk full during the backup                                                | The online backup or a write fails; same as a failure. The free-space precheck (#230 D7) makes this rare.                                                                                      | The `SQLITE_FULL` or I/O error in the message.                                              |
-| Crash or kill during the backup                                            | Live store intact: the maintenance connection has written nothing before the backup (#230 D3 step 4). A `.<id>.staging` entry stays and is ignored by inventory.                               | Next run works. The orphan is disk space only (Follow-ups).                                 |
-| Failure after publication (reload)                                         | Unchanged from #230: the published generation is kept.                                                                                                                                         | As today.                                                                                   |
-| Retention runs out of time, is cancelled, or finds corrupt replacements    | Nothing is deleted in this call; the new generation stays published. A corrupt generation is never a replacement (O3).                                                                         | A `tracing::warn!`; the creation succeeds.                                                  |
-| Restore fails, deadline or Ctrl-C before the journal is published          | Live store untouched. Staging, temporary journal and empty preserved directory removed. The store starts as before.                                                                            | The cause, or `Cancelled`.                                                                  |
-| Disk full during the restore copy, or while writing or syncing the journal | Same as the row above (O7: the journal is published by rename only after its sync). After publication, restore only renames on one volume, so it needs no space.                               | As above.                                                                                   |
-| Crash or kill before the journal is published                              | Staging entry, and at most a temporary journal, left. The next `restore` or `start-empty` clears them (O4).                                                                                    | Startup reports `RecoveryIncomplete` until then, which opens the desktop's recovery dialog. |
-| Crash or kill during the commit, or an error in it                         | The journal stays. The next start, `restore` or `start-empty` completes the restore (O7); every old live file ends in `recovery/`.                                                             | Nothing if completion succeeds; `RecoveryIncomplete` if the files match no known state.     |
-| Desktop's WSL watchdog fires                                               | Usually the server's own deadline fires first. If the kill lands during the commit, it is the row above. If the process survives `wsl.exe`, it finishes and the next start waits on its locks. | "WSL recovery timed out", then the status the next inspection finds.                        |
-| A listed backup rotted after publication                                   | Restore refuses it before touching the live store (O3).                                                                                                                                        | "The selected backup exists but failed verification."                                       |
+| Path                                                                       | State left                                                                                                                                                                                                                     | Reported                                                                                      |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| Pre-compact backup fails or hits its deadline                              | Live store as found (the copy only reads). Staging removed. No generation.                                                                                                                                                     | `CompactFailed { phase: "backup", backupId: null }` with the cause.                           |
+| Ctrl-C during the backup                                                   | Same. The token stops the copy, hash or `quick_check` within one step.                                                                                                                                                         | `Cancelled { backupId: null }`: "the database was not changed".                               |
+| Disk full during the backup                                                | The online backup or a write fails; same as a failure. The free-space precheck (#230 D7) makes this rare.                                                                                                                      | The `SQLITE_FULL` or I/O error in the message.                                                |
+| Crash or kill during the backup                                            | Live store intact: the maintenance connection has written nothing before the backup (#230 D3 step 4). A `.<id>.staging` entry stays and is ignored by inventory.                                                               | Next run works. The orphan is disk space only (Follow-ups).                                   |
+| Failure after publication (reload)                                         | Unchanged from #230: the published generation is kept.                                                                                                                                                                         | As today.                                                                                     |
+| Retention runs out of time, is cancelled, or finds corrupt replacements    | Nothing is deleted in this call; the new generation stays published. A corrupt generation is never a replacement (O3).                                                                                                         | A `tracing::warn!`; the creation succeeds.                                                    |
+| Restore fails, deadline or Ctrl-C before the journal is published          | Live store untouched. Staging, temporary journal and empty preserved directory removed. The store starts as before.                                                                                                            | The cause, or `Cancelled`.                                                                    |
+| Disk full during the restore copy, or while writing or syncing the journal | Same as the row above (O7: the journal is published by rename only after its sync). After publication, restore only renames on one volume, so it needs no space.                                                               | As above.                                                                                     |
+| Crash or kill before the journal is published                              | Staging entry, and at most a temporary journal, left. The next `restore` or `start-empty` clears them (O4).                                                                                                                    | Startup reports `RecoveryIncomplete` until then, which opens the desktop's recovery dialog.   |
+| Crash or kill during the commit, or an error in it                         | The journal, staging entry and staged files stay (the rename is the commit point). Startup and every writable opener refuse; `bibcode storage restore --resume` finishes it (O7), and every old live file ends in `recovery/`. | `RecoveryIncomplete` naming `--resume`; `--resume` refuses if the files match no known state. |
+| Desktop's WSL watchdog fires                                               | Usually the server's own deadline fires first. If the kill lands during the commit, it is the row above. If the process survives `wsl.exe`, it finishes and the next start waits on its locks.                                 | "WSL recovery timed out", then the status the next inspection finds.                          |
+| A listed backup rotted after publication                                   | Restore refuses it before touching the live store (O3).                                                                                                                                                                        | "The selected backup exists but failed verification."                                         |
 
 ## Tests
 
@@ -552,39 +578,63 @@ noted:
     staging entry; live database, marker and listing unchanged;
     `prepare_store` succeeds. Before the change a partial journal stays and
     startup fails with `RecoveryIncomplete`.
-21. `startup_completes_a_restore_interrupted_at_every_commit_step`: the live
-    store is the crash-left WAL fixture with `-shm` and different rows from the
-    backup. `RecoveryFault::CrashAt(step)` returns at once without any cleanup,
-    as a kill would, at each of: after publishing the journal, after preserving
-    the database, `-wal`, `-shm` and the marker in turn, after moving the
-    staged database, after moving the staged marker, and after removing the
-    staging directory. Then `prepare_store` succeeds; the database's SHA-256
-    equals the manifest's; the marker holds the backup's storage ID; no old
-    `-wal` or `-shm` sits beside it; the preserved directory holds every
-    original live file byte-identical; no journal or staging entry remains; and
-    the rows equal the backup's. A second crash injected during the completion
-    itself is completed by the next `prepare_store`. Runs again with
-    `bibcode storage restore` of another backup as the next command: it
-    completes the interrupted restore, preserves that result, and installs the
-    requested backup. This replaces the last assertion of
-    `restore_failure_after_preservation_keeps_the_journal_and_recoverable_live_files`.
-22. `startup_refuses_a_journal_it_cannot_complete`: a version-1 journal (as
+21. `resume_finishes_a_restore_interrupted_at_every_commit_step`: the live
+    store has `-wal` and `-shm` and different rows from the backup.
+    `RecoveryFault::CrashAt(step)` returns at once without any cleanup, as a
+    kill would, at each of: after publishing the journal, after preserving the
+    database, `-wal`, `-shm` and the marker in turn, after syncing the
+    preserved directory, after moving the staged database, after moving the
+    staged marker, and after removing the staging directory. Then
+    `prepare_store` fails with `RecoveryIncomplete` whose message names
+    `bibcode storage restore --resume`, and no file moved. `resume_recovery`
+    then succeeds; the database's SHA-256 equals the manifest's; the marker
+    holds the backup's storage ID; no old `-wal` or `-shm` sits beside it; the
+    preserved directory holds every original live file byte-identical; no
+    journal or staging entry remains; `prepare_store` succeeds and the rows
+    equal the backup's. A second crash injected during `--resume` itself is
+    finished by the next `--resume`. The existing
+    `restore_failure_after_preservation_keeps_the_journal_and_recoverable_live_files`
+    keeps its assertion that startup refuses, adds the message assertion, and
+    ends with `--resume` finishing it.
+22. `resume_refuses_a_journal_it_cannot_finish`: a version-1 journal (as
     written today), a journal for the other state kind, an extra entry in
     staging, and a staged database whose identity differs from the journal's.
-    Each gives `RecoveryIncomplete` and leaves every file byte-identical and in
-    place.
-23. `startup_completes_an_interrupted_start_empty`: a crash after preserving
-    the database only. `prepare_store` finishes preserving the WAL, `-shm` and
-    marker, removes the journal, and starts a first-run store.
-24. `a_killed_restore_process_is_completed_by_the_next_start`
+    Each gives an error, and every file stays byte-identical and in place.
+    With no journal, `--resume` reports nothing to resume and changes nothing.
+23. `resume_finishes_an_interrupted_start_empty`: a crash after preserving
+    the database only. Startup refuses naming `--resume`; `--resume` finishes
+    preserving the WAL, `-shm` and marker and removes the journal; the next
+    `prepare_store` starts a first-run store.
+24. `a_killed_restore_process_is_finished_by_restore_resume`
     (**Unix only**, `apps/server/tests/cli_smoke.rs`): spawns the debug
-    `bibcode storage restore` with `BIBCODE_TEST_PAUSE_RECOVERY=<step>`, a hook
-    compiled only under `debug_assertions` that blocks at that commit step;
-    sends `SIGKILL` once a marker file says it is paused; then
-    `bibcode storage inspect` reports `recovery-incomplete`, and
-    `ServerRuntime::start` completes the restore with test 21's assertions.
-    Run for the journal-published and database-moved steps. This is the
-    watchdog kill with a real process instead of a returned error.
+    `bibcode storage restore` with `BIBCODE_TEST_PAUSE_RECOVERY=<step>` and
+    `BIBCODE_TEST_PAUSE_RECOVERY_MARKER=<file>`, a hook compiled only under
+    `debug_assertions` that writes the marker and blocks at that commit step;
+    sends `SIGKILL` once the marker exists; then `bibcode storage inspect`
+    reports `recovery-incomplete` with the `--resume` message,
+    `bibcode storage restore --resume` succeeds, and the store opens with test
+    21's assertions. Run for the journal-published and database-moved steps.
+    This is the watchdog kill with a real process instead of a returned error.
+
+Round 3:
+
+25. `writable_openers_refuse_during_an_interrupted_restore`: with a published
+    journal left by `CrashAt(AfterPreserveDatabase)`, the pairing CLI's
+    `open_existing_data_root` (`lib.rs` unit test) and the MCP relay's
+    `open_store` (`mcp/relay.rs` unit test) fail with the `RecoveryIncomplete`
+    message naming `--resume`, and create no file; the same with only an
+    abandoned recovery-staging entry. Before the change both open the
+    database.
+26. `a_preserved_directory_sync_failure_keeps_the_journal_for_resume`:
+    `RecoveryFault::PreservedSync` fails the sync of the preserved directory,
+    in restore and in start-empty. Error; journal, staging and staged files
+    stay; no staged file was moved; `--resume` then finishes. A source check
+    confirms the sync precedes the first staged move.
+27. `a_failure_after_the_journal_rename_keeps_the_operation_for_resume`:
+    `RecoveryFault::JournalDirectorySync` fails the data-root sync right after
+    the rename. Error; the journal, staging entry and staged files remain (no
+    stranded journal); startup refuses naming `--resume`; `--resume`
+    finishes.
 
 Unchanged and must pass: every test the #230 design lists under item 25;
 `recovery_lookup_verifies_only_the_selected_generation`;
@@ -626,11 +676,10 @@ for creation or restore, times three, exceeds it; then it is raised to that.
   and the overview's Profiler section say both. Restore has no profiler event
   today and gets none here.
 - **Tracing.** `tracing::warn!` when staging cleanup leaves content behind,
-  when retention defers, and when startup refuses a journal it cannot
-  complete; `tracing::info!` when restore clears an abandoned staging entry and
-  when startup completes an interrupted restore or start-empty. They name no
+  when retention defers, and when `--resume` refuses a journal it cannot
+  finish; `tracing::info!` when restore clears an abandoned staging entry and
+  when `--resume` finishes an interrupted restore or start-empty. They name no
   path beyond the entry or operation ID, as `apply_retention` already logs.
-  Startup completion runs inside the server, where the subscriber exists.
 - **Not applicable:** child processes, RPC methods and `is_long_running`,
   worktree removal, binaries and re-exec modes, shutdown ordering.
 
@@ -653,10 +702,14 @@ for creation or restore, times three, exceeds it; then it is raised to that.
   cleanup on failure in creation and restore; the abandoned-staging rule in
   `ensure_no_recovery_in_progress` callers for restore and start-empty;
   restore's size-scaled deadline and `CancellationToken` parameter; atomic
-  journal publication for restore and start-empty; the version-2 journal and
-  `complete_interrupted_recovery`; the test seams named in Tests.
-- `persistence/store.rs`: startup calls `complete_interrupted_recovery` under
-  its storage-operation guard before the journal check.
+  journal publication for restore and start-empty; the preserved-directory
+  sync before staged moves; the version-2 journal and `resume_recovery`; the
+  test seams named in Tests.
+- `persistence/store.rs`: `ensure_no_interrupted_recovery`, used by startup;
+  its message names `--resume`.
+- `lib.rs` (`open_existing_data_root`) and `mcp/relay.rs` (`open_store`): call
+  `ensure_no_interrupted_recovery` after the shared runtime lock.
+- `config.rs`: `storage restore --resume`, exclusive with `--backup-id`.
 - `main.rs` or `lib.rs`: the `debug_assertions`-only
   `BIBCODE_TEST_PAUSE_RECOVERY` hook for test 24.
 - `persistence/compaction.rs`: `create_verified_backup_with` with the
@@ -678,12 +731,10 @@ for creation or restore, times three, exceeds it; then it is raised to that.
   publication, `Structural` listing and deletion, the size-scaled budgets,
   staging cleanup, retention behind content-verified replacements) and the
   offline recovery paragraph (restore deadline, Ctrl-C, abandoned staging,
-  atomic journal, roll-forward at startup; "A crash or cancellation after
-  preservation therefore leaves … an explicit incomplete operation" becomes
-  "…is completed by the next start").
+  atomic journal, `restore --resume`, the opener gate).
 - `docs/guides/project-data-recovery.md` also says that an interrupted restore
-  finishes on the next start, and what `RecoveryIncomplete` means when it
-  cannot.
+  is finished with `bibcode storage restore --resume`, and what to do when it
+  refuses.
 - `docs/skills/bibcode-profiler/references/events.md`: `backupBudgetMs`.
 - `docs/testing/`: reviewed. No runbook covers storage CLI commands; they
   remain accurate unless the implementation adds a native validation step.
@@ -715,9 +766,8 @@ no contract and no server-path budget.
   deletion, but it can keep an extra generation on disk (O3).
 - Retention beside a large replacement defers deletion, so up to two extra
   generations can stay until three newer ones exist (O3, test 19).
-- Startup now renames files when it completes an interrupted restore (O7). It
-  does so only for a version-2 journal whose files match a known state, under
-  the storage-operation lock, and refuses otherwise as today.
+- An interrupted restore needs a person to run `--resume` (user decision);
+  until then the store does not open. The message names the command.
 - An older binary that finds a version-2 journal refuses, as it does for any
   journal today; a newer binary refuses a version-1 journal (test 22).
 - A cold disk cache at restore time is slower than creation's warm one; the
@@ -725,7 +775,7 @@ no contract and no server-path budget.
 - A crash during a pre-compact backup leaves a `.staging` copy that only
   costs disk space.
 - An older desktop driving a newer WSL binary kills a long restore at 30 s;
-  the next start or restore clears the abandoned staging or completes the
+  the next restore clears the abandoned staging, or `--resume` finishes the
   commit.
 - The 5 s startup validation still refuses stores whose `quick_check` exceeds
   it, before and after compaction or restore.
@@ -747,3 +797,12 @@ Round 2 (Codex, on `8a416944e`):
 | r2-P1 | Retention driven by a structural-only listing can delete the last usable generation: with A good, B and C corrupted at the same length and D from an empty valid store, it keeps B, C and D and deletes A. Today's retention excludes content failures. | Listing stays structural, but retention deletes only behind `RETAINED_GENERATIONS` replacements that pass `Content` verification now, walked newest first under the creation's deadline; otherwise it defers (O3). Tests 18, 19.         |
 | r2-P2 | The journal is created at its final path before it is written and synced, so ENOSPC leaves a partial journal that O4 then refuses to clear, blocking startup and recovery.                                                                              | Atomic publication: temporary file, write, `sync_all`, rename, directory sync; an owned temporary journal is removed on failure and cleared after a crash (O7, O4). Test 20, and 9 for the crash case.                                   |
 | r2-P2 | The WSL watchdog can kill a restore during its journaled commit, whose syncs ignore the deadline; round 1 claimed the server's deadline always fires first, and only tested the arithmetic.                                                             | The claim is withdrawn (O4). A version-2 journal records the staged identities, and startup, `restore` and `start-empty` roll the commit forward from the files, or refuse as today when they match no known state (O7). Tests 21 to 24. |
+
+Round 3 (user decision, and Codex on `193527d7e`):
+
+| #        | Finding                                                                                                                                                              | Resolution                                                                                                                      |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| decision | An interrupted restore is finished by an explicit command, not at startup.                                                                                           | Startup refuses as today and names `bibcode storage restore --resume`, which finishes it under both locks (O7). Tests 21 to 24. |
+| r3-P1    | The pairing CLI's `open_existing_data_root` and the MCP relay's `open_store` open writable SQLite without checking for a recovery journal, under a shared lock only. | `ensure_no_interrupted_recovery` gates all three writable openers after the shared runtime lock (O7). Test 25.                  |
+| r3-P1    | The preserved directory must be synced after files move into it and before the journal is removed.                                                                   | The sync runs before any staged move, in restore, start-empty and `--resume`; a failure keeps the journal (O7). Test 26.        |
+| r3-P2    | A failure after the journal rename must not strand a journal whose files were cleaned up.                                                                            | The rename is the commit point: after it, failures keep the journal, staging and staged files for `--resume` (O7). Test 27.     |
