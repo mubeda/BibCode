@@ -1,7 +1,7 @@
 //! Leak and sustained-CPU rules over one process's 1-minute series (RESIN-style): a
 //! 15-minute warm-up, a rolling 10-minute minimum so sawtooth peaks never count as growth,
-//! growth measured on that floor's high-water mark so a refill after a dip never counts,
-//! and a baseline reset on step changes and sampling gaps.
+//! growth required on both that floor and its high-water mark so neither memory freed again
+//! nor a refill after a dip counts, and a baseline reset on step changes and sampling gaps.
 
 use std::collections::VecDeque;
 
@@ -37,8 +37,9 @@ pub enum LeakVerdict {
 
 #[derive(Default)]
 pub struct LeakDetector {
-    raw: VecDeque<(u64, f64)>,   // (minute, bytes) since last reset
-    floor: VecDeque<(u64, f64)>, // rolling-minimum series
+    raw: VecDeque<(u64, f64)>, // (minute, bytes) since last reset
+    /// (minute, rolling minimum, its high-water mark since the last reset)
+    floor: VecDeque<(u64, f64, f64)>,
     started: Option<u64>,
     last_minute: Option<u64>,
     baseline: Option<f64>,
@@ -96,7 +97,12 @@ impl LeakDetector {
                 return None;
             }
         }
-        self.floor.push_back((minute, floor_value));
+        // Carried on the newest entry, so the mark outlives the 6 h history it came from.
+        let high = self
+            .floor
+            .back()
+            .map_or(floor_value, |p| p.2.max(floor_value));
+        self.floor.push_back((minute, floor_value, high));
         while self.floor.len() > LIKELY_WINDOW_MIN {
             self.floor.pop_front();
         }
@@ -124,50 +130,20 @@ impl LeakDetector {
         if self.floor.len() < SUSPECT_WINDOW_MIN {
             return LeakVerdict::None;
         }
-        // The floor's high-water mark since the last reset: a refill after a dip returns to a
-        // level already held, so only a rise above it counts as growth.
-        let mut high = f64::NEG_INFINITY;
-        let points: Vec<(f64, f64)> = self
-            .floor
-            .iter()
-            .map(|(m, v)| {
-                high = high.max(*v);
-                (*m as f64 / 60.0, high / MB)
-            })
-            .collect();
-        let recent = &points[points.len() - SUSPECT_WINDOW_MIN..];
-        // A step too small to reset the baseline (under 64 MB) still reads as steady growth
-        // once it passes the middle of the hour. Growth that one minute dominates is a step.
-        if step_dominated(recent) {
-            return LeakVerdict::None;
-        }
-        let slope = theil_sen(recent); // MB per hour
-        let threshold = (10.0f64).max(0.02 * baseline / MB);
-        let z = mann_kendall_z(&recent.iter().map(|p| p.1).collect::<Vec<_>>());
-        let latest = points.last().map_or(0.0, |p| p.1);
-        let growth = latest - baseline / MB;
-        let r2 = r_squared(&points);
-        let rising = z > 2.33;
-        // Still rising in the last 15 minutes, not only somewhere in the last hour.
-        let rising_lately = theil_sen(&points[points.len() - RECENT_WINDOW_MIN..]) >= threshold;
-        // Two alternatives: 6 h of growth at the suspect rate that fits a line, or growth of
-        // at least 50% and 200 MB since the baseline that is still going on, which needs only
-        // the 1 h window. Growth that has stopped is a new level.
-        let fits_six_hours = points.len() >= LIKELY_WINDOW_MIN && slope >= threshold && r2 > 0.8;
-        let grew_large =
-            growth >= 200.0 && growth >= 0.5 * baseline / MB && rising && rising_lately;
-        if fits_six_hours || grew_large {
-            return LeakVerdict::Likely {
-                slope_mb_per_h: slope,
-                r2,
-            };
-        }
-        if slope >= threshold && rising {
-            LeakVerdict::Suspect {
-                slope_mb_per_h: slope,
-            }
+        let series = |pick: fn(&(u64, f64, f64)) -> f64| -> Vec<(f64, f64)> {
+            self.floor
+                .iter()
+                .map(|p| (p.0 as f64 / 60.0, pick(p) / MB))
+                .collect()
+        };
+        // Growth must show on both series: the floor stays flat when memory is freed again, and
+        // its high-water mark stays flat when a dip refills to a level already held.
+        let floor = verdict_of(&series(|p| p.1), baseline);
+        let high = verdict_of(&series(|p| p.2), baseline);
+        if strength(high) < strength(floor) {
+            high
         } else {
-            LeakVerdict::None
+            floor
         }
     }
 
@@ -181,7 +157,7 @@ impl LeakDetector {
 
     fn reset_keep(&mut self, minute: u64, floor_value: f64) {
         self.floor.clear();
-        self.floor.push_back((minute, floor_value));
+        self.floor.push_back((minute, floor_value, floor_value));
         self.baseline = Some(floor_value);
         self.consecutive_hits = 0;
     }
@@ -210,6 +186,51 @@ impl CpuDetector {
         }
         let start = *self.above_since.get_or_insert(at_secs);
         at_secs.saturating_sub(start) >= CPU_SUSTAINED_SECS
+    }
+}
+
+/// The verdict for one floor series, in (hours, MB) points since the last reset.
+fn verdict_of(points: &[(f64, f64)], baseline: f64) -> LeakVerdict {
+    let recent = &points[points.len() - SUSPECT_WINDOW_MIN..];
+    // A step too small to reset the baseline (under 64 MB) still reads as steady growth
+    // once it passes the middle of the hour. Growth that one minute dominates is a step.
+    if step_dominated(recent) {
+        return LeakVerdict::None;
+    }
+    let slope = theil_sen(recent); // MB per hour
+    let threshold = (10.0f64).max(0.02 * baseline / MB);
+    let z = mann_kendall_z(&recent.iter().map(|p| p.1).collect::<Vec<_>>());
+    let latest = points.last().map_or(0.0, |p| p.1);
+    let growth = latest - baseline / MB;
+    let r2 = r_squared(points);
+    let rising = z > 2.33;
+    // Still rising in the last 15 minutes, not only somewhere in the last hour.
+    let rising_lately = theil_sen(&points[points.len() - RECENT_WINDOW_MIN..]) >= threshold;
+    // Two alternatives: 6 h of growth at the suspect rate that fits a line, or growth of
+    // at least 50% and 200 MB since the baseline that is still going on, which needs only
+    // the 1 h window. Growth that has stopped is a new level.
+    let fits_six_hours = points.len() >= LIKELY_WINDOW_MIN && slope >= threshold && r2 > 0.8;
+    let grew_large = growth >= 200.0 && growth >= 0.5 * baseline / MB && rising && rising_lately;
+    if fits_six_hours || grew_large {
+        return LeakVerdict::Likely {
+            slope_mb_per_h: slope,
+            r2,
+        };
+    }
+    if slope >= threshold && rising {
+        LeakVerdict::Suspect {
+            slope_mb_per_h: slope,
+        }
+    } else {
+        LeakVerdict::None
+    }
+}
+
+fn strength(verdict: LeakVerdict) -> u8 {
+    match verdict {
+        LeakVerdict::None => 0,
+        LeakVerdict::Suspect { .. } => 1,
+        LeakVerdict::Likely { .. } => 2,
     }
 }
 
@@ -495,32 +516,53 @@ mod tests {
         }
     }
 
-    /// A 40 MB process held flat for 90 minutes, then a dip to 25.8 MB and a refill in two
-    /// steps (#272). `after_refill` gives the private MB from minute 106 on.
-    fn dip_then(after_refill: impl Fn(u64) -> f64) -> impl Fn(u64) -> u64 {
+    /// A 40 MB process held flat for 90 minutes, then `dip_min` minutes at 25.8 MB and
+    /// 8 at 33.5 MB (#272). `after_refill` gives the private MB by minutes since the refill.
+    fn dip_then(dip_min: u64, after_refill: impl Fn(u64) -> f64) -> impl Fn(u64) -> u64 {
         move |m: u64| {
+            let refilled = 90 + dip_min + 8;
             let mb = match m {
                 0..90 => 40.0,
-                90..98 => 25.8,
-                98..106 => 33.5,
-                _ => after_refill(m),
+                _ if m < 90 + dip_min => 25.8,
+                _ if m < refilled => 33.5,
+                _ => after_refill(m - refilled),
             };
             (mb * MB as f64) as u64
         }
+    }
+
+    /// The refill seen in #272: 40.6 MB, creeping to 41.4 MB over 40 minutes.
+    fn refill(t: u64) -> f64 {
+        40.6 + t.min(40) as f64 * 0.8 / 40.0
     }
 
     /// A refill to the level held before a dip is not growth, even in a small process where
     /// the 10 MB/h floor is a large share of its size.
     #[test]
     fn recovery_after_a_dip_in_a_small_process_is_not_a_leak() {
-        let refill = dip_then(|m| 40.6 + (m.min(146) - 106) as f64 * 0.8 / 40.0);
-        assert_eq!(verdicts_of(400, refill), []);
+        assert_eq!(verdicts_of(400, dip_then(8, refill)), []);
+    }
+
+    /// The level held before a dip still counts after the 6 h floor history no longer holds it.
+    #[test]
+    fn recovery_after_a_dip_longer_than_the_floor_history_is_not_a_leak() {
+        assert_eq!(verdicts_of(800, dip_then(308, refill)), []);
+    }
+
+    /// Memory that grew and was then freed is not a leak, though the high-water mark rose.
+    #[test]
+    fn growth_that_is_freed_again_is_not_a_leak() {
+        let freed = |m: u64| match m {
+            120..140 => 500 * MB + (m - 119) * 3 * MB / 2,
+            _ => 500 * MB,
+        };
+        assert_eq!(verdicts_of(800, freed), []);
     }
 
     /// A leak that carries a small process past the level it held before a dip still counts.
     #[test]
     fn a_leak_past_the_pre_dip_level_is_still_flagged() {
-        let leak = dip_then(|m| 40.0 + (m - 106) as f64 * 20.0 / 60.0);
+        let leak = dip_then(8, |t| 40.0 + t as f64 * 20.0 / 60.0);
         let verdicts = verdicts_of(400, leak);
         assert!(
             matches!(verdicts.first(), Some((m, "suspect")) if *m <= 106 + 75),
