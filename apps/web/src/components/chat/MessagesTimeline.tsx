@@ -1377,7 +1377,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             {regularImages.map((image) => (
               <div
                 key={image.id}
-                className="overflow-hidden rounded-lg border border-border/80 bg-background/70"
+                className="min-h-[72px] overflow-hidden rounded-lg border border-border/80 bg-background/70"
               >
                 {image.previewUrl ? (
                   <button
@@ -1393,6 +1393,8 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                     <img
                       src={image.previewUrl}
                       alt={image.name}
+                      loading="lazy"
+                      decoding="async"
                       className="block h-auto max-h-[220px] w-full object-cover"
                     />
                   </button>
@@ -2073,6 +2075,8 @@ function UserMessagePreviewAnnotationCard(props: {
           <img
             src={props.image.previewUrl}
             alt="Annotated preview crop"
+            loading="lazy"
+            decoding="async"
             className="size-full object-cover"
           />
         </button>

@@ -180,6 +180,14 @@ the encrypted channel; a policy limited to loopback and TLS makes every
 Add Server attempt fail as "Server unreachable" before any packet leaves the
 machine. `scripts/tauri-hardening.test.ts` pins both halves of that policy.
 
+The same policy gives `media-src` and `object-src` only `blob:` (plus `'self'`
+for media), and `img-src` never admits an environment origin. The Files panel
+previews an environment's images, PDFs and audio by fetching them through the
+signed asset URL (a `connect-src` request, so LAN, tailnet and relay hosts work)
+and showing the bytes from a `blob:` URL the app creates and revokes. Opening
+those origins to media or objects instead would let agent-written content from
+any chosen environment load as a page resource.
+
 On macOS a second gate applies: App Transport Security refuses plain-HTTP
 loads from web content unless the bundle declares an exception, and it does so
 before any packet leaves the machine. `apps/desktop/src-tauri/Info.plist`,
@@ -317,7 +325,8 @@ File transfers use token-in-path URLs for the same reason asset previews do,
 so they work on every profile. On a pinned (E2EE) profile whose endpoint is
 plain `http://`, Files panel downloads and uploads (`/api/transfers/<token>`)
 and asset previews (`/api/assets/<capability>/<path>`: chat images, project
-icons, and HTML or PDF files opened in the integrated browser) travel outside
+icons, HTML or PDF files opened in the integrated browser, and the image, SVG,
+PDF and audio files the Files panel previews in place) travel outside
 the Noise channel, and only the RPC that issues their URLs is encrypted, so
 anyone on the network path can read and alter their contents, read the
 workspace paths encoded in those URLs, and reuse a captured URL until it
