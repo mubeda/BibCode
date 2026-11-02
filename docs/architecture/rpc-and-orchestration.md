@@ -4659,7 +4659,7 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   `pullRequests.checkout`, `runAction`, `list`, `get`, `getTimeline`,
   `getCommits`, `getChecks`, `getFiles`, `getContext`, `getVocabulary`, and
   `getCreateDefaults`; `updater.check` and `updater.install`;
-  `server.updateProvider`, `server.refreshProviders`, and
+  `server.updateProvider`, `server.updateTool`, `server.refreshProviders`, and
   `server.refreshProviderUsage`; `worktree.createManaged` and `worktree.remove`
   (which deletes the whole tree, dependencies and build output included); and
   `agentSessions.import` and `agentSessions.openInPanel` (a whole transcript

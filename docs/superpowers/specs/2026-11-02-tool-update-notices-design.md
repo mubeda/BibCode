@@ -357,3 +357,23 @@ environment propagation test; contracts schema tests plus the old/new wire
 fixtures (`vp run check:contracts`); web logic tests for the shared candidate
 type, the capability gate (no call to servers without `tools`), the Tools group
 and the external-update toast; and a Settings entry in `docs/testing/`.
+
+## Implementation notes
+
+Where the implementation settled a detail this design left open:
+
+- Tool update lifecycles and states live in `ToolMaintenance`'s own map
+  (`production/tool_maintenance.rs`), not in `ProviderMaintenance`'s
+  coordinator. Provider settings validation and full-refresh pruning iterate
+  only the provider map, so they cannot reach a tool entry. The
+  `update_state_for` wrapper named under "Maintenance adapter" was therefore
+  not needed; `enrich_advisory` is the only extracted entry point.
+- The web client sends a tool's update through the one
+  `serverEnvironment.updateProvider` command, which routes a tool id to
+  `server.updateTool` and reports the result as provider rows, so the toast, pill,
+  environment rows and "Update all" needed no second code path.
+- A hermetic test build (`hermetic-test-guard`) starts with no tool
+  definitions, because a bare `codegraph` would resolve on the host's PATH;
+  tests install a stub through `ToolSetup`.
+- The external-update toast is gated by a driver set
+  (`EXTERNAL_UPDATE_NOTICE_DRIVERS`) that holds only `claudeAgent`.

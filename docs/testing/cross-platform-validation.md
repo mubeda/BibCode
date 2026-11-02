@@ -3375,6 +3375,20 @@ sizes. Cover relevant:
   confirmation lists its server version and running work; after confirming, the
   host restarts only once its providers show **Updated**, its Remote Servers
   row shows the same progress, and a manual host is listed as skipped;
+- with CodeGraph installed (standalone installer or a global package-manager
+  install), **Settings → Providers → Tools** lists it with its version. Point
+  `PATH` at a stub `codegraph` that records its environment and arguments,
+  never the real CLI or a real agent configuration, to confirm **Update** runs
+  `upgrade` with `CODEGRAPH_NO_PROMPT_HOOK=1` and `CODEGRAPH_NO_INSTALL_REFRESH=1`
+  and leaves a sentinel agent-config file untouched. Close the window mid-
+  update: the stub keeps running and the row shows the result on return, and a
+  server restart while it runs says **still being updated** with no reinstall.
+  A stub that exits non-zero leaves **may be damaged** with a reinstall; a
+  wrapper outside the installer layout is shown as manual with the reason. A
+  WSL or remote environment reports its own CodeGraph, and an older server that
+  reports no tools shows no Tools group. When Claude Code updates itself (or a
+  stub `claude` reports a higher version after a refresh), one **Claude updated
+  to `<version>`** notice appears per version;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
