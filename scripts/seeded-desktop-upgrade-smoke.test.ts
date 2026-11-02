@@ -410,6 +410,33 @@ describe("remote phase receipt retention boundaries", () => {
       await fixture.dispose();
     }
   });
+  it("surfaces the driver's pairing-offer failure when no credential receipt exists", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      const message =
+        "Remote verification pairing offer could not be generated (share UI found=true, clicked=false).";
+      // The spec traces this line, then throws before any receipt is written.
+      fixture.runCommand.mockImplementation(async () => {
+        await NodeFS.promises.writeFile(
+          NodePath.join(fixture.evidenceDirectory, "remote-credential-trace.log"),
+          `${JSON.stringify({ step: "pairing-offer", widened: false, message })}
+`,
+        );
+        return { exitCode: 1, stdout: "fixture-private-returned-token", stderr: "" };
+      });
+      const error = await fixture.runPhase().catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).toContain(message);
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain(message);
+      expect(log).not.toContain("fixture-private-returned-token");
+    } finally {
+      await fixture.dispose();
+    }
+  });
   it.each(["returned", "thrown"])(
     "refuses final copies after a %s remote phase failure without a bootstrap receipt",
     async (kind) => {
@@ -515,7 +542,10 @@ const publicPairingGrant = {
 };
 
 /** Executes the generated credential callback and its receipt/driver handoff without a desktop. */
-const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
+const remoteGrantFixture = (
+  responses: ReadonlyArray<unknown>,
+  options: { readonly fromShareUi?: boolean } = {},
+) => {
   const input = {
     candidateVersion: "0.7.3",
     expectedDataRoot: absolute("remote", "data"),
@@ -531,9 +561,13 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     remoteSecretPath: absolute("remote", "private.json"),
     remoteUploadSecretPath: absolute("remote", "upload-private.json"),
     remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
+    remoteTracePath: absolute("remote", "evidence", "remote-credential-trace.log"),
   };
   const spec = createSeededUpgradeDriverSpec(input);
-  const start = spec.indexOf("    let credentials;");
+  // From the share UI, the generated scenario also runs the real widening guard.
+  const start = spec.indexOf(
+    options.fromShareUi ? "    const traceRemote = (entry) => {" : "    let credentials;",
+  );
   const end = spec.indexOf("\n  });\n});", start);
   if (start < 0 || end < 0) throw new Error("Generated remote credential scenario is missing.");
   // Replace module loading only; run the actual browser callback and handoff statements.
@@ -547,13 +581,31 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
   const driver = vi.fn(async (_credentials: unknown) => ({ phases: ["succeeded"] }));
   const execute = async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
     callback(...args);
+  const traces: string[] = [];
   const context = {
     input,
     widened: true,
     traceRemote: () => {},
     observation: { projectId: "remote-project" },
-    browser: { execute },
+    browser: {
+      execute,
+      // Poll the condition once per interval without a real clock.
+      waitUntil: async (
+        condition: () => Promise<boolean>,
+        { timeout, interval }: { timeout: number; interval: number },
+      ) => {
+        for (let elapsed = 0; elapsed < timeout; elapsed += interval) {
+          if (await condition()) return true;
+        }
+        throw new Error("waitUntil timed out");
+      },
+    },
+    document: {
+      // The share control exists but never becomes enabled.
+      querySelectorAll: () => [{ textContent: " Generate pairing offer ", disabled: true }],
+    },
     window: {
+      location: { hash: "" },
       desktopBridge: {
         getLocalEnvironmentBootstraps: () => [
           {
@@ -568,6 +620,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     NodeFS: {
       writeFileSync: (path: string, contents: string, options?: { mode: number }) =>
         files.set(path, { contents, ...options }),
+      appendFileSync: (_path: string, line: string) => traces.push(line),
     },
     loadFixture: async (path: string) => {
       if (path === input.remoteInstallDriverPath) return { runRemoteInstallDriver: driver };
@@ -586,6 +639,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     input,
     context,
     files,
+    traces,
     fetch,
     driver,
     run: () =>
@@ -624,6 +678,17 @@ describe("generated remote sharing grant handoff", () => {
       if (path !== fixture.input.remoteSecretPath)
         expect(file.contents).not.toContain("fixture-distinct-grant");
     }
+  });
+
+  it("fails fast without a credential receipt or coordinator call when the pairing offer cannot be generated", async () => {
+    const fixture = remoteGrantFixture([[publicPairingGrant]], { fromShareUi: true });
+    await expect(fixture.run()).rejects.toThrow(
+      "Remote verification pairing offer could not be generated (share UI found=false, clicked=false).",
+    );
+    expect(fixture.files.size).toBe(0);
+    expect(fixture.fetch).not.toHaveBeenCalled();
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(fixture.traces.join("")).toContain('"step":"pairing-offer"');
   });
 
   it("waits for minting after native exposure has already widened", async () => {
@@ -1481,6 +1546,9 @@ describe("seeded packaged desktop upgrade harness", () => {
       expect(spec).toContain("remote-credential-trace.log");
       expect(spec).toContain('step: "share-ui"');
       expect(spec).toContain('step: "credentials"');
+      expect(spec).toContain("pairing offer could not be generated");
+      expect(spec).toContain('step: "pairing-offer"');
+      expect(spec).not.toContain("bootstrap unavailable");
       expect(spec).toContain("[redacted]");
       expect(spec).not.toContain("bridge.installUpdate()");
     } finally {
@@ -2102,7 +2170,10 @@ describe("seeded packaged desktop upgrade harness", () => {
       ]),
     ).toThrow("The candidate could not inspect primary project data: database is locked");
     expect(verify([primary])).toThrow(
-      `primary healthy, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+      `primary healthy, issue: none, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+    );
+    expect(verify([{ ...primary, issue: "generation 3 rejected" }])).toThrow(
+      "primary healthy, issue: generation 3 rejected, 0 listed",
     );
     expect(verify(undefined)).toThrow(
       /^The protected update did not retain a verified pre-update backup\.$/,
