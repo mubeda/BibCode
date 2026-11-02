@@ -1,15 +1,20 @@
 import type { ScopedThreadRef } from "@bibcode/contracts";
 import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react";
+import * as Cause from "effect/Cause";
+import * as Effect from "effect/Effect";
 import {
   memo,
+  useCallback,
   useEffect,
+  useRef,
   useState,
   type ChangeEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 import { isMacPlatform } from "~/lib/platform";
-import { useThreadFindLoadState } from "~/state/threads";
+import { runOlderHistoryLoad } from "~/state/olderHistoryLoad";
+import { useThreadFindLoadState, useThreadOlderHistory } from "~/state/threads";
 import { Button } from "../../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 import { MAX_FIND_QUERY_LENGTH } from "./threadFindText";
@@ -66,9 +71,20 @@ function isModKey(event: ReactKeyboardEvent): boolean {
   return isMacPlatform(navigator.platform) ? event.metaKey : event.ctrlKey;
 }
 
+/**
+ * What find covers while older history is still on the server (#226): it searched the loaded
+ * messages, and Search all loads the rest, after which the scan reruns over them.
+ */
+export interface ThreadFindOlderHistory {
+  readonly state: "partial" | "loading" | "failed";
+  readonly onSearchAll: () => void;
+}
+
 export interface ThreadFindBarProps {
   readonly query: string;
   readonly status: ThreadFindStatus;
+  /** Present while older history is on the server. */
+  readonly olderHistory?: ThreadFindOlderHistory | null;
   /** The input, as a callback ref, so the controller can focus it. */
   readonly attachInput: (input: HTMLInputElement | null) => void;
   readonly onQueryChange: (query: string, composing: boolean) => void;
@@ -82,6 +98,7 @@ export interface ThreadFindBarProps {
 export function ThreadFindBar({
   query,
   status,
+  olderHistory = null,
   attachInput,
   onQueryChange,
   onSubmit,
@@ -178,7 +195,36 @@ export function ThreadFindBar({
           {message}
         </p>
       ) : null}
+      {olderHistory && (status.kind === "match" || status.kind === "none") ? (
+        <OlderHistoryLine olderHistory={olderHistory} />
+      ) : null}
     </div>
+  );
+}
+
+function OlderHistoryLine({ olderHistory }: { olderHistory: ThreadFindOlderHistory }) {
+  const text =
+    olderHistory.state === "loading"
+      ? "Loading earlier messages…"
+      : olderHistory.state === "failed"
+        ? "Couldn't load all earlier messages."
+        : "Searched loaded messages.";
+  return (
+    <p
+      className="flex items-center gap-1.5 px-2.5 pb-1.5 text-xs text-muted-foreground"
+      role="status"
+    >
+      <span>{text}</span>
+      {olderHistory.state === "loading" ? null : (
+        <button
+          type="button"
+          className="rounded-sm px-1 py-0.5 font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          onClick={olderHistory.onSearchAll}
+        >
+          {olderHistory.state === "failed" ? "Retry" : "Search all"}
+        </button>
+      )}
+    </p>
   );
 }
 
@@ -223,14 +269,66 @@ export interface ThreadFindProps extends Omit<UseThreadFindOptions, "loadState">
   readonly threadRef: ScopedThreadRef | null;
 }
 
+/**
+ * Search all: loads every older page while the bar is open. Closing the bar cancels it; a
+ * failure shows until the next try or until the bar closes.
+ */
+export function useSearchAllOlder(
+  threadRef: ScopedThreadRef | null,
+  hasOlderHistory: boolean,
+  isOpen: boolean,
+): ThreadFindOlderHistory | null {
+  const olderHistory = useThreadOlderHistory(threadRef);
+  const [state, setState] = useState<"partial" | "loading" | "failed">("partial");
+  const [wasOpen, setWasOpen] = useState(isOpen);
+  if (wasOpen !== isOpen) {
+    setWasOpen(isOpen);
+    if (!isOpen) setState("partial");
+  }
+  const cancelRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (isOpen) return;
+    cancelRef.current?.();
+    cancelRef.current = null;
+  }, [isOpen]);
+  useEffect(
+    () => () => {
+      cancelRef.current?.();
+    },
+    [],
+  );
+  const onSearchAll = useCallback(() => {
+    if (!olderHistory) return;
+    cancelRef.current?.();
+    setState("loading");
+    cancelRef.current = runOlderHistoryLoad(
+      olderHistory.loadAllOlder.pipe(
+        Effect.matchCause({
+          onSuccess: () => setState("partial"),
+          onFailure: (cause) => {
+            if (!Cause.hasInterruptsOnly(cause)) setState("failed");
+          },
+        }),
+      ),
+    );
+  }, [olderHistory]);
+  return hasOlderHistory && olderHistory ? { state, onSearchAll } : null;
+}
+
 /** The controller and its bar for one timeline; renders nothing while find is closed. */
 export const ThreadFind = memo(function ThreadFind({ threadRef, ...options }: ThreadFindProps) {
   const loadState = useThreadFindLoadState(threadRef);
   const controller = useThreadFind({ ...options, loadState });
+  const olderHistory = useSearchAllOlder(
+    threadRef,
+    loadState.hasOlderHistory === true,
+    controller.isOpen,
+  );
   return controller.isOpen ? (
     <ThreadFindBar
       query={controller.query}
       status={controller.status}
+      olderHistory={olderHistory}
       attachInput={controller.attachInput}
       onQueryChange={controller.setQuery}
       onSubmit={controller.submit}

@@ -1156,6 +1156,39 @@ describe("MessagesTimeline assistant rows", () => {
     expect(markup).toContain("alpha.ts");
     expect(markup).toContain("beta.ts");
   });
+
+  it("says when a captured turn's changes cannot be shown", async () => {
+    const assistantMessageId = MessageId.make("message-assistant-no-diff");
+    const markup = await renderTimeline({
+      timelineEntries: [
+        buildUserTimelineEntry("Change files."),
+        buildAssistantTimelineEntry({
+          id: "entry-2",
+          messageId: "message-assistant-no-diff",
+          text: "Changed a file.",
+          turnId: TURN_ID,
+        }),
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [
+          assistantMessageId,
+          {
+            turnId: TURN_ID,
+            checkpointTurnCount: 2,
+            checkpointRef: CheckpointRef.make("checkpoint-2"),
+            status: "ready" as const,
+            files: [],
+            diffAvailable: false,
+            assistantMessageId,
+            completedAt: LATER_CREATED_AT,
+          },
+        ],
+      ]),
+    });
+
+    expect(markup).toContain("for this turn: the checkpoint before it is missing.");
+    expect(markup).not.toContain("View diff");
+  });
 });
 
 describe("MessagesTimeline turn folds", () => {
@@ -2955,5 +2988,130 @@ describe("MessagesTimeline thinking rows", () => {
     await scrollTo(1_500 - 256 - 3);
     await stream("First, then more, and more, and the end", 2_000);
     expect(scrollTop).toBe(2_000);
+  });
+});
+
+// The thread history window (#226).
+describe("MessagesTimeline older history", () => {
+  const turn = (index: number) => {
+    const createdAt = `2026-03-17T19:${String(index).padStart(2, "0")}:00.000Z`;
+    return [
+      {
+        ...buildUserTimelineEntry(`Question ${index}`),
+        id: `user-${index}`,
+        createdAt,
+        message: {
+          ...buildUserTimelineEntry(`Question ${index}`).message,
+          id: MessageId.make(`user-${index}`),
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      buildAssistantTimelineEntry({
+        id: `answer-${index}`,
+        messageId: `answer-${index}`,
+        text: `Answer ${index}`,
+        createdAt,
+      }),
+    ];
+  };
+  const olderHistory = (
+    status: "idle" | "loading" | "error",
+    onLoadOlder: () => void = () => {},
+  ) => ({ olderRows: 42, status, onLoadOlder });
+  const rowIds = () =>
+    (h.legendListProps?.data as ReadonlyArray<{ id: string }> | undefined)?.map((row) => row.id) ??
+    [];
+
+  it("keeps the first visible row in place when an older page loads", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mountedTrees.push({ container, root });
+    const render = (entries: ReturnType<typeof turn>) =>
+      act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={entries}
+            olderHistory={olderHistory("idle")}
+          />,
+        ),
+      );
+    // LegendList's data-change anchor: the first row in view it may restore (its fallback when
+    // no anchor is locked), here with every row in view.
+    const anchor = (inView: ReadonlyArray<string>) => {
+      const rows = h.legendListProps?.data as ReadonlyArray<{ id: string }>;
+      const keep = (
+        h.legendListProps?.maintainVisibleContentPosition as
+          | {
+              shouldRestorePosition?: (
+                item: { id: string },
+                index: number,
+                data: unknown,
+              ) => boolean;
+            }
+          | undefined
+      )?.shouldRestorePosition;
+      return inView.find((id) => {
+        const index = rows.findIndex((row) => row.id === id);
+        return index >= 0 && (keep === undefined || keep(rows[index]!, index, rows));
+      });
+    };
+    await render([...turn(10), ...turn(11)]);
+    const before = rowIds();
+    expect(before[0]).toBe("history-start");
+    expect(h.legendListProps?.maintainVisibleContentPosition).toMatchObject({ data: true });
+    // The control at the top is never the anchor: the first message being read is.
+    expect(anchor(before)).toBe("user-10");
+
+    await render([...turn(8), ...turn(9), ...turn(10), ...turn(11)]);
+    const after = rowIds();
+    // The rows already shown keep their keys and order, the page lands between the control and
+    // them, and the anchor is still the message that was being read.
+    expect(after.slice(after.indexOf("user-10"))).toEqual(before.slice(1));
+    expect(after.indexOf("user-10")).toBeGreaterThan(1);
+    expect(anchor(before)).toBe("user-10");
+  });
+
+  it("loads earlier messages from the top row without scrolling", async () => {
+    const onLoadOlder = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("idle", onLoadOlder),
+    });
+    const button = [...container.querySelectorAll("button")].find(
+      (element) => element.textContent === "Load earlier messages (42 more)",
+    );
+    expect(button).toBeDefined();
+    await click(button!);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    // Scrolling within a viewport of the top loads it too.
+    expect(h.legendListProps?.onStartReached).toBe(onLoadOlder);
+    expect(h.legendListProps?.onStartReachedThreshold).toBe(1);
+  });
+
+  it("offers a retry when an older page fails", async () => {
+    const onLoadOlder = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("error", onLoadOlder),
+    });
+    expect(container.textContent).toContain("Couldn't load earlier messages.");
+    const retry = [...container.querySelectorAll("button")].find(
+      (element) => element.textContent === "Retry",
+    );
+    await click(retry!);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    // A failed page is not retried by scrolling, only by the button.
+    expect(h.legendListProps?.onStartReached).toBeUndefined();
+
+    const loading = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("loading"),
+    });
+    expect(loading.textContent).toContain("Loading earlier messages…");
+    expect(h.legendListProps?.onStartReached).toBeUndefined();
   });
 });

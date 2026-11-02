@@ -1089,6 +1089,23 @@ impl Repositories {
             .await
     }
 
+    /// Whether the delivery was ever claimed, even if a manual retry reset its attempts since:
+    /// the provider may then have edited the checkout. A missing row counts as claimed.
+    pub async fn provider_turn_was_claimed(&self, command_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = ?",
+                        [command_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_none_or(|claimed| claimed != 0))
+            })
+            .await
+    }
+
     pub async fn claim_provider_turn(
         &self,
         command_id: String,
@@ -1100,7 +1117,7 @@ impl Repositories {
             .fetch_add(1, Ordering::SeqCst);
         // A closed (archived) chat panel starts nothing until it is reopened.
         let result = self.database.call(move |connection| connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
             params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {
@@ -1481,6 +1498,56 @@ impl Repositories {
             .await
     }
 
+    /// What a thread's history window (#226) reads beside its rows: when each history row was
+    /// last written, the thread's history epoch, and the open requests and running
+    /// implementations its carried state rows are selected by. One SQLite job, so the marks are
+    /// consistent with each other.
+    pub async fn load_thread_history_marks(&self, thread_id: String) -> Result<ThreadHistoryMarks> {
+        self.database
+            .call(move |connection| {
+                let written = |table: &str, id: &str| -> Result<HashMap<String, i64>> {
+                    let mut statement = connection.prepare(&format!(
+                        "SELECT {id}, written_sequence FROM {table} WHERE thread_id = ?"
+                    ))?;
+                    let rows = statement
+                        .query_map([&thread_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<HashMap<String, i64>>>()?;
+                    Ok(rows)
+                };
+                let ids = |sql: &str| -> Result<std::collections::HashSet<String>> {
+                    let mut statement = connection.prepare(sql)?;
+                    let rows = statement
+                        .query_map([&thread_id], |row| row.get::<_, Option<String>>(0))?
+                        .filter_map(|row| row.transpose())
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(rows)
+                };
+                let epoch = connection
+                    .query_row(
+                        "SELECT history_epoch FROM projection_threads WHERE thread_id = ?",
+                        [&thread_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                Ok(ThreadHistoryMarks {
+                    epoch,
+                    messages: written("projection_thread_messages", "message_id")?,
+                    activities: written("projection_thread_activities", "activity_id")?,
+                    reasoning: written("projection_thread_reasoning", "reasoning_id")?,
+                    proposed_plans: written("projection_thread_proposed_plans", "plan_id")?,
+                    pending_approvals: ids(
+                        "SELECT request_id FROM projection_pending_approvals WHERE thread_id = ? AND status = 'pending'",
+                    )?,
+                    open_user_inputs: ids(&open_user_input_requests_sql("?1"))?,
+                    running_source_plans: ids(
+                        "SELECT source_proposed_plan_id FROM projection_turns WHERE source_proposed_plan_thread_id = ? AND state = 'running'",
+                    )?,
+                })
+            })
+            .await
+    }
+
     /// Every reasoning entry still streaming, on any thread: what the settlement sweeps close.
     pub async fn list_streaming_reasoning(&self) -> Result<Vec<ProjectionThreadReasoning>> {
         self.database
@@ -1599,20 +1666,20 @@ impl Repositories {
     /// Checkpoints are projection-turn rows.  This transaction clears a
     /// conflicting checkpoint key before inserting/updating the canonical turn.
     pub async fn upsert_checkpoint(&self, row: ProjectionCheckpoint) -> Result<()> {
-        self.database.call(move |connection| { let transaction = connection.transaction()?; transaction.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count = ?", params![row.thread_id,row.checkpoint_turn_count])?; transaction.execute(TURN_UPSERT_SQL, params![row.thread_id,row.turn_id,Option::<String>::None,Option::<String>::None,Option::<String>::None,row.assistant_message_id,if row.status == "error" { "error" } else { "completed" },row.completed_at,row.completed_at,row.completed_at,row.checkpoint_turn_count,row.checkpoint_ref,row.status,encode_json(&row.files)?])?; transaction.commit()?; Ok(()) }).await
+        self.database.call(move |connection| { let transaction = connection.transaction()?; transaction.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count = ?", params![row.thread_id,row.checkpoint_turn_count])?; transaction.execute(TURN_UPSERT_SQL, params![row.thread_id,row.turn_id,Option::<String>::None,Option::<String>::None,Option::<String>::None,row.assistant_message_id,if row.status == "error" { "error" } else { "completed" },row.completed_at,row.completed_at,row.completed_at,row.checkpoint_turn_count,row.checkpoint_ref,row.status,encode_json(&row.files)?])?; transaction.execute("UPDATE projection_turns SET checkpoint_diff_available = ? WHERE thread_id = ? AND turn_id = ?", params![row.diff_available,row.thread_id,row.turn_id])?; transaction.commit()?; Ok(()) }).await
     }
     pub async fn list_checkpoints_by_thread(
         &self,
         thread_id: String,
     ) -> Result<Vec<ProjectionCheckpoint>> {
-        self.database.call(move |connection| collect(connection, "SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL ORDER BY checkpoint_turn_count ASC", [thread_id], decode_checkpoint)).await
+        self.database.call(move |connection| collect(connection, "SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at, checkpoint_diff_available FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL ORDER BY checkpoint_turn_count ASC", [thread_id], decode_checkpoint)).await
     }
     pub async fn get_checkpoint(
         &self,
         thread_id: String,
         checkpoint_turn_count: i64,
     ) -> Result<Option<ProjectionCheckpoint>> {
-        self.database.call(move |connection| connection.query_row("SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count = ?", params![thread_id,checkpoint_turn_count], decode_checkpoint).optional().map_err(Into::into)).await
+        self.database.call(move |connection| connection.query_row("SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at, checkpoint_diff_available FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count = ?", params![thread_id,checkpoint_turn_count], decode_checkpoint).optional().map_err(Into::into)).await
     }
     pub async fn delete_checkpoints_by_thread(&self, thread_id: String) -> Result<()> {
         self.database.call(move |connection| { connection.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL", [thread_id])?; Ok(()) }).await
@@ -2971,6 +3038,24 @@ pub struct ProjectionThreadMessage {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
+/// See [`Repositories::load_thread_history_marks`]. Each history map is keyed by row id and
+/// holds the row's `written_sequence`: the sequence of the event that last wrote it.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadHistoryMarks {
+    /// The sequence of the thread's last revert, or 0.
+    pub epoch: i64,
+    pub messages: HashMap<String, i64>,
+    pub activities: HashMap<String, i64>,
+    pub reasoning: HashMap<String, i64>,
+    pub proposed_plans: HashMap<String, i64>,
+    /// Request ids of the thread's pending approvals.
+    pub pending_approvals: std::collections::HashSet<String>,
+    /// Request ids of the thread's open user-input requests.
+    pub open_user_inputs: std::collections::HashSet<String>,
+    /// Plan ids of this thread named as the source plan by a running turn, on any thread.
+    pub running_source_plans: std::collections::HashSet<String>,
+}
+
 /// The rows a shell snapshot shows; see [`Repositories::load_shell_snapshot_rows`].
 #[derive(Clone, Debug)]
 pub struct ShellSnapshotRows {
@@ -3111,6 +3196,9 @@ pub struct ProjectionCheckpoint {
     pub checkpoint_ref: String,
     pub status: String,
     pub files: Value,
+    /// Whether the turn before's checkpoint is a trusted baseline, so `files` and the one-turn
+    /// patch are this turn's change. A `ready` turn without it can still be reverted to.
+    pub diff_available: bool,
     pub assistant_message_id: Option<String>,
     pub completed_at: Timestamp,
 }
@@ -4475,6 +4563,7 @@ fn decode_checkpoint(row: &Row<'_>) -> rusqlite::Result<ProjectionCheckpoint> {
         files: decode_json(row.get(5)?, "checkpoint_files_json")?,
         assistant_message_id: row.get(6)?,
         completed_at: row.get(7)?,
+        diff_available: row.get(8)?,
     })
 }
 fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {

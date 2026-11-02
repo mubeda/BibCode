@@ -1,0 +1,4233 @@
+{
+  "input": {
+    "history": {},
+    "patches": true,
+    "threadId": "t1"
+  },
+  "items": [
+    {
+      "kind": "snapshot",
+      "revision": "revision",
+      "snapshot": {
+        "snapshotSequence": 205,
+        "thread": {
+          "activities": [],
+          "archivedAt": null,
+          "branch": null,
+          "checkpoints": [],
+          "createdAt": "2026-07-10T10:00:00.000Z",
+          "deletedAt": null,
+          "hasActionableProposedPlan": false,
+          "hasPendingApprovals": false,
+          "hasPendingUserInput": true,
+          "history": {
+            "carried": {
+              "activities": [
+                {
+                  "createdAt": "2026-07-11T00:00:01.000Z",
+                  "id": "ask",
+                  "kind": "user-input.requested",
+                  "payload": {
+                    "questions": [],
+                    "requestId": "ask-1"
+                  },
+                  "sequence": 204,
+                  "summary": "Question",
+                  "tone": "approval",
+                  "turnId": null
+                }
+              ],
+              "proposedPlans": []
+            },
+            "floor": "eyJ2IjoxLCJrIjpbIjIwMjYtMDctMTJUMDE6MzA6MDAuMDAwWiIsMCwidTA5MCJdLCJvcGVuZWRBdCI6MjA1LCJlcG9jaCI6MH0",
+            "hasOlder": true,
+            "olderRows": 181
+          },
+          "id": "t1",
+          "interactionMode": "default",
+          "kind": "workspace",
+          "latestTurn": {
+            "assistantMessageId": "streaming",
+            "completedAt": null,
+            "requestedAt": "2026-07-11T00:00:01.000Z",
+            "sourceProposedPlan": null,
+            "startedAt": "2026-07-11T00:00:01.000Z",
+            "state": "running",
+            "turnId": "turn-old"
+          },
+          "latestUserMessageAt": "2026-07-11T00:00:02.000Z",
+          "messages": [
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:03.000Z",
+              "id": "a090",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 90",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:03.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:04.000Z",
+              "id": "a091",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 91",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:04.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:05.000Z",
+              "id": "a092",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 92",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:05.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:06.000Z",
+              "id": "a093",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 93",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:06.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:07.000Z",
+              "id": "a094",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 94",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:07.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:08.000Z",
+              "id": "a095",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 95",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:08.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:09.000Z",
+              "id": "a096",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 96",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:09.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:10.000Z",
+              "id": "a097",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 97",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:10.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:11.000Z",
+              "id": "a098",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 98",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:11.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:12.000Z",
+              "id": "a099",
+              "role": "assistant",
+              "streaming": false,
+              "text": "answer 99",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:12.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:01.000Z",
+              "id": "streaming",
+              "role": "assistant",
+              "streaming": true,
+              "text": "still ",
+              "turnId": "turn-old",
+              "updatedAt": "2026-07-11T00:00:01.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:13.000Z",
+              "id": "u090",
+              "role": "user",
+              "streaming": false,
+              "text": "question 90",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:13.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:14.000Z",
+              "id": "u091",
+              "role": "user",
+              "streaming": false,
+              "text": "question 91",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:14.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:15.000Z",
+              "id": "u092",
+              "role": "user",
+              "streaming": false,
+              "text": "question 92",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:15.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:16.000Z",
+              "id": "u093",
+              "role": "user",
+              "streaming": false,
+              "text": "question 93",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:16.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:17.000Z",
+              "id": "u094",
+              "role": "user",
+              "streaming": false,
+              "text": "question 94",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:17.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:18.000Z",
+              "id": "u095",
+              "role": "user",
+              "streaming": false,
+              "text": "question 95",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:18.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:19.000Z",
+              "id": "u096",
+              "role": "user",
+              "streaming": false,
+              "text": "question 96",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:19.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:20.000Z",
+              "id": "u097",
+              "role": "user",
+              "streaming": false,
+              "text": "question 97",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:20.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:21.000Z",
+              "id": "u098",
+              "role": "user",
+              "streaming": false,
+              "text": "question 98",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:21.000Z"
+            },
+            {
+              "attachments": [],
+              "createdAt": "2026-07-11T00:00:02.000Z",
+              "id": "u099",
+              "role": "user",
+              "streaming": false,
+              "text": "question 99",
+              "turnId": null,
+              "updatedAt": "2026-07-11T00:00:02.000Z"
+            }
+          ],
+          "modelSelection": {
+            "instanceId": "codex",
+            "model": "gpt-5"
+          },
+          "projectId": "p1",
+          "proposedPlans": [],
+          "reasoning": [],
+          "runtimeMode": "full-access",
+          "session": null,
+          "title": "Thread",
+          "unresolvedDelivery": null,
+          "updatedAt": "2026-07-11T00:00:01.000Z",
+          "worktreePath": null
+        }
+      }
+    },
+    {
+      "kind": "patch",
+      "patch": {
+        "arrays": {
+          "messages": {
+            "changes": [
+              [
+                10,
+                {
+                  "attachments": [],
+                  "createdAt": "2026-07-11T00:00:01.000Z",
+                  "id": "streaming",
+                  "role": "assistant",
+                  "streaming": true,
+                  "text": "still going",
+                  "turnId": "turn-old",
+                  "updatedAt": "2026-07-11T00:00:01.000Z"
+                }
+              ]
+            ],
+            "length": 21
+          }
+        },
+        "set": {},
+        "unset": []
+      },
+      "revision": "revision",
+      "snapshotSequence": 206
+    }
+  ],
+  "pages": [
+    {
+      "activities": [],
+      "checkpoints": [],
+      "cursor": "eyJ2IjoxLCJrIjpbIjIwMjYtMDctMTJUMDA6NTI6MzAuMDAwWiIsMCwiYTA1MiJdLCJvcGVuZWRBdCI6MjA1LCJlcG9jaCI6MH0",
+      "messages": [
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:23.000Z",
+          "id": "a089",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 89",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:23.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:24.000Z",
+          "id": "u089",
+          "role": "user",
+          "streaming": false,
+          "text": "question 89",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:24.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:25.000Z",
+          "id": "a088",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 88",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:25.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:26.000Z",
+          "id": "u088",
+          "role": "user",
+          "streaming": false,
+          "text": "question 88",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:26.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:27.000Z",
+          "id": "a087",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 87",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:27.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:28.000Z",
+          "id": "u087",
+          "role": "user",
+          "streaming": false,
+          "text": "question 87",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:28.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:29.000Z",
+          "id": "a086",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 86",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:29.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:30.000Z",
+          "id": "u086",
+          "role": "user",
+          "streaming": false,
+          "text": "question 86",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:30.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:31.000Z",
+          "id": "a085",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 85",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:31.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:32.000Z",
+          "id": "u085",
+          "role": "user",
+          "streaming": false,
+          "text": "question 85",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:32.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:33.000Z",
+          "id": "a084",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 84",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:33.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:34.000Z",
+          "id": "u084",
+          "role": "user",
+          "streaming": false,
+          "text": "question 84",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:34.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:35.000Z",
+          "id": "a083",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 83",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:35.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:36.000Z",
+          "id": "u083",
+          "role": "user",
+          "streaming": false,
+          "text": "question 83",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:36.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:37.000Z",
+          "id": "a082",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 82",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:37.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:38.000Z",
+          "id": "u082",
+          "role": "user",
+          "streaming": false,
+          "text": "question 82",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:38.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:39.000Z",
+          "id": "a081",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 81",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:39.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:40.000Z",
+          "id": "u081",
+          "role": "user",
+          "streaming": false,
+          "text": "question 81",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:40.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:41.000Z",
+          "id": "a080",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 80",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:41.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:42.000Z",
+          "id": "u080",
+          "role": "user",
+          "streaming": false,
+          "text": "question 80",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:42.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:43.000Z",
+          "id": "a079",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 79",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:43.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:44.000Z",
+          "id": "u079",
+          "role": "user",
+          "streaming": false,
+          "text": "question 79",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:44.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:45.000Z",
+          "id": "a078",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 78",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:45.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:46.000Z",
+          "id": "u078",
+          "role": "user",
+          "streaming": false,
+          "text": "question 78",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:46.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:47.000Z",
+          "id": "a077",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 77",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:47.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:48.000Z",
+          "id": "u077",
+          "role": "user",
+          "streaming": false,
+          "text": "question 77",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:48.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:49.000Z",
+          "id": "a076",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 76",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:49.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:50.000Z",
+          "id": "u076",
+          "role": "user",
+          "streaming": false,
+          "text": "question 76",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:50.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:51.000Z",
+          "id": "a075",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 75",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:51.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:52.000Z",
+          "id": "u075",
+          "role": "user",
+          "streaming": false,
+          "text": "question 75",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:52.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:53.000Z",
+          "id": "a074",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 74",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:53.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:54.000Z",
+          "id": "u074",
+          "role": "user",
+          "streaming": false,
+          "text": "question 74",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:54.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:55.000Z",
+          "id": "a073",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 73",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:55.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:56.000Z",
+          "id": "u073",
+          "role": "user",
+          "streaming": false,
+          "text": "question 73",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:56.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:57.000Z",
+          "id": "a072",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 72",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:57.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:58.000Z",
+          "id": "u072",
+          "role": "user",
+          "streaming": false,
+          "text": "question 72",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:58.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:59.000Z",
+          "id": "a071",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 71",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:59.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:60.000Z",
+          "id": "u071",
+          "role": "user",
+          "streaming": false,
+          "text": "question 71",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:60.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:61.000Z",
+          "id": "a070",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 70",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:61.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:62.000Z",
+          "id": "u070",
+          "role": "user",
+          "streaming": false,
+          "text": "question 70",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:62.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:63.000Z",
+          "id": "a069",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 69",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:63.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:64.000Z",
+          "id": "u069",
+          "role": "user",
+          "streaming": false,
+          "text": "question 69",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:64.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:65.000Z",
+          "id": "a068",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 68",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:65.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:66.000Z",
+          "id": "u068",
+          "role": "user",
+          "streaming": false,
+          "text": "question 68",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:66.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:67.000Z",
+          "id": "a067",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 67",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:67.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:68.000Z",
+          "id": "u067",
+          "role": "user",
+          "streaming": false,
+          "text": "question 67",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:68.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:69.000Z",
+          "id": "a066",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 66",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:69.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:70.000Z",
+          "id": "u066",
+          "role": "user",
+          "streaming": false,
+          "text": "question 66",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:70.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:71.000Z",
+          "id": "a065",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 65",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:71.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:72.000Z",
+          "id": "u065",
+          "role": "user",
+          "streaming": false,
+          "text": "question 65",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:72.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:73.000Z",
+          "id": "a064",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 64",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:73.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:74.000Z",
+          "id": "u064",
+          "role": "user",
+          "streaming": false,
+          "text": "question 64",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:74.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:75.000Z",
+          "id": "a063",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 63",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:75.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:76.000Z",
+          "id": "u063",
+          "role": "user",
+          "streaming": false,
+          "text": "question 63",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:76.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:77.000Z",
+          "id": "a062",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 62",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:77.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:78.000Z",
+          "id": "u062",
+          "role": "user",
+          "streaming": false,
+          "text": "question 62",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:78.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:79.000Z",
+          "id": "a061",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 61",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:79.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:80.000Z",
+          "id": "u061",
+          "role": "user",
+          "streaming": false,
+          "text": "question 61",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:80.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:81.000Z",
+          "id": "a060",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 60",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:81.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:82.000Z",
+          "id": "u060",
+          "role": "user",
+          "streaming": false,
+          "text": "question 60",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:82.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:83.000Z",
+          "id": "a059",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 59",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:83.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:84.000Z",
+          "id": "u059",
+          "role": "user",
+          "streaming": false,
+          "text": "question 59",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:84.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:85.000Z",
+          "id": "a058",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 58",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:85.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:86.000Z",
+          "id": "u058",
+          "role": "user",
+          "streaming": false,
+          "text": "question 58",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:86.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:87.000Z",
+          "id": "a057",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 57",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:87.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:88.000Z",
+          "id": "u057",
+          "role": "user",
+          "streaming": false,
+          "text": "question 57",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:88.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:89.000Z",
+          "id": "a056",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 56",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:89.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:90.000Z",
+          "id": "u056",
+          "role": "user",
+          "streaming": false,
+          "text": "question 56",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:90.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:91.000Z",
+          "id": "a055",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 55",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:91.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:92.000Z",
+          "id": "u055",
+          "role": "user",
+          "streaming": false,
+          "text": "question 55",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:92.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:93.000Z",
+          "id": "a054",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 54",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:93.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:94.000Z",
+          "id": "u054",
+          "role": "user",
+          "streaming": false,
+          "text": "question 54",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:94.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:95.000Z",
+          "id": "a053",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 53",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:95.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:96.000Z",
+          "id": "u053",
+          "role": "user",
+          "streaming": false,
+          "text": "question 53",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:96.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:97.000Z",
+          "id": "a052",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 52",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:97.000Z"
+        }
+      ],
+      "olderRows": 106,
+      "proposedPlans": [],
+      "reasoning": []
+    },
+    {
+      "activities": [],
+      "checkpoints": [],
+      "cursor": "eyJ2IjoxLCJrIjpbIjIwMjYtMDctMTJUMDA6MTU6MDAuMDAwWiIsMCwidTAxNSJdLCJvcGVuZWRBdCI6MjA1LCJlcG9jaCI6MH0",
+      "messages": [
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:98.000Z",
+          "id": "u052",
+          "role": "user",
+          "streaming": false,
+          "text": "question 52",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:98.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:99.000Z",
+          "id": "a051",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 51",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:99.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:100.000Z",
+          "id": "u051",
+          "role": "user",
+          "streaming": false,
+          "text": "question 51",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:100.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:101.000Z",
+          "id": "a050",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 50",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:101.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:102.000Z",
+          "id": "u050",
+          "role": "user",
+          "streaming": false,
+          "text": "question 50",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:102.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:103.000Z",
+          "id": "a049",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 49",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:103.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:104.000Z",
+          "id": "u049",
+          "role": "user",
+          "streaming": false,
+          "text": "question 49",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:104.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:105.000Z",
+          "id": "a048",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 48",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:105.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:106.000Z",
+          "id": "u048",
+          "role": "user",
+          "streaming": false,
+          "text": "question 48",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:106.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:107.000Z",
+          "id": "a047",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 47",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:107.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:108.000Z",
+          "id": "u047",
+          "role": "user",
+          "streaming": false,
+          "text": "question 47",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:108.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:109.000Z",
+          "id": "a046",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 46",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:109.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:110.000Z",
+          "id": "u046",
+          "role": "user",
+          "streaming": false,
+          "text": "question 46",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:110.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:111.000Z",
+          "id": "a045",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 45",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:111.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:112.000Z",
+          "id": "u045",
+          "role": "user",
+          "streaming": false,
+          "text": "question 45",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:112.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:113.000Z",
+          "id": "a044",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 44",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:113.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:114.000Z",
+          "id": "u044",
+          "role": "user",
+          "streaming": false,
+          "text": "question 44",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:114.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:115.000Z",
+          "id": "a043",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 43",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:115.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:116.000Z",
+          "id": "u043",
+          "role": "user",
+          "streaming": false,
+          "text": "question 43",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:116.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:117.000Z",
+          "id": "a042",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 42",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:117.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:118.000Z",
+          "id": "u042",
+          "role": "user",
+          "streaming": false,
+          "text": "question 42",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:118.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:119.000Z",
+          "id": "a041",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 41",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:119.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:120.000Z",
+          "id": "u041",
+          "role": "user",
+          "streaming": false,
+          "text": "question 41",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:120.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:121.000Z",
+          "id": "a040",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 40",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:121.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:122.000Z",
+          "id": "u040",
+          "role": "user",
+          "streaming": false,
+          "text": "question 40",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:122.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:123.000Z",
+          "id": "a039",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 39",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:123.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:124.000Z",
+          "id": "u039",
+          "role": "user",
+          "streaming": false,
+          "text": "question 39",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:124.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:125.000Z",
+          "id": "a038",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 38",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:125.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:126.000Z",
+          "id": "u038",
+          "role": "user",
+          "streaming": false,
+          "text": "question 38",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:126.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:127.000Z",
+          "id": "a037",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 37",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:127.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:128.000Z",
+          "id": "u037",
+          "role": "user",
+          "streaming": false,
+          "text": "question 37",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:128.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:129.000Z",
+          "id": "a036",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 36",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:129.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:130.000Z",
+          "id": "u036",
+          "role": "user",
+          "streaming": false,
+          "text": "question 36",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:130.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:131.000Z",
+          "id": "a035",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 35",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:131.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:132.000Z",
+          "id": "u035",
+          "role": "user",
+          "streaming": false,
+          "text": "question 35",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:132.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:133.000Z",
+          "id": "a034",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 34",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:133.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:134.000Z",
+          "id": "u034",
+          "role": "user",
+          "streaming": false,
+          "text": "question 34",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:134.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:135.000Z",
+          "id": "a033",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 33",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:135.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:136.000Z",
+          "id": "u033",
+          "role": "user",
+          "streaming": false,
+          "text": "question 33",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:136.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:137.000Z",
+          "id": "a032",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 32",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:137.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:138.000Z",
+          "id": "u032",
+          "role": "user",
+          "streaming": false,
+          "text": "question 32",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:138.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:139.000Z",
+          "id": "a031",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 31",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:139.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:140.000Z",
+          "id": "u031",
+          "role": "user",
+          "streaming": false,
+          "text": "question 31",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:140.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:141.000Z",
+          "id": "a030",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 30",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:141.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:142.000Z",
+          "id": "u030",
+          "role": "user",
+          "streaming": false,
+          "text": "question 30",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:142.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:143.000Z",
+          "id": "a029",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 29",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:143.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:144.000Z",
+          "id": "u029",
+          "role": "user",
+          "streaming": false,
+          "text": "question 29",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:144.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:145.000Z",
+          "id": "a028",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 28",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:145.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:146.000Z",
+          "id": "u028",
+          "role": "user",
+          "streaming": false,
+          "text": "question 28",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:146.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:147.000Z",
+          "id": "a027",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 27",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:147.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:148.000Z",
+          "id": "u027",
+          "role": "user",
+          "streaming": false,
+          "text": "question 27",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:148.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:149.000Z",
+          "id": "a026",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 26",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:149.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:150.000Z",
+          "id": "u026",
+          "role": "user",
+          "streaming": false,
+          "text": "question 26",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:150.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:151.000Z",
+          "id": "a025",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 25",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:151.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:152.000Z",
+          "id": "u025",
+          "role": "user",
+          "streaming": false,
+          "text": "question 25",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:152.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:153.000Z",
+          "id": "a024",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 24",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:153.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:154.000Z",
+          "id": "u024",
+          "role": "user",
+          "streaming": false,
+          "text": "question 24",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:154.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:155.000Z",
+          "id": "a023",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 23",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:155.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:156.000Z",
+          "id": "u023",
+          "role": "user",
+          "streaming": false,
+          "text": "question 23",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:156.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:157.000Z",
+          "id": "a022",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 22",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:157.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:158.000Z",
+          "id": "u022",
+          "role": "user",
+          "streaming": false,
+          "text": "question 22",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:158.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:159.000Z",
+          "id": "a021",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 21",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:159.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:160.000Z",
+          "id": "u021",
+          "role": "user",
+          "streaming": false,
+          "text": "question 21",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:160.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:161.000Z",
+          "id": "a020",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 20",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:161.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:162.000Z",
+          "id": "u020",
+          "role": "user",
+          "streaming": false,
+          "text": "question 20",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:162.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:163.000Z",
+          "id": "a019",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 19",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:163.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:164.000Z",
+          "id": "u019",
+          "role": "user",
+          "streaming": false,
+          "text": "question 19",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:164.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:165.000Z",
+          "id": "a018",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 18",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:165.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:166.000Z",
+          "id": "u018",
+          "role": "user",
+          "streaming": false,
+          "text": "question 18",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:166.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:167.000Z",
+          "id": "a017",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 17",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:167.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:168.000Z",
+          "id": "u017",
+          "role": "user",
+          "streaming": false,
+          "text": "question 17",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:168.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:169.000Z",
+          "id": "a016",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 16",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:169.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:170.000Z",
+          "id": "u016",
+          "role": "user",
+          "streaming": false,
+          "text": "question 16",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:170.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:171.000Z",
+          "id": "a015",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 15",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:171.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:172.000Z",
+          "id": "u015",
+          "role": "user",
+          "streaming": false,
+          "text": "question 15",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:172.000Z"
+        }
+      ],
+      "olderRows": 31,
+      "proposedPlans": [],
+      "reasoning": []
+    },
+    {
+      "activities": [
+        {
+          "createdAt": "2026-07-11T00:00:01.000Z",
+          "id": "ask",
+          "kind": "user-input.requested",
+          "payload": {
+            "questions": [],
+            "requestId": "ask-1"
+          },
+          "sequence": 204,
+          "summary": "Question",
+          "tone": "approval",
+          "turnId": null
+        }
+      ],
+      "checkpoints": [],
+      "cursor": null,
+      "messages": [
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:173.000Z",
+          "id": "a014",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 14",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:173.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:174.000Z",
+          "id": "u014",
+          "role": "user",
+          "streaming": false,
+          "text": "question 14",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:174.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:175.000Z",
+          "id": "a013",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 13",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:175.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:176.000Z",
+          "id": "u013",
+          "role": "user",
+          "streaming": false,
+          "text": "question 13",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:176.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:177.000Z",
+          "id": "a012",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 12",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:177.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:178.000Z",
+          "id": "u012",
+          "role": "user",
+          "streaming": false,
+          "text": "question 12",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:178.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:179.000Z",
+          "id": "a011",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 11",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:179.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:180.000Z",
+          "id": "u011",
+          "role": "user",
+          "streaming": false,
+          "text": "question 11",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:180.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:181.000Z",
+          "id": "a010",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 10",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:181.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:182.000Z",
+          "id": "u010",
+          "role": "user",
+          "streaming": false,
+          "text": "question 10",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:182.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:183.000Z",
+          "id": "a009",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 9",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:183.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:184.000Z",
+          "id": "u009",
+          "role": "user",
+          "streaming": false,
+          "text": "question 9",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:184.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:185.000Z",
+          "id": "a008",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 8",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:185.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:186.000Z",
+          "id": "u008",
+          "role": "user",
+          "streaming": false,
+          "text": "question 8",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:186.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:187.000Z",
+          "id": "a007",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 7",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:187.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:188.000Z",
+          "id": "u007",
+          "role": "user",
+          "streaming": false,
+          "text": "question 7",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:188.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:189.000Z",
+          "id": "a006",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 6",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:189.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:190.000Z",
+          "id": "u006",
+          "role": "user",
+          "streaming": false,
+          "text": "question 6",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:190.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:191.000Z",
+          "id": "a005",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 5",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:191.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:192.000Z",
+          "id": "u005",
+          "role": "user",
+          "streaming": false,
+          "text": "question 5",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:192.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:193.000Z",
+          "id": "a004",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 4",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:193.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:194.000Z",
+          "id": "u004",
+          "role": "user",
+          "streaming": false,
+          "text": "question 4",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:194.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:195.000Z",
+          "id": "a003",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 3",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:195.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:196.000Z",
+          "id": "u003",
+          "role": "user",
+          "streaming": false,
+          "text": "question 3",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:196.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:197.000Z",
+          "id": "a002",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 2",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:197.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:198.000Z",
+          "id": "u002",
+          "role": "user",
+          "streaming": false,
+          "text": "question 2",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:198.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:199.000Z",
+          "id": "a001",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 1",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:199.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:200.000Z",
+          "id": "u001",
+          "role": "user",
+          "streaming": false,
+          "text": "question 1",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:200.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:201.000Z",
+          "id": "a000",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 0",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:201.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:202.000Z",
+          "id": "u000",
+          "role": "user",
+          "streaming": false,
+          "text": "question 0",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:202.000Z"
+        }
+      ],
+      "olderRows": 0,
+      "proposedPlans": [],
+      "reasoning": []
+    }
+  ],
+  "stalePage": {
+    "_tag": "OrchestrationThreadHistoryStaleError",
+    "message": "The thread's history changed since this window opened."
+  },
+  "whole": {
+    "snapshotSequence": 206,
+    "thread": {
+      "activities": [
+        {
+          "createdAt": "2026-07-11T00:00:01.000Z",
+          "id": "ask",
+          "kind": "user-input.requested",
+          "payload": {
+            "questions": [],
+            "requestId": "ask-1"
+          },
+          "sequence": 204,
+          "summary": "Question",
+          "tone": "approval",
+          "turnId": null
+        }
+      ],
+      "archivedAt": null,
+      "branch": null,
+      "checkpoints": [],
+      "createdAt": "2026-07-10T10:00:00.000Z",
+      "deletedAt": null,
+      "hasActionableProposedPlan": false,
+      "hasPendingApprovals": false,
+      "hasPendingUserInput": true,
+      "id": "t1",
+      "interactionMode": "default",
+      "kind": "workspace",
+      "latestTurn": {
+        "assistantMessageId": "streaming",
+        "completedAt": null,
+        "requestedAt": "2026-07-11T00:00:01.000Z",
+        "sourceProposedPlan": null,
+        "startedAt": "2026-07-11T00:00:01.000Z",
+        "state": "running",
+        "turnId": "turn-old"
+      },
+      "latestUserMessageAt": "2026-07-11T00:00:02.000Z",
+      "messages": [
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:201.000Z",
+          "id": "a000",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 0",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:201.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:199.000Z",
+          "id": "a001",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 1",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:199.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:197.000Z",
+          "id": "a002",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 2",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:197.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:195.000Z",
+          "id": "a003",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 3",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:195.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:193.000Z",
+          "id": "a004",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 4",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:193.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:191.000Z",
+          "id": "a005",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 5",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:191.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:189.000Z",
+          "id": "a006",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 6",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:189.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:187.000Z",
+          "id": "a007",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 7",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:187.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:185.000Z",
+          "id": "a008",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 8",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:185.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:183.000Z",
+          "id": "a009",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 9",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:183.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:181.000Z",
+          "id": "a010",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 10",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:181.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:179.000Z",
+          "id": "a011",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 11",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:179.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:177.000Z",
+          "id": "a012",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 12",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:177.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:175.000Z",
+          "id": "a013",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 13",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:175.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:173.000Z",
+          "id": "a014",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 14",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:173.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:171.000Z",
+          "id": "a015",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 15",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:171.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:169.000Z",
+          "id": "a016",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 16",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:169.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:167.000Z",
+          "id": "a017",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 17",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:167.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:165.000Z",
+          "id": "a018",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 18",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:165.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:163.000Z",
+          "id": "a019",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 19",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:163.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:161.000Z",
+          "id": "a020",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 20",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:161.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:159.000Z",
+          "id": "a021",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 21",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:159.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:157.000Z",
+          "id": "a022",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 22",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:157.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:155.000Z",
+          "id": "a023",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 23",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:155.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:153.000Z",
+          "id": "a024",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 24",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:153.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:151.000Z",
+          "id": "a025",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 25",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:151.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:149.000Z",
+          "id": "a026",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 26",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:149.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:147.000Z",
+          "id": "a027",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 27",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:147.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:145.000Z",
+          "id": "a028",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 28",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:145.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:143.000Z",
+          "id": "a029",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 29",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:143.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:141.000Z",
+          "id": "a030",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 30",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:141.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:139.000Z",
+          "id": "a031",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 31",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:139.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:137.000Z",
+          "id": "a032",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 32",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:137.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:135.000Z",
+          "id": "a033",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 33",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:135.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:133.000Z",
+          "id": "a034",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 34",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:133.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:131.000Z",
+          "id": "a035",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 35",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:131.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:129.000Z",
+          "id": "a036",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 36",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:129.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:127.000Z",
+          "id": "a037",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 37",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:127.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:125.000Z",
+          "id": "a038",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 38",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:125.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:123.000Z",
+          "id": "a039",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 39",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:123.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:121.000Z",
+          "id": "a040",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 40",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:121.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:119.000Z",
+          "id": "a041",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 41",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:119.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:117.000Z",
+          "id": "a042",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 42",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:117.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:115.000Z",
+          "id": "a043",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 43",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:115.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:113.000Z",
+          "id": "a044",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 44",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:113.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:111.000Z",
+          "id": "a045",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 45",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:111.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:109.000Z",
+          "id": "a046",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 46",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:109.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:107.000Z",
+          "id": "a047",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 47",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:107.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:105.000Z",
+          "id": "a048",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 48",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:105.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:103.000Z",
+          "id": "a049",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 49",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:103.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:101.000Z",
+          "id": "a050",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 50",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:101.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:99.000Z",
+          "id": "a051",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 51",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:99.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:97.000Z",
+          "id": "a052",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 52",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:97.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:95.000Z",
+          "id": "a053",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 53",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:95.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:93.000Z",
+          "id": "a054",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 54",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:93.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:91.000Z",
+          "id": "a055",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 55",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:91.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:89.000Z",
+          "id": "a056",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 56",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:89.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:87.000Z",
+          "id": "a057",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 57",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:87.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:85.000Z",
+          "id": "a058",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 58",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:85.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:83.000Z",
+          "id": "a059",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 59",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:83.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:81.000Z",
+          "id": "a060",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 60",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:81.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:79.000Z",
+          "id": "a061",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 61",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:79.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:77.000Z",
+          "id": "a062",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 62",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:77.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:75.000Z",
+          "id": "a063",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 63",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:75.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:73.000Z",
+          "id": "a064",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 64",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:73.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:71.000Z",
+          "id": "a065",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 65",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:71.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:69.000Z",
+          "id": "a066",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 66",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:69.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:67.000Z",
+          "id": "a067",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 67",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:67.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:65.000Z",
+          "id": "a068",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 68",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:65.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:63.000Z",
+          "id": "a069",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 69",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:63.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:61.000Z",
+          "id": "a070",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 70",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:61.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:59.000Z",
+          "id": "a071",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 71",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:59.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:57.000Z",
+          "id": "a072",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 72",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:57.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:55.000Z",
+          "id": "a073",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 73",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:55.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:53.000Z",
+          "id": "a074",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 74",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:53.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:51.000Z",
+          "id": "a075",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 75",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:51.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:49.000Z",
+          "id": "a076",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 76",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:49.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:47.000Z",
+          "id": "a077",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 77",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:47.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:45.000Z",
+          "id": "a078",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 78",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:45.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:43.000Z",
+          "id": "a079",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 79",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:43.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:41.000Z",
+          "id": "a080",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 80",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:41.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:39.000Z",
+          "id": "a081",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 81",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:39.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:37.000Z",
+          "id": "a082",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 82",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:37.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:35.000Z",
+          "id": "a083",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 83",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:35.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:33.000Z",
+          "id": "a084",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 84",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:33.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:31.000Z",
+          "id": "a085",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 85",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:31.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:29.000Z",
+          "id": "a086",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 86",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:29.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:27.000Z",
+          "id": "a087",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 87",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:27.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:25.000Z",
+          "id": "a088",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 88",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:25.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:23.000Z",
+          "id": "a089",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 89",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:23.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:03.000Z",
+          "id": "a090",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 90",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:03.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:04.000Z",
+          "id": "a091",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 91",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:04.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:05.000Z",
+          "id": "a092",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 92",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:05.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:06.000Z",
+          "id": "a093",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 93",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:06.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:07.000Z",
+          "id": "a094",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 94",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:07.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:08.000Z",
+          "id": "a095",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 95",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:08.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:09.000Z",
+          "id": "a096",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 96",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:09.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:10.000Z",
+          "id": "a097",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 97",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:10.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:11.000Z",
+          "id": "a098",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 98",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:11.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:12.000Z",
+          "id": "a099",
+          "role": "assistant",
+          "streaming": false,
+          "text": "answer 99",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:12.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:01.000Z",
+          "id": "streaming",
+          "role": "assistant",
+          "streaming": true,
+          "text": "still going",
+          "turnId": "turn-old",
+          "updatedAt": "2026-07-11T00:00:01.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:202.000Z",
+          "id": "u000",
+          "role": "user",
+          "streaming": false,
+          "text": "question 0",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:202.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:200.000Z",
+          "id": "u001",
+          "role": "user",
+          "streaming": false,
+          "text": "question 1",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:200.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:198.000Z",
+          "id": "u002",
+          "role": "user",
+          "streaming": false,
+          "text": "question 2",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:198.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:196.000Z",
+          "id": "u003",
+          "role": "user",
+          "streaming": false,
+          "text": "question 3",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:196.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:194.000Z",
+          "id": "u004",
+          "role": "user",
+          "streaming": false,
+          "text": "question 4",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:194.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:192.000Z",
+          "id": "u005",
+          "role": "user",
+          "streaming": false,
+          "text": "question 5",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:192.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:190.000Z",
+          "id": "u006",
+          "role": "user",
+          "streaming": false,
+          "text": "question 6",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:190.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:188.000Z",
+          "id": "u007",
+          "role": "user",
+          "streaming": false,
+          "text": "question 7",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:188.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:186.000Z",
+          "id": "u008",
+          "role": "user",
+          "streaming": false,
+          "text": "question 8",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:186.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:184.000Z",
+          "id": "u009",
+          "role": "user",
+          "streaming": false,
+          "text": "question 9",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:184.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:182.000Z",
+          "id": "u010",
+          "role": "user",
+          "streaming": false,
+          "text": "question 10",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:182.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:180.000Z",
+          "id": "u011",
+          "role": "user",
+          "streaming": false,
+          "text": "question 11",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:180.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:178.000Z",
+          "id": "u012",
+          "role": "user",
+          "streaming": false,
+          "text": "question 12",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:178.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:176.000Z",
+          "id": "u013",
+          "role": "user",
+          "streaming": false,
+          "text": "question 13",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:176.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:174.000Z",
+          "id": "u014",
+          "role": "user",
+          "streaming": false,
+          "text": "question 14",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:174.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:172.000Z",
+          "id": "u015",
+          "role": "user",
+          "streaming": false,
+          "text": "question 15",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:172.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:170.000Z",
+          "id": "u016",
+          "role": "user",
+          "streaming": false,
+          "text": "question 16",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:170.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:168.000Z",
+          "id": "u017",
+          "role": "user",
+          "streaming": false,
+          "text": "question 17",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:168.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:166.000Z",
+          "id": "u018",
+          "role": "user",
+          "streaming": false,
+          "text": "question 18",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:166.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:164.000Z",
+          "id": "u019",
+          "role": "user",
+          "streaming": false,
+          "text": "question 19",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:164.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:162.000Z",
+          "id": "u020",
+          "role": "user",
+          "streaming": false,
+          "text": "question 20",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:162.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:160.000Z",
+          "id": "u021",
+          "role": "user",
+          "streaming": false,
+          "text": "question 21",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:160.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:158.000Z",
+          "id": "u022",
+          "role": "user",
+          "streaming": false,
+          "text": "question 22",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:158.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:156.000Z",
+          "id": "u023",
+          "role": "user",
+          "streaming": false,
+          "text": "question 23",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:156.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:154.000Z",
+          "id": "u024",
+          "role": "user",
+          "streaming": false,
+          "text": "question 24",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:154.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:152.000Z",
+          "id": "u025",
+          "role": "user",
+          "streaming": false,
+          "text": "question 25",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:152.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:150.000Z",
+          "id": "u026",
+          "role": "user",
+          "streaming": false,
+          "text": "question 26",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:150.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:148.000Z",
+          "id": "u027",
+          "role": "user",
+          "streaming": false,
+          "text": "question 27",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:148.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:146.000Z",
+          "id": "u028",
+          "role": "user",
+          "streaming": false,
+          "text": "question 28",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:146.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:144.000Z",
+          "id": "u029",
+          "role": "user",
+          "streaming": false,
+          "text": "question 29",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:144.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:142.000Z",
+          "id": "u030",
+          "role": "user",
+          "streaming": false,
+          "text": "question 30",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:142.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:140.000Z",
+          "id": "u031",
+          "role": "user",
+          "streaming": false,
+          "text": "question 31",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:140.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:138.000Z",
+          "id": "u032",
+          "role": "user",
+          "streaming": false,
+          "text": "question 32",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:138.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:136.000Z",
+          "id": "u033",
+          "role": "user",
+          "streaming": false,
+          "text": "question 33",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:136.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:134.000Z",
+          "id": "u034",
+          "role": "user",
+          "streaming": false,
+          "text": "question 34",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:134.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:132.000Z",
+          "id": "u035",
+          "role": "user",
+          "streaming": false,
+          "text": "question 35",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:132.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:130.000Z",
+          "id": "u036",
+          "role": "user",
+          "streaming": false,
+          "text": "question 36",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:130.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:128.000Z",
+          "id": "u037",
+          "role": "user",
+          "streaming": false,
+          "text": "question 37",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:128.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:126.000Z",
+          "id": "u038",
+          "role": "user",
+          "streaming": false,
+          "text": "question 38",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:126.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:124.000Z",
+          "id": "u039",
+          "role": "user",
+          "streaming": false,
+          "text": "question 39",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:124.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:122.000Z",
+          "id": "u040",
+          "role": "user",
+          "streaming": false,
+          "text": "question 40",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:122.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:120.000Z",
+          "id": "u041",
+          "role": "user",
+          "streaming": false,
+          "text": "question 41",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:120.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:118.000Z",
+          "id": "u042",
+          "role": "user",
+          "streaming": false,
+          "text": "question 42",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:118.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:116.000Z",
+          "id": "u043",
+          "role": "user",
+          "streaming": false,
+          "text": "question 43",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:116.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:114.000Z",
+          "id": "u044",
+          "role": "user",
+          "streaming": false,
+          "text": "question 44",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:114.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:112.000Z",
+          "id": "u045",
+          "role": "user",
+          "streaming": false,
+          "text": "question 45",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:112.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:110.000Z",
+          "id": "u046",
+          "role": "user",
+          "streaming": false,
+          "text": "question 46",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:110.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:108.000Z",
+          "id": "u047",
+          "role": "user",
+          "streaming": false,
+          "text": "question 47",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:108.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:106.000Z",
+          "id": "u048",
+          "role": "user",
+          "streaming": false,
+          "text": "question 48",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:106.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:104.000Z",
+          "id": "u049",
+          "role": "user",
+          "streaming": false,
+          "text": "question 49",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:104.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:102.000Z",
+          "id": "u050",
+          "role": "user",
+          "streaming": false,
+          "text": "question 50",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:102.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:100.000Z",
+          "id": "u051",
+          "role": "user",
+          "streaming": false,
+          "text": "question 51",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:100.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:98.000Z",
+          "id": "u052",
+          "role": "user",
+          "streaming": false,
+          "text": "question 52",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:98.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:96.000Z",
+          "id": "u053",
+          "role": "user",
+          "streaming": false,
+          "text": "question 53",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:96.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:94.000Z",
+          "id": "u054",
+          "role": "user",
+          "streaming": false,
+          "text": "question 54",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:94.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:92.000Z",
+          "id": "u055",
+          "role": "user",
+          "streaming": false,
+          "text": "question 55",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:92.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:90.000Z",
+          "id": "u056",
+          "role": "user",
+          "streaming": false,
+          "text": "question 56",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:90.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:88.000Z",
+          "id": "u057",
+          "role": "user",
+          "streaming": false,
+          "text": "question 57",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:88.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:86.000Z",
+          "id": "u058",
+          "role": "user",
+          "streaming": false,
+          "text": "question 58",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:86.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:84.000Z",
+          "id": "u059",
+          "role": "user",
+          "streaming": false,
+          "text": "question 59",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:84.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:82.000Z",
+          "id": "u060",
+          "role": "user",
+          "streaming": false,
+          "text": "question 60",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:82.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:80.000Z",
+          "id": "u061",
+          "role": "user",
+          "streaming": false,
+          "text": "question 61",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:80.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:78.000Z",
+          "id": "u062",
+          "role": "user",
+          "streaming": false,
+          "text": "question 62",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:78.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:76.000Z",
+          "id": "u063",
+          "role": "user",
+          "streaming": false,
+          "text": "question 63",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:76.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:74.000Z",
+          "id": "u064",
+          "role": "user",
+          "streaming": false,
+          "text": "question 64",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:74.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:72.000Z",
+          "id": "u065",
+          "role": "user",
+          "streaming": false,
+          "text": "question 65",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:72.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:70.000Z",
+          "id": "u066",
+          "role": "user",
+          "streaming": false,
+          "text": "question 66",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:70.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:68.000Z",
+          "id": "u067",
+          "role": "user",
+          "streaming": false,
+          "text": "question 67",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:68.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:66.000Z",
+          "id": "u068",
+          "role": "user",
+          "streaming": false,
+          "text": "question 68",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:66.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:64.000Z",
+          "id": "u069",
+          "role": "user",
+          "streaming": false,
+          "text": "question 69",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:64.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:62.000Z",
+          "id": "u070",
+          "role": "user",
+          "streaming": false,
+          "text": "question 70",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:62.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:60.000Z",
+          "id": "u071",
+          "role": "user",
+          "streaming": false,
+          "text": "question 71",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:60.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:58.000Z",
+          "id": "u072",
+          "role": "user",
+          "streaming": false,
+          "text": "question 72",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:58.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:56.000Z",
+          "id": "u073",
+          "role": "user",
+          "streaming": false,
+          "text": "question 73",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:56.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:54.000Z",
+          "id": "u074",
+          "role": "user",
+          "streaming": false,
+          "text": "question 74",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:54.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:52.000Z",
+          "id": "u075",
+          "role": "user",
+          "streaming": false,
+          "text": "question 75",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:52.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:50.000Z",
+          "id": "u076",
+          "role": "user",
+          "streaming": false,
+          "text": "question 76",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:50.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:48.000Z",
+          "id": "u077",
+          "role": "user",
+          "streaming": false,
+          "text": "question 77",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:48.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:46.000Z",
+          "id": "u078",
+          "role": "user",
+          "streaming": false,
+          "text": "question 78",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:46.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:44.000Z",
+          "id": "u079",
+          "role": "user",
+          "streaming": false,
+          "text": "question 79",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:44.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:42.000Z",
+          "id": "u080",
+          "role": "user",
+          "streaming": false,
+          "text": "question 80",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:42.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:40.000Z",
+          "id": "u081",
+          "role": "user",
+          "streaming": false,
+          "text": "question 81",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:40.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:38.000Z",
+          "id": "u082",
+          "role": "user",
+          "streaming": false,
+          "text": "question 82",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:38.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:36.000Z",
+          "id": "u083",
+          "role": "user",
+          "streaming": false,
+          "text": "question 83",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:36.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:34.000Z",
+          "id": "u084",
+          "role": "user",
+          "streaming": false,
+          "text": "question 84",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:34.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:32.000Z",
+          "id": "u085",
+          "role": "user",
+          "streaming": false,
+          "text": "question 85",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:32.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:30.000Z",
+          "id": "u086",
+          "role": "user",
+          "streaming": false,
+          "text": "question 86",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:30.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:28.000Z",
+          "id": "u087",
+          "role": "user",
+          "streaming": false,
+          "text": "question 87",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:28.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:26.000Z",
+          "id": "u088",
+          "role": "user",
+          "streaming": false,
+          "text": "question 88",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:26.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:24.000Z",
+          "id": "u089",
+          "role": "user",
+          "streaming": false,
+          "text": "question 89",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:24.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:13.000Z",
+          "id": "u090",
+          "role": "user",
+          "streaming": false,
+          "text": "question 90",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:13.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:14.000Z",
+          "id": "u091",
+          "role": "user",
+          "streaming": false,
+          "text": "question 91",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:14.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:15.000Z",
+          "id": "u092",
+          "role": "user",
+          "streaming": false,
+          "text": "question 92",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:15.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:16.000Z",
+          "id": "u093",
+          "role": "user",
+          "streaming": false,
+          "text": "question 93",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:16.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:17.000Z",
+          "id": "u094",
+          "role": "user",
+          "streaming": false,
+          "text": "question 94",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:17.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:18.000Z",
+          "id": "u095",
+          "role": "user",
+          "streaming": false,
+          "text": "question 95",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:18.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:19.000Z",
+          "id": "u096",
+          "role": "user",
+          "streaming": false,
+          "text": "question 96",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:19.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:20.000Z",
+          "id": "u097",
+          "role": "user",
+          "streaming": false,
+          "text": "question 97",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:20.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:21.000Z",
+          "id": "u098",
+          "role": "user",
+          "streaming": false,
+          "text": "question 98",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:21.000Z"
+        },
+        {
+          "attachments": [],
+          "createdAt": "2026-07-11T00:00:02.000Z",
+          "id": "u099",
+          "role": "user",
+          "streaming": false,
+          "text": "question 99",
+          "turnId": null,
+          "updatedAt": "2026-07-11T00:00:02.000Z"
+        }
+      ],
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5"
+      },
+      "projectId": "p1",
+      "proposedPlans": [],
+      "reasoning": [],
+      "runtimeMode": "full-access",
+      "session": null,
+      "title": "Thread",
+      "unresolvedDelivery": null,
+      "updatedAt": "2026-07-11T00:00:01.000Z",
+      "worktreePath": null
+    }
+  }
+}

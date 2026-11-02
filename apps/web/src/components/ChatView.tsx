@@ -96,6 +96,7 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@bibcode/client-runtime/state/runtime";
+import { threadHasMessages } from "@bibcode/client-runtime/state/thread-history";
 import {
   selectWorktreeCatalogCapabilityPolicy,
   selectWorktreeWorkspaceActionsAvailable,
@@ -298,7 +299,8 @@ import {
   serverEnvironment,
 } from "../state/server";
 import { terminalEnvironment } from "../state/terminal";
-import { threadEnvironment } from "../state/threads";
+import { runOlderHistoryLoad } from "../state/olderHistoryLoad";
+import { threadEnvironment, useThreadOlderHistory } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
@@ -308,7 +310,7 @@ import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/Composer
 import { historyUnavailableReason } from "./chat/ComposerHistoryMenu.logic";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
-import { MessagesTimeline } from "./chat/MessagesTimeline";
+import { MessagesTimeline, type TimelineOlderHistory } from "./chat/MessagesTimeline";
 import { ChatHeaderActions } from "./chat/ChatHeaderActions";
 import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
@@ -2690,8 +2692,27 @@ function ChatViewContent(props: ChatViewProps) {
         timelineMessages.filter((message) => !isQueuedTimelineMessage(message)),
         activeThread?.proposedPlans ?? [],
         workLogEntries,
+        activeThread?.history,
       ),
-    [activeThread?.proposedPlans, timelineMessages, workLogEntries],
+    [activeThread?.history, activeThread?.proposedPlans, timelineMessages, workLogEntries],
+  );
+  // Older history still on the server (#226): the timeline's top row and scroll load its pages.
+  const olderHistoryLoading = useThreadOlderHistory(routeKind === "server" ? routeThreadRef : null);
+  const onLoadOlderHistory = useCallback(() => {
+    if (olderHistoryLoading) runOlderHistoryLoad(olderHistoryLoading.loadOlder);
+  }, [olderHistoryLoading]);
+  const hasOlderHistory = activeThread?.history?.hasOlder === true;
+  const olderHistoryRows = activeThread?.history?.olderRows ?? 0;
+  const timelineOlderHistory = useMemo<TimelineOlderHistory | null>(
+    () =>
+      hasOlderHistory && olderHistoryLoading
+        ? {
+            olderRows: olderHistoryRows,
+            status: olderHistoryLoading.status,
+            onLoadOlder: onLoadOlderHistory,
+          }
+        : null,
+    [hasOlderHistory, olderHistoryLoading, olderHistoryRows, onLoadOlderHistory],
   );
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
@@ -2815,7 +2836,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   const envLocked = Boolean(
     activeThread &&
-    (activeThread.messages.length > 0 ||
+    (threadHasMessages(activeThread) ||
       (activeThread.session !== null && activeThread.session.status !== "stopped")),
   );
 
@@ -4283,7 +4304,7 @@ function ChatViewContent(props: ChatViewProps) {
   const canOverrideServerThreadEnvMode = Boolean(
     isServerThread &&
     activeThread &&
-    activeThread.messages.length === 0 &&
+    !threadHasMessages(activeThread) &&
     activeThread.worktreePath === null &&
     !envLocked,
   );
@@ -5576,7 +5597,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       if (currentQueueThreadKeyRef.current !== routeThreadKey) return;
       const threadIdForSend = activeThread.id;
-      const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
+      const isFirstMessage = !isServerThread || !threadHasMessages(activeThread);
       const baseBranchForWorktree =
         isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath
           ? activeThreadBranch
@@ -7180,6 +7201,7 @@ function ChatViewContent(props: ChatViewProps) {
                       isHostFindSurface={!isPanel}
                       onFindFocusComposer={focusComposer}
                       onReasoningRowToggle={onReasoningRowToggle}
+                      olderHistory={timelineOlderHistory}
                     />
 
                     {/* scroll to end pill — shown when user has scrolled away from the live edge */}

@@ -47,6 +47,8 @@ use super::provider_runtime::{
 use super::turn_delivery::TurnDeliveryService;
 use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
+mod thread_history;
+
 const STREAM_CAPACITY: usize = 16;
 /// Use the History page target (`COMMIT_PAGE_TARGET_BYTES`): 1 MiB of event JSON.
 const REPLAY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
@@ -253,6 +255,13 @@ fn register_orchestration_rpc_inner(
             async move { handle_query(&engine, availability.as_ref(), request, cancellation).await }
         });
     }
+
+    // A local database read, like `replayEvents`: not in `is_long_running`.
+    let pages = engine.clone();
+    registry.register_unary("orchestration.getThreadHistoryPage", move |request, _| {
+        let pages = pages.clone();
+        async move { thread_history::history_page(&pages, decode(request)?).await }
+    });
 
     let shell = engine.clone();
     registry.register_stream(
@@ -884,7 +893,7 @@ async fn prepare_attachments(
     Ok((command, None))
 }
 
-async fn handle_query(
+pub(super) async fn handle_query(
     engine: &OrchestrationEngine,
     availability: Option<&WorkspaceAdmissionController>,
     request: RpcRequest,
@@ -964,24 +973,29 @@ async fn diff(
     let tag = request.error_tag;
     // Only a captured checkpoint is a turn's end state, as for revert: a ref of a turn not
     // captured (`missing`) or given up (`error`) may hold a later checkout. Turn 0 is the ref 0
-    // baseline. The start of a one-turn range is vouched for by its end being `ready`, which
-    // required that ref.
+    // baseline. The start of a one-turn range is vouched for only by its end's diff: its end was
+    // captured against that start as a trusted baseline.
+    let one_turn = request.to_turn_count == request.from_turn_count + 1;
     for turn_count in [request.from_turn_count, request.to_turn_count] {
-        let vouched = turn_count == 0
-            || (turn_count == request.from_turn_count && request.to_turn_count == turn_count + 1);
-        if vouched {
+        if turn_count == 0 || (one_turn && turn_count == request.from_turn_count) {
             continue;
         }
-        let captured = engine
+        let Some(checkpoint) = engine
             .repositories()
             .get_checkpoint(request.thread_id.clone(), turn_count)
             .await
             .map_err(|error| orchestration_error(tag, error))?
-            .is_some_and(|checkpoint| checkpoint.status == "ready");
-        if !captured {
+            .filter(|checkpoint| checkpoint.status == "ready")
+        else {
             return Err(orchestration_error(
                 tag,
                 super::orchestration_effects::uncaptured_diff_detail(turn_count),
+            ));
+        };
+        if one_turn && !checkpoint.diff_available {
+            return Err(orchestration_error(
+                tag,
+                super::orchestration_effects::no_baseline_diff_detail(turn_count),
             ));
         }
     }
@@ -1436,7 +1450,15 @@ fn thread_stream_with_keys(
     // startup can publish a session update while this snapshot is loading.
     let mut events = engine.subscribe_events();
     tokio::spawn(async move {
-        let first = thread_snapshot(&engine, &input.thread_id).await;
+        // Without `history` the stream is today's, byte for byte.
+        let mut window = input
+            .history
+            .as_ref()
+            .map(thread_history::HistoryWindow::new);
+        let first = match window.as_mut() {
+            Some(window) => window.read(&engine, &input.thread_id).await.0,
+            None => thread_snapshot(&engine, &input.thread_id).await,
+        };
         // What the subscriber holds of the last snapshot, for a client that applies patches.
         let hold = |snapshot: &RpcResult| {
             snapshot
@@ -1476,14 +1498,21 @@ fn thread_stream_with_keys(
                 () = cancellation.cancelled() => return,
                 () = async { tokio::time::sleep_until(due.expect("guarded")).await }, if due.is_some() => {
                     due = None;
-                    let next = thread_snapshot(&engine, &input.thread_id).await;
+                    // Every re-read, whatever woke it, checks the window's history epoch: a
+                    // revert, seen or lost to `Lagged`, re-windows and sends a snapshot.
+                    let (next, rewindowed) = match window.as_mut() {
+                        Some(window) => window.read(&engine, &input.thread_id).await,
+                        None => (thread_snapshot(&engine, &input.thread_id).await, false),
+                    };
                     let next_held = hold(&next);
                     let revision = next_held.as_ref().map(|held| held.revision(keys));
                     // A whole thread per update re-sent megabytes for long threads and
                     // saturated slow remote links (#89): a client that applies patches
                     // gets only what changed since the snapshot it holds.
                     let patch = match (&next, &held) {
-                        (Ok(next), Some(held)) if input.patches => Some(thread_patch(held, next)),
+                        (Ok(next), Some(held)) if input.patches && !rewindowed => {
+                            Some(thread_patch(held, next))
+                        }
                         _ => None,
                     };
                     let sent = match patch {
@@ -1766,7 +1795,7 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
             rows.checkpoints
                 .iter()
                 .map(|row| {
-                    json!({
+                    let mut checkpoint = json!({
                         "turnId": row.turn_id,
                         "checkpointTurnCount": row.checkpoint_turn_count,
                         "checkpointRef": row.checkpoint_ref,
@@ -1774,7 +1803,12 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
                         "files": row.files,
                         "assistantMessageId": row.assistant_message_id,
                         "completedAt": row.completed_at,
-                    })
+                    });
+                    // Absent means true, so older clients and fixtures read it unchanged.
+                    if !row.diff_available {
+                        checkpoint["diffAvailable"] = json!(false);
+                    }
+                    checkpoint
                 })
                 .collect(),
         ),
@@ -2323,6 +2357,9 @@ struct SubscribeThreadInput {
     /// The last revision the client applied; older clients omit it.
     #[serde(default)]
     resume: Option<ResumeThreadInput>,
+    /// The client opens a history window (#226); older clients omit it and get the whole thread.
+    #[serde(default)]
+    history: Option<thread_history::HistoryInput>,
 }
 
 #[derive(Deserialize)]
@@ -2968,6 +3005,7 @@ mod tests {
                 checkpoint_ref: "refs/checkpoint/1".to_owned(),
                 status: "ready".to_owned(),
                 files: json!([]),
+                diff_available: true,
                 assistant_message_id: None,
                 completed_at: "2026-07-11T00:00:06.000Z".to_owned(),
             })
@@ -3416,6 +3454,7 @@ mod tests {
             checkpoint_ref: "refs/checkpoints/owned".to_owned(),
             status: "ready".to_owned(),
             files: json!([]),
+            diff_available: true,
             assistant_message_id: None,
             completed_at: CREATED_AT.to_owned(),
         }];
@@ -3496,6 +3535,7 @@ mod tests {
             checkpoint_turn_count: i64::try_from(turn).unwrap(),
             checkpoint_ref: format!("refs/checkpoints/{turn}"),
             status: "ready".to_owned(),
+            diff_available: true,
             files: Value::Array(
                 (0..count)
                     .map(|index| {
@@ -7972,6 +8012,613 @@ mod tests {
         provider.shutdown().await.unwrap();
         engine.shutdown().await;
     }
+
+    // The thread history window (#226) through the real stream, engine and projections.
+
+    /// Imports `turns` turns (a user message and its reply) a minute apart after `CREATED_AT`.
+    async fn import_turns(engine: &OrchestrationEngine, thread_id: &str, turns: usize) {
+        let messages = (0..turns)
+            .flat_map(|turn| {
+                let at = |second: usize| format!("2026-07-12T{:02}:{:02}:{second:02}.000Z", turn / 60, turn % 60);
+                [
+                    json!({"messageId": format!("u{turn:03}"), "role": "user", "text": format!("question {turn}"), "createdAt": at(0)}),
+                    json!({"messageId": format!("a{turn:03}"), "role": "assistant", "text": format!("answer {turn}"), "createdAt": at(30)}),
+                ]
+            })
+            .collect::<Vec<_>>();
+        engine
+            .dispatch(decode_command(json!({
+                "type": "thread.history.import", "commandId": "import", "threadId": thread_id,
+                "messages": messages,
+            })))
+            .await
+            .expect("history imported");
+    }
+
+    async fn dispatch_all(engine: &OrchestrationEngine, commands: Vec<Value>) {
+        for command in commands {
+            engine
+                .dispatch(decode_command(command))
+                .await
+                .expect("command accepted");
+        }
+    }
+
+    fn windowed(thread_id: &str, floor: Option<&Value>, resume_from: Option<&Value>) -> Value {
+        let mut payload = match resume_from {
+            Some(item) => resume(thread_id, item),
+            None => json!({ "threadId": thread_id, "patches": true }),
+        };
+        payload["history"] = match floor {
+            Some(floor) => json!({ "floor": floor }),
+            None => json!({}),
+        };
+        payload
+    }
+
+    fn thread_of(item: &Value) -> &Value {
+        &item["snapshot"]["thread"]
+    }
+
+    fn floor_of(thread: &Value) -> Value {
+        thread["history"]["floor"].clone()
+    }
+
+    fn ids_of(thread: &Value, name: &str) -> Vec<String> {
+        thread[name]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|row| row["id"].as_str().expect("an id").to_owned())
+            .collect()
+    }
+
+    /// Applies a `patch` item to the thread a subscriber holds, as the client does.
+    fn apply_patch(thread: &mut Value, item: &Value) {
+        assert_eq!(item["kind"], "patch", "{item}");
+        let patch = &item["patch"];
+        for (key, value) in patch["set"].as_object().expect("set") {
+            thread[key] = value.clone();
+        }
+        for key in patch["unset"].as_array().expect("unset") {
+            thread
+                .as_object_mut()
+                .unwrap()
+                .remove(key.as_str().unwrap());
+        }
+        for (key, array) in patch["arrays"].as_object().expect("arrays") {
+            let entries = thread[key].as_array_mut().expect("a held array");
+            let length = array["length"].as_u64().unwrap() as usize;
+            entries.resize(length, Value::Null);
+            for change in array["changes"].as_array().unwrap() {
+                entries[change[0].as_u64().unwrap() as usize] = change[1].clone();
+            }
+        }
+    }
+
+    /// Applies stream items to the held thread until `until` holds.
+    async fn follow(
+        stream: &mut mpsc::Receiver<RpcStreamChunk>,
+        thread: &mut Value,
+        until: impl Fn(&Value) -> bool,
+    ) {
+        loop {
+            let item = next_items(stream).await.remove(0);
+            if item["kind"] == "snapshot" {
+                *thread = thread_of(&item).clone();
+            } else {
+                apply_patch(thread, &item);
+            }
+            if until(thread) {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clients_without_the_history_flag_get_the_full_thread_byte_identical() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let expected = thread_snapshot(&engine, &thread_id)
+            .await
+            .expect("snapshot");
+        for payload in [
+            json!({ "threadId": thread_id, "patches": true }),
+            json!({ "threadId": thread_id, "patches": true, "history": null }),
+            json!({ "threadId": thread_id }),
+        ] {
+            let mut stream = subscribe_thread(&engine, payload, keys, &cancellation);
+            let item = next_items(&mut stream).await.remove(0);
+            assert_eq!(
+                serde_json::to_vec(&item["snapshot"]).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(thread_of(&item).get("history").is_none());
+        }
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn windowed_stream_patches_a_new_message_and_never_removes_rows_outside_the_window() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let opened = next_items(&mut stream).await.remove(0);
+        let mut held = thread_of(&opened).clone();
+        assert_eq!(held["history"]["hasOlder"], true);
+        assert_eq!(
+            held["messages"].as_array().unwrap().len(),
+            20,
+            "ten whole turns"
+        );
+        assert_eq!(held["history"]["olderRows"], 40);
+        let before = ids_of(&held, "messages");
+
+        dispatch_all(&engine, vec![
+            json!({"type":"thread.message.assistant.delta","commandId":"new-1","threadId":thread_id,"messageId":"a-new","delta":"more","turnId":"turn-new","createdAt":"2026-07-13T00:00:00.000Z"}),
+            json!({"type":"thread.message.assistant.complete","commandId":"new-2","threadId":thread_id,"messageId":"a-new","turnId":"turn-new","createdAt":"2026-07-13T00:00:01.000Z"}),
+        ])
+        .await;
+        let mut lengths = vec![held["messages"].as_array().unwrap().len()];
+        follow(&mut stream, &mut held, |thread| {
+            thread["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "a-new" && row["streaming"] == false)
+        })
+        .await;
+        lengths.push(held["messages"].as_array().unwrap().len());
+        assert_eq!(lengths, [20, 21], "one row entered and none left");
+        let after = ids_of(&held, "messages");
+        assert!(before.iter().all(|id| after.contains(id)));
+        assert_eq!(held["history"]["olderRows"], 40);
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_backdated_message_after_a_withdrawn_queued_message_joins_the_window() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let mut held = thread_of(&next_items(&mut stream).await.remove(0)).clone();
+        let has =
+            |thread: &Value, id: &str| ids_of(thread, "messages").iter().any(|held| held == id);
+
+        // Queued at `CREATED_AT`, a day before the imported history: live, so in the window.
+        seed_delivery(
+            &engine,
+            "queued",
+            &thread_id,
+            "queued-message",
+            TurnDeliveryState::Queued,
+        )
+        .await;
+        follow(&mut stream, &mut held, |thread| {
+            has(thread, "queued-message")
+        })
+        .await;
+        engine
+            .dispatch(delivery_resolution(
+                "withdraw",
+                &thread_id,
+                "queued-message",
+                "cancel",
+            ))
+            .await
+            .expect("withdrawn");
+        follow(&mut stream, &mut held, |thread| {
+            !has(thread, "queued-message")
+        })
+        .await;
+
+        // SQLite may hand the withdrawn row's rowid to the next insert; the write sequence
+        // still says this backdated row was written after the window opened.
+        dispatch_all(&engine, vec![
+            json!({"type":"thread.message.assistant.delta","commandId":"late-1","threadId":thread_id,"messageId":"backdated","delta":"late","turnId":"turn-late","createdAt":CREATED_AT}),
+            json!({"type":"thread.message.assistant.complete","commandId":"late-2","threadId":thread_id,"messageId":"backdated","turnId":"turn-late","createdAt":CREATED_AT}),
+        ])
+        .await;
+        follow(&mut stream, &mut held, |thread| {
+            thread["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "backdated" && row["streaming"] == false)
+        })
+        .await;
+        assert_eq!(held["history"]["olderRows"], 40);
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_settled_row_below_the_floor_that_changes_moves_into_the_window() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let old = "2026-07-12T00:00:10.000Z";
+        let failure = |summary: &str, command: &str| json!({"type":"thread.activity.append","commandId":command,"threadId":thread_id,"activity":{"id":"old-failure","tone":"error","kind":"runtime.error","summary":summary,"payload":{},"turnId":null,"createdAt":old},"createdAt":old});
+        dispatch_all(&engine, vec![failure("Failed", "fail-1")]).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let mut held = thread_of(&next_items(&mut stream).await.remove(0)).clone();
+        assert!(ids_of(&held, "activities").is_empty(), "below the floor");
+
+        dispatch_all(&engine, vec![failure("Dismissed", "fail-2")]).await;
+        follow(&mut stream, &mut held, |thread| {
+            !ids_of(thread, "activities").is_empty()
+        })
+        .await;
+        assert_eq!(held["activities"][0]["summary"], "Dismissed");
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_streaming_row_below_the_floor_stays_in_the_window_through_deltas_and_settlement() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let delta = |command: &str, text: &str| json!({"type":"thread.message.assistant.delta","commandId":command,"threadId":thread_id,"messageId":"long-reply","delta":text,"turnId":"turn-long","createdAt":"2026-07-12T00:00:05.000Z"});
+        dispatch_all(&engine, vec![delta("d1", "one ")]).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let mut held = thread_of(&next_items(&mut stream).await.remove(0)).clone();
+        let reply = |thread: &Value| {
+            thread["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "long-reply")
+                .cloned()
+        };
+        assert_eq!(reply(&held).expect("live at open")["text"], "one ");
+        dispatch_all(&engine, vec![delta("d2", "two")]).await;
+        follow(&mut stream, &mut held, |thread| {
+            reply(thread).is_some_and(|row| row["text"] == "one two")
+        })
+        .await;
+        dispatch_all(&engine, vec![json!({"type":"thread.message.assistant.complete","commandId":"d3","threadId":thread_id,"messageId":"long-reply","turnId":"turn-long","createdAt":"2026-07-12T00:00:06.000Z"})]).await;
+        follow(&mut stream, &mut held, |thread| {
+            reply(thread).is_some_and(|row| row["streaming"] == false)
+        })
+        .await;
+        rename(&engine, &thread_id, 1).await;
+        follow(&mut stream, &mut held, |thread| {
+            thread["title"] == "Title 1"
+        })
+        .await;
+        assert!(reply(&held).is_some(), "settled, it stays in the window");
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn windowed_resubscribe_at_the_current_revision_sends_unchanged() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut first = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let opened = next_items(&mut first).await.remove(0);
+        drop(first);
+        let floor = floor_of(thread_of(&opened));
+        let mut resumed = subscribe_thread(
+            &engine,
+            windowed(&thread_id, Some(&floor), Some(&opened)),
+            keys,
+            &cancellation,
+        );
+        let unchanged = next_items(&mut resumed).await.remove(0);
+        assert_eq!(unchanged["kind"], "unchanged", "{unchanged}");
+        assert_eq!(unchanged["revision"], opened["revision"]);
+        // Without its floor, a resubscribe gets a fresh window: the same one while nothing changed.
+        let mut other = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, Some(&opened)),
+            keys,
+            &cancellation,
+        );
+        let item = next_items(&mut other).await.remove(0);
+        assert_eq!(item["kind"], "unchanged", "the same fresh window: {item}");
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn windowed_resubscribe_with_its_floor_keeps_the_floor_after_a_change() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut first = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let opened = next_items(&mut first).await.remove(0);
+        drop(first);
+        let floor = floor_of(thread_of(&opened));
+        // Ten more turns: a fresh window would start higher.
+        dispatch_all(&engine, (0..10).flat_map(|turn| {
+            let at = format!("2026-07-14T00:{turn:02}:00.000Z");
+            [
+                json!({"type":"thread.message.assistant.delta","commandId":format!("more-{turn}"),"threadId":thread_id,"messageId":format!("more-{turn}"),"delta":"more","turnId":format!("turn-more-{turn}"),"createdAt":at}),
+                json!({"type":"thread.message.assistant.complete","commandId":format!("done-{turn}"),"threadId":thread_id,"messageId":format!("more-{turn}"),"turnId":format!("turn-more-{turn}"),"createdAt":at}),
+            ]
+        }).collect()).await;
+        let mut resumed = subscribe_thread(
+            &engine,
+            windowed(&thread_id, Some(&floor), Some(&opened)),
+            keys,
+            &cancellation,
+        );
+        let item = next_items(&mut resumed).await.remove(0);
+        assert_eq!(item["kind"], "snapshot");
+        assert_eq!(
+            floor_of(thread_of(&item)),
+            floor,
+            "the pages the client holds stay contiguous"
+        );
+        assert_eq!(thread_of(&item)["messages"].as_array().unwrap().len(), 30);
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    fn revert(thread_id: &str, command: &str) -> Value {
+        json!({"type":"thread.revert.complete","commandId":command,"threadId":thread_id,"turnCount":0,"createdAt":"2026-07-15T00:00:00.000Z"})
+    }
+
+    #[tokio::test]
+    async fn a_live_revert_rewindows_the_subscription() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let opened = next_items(&mut stream).await.remove(0);
+        dispatch_all(&engine, vec![revert(&thread_id, "revert")]).await;
+        let item = next_items(&mut stream).await.remove(0);
+        assert_eq!(
+            item["kind"], "snapshot",
+            "a revert sends a new window, never a patch: {item}"
+        );
+        assert_ne!(floor_of(thread_of(&item)), floor_of(thread_of(&opened)));
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_revert_lost_to_lag_rewindows_on_the_next_read() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &cancellation,
+        );
+        let opened = next_items(&mut stream).await.remove(0);
+        // Unread patches fill the stream until its task waits to send, and stops reading events.
+        for index in 0..(STREAM_CAPACITY + 2) {
+            rename(&engine, &thread_id, index).await;
+            tokio::time::sleep(THREAD_UPDATE_COALESCE + Duration::from_millis(40)).await;
+        }
+        // More events than the event channel holds, the revert among them: the receiver lags.
+        dispatch_all(&engine, vec![revert(&thread_id, "revert")]).await;
+        dispatch_all(&engine, (0..200).map(|index| json!({"type":"thread.activity.append","commandId":format!("flood-{index}"),"threadId":thread_id,"activity":{"id":format!("flood-{index}"),"tone":"info","kind":"status","summary":"flood","payload":{},"turnId":null,"createdAt":"2026-07-16T00:00:00.000Z"},"createdAt":"2026-07-16T00:00:00.000Z"})).collect()).await;
+        loop {
+            let item = next_items(&mut stream).await.remove(0);
+            if item["kind"] == "snapshot" {
+                assert_ne!(floor_of(thread_of(&item)), floor_of(thread_of(&opened)));
+                break;
+            }
+            assert_eq!(item["kind"], "patch");
+        }
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_resubscribe_after_a_missed_revert_gets_a_fresh_window() {
+        let (_database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let cancellation = CancellationToken::new();
+        let keys = default_thread_revision_keys();
+        let subscription = CancellationToken::new();
+        let mut first = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            keys,
+            &subscription,
+        );
+        let opened = next_items(&mut first).await.remove(0);
+        subscription.cancel();
+        drop(first);
+        let floor = floor_of(thread_of(&opened));
+        dispatch_all(&engine, vec![revert(&thread_id, "revert")]).await;
+        let mut resumed = subscribe_thread(
+            &engine,
+            windowed(&thread_id, Some(&floor), Some(&opened)),
+            keys,
+            &cancellation,
+        );
+        let item = next_items(&mut resumed).await.remove(0);
+        assert_eq!(item["kind"], "snapshot");
+        assert_ne!(floor_of(thread_of(&item)), floor);
+        // A page from the old window answers stale.
+        let stale = thread_history::history_page(
+            &engine,
+            serde_json::from_value(json!({ "threadId": thread_id, "cursor": floor })).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale["_tag"], "OrchestrationThreadHistoryStaleError");
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// An OpenCode ask survives a restart of either side (#187); recovered without a turn, it
+    /// still reaches the composer of a windowed thread.
+    #[tokio::test]
+    async fn a_recovered_turnless_opencode_ask_below_the_floor_is_carried() {
+        let (database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        import_turns(&engine, &thread_id, 30).await;
+        let old = "2026-07-12T00:00:10.000Z";
+        dispatch_all(&engine, vec![
+            json!({"type":"thread.session.set","commandId":"session","threadId":thread_id,"session":{"threadId":thread_id,"status":"ready","providerName":"opencode","providerInstanceId":"opencode","runtimeMode":"full-access","activeTurnId":null,"lastError":null,"updatedAt":old},"createdAt":old}),
+            json!({"type":"thread.activity.append","commandId":"ask","threadId":thread_id,"activity":{"id":"recovered-ask","tone":"approval","kind":"user-input.requested","summary":"Question","payload":{"requestId":"ask-1","questions":[]},"turnId":null,"createdAt":old},"createdAt":old}),
+        ])
+        .await;
+        engine.shutdown().await;
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine restarts");
+        let cancellation = CancellationToken::new();
+        let mut stream = subscribe_thread(
+            &engine,
+            windowed(&thread_id, None, None),
+            default_thread_revision_keys(),
+            &cancellation,
+        );
+        let thread = thread_of(&next_items(&mut stream).await.remove(0)).clone();
+        assert!(!ids_of(&thread, "activities").contains(&"recovered-ask".to_owned()));
+        assert_eq!(
+            ids_of(&thread["history"]["carried"], "activities"),
+            ["recovered-ask"]
+        );
+        cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    /// The window wire contract: a subscribe with `history`, the windowed snapshot with a live
+    /// and a carried row, a patch, every page, a stale page, and the whole thread the client
+    /// merges them back into. `threadStreamParity.test.ts` decodes and merges it. Regenerate
+    /// with `BIBCODE_UPDATE_THREAD_STREAM_FIXTURE=1`.
+    #[tokio::test]
+    async fn thread_stream_window_fixture_matches_the_wire() {
+        const AT: &str = "2026-07-10T10:00:00.000Z";
+        let engine = migrated_engine().await;
+        dispatch_all(&engine, vec![
+            json!({"type":"project.create","commandId":"c01","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","defaultModelSelection":null,"createdAt":AT}),
+            json!({"type":"thread.create","commandId":"c02","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","branch":null,"worktreePath":null,"createdAt":AT}),
+        ])
+        .await;
+        import_turns(&engine, "t1", 100).await;
+        let old = "2026-07-12T00:00:10.000Z";
+        dispatch_all(&engine, vec![
+            json!({"type":"thread.activity.append","commandId":"c03","threadId":"t1","activity":{"id":"ask","tone":"approval","kind":"user-input.requested","summary":"Question","payload":{"requestId":"ask-1","questions":[]},"turnId":null,"createdAt":old},"createdAt":old}),
+            json!({"type":"thread.message.assistant.delta","commandId":"c04","threadId":"t1","messageId":"streaming","delta":"still ","turnId":"turn-old","createdAt":old}),
+        ])
+        .await;
+        let cancellation = CancellationToken::new();
+        let input = windowed("t1", None, None);
+        let mut stream = subscribe_thread(
+            &engine,
+            input.clone(),
+            default_thread_revision_keys(),
+            &cancellation,
+        );
+        let snapshot = next_items(&mut stream).await.remove(0);
+        dispatch_all(&engine, vec![
+            json!({"type":"thread.message.assistant.delta","commandId":"c05","threadId":"t1","messageId":"streaming","delta":"going","turnId":"turn-old","createdAt":old}),
+        ])
+        .await;
+        let patch = next_items(&mut stream).await.remove(0);
+        cancellation.cancel();
+        let mut pages = Vec::new();
+        let mut cursor = floor_of(thread_of(&snapshot));
+        while let Some(text) = cursor.as_str().map(str::to_owned) {
+            let page = thread_history::history_page(
+                &engine,
+                serde_json::from_value(json!({ "threadId": "t1", "cursor": text })).unwrap(),
+            )
+            .await
+            .expect("a page");
+            cursor = page["cursor"].clone();
+            pages.push(page);
+        }
+        let whole = thread_snapshot(&engine, "t1")
+            .await
+            .expect("the whole thread");
+        dispatch_all(&engine, vec![revert("t1", "c06")]).await;
+        let stale = thread_history::history_page(
+            &engine,
+            serde_json::from_value(
+                json!({ "threadId": "t1", "cursor": floor_of(thread_of(&snapshot)) }),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let mut fixture = stable_ids_and_clock_times(
+            json!({ "input": input, "items": [snapshot, patch], "pages": pages, "stalePage": stale, "whole": whole }),
+            AT,
+        );
+        for item in fixture["items"].as_array_mut().unwrap() {
+            item["revision"] = json!("revision");
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/contracts/fixtures/thread-stream/window.json");
+        if std::env::var_os("BIBCODE_UPDATE_THREAD_STREAM_FIXTURE").is_some() {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&fixture).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        let committed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("committed fixture"))
+                .expect("fixture JSON");
+        assert_eq!(
+            fixture, committed,
+            "regenerate the thread stream window fixture"
+        );
+        assert!(fixture["pages"].as_array().unwrap().len() >= 2);
+        engine.shutdown().await;
+    }
 }
 
 /// Turn and full-thread patches computed live from checkpoint refs (#140).
@@ -8428,5 +9075,183 @@ mod turn_diff_tests {
         assert!(!pid_file.exists(), "the refused read never started Git");
         drop(removal);
         engine.shutdown().await;
+    }
+
+    /// Records turn `turn_count` of `thread_id` as the effects worker does with `status`, and
+    /// with `diffAvailable: false` when `diff_available` is false.
+    async fn record_turn(
+        engine: &OrchestrationEngine,
+        thread_id: &str,
+        turn_count: i64,
+        status: &str,
+        diff_available: bool,
+        files: Value,
+    ) {
+        let mut command = json!({
+            "type": "thread.turn.diff.complete",
+            "commandId": format!("recorded-{turn_count}"),
+            "threadId": thread_id,
+            "turnId": format!("turn-{turn_count}"),
+            "checkpointTurnCount": turn_count,
+            "checkpointRef": super::super::orchestration_effects::checkpoint_ref(thread_id, turn_count),
+            "status": status,
+            "files": files,
+            "assistantMessageId": null,
+            "completedAt": CREATED_AT,
+            "createdAt": CREATED_AT,
+        });
+        if !diff_available {
+            command["diffAvailable"] = json!(false);
+        }
+        engine
+            .dispatch(serde_json::from_value(command).expect("checkpoint command"))
+            .await
+            .expect("recorded checkpoint");
+    }
+
+    /// Captures `lines.txt` with line 20 replaced by `line` as checkpoint `turn_count`.
+    async fn capture_line_twenty(root: &Path, thread_id: &str, turn_count: i64, line: &str) {
+        std::fs::write(
+            root.join("lines.txt"),
+            twenty_lines()
+                .replace("line 10\n", "line ten\n")
+                .replace("line 20\n", &format!("{line}\n")),
+        )
+        .expect("changed line");
+        capture_checkpoint(root, thread_id, turn_count)
+            .await
+            .expect("checkpoint");
+    }
+
+    #[tokio::test]
+    async fn a_one_turn_diff_without_a_baseline_is_refused_but_a_wider_range_is_served() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&engine, &root, &thread_id).await;
+        capture_line_twenty(&root, &thread_id, 2, "line twenty").await;
+        record_turn(&engine, &thread_id, 2, "ready", false, json!([])).await;
+
+        let refused = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 1, "toTurnCount": 2}),
+        )
+        .await
+        .expect_err("a turn without a baseline has no one-turn patch");
+        assert_eq!(refused["_tag"], "OrchestrationGetTurnDiffError");
+        assert_eq!(
+            refused["message"],
+            super::super::orchestration_effects::no_baseline_diff_detail(2)
+        );
+
+        // Both ends of a wider range are end states, so it is still served.
+        let wider = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 2}),
+        )
+        .await
+        .expect("a wider range");
+        let diff = wider["diff"].as_str().expect("diff text");
+        assert!(diff.contains("+line ten"), "{diff}");
+        assert!(diff.contains("+line twenty"), "{diff}");
+        let full = handle_query(
+            &engine,
+            None,
+            request(
+                "orchestration.getFullThreadDiff",
+                json!({"threadId": thread_id, "toTurnCount": 2}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("full-thread patch");
+        assert_eq!(full, wider);
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_ready_turn_after_a_missing_one_has_no_one_turn_diff() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&engine, &root, &thread_id).await;
+        capture_line_twenty(&root, &thread_id, 2, "line two").await;
+        record_turn(&engine, &thread_id, 2, "ready", true, json!([])).await;
+        // Turn 3 was never captured; its ref is a leftover that old code read turn 4 against.
+        capture_line_twenty(&root, &thread_id, 3, "leftover").await;
+        record_turn(&engine, &thread_id, 3, "missing", true, json!([])).await;
+        capture_line_twenty(&root, &thread_id, 4, "line four").await;
+        record_turn(
+            &engine,
+            &thread_id,
+            4,
+            "ready",
+            true,
+            json!([{"path": "lines.txt", "kind": "modified", "additions": 1, "deletions": 1}]),
+        )
+        .await;
+        // Back to the ledger a v0.14 server wrote (migration 62), then upgraded. Migration 64
+        // (#226) is idempotent, so its columns can stay.
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let has_column = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('projection_turns') \
+                     WHERE name = 'checkpoint_diff_available'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? == 1;
+                if has_column {
+                    connection.execute_batch(
+                        "ALTER TABLE projection_turns DROP COLUMN checkpoint_diff_available;
+                         DELETE FROM effect_sql_migrations
+                           WHERE name IN ('ProjectionTurnCheckpointDiffAvailable', 'ThreadHistoryWindow');",
+                    )?;
+                }
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("upgraded");
+
+        let refused = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 3, "toTurnCount": 4}),
+        )
+        .await
+        .expect_err("an upgraded turn after a missing one has no one-turn patch");
+        assert_eq!(
+            refused["message"],
+            super::super::orchestration_effects::no_baseline_diff_detail(4)
+        );
+        let served = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 2, "toTurnCount": 4}),
+        )
+        .await
+        .expect("a range between two captured turns");
+        assert!(
+            served["diff"].as_str().unwrap().contains("+line four"),
+            "{served}"
+        );
+        let snapshot = thread_snapshot(&engine, &thread_id)
+            .await
+            .expect("thread snapshot");
+        let checkpoint = |turn_count: i64| {
+            snapshot["thread"]["checkpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|checkpoint| checkpoint["checkpointTurnCount"] == turn_count)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(checkpoint(4)["diffAvailable"], false);
+        assert_eq!(checkpoint(4)["files"], json!([]));
+        assert!(checkpoint(2).get("diffAvailable").is_none());
     }
 }

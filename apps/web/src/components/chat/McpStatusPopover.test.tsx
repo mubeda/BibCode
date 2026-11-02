@@ -1,4 +1,9 @@
-import type { OrchestrationThreadActivity } from "@bibcode/contracts";
+import type { OrchestrationThread, OrchestrationThreadActivity } from "@bibcode/contracts";
+import {
+  appendHistoryPage,
+  mergeThreadHistory,
+} from "@bibcode/client-runtime/state/thread-history";
+import carriedStatus from "../../../../../packages/contracts/fixtures/thread-stream/carried-status.json";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -287,3 +292,106 @@ describe("McpStatusPopover", () => {
     expect(markup).not.toContain("Awaiting MCP status");
   });
 });
+
+// The thread history window (#226): a windowed thread carries, per provider instance, the MCP
+// status row this reader selects. The server's selection runs on the same fixture.
+describe("deriveMcpStatusSnapshot on carried status rows", () => {
+  it("selects the row the server carries for each instance of the shared fixture", () => {
+    for (const testCase of carriedStatus.cases) {
+      const activities =
+        testCase.activities as unknown as ReadonlyArray<OrchestrationThreadActivity>;
+      const instances = new Set(
+        activities.flatMap((row) => {
+          const instance = (row.payload as { providerInstanceId?: unknown }).providerInstanceId;
+          return typeof instance === "string" ? [instance] : [];
+        }),
+      );
+      const expected = testCase.mcpStatus as Record<string, string>;
+      for (const instance of instances) {
+        const selected = activities.find((row) => row.id === expected[instance]);
+        const servers = selected
+          ? (
+              selected.payload as {
+                servers: ReadonlyArray<{ name: string; state: string; detail?: string }>;
+              }
+            ).servers.map((server) => ({ ...server, detail: server.detail ?? null }))
+          : [];
+        expect(
+          deriveMcpStatusSnapshot(activities, instance, true).servers,
+          `${testCase.name}: ${instance}`,
+        ).toEqual(servers);
+      }
+    }
+  });
+
+  it("reads the carried status after a clock correction, before and after a page loads", () => {
+    const status = (id: string, sequence: number, state: string, minute: number) =>
+      activity(
+        {
+          eventType: "mcp.status.updated",
+          providerInstanceId: "codex",
+          servers: [{ name: "docs", state }],
+        },
+        {
+          id: id as OrchestrationThreadActivity["id"],
+          sequence,
+          createdAt: `2026-08-01T12:${String(minute).padStart(2, "0")}:00.000Z`,
+        },
+      );
+    const window = {
+      ...(carriedStatusThread as unknown as OrchestrationThread),
+      activities: [
+        activity(
+          {},
+          {
+            id: "tool" as OrchestrationThreadActivity["id"],
+            sequence: 100,
+            summary: "Ran",
+            createdAt: "2026-08-01T12:30:00.000Z",
+          },
+        ),
+      ],
+      history: {
+        floor: "floor",
+        hasOlder: true,
+        olderRows: 1,
+        carried: { activities: [status("connected", 200, "connected", 1)], proposedPlans: [] },
+      },
+    };
+    const page = {
+      messages: [],
+      activities: [status("needs-auth", 10, "needs-auth", 20)],
+      reasoning: [],
+      proposedPlans: [],
+      checkpoints: [],
+      cursor: null,
+      olderRows: 0,
+    };
+    const read = (thread: OrchestrationThread) =>
+      deriveMcpStatusSnapshot(thread.activities, "codex", true).servers[0]?.state;
+    expect(read(mergeThreadHistory(window, null))).toBe("connected");
+    expect(read(mergeThreadHistory(window, appendHistoryPage(null, page)))).toBe("connected");
+  });
+});
+
+const carriedStatusThread = {
+  id: "thread-1",
+  projectId: "project-1",
+  title: "Thread",
+  modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-08-01T12:00:00.000Z",
+  updatedAt: "2026-08-01T12:00:00.000Z",
+  archivedAt: null,
+  deletedAt: null,
+  messages: [],
+  reasoning: [],
+  proposedPlans: [],
+  activities: [],
+  checkpoints: [],
+  session: null,
+};
