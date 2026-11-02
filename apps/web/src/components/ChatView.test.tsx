@@ -166,6 +166,7 @@ vi.mock("../state/use-atom-command", () => ({
 }));
 
 vi.mock("../state/threads", () => ({
+  useThreadOlderHistory: () => null,
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
