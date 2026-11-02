@@ -472,7 +472,7 @@ export function WorktreeRemovalDialog({
                   <li key={`${impact.path}:${impact.pruneReason}`}>
                     <span className="block break-all font-mono text-xs">{impact.path}</span>
                     <span>{impact.pruneReason}</span>
-                    {impact.lockReason ? <span> — {impact.lockReason}</span> : null}
+                    {impact.lockReason ? <span> ({impact.lockReason})</span> : null}
                   </li>
                 ))}
               </ul>

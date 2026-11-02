@@ -4246,7 +4246,7 @@ describe("ChatView", () => {
         input: {
           commandId: expect.any(String),
           hostThreadId: threadId,
-          title: "Panel — Codex",
+          title: "Panel: Codex",
           threadDefaults: {
             modelSelection: expect.objectContaining({ instanceId: codexInstanceId }),
             runtimeMode: "full-access",

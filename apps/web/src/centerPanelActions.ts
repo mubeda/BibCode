@@ -221,7 +221,7 @@ export function useCenterPanelActions({
           commandId: newCommandId(),
           hostThreadId: hostRef.threadId,
           threadId,
-          title: `Panel — ${providerLabel}`,
+          title: `Panel: ${providerLabel}`,
           threadDefaults: {
             modelSelection,
             runtimeMode: DEFAULT_RUNTIME_MODE,

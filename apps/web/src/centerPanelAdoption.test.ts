@@ -6,6 +6,7 @@ import {
   applyPanelThreadAdoption,
   applyTerminalMetadataAdoption,
   createCenterPanelAdoptionTracker,
+  panelProviderLabel,
 } from "./centerPanelAdoption";
 import {
   HOST_SURFACE_ID,
@@ -282,5 +283,13 @@ describe("center panel adoption", () => {
     // Back in the list: still one tab.
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], true);
     expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+  });
+});
+
+describe("panelProviderLabel", () => {
+  it("reads the provider label from the colon title and the legacy em dash title", () => {
+    expect(panelProviderLabel("Panel: Claude")).toBe("Claude");
+    expect(panelProviderLabel("Panel — Claude")).toBe("Claude");
+    expect(panelProviderLabel("Panel Claude")).toBeUndefined();
   });
 });

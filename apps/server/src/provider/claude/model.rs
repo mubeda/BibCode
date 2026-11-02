@@ -59,7 +59,7 @@ fn model_from_initialization(value: &Value) -> Option<Value> {
         .filter(|name| !name.is_empty());
     let name = match discovered_name {
         Some(name) if slug.eq_ignore_ascii_case("default") => {
-            format!("{display_name} — {name}")
+            format!("{display_name}: {name}")
         }
         Some(name) => name.to_owned(),
         None => display_name.to_owned(),
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(models[0]["slug"], "default");
         assert_eq!(
             models[0]["name"],
-            "Default (recommended) — Opus 5 with 1M context"
+            "Default (recommended): Opus 5 with 1M context"
         );
     }
 

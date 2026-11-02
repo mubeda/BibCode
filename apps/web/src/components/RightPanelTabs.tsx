@@ -448,7 +448,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                 >
                   <Tooltip>
                     <TooltipTrigger render={tabButton} />
-                    <TooltipPopup>{conflicted ? `${title} — changed on disk` : title}</TooltipPopup>
+                    <TooltipPopup>{conflicted ? `${title} (changed on disk)` : title}</TooltipPopup>
                   </Tooltip>
                   <button
                     type="button"

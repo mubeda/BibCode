@@ -40,8 +40,8 @@ function AnnotationFallback({
             Review comment
             {annotation.lineNumber
               ? ` at line ${annotation.lineNumber} (${annotation.side === "deletions" ? "old" : "new"} version)`
-              : ""}{" "}
-            — line not shown in this diff
+              : ""}
+            . Line not shown in this diff
           </p>
           {annotation.metadata}
         </div>
@@ -137,7 +137,7 @@ function DiffBody({
       {classification === "unrenderable" ? (
         <p className="p-3 text-sm">
           <PullRequestsExternalLink href={hostUrl}>
-            Diff too large to render — open on host
+            Diff too large to render. Open on host
           </PullRequestsExternalLink>
         </p>
       ) : gated ? (
@@ -229,13 +229,13 @@ export const PullRequestsFileDiff = memo(function PullRequestsFileDiff(
       ) : file.tooLarge ? (
         <p className="p-3 text-sm">
           <PullRequestsExternalLink href={hostUrl}>
-            Diff too large to render — open on host
+            Diff too large to render. Open on host
           </PullRequestsExternalLink>
         </p>
       ) : file.patch === null ? (
         <p className="p-3 text-sm">
           <PullRequestsExternalLink href={hostUrl}>
-            Diff unavailable — open on host
+            Diff unavailable. Open on host
           </PullRequestsExternalLink>
         </p>
       ) : visible ? (
