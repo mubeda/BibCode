@@ -881,6 +881,8 @@ export interface WorkspaceChatSummary {
   readonly count: number;
   /** The most urgent status among the chats, idle included; shown as the row's glyph. */
   readonly status: WorkspaceCardStatus;
+  /** How many of `count` a capped shell left out (#223), which its list pages in. */
+  readonly older?: number;
 }
 
 /**
@@ -917,6 +919,48 @@ export function summarizeWorkspaceChats<T extends WorkspaceChatThread>(
     }
   }
   return summaries;
+}
+
+/**
+ * Adds the chat panels a capped shell left out (#223) to each checkout's **N more chats**, by
+ * the same checkout key as `summarizeWorkspaceChats`. A checkout whose chats were all left out
+ * gets an idle summary: they are finished.
+ */
+export function addOlderChatCounts(
+  summaries: ReadonlyMap<string, WorkspaceChatSummary>,
+  projects: ReadonlyArray<{
+    readonly environmentId: string;
+    readonly id: string;
+    readonly olderThreads?:
+      | {
+          readonly chats: ReadonlyArray<{
+            readonly worktreePath: string | null;
+            readonly count: number;
+          }>;
+        }
+      | undefined;
+  }>,
+): ReadonlyMap<string, WorkspaceChatSummary> {
+  if (projects.every((project) => (project.olderThreads?.chats.length ?? 0) === 0)) {
+    return summaries;
+  }
+  const next = new Map(summaries);
+  for (const project of projects) {
+    for (const chats of project.olderThreads?.chats ?? []) {
+      const key = workspaceCheckoutKey({
+        environmentId: project.environmentId,
+        projectId: project.id,
+        worktreePath: chats.worktreePath,
+      });
+      const current = next.get(key);
+      next.set(key, {
+        count: (current?.count ?? 0) + chats.count,
+        status: current?.status ?? WORKSPACE_CARD_STATUS.idle,
+        older: (current?.older ?? 0) + chats.count,
+      });
+    }
+  }
+  return next;
 }
 
 type WorktreeSessionThread = Pick<

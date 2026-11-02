@@ -222,6 +222,8 @@ export function filterCommandPaletteGroups(input: {
   isInSubmenu: boolean;
   projectSearchItems: ReadonlyArray<CommandPaletteActionItem>;
   threadSearchItems: ReadonlyArray<CommandPaletteActionItem>;
+  /** Threads a capped shell left out that a server search found (#223), after the rest. */
+  olderThreadSearchItems?: ReadonlyArray<CommandPaletteActionItem>;
 }): CommandPaletteGroup[] {
   const isActionsFilter = input.query.startsWith(">");
   const searchQuery = isActionsFilter ? input.query.slice(1) : input.query;
@@ -255,6 +257,13 @@ export function filterCommandPaletteGroups(input: {
         value: "threads-search",
         label: "Threads",
         items: input.threadSearchItems,
+      });
+    }
+    if ((input.olderThreadSearchItems?.length ?? 0) > 0) {
+      searchableGroups.push({
+        value: "older-threads-search",
+        label: "Older threads",
+        items: input.olderThreadSearchItems ?? [],
       });
     }
   }
@@ -364,4 +373,78 @@ export function getCommandPaletteInputPlaceholder(mode: CommandPaletteMode): str
     case "submenu-browse":
       return "Enter path (e.g. ~/projects/my-app)";
   }
+}
+
+/** How long the palette waits after typing before it searches older threads (#223). */
+export const OLDER_THREAD_SEARCH_DELAY_MS = 250;
+
+/**
+ * Searches the threads a capped shell left out once typing pauses: at least two characters,
+ * never an actions filter, and a newer query aborts the search in flight.
+ */
+export function createOlderThreadSearch(
+  run: (query: string, signal: AbortSignal) => void,
+  timers: {
+    readonly set: (callback: () => void, delayMs: number) => unknown;
+    readonly clear: (handle: unknown) => void;
+  },
+) {
+  let handle: unknown;
+  let controller: AbortController | null = null;
+  const cancel = () => {
+    if (handle !== undefined) timers.clear(handle);
+    handle = undefined;
+    controller?.abort();
+    controller = null;
+  };
+  return {
+    update(query: string): void {
+      cancel();
+      const trimmed = query.trim();
+      if (trimmed.length < 2 || trimmed.startsWith(">")) return;
+      handle = timers.set(() => {
+        handle = undefined;
+        controller = new AbortController();
+        run(trimmed, controller.signal);
+      }, OLDER_THREAD_SEARCH_DELAY_MS);
+    },
+    dispose: cancel,
+  };
+}
+
+/** The last older-thread search the palette ran, and how it ended. */
+export interface OlderThreadSearchState {
+  readonly query: string;
+  readonly phase: "searching" | "done" | "failed";
+}
+
+export type OlderThreadSearchLine =
+  | { readonly kind: "searching" }
+  | { readonly kind: "failed" }
+  | { readonly kind: "offline"; readonly label: string };
+
+/**
+ * The status lines under the palette's results while it searches older threads (#223): one
+ * while the search for this query has not answered, the failure with its Retry, and one per
+ * capped environment that is not connected, whose older threads go unsearched.
+ */
+export function olderThreadSearchLines(input: {
+  readonly query: string;
+  readonly environments: ReadonlyArray<{ readonly label: string; readonly live: boolean }>;
+  readonly search: OlderThreadSearchState | null;
+}): OlderThreadSearchLine[] {
+  const query = input.query.trim();
+  if (query.length < 2 || query.startsWith(">") || input.environments.length === 0) return [];
+  const lines: OlderThreadSearchLine[] = [];
+  if (input.environments.some((environment) => environment.live)) {
+    if (input.search?.query !== query || input.search.phase === "searching") {
+      lines.push({ kind: "searching" });
+    } else if (input.search.phase === "failed") {
+      lines.push({ kind: "failed" });
+    }
+  }
+  for (const environment of input.environments) {
+    if (!environment.live) lines.push({ kind: "offline", label: environment.label });
+  }
+  return lines;
 }

@@ -1,5 +1,6 @@
 {
   "shell": { "wireBytes": 40000, "decodedBytes": 255000 },
+  "cappedShell": { "wireBytes": 11200, "decodedBytes": 65000 },
   "thread": { "wireBytes": 1920000, "decodedBytes": 6310000 },
   "resume": { "wireBytes": 256, "decodedBytes": 256 },
   "window": { "wireBytes": 100000, "decodedBytes": 353000 }

@@ -9005,7 +9005,24 @@ pub async fn load_shell_snapshot(
         .load_shell_snapshot_rows(archived)
         .await
         .map_err(wrap_persistence)?;
-    Ok(Snapshot {
+    Ok(shell_rows_snapshot(rows))
+}
+
+/// The live shell capped for #223, with what each project and checkout left out.
+pub async fn load_capped_shell_snapshot(
+    repositories: &Repositories,
+    forced: std::collections::HashSet<String>,
+) -> Result<(Snapshot, Vec<crate::persistence::ShellOlderCount>), OrchestrationError> {
+    let (rows, older) = repositories
+        .load_capped_shell_snapshot_rows(forced)
+        .await
+        .map_err(wrap_persistence)?;
+    Ok((shell_rows_snapshot(rows), older))
+}
+
+/// A snapshot holding exactly the rows a shell read returned.
+pub fn shell_rows_snapshot(rows: crate::persistence::ShellSnapshotRows) -> Snapshot {
+    Snapshot {
         projects: rows.projects,
         threads: rows.threads,
         messages: rows.preview_messages,
@@ -9020,7 +9037,7 @@ pub async fn load_shell_snapshot(
         receipts: Vec::new(),
         diffs: Vec::new(),
     }
-    .in_canonical_order())
+    .in_canonical_order()
 }
 
 /// Loads one thread and the rows its detail shows, ordered as [`load_snapshot`] orders

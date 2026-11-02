@@ -2721,7 +2721,87 @@ initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery. Live
 updates are coalesced: a thread stream re-reads its thread 100 ms after the
 first of a burst of its events, and the shell stream re-reads the shell
-500 ms after the first event of a burst. A thread subscriber that sends
+500 ms after the first event of a burst. After its first snapshot the shell
+stream sends only what changed (#223). Per subscription it keeps a keyed
+64-bit fingerprint of each project and thread shell it last sent, never the
+shell itself, and leaves `lastActivityAgeMs` out of it: that age grows on every
+re-read. The client pins each received age to its own clock on receipt
+(`lastActivityObservedAt`), since an unchanged thread is not sent again and its
+age would otherwise be as old as the item that carried it. Each
+re-read sends, in one chunk, `project-upserted` and `thread-upserted` for the
+entries that changed or appeared, then `thread-removed` and `project-removed`
+for those that left the live shell (deleted, archived, or in a deleted
+project). A re-read that changes nothing sends nothing. The items take
+consecutive sequences ending at the re-read shell's `snapshotSequence`, so the
+client's reducer, which drops an item at or below the sequence it holds,
+applies each item once, drops a redelivered one, and ends at the sequence a new
+snapshot would carry. When a window had fewer events than items (an AI
+Terminal's agent started working, which is no orchestration event), the
+numbering continues past that sequence instead, always above what the client
+holds, and each item past it carries the engine's sequence as
+`engineSequence`. The client keeps that value beside its shell: the lifecycle
+reconciler compares the archived snapshot's sequence with it, never with the
+item sequence, and a resume sends it as `snapshotSequence`. The stream sends a
+whole snapshot instead when its event receiver lagged. A failed re-read sends
+nothing and keeps the stream open, because the client resubscribes only when
+its session changes: the stream logs a warning, re-reads 2 s later whether or
+not events arrive, and sends a whole snapshot once a read succeeds. A capped
+stream keeps the ids it held across the failure, so that snapshot keeps them
+too. Every
+subscription, including each one after a reconnect, starts with a snapshot (or
+`unchanged`, below), so a client cannot miss a delta between streams. Every
+released client decodes and applies these items (the union and its reducer
+predate them), so no input flag gates them; an older server keeps sending
+snapshots.
+
+**The finished-thread cap and shell resume** ([design](../plans/2026-11-02-shell-finished-thread-cap-design.md)).
+A subscriber that sends `cap: { include? }` gets the kept set instead of every
+thread: live threads (a starting or running session, a running latest turn, a
+pending request, an unresolved delivery, an unsettled compaction, a queued
+message), hosts of AI Terminals whose agent is working, blocked or waiting,
+every `default` thread and every `workspace` thread with a worktree, the
+client's `include` ids (at most 256: its routed thread, open chat panels'
+hosts, pinned and unread threads), and of the rest the newest 25 across the
+environment plus the newest 3 non-panel threads of each project, newest by
+`COALESCE(latest_user_message_at, updated_at)` then `thread_id`. The cap is
+applied in `load_capped_shell_snapshot_rows` before the per-thread reads, so a
+left-out thread costs one row of the thread scan. The snapshot carries
+`capped: true`, and each project shell `olderThreads { count, chats }`: its
+left-out non-panel threads, and its left-out chat panels per checkout, grouped
+as the left panel groups chats. The kept set is sticky within a subscription:
+each re-read and each fallback snapshot keeps every thread the client holds, so
+a thread never disappears for leaving the cap. A held or included thread keeps
+its place in the newest-first ranking, so it never hands its slot to an older
+thread and a re-read never widens the cap. Removals for left-out threads:
+the stream collects the ids of the window's `thread.archived`,
+`thread.deleted` and `thread.unarchived` events and, at the tick, sends
+`thread-removed` for those that are not live-shell threads then (an archive
+undone in the same window sends nothing). A removal only says "no longer in the
+live shell": it never deletes client state.
+
+`orchestration.listOlderThreads` pages left-out threads newest first with an
+opaque keyset cursor (base64url JSON of a timestamp and an id): scope
+`project` (its non-panel threads), `checkout` (its chat panels in one
+checkout), `agents` (every left-out thread with a session, panels included),
+or `search` (every unarchived thread whose title contains `query`,
+case-insensitively and literally, kept or not; `query` is required). Without a
+query the set is computed without `include`. `orchestration.getThreadShells`
+returns the named threads, live or archived, and lists the ids that are
+deleted or never existed as `missing`: the only evidence a capped shell's
+client has that a thread is gone. Both are local reads registered with
+`register_unary` and are not long-running.
+
+A subscriber that sends `cap` or `resume` gets a `revision` on each snapshot
+and on the last item of each delta chunk: a 128-bit digest of the held
+fingerprints, ids and cap flag under keys secret to the server process. A
+resubscribe with `resume: { revision, snapshotSequence }` is answered
+`{ kind: "unchanged", snapshotSequence, revision, activityAges }` when the
+fresh kept set has that revision and the server's sequence is at least the
+client's; anything else gets a snapshot. `activityAges` re-ages each kept
+thread's provider progress, which a cached shell cannot age itself; the client
+pins those ages on receipt. A request with neither `cap` nor `resume`, as an
+old client sends, gets today's full list without any of these fields.
+A thread subscriber that sends
 `patches: true` then receives a `patch` item against the snapshot it holds:
 changed fields are replaced, removed fields listed, and each changed array
 sends its new length and only the entries that differ, by index, so an
@@ -2880,8 +2960,9 @@ The shell carries what the left panel's agent status reads (#187):
   and it never moves backwards. Migration 057 seeds it from each thread's latest
   provider event.
 - **`lastActivityAgeMs`** is how old `lastActivityAt` was on the server's clock
-  when the snapshot was built. The client ages a Working status from its own
-  receipt of that value, so it never compares clocks with the server.
+  when the shell item carrying it was built. The client ages a Working status
+  from its own receipt of that value, recorded when the item arrives rather than
+  when a row first renders, so it never compares clocks with the server.
 
 Requests also settle without an answer:
 

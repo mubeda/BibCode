@@ -2,7 +2,8 @@
 //!
 //! One big thread (200 turns, long answers, many tool activities of realistic sizes, proposed
 //! plans and one checkpoint that touches 2,400 files) and a shell of 160 non-archived threads
-//! across six projects, most of them finished, plus chat panels. It is written straight into
+//! across six projects, most of them finished: one default thread per project, workspace
+//! threads without a worktree, and chat panels. It is written straight into
 //! the store through `Repositories`, so a test and the 3G harness
 //! (`scripts/measure-remote-latency.ts`, through `examples/write_load_fixture.rs`) measure the
 //! same data. A fixed seed makes two builds byte-identical; all text is synthetic.
@@ -410,10 +411,14 @@ async fn seed_shell_thread(
         Some("turn-1"),
         minutes,
     );
-    // A chat panel of the thread one round of projects back, which is in the same project.
+    // One default thread per project (the big thread is project 0's); the rest are workspace
+    // threads without a worktree, and every eighth a chat panel of the thread one round of
+    // projects back, which is in the same project.
     if index >= PROJECT_COUNT && index % 8 == 3 {
         thread.kind = "panel".to_owned();
         thread.host_thread_id = Some(format!("thread-{:03}", index - PROJECT_COUNT));
+    } else if index >= PROJECT_COUNT {
+        thread.kind = "workspace".to_owned();
     }
     if index >= NON_ARCHIVED_THREADS {
         thread.archived_at = Some(timestamp(minutes + 5, 0));

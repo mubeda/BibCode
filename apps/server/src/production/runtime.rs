@@ -611,6 +611,7 @@ impl ProductionRuntime {
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
         let mcp_terminals = terminal_manager.clone();
+        let shell_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
@@ -676,6 +677,7 @@ impl ProductionRuntime {
             turn_delivery.clone(),
             workspace_availability.clone(),
             attachment_uploads.clone(),
+            Some(shell_terminals),
         );
         crate::production::uploads_rpc::register_uploads_rpc(
             &mut registry,

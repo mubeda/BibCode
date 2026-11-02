@@ -186,7 +186,27 @@ appear again when you expand it.
 - Worktree cards represent worktree threads. Creating a worktree creates both
   the Git worktree and its thread before the first message.
 - Other chats open in a worktree show as **N more chats** under its card;
-  chats in the main checkout count on the primary card.
+  chats in the main checkout count on the primary card. The count includes
+  finished chats the panel did not load. Selecting it lists the checkout's
+  chats; the ones the panel did not load follow, 20 at a time, and selecting a
+  chat opens it in its workspace.
+
+To load quickly, the panel loads each server's live and recent threads: every
+working or waiting agent, every workspace card, threads you pinned, left unread
+or have open, and the newest finished ones (25 in all, and at least the 3
+newest of each project). A project with more finished threads ends with **N
+older threads**; selecting it loads them 20 at a time (**Load 20 more**), and
+**Hide older threads** folds them away again. While the server is not
+connected the row reads **N older threads: reconnect to load**. In the Agents
+view and the Inbox, the **Done** group ends with **Show older**, which loads
+the finished agents the panel did not load, chat panels included; when none
+loaded, the Agents view offers **Show older finished agents** instead. The command
+palette's search also asks the server once you pause typing, and lists matches
+the panel did not load under **Older threads**. Under its results it says
+**Searching older threads…** until the server answers, offers **Retry** when
+the search fails, and names any server that is not connected, whose older
+threads it cannot search. A thread you open from these lists opens as usual,
+however slow the connection.
 
 Tab moves between cards; **Enter** opens one, and **Shift+F10** or the
 **Menu** key opens its menu at the card.

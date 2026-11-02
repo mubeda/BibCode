@@ -36,6 +36,7 @@ import {
   resolveWorkspaceDirty,
   shouldShowWorkspaceBranchText,
   summarizeWorkspaceChats,
+  addOlderChatCounts,
   workspaceCheckoutKey,
   isWorktreeSessionRunning,
 } from "./Sidebar.logic";
@@ -1669,6 +1670,46 @@ describe("card age", () => {
     expect(formatCompactAge("2026-07-03T12:05:00.000Z", now)).toBe("now");
     expect(formatCompactAge("invalid", now)).toBeNull();
     expect(formatCompactAge(null, now)).toBeNull();
+  });
+});
+
+describe("addOlderChatCounts (#223)", () => {
+  const environmentId = localEnvironmentId;
+  const project = (chats: ReadonlyArray<{ worktreePath: string | null; count: number }>) => ({
+    environmentId,
+    id: "project-1",
+    olderThreads: { count: 4, chats },
+  });
+  const key = (worktreePath: string | null) =>
+    workspaceCheckoutKey({ environmentId, projectId: "project-1", worktreePath });
+
+  it("adds the checkout's chats count to N more chats", () => {
+    const loaded = new Map([
+      [key("/wt/fix"), { count: 1, status: WORKSPACE_CARD_STATUS.approval }],
+    ]);
+    const summaries = addOlderChatCounts(loaded, [
+      project([
+        { worktreePath: "/wt/fix", count: 2 },
+        { worktreePath: null, count: 3 },
+      ]),
+    ]);
+    // The loaded chat keeps its urgency; the main checkout's left-out chats count as idle.
+    expect(summaries.get(key("/wt/fix"))).toEqual({
+      count: 3,
+      status: WORKSPACE_CARD_STATUS.approval,
+      older: 2,
+    });
+    expect(summaries.get(key(null))).toEqual({
+      count: 3,
+      status: WORKSPACE_CARD_STATUS.idle,
+      older: 3,
+    });
+  });
+
+  it("keeps every workspace card: an uncapped project changes nothing", () => {
+    const loaded = new Map([[key(null), { count: 1, status: WORKSPACE_CARD_STATUS.idle }]]);
+    expect(addOlderChatCounts(loaded, [{ environmentId, id: "project-1" }])).toBe(loaded);
+    expect(addOlderChatCounts(loaded, [project([])])).toBe(loaded);
   });
 });
 

@@ -269,4 +269,18 @@ describe("center panel adoption", () => {
     expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-b", "chat:panel-a"]);
     expect(activeSurfaceId()).toBe(HOST_SURFACE_ID);
   });
+
+  it("keeps a tracked panel's tab when a capped list leaves it out (#223)", () => {
+    const tracker = createCenterPanelAdoptionTracker();
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], true);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+
+    // A reconnect's capped snapshot leaves the finished panel out: it may still exist.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread], true);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+
+    // Back in the list: still one tab.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], true);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+  });
 });

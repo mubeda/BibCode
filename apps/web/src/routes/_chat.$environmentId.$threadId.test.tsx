@@ -6,7 +6,9 @@ const harness = vi.hoisted(() => ({
   routeConfig: null as Record<string, unknown> | null,
   params: { environmentId: "environment-1", threadId: "thread-1" },
   threadRef: null as null | { environmentId: string; threadId: string },
-  shell: { data: undefined as undefined | { snapshot: { _tag: string }; status?: string } },
+  shell: {
+    data: undefined as undefined | { snapshot: { _tag: string; value?: unknown }; status?: string },
+  },
   serverShell: null as unknown,
   serverDetail: null as unknown,
   environmentRefs: [] as unknown[],
@@ -76,6 +78,9 @@ vi.mock("../state/query", () => ({
     return harness.shell;
   },
 }));
+vi.mock("../state/offShell", () => ({
+  useOffShellState: () => ({ missing: new Set() }),
+}));
 vi.mock("../state/shell", () => ({
   environmentShell: { stateAtom: (environmentId: unknown) => harness.shellAtom(environmentId) },
 }));
@@ -93,7 +98,7 @@ function renderRoute(): string {
 
 beforeEach(() => {
   harness.threadRef = { environmentId: "environment-1", threadId: "thread-1" };
-  harness.shell = { data: { snapshot: { _tag: "Some" }, status: "ready" } };
+  harness.shell = { data: { snapshot: { _tag: "Some", value: {} }, status: "ready" } };
   harness.serverShell = { id: "shell" };
   harness.serverDetail = null;
   harness.environmentRefs = [];
@@ -133,7 +138,7 @@ describe("thread chat route", () => {
     harness.shell = { data: { snapshot: { _tag: "None" } } };
     expect(renderRoute()).toBe("");
 
-    harness.shell = { data: { snapshot: { _tag: "Some" } } };
+    harness.shell = { data: { snapshot: { _tag: "Some", value: {} } } };
     harness.serverShell = null;
     harness.serverDetail = null;
     harness.draft = null;

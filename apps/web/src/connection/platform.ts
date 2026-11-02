@@ -55,6 +55,7 @@ import {
   type PrimaryEnvironmentTarget,
 } from "../environments/primary/target";
 import { forgetPreviewStorage } from "../browser/previewStorageCleanup";
+import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
 import {
   isHostedStaticApp,
@@ -761,6 +762,8 @@ const environmentOwnedDataCleanupLayer = Layer.succeed(
       Effect.sync(() => {
         clearComposerDraftsEnvironment(environmentId);
         void forgetPreviewStorage(environmentId);
+        // Its older and looked-up threads (#223) leave Agents, the Inbox and the palette.
+        offShellThreads.forget(environmentId);
       }),
   }),
 );

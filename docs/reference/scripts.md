@@ -357,9 +357,10 @@ performing a production install.
 - `cargo test -p bibcode-server --test transfer_budget`: the transfer byte budget. It builds the
   deterministic large-thread fixture (`apps/server/tests/support/load_fixture.rs`: one
   200-turn thread with a 2,400-file checkpoint and a 160-thread shell), serves it over a real
-  `/ws` to a client that offers compression, and asserts that the shell snapshot, the big
-  thread's first `subscribeThread` item (whole, as an older client asks for it, and as the
-  history window the app opens, #226) and the resume answer each stay under the bytes in
+  `/ws` to a client that offers compression, and asserts that the shell snapshot (whole, as
+  `{}` asks, and capped, as the app asks with `cap`), the big thread's first `subscribeThread`
+  item (whole, as an older client asks for it, and as the history window the app opens, #226)
+  and the resume answer each stay under the bytes in
   `apps/server/tests/transfer_budget.json`, both after the transport's deflate and decoded. A
   failure prints a table of the measured and budgeted bytes. Raise a budget only by editing that
   file in the same change; `BIBCODE_TRANSFER_REPORT=<path>` also writes the measurements as

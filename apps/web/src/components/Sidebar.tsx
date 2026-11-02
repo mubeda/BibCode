@@ -258,6 +258,8 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "./ui/sidebar";
+import { SidebarOlderThreads } from "./sidebar/SidebarOlderThreads";
+import { WorkspaceMoreChats } from "./sidebar/WorkspaceMoreChats";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useOpenAddProjectCommandPalette } from "../commandPaletteContext";
 import {
@@ -285,6 +287,7 @@ import {
   resolveWorkspaceDirty,
   shouldShowWorkspaceBranchText,
   summarizeWorkspaceChats,
+  addOlderChatCounts,
   workspaceCheckoutKey,
   type WorkspaceCardStatus,
   type WorkspaceChatSummary,
@@ -316,7 +319,6 @@ import {
   WorkspaceCardBranchLine,
   WorkspaceCardDirtyDot,
   workspaceCardIds,
-  WorkspaceCardMoreChats,
   WorkspaceCardPortsButton,
   WorkspaceCardPrButton,
   WorkspaceCardSessionLine,
@@ -778,6 +780,8 @@ interface SidebarThreadRowProps {
   /** Unarchived panel chats open in this card's worktree. */
   moreChatsCount: number;
   moreChatsStatus: WorkspaceCardStatus | null;
+  /** How many of them a capped shell left out (#223). */
+  moreChatsOlderCount: number;
 }
 
 /**
@@ -827,6 +831,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
     modelLabel,
     moreChatsCount,
     moreChatsStatus,
+    moreChatsOlderCount,
   } = props;
   const idBase = useId();
   const cardIds = workspaceCardIds(idBase);
@@ -1285,8 +1290,15 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           ageIso={ageIso}
         />
       ) : null}
-      {moreChatsCount > 0 && moreChatsStatus !== null ? (
-        <WorkspaceCardMoreChats count={moreChatsCount} status={moreChatsStatus} />
+      {moreChatsCount > 0 && moreChatsStatus !== null && thread.worktreePath !== null ? (
+        <WorkspaceMoreChats
+          environmentId={thread.environmentId}
+          projectId={thread.projectId}
+          worktreePath={thread.worktreePath}
+          count={moreChatsCount}
+          status={moreChatsStatus}
+          olderCount={moreChatsOlderCount}
+        />
       ) : null}
     </WorkspaceCardShell>
   );
@@ -1360,6 +1372,7 @@ interface SidebarPrimaryCardProps {
   modelLabel: string;
   moreChatsCount: number;
   moreChatsStatus: WorkspaceCardStatus | null;
+  moreChatsOlderCount: number;
   onClick: () => void;
   onOpenMenu: (position: { x: number; y: number }, branchName: string | null) => void;
   openPrLink: (event: React.MouseEvent<HTMLElement>, prUrl: string) => void;
@@ -1384,6 +1397,7 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
     modelLabel,
     moreChatsCount,
     moreChatsStatus,
+    moreChatsOlderCount,
     onClick,
     onOpenMenu,
     openPrLink,
@@ -1573,7 +1587,14 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
         />
       ) : null}
       {moreChatsCount > 0 && moreChatsStatus !== null ? (
-        <WorkspaceCardMoreChats count={moreChatsCount} status={moreChatsStatus} />
+        <WorkspaceMoreChats
+          environmentId={primaryThread?.environmentId ?? project.environmentId}
+          projectId={primaryThread?.projectId ?? project.id}
+          worktreePath={null}
+          count={moreChatsCount}
+          status={moreChatsStatus}
+          olderCount={moreChatsOlderCount}
+        />
       ) : null}
     </WorkspaceCardShell>
   );
@@ -1691,6 +1712,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
           modelLabel={primaryThread ? resolveWorkspaceModelLabel(modelLabels, primaryThread) : ""}
           moreChatsCount={primaryChats?.count ?? 0}
           moreChatsStatus={primaryChats?.status ?? null}
+          moreChatsOlderCount={primaryChats?.older ?? 0}
           onClick={onPrimaryClick}
           onOpenMenu={openPrimaryCardMenu}
           openPrLink={openPrLink}
@@ -1742,6 +1764,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
               modelLabel={resolveWorkspaceModelLabel(modelLabels, thread)}
               moreChatsCount={chatSummary?.count ?? 0}
               moreChatsStatus={chatSummary?.status ?? null}
+              moreChatsOlderCount={chatSummary?.older ?? 0}
             />
           );
         })}
@@ -1779,6 +1802,20 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
           </SidebarMenuSubButton>
         </SidebarMenuSubItem>
       )}
+      {projectExpanded
+        ? project.memberProjects.map((member) =>
+            (member.olderThreads?.count ?? 0) > 0 ? (
+              <SidebarOlderThreads
+                key={member.physicalProjectKey}
+                environmentId={member.environmentId}
+                projectId={member.id}
+                projectName={project.displayName}
+                count={member.olderThreads?.count ?? 0}
+                onOpenThread={navigateToThread}
+              />
+            ) : null,
+          )
+        : null}
     </SidebarMenuSub>
   );
 });
@@ -2072,7 +2109,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         workspaceStatuses.statusOf,
       ),
     );
-    const chatSummaries = summarizeWorkspaceChats(projectThreads, workspaceStatuses.lastVisitedAt);
+    const chatSummaries = addOlderChatCounts(
+      summarizeWorkspaceChats(projectThreads, workspaceStatuses.lastVisitedAt),
+      project.memberProjects,
+    );
     return {
       chatSummaries,
       orderedProjectThreadKeys: visibleProjectThreads.map((thread) =>
@@ -2082,7 +2122,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       projectStatus,
       visibleProjectThreads,
     };
-  }, [pinnedThreadKeys, projectThreads, threadSortOrder, workspaceStatuses]);
+  }, [
+    pinnedThreadKeys,
+    project.memberProjects,
+    projectThreads,
+    threadSortOrder,
+    workspaceStatuses,
+  ]);
   const pinnedCollapsedThread = useMemo(() => {
     const activeThreadKey = activeRouteThreadKey ?? undefined;
     if (!activeThreadKey || projectExpanded) {

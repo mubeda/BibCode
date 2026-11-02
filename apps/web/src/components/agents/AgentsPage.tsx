@@ -37,6 +37,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { SidebarMenu } from "../ui/sidebar";
 import { Toggle } from "../ui/toggle";
 import { AgentsRow } from "./AgentsRow";
+import { AgentsShowOlder } from "./AgentsShowOlder";
 import { useAgentRows } from "./useAgentRows";
 
 const GROUP_BY_LABELS: Record<AgentsGroupByMode, string> = {
@@ -286,10 +287,14 @@ export function AgentsPage() {
                           ))}
                         </SidebarMenu>
                       ) : null}
+                      {groupExpanded && group.id === "status:done" ? <AgentsShowOlder /> : null}
                     </div>
                   );
                 })
               )}
+              {groupBy === "status" && !groups.some((group) => group.id === "status:done") ? (
+                <AgentsShowOlder standalone />
+              ) : null}
             </div>
           </div>
         </aside>

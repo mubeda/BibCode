@@ -42,8 +42,9 @@ workflow as idle.
   tests may still select `--test-threads=1` inside an isolated child process
   that intentionally owns process-global state.
   That suite includes the transfer byte budget (`apps/server/tests/transfer_budget.rs`): it
-  fails when the shell snapshot, the big thread's first `subscribeThread` item (whole, and as
-  the history window the app opens) or its resume answer grows past `apps/server/tests/transfer_budget.json`, in bytes after deflate or decoded.
+  fails when the shell snapshot (whole and capped), the big thread's first `subscribeThread`
+  item (whole, and as the history window the app opens) or its resume answer grows past
+  `apps/server/tests/transfer_budget.json`, in bytes after deflate or decoded.
   It counts bytes, not time, so it is deterministic on any runner.
   The job then builds the guarded `bibcode` through
   `cargo test -p bibcode-server --test cli_smoke --no-run -j 2`
