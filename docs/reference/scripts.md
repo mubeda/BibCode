@@ -328,7 +328,7 @@ performing a production install.
   Each direction is paced separately with backpressure. `--delay` holds every
   byte that long in each direction (125 ms is a 250 ms round trip), plus up to
   `--jitter` more, without reordering bytes. `--preset 3g` is 50,000 bytes/s each way and a
-  200 ms one-way delay (400 kbps, a 400 ms round trip, as T3 Code's preset); an explicit flag
+  200 ms one-way delay (400 kbps, a 400 ms round trip, a common 3G preset); an explicit flag
   overrides it. `--new-connections 1` makes every connection pay a TCP handshake (one round
   trip before its first byte) and ends HTTP keep-alive, by rewriting the first response on a
   connection to `Connection: close`; a WebSocket upgrade keeps its connection.

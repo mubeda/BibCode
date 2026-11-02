@@ -49,4 +49,4 @@ The budgets in `apps/server/tests/transfer_budget.json` are these sizes plus abo
 (40,000 / 255,000, 1,950,000 / 6,500,000 and 256 / 256 bytes). The thread snapshot is 89% of the
 cold open: the rest of the 2.1 MB is the shell, the archived-shell snapshot and the other 50-odd requests
 (58 in all). The synthetic text deflates 3.3 times; real threads may compress differently, so
-compare builds against each other, not against T3 Code's figures.
+compare builds against each other, not against figures from other projects.
