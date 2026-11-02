@@ -21,7 +21,7 @@ use crate::{
             in_progress::detect_in_progress_operation,
             merge::{self, GitManagerMergeError, GitManagerMergePreview},
             operations::{
-                CoAuthor, CommitRequest, DiscardError, DiscardRequest,
+                CoAuthor, CommitRequest, DiscardError, DiscardOutcome, DiscardRequest,
                 GitManagerOperationError as DomainOperationError, GitManagerOperationRequest,
                 PartialSelectionError, PartialSelectionRequest, commit_arguments,
                 commit_message_body, discard_partial, discard_paths, parse_undo_commit_message,
@@ -642,11 +642,7 @@ impl ConfiguredGitManagerRpcServices {
                         )
                         .await
                         .map_err(|error| discard_error("gitManager.discard", error))?;
-                        Ok(json!({
-                            "trashed": outcome.trashed,
-                            "permanentlyDiscarded": outcome.permanently_discarded,
-                            "trashUnavailable": outcome.trash_unavailable,
-                        }))
+                        Ok(discard_wire(&outcome))
                     },
                 )
                 .await
@@ -1321,6 +1317,21 @@ fn discard_error(operation: &str, error: DiscardError) -> Value {
     }
 }
 
+/// The `gitManager.discard` answer. `keptInStaging` is additive: a client that does not know
+/// it ignores it, and a path listed there is never also in `trashUnavailable`, which a client
+/// answers by offering a permanent discard of whatever now holds that name.
+fn discard_wire(outcome: &DiscardOutcome) -> Value {
+    json!({
+        "trashed": outcome.trashed,
+        "permanentlyDiscarded": outcome.permanently_discarded,
+        "trashUnavailable": outcome.trash_unavailable,
+        "keptInStaging": outcome.kept_in_staging.iter().map(|kept| json!({
+            "path": kept.path,
+            "stagedAt": kept.staged_at,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn partial_selection_error(operation: &str, error: PartialSelectionError) -> Value {
     match error {
         PartialSelectionError::Stale => operation_error(
@@ -1812,6 +1823,28 @@ mod tests {
     use tokio::sync::{Semaphore, oneshot};
 
     use super::*;
+
+    #[test]
+    fn a_discard_answer_names_where_a_stranded_entry_is_kept() {
+        let outcome = DiscardOutcome {
+            trash_unavailable: vec!["kept.txt".into()],
+            kept_in_staging: vec![crate::git::manager::operations::KeptInStaging {
+                path: "dir/victim.txt".into(),
+                staged_at: "bibcode-discard/0f3a/victim.txt".into(),
+            }],
+            ..Default::default()
+        };
+        let wire = discard_wire(&outcome);
+        assert_eq!(wire["trashUnavailable"], json!(["kept.txt"]));
+        assert_eq!(
+            wire["keptInStaging"],
+            json!([{ "path": "dir/victim.txt", "stagedAt": "bibcode-discard/0f3a/victim.txt" }])
+        );
+        assert_eq!(
+            discard_wire(&DiscardOutcome::default())["keptInStaging"],
+            json!([])
+        );
+    }
 
     #[test]
     fn git_failure_messages_keep_known_exit_status_without_forwarding_private_detail() {

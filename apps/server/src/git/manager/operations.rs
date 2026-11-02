@@ -69,6 +69,17 @@ pub struct DiscardOutcome {
     pub trashed: Vec<String>,
     pub permanently_discarded: Vec<String>,
     pub trash_unavailable: Vec<String>,
+    /// Entries the trash refused that could not go back because something else took their name:
+    /// they are in the Git directory's staging folder, not in the working tree.
+    pub kept_in_staging: Vec<KeptInStaging>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeptInStaging {
+    /// The path the discard was asked for.
+    pub path: String,
+    /// Where the entry is now, relative to the Git directory (`bibcode-discard/<id>/<name>`).
+    pub staged_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2397,8 +2408,9 @@ pub async fn discard_paths(
     let tracked = repository
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
+    let git_dir = roots.git_dir;
     #[cfg(unix)]
-    let (git_dir, worktree_root) = (roots.git_dir, roots.worktree_root);
+    let worktree_root = roots.worktree_root;
     #[cfg(unix)]
     {
         let (staging_dir, recovery_root) = (git_dir.clone(), worktree_root.clone());
@@ -2409,7 +2421,12 @@ pub async fn discard_paths(
     }
     let mut outcome = DiscardOutcome::default();
     let mut restore_only = Vec::new();
-    for path in &request.paths {
+    for path in &collapse_requested_paths(&request.paths) {
+        // An entry stranded earlier in this batch is never touched again: its name now belongs
+        // to something else, which a second trash or a permanent discard would remove.
+        if overlaps_stranded(path, &outcome.kept_in_staging) {
+            continue;
+        }
         let absolute_path = request.cwd.join(path);
         let tracked_path = tracked
             .iter()
@@ -2439,17 +2456,27 @@ pub async fn discard_paths(
             Moved::NotTaken if request.permit_permanent => {
                 outcome.permanently_discarded.push(path.clone());
             }
-            // A stranded entry is listed with those the trash did not take; it is in the
-            // staging folder, which the next discard's recovery empties.
-            Moved::NotTaken | Moved::Kept | Moved::Stranded(_) => {
-                outcome.trash_unavailable.push(path.clone());
-            }
+            // Never offered a permanent discard: its name now belongs to something else, which
+            // a clean would delete. The next discard's recovery moves it back once the name is free.
+            Moved::Stranded(staged) => outcome.kept_in_staging.push(KeptInStaging {
+                path: path.clone(),
+                staged_at: staged
+                    .strip_prefix(&git_dir)
+                    .unwrap_or(&staged)
+                    .to_string_lossy()
+                    .into_owned(),
+            }),
+            Moved::NotTaken | Moved::Kept => outcome.trash_unavailable.push(path.clone()),
         }
     }
 
-    let mut discarded_paths = outcome.trashed.clone();
+    // What was queued before an entry stranded may now name a file that took its place (the
+    // same file through another letter case, or a folder holding it): nothing deferred below
+    // unstages, restores or removes it. It is left in place, and the stranded entry reports it.
+    leave_stranded_names_alone(&mut outcome);
+    let mut discarded_paths = without_stranded(&outcome.trashed, &outcome.kept_in_staging);
     discarded_paths.extend(outcome.permanently_discarded.iter().cloned());
-    discarded_paths.extend(restore_only);
+    discarded_paths.extend(without_stranded(&restore_only, &outcome.kept_in_staging));
     if discarded_paths.is_empty() {
         return Ok(outcome);
     }
@@ -2495,6 +2522,70 @@ pub async fn discard_paths(
         outcome.trash_unavailable.extend(kept);
     }
     Ok(outcome)
+}
+
+/// Whether `path` is, holds or lies inside an entry in `stranded`. Compared without regard to
+/// letter case on every platform: a case-insensitive volume (macOS, Windows) reaches the same
+/// replacement file through `X.txt` as through `x.txt`, and skipping more only leaves an entry
+/// in place.
+fn overlaps_stranded(path: &str, stranded: &[KeptInStaging]) -> bool {
+    let path = path.to_lowercase();
+    stranded.iter().any(|kept| {
+        let kept = kept.path.to_lowercase();
+        path_matches(&path, &kept) || path_matches(&kept, &path)
+    })
+}
+
+/// Takes out of the lists a client acts on (a permanent discard, or a retry that offers one)
+/// every path overlapping an entry that stranded in this batch: it names the replacement file.
+fn leave_stranded_names_alone(outcome: &mut DiscardOutcome) {
+    let stranded = &outcome.kept_in_staging;
+    let (permanent, unavailable) = (
+        without_stranded(&outcome.permanently_discarded, stranded),
+        without_stranded(&outcome.trash_unavailable, stranded),
+    );
+    outcome.permanently_discarded = permanent;
+    outcome.trash_unavailable = unavailable;
+}
+
+/// `paths` without those that overlap an entry in `stranded` (see [`overlaps_stranded`]).
+fn without_stranded(paths: &[String], stranded: &[KeptInStaging]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !overlaps_stranded(path, stranded))
+        .cloned()
+        .collect()
+}
+
+/// The requested paths, each once and in order, without the ones a requested folder covers: a
+/// path named twice, or inside a folder that is also named, must not be discarded a second
+/// time, when the first attempt may have left something new at its name.
+fn collapse_requested_paths(paths: &[String]) -> Vec<String> {
+    let normalized: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let parts: Vec<_> = Path::new(path)
+                .components()
+                .filter_map(|part| part.as_os_str().to_str())
+                .collect();
+            if parts.is_empty() {
+                path.clone()
+            } else {
+                parts.join("/")
+            }
+        })
+        .collect();
+    let mut kept: Vec<String> = Vec::new();
+    for path in &normalized {
+        if !kept.contains(path)
+            && !normalized
+                .iter()
+                .any(|other| other != path && path_matches(other, path))
+        {
+            kept.push(path.clone());
+        }
+    }
+    kept
 }
 
 /// Refuses every path whose folder resolves outside the checkout, before anything is trashed or
@@ -4800,6 +4891,223 @@ mod tests {
         }
     }
 
+    /// Writes a new file where the first staged entry came from and refuses it; every later
+    /// entry is refused untouched.
+    #[cfg(unix)]
+    struct RefusingOnceTrash {
+        recreate: PathBuf,
+        /// Which call (from 0) recreates the file.
+        recreate_on: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for RefusingOnceTrash {
+        fn trash<'a>(
+            &'a self,
+            _path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.recreate_on
+                {
+                    std::fs::write(&self.recreate, "new\n").expect("a new file appears");
+                }
+                Err(TrashUnavailable)
+            })
+        }
+    }
+
+    /// A path named twice is discarded once: the second attempt would stage the file that took
+    /// the stranded entry's name, and `permitPermanent` would then delete it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_named_twice_never_discards_the_file_that_took_a_stranded_name() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("untracked.txt"), "old\n").expect("untracked file");
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingOnceTrash {
+                recreate: fixture.path().join("untracked.txt"),
+                recreate_on: 0,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["untracked.txt".into(), "untracked.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.permanently_discarded.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.kept_in_staging.len(), 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("untracked.txt")).unwrap(),
+            "new\n",
+            "the file that took the name survives"
+        );
+    }
+
+    /// A path that overlaps an entry stranded earlier in the batch is skipped, whatever its case.
+    #[test]
+    fn a_path_overlapping_a_stranded_entry_is_skipped_without_regard_to_case() {
+        let stranded = [KeptInStaging {
+            path: "Dir/Victim.txt".into(),
+            staged_at: "bibcode-discard/0f3a/Victim.txt".into(),
+        }];
+        for overlapping in [
+            "Dir/Victim.txt",
+            "dir/victim.txt",
+            "DIR",
+            "dir",
+            "DIR/VICTIM.TXT/inner",
+        ] {
+            assert!(overlaps_stranded(overlapping, &stranded), "{overlapping}");
+        }
+        for apart in ["Dir/Other.txt", "Direct", "victim.txt"] {
+            assert!(!overlaps_stranded(apart, &stranded), "{apart}");
+        }
+    }
+
+    /// On a case-insensitive volume, `victim.txt` is queued for a permanent discard (the trash
+    /// refused it, and it went back); then `VICTIM.TXT` reaches the same file, which a writer
+    /// recreates while it is staged, so it strands. The deferred clean must not delete the
+    /// replacement. A case-sensitive volume cannot reach the file by the second name, so the
+    /// test has nothing to check there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_permanent_discard_queued_before_a_stranding_never_removes_the_replacement() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("victim.txt"), "old\n").expect("untracked file");
+        if !fixture.path().join("VICTIM.TXT").exists() {
+            return;
+        }
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingOnceTrash {
+                recreate: fixture.path().join("victim.txt"),
+                recreate_on: 1,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["victim.txt".into(), "VICTIM.TXT".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.permanently_discarded.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.kept_in_staging.len(), 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("victim.txt")).unwrap(),
+            "new\n",
+            "the file that took the name survives"
+        );
+    }
+
+    /// The same without `permitPermanent`: the first refusal went back and is listed as refused;
+    /// the second strands. The refused list must not name the replacement, or the permanent
+    /// retry a client offers would delete it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_listed_before_a_stranding_never_offers_the_replacement_for_deletion() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("victim.txt"), "old\n").expect("untracked file");
+        if !fixture.path().join("VICTIM.TXT").exists() {
+            return;
+        }
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingOnceTrash {
+                recreate: fixture.path().join("victim.txt"),
+                recreate_on: 1,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["victim.txt".into(), "VICTIM.TXT".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.trash_unavailable.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.kept_in_staging.len(), 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("victim.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    /// What was queued before an entry stranded is dropped from the deferred work by the same
+    /// overlap rule.
+    #[test]
+    fn queued_paths_overlapping_a_stranded_entry_are_dropped_from_deferred_work() {
+        let stranded = [KeptInStaging {
+            path: "VICTIM.TXT".into(),
+            staged_at: "bibcode-discard/0f3a/VICTIM.TXT".into(),
+        }];
+        let queued = ["victim.txt".to_owned(), "other.txt".to_owned()];
+        assert_eq!(without_stranded(&queued, &stranded), ["other.txt"]);
+        assert_eq!(without_stranded(&queued, &[]), queued);
+
+        let mut outcome = DiscardOutcome {
+            permanently_discarded: vec!["victim.txt".into(), "kept.txt".into()],
+            trash_unavailable: vec!["Victim.Txt".into(), "refused.txt".into()],
+            kept_in_staging: stranded.to_vec(),
+            ..Default::default()
+        };
+        leave_stranded_names_alone(&mut outcome);
+        assert_eq!(outcome.permanently_discarded, ["kept.txt"]);
+        assert_eq!(outcome.trash_unavailable, ["refused.txt"]);
+    }
+
+    /// A path a requested folder covers, and one named twice, are discarded with the folder or
+    /// once; nothing else changes.
+    #[test]
+    fn requested_paths_are_deduplicated_and_collapsed_into_requested_folders() {
+        let collapse = |paths: &[&str]| {
+            collapse_requested_paths(
+                &paths
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(collapse(&["x.txt", "x.txt"]), ["x.txt"]);
+        assert_eq!(collapse(&["dir/a.txt", "dir"]), ["dir"]);
+        assert_eq!(collapse(&["dir", "dir/a.txt", "dir/sub/b.txt"]), ["dir"]);
+        assert_eq!(collapse(&["dir/", "dir/a.txt"]), ["dir"]);
+        assert_eq!(
+            collapse(&["dir2/a.txt", "dir/a.txt", "dir"]),
+            ["dir2/a.txt", "dir"]
+        );
+        assert_eq!(collapse(&["a.txt", "b.txt"]), ["a.txt", "b.txt"]);
+    }
+
     /// Git's own metadata is never a discard target, for any caller: `.git` as the first part of
     /// a path (in any case), and any path that resolves into the Git directory, are refused
     /// before anything moves. Staging shares the validator and refuses them too (review
@@ -5254,11 +5562,26 @@ mod tests {
         .await
         .expect("the discard runs");
 
-        assert_eq!(outcome.trash_unavailable, ["untracked.txt"]);
+        assert!(outcome.trash_unavailable.is_empty(), "{outcome:?}");
         assert!(outcome.permanently_discarded.is_empty());
         assert_eq!(
             std::fs::read_to_string(fixture.path().join("untracked.txt")).unwrap(),
             "new\n"
+        );
+        let [kept] = outcome.kept_in_staging.as_slice() else {
+            panic!("expected one stranded entry: {outcome:?}");
+        };
+        assert_eq!(kept.path, "untracked.txt");
+        assert!(
+            kept.staged_at.starts_with("bibcode-discard/")
+                && kept.staged_at.ends_with("/untracked.txt"),
+            "{}",
+            kept.staged_at
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join(".git").join(&kept.staged_at)).unwrap(),
+            "old\n",
+            "the entry is where the outcome says"
         );
     }
 

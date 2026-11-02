@@ -673,8 +673,14 @@ first staged by folder handle:
 4. A refused entry is renamed back, never over a file created meanwhile
    (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). The holder and its
    record are removed once the entry is trashed or back. An entry whose name was taken
-   meanwhile stays in its holder: a discard lists it in `trashUnavailable`, and a Files
-   delete answers `kept_in_staging` with where it is (below).
+   meanwhile stays in its holder: a discard lists it in `keptInStaging` (`path`, and
+   `stagedAt`, its path below the Git directory), never in `trashUnavailable`, and a
+   Files delete answers `kept_in_staging` with where it is (below). Under
+   `permitPermanent` it is still not removed: its name belongs to something else now,
+   which `git clean` would delete, and the next discard's recovery moves it back once
+   the name is free. `keptInStaging` is additive: a client that predates it ignores it
+   (and sees nothing for that path), and a client reading an older server's answer
+   decodes an empty list.
 5. Each discard first recovers what a crash left behind. A discard holds an
    exclusive `flock` on its holder folder from just after creating it until it is
    done, so recovery, which takes that lock without waiting, never touches a holder a
