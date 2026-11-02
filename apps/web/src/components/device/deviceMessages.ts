@@ -21,7 +21,7 @@ export const PLATFORM_LABELS: Readonly<Record<DevicePlatform, string>> = {
 };
 
 /** Appended to an image that already runs outside BiBCode, which the picker lists disabled. */
-export const IN_USE_ELSEWHERE_SUFFIX = " — Running outside BiBCode";
+export const IN_USE_ELSEWHERE_SUFFIX = " (Running outside BiBCode)";
 
 /** The most devices one server runs at once; it refuses a fifth. */
 export const MAX_RUNNING_DEVICES = 4;
@@ -36,9 +36,9 @@ export function runningSuffix(
     | { readonly kind: "thread"; readonly title: string | null }
     | { readonly kind: "none" },
 ): string {
-  if (owner.kind === "here") return " — Running here";
-  if (owner.kind === "thread" && owner.title !== null) return ` — Running in ${owner.title}`;
-  return " — Running";
+  if (owner.kind === "here") return " (Running here)";
+  if (owner.kind === "thread" && owner.title !== null) return ` (Running in ${owner.title})`;
+  return " (Running)";
 }
 
 /** Under the toolbar while the pane shows a device another thread started. */

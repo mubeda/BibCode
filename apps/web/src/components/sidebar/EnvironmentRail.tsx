@@ -211,7 +211,7 @@ export function EnvironmentRail() {
     "aria-checked": model.localSelected,
     "data-selected": model.localSelected,
     tabIndex: model.localSelected ? 0 : -1,
-    "aria-label": "Local — this machine",
+    "aria-label": "Local (this machine)",
     "data-testid": "environment-rail-local",
     className: cn(RAIL_BUTTON_CLASS, model.localSelected && RAIL_BUTTON_SELECTED_CLASS),
   };
@@ -270,7 +270,7 @@ export function EnvironmentRail() {
               <MonitorIcon className="size-[18px]" />
               <EnvironmentStatusDot status={model.localStatus} />
             </TooltipTrigger>
-            <TooltipPopup side="right">Local — this machine</TooltipPopup>
+            <TooltipPopup side="right">Local (this machine)</TooltipPopup>
           </Tooltip>
         )}
         {model.remotes.length > 0 ? (

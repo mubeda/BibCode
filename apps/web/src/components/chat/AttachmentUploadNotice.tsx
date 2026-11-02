@@ -11,7 +11,7 @@ export interface PendingAttachmentUpload extends UploadProgress {
 export function attachmentUploadCopy(progress: PendingAttachmentUpload): string {
   if (progress.phase === "reconnecting") return "Reconnecting…";
   const attachments = progress.attachmentCount === 1 ? "attachment" : "attachments";
-  return `Uploading ${progress.attachmentCount} ${attachments} — ${formatTransferBytes(progress.sentBytes, progress.totalBytes)}`;
+  return `Uploading ${progress.attachmentCount} ${attachments} (${formatTransferBytes(progress.sentBytes, progress.totalBytes)})`;
 }
 
 export function attachmentUploadFailureCopy(fileName: string, cause: string | null): string {

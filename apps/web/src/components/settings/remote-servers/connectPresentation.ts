@@ -138,7 +138,7 @@ export function describeAddServerFailure(
       return {
         title: "Pairing rejected",
         detail:
-          "The server rejected this pairing code. Codes are single-use and expire — generate a new one on the server.",
+          "The server rejected this pairing code. Codes are single-use and expire. Generate a new one on the server.",
       };
     case "incompatible":
       return {

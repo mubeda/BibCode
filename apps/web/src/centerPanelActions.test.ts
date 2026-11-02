@@ -184,7 +184,7 @@ describe("center panel actions", () => {
         commandId: "command-panel-create",
         hostThreadId: hostRef.threadId,
         threadId: "new-panel-thread",
-        title: "Panel — Codex",
+        title: "Panel: Codex",
         threadDefaults: {
           modelSelection,
           runtimeMode: "full-access",

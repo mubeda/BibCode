@@ -1766,7 +1766,7 @@ describe("MessagesTimeline user message affordances", () => {
       },
       onCancelAttachmentUpload: cancel,
     });
-    expect(container.textContent).toContain("Uploading 2 attachments — 3.1 of 20 MiB");
+    expect(container.textContent).toContain("Uploading 2 attachments (3.1 of 20 MiB)");
     const button = [...container.querySelectorAll("button")].find(
       (value) => value.textContent === "Cancel",
     )!;

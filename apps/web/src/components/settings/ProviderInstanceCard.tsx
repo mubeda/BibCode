@@ -641,8 +641,8 @@ export function ProviderInstanceCard({
                         )}
                         aria-label={
                           hasProviderUpdate
-                            ? "Update available — view details"
-                            : "Provider update check failed — view details"
+                            ? "Update available. View details"
+                            : "Provider update check failed. View details"
                         }
                       >
                         {hasProviderUpdate ? (

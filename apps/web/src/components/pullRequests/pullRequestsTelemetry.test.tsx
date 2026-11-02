@@ -349,7 +349,7 @@ describe("Pull Requests zero-telemetry runtime", () => {
     expect(
       container.querySelectorAll('a[href="https://images.example.test/tracker.png"]').length,
     ).toBeGreaterThanOrEqual(4);
-    expect(container.textContent).toContain("image: remote diagram — open in browser");
+    expect(container.textContent).toContain("image: remote diagram (open in browser)");
     expectNoDirectNetwork();
   });
 
