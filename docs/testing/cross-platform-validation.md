@@ -3730,7 +3730,8 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
   middle-click. Right-click offers **Open in BiBCode browser**, **Open in
   system browser**, and **Copy link**; other link types show no custom menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
   any modifier-click opens the editor. A file outside the workspace shows the
-  notice with **Open in editor**.
+  notice with **Open in editor**. Repeat the chat rows in a chat panel beside
+  the host chat: the BiBCode browser opens in the host's right panel.
 - Terminal URL: plain click does nothing; Ctrl/Cmd-click opens the setting's
   target; Ctrl/Cmd+Shift-click opens the other.
 - OSC 8: `printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'` opens

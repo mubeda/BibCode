@@ -40,6 +40,7 @@ import {
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
+import { RightPanelThreadContext } from "./chat/rightPanelThread";
 import {
   attachmentUploadFailureCopy,
   type PendingAttachmentUpload,
@@ -7499,7 +7500,10 @@ function ChatViewContent(props: ChatViewProps) {
 export default function ChatView(props: ChatViewProps) {
   return (
     <DiffWorkerPoolProvider>
-      <ChatViewContent {...props} />
+      {/* A chat panel renders no right panel: what its chat opens goes to its host's. */}
+      <RightPanelThreadContext value={props.activityPaneHostRef ?? null}>
+        <ChatViewContent {...props} />
+      </RightPanelThreadContext>
     </DiffWorkerPoolProvider>
   );
 }

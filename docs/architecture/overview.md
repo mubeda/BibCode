@@ -1140,6 +1140,12 @@ way before unarchiving the thread and removes it on a confirmed failure. This
 ordering is shared by browser and all desktop hosts; it does not depend on a
 WebView-specific scheduling delay.
 
+A chat panel renders no right panel. Its `ChatView` provides its host thread
+through `RightPanelThreadContext`, so a link or file its chat Markdown opens in
+the BiBCode browser or file viewer goes to the host's right panel, the one on
+screen. A command's open request (`OpenRequestRouter`) for a panel thread still
+uses the system browser.
+
 Center-panel layout is renderer-local, but the panels it holds are shared.
 Center terminals open or attach with `centerPanel: true`; the terminal manager
 keeps that marker (sticky once set, including across restart and reopen) and
