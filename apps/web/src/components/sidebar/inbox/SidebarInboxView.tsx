@@ -14,6 +14,7 @@ import { useThreadSelectionStore } from "../../../threadSelectionStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../../../threadRoutes";
 import { type InboxCategory, useUiStateStore } from "../../../uiStateStore";
 import { AgentsRow } from "../../agents/AgentsRow";
+import { AgentsShowOlder } from "../../agents/AgentsShowOlder";
 import { Button } from "../../ui/button";
 import { SidebarContent, SidebarGroup, SidebarMenu, useSidebar } from "../../ui/sidebar";
 import { agentRowUnreadKey } from "../agentsSection.logic";
@@ -214,6 +215,7 @@ export const SidebarInboxView = memo(function SidebarInboxView({ notices }: Side
               ))}
             </SidebarMenu>
           )}
+          {category === "done" && dataState !== "loading" ? <AgentsShowOlder /> : null}
         </div>
       </SidebarGroup>
     </SidebarContent>

@@ -10,6 +10,7 @@ import {
   ArrowLeftIcon,
   ArrowUpIcon,
   FolderPlusIcon,
+  LoaderIcon,
   MessageSquareIcon,
   SearchIcon,
   SettingsIcon,
@@ -53,7 +54,10 @@ import {
   buildRootGroups,
   buildThreadActionItems,
   createOlderThreadSearch,
+  olderThreadSearchLines,
   type CommandPaletteActionItem,
+  type OlderThreadSearchLine,
+  type OlderThreadSearchState,
   type CommandPaletteSubmenuItem,
   type CommandPaletteView,
   filterCommandPaletteGroups,
@@ -372,19 +376,30 @@ function OpenCommandPaletteDialog(props: {
     projectTitleById,
     threads,
   ]);
-  // A newer query, or a change of capped environments, aborts the search in flight.
+  const [olderSearch, setOlderSearch] = useState<OlderThreadSearchState | null>(null);
+  const olderSearchRef = useRef<ReturnType<typeof createOlderThreadSearch> | null>(null);
+  // A newer query, a retry, or a change of capped environments aborts the search in flight.
   useEffect(() => {
     const live = cappedEnvironments.filter((environment) => environment.live);
     if (live.length === 0) return;
     const search = createOlderThreadSearch(
       (searchQuery, signal) => {
-        for (const { environmentId } of live) {
-          void loadOlderThreads(environmentId, OLDER_SEARCH_SCOPE, {
+        setOlderSearch({ query: searchQuery, phase: "searching" });
+        void Promise.all(
+          live.map(({ environmentId }) =>
+            loadOlderThreads(environmentId, OLDER_SEARCH_SCOPE, {
+              query: searchQuery,
+              append: false,
+              signal,
+            }),
+          ),
+        ).then((outcomes) => {
+          if (signal.aborted) return;
+          setOlderSearch({
             query: searchQuery,
-            append: false,
-            signal,
+            phase: outcomes.includes("failed") ? "failed" : "done",
           });
-        }
+        });
       },
       {
         set: (callback, delayMs) => window.setTimeout(callback, delayMs),
@@ -392,8 +407,25 @@ function OpenCommandPaletteDialog(props: {
       },
     );
     search.update(deferredQuery);
-    return () => search.dispose();
+    olderSearchRef.current = search;
+    return () => {
+      olderSearchRef.current = null;
+      search.dispose();
+    };
   }, [cappedEnvironments, deferredQuery]);
+  const olderSearchLines = useMemo(() => {
+    const labelById = new Map(
+      environments.map((environment) => [environment.environmentId, environment.label]),
+    );
+    return olderThreadSearchLines({
+      query: deferredQuery,
+      environments: cappedEnvironments.map(({ environmentId, live }) => ({
+        label: labelById.get(environmentId) ?? "its server",
+        live,
+      })),
+      search: olderSearch,
+    });
+  }, [cappedEnvironments, deferredQuery, environments, olderSearch]);
 
   function pushPaletteView(view: CommandPaletteView): void {
     setViewStack((previousViews) => [
@@ -643,6 +675,12 @@ function OpenCommandPaletteDialog(props: {
             keybindings={keybindings}
             onExecuteItem={executeItem}
           />
+          {isSubmenu || olderSearchLines.length === 0 ? null : (
+            <OlderThreadSearchStatus
+              lines={olderSearchLines}
+              onRetry={() => olderSearchRef.current?.update(deferredQuery)}
+            />
+          )}
         </CommandPanel>
         <CommandFooter className="gap-3 max-sm:flex-col max-sm:items-start">
           <div className="flex items-center gap-3">
@@ -673,5 +711,51 @@ function OpenCommandPaletteDialog(props: {
         </CommandFooter>
       </Command>
     </CommandDialogPopup>
+  );
+}
+
+/** How the search of older threads is going (#223), under the results, which stay usable. */
+function OlderThreadSearchStatus(props: {
+  readonly lines: ReadonlyArray<OlderThreadSearchLine>;
+  readonly onRetry: () => void;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex flex-col gap-1 border-t px-3 py-2 text-xs text-muted-foreground"
+      data-testid="older-thread-search-status"
+    >
+      {props.lines.map((line) => {
+        switch (line.kind) {
+          case "searching":
+            return (
+              <span key="searching" className="flex items-center gap-2">
+                <LoaderIcon className="size-3 animate-spin" aria-hidden />
+                Searching older threads…
+              </span>
+            );
+          case "failed":
+            return (
+              <span key="failed" className="flex items-center gap-2">
+                Couldn&apos;t search older threads.
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:text-foreground"
+                  onClick={props.onRetry}
+                >
+                  Retry
+                </button>
+              </span>
+            );
+          case "offline":
+            return (
+              <span key={`offline:${line.label}`}>
+                Older threads are searched when {line.label} is connected.
+              </span>
+            );
+        }
+      })}
+    </div>
   );
 }

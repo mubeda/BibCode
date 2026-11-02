@@ -1697,8 +1697,13 @@ describe("addOlderChatCounts (#223)", () => {
     expect(summaries.get(key("/wt/fix"))).toEqual({
       count: 3,
       status: WORKSPACE_CARD_STATUS.approval,
+      older: 2,
     });
-    expect(summaries.get(key(null))).toEqual({ count: 3, status: WORKSPACE_CARD_STATUS.idle });
+    expect(summaries.get(key(null))).toEqual({
+      count: 3,
+      status: WORKSPACE_CARD_STATUS.idle,
+      older: 3,
+    });
   });
 
   it("keeps every workspace card: an uncapped project changes nothing", () => {

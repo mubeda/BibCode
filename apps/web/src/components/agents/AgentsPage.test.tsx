@@ -195,6 +195,10 @@ vi.mock("../ui/sidebar", async (importOriginal) => ({
   useSidebar: () => ({ toggleSidebar: vi.fn() }),
 }));
 
+vi.mock("./AgentsShowOlder", () => ({
+  AgentsShowOlder: () => <div data-testid="agents-show-older" />,
+}));
+
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: { children?: ReactNode }) => <>{children}</>,
   TooltipPopup: () => null,
@@ -552,6 +556,17 @@ describe("AgentsPage", () => {
 
     expect(h.historyBack).not.toHaveBeenCalled();
     expect(h.routerNavigate).toHaveBeenCalledExactlyOnceWith({ to: "/" });
+  });
+
+  it("ends the expanded Done group with Show older (#223)", async () => {
+    h.shells = [makeShell()];
+    const { container } = await mount(<AgentsPage />);
+    expect(container.querySelector('[data-testid="agents-show-older"]')).toBeNull();
+
+    h.groupExpandedById = { "status:done": true };
+    await rerender({ container, root: mountedTrees.at(-1)!.root }, <AgentsPage />);
+    expect(container.querySelector('[data-testid="agents-group-status:done"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="agents-show-older"]')).not.toBeNull();
   });
 
   it("counts unread agents from the full row set", async () => {

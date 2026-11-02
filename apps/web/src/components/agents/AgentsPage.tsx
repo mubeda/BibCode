@@ -287,7 +287,7 @@ export function AgentsPage() {
                           ))}
                         </SidebarMenu>
                       ) : null}
-                      {groupExpanded && group.id === "done" ? <AgentsShowOlder /> : null}
+                      {groupExpanded && group.id === "status:done" ? <AgentsShowOlder /> : null}
                     </div>
                   );
                 })

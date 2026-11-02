@@ -32,7 +32,9 @@ import {
   type EnvironmentAvailabilityStatus,
   makeEnvironmentShellState,
   setShellIncludeHints,
+  shellSubscribeInput,
 } from "./shell.ts";
+import { offShellThreads } from "./offShellThreads.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -1058,6 +1060,65 @@ describe("shell cap and resume", () => {
       expect(
         Option.getOrThrow((yield* SubscriptionRef.get(shellState)).snapshot).revision,
       ).toBeUndefined();
+    }),
+  );
+
+  it.effect("keeps the engine sequence an item past it carries, and resumes from it", () =>
+    Effect.gen(function* () {
+      const { items, shellState, live } = yield* setup(null);
+      const { revision: _none, ...uncached } = CACHED;
+      yield* Queue.offer(items, { kind: "snapshot", snapshot: uncached, revision: "first" });
+      yield* live;
+      const atSequence = (sequence: number) =>
+        SubscriptionRef.changes(shellState).pipe(
+          Stream.filter(
+            (state) =>
+              Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === sequence,
+          ),
+          Stream.runHead,
+        );
+      // A terminal's agent started working: no event, so the item runs past the engine.
+      yield* Queue.offer(items, {
+        kind: "thread-upserted",
+        sequence: 10,
+        engineSequence: 9,
+        revision: "past",
+        thread: capThread("host"),
+      });
+      yield* atSequence(10);
+      const past = Option.getOrThrow((yield* SubscriptionRef.get(shellState)).snapshot);
+      expect(past.engineSequence).toBe(9);
+      expect(shellSubscribeInput(TARGET.environmentId, past).resume).toEqual({
+        revision: "past",
+        snapshotSequence: 9,
+      });
+      yield* Queue.offer(items, {
+        kind: "thread-removed",
+        sequence: 11,
+        threadId: ThreadId.make("host"),
+      });
+      yield* atSequence(11);
+      expect(
+        Option.getOrThrow((yield* SubscriptionRef.get(shellState)).snapshot).engineSequence,
+      ).toBeUndefined();
+    }),
+  );
+
+  it.effect("a new session clears the off-shell store, missing included", () =>
+    Effect.gen(function* () {
+      const { activeSession } = yield* setup(CACHED);
+      offShellThreads.applyLookup(
+        TARGET.environmentId,
+        offShellThreads.get(TARGET.environmentId).generation,
+        { threads: [], missing: [ThreadId.make("restored-later")] },
+      );
+      expect(offShellThreads.get(TARGET.environmentId).missing.size).toBe(1);
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some(session({} as unknown as WsRpcProtocolClient)),
+      );
+      yield* yieldForShell;
+      expect(offShellThreads.get(TARGET.environmentId).missing.size).toBe(0);
     }),
   );
 

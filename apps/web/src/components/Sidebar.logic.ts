@@ -881,6 +881,8 @@ export interface WorkspaceChatSummary {
   readonly count: number;
   /** The most urgent status among the chats, idle included; shown as the row's glyph. */
   readonly status: WorkspaceCardStatus;
+  /** How many of `count` a capped shell left out (#223), which its list pages in. */
+  readonly older?: number;
 }
 
 /**
@@ -954,6 +956,7 @@ export function addOlderChatCounts(
       next.set(key, {
         count: (current?.count ?? 0) + chats.count,
         status: current?.status ?? WORKSPACE_CARD_STATUS.idle,
+        older: (current?.older ?? 0) + chats.count,
       });
     }
   }

@@ -116,7 +116,12 @@ export function shellSubscribeInput(
     cap: { include },
     ...(cached?.revision === undefined
       ? {}
-      : { resume: { revision: cached.revision, snapshotSequence: cached.snapshotSequence } }),
+      : {
+          resume: {
+            revision: cached.revision,
+            snapshotSequence: cached.engineSequence ?? cached.snapshotSequence,
+          },
+        }),
   };
 }
 
@@ -130,6 +135,17 @@ function withShellRevision(
   if (snapshot.revision === revision) return snapshot;
   if (revision !== undefined) return { ...snapshot, revision };
   const { revision: _cleared, ...rest } = snapshot;
+  return rest;
+}
+
+/** Keeps the engine's sequence an item carries, which the server sends only past it (#223). */
+function withEngineSequence(
+  snapshot: OrchestrationShellSnapshot,
+  engineSequence: number | undefined,
+): OrchestrationShellSnapshot {
+  if (snapshot.engineSequence === engineSequence) return snapshot;
+  if (engineSequence !== undefined) return { ...snapshot, engineSequence };
+  const { engineSequence: _cleared, ...rest } = snapshot;
   return rest;
 }
 
@@ -293,11 +309,14 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         return;
       }
       nextSnapshot = withActivityAges(
-        {
-          ...current.snapshot.value,
-          snapshotSequence: item.snapshotSequence,
-          revision: item.revision,
-        },
+        withEngineSequence(
+          {
+            ...current.snapshot.value,
+            snapshotSequence: item.snapshotSequence,
+            revision: item.revision,
+          },
+          undefined,
+        ),
         item.activityAges,
         receivedAt,
       );
@@ -322,7 +341,10 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         return;
       }
       // Only an item that carries a revision vouches for the shell it leaves.
-      nextSnapshot = withShellRevision(nextSnapshot, item.revision);
+      nextSnapshot = withEngineSequence(
+        withShellRevision(nextSnapshot, item.revision),
+        item.engineSequence,
+      );
     }
     if (nextSnapshot === null) {
       return;
@@ -355,6 +377,10 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           const session = Option.getOrNull(yield* SubscriptionRef.get(subscriptionSession));
           const previousSession = yield* Ref.get(observedSession);
           yield* Ref.set(observedSession, session);
+          // Nothing loaded off the shell in another session is trusted, `missing` included.
+          if (session !== null && session !== previousSession) {
+            offShellThreads.reset(environmentId);
+          }
           yield* projectConnectionStateLocked(connection);
           return {
             connection,
