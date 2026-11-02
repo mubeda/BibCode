@@ -505,9 +505,10 @@ read and download tools work at read-only.
   it back on the next delete or discard in that folder once the name is free. A permanent delete of a
   folder that stops part-way says where what is left is (`partially_removed`). `files_delete`
   takes a `clientRequestId`.
-- **Windows.** On a BiBCode server running on Windows, the tools that change files
-  (`files_write`, `files_create`, `files_rename`, `files_delete`, `files_upload`) are refused
-  (`McpPlatformUnsupportedError`); reading, listing, searching and downloading work.
+- **Windows.** The Files tools work the same on a BiBCode server running on Windows. A
+  junction or symlink is never followed out of the thread's folder, and a path that names
+  an alternate data stream (`file.txt:stream`) is refused. Moving an entry to the trash
+  needs an NTFS or ReFS drive; elsewhere it is left in place (`trash_unavailable`).
 - **Transfers.** No file bytes pass through MCP. A transfer URL works for 5 minutes, for one
   file or folder, and only while the agent's access lasts: Stop, Revoke, turning the MCP
   server or **Files** off, or (for an upload) **Take over** or read-only ends it, also
