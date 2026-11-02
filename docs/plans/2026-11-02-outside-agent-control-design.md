@@ -14,6 +14,14 @@ amends one answer of the approved
   touches auth, recorded outcomes, Stop and the UI's id joins. That is out of proportion
   next to the urgent P0, so they get their own issue, a re-review and a later release.
 
+**Revision 2 (2026-11-02)** answers the second Codex review:
+
+- Stray token files are removed per endpoint, under its edit mutex, with no startup
+  sweep.
+- Mixed client and server versions are specified.
+- `answer`, `approve` and `decline` lose `--wait`.
+- One-shot `bibcode mcp call` is limited to read-only tools other than `files_download`.
+
 The stale-doc fix and the `input.*` webhook events change no decision, so they form the
 first slice and may land before this note is approved. Every other slice waits for
 approval.
@@ -111,6 +119,11 @@ test names are proposals. Contract and Rust shapes change together, and
   (`WebhooksTab.tsx:46-64`).
 - **Existing endpoints are unchanged.** Each one stores its own event list, so only new
   endpoints, which default to every event (`WebhooksTab.tsx:66-68`), get the new events.
+- **Mixed versions** (see [Mixed client and server versions](#mixed-client-and-server-versions)):
+  - The capability is `webhookQuestionEvents`.
+  - `WebhookEndpoint.eventTypes` decodes as strings, so a later event never breaks the
+    list.
+  - The form keeps event names it does not know when it saves.
 - **Tests.** `feed_entries_map_to_the_catalog` expects both events.
   `a_payload_holds_ids_and_states_only` covers an input payload.
   `every_webhook_event_is_in_the_webhooks_reference` passes. `WebhooksTab.test.tsx` shows
@@ -143,9 +156,16 @@ test names are proposals. Contract and Rust shapes change together, and
   - **Clear:** commit `bearer_secret = NULL`, then remove the replaced file.
   - **A failed commit** removes the new file and answers `storage`. Nothing changed: the
     old URL and old token stay paired.
-  - **A crash** between the file write and the commit leaves an unreferenced file. The
-    dispatcher's start removes every `webhook-bearer-*` file that no row names
-    (`SecretStore::prune_records_with_prefix`, `secret_store.rs:302`).
+  - **A crash** before the commit, or before the replaced file is removed, leaves an
+    unreferenced file. There is no startup sweep, because one would race a save
+    (`Webhooks::start` spawns its task without awaiting it, `mod.rs:241`). Instead, every
+    upsert and delete of an endpoint, while holding that endpoint's edit mutex, lists
+    `SecretStore::names()` (`secret_store.rs:279`). It removes each
+    `webhook-bearer-<that id>-*` file that the row does not name, other than the file this
+    edit just wrote. Delete removes all of them. So only the one edit that owns an
+    endpoint's prefix ever removes its files. Shortcut: a stray file of an endpoint that is
+    never edited again stays until the endpoint is deleted. It names no destination and
+    has the secret store's protection.
   - **Create:** signing secret, token file, then row. If the insert fails, remove both, as
     `rpc.rs:315-316` does today. Delete removes the signing secret and the named file.
   - **One edit at a time per endpoint.** Every upsert and delete of an endpoint holds a
@@ -174,7 +194,10 @@ test names are proposals. Contract and Rust shapes change together, and
   not retried and is never sent without the token, as with `secret_missing`. The HMAC is
   unchanged and does not cover `Authorization`.
 - **Output.** `endpoint_view` and the `WebhookEndpoint` contract gain
-  `bearerTokenSet: boolean` (`bearer_secret IS NOT NULL`). `WebhookDelivery.lastError` documents `token_missing`.
+  `bearerTokenSet: boolean` (`bearer_secret IS NOT NULL`), which decodes to `false` when
+  absent. `WebhookDelivery.lastError` documents `token_missing`. The capability is
+  `webhookBearerToken`. Without it the form hides the field and says "Update BiBCode on
+  this environment to send a bearer token."
 - **Fixtures.** Webhooks have only typed-failure and manifest fixtures today
   (`fixtures/rpc-wire/typed-failures/webhooks__*.json`), so a new field regenerates
   nothing. Add three `contract-shapes/webhooks__upsert-*-request.json` fixtures (token
@@ -202,8 +225,11 @@ test names are proposals. Contract and Rust shapes change together, and
     It injects a store failure into the row commit, then checks that receiver A gets only
     token A and receiver B gets nothing.
   - New: `a_url_change_without_the_token_is_refused_while_one_is_set`.
-  - New: `a_token_file_left_by_a_crash_before_the_commit_is_removed_at_start_and_never_sent`.
-    It writes the file, skips the commit and restarts the dispatcher.
+  - New: `a_token_file_left_by_a_crash_is_removed_by_the_next_edit_and_never_sent`. It
+    writes the file, skips the commit, restarts, then edits.
+  - New: `a_save_during_dispatcher_start_keeps_its_token`. A pause hook holds the
+    dispatcher's start while an upsert writes its file and commits. No delivery fails as
+    `token_missing`.
   - New: `concurrent_clear_and_replace_leave_a_readable_token_or_none`. Pause hooks hold one
     upsert after its file write while the other commits, in both orders. The row then
     names a readable file or none, and no delivery fails as `token_missing`.
@@ -316,14 +342,21 @@ recorded outcomes, Stop, the UI).
 | Command                                                                | Tool                                               | Flags                                                                                |
 | ---------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `requests <thread>` (added: there is no other way to get a request id) | `list_pending_requests`                            | none                                                                                 |
-| `answer <thread> <request> <answers-json\|->`                          | `answer_question`                                  | `--request-id`, `--wait`                                                             |
-| `approve <thread> <request> [--for-session]`                           | `answer_approval` (`accept` or `acceptForSession`) | `--request-id`, `--wait`                                                             |
-| `decline <thread> <request> [--cancel]`                                | `answer_approval` (`decline` or `cancel`)          | `--request-id`, `--wait`                                                             |
+| `answer <thread> <request> <answers-json\|->`                          | `answer_question`                                  | `--request-id`                                                                       |
+| `approve <thread> <request> [--for-session]`                           | `answer_approval` (`accept` or `acceptForSession`) | `--request-id`                                                                       |
+| `decline <thread> <request> [--cancel]`                                | `answer_approval` (`decline` or `cancel`)          | `--request-id`                                                                       |
 | `interrupt <thread> [--turn <id>]`                                     | `interrupt_turn`                                   | none. The tool refuses a `clientRequestId` (`mcp.md:756-757`), so no `--request-id`. |
 | `changes [--cursor <c>] [--thread <id>] [--limit <n>]`                 | `changes_since`                                    | none                                                                                 |
 
-- `--wait` reuses the existing `wait_for_thread` loop. Sign-in, `--json` and exit codes 0,
-  1 and 2 are the same as today. Usage errors already exit 1 (`main.rs:28-38`), so 2 stays
+- **No `--wait` on `answer`, `approve` or `decline`** (restricted).
+  - `wait_for_thread` stops at once on `awaiting_input` or `awaiting_approval`
+    (`mcp/wait.rs:49-55`), and the answer's resolution is projected later. So a wait right
+    after an answer can report the request just answered.
+  - A correct wait needs a fence on that request's resolution and the answered turn's id.
+    `wait_for_thread` takes neither today (`:75`). That is a server change for a
+    convenience, so it is left out. Watch the thread with `bibcode thread show`, or the
+    `input.resolved` and `approval.resolved` webhooks.
+- Sign-in, `--json` and exit codes 0, 1 and 2 are the same as today. Usage errors already exit 1 (`main.rs:28-38`), so 2 stays
   unambiguous. Answers are never echoed or logged, like messages today.
 - **Tests** (`thread_cli/tests.rs`): one case per subcommand with `--json` and its exit
   code. `answer` and `approve` are refused when **Agents may** is below the thread's mode.
@@ -338,11 +371,24 @@ recorded outcomes, Stop, the UI).
   (`config.rs:723-729`), rather than as top-level `call` and `tools`. That keeps the top
   level small and gives them `--access`, and `--client` once named clients ship.
   - `call <tool> [<arguments-json>|-]` prints the tool result.
-  - `tools` prints the tool list the credential sees.
+  - `tools` prints the tool list the credential sees, each with `oneShot: true|false`.
   - Exit codes: 0 success; 1 a tool error, unknown tool or transport failure; 2 a result
     whose `status` is `awaiting_approval` or `awaiting_input`.
-- **Tests.** In a new `mcp/call_cli` module: a read tool, a tool refused at the ceiling, and
-  an unknown tool.
+- **Restricted to read-only tools, except `files_download`.**
+  - A one-shot run revokes its credential on exit. That ends what the call handed back:
+    a transfer URL is checked against its minting session (`controls_for`,
+    `production/transfer_routes.rs:76-92`), and owned work such as a running clone stops
+    (`mcp.md:918-929`).
+  - Read-only tools (`ToolSpec.read_only`) finish within the call. `files_download` is the
+    one read-only tool that hands back a session-bound URL.
+  - Every other tool is refused before any credential is minted: "`<tool>` needs a
+    connection that stays open. Use it from `bibcode mcp` in your agent, or `bibcode
+    thread` for messages, answers and approvals."
+  - Widening this needs a per-tool "finishes within the call" flag on `ToolSpec`, which is
+    a later choice.
+- **Tests.** In a new `mcp/call_cli` module: a read tool, a tool refused at the ceiling, an
+  unknown tool, and `files_download`, `files_upload` and `clone_repository` refused with
+  no credential minted.
 - **Docs.** `docs/reference/mcp.md` (transports) and the skill.
 
 ### P2b: remote OAuth with a hosted client (slice 7)
@@ -377,10 +423,50 @@ recorded outcomes, Stop, the UI).
     kinds. `null` means all. `address` (`mod.rs:784-806`) skips a non-matching kind.
     Changing the list is a new revision, like `eventTypes`. It is persisted as a JSON
     column.
+  - On input, `statusKinds` absent keeps the stored filter, so an older client's save
+    never resets it. On output, absent decodes to `null`. The capability is
+    `webhookStatusKinds`.
 - **Tests.** `a_payload_holds_ids_and_states_only` checks `projectId`. New:
   `an_endpoint_that_skips_turn_started_gets_no_such_delivery`. Add the contract, a fixture
   and `WebhooksTab.test.tsx`.
 - **Docs.** `docs/reference/webhooks.md:141-156`, `:51-66` and `:312-320`.
+
+## Mixed client and server versions
+
+A desktop app often reaches an environment that runs another BiBCode version. Both sides
+advertise the same remote protocol (`REMOTE_PROTOCOL_VERSION` is 1). The existing answer is
+`ExecutionEnvironmentCapabilities`: booleans that decode to `false` when absent
+(`packages/contracts/src/environment.ts:29-60`), set by the server's descriptor
+(`production/control.rs:2697-2706`). This note uses that mechanism and adds nothing new.
+
+- **New client, older server.**
+  - The capabilities `webhookQuestionEvents` (slice 1), `webhookBearerToken` (slice 2)
+    and `webhookStatusKinds` (slice 4) read `false`, so the form hides that control with
+    "Update BiBCode on this environment to ...".
+  - New output fields have decoding defaults: `bearerTokenSet` is `false` and
+    `statusKinds` is `null`. An older server's `webhooks.list` result still decodes.
+  - The client never sends `bearerToken` or `statusKinds` to a server without the
+    capability. If it did, `deny_unknown_fields` (`rpc.rs:137`) would refuse it as
+    `invalid`, never ignore it silently.
+- **Older client, newer server.**
+  - An upsert without `bearerToken` or `statusKinds` keeps both. An older client's save
+    never clears a token or resets a filter.
+  - Effect `Struct` ignores fields it does not know, so new output fields are harmless.
+  - The closed event enum is not. A v0.14 client fails to decode `webhooks.list` once an
+    endpoint subscribes to a question event, because `WebhookEndpoint.eventTypes` is
+    `Array(WebhookEventType)` (`webhooks.ts:60`). Its Webhooks tab shows a load error. It
+    fails closed and loses nothing, but it can neither list nor edit endpoints.
+  - **Known limit.** A server cannot tell which version a client runs (no client version
+    is sent), and hiding events from the list would make an old client's save drop them.
+    The fix is to update the app.
+  - From slice 1 on, `eventTypes` decodes as `Array(String)` and the form saves back the
+    names it does not know. Later events then never break a client.
+- **Tests, both directions.**
+  - Contract tests decode older-server fixtures, without the new fields, into the new
+    schema.
+  - `WebhooksTab.test.tsx` hides each control when its capability is `false`.
+  - A Rust test checks that an upsert in the v0.14 shape keeps the token and the filter.
+  - A contract test decodes a list with an unknown event type and preserves it.
 
 ## Failure, restart, concurrency and security
 
@@ -391,7 +477,10 @@ recorded outcomes, Stop, the UI).
   A URL change must restate it.
 - **Crossing receivers.** The URL and the token reference change in one row commit. A
   failed commit, or a crash before it, leaves the old URL with the old token. A crash
-  after it leaves only an unreferenced file, which is removed at start.
+  after it leaves only an unreferenced file, which the endpoint's next edit removes.
+- **Mixed versions.** Every new output field has a decoding default. Every new control is
+  gated on an environment capability. An upsert from an older client keeps what it does
+  not name. See [Mixed client and server versions](#mixed-client-and-server-versions).
 - **Concurrent edits.** A per-endpoint edit mutex orders upserts. A replaced file is
   removed only after its replacement is committed, and under the send lock, so the row
   always names a readable file or none.
@@ -447,7 +536,17 @@ Codex review, round 1, of revision 0. Each finding was checked against the sourc
 | 5   | P2: a concurrent clear and replace can leave the flag set with no file, which gives `token_missing` failures and then a disabled endpoint. | Confirmed for revision 0's flag and fixed file name. A whole-row `update_endpoint` could also write back a stale value.                                                                                                           | **Fixed (P0).** There is no separate flag: the row names the file. A per-endpoint edit mutex orders edits. `update_endpoint` touches `bearer_secret` only when a token is given. A replaced file is removed after the commit, under the send lock. A controlled-interleaving test is named. |
 | 6   | P2: folding the CLI into a reserved identity breaks the 24-hour retry promise at upgrade.                                                  | Confirmed. The rows are keyed `CLI · bibcode thread` (`control.rs:1255`), and `docs/reference/mcp.md:192-195` promises 24 hours.                                                                                                  | **Removed.** The CLI keeps its label scope, so no rows move and nothing needs migrating. This is the smaller design.                                                                                                                                                                        |
 
-**Proportion.** Findings 2 to 4 show that named clients reach into auth issuance, recorded
+Codex review, round 2, of revision 1. Each finding was checked against the source. None
+was refuted. Two are resolved by restricting a slice, the smaller correct design.
+
+| #    | Finding                                                                                                   | Checked in source                                                                                                                                                      | Resolution                                                                                                                                                                                                                                                                                                                                 |
+| ---- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| R2.1 | P2: a startup sweep races a token save, and the cited prune helper's predicate reads contents, not names. | Confirmed. `Webhooks::start` spawns `run` without awaiting it (`mod.rs:241`). `prune_records_with_prefix` takes `Fn(&[u8])` over contents (`secret_store.rs:302-308`). | **Fixed (P0).** No startup sweep. Each edit of an endpoint removes that endpoint's unreferenced files under its own edit mutex, using `SecretStore::names()`. Tests cover a stray file after a crash, and a save during dispatcher start.                                                                                                  |
+| R2.2 | P2: mixed versions. New fields are required, and the event enum is closed.                                | Confirmed. `WebhookEndpoint` fields are required (`webhooks.ts:55-75`). `eventTypes` is a closed enum (`:60`). There is no client version signal.                      | **Fixed, with one documented limit.** Capability flags and decoding defaults follow the existing pattern, and absent input fields keep stored values. `eventTypes` decodes as strings from slice 1 on. A v0.14 client fails closed on question events. Tests run in both directions ([Mixed versions](#mixed-client-and-server-versions)). |
+| R2.3 | P2: `answer --wait` can return `awaiting_input` for the question just answered.                           | Confirmed. `done()` stops on `awaiting_input` (`mcp/wait.rs:49-55`), and `wait_for_thread` takes only `threadId`, `messageId` and `timeoutMs` (`:74`).                 | **Restricted.** `--wait` is dropped from `answer`, `approve` and `decline`. A fenced wait needs a server change for a convenience.                                                                                                                                                                                                         |
+| R2.4 | P2: `bibcode mcp call files_download` prints a URL that dies when the run exits.                          | Confirmed. `controls_for` refuses a session that ended (`transfer_routes.rs:76-92`). Owned work such as a clone also stops on revoke (`mcp.md:919-929`).               | **Restricted.** One-shot `call` accepts read-only tools except `files_download`, and refuses every other tool before minting. `tools` marks `oneShot`. Tests are named.                                                                                                                                                                    |
+
+**Proportion (round 1).** Round 1 findings 2 to 4 show that named clients reach into auth issuance, recorded
 outcomes, Stop and two UI joins. Next to the urgent P0, that is disproportionate. They are
 split into their own issue and a later release (see the status note). Every other item
 stays in this batch.
