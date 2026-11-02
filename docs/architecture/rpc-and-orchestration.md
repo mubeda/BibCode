@@ -842,21 +842,47 @@ range from `review.getDiffPreview`, and a turn or the whole thread from
 
 ### Turn checkpoints
 
-A checkpoint is a commit of the whole checkout, written by the orchestration
-effects worker (`orchestration_effects.rs`) through a temporary index, so the
-person's own index and branches are untouched. `refs/bibcode/checkpoints/<base64
+A checkpoint is a commit of the whole checkout, written through a temporary
+index, so the person's own index and branches are untouched. The orchestration
+effects worker (`orchestration_effects.rs`) writes every numbered ref; turn
+delivery writes ref 0. `refs/bibcode/checkpoints/<base64
 thread id>/turn/<n>` is the checkout after turn `n`; ref 0 is the checkout
 before the thread's first recorded turn. Turn `n`'s patch is ref `n - 1` to ref
 `n`, and the read model's `projection_turns.checkpoint_*` columns hold each
-turn's number, ref, status and changed files.
+turn's number, ref, status, changed files and whether its diff is available
+(`checkpoint_diff_available`, migration 63).
 
-1. **Turn start.** `thread.turn-start-requested` (and a non-imported user
-   `thread.message-sent`) captures ref `n`, `n` being the latest number among
-   the turns before the starting one, if it is missing. A thread with settled
-   turns but no recorded checkpoint, whose turns predate turn checkpoints,
-   captures ref 0 again on `thread.turn-start-requested` unless another turn
-   runs, so its first recorded turn does not reach back to the thread's first
-   turn. A latest turn whose checkpoint went stale (step 3) gets no ref.
+A `ready` turn's ref `n` is its end state, so it is a revert target. Its diff
+also needs a **trusted baseline**: ref 0, or ref `n - 1` of a `ready` turn. A
+numbered ref is written only by that turn's own capture, while the turn's hold
+keeps every later turn out of the checkout. That is the only time the checkout
+is known to be the turn's end state.
+
+1. **Turn start.** Turn delivery captures ref 0 before it first claims a start
+   (attempt 0) of a thread with no numbered turn (#261), so ref 0 is the
+   checkout before that turn. A baseline stage in the delivery loop
+   (`FirstTurnBaselines` in `turn_delivery.rs`) runs the capture
+   (`ensure_first_turn_baseline`) outside the delivery slots, at most four at a
+   time and one per thread. The row takes a slot only once the stage has
+   ended. A start with a `bootstrap` runs it in a slot first, then releases the
+   slot, so its baseline is taken in the checkout the bootstrap set up. A thread
+   with a numbered turn costs one read and no Git, and a project outside Git
+   costs a filesystem probe. Every step is bounded by the checkpoint hold limit.
+   Cancelled steps get 10 seconds to stop, and a capture waits at most 5
+   seconds to remove its temporary index. That removal is then left to finish
+   on its own and logged, so a stalled filesystem never holds the stage.
+   A failure or timeout is logged and shown once as a
+   `checkpoint.capture.failed` activity (`turnCount: 0`, no turn id). The turn
+   still goes, and its capture is then `ready` without a diff. Shutdown cancels
+   the stage, which leaves the row pending and unclaimed. A row claimed before
+   never captures, because the checkout may hold its edits. A claim sets
+   `provider_turn_outbox.claimed_once` (migration 65), which a manual retry
+   does not clear, and every row from before the migration counts as claimed. Every Git command whose output ref 0 holds finishes before the claim.
+   Only `update-ref` can outlive a timeout (a stalled Windows spawn), and it
+   publishes a commit fixed before the claim. A turn start never writes a
+   numbered ref. A thread with settled turns but no recorded checkpoint, whose
+   turns predate turn checkpoints, captures ref 0 again at that first claim, so
+   its first recorded turn does not reach back to the thread's first turn.
 2. **Turn end.** Provider ingestion's `turn.completed` (not a compaction's own
    turn) records the turn's number, the latest plus one, with status `missing`
    before the session settles (`record_turn_end`). A turn that already has a
@@ -872,27 +898,39 @@ turn's number, ref, status and changed files.
    thread's holds are released.
 3. **Capture.** The worker handles the `missing` record: it captures ref `n`
    (always written: a ref already there is a leftover a revert could not
-   delete; a capture that fails deletes it), diffs it against ref `n - 1`,
-   records `ready` with the changed files and the turn's own answer id, appends
-   a `checkpoint.captured` activity, and releases that turn's hold however it
-   ends. A `ready` or `error` row is never captured again. `ready` requires
-   ref `n - 1`, and turn `n - 1` not given up (`error`); without them, and
-   after a failed capture,
-   the turn stays `missing` with a `checkpoint.capture.failed` activity, and
-   the next turn start writes ref `n` if it is still missing. A hold still
-   pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds) gives
-   the capture up: the turn's checkpoint is recorded `error` (terminal: no
-   later record of it changes that) before the hold is released, with a
-   warning and one `checkpoint.capture.failed` activity. The worker never
-   captures or records that turn `ready`, and no later baseline writes its
-   ref, across restarts too. Expiry and completion decide once per turn under
-   the hold lock (`claim_checkpoint_completion`): a turn ends `ready` or
-   `error`, never both. An `error` checkpoint does not change the turn's own
-   state.
+   delete; a capture that fails tries to delete it, and one left behind is
+   never read), records `ready` with the turn's own answer id, appends a
+   `checkpoint.captured` activity, and releases that turn's hold. A `ready` or
+   `error` row is never captured again. When ref `n - 1` is a trusted baseline
+   and resolves, the row carries the changed files from ref `n - 1`. Otherwise
+   it is `ready` with no files and `diffAvailable: false`, and its
+   `checkpoint.captured` activity has tone `warning` and says the turn's
+   changes cannot be shown but it can still be reverted to. A failed capture
+   leaves the turn `missing` with a `checkpoint.capture.failed` activity. So
+   the turn after one whose capture did not complete (it failed, timed out or
+   was cut off by a restart) has no diff, though it can be reverted to. It
+   never gets a diff from a late baseline that may hold its own edits. A hold
+   still pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds)
+   gives the capture up: one attempt records the turn's checkpoint `error`
+   (terminal: no later record of it changes that) before the hold is released,
+   with a warning and one `checkpoint.capture.failed` activity. If that record
+   fails, it is logged and the row stays `missing`, which is just as safe: it
+   is no revert target, no baseline, and no baseline writes its ref, across
+   restarts too. The worker never captures or records a stale turn `ready`.
+   Expiry and completion decide once per turn under the hold lock
+   (`claim_checkpoint_completion`): a turn ends `ready` or `error`, never both.
+   A stale turn's hold is released only by its expiry task, after its record
+   attempt: the worker's release (`release_checkpoint_hold_unless_stale`)
+   reads the stale mark and removes the hold under that same lock, so no
+   record of the turn lands after its release. An `error` checkpoint does not
+   change the turn's own state.
 4. **Restart.** Startup reconciliation records a turn the restart cut off as
    `missing`, without a capture, when the thread already has a recorded
    checkpoint, so the numbers stay dense and a revert's provider rewind
-   (current number minus target) still counts every turn.
+   (current number minus target) still counts every turn. No baseline writes
+   that turn's ref, so the next turn is captured without a diff. A first turn
+   still pending at the restart passes the baseline stage before its first
+   claim, even though the effects worker never replays its start event.
 
 A provider stream that ends mid-turn synthesizes a failed `turn.completed`, so
 that turn is recorded too. The turn-diff projector keeps a turn's `interrupted` or `error` state and its answer
@@ -910,12 +948,14 @@ Turn and full-thread patches are computed live from the checkpoint refs at
 `refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
 
 0. It serves only captured turns, as a revert restores only them: each end of
-   the range past turn 0 must have a `ready` checkpoint row (the start of a
-   one-turn range is vouched for by its end, whose capture required that
-   ref). Otherwise it returns the method's error with "Turn n has no captured
-   checkpoint (its capture failed or timed out), so its changes cannot be
-   shown.", whatever refs exist. The Diff panel shows it as it shows a
-   checkpoint that is gone.
+   the range past turn 0 must have a `ready` checkpoint row. Otherwise it
+   returns the method's error with "Turn n has no captured checkpoint (its
+   capture failed or timed out), so its changes cannot be shown.", whatever
+   refs exist. The start of a one-turn range is vouched for only by its end's
+   `diffAvailable`; an end without it returns "Turn n has no diff: the
+   checkpoint before it is missing. You can still revert to it." A wider
+   range between two `ready` ends is served, since both refs are end states.
+   The Diff panel shows either error as it shows a checkpoint that is gone.
 1. It acquires the thread's workspace admission, which resolves the thread's
    worktree or its project's root. The lease is held until Git exits. A
    workspace that is being removed, or is gone, returns
@@ -2724,6 +2764,67 @@ servers ignore it and send no `revision`, so either side alone keeps today's
 full snapshot. `packages/contracts/fixtures/thread-stream/resume.json` pins the
 items; revisions in it are placeholders, because they mean nothing to another
 process.
+
+A subscriber that sends `history: {}` opens a **history window** (#226,
+[design](../plans/2026-11-01-thread-history-window-design.md)): the first item
+holds recent history under a byte budget, and older rows load in pages. The
+four history arrays (messages, activities, reasoning, proposed plans) are cut by
+the key `K = (createdAt, kindRank, id)`, the timeline's order across kinds. A
+window has a fixed floor `{ K | ALL, openedAt, epoch }`, and a row is in it when
+`K >= floor.K`, when its `written_sequence` is greater than `openedAt` (it was
+written after the window opened), or when it is live: a streaming message or
+reasoning row, or a message whose delivery is `queued`, `pending`, `sending`,
+`uncertain` or `failed`. Every projector write to a history row sets
+`written_sequence` to the sequence of the event it projects, so it never
+repeats and a projection rebuild gives the same values; a rowid would do
+neither. A row stops being live only through a write, so rows only ever enter a
+window: index patches stay exact and nothing outside the window is sent as a
+removal. The server chooses a fresh floor by serializing the fixed parts first
+(the shell, live rows, carried rows and the turn index) and then walking the
+other rows newest first by `K` until 1 MiB of JSON, 500 rows or 10 user
+messages, always taking the newest row. The floor is the oldest whole turn
+reached, the oldest row taken inside one oversized turn, or `ALL` when the walk
+reaches the oldest row. The thread then has `history: { floor, hasOlder,
+olderRows, carried }`; `floor` is opaque base64url JSON of ids, timestamps and
+sequences.
+
+State a window may not hold travels in `history.carried`, selected by the same
+rules the web's readers use: every `*.requested` activity of a request still
+open (a pending approval in `projection_pending_approvals`, or a user-input
+request `open_user_input_requests_sql` lists, of any turn or none), the
+context-window and MCP status rows `deriveLatestContextWindowSnapshot` and
+`deriveMcpStatusSnapshot` would select (the newest valid one in canonical
+activity order, per provider instance for MCP), the newest proposed plan, the
+newest of the latest turn, and any plan a `running` turn names as its source.
+`packages/contracts/fixtures/thread-stream/carried-status.json` runs the Rust
+selector and the web readers on the same cases. Every checkpoint is sent, but
+one whose turn has no row in the window comes with `files: []` and its
+`filesTotal`: the turn index. A resubscribe echoes `history.floor`; the server
+keeps that floor when its epoch is the thread's and the whole value it admits
+is at most 4 MiB, and opens a fresh window otherwise. The revision covers the
+window value, so a resubscribe at the current revision with its floor still
+answers `unchanged`.
+
+`orchestration.getThreadHistoryPage { threadId, cursor }` (orchestration read
+scope; a local database read, so not in the profiler's `is_long_running`)
+returns the rows below the cursor that its window does not hold
+(`written_sequence <= openedAt` and not live), newest first, at most 75 rows or
+512 KiB but always one, the checkpoints of their turns with their files, the
+next `cursor` (`null` when nothing is older) and `olderRows`. The first cursor
+is the window's floor. A revert is the only deletion of settled rows: the
+`thread.reverted` projection sets `projection_threads.history_epoch` to its
+event sequence. Every re-read compares that epoch with the window's and
+re-windows with a snapshot when it moved, a revert lost to `Lagged` included;
+a resubscribe with an older floor gets a fresh window, and a page whose cursor
+carries an older epoch fails with `OrchestrationThreadHistoryStaleError`. A
+malformed cursor or an unreadable thread fails with
+`OrchestrationGetThreadHistoryPageError`, logged with the method, the thread id
+and the reason only. Without `history` the stream is byte-identical to a whole
+thread, and an older server ignores the field and sends one.
+`packages/contracts/fixtures/thread-stream/window.json` pins the windowed
+snapshot, a patch, every page, a stale page and the whole thread the client
+merges them back into.
+
 A thread stream ends with its first error, such as `Thread … was not found`
 for a missing or deleted thread, whose targeted load reads none of its rows.
 The client retries a failed `subscribeThread` or `subscribeActivity` with
@@ -3327,11 +3428,17 @@ orchestration effects, before the Profiler's teardown.
 the work. A provider cannot undo a rewind, so the effect orders the steps to
 keep a failure from leaving the files and the conversation out of step:
 
-1. It checks that the workspace is a Git repository and that the target
-   checkpoint is `ready` and its ref resolves (turn 0: ref 0, or `HEAD`). A
-   turn whose checkpoint was not captured (`missing`) or was given up
-   (`error`) is refused: "Turn n has no captured checkpoint (its capture
-   failed or timed out), so the thread cannot be reverted to it."
+1. It checks that no checkpoint hold stands on the thread, that the workspace
+   is a Git repository, and that the target checkpoint is `ready` and its ref
+   resolves (turn 0: ref 0, or `HEAD`). A `ready` turn without a diff
+   (`diffAvailable: false`) is a target like any other. While a hold stands
+   (a stale turn's expiry is still writing its record) the revert is refused:
+   "The last turn's checkpoint is still being recorded. Try the revert again
+   in a moment." Every record of a turn lands before its hold is released, so
+   none can bring back a row the revert deletes. A turn whose checkpoint was
+   not captured (`missing`) or was given up (`error`) is refused: "Turn n has
+   no captured checkpoint (its capture failed or timed out), so the thread
+   cannot be reverted to it."
 2. It asks the provider to drop the newer turns. If the session was suspended
    while idle, the supervisor first reopens it with the launch a new message
    would use: the thread's provider, modes and saved resume cursor. One case

@@ -150,6 +150,9 @@ struct Measured {
     shell: Exchange,
     thread: Exchange,
     resume: Exchange,
+    /// The big thread's first item for a client that opens a history window (#226), as the app
+    /// does; `thread` is what an older client, which asks for the whole thread, receives.
+    window: Exchange,
 }
 
 async fn measure() -> Measured {
@@ -172,6 +175,13 @@ async fn measure() -> Measured {
         "2",
         "orchestration.subscribeThread",
         json!({ "threadId": load_fixture::BIG_THREAD_ID, "patches": true }),
+    )
+    .await;
+    let window = first_chunk(
+        &mut socket,
+        "3",
+        "orchestration.subscribeThread",
+        json!({ "threadId": load_fixture::BIG_THREAD_ID, "patches": true, "history": {} }),
     )
     .await;
     drop(socket);
@@ -199,6 +209,7 @@ async fn measure() -> Measured {
         shell,
         thread,
         resume,
+        window,
     }
 }
 
@@ -209,6 +220,7 @@ async fn payloads_stay_within_the_transfer_budget() {
         ("shell", &measured.shell),
         ("thread", &measured.thread),
         ("resume", &measured.resume),
+        ("window", &measured.window),
     ];
     let budget: BTreeMap<String, BTreeMap<String, usize>> =
         serde_json::from_str(BUDGET).expect("transfer_budget.json is valid");
@@ -290,6 +302,11 @@ async fn the_fixture_is_a_big_thread_in_a_big_shell() {
     );
     assert!(threads.iter().any(|thread| thread["kind"] == "panel"));
     assert_eq!(measured.resume.item["kind"], "unchanged");
+    // The window holds recent history and says how much more the server has (#226).
+    let window = &measured.window.item["snapshot"]["thread"];
+    assert_eq!(window["history"]["hasOlder"], true);
+    assert!(window["history"]["olderRows"].as_u64().unwrap() > 0);
+    assert!(window["messages"].as_array().unwrap().len() < 400);
 }
 
 /// Two builds give byte-identical payloads, so a budget change is always a code change.

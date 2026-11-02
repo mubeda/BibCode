@@ -224,6 +224,8 @@ import {
   OrchestrationGetTurnDiffInput,
   OrchestrationReplayEventsError,
   OrchestrationReplayEventsInput,
+  OrchestrationGetThreadHistoryPageError,
+  OrchestrationThreadHistoryStaleError,
   OrchestrationRpcSchemas,
   ProviderInteractionMode,
   RuntimeMode,
@@ -2017,6 +2019,19 @@ export const WsOrchestrationReplayEventsRpc = Rpc.make(ORCHESTRATION_WS_METHODS.
   error: Schema.Union([OrchestrationReplayEventsError, EnvironmentRpcError]),
 });
 
+export const WsOrchestrationGetThreadHistoryPageRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.getThreadHistoryPage,
+  {
+    payload: OrchestrationRpcSchemas.getThreadHistoryPage.input,
+    success: OrchestrationRpcSchemas.getThreadHistoryPage.output,
+    error: Schema.Union([
+      OrchestrationThreadHistoryStaleError,
+      OrchestrationGetThreadHistoryPageError,
+      EnvironmentRpcError,
+    ]),
+  },
+);
+
 export const WsOrchestrationGetArchivedShellSnapshotRpc = Rpc.make(
   ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot,
   {
@@ -2428,6 +2443,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,
   WsOrchestrationReplayEventsRpc,
+  WsOrchestrationGetThreadHistoryPageRpc,
   WsOrchestrationGetArchivedShellSnapshotRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,

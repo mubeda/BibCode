@@ -1,11 +1,46 @@
 import { describe, expect, it } from "vite-plus/test";
-import { EventId, type OrchestrationThreadActivity, TurnId } from "@bibcode/contracts";
+import {
+  EventId,
+  type OrchestrationThread,
+  type OrchestrationThreadActivity,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  TurnId,
+} from "@bibcode/contracts";
+import {
+  appendHistoryPage,
+  mergeThreadHistory,
+} from "@bibcode/client-runtime/state/thread-history";
+import carriedStatus from "../../../../packages/contracts/fixtures/thread-stream/carried-status.json";
 
 import {
   deriveLatestContextWindowSnapshot,
   formatContextWindowTokens,
   formatProviderDisplayName,
 } from "./contextWindow";
+
+const EMPTY_THREAD: OrchestrationThread = {
+  id: ThreadId.make("thread-1"),
+  projectId: ProjectId.make("project-1"),
+  title: "Thread",
+  modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-03-23T00:00:00.000Z",
+  updatedAt: "2026-03-23T00:00:00.000Z",
+  archivedAt: null,
+  deletedAt: null,
+  messages: [],
+  reasoning: [],
+  proposedPlans: [],
+  activities: [],
+  checkpoints: [],
+  session: null,
+};
 
 function makeActivity(id: string, kind: string, payload: unknown): OrchestrationThreadActivity {
   return {
@@ -158,5 +193,54 @@ describe("contextWindow", () => {
     expect(formatContextWindowTokens(9_999)).toBe("10k");
     expect(formatContextWindowTokens(1_000_000)).toBe("1m");
     expect(formatContextWindowTokens(1_250_000)).toBe("1.3m");
+  });
+});
+
+// The thread history window (#226): a windowed thread carries the usage row this reader
+// selects. The server's selection runs on the same fixture (`thread_history.rs`).
+describe("deriveLatestContextWindowSnapshot on carried status rows", () => {
+  it("selects the row the server carries for each shared fixture case", () => {
+    for (const testCase of carriedStatus.cases) {
+      const activities =
+        testCase.activities as unknown as ReadonlyArray<OrchestrationThreadActivity>;
+      const expected = activities.find((row) => row.id === testCase.contextWindow);
+      expect(deriveLatestContextWindowSnapshot(activities)?.usedTokens ?? null, testCase.name).toBe(
+        expected ? (expected.payload as { usedTokens: number }).usedTokens : null,
+      );
+    }
+  });
+
+  it("reads the carried usage after a clock correction, before and after a page loads", () => {
+    // After a clock correction the effective row has the highest sequence and an early time,
+    // so it is carried; a page later loads an older row. Canonical order keeps it last.
+    const usage = (id: string, sequence: number, usedTokens: number, minute: number) => ({
+      ...makeActivity(id, "context-window.updated", { usedTokens }),
+      sequence,
+      createdAt: `2026-03-23T00:${String(minute).padStart(2, "0")}:00.000Z`,
+    });
+    const window = {
+      ...EMPTY_THREAD,
+      activities: [usage("tool", 100, 0, 30)].map((row) => ({ ...row, kind: "status" })),
+      history: {
+        floor: "floor",
+        hasOlder: true,
+        olderRows: 1,
+        carried: { activities: [usage("usage-now", 200, 1000, 1)], proposedPlans: [] },
+      },
+    };
+    const page = {
+      messages: [],
+      activities: [usage("usage-stale", 10, 2000, 20)],
+      reasoning: [],
+      proposedPlans: [],
+      checkpoints: [],
+      cursor: null,
+      olderRows: 0,
+    };
+    expect(
+      deriveLatestContextWindowSnapshot(mergeThreadHistory(window, null).activities)?.usedTokens,
+    ).toBe(1000);
+    const merged = mergeThreadHistory(window, appendHistoryPage(null, page));
+    expect(deriveLatestContextWindowSnapshot(merged.activities)?.usedTokens).toBe(1000);
   });
 });

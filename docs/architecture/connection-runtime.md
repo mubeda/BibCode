@@ -48,7 +48,17 @@ public package has no root export; callers use focused subpaths such as
   an app restart resumes too, and a server that kept running answers
   `unchanged` instead of resending the thread (#227). A record written before
   this has no revision and subscribes without `resume`; any change that clears
-  the in-memory revision rewrites the record without it. An attempt that ends
+  the in-memory revision rewrites the record without it. Each subscribe asks for
+  a history window (`history`, #226) and echoes the floor of the window it
+  holds, so a reconnect keeps the older pages it loaded contiguous. The thread
+  state holds the server's window, which patches apply to, and the older pages
+  loaded this session apart from it; it publishes them merged by id (the
+  window's copy wins over a carried row, which wins over a page's) and in each
+  collection's server order, so every state reader reads one thread. Only the
+  window is cached. `olderHistory.loadOlder` is single-flight and drops a page
+  that answers a floor or cursor the state no longer holds; a snapshot with a
+  new floor or no `history`, or a page answered stale, drops the loaded pages.
+  An attempt that ends
   unverified clears `subscriptionSession`, which interrupts its followers; their
   held data is dropped. What changes is that a read subscription's request (its
   input, such as a thread ID or cwd) reaches the server before the config's

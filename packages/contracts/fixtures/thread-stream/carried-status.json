@@ -1,0 +1,173 @@
+{
+  "description": "Status rows a windowed thread carries (#226). For each case, contextWindow is the activity deriveLatestContextWindowSnapshot selects and mcpStatus the activity deriveMcpStatusSnapshot selects per provider instance. The server's carried selection (thread_history.rs) and the web readers both run on these cases. Activities are in canonical order: sequence, then createdAt, then id.",
+  "cases": [
+    {
+      "name": "a malformed newest usage row over a valid older one",
+      "activities": [
+        {
+          "id": "usage-valid",
+          "tone": "info",
+          "kind": "context-window.updated",
+          "summary": "Context window updated",
+          "payload": { "usedTokens": 1000, "maxTokens": 200000 },
+          "turnId": null,
+          "sequence": 1,
+          "createdAt": "2026-11-01T00:00:01.000Z"
+        },
+        {
+          "id": "usage-malformed",
+          "tone": "info",
+          "kind": "context-window.updated",
+          "summary": "Context window updated",
+          "payload": { "usedTokens": "lots", "maxTokens": 200000 },
+          "turnId": null,
+          "sequence": 2,
+          "createdAt": "2026-11-01T00:00:02.000Z"
+        },
+        {
+          "id": "usage-negative",
+          "tone": "info",
+          "kind": "context-window.updated",
+          "summary": "Context window updated",
+          "payload": { "usedTokens": -5, "maxTokens": 200000 },
+          "turnId": null,
+          "sequence": 3,
+          "createdAt": "2026-11-01T00:00:03.000Z"
+        }
+      ],
+      "contextWindow": "usage-valid",
+      "mcpStatus": {}
+    },
+    {
+      "name": "after a clock correction the highest sequence wins over a later createdAt",
+      "activities": [
+        {
+          "id": "usage-later-clock",
+          "tone": "info",
+          "kind": "context-window.updated",
+          "summary": "Context window updated",
+          "payload": { "usedTokens": 2000, "maxTokens": 200000 },
+          "turnId": null,
+          "sequence": 5,
+          "createdAt": "2026-11-01T09:00:00.000Z"
+        },
+        {
+          "id": "usage-corrected-clock",
+          "tone": "info",
+          "kind": "context-window.updated",
+          "summary": "Context window updated",
+          "payload": { "usedTokens": 1000, "maxTokens": 200000 },
+          "turnId": null,
+          "sequence": 9,
+          "createdAt": "2026-11-01T08:00:00.000Z"
+        }
+      ],
+      "contextWindow": "usage-corrected-clock",
+      "mcpStatus": {}
+    },
+    {
+      "name": "MCP status per provider instance, newest valid snapshot",
+      "activities": [
+        {
+          "id": "mcp-a-valid",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "MCP status",
+          "payload": {
+            "eventType": "mcp.status.updated",
+            "providerInstanceId": "a",
+            "servers": [{ "name": "docs", "state": "connected" }]
+          },
+          "turnId": null,
+          "sequence": 3,
+          "createdAt": "2026-11-01T00:00:03.000Z"
+        },
+        {
+          "id": "mcp-a-unnamed",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "MCP status",
+          "payload": {
+            "eventType": "mcp.status.updated",
+            "providerInstanceId": "a",
+            "servers": [{ "name": " ", "state": "connected" }]
+          },
+          "turnId": null,
+          "sequence": 4,
+          "createdAt": "2026-11-01T00:00:04.000Z"
+        },
+        {
+          "id": "mcp-b-valid",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "MCP status",
+          "payload": {
+            "eventType": "mcp.status.updated",
+            "providerInstanceId": "b",
+            "servers": [{ "name": "search", "state": "needs-auth", "detail": "Sign in" }]
+          },
+          "turnId": null,
+          "sequence": 5,
+          "createdAt": "2026-11-01T00:00:05.000Z"
+        },
+        {
+          "id": "mcp-b-null-detail",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "MCP status",
+          "payload": {
+            "eventType": "mcp.status.updated",
+            "providerInstanceId": "b",
+            "servers": [{ "name": "search", "state": "connected", "detail": null }]
+          },
+          "turnId": null,
+          "sequence": 6,
+          "createdAt": "2026-11-01T00:00:06.000Z"
+        },
+        {
+          "id": "mcp-c-by-summary",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "mcp.status.updated",
+          "payload": {
+            "providerInstanceId": "c",
+            "servers": [{ "name": "files", "state": "starting" }]
+          },
+          "turnId": null,
+          "sequence": 7,
+          "createdAt": "2026-11-01T00:00:07.000Z"
+        },
+        {
+          "id": "mcp-c-other-event",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "mcp.status.updated",
+          "payload": {
+            "eventType": "mcp.oauth.started",
+            "providerInstanceId": "c",
+            "servers": [{ "name": "files", "state": "error" }]
+          },
+          "turnId": null,
+          "sequence": 8,
+          "createdAt": "2026-11-01T00:00:08.000Z"
+        },
+        {
+          "id": "mcp-d-bad-state",
+          "tone": "info",
+          "kind": "mcp.status",
+          "summary": "MCP status",
+          "payload": {
+            "eventType": "mcp.status.updated",
+            "providerInstanceId": "d",
+            "servers": [{ "name": "docs", "state": "exploded" }]
+          },
+          "turnId": null,
+          "sequence": 9,
+          "createdAt": "2026-11-01T00:00:09.000Z"
+        }
+      ],
+      "contextWindow": null,
+      "mcpStatus": { "a": "mcp-a-valid", "b": "mcp-b-valid", "c": "mcp-c-by-summary" }
+    }
+  ]
+}

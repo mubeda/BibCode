@@ -2031,6 +2031,26 @@ describe("connectionStorageLayer", () => {
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
+  // The thread history window (#226): the cache holds the window, never loaded pages. `history`
+  // is optional, so a record from before it decodes, and one with it round-trips.
+  it.effect("decodes a cached thread with and without history", () => {
+    installFakeIndexedDb();
+    return Effect.gen(function* () {
+      const cacheStore = yield* EnvironmentCacheStore;
+      const history = {
+        floor: "eyJ2IjoxfQ",
+        hasOlder: true,
+        olderRows: 42,
+        carried: { activities: [], proposedPlans: [] },
+      };
+      for (const thread of [orchestrationThread(), { ...orchestrationThread(), history }]) {
+        yield* cacheStore.saveThread(environmentId, { thread, resumeFrom: null });
+        const cached = Option.getOrThrow(yield* cacheStore.loadThread(environmentId, threadId));
+        expect(cached.thread.history).toEqual(thread.history);
+      }
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("fails to build when IndexedDB is unavailable", () => {
     installFakeIndexedDb({ open: "undefined" });
     return ConnectionTargetStore.pipe(

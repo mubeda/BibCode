@@ -25,6 +25,7 @@ import {
 } from "@bibcode/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@bibcode/contracts/settings";
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { mergeThreadHistory } from "@bibcode/client-runtime/state/thread-history";
 import type { EnvironmentConnectionPresentation } from "@bibcode/client-runtime/connection";
 import { serializeComposerReference } from "@bibcode/shared/composerReferences";
 import * as React from "react";
@@ -1104,6 +1105,73 @@ describe("ChatComposer rendering", () => {
     renderComposer({ providerStatuses: [codexProvider], activeThreadActivities });
     expect(filterCaptures("McpStatusPopover")).toHaveLength(1);
     expect(findCapture("McpStatusPopover")["supported"]).toBe(false);
+  });
+
+  // The thread history window (#226): status rows below the window arrive carried, and the
+  // composer reads them from the merged thread as from a whole one.
+  it("shows the carried MCP status and context-window usage of a windowed thread", () => {
+    const carried = [
+      {
+        id: "activity-context" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "context-window.updated",
+        summary: "context.window.updated",
+        payload: { usedTokens: 30, maxTokens: 100 },
+        turnId: null,
+        sequence: 1,
+        createdAt: now,
+      },
+      {
+        id: "activity-mcp" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "provider-event",
+        summary: "mcp.status.updated",
+        payload: { providerInstanceId: "codex", servers: [{ name: "docs", state: "needs-auth" }] },
+        turnId: null,
+        sequence: 2,
+        createdAt: now,
+      },
+    ] as Thread["activities"];
+    const windowed = mergeThreadHistory(
+      {
+        id: "thread-1" as Thread["id"],
+        projectId: "project-1" as Thread["projectId"],
+        title: "Thread",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        latestTurn: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        deletedAt: null,
+        messages: [],
+        reasoning: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+        session: null,
+        history: {
+          floor: "floor",
+          hasOlder: true,
+          olderRows: 9,
+          carried: { activities: carried, proposedPlans: [] },
+        },
+      },
+      null,
+    );
+    renderComposer({
+      providerStatuses: [
+        { ...codexProvider, supportsMcpStatus: true, supportsContextWindowUsage: true },
+      ],
+      activeThreadActivities: windowed.activities,
+    });
+    expect(findCapture("ContextWindowMeter")["usage"]).toMatchObject({ usedTokens: 30 });
+    expect(findCapture("McpStatusPopover")["snapshot"]).toEqual({
+      servers: [{ name: "docs", state: "needs-auth", detail: null }],
+    });
   });
 
   it("uses a provider-family lock without fixing the active instance", () => {

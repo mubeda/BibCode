@@ -20,6 +20,7 @@ const PAYLOADS: ReadonlyArray<readonly [key: string, label: string]> = [
   ["shell", "Shell snapshot (`subscribeShell`, first item)"],
   ["thread", "Big thread, first `subscribeThread` item"],
   ["resume", "Big thread, resume answer (`unchanged`)"],
+  ["window", "Big thread, history window (first `subscribeThread` item)"],
 ];
 const METRICS = [
   ["wireBytes", "after deflate"],
