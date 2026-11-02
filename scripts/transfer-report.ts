@@ -18,6 +18,7 @@ export type Sizes = Readonly<
 
 const PAYLOADS: ReadonlyArray<readonly [key: string, label: string]> = [
   ["shell", "Shell snapshot (`subscribeShell`, first item)"],
+  ["cappedShell", "Capped shell snapshot (`subscribeShell` with `cap`, first item)"],
   ["thread", "Big thread, first `subscribeThread` item"],
   ["resume", "Big thread, resume answer (`unchanged`)"],
 ];
