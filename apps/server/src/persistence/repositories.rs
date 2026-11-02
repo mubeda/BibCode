@@ -1481,6 +1481,56 @@ impl Repositories {
             .await
     }
 
+    /// What a thread's history window (#226) reads beside its rows: when each history row was
+    /// last written, the thread's history epoch, and the open requests and running
+    /// implementations its carried state rows are selected by. One SQLite job, so the marks are
+    /// consistent with each other.
+    pub async fn load_thread_history_marks(&self, thread_id: String) -> Result<ThreadHistoryMarks> {
+        self.database
+            .call(move |connection| {
+                let written = |table: &str, id: &str| -> Result<HashMap<String, i64>> {
+                    let mut statement = connection.prepare(&format!(
+                        "SELECT {id}, written_sequence FROM {table} WHERE thread_id = ?"
+                    ))?;
+                    let rows = statement
+                        .query_map([&thread_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<HashMap<String, i64>>>()?;
+                    Ok(rows)
+                };
+                let ids = |sql: &str| -> Result<std::collections::HashSet<String>> {
+                    let mut statement = connection.prepare(sql)?;
+                    let rows = statement
+                        .query_map([&thread_id], |row| row.get::<_, Option<String>>(0))?
+                        .filter_map(|row| row.transpose())
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(rows)
+                };
+                let epoch = connection
+                    .query_row(
+                        "SELECT history_epoch FROM projection_threads WHERE thread_id = ?",
+                        [&thread_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                Ok(ThreadHistoryMarks {
+                    epoch,
+                    messages: written("projection_thread_messages", "message_id")?,
+                    activities: written("projection_thread_activities", "activity_id")?,
+                    reasoning: written("projection_thread_reasoning", "reasoning_id")?,
+                    proposed_plans: written("projection_thread_proposed_plans", "plan_id")?,
+                    pending_approvals: ids(
+                        "SELECT request_id FROM projection_pending_approvals WHERE thread_id = ? AND status = 'pending'",
+                    )?,
+                    open_user_inputs: ids(&open_user_input_requests_sql("?1"))?,
+                    running_source_plans: ids(
+                        "SELECT source_proposed_plan_id FROM projection_turns WHERE source_proposed_plan_thread_id = ? AND state = 'running'",
+                    )?,
+                })
+            })
+            .await
+    }
+
     /// Every reasoning entry still streaming, on any thread: what the settlement sweeps close.
     pub async fn list_streaming_reasoning(&self) -> Result<Vec<ProjectionThreadReasoning>> {
         self.database
@@ -2971,6 +3021,24 @@ pub struct ProjectionThreadMessage {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
+/// See [`Repositories::load_thread_history_marks`]. Each history map is keyed by row id and
+/// holds the row's `written_sequence`: the sequence of the event that last wrote it.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadHistoryMarks {
+    /// The sequence of the thread's last revert, or 0.
+    pub epoch: i64,
+    pub messages: HashMap<String, i64>,
+    pub activities: HashMap<String, i64>,
+    pub reasoning: HashMap<String, i64>,
+    pub proposed_plans: HashMap<String, i64>,
+    /// Request ids of the thread's pending approvals.
+    pub pending_approvals: std::collections::HashSet<String>,
+    /// Request ids of the thread's open user-input requests.
+    pub open_user_inputs: std::collections::HashSet<String>,
+    /// Plan ids of this thread named as the source plan by a running turn, on any thread.
+    pub running_source_plans: std::collections::HashSet<String>,
+}
+
 /// The rows a shell snapshot shows; see [`Repositories::load_shell_snapshot_rows`].
 #[derive(Clone, Debug)]
 pub struct ShellSnapshotRows {

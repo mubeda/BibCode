@@ -701,6 +701,8 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(60, "McpActorAttribution", migration_060),
     Migration::new(61, "Webhooks", migration_061),
     Migration::new(62, "McpOAuth", migration_062),
+    // 63 is taken by #234-#236 (ProjectionTurnCheckpointDiffAvailable); it lands first.
+    Migration::new(64, "ThreadHistoryWindow", migration_064),
 ];
 
 impl Migration {
@@ -2898,6 +2900,37 @@ fn migration_062(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_064(transaction: &Transaction<'_>) -> Result<()> {
+    // The thread history window (#226). `written_sequence` is the sequence of the event that
+    // last wrote a history row, so a window opened at a sequence can tell the rows written after
+    // it; a rowid can't, because SQLite reuses a deleted top rowid and a rebuild renumbers them.
+    // `history_epoch` is the sequence of the thread's last revert, the only deletion of settled
+    // rows. Existing rows get 0: written before any window opened. Guarded like 044: a
+    // trusted-ledger restore may not carry these rebuildable projections.
+    for table in [
+        "projection_thread_messages",
+        "projection_thread_activities",
+        "projection_thread_reasoning",
+        "projection_thread_proposed_plans",
+    ] {
+        if table_exists(transaction, table)?
+            && !table_has_column(transaction, table, "written_sequence")?
+        {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN written_sequence INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    if table_exists(transaction, "projection_threads")?
+        && !table_has_column(transaction, "projection_threads", "history_epoch")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_threads ADD COLUMN history_epoch INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3296,7 +3329,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59, 60, 61, 62]
+            [55, 56, 57, 58, 59, 60, 61, 62, 64]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3321,6 +3354,43 @@ mod tests {
                 "idx_projection_thread_reasoning_thread_created",
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn history_window_columns_default_existing_rows_to_zero() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(62))?;
+        connection.execute_batch(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z', NULL, NULL);
+             INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('m', 't', 'user', 'hi', 0, '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z');
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('a', 't', NULL, 'info', 'k', 's', '{}', 1, '2026-11-01T00:00:00Z');
+             INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'x', 0, '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z');
+             INSERT INTO projection_thread_proposed_plans (plan_id, thread_id, turn_id, plan_markdown, implemented_at, implementation_thread_id, created_at, updated_at) VALUES ('pl', 't', NULL, 'x', NULL, NULL, '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z');",
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(applied.last().map(|migration| migration.id), Some(64));
+        for table in [
+            "projection_thread_messages",
+            "projection_thread_activities",
+            "projection_thread_reasoning",
+            "projection_thread_proposed_plans",
+        ] {
+            let written = connection.query_row(
+                &format!("SELECT written_sequence FROM {table}"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            assert_eq!(written, 0, "{table}");
+        }
+        let epoch = connection.query_row(
+            "SELECT history_epoch FROM projection_threads WHERE thread_id = 't'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(epoch, 0);
         Ok(())
     }
 
@@ -4090,6 +4160,7 @@ mod tests {
                 (60, "McpActorAttribution"),
                 (61, "Webhooks"),
                 (62, "McpOAuth"),
+                (64, "ThreadHistoryWindow"),
             ],
         );
         assert_eq!(
