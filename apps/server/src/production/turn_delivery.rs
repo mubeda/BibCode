@@ -1098,16 +1098,19 @@ async fn fill_available_slots(
         if !in_flight_commands.contains(&row.command_id)
             && !in_flight_threads.contains(&row.thread_id)
             && baselines.pending(engine, &row)
-            // A bootstrap sets up the checkout first, in a slot that it then releases.
-            && (row.payload.get("bootstrap").is_none_or(serde_json::Value::is_null)
-                || baselines.bootstrapped.contains(&row.command_id))
         {
             if first_turn_baseline_settled(engine, &row).await? {
                 baselines.settled.insert(row.command_id.clone());
-            } else {
+            } else if row
+                .payload
+                .get("bootstrap")
+                .is_none_or(serde_json::Value::is_null)
+                || baselines.bootstrapped.contains(&row.command_id)
+            {
                 baselines.start(engine, &row, stop_claiming);
                 continue;
             }
+            // Otherwise a bootstrap sets up the checkout first, in a slot that it then releases.
         }
         ready.push(row);
     }
@@ -1263,12 +1266,21 @@ impl FirstTurnBaselines {
     }
 }
 
-/// Whether `row`'s thread already has a numbered turn, so its baseline is long settled: one read,
-/// and no Git.
+/// Whether `row` needs no baseline: it was claimed before (a manual retry resets `attempts`, not
+/// that), so the checkout may hold its edits, or its thread already has a numbered turn, so its
+/// baseline is long settled. Database reads only, no Git.
 async fn first_turn_baseline_settled(
     engine: &OrchestrationEngine,
     row: &ProviderTurnDelivery,
 ) -> Result<bool, String> {
+    if engine
+        .repositories()
+        .provider_turn_was_claimed(row.command_id.clone())
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(true);
+    }
     let turns = engine
         .repositories()
         .list_turns_by_thread(row.thread_id.clone())
