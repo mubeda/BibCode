@@ -1860,7 +1860,7 @@ the complete job 360 minutes. Windows gives each packaging child 60 minutes and
 Linux 45, both within 240-minute jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
 10 minutes per checkout. Each macOS job reserves 60 additional minutes after the
 three packaging and install bounds for setup, all lanes, evidence, and cleanup.
-Product, WebDriver, and restart deadlines remain unchanged. Record a command
+Product, WebDriver, and restart deadlines remain unchanged. The smoke builds override the release profile with 16 codegen units and LTO off, because they prove upgrade behaviour, not optimised code; a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs. Read `build-timings.txt` first when a lane stops during packaging. Record a command
 timeout and the last completed phase as unavailable native evidence; passing
 tooling tests cannot substitute for completed upgrade observations.
 

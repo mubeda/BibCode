@@ -160,6 +160,8 @@ budgets above include a cold compile. Native desktop keeps its 120-minute and
   240 minutes; their packaging children keep 45 minutes. If owned-child cleanup does not observe `close`
   within five seconds, the harness releases that child and exits nonzero so the
   job cannot stay open for the rest of the 240-minute budget.
+  The smoke builds override the release profile with 16 codegen units and LTO off, because they prove upgrade behaviour, not optimised code; a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package.
+  The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs.
   `remote-install` reuses the protected package.
   Repository `target` caching cannot warm the run root's three Cargo outputs.
   These packaging allowances are separate from the native desktop CI job above

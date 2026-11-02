@@ -1796,6 +1796,8 @@ export const runBoundedCommand = async (input: {
   readonly cwd: string;
   readonly env?: NodeJS.ProcessEnv | undefined;
   readonly inherit?: boolean | undefined;
+  /** Names the command in failure messages, e.g. "candidate vp run build". */
+  readonly label?: string | undefined;
   readonly timeoutMs?: number | undefined;
 }): Promise<CommandResult> =>
   new Promise((resolve, reject) => {
@@ -1826,7 +1828,7 @@ export const runBoundedCommand = async (input: {
               () =>
                 reject(
                   new SeededUpgradeCommandTimeoutError(
-                    `${NodePath.basename(input.command)} timed out after ${input.timeoutMs}ms.`,
+                    `${input.label ?? NodePath.basename(input.command)} timed out after ${input.timeoutMs}ms.`,
                   ),
                 ),
               reject,
@@ -1908,7 +1910,81 @@ const requireCommandSuccess = async (input: Parameters<typeof runCommand>[0]): P
   const result = await runCommand(input);
   if (result.exitCode !== 0) {
     throw new SeededDesktopUpgradeSmokeError(
-      `${NodePath.basename(input.command)} exited with code ${result.exitCode}.`,
+      `${input.label ?? NodePath.basename(input.command)} exited with code ${result.exitCode}.`,
+    );
+  }
+};
+
+const buildHeartbeatMs = 5 * 60_000;
+
+/** One ps sample of the Rust toolchain, so a slow build shows what it is doing. */
+const sampleBuildProcesses = async (cwd: string): Promise<string> => {
+  // shortcut: Windows has no ps; its heartbeat records elapsed time only.
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- ps exists only on the macOS and Linux runners.
+  if (process.platform === "win32") return "process sample skipped on Windows\n";
+  const { stdout } = await runCommand({
+    command: "ps",
+    args: ["-A", "-o", "pid,pcpu,pmem,etime,command"],
+    cwd,
+    timeoutMs: 30_000,
+  });
+  const [header = "", ...rows] = stdout.split("\n");
+  const toolchain = rows.filter((row) =>
+    /^(?:rustc|cargo|ld)/.test(NodePath.basename(row.trim().split(/\s+/)[4] ?? "")),
+  );
+  // rustc argument lists run to kilobytes; the start of each is enough to name the crate.
+  return `${[header, ...toolchain].map((row) => row.slice(0, 240)).join("\n")}\n`;
+};
+
+/**
+ * Runs one packaging command and appends its start, end, outcome, and a periodic
+ * process sample to build-timings.txt, so a build killed by a deadline still
+ * leaves evidence for the always-run upload.
+ */
+const runTimedBuildCommand = async (
+  input: Parameters<typeof runCommand>[0] & {
+    readonly artifactDirectory: string;
+    readonly heartbeatMs?: number;
+    readonly label: string;
+  },
+): Promise<void> => {
+  const { artifactDirectory, heartbeatMs, ...command } = input;
+  const log = NodePath.join(artifactDirectory, "build-timings.txt");
+  // Evidence is best effort: it must never replace the build's own result.
+  const append = (text: string) => NodeFS.promises.appendFile(log, text).catch(() => undefined);
+  await NodeFS.promises.mkdir(artifactDirectory, { recursive: true }).catch(() => undefined);
+  const started = Date.now();
+  await append(`${input.label} started ${new Date(started).toISOString()}\n`);
+  let sample: Promise<void> = Promise.resolve();
+  const heartbeat = setInterval(() => {
+    sample = sample
+      .then(async () => {
+        const minutes = Math.floor((Date.now() - started) / 60_000);
+        console.log(`[seeded-upgrade] ${input.label} still running after ${minutes} min`);
+        await append(
+          `${input.label} heartbeat ${new Date().toISOString()} (${minutes} min)\n${await sampleBuildProcesses(input.cwd)}`,
+        );
+      })
+      .catch(() => undefined);
+  }, heartbeatMs ?? buildHeartbeatMs);
+  let outcome = "failed";
+  try {
+    const result = await runCommand(command);
+    outcome = `exit code ${result.exitCode}`;
+    if (result.exitCode !== 0) {
+      throw new SeededDesktopUpgradeSmokeError(
+        `${input.label} exited with code ${result.exitCode}.`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof SeededUpgradeCommandTimeoutError) outcome = "timed out";
+    throw error;
+  } finally {
+    clearInterval(heartbeat);
+    await sample;
+    const ended = Date.now();
+    await append(
+      `${input.label} ended ${new Date(ended).toISOString()} after ${Math.round((ended - started) / 1000)}s: ${outcome}\n`,
     );
   }
 };
@@ -2062,7 +2138,10 @@ export async function prepareSeededUpgradeBuild(
 
 const buildPackagedApplication = async (input: {
   readonly arch: SeededUpgradeArch;
+  readonly artifactDirectory: string;
   readonly bundle: SeededDesktopUpgradeSmokeInput["bundle"];
+  /** Evidence name: candidate, previous-stable, or protected-baseline. */
+  readonly build: string;
   readonly checkout: string;
   readonly overlayPath: string;
   readonly platform: SeededUpgradePlatform;
@@ -2072,14 +2151,17 @@ const buildPackagedApplication = async (input: {
   readonly version: string;
 }): Promise<void> => {
   await prepareSeededUpgradeBuild(input);
-  await requireCommandSuccess({
+  await runTimedBuildCommand({
+    artifactDirectory: input.artifactDirectory,
     command: seededUpgradeVitePlusExecutable,
     args: ["install", "--frozen-lockfile"],
     cwd: input.checkout,
     inherit: true,
+    label: `${input.build} vp install`,
     timeoutMs: 10 * 60_000,
   });
-  await requireCommandSuccess({
+  await runTimedBuildCommand({
+    artifactDirectory: input.artifactDirectory,
     command: seededUpgradeVitePlusExecutable,
     args: [
       "run",
@@ -2100,8 +2182,16 @@ const buildPackagedApplication = async (input: {
       seededUpgradeRustTarget(input.platform, input.arch),
     ],
     cwd: input.checkout,
-    env: { ...input.signingEnvironment, CARGO_TARGET_DIR: input.targetDirectory },
+    // The smoke proves upgrade behaviour, not optimised codegen. The release profile's single
+    // thin-LTO codegen unit kept Intel runners on one core for 27-65 minutes per package.
+    env: {
+      ...input.signingEnvironment,
+      CARGO_TARGET_DIR: input.targetDirectory,
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16",
+      CARGO_PROFILE_RELEASE_LTO: "off",
+    },
     inherit: true,
+    label: `${input.build} vp run build`,
     // Each seeded package has its own cold Cargo output. Intel needs more than 45 minutes, and
     // the capacity-constrained Apple silicon runners have taken 43 minutes for one build.
     // Windows x64 took 43 minutes to compile one release build, then ran out of time bundling.
@@ -2741,7 +2831,7 @@ const copyBoundedEvidence = async (input: {
   }
 };
 
-export { copyBoundedEvidence };
+export { copyBoundedEvidence, runTimedBuildCommand };
 
 export async function runSeededDesktopUpgradeSmoke(
   input: SeededDesktopUpgradeSmokeInput,
@@ -2927,7 +3017,9 @@ export async function runSeededDesktopUpgradeSmoke(
 
     await buildPackagedApplication({
       arch: input.arch,
+      artifactDirectory: input.artifactDirectory,
       bundle: input.bundle,
+      build: "candidate",
       checkout: layout.candidateCheckout,
       overlayPath: candidateOverlay,
       platform: input.platform,
@@ -2939,7 +3031,9 @@ export async function runSeededDesktopUpgradeSmoke(
     if (!input.wsl) {
       await buildPackagedApplication({
         arch: input.arch,
+        artifactDirectory: input.artifactDirectory,
         bundle: input.bundle,
+        build: "previous-stable",
         checkout: layout.previousStable.checkout,
         overlayPath: previousOverlay,
         platform: input.platform,
@@ -2951,7 +3045,9 @@ export async function runSeededDesktopUpgradeSmoke(
     }
     await buildPackagedApplication({
       arch: input.arch,
+      artifactDirectory: input.artifactDirectory,
       bundle: input.bundle,
+      build: "protected-baseline",
       checkout: layout.protectedBaseline.checkout,
       overlayPath: protectedOverlay,
       platform: input.platform,
