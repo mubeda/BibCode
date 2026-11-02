@@ -262,6 +262,12 @@ A panic that ended the process also leaves a `crash.unclean-exit` or
     executable, such as `bibcode-connect`): signals and non-zero exits, noticed
     within 5 s; its relay preview hostnames are withdrawn until the next link
     or restart.
+  - the update of a maintained tool such as CodeGraph (`command`, labelled by
+    its executable): signals only. A non-zero exit shows in **Settings →
+    Providers → Tools** instead, which also flags the tool as possibly damaged
+    until a reinstall verifies it. While it runs it is registered as a
+    `helper` labelled `codegraph update`, so its memory and CPU are attributed
+    to it.
   - Android device preview helpers (`command`): the emulator, labelled
     `android-emulator`, noticed within 1 s and failing the device with
     `exited`; and the scrcpy-server `adb shell`, labelled `android-scrcpy`,
