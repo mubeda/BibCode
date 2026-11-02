@@ -2127,6 +2127,12 @@ Then check liveness during large-diff transfers:
 Record the rates, transfer durations, close codes, the exact status text, and
 the server log lines.
 
+`node scripts/throttle-proxy.ts --preset 3g` (or `/set?preset=3g`) sets the 3G link
+used by the [load measurement](#high-latency-measurement): 50,000 bytes/s each way and a
+200 ms one-way delay. Add `--new-connections 1` (`new-connections=1`) to make each new
+connection pay its own handshake and each HTTP request open a new connection; an explicit
+`--down`, `--up` or `--delay` overrides the preset.
+
 ## High-latency measurement
 
 For changes that add, remove or reorder RPCs on a user action, or change how
@@ -2152,6 +2158,30 @@ round trips, or terminal echo lag above about two round trips, is a regression
 to explain. The sequential column is inferred from timing and is noisy for
 typing rows; use their echo lag instead. Record the tables in the execution
 report.
+
+### Load on a 3G link
+
+For changes that alter what the shell, a thread open or a reconnect sends, measure the bytes
+and time on the 3G preset against the large-thread fixture, and run the byte budget:
+
+```sh
+cargo build -p bibcode-server --bin bibcode
+cargo build -p bibcode-server --example write_load_fixture
+VITE_HOSTED_APP_URL=https://hosted.invalid vp run --filter=@bibcode/web build
+node scripts/measure-remote-latency.ts --link 3g --out <report>.json
+cargo test -p bibcode-server --test transfer_budget
+```
+
+`--link 3g` writes the fixture's store (one 200-turn thread, a 160-thread shell) before the
+server starts, then limits the link and runs five rows: cold connect onto the big thread, open
+it from the sidebar with no cache, switch back to it, reconnect, and a reload onto the big thread
+while the page's cache still holds it. Each row reports RPCs,
+sequential round trips, bytes received after the transport's deflate and decoded, and time to
+visible. Static assets are served locally, so the rows count RPC bytes only. Compare against the
+latest `docs/architecture/measurements/remote-load-3g-*.md`; add a new dated capture rather than
+rewriting one. The byte budget needs no browser: raise a budget in
+`apps/server/tests/transfer_budget.json` only when the growth is intended, and lower it when a
+change shrinks a payload. Time at 3G is a reported number, never a gate.
 
 ## Git Manager validation scenario
 

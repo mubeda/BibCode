@@ -51,6 +51,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "pipelines.subscribe"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"
+        | "orchestration.getThreadHistoryPage"
         | "orchestration.getTurnDiff"
         | "orchestration.replayEvents"
         | "orchestration.subscribeShell"
@@ -255,6 +256,10 @@ mod tests {
         );
         assert_eq!(
             required_scope("server.getProviderCapabilities"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        assert_eq!(
+            required_scope("orchestration.getThreadHistoryPage"),
             Some(SCOPE_ORCHESTRATION_READ)
         );
         assert_eq!(

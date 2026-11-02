@@ -294,6 +294,16 @@ SSH environments and plain remote servers get the same compression on plain
 `/ws` through the `bibcode.rpc.chunked-deflate.v1` subprotocol, which the same
 switch stops the server from selecting
 ([RPC and orchestration](./rpc-and-orchestration.md#wire-protocol)).
+The web build a browser loads from a remote server is gzip-compressed for a
+client that offers it (#227): tower-http's `CompressionLayer` wraps only the
+static fallback and leaves images, empty responses (a `304`, a `HEAD`) and
+bodies under 32 bytes as they are. Every static file answer, a `304` included,
+carries `Vary: Accept-Encoding`, and a `304` carries no `Content-Length`,
+which would be the uncompressed one. Caching is
+unchanged: content-hashed assets stay immutable and other files keep their weak
+ETag, which matches either encoding. `/ws`, `/ws-e2ee`, the JSON routes and
+preview traffic are never compressed by it. The desktop app loads its bundled
+copy of the web build and does not use this path.
 Invalid credentials receive
 `e2ee_error/unauthorized`; malformed protocol receives `e2ee_error/protocol`;
 both paths close the socket.

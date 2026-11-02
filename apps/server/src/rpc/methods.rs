@@ -99,6 +99,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("orchestration.dispatchCommand"),
     read_unary("orchestration.getArchivedShellSnapshot"),
     read_unary("orchestration.getFullThreadDiff"),
+    read_unary("orchestration.getThreadHistoryPage"),
     read_unary("orchestration.getTurnDiff"),
     read_unary("orchestration.replayEvents"),
     read_stream("orchestration.subscribeShell"),

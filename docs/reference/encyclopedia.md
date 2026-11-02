@@ -163,6 +163,15 @@ such as checkpoint capture, diff finalization, or turn quiescence.
 A turn has gone quiet and stable: provider work and follow-up processing have
 settled far enough for tests and orchestration to continue deterministically.
 
+### History Window
+
+The recent part of a thread a client opens with, under a byte budget, with older
+history loaded in pages as the reader scrolls up. A row is in the window when it
+is recent, was written after the window opened, or is still live (streaming or
+an unsettled delivery); state the window may not hold, such as an open request,
+arrives as carried rows. See
+[RPC and orchestration](../architecture/rpc-and-orchestration.md).
+
 ## Provider Runtime
 
 ### Provider Driver
