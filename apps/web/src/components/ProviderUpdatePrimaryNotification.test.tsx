@@ -83,7 +83,7 @@ vi.mock("@effect/atom-react", () => ({
 }));
 
 vi.mock("../state/server", () => ({
-  primaryServerProvidersAtom: { key: "primaryServerProviders" },
+  primaryUpdateSubjectsAtom: { key: "primaryUpdateSubjects" },
   serverEnvironment: { updateProvider: { key: "updateProvider" } },
 }));
 

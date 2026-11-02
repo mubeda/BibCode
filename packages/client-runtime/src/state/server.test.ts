@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  ProviderDriverKind,
   ProviderInstanceId,
   type ServerConfig,
   type ServerLifecycleWelcomePayload,
@@ -22,6 +23,7 @@ import {
   projectServerWelcome,
 } from "./server.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
+import { runAtomCommand } from "./runtime.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 
 const CONFIG = {
@@ -423,6 +425,83 @@ describe("server profiler status query", () => {
       expect(atoms.profilerStatus({ environmentId, input: {} })).toBe(atom);
       release();
       atomRegistry.dispose();
+    }),
+  );
+});
+
+describe("server update command", () => {
+  const tool = {
+    toolId: "codegraph",
+    displayName: "CodeGraph",
+    installed: true,
+    version: "1.6.3",
+    checkedAt: "2026-11-02T00:00:00.000Z",
+  };
+
+  const run = (provider: string) =>
+    Effect.gen(function* () {
+      const environmentId = EnvironmentId.make("environment-update");
+      const calls: Array<{ readonly method: string; readonly input: unknown }> = [];
+      const record = (method: string, result: unknown) => (input: unknown) =>
+        Effect.sync(() => {
+          calls.push({ method, input });
+          return result;
+        });
+      const session = yield* SubscriptionRef.make(
+        Option.some({
+          client: {
+            [WS_METHODS.serverUpdateTool]: record(WS_METHODS.serverUpdateTool, { tools: [tool] }),
+            [WS_METHODS.serverUpdateProvider]: record(WS_METHODS.serverUpdateProvider, {
+              providers: [],
+            }),
+          },
+        } as never),
+      );
+      const supervisor = EnvironmentSupervisor.of({
+        target: { environmentId, label: "Update environment" },
+        session,
+        state: yield* SubscriptionRef.make({ phase: "connected", generation: 1 }),
+      } as never);
+      const environmentRegistry = EnvironmentRegistry.of({
+        run: <A, E>(_: string, effect: Effect.Effect<A, E, EnvironmentSupervisor>) =>
+          Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+        followStream: <A, E>(_: string, stream: Stream.Stream<A, E, EnvironmentSupervisor>) =>
+          Stream.provideService(stream, EnvironmentSupervisor, supervisor),
+      } as never);
+      const atoms = createServerEnvironmentAtoms(
+        Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
+        { initialConfigValueAtom: () => Atom.make(null) },
+      );
+      const atomRegistry = AtomRegistry.make();
+      const result = yield* Effect.promise(() =>
+        runAtomCommand(
+          atomRegistry,
+          atoms.updateProvider,
+          { environmentId, input: { provider: ProviderDriverKind.make(provider) } },
+          { reportFailure: false },
+        ),
+      );
+      atomRegistry.dispose();
+      return { calls, result };
+    });
+
+  it.effect("sends a tool to server.updateTool and reads the result as provider rows", () =>
+    Effect.gen(function* () {
+      const { calls, result } = yield* run("codegraph");
+      expect(calls).toEqual([
+        { method: WS_METHODS.serverUpdateTool, input: { toolId: "codegraph" } },
+      ]);
+      expect(result._tag).toBe("Success");
+      if (result._tag === "Success") {
+        expect(result.value.providers.map((provider) => provider.driver)).toEqual(["codegraph"]);
+      }
+    }),
+  );
+
+  it.effect("keeps sending a provider to server.updateProvider", () =>
+    Effect.gen(function* () {
+      const { calls } = yield* run("codex");
+      expect(calls.map((call) => call.method)).toEqual([WS_METHODS.serverUpdateProvider]);
     }),
   );
 });

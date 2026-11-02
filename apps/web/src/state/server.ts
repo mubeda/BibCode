@@ -8,6 +8,7 @@ import {
   type ServerSettings,
 } from "@bibcode/contracts";
 import { createServerEnvironmentAtoms } from "@bibcode/client-runtime/state/server";
+import { updateSubjects } from "@bibcode/client-runtime/state/server-tools";
 import { createEnvironmentServerConfigsAtom } from "@bibcode/client-runtime/state/shell";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@bibcode/shared/keybindings";
 import * as Option from "effect/Option";
@@ -79,6 +80,20 @@ export const primaryServerProvidersAtom = Atom.make(
   (get): ReadonlyArray<ServerProvider> =>
     get(primaryServerConfigAtom)?.providers ?? EMPTY_SERVER_PROVIDERS,
 ).pipe(Atom.withLabel("web-primary-server-providers"));
+
+/**
+ * What the update notices list for the primary environment: its providers, then its tools
+ * (CodeGraph). Pickers and sessions read `primaryServerProvidersAtom`, which has no tools.
+ */
+export const primaryUpdateSubjectsAtom = Atom.make((get): ReadonlyArray<ServerProvider> => {
+  const config = get(primaryServerConfigAtom);
+  return config === null ? EMPTY_SERVER_PROVIDERS : updateSubjects(config);
+}).pipe(Atom.withLabel("web-primary-update-subjects"));
+
+/** The tools the primary server reports; `undefined` from a server older than tool maintenance. */
+export const primaryServerToolsAtom = Atom.make(
+  (get): ServerConfig["tools"] => get(primaryServerConfigAtom)?.tools,
+).pipe(Atom.withLabel("web-primary-server-tools"));
 
 export const primaryServerKeybindingsAtom = Atom.make(
   (get): ServerConfig["keybindings"] =>
