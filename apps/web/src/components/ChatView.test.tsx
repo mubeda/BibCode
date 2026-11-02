@@ -2016,7 +2016,10 @@ describe("ChatView", () => {
             contentLength: 3_000,
             data: [{}, {}],
             positionAtIndex: (index: number) => index * 1_000,
-            sizeAtIndex: () => 1_000,
+            // A just-sent turn is anchored before its reply arrives: the sent row is the whole
+            // turn and ends inside the view, so a follow has no end to reveal. With a tall reply
+            // below the fold, ChatView does follow the end when the inset grows (#204).
+            sizeAtIndex: (index: number) => (anchored && index === 1 ? 120 : 1_000),
           }),
           ...listScroll,
         };
@@ -2103,13 +2106,30 @@ describe("ChatView", () => {
               )(sent.input.message.messageId, 1),
             );
           }
-          // Let the send's own anchoring settle before the panel is toggled.
+          // The send's own anchoring scrolls the list for a while: a glide, then landings a few
+          // frames apart, then a follow. Wait until it has begun and has stayed quiet for longer
+          // than its longest gap, counted in frames, so how long the host takes per frame cannot
+          // end the wait early and let a late landing count as the panel's scroll.
+          if (anchored) {
+            await vi.waitFor(() => expect(listScroll.scrollToOffset).toHaveBeenCalled(), {
+              timeout: 10_000,
+            });
+          }
           await act(
             () =>
               new Promise<void>((resolve) => {
-                const step = (left: number) =>
-                  left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
-                step(6);
+                const scrolls = () =>
+                  Object.values(listScroll).reduce((sum, spy) => sum + spy.mock.calls.length, 0);
+                let last = scrolls();
+                let quietFrames = 0;
+                const step = () => {
+                  const now = scrolls();
+                  quietFrames = now === last ? quietFrames + 1 : 0;
+                  last = now;
+                  if (quietFrames >= 12) resolve();
+                  else requestAnimationFrame(step);
+                };
+                requestAnimationFrame(step);
               }),
           );
           for (const spy of Object.values(listScroll)) spy.mockClear();
