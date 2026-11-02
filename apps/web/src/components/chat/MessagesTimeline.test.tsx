@@ -1856,8 +1856,8 @@ describe("MessagesTimeline row typing and scroll wiring", () => {
       ],
     });
 
-    expect(markup).toContain('data-item-type="message:user"');
-    expect(markup).toContain('data-item-type="message:assistant"');
+    expect(markup).toContain('data-item-type="message:user:0"');
+    expect(markup).toContain('data-item-type="message:assistant:0"');
     expect(markup).toContain('data-item-type="work"');
     expect(markup).toContain('data-item-type="working"');
   });

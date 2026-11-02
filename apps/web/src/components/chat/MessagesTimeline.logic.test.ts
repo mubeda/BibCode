@@ -19,6 +19,7 @@ import {
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  resolveTimelineItemType,
   resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
@@ -2661,5 +2662,57 @@ describe("deriveMessagesTimelineRows with older history", () => {
       ["turn-old", "Worked for 30s"],
       ["turn-new", "Worked for 20s"],
     ]);
+  });
+});
+
+describe("timeline item types", () => {
+  const messageRow = (role: "user" | "assistant", length: number): MessagesTimelineRow => ({
+    kind: "message",
+    id: `${role}-${length}`,
+    createdAt: "2026-01-01T00:00:00Z",
+    message: {
+      id: `${role}-${length}` as never,
+      role,
+      text: "x".repeat(length),
+      turnId: null,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      streaming: false,
+    },
+    durationStart: "2026-01-01T00:00:00Z",
+    showAssistantMeta: false,
+    showAssistantCopyButton: false,
+    assistantCopyStreaming: false,
+    disclosure: undefined,
+  });
+
+  it.each([
+    [0, 0],
+    [1, 0],
+    [999, 0],
+    [1_000, 0],
+    [1_999, 0],
+    [2_000, 1],
+    [3_999, 1],
+    [4_000, 2],
+    [100_000, 6],
+  ])("buckets a %i-character message into bucket %i", (length, bucket) => {
+    // LegendList estimates an unmeasured row from rows of its type, so a short reply must
+    // never take its estimate from a very long one (#228).
+    expect(resolveTimelineItemType(messageRow("user", length))).toBe(`message:user:${bucket}`);
+    expect(resolveTimelineItemType(messageRow("assistant", length))).toBe(
+      `message:assistant:${bucket}`,
+    );
+  });
+
+  it.each([
+    "queued-message",
+    "work",
+    "work-toggle",
+    "turn-fold",
+    "proposed-plan",
+    "working",
+  ] as const)("keeps the %s kind as its type", (kind) => {
+    expect(resolveTimelineItemType({ kind, id: kind } as never)).toBe(kind);
   });
 });
