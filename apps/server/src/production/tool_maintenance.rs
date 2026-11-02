@@ -50,10 +50,15 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long shutdown waits for a running update. Killing an updater mid-replacement is what
 /// corrupts an install, so it is never asked to stop earlier than this.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// How long a host that stops this server on a deadline of its own must allow a running tool
+/// update on top of that deadline.
+pub const TOOL_UPDATE_SHUTDOWN_WAIT: Duration = SHUTDOWN_WAIT;
 const OUTPUT_LIMIT: usize = 10_000;
 const STILL_UPDATING_MESSAGE: &str =
     "CodeGraph is still being updated by an earlier BiBCode session.";
 const DAMAGED_MESSAGE: &str = "CodeGraph may be damaged (the last update did not finish cleanly).";
+const CHANGED_WHILE_WAITING: &str =
+    "CodeGraph changed while this update waited. Refresh and try again.";
 const MANUAL_REINSTALL: &str = "Reinstall CodeGraph with its installer, then refresh.";
 const UNKNOWN_INSTALL: &str = "BiBCode cannot tell how CodeGraph was installed, so it will not update it. Run `codegraph upgrade` yourself.";
 
@@ -161,6 +166,8 @@ struct Inner {
     tasks: TaskTracker,
     closed: AtomicBool,
     attribution: OnceLock<ProcessAttributionRegistry>,
+    #[cfg(test)]
+    fail_spawn: AtomicBool,
     /// Never cancelled: only a server shutdown that outlives its wait stops an updater, and
     /// then process cleanup, not this token, ends it.
     updater_cancellation: CancellationToken,
@@ -226,13 +233,16 @@ fn forced(mut update: ProviderUpdateCommand) -> ProviderUpdateCommand {
 
 fn update_outcome(before: Option<&str>, after: &Value) -> &'static str {
     let after_version = after["version"].as_str();
+    if provider_version_regressed(CODEGRAPH_ID, before, after_version) {
+        return "unchanged";
+    }
+    // A version that rose is a verified finish even when the registry already advertises a
+    // newer release than the one the updater installed.
+    if provider_version_advanced(CODEGRAPH_ID, before, after_version) {
+        return "succeeded";
+    }
     match after["versionAdvisory"]["status"].as_str() {
-        Some("current") if provider_version_regressed(CODEGRAPH_ID, before, after_version) => {
-            "unchanged"
-        }
         Some("current") => "succeeded",
-        Some("behind_latest") => "unchanged",
-        _ if provider_version_advanced(CODEGRAPH_ID, before, after_version) => "succeeded",
         _ => "unchanged",
     }
 }
@@ -246,10 +256,18 @@ impl ToolMaintenance {
                 state: Mutex::new(State::default()),
                 tasks: TaskTracker::new(),
                 closed: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_spawn: AtomicBool::new(false),
                 attribution: OnceLock::new(),
                 updater_cancellation: CancellationToken::new(),
             }),
         }
+    }
+
+    /// Whether a tool update is running; a host with its own stop deadline extends it by
+    /// [`TOOL_UPDATE_SHUTDOWN_WAIT`] while this is true.
+    pub(crate) fn updates_running(&self) -> bool {
+        !self.lock().running.is_empty()
     }
 
     pub(crate) fn attach_attribution(&self, registry: ProcessAttributionRegistry) {
@@ -379,6 +397,19 @@ impl ToolMaintenance {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, &path)
+    }
+
+    fn restore_marker(&self, tool_id: &str, bytes: &[u8]) {
+        use std::io::Write;
+        let path = self.marker_path(tool_id);
+        let temporary = path.with_extension("json.tmp");
+        let written = std::fs::File::create(&temporary).and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        });
+        if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, &path)) {
+            tracing::warn!(tool = tool_id, %error, "could not restore the tool update marker");
+        }
     }
 
     fn remove_marker(&self, tool_id: &str) {
@@ -708,6 +739,29 @@ impl ToolMaintenance {
         )
         .await;
 
+        // Kept so a failed start can put back the evidence of an earlier interrupted update.
+        let previous_marker = std::fs::read(self.marker_path(&tool_id)).ok();
+        // The installation may have changed while this update waited for the command lock: an
+        // installer may have replaced it, so the action and its ownership are chosen again.
+        let (install_path, version_before, stale) =
+            match self.update_action(&definition, &cwd).await {
+                Ok((fresh, path, version)) if fresh == action => (path, version, None),
+                Ok(_) => (
+                    install_path,
+                    version_before,
+                    Some(CHANGED_WHILE_WAITING.to_owned()),
+                ),
+                Err(error) => (
+                    install_path,
+                    version_before,
+                    Some(
+                        error["reason"]
+                            .as_str()
+                            .unwrap_or(CHANGED_WHILE_WAITING)
+                            .to_owned(),
+                    ),
+                ),
+            };
         let marker = UpdateMarker {
             tool_id: tool_id.clone(),
             install_path,
@@ -716,7 +770,9 @@ impl ToolMaintenance {
             pid: None,
             process_started_at: None,
         };
-        let final_state = if let Err(error) = self.write_marker(&marker) {
+        let final_state = if let Some(reason) = stale {
+            finish("failed", &started_at, &reason, None)
+        } else if let Err(error) = self.write_marker(&marker) {
             tracing::warn!(tool = %tool_id, %error, "could not record the tool update");
             finish(
                 "failed",
@@ -737,8 +793,12 @@ impl ToolMaintenance {
             );
             match outcome {
                 Err(SupervisedRunError::Spawn(error)) => {
-                    // Nothing ran, so nothing can be half-replaced.
-                    self.remove_marker(&tool_id);
+                    // Nothing ran, so this attempt changed nothing; an earlier interrupted
+                    // update's marker stays, because nothing was repaired.
+                    match &previous_marker {
+                        Some(bytes) => self.restore_marker(&tool_id, bytes),
+                        None => self.remove_marker(&tool_id),
+                    }
                     finish(
                         "failed",
                         &started_at,
@@ -804,6 +864,12 @@ impl ToolMaintenance {
         marker: UpdateMarker,
         registration: Arc<Mutex<Option<ProcessRegistration>>>,
     ) -> Result<(i32, Option<String>), SupervisedRunError> {
+        #[cfg(test)]
+        if self.inner.fail_spawn.load(Ordering::Acquire) {
+            return Err(SupervisedRunError::Spawn(std::io::Error::other(
+                "injected spawn failure",
+            )));
+        }
         let environment = update_environment(&definition.environment);
         let executable = resolve_provider_executable_with_environment(
             &action.executable,
@@ -919,7 +985,7 @@ pub(crate) mod tests {
         test_support::{TestSandbox, executable_fixture},
     };
 
-    const LATEST: &str = "1.6.3";
+    const LATEST: &str = "1.6.4";
 
     struct Fixture {
         sandbox: TestSandbox,
@@ -1412,6 +1478,69 @@ pub(crate) mod tests {
         std::fs::remove_file(&fixture.marker).expect("marker cleared");
         fixture.refresh().await;
         assert_eq!(fixture.tool()["versionAdvisory"]["status"], "behind_latest");
+    }
+
+    #[tokio::test]
+    async fn a_version_advance_is_a_verified_finish_even_when_a_newer_release_exists() {
+        let fixture = fixture("tool-advance").await;
+        // The updater installs 1.6.3 while the registry already advertises 1.6.4.
+        std::fs::write(fixture.flag("next"), "1.6.3").expect("next version");
+        fixture.refresh().await;
+        let result = fixture.update().await.expect("update");
+        assert_eq!(result["tools"][0]["updateState"]["status"], "succeeded");
+        assert_eq!(fixture.version(), "1.6.3");
+        assert!(!fixture.marker.exists(), "an advance clears the marker");
+        let tool = fixture.tool();
+        assert_eq!(tool["versionAdvisory"]["status"], "behind_latest");
+        assert!(!message_contains(&tool, "may be damaged"));
+    }
+
+    #[tokio::test]
+    async fn a_reinstall_that_cannot_start_keeps_the_interrupted_updates_marker() {
+        let fixture = fixture("tool-spawn-failure").await;
+        write_marker(&fixture, None, None, &fixture.stub);
+        let before = std::fs::read(&fixture.marker).expect("marker");
+        fixture
+            .tools
+            .inner
+            .fail_spawn
+            .store(true, Ordering::Release);
+        let result = fixture.update().await.expect("the call settles");
+        assert_eq!(result["tools"][0]["updateState"]["status"], "failed");
+        assert_eq!(
+            std::fs::read(&fixture.marker).expect("the marker is still there"),
+            before
+        );
+        assert!(message_contains(&fixture.tool(), "may be damaged"));
+        // With no earlier marker the same failure leaves nothing behind.
+        std::fs::remove_file(&fixture.marker).expect("clear");
+        fixture.update().await.expect("the call settles");
+        assert!(!fixture.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn a_queued_update_rechecks_the_install_after_waiting_for_the_command_lock() {
+        let fixture = fixture("tool-queued-recheck").await;
+        fixture.refresh().await;
+        let lock = fixture
+            .tools
+            .inner
+            .setup
+            .maintenance
+            .command_lock("codegraph-standalone");
+        let held = lock.lock_owned().await;
+        let call = spawn_update(&fixture, None);
+        until("the update to queue", || {
+            update_status(&fixture.tool()).as_deref() == Some("queued")
+        })
+        .await;
+        // An installer replaces version 1 with a major BiBCode has not verified.
+        std::fs::write(fixture.flag("version"), "2.0.0").expect("new major");
+        drop(held);
+        let result = call.await.expect("join").expect("the call settles");
+        assert_eq!(result["tools"][0]["updateState"]["status"], "failed");
+        assert!(!fixture.flag("started").exists(), "the updater never ran");
+        assert!(!fixture.marker.exists());
     }
 
     #[tokio::test]

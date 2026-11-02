@@ -818,6 +818,19 @@ impl ServerHandle {
         self.update_maintenance.clone()
     }
 
+    /// A probe for whether a tool update is running, for a host that stops this server on a
+    /// deadline of its own. It does not keep the runtime alive. `None` without a production
+    /// runtime.
+    #[must_use]
+    pub fn tool_updates_probe(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        let runtime = Arc::downgrade(self._production_runtime.as_ref()?);
+        Some(Arc::new(move || {
+            runtime
+                .upgrade()
+                .is_some_and(|runtime| runtime.tool_updates_running())
+        }))
+    }
+
     /// The production runtime's committed `enableProfiler`, which a desktop host follows to
     /// run the crash monitor for itself and this in-process server. `None` without one.
     #[must_use]

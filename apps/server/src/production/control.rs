@@ -861,6 +861,11 @@ impl NativeServerControl {
         )
     }
 
+    /// Whether a tool update is running, for a host that stops the server on a deadline of its own.
+    pub(crate) fn tool_updates_running(&self) -> bool {
+        self.tools.updates_running()
+    }
+
     /// Waits for a running tool update before shutdown goes on, then refuses new ones.
     pub(crate) async fn shutdown_tool_updates(&self) {
         self.tools.shutdown().await;
