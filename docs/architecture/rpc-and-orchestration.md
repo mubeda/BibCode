@@ -2694,6 +2694,14 @@ client decodes only the changed fields with the thread's field
 schemas, and `packages/contracts/fixtures/thread-stream/lifecycle.json` pins
 that patches rebuild the server's snapshot exactly. Older clients omit
 `patches` and keep receiving whole snapshots; older servers ignore it.
+The thread stream sends at most the first 200 files of each checkpoint, in
+their stored (path) order so patches do not churn, and the checkpoint's
+`filesTotal` (#227): one formatter run or generated folder made every open of
+its thread carry thousands of entries. The chat's changed-files section shows
+the total and an "and N more files" row that opens the turn diff, which
+`getTurnDiff` computes from the checkpoint refs with every file. The HTTP read
+model keeps the full list and no total; an older server sends every file
+without `filesTotal`, and an older client ignores the field.
 
 A resubscribe resumes instead of resending the thread
 ([design](../superpowers/specs/2026-10-17-thread-resubscribe-resume-design.md)).
@@ -2704,7 +2712,9 @@ the last item it applied in full and sends it on each resubscribe as
 `resume: { revision, snapshotSequence }`. The server loads the thread as
 before, and answers `{ kind: "unchanged", snapshotSequence, revision }` only
 when the thread still has that revision and its sequence is at least the
-client's. It then patches against that thread. Anything else gets the whole
+client's. It then patches against that thread. The client caches the revision
+with the thread, so this also holds for its first subscribe after a reload or
+an app restart ([connection runtime](./connection-runtime.md)). Anything else gets the whole
 snapshot: a change the client missed, a revision from before a restart (new
 keys), one the server never produced, a sequence newer than the server's, or a
 client that does not apply patches. The client clears its revision whenever it

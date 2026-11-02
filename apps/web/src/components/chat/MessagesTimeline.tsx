@@ -1837,7 +1837,8 @@ const AssistantChangedFilesSection = memo(function AssistantChangedFilesSection(
 }) {
   if (!turnSummary) return null;
   const checkpointFiles = turnSummary.files;
-  if (checkpointFiles.length === 0) return null;
+  // The thread stream sends at most 200 files of a checkpoint and their total (#227).
+  if ((turnSummary.filesTotal ?? checkpointFiles.length) === 0) return null;
 
   return (
     <AssistantChangedFilesSectionInner
@@ -1869,8 +1870,12 @@ function AssistantChangedFilesSectionInner({
     (store) => store.threadChangedFilesExpandedById[routeThreadKey]?.[turnSummary.turnId] ?? true,
   );
   const setExpanded = useUiStateStore((store) => store.setThreadChangedFilesExpanded);
-  const summaryStat = summarizeTurnDiffStats(checkpointFiles);
-  const changedFileCountLabel = String(checkpointFiles.length);
+  const totalFiles = Math.max(turnSummary.filesTotal ?? 0, checkpointFiles.length);
+  const hiddenFiles = totalFiles - checkpointFiles.length;
+  // Line totals of the shown files alone would understate a capped turn.
+  const summaryStat =
+    hiddenFiles > 0 ? { additions: 0, deletions: 0 } : summarizeTurnDiffStats(checkpointFiles);
+  const changedFileCountLabel = totalFiles.toLocaleString();
 
   return (
     <div className="mt-2 rounded-lg border border-border/80 bg-card/45 p-2.5">
@@ -1912,6 +1917,18 @@ function AssistantChangedFilesSectionInner({
         resolvedTheme={resolvedTheme}
         onOpenTurnDiff={onOpenTurnDiff}
       />
+      {hiddenFiles > 0 && (
+        <button
+          type="button"
+          data-scroll-anchor-ignore
+          className="flex w-full items-center rounded-xl px-1.5 py-1 text-left text-muted-foreground text-xs transition-colors hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+          onClick={() => onOpenTurnDiff(turnSummary.turnId)}
+        >
+          {checkpointFiles.length > 0
+            ? `and ${hiddenFiles.toLocaleString()} more ${hiddenFiles === 1 ? "file" : "files"}`
+            : `${hiddenFiles.toLocaleString()} ${hiddenFiles === 1 ? "file" : "files"} changed`}
+        </button>
+      )}
     </div>
   );
 }

@@ -42,7 +42,13 @@ public package has no root export; callers use focused subpaths such as
   domain state, and held data meets a connected environment. `session` then
   publishes the same object, so nothing subscribes twice: each followed thread
   sends one `subscribeThread` per connection, resuming from the revision it
-  holds (`rpc/client.reconnect.test.ts`). An attempt that ends
+  holds (`rpc/client.reconnect.test.ts`). The revision is cached with the
+  thread in `EnvironmentCacheStore` (the web store keeps it in the same
+  IndexedDB record as `resumeFrom`), so the first subscribe after a reload or
+  an app restart resumes too, and a server that kept running answers
+  `unchanged` instead of resending the thread (#227). A record written before
+  this has no revision and subscribes without `resume`; any change that clears
+  the in-memory revision rewrites the record without it. An attempt that ends
   unverified clears `subscriptionSession`, which interrupts its followers; their
   held data is dropped. What changes is that a read subscription's request (its
   input, such as a thread ID or cwd) reaches the server before the config's

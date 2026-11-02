@@ -16,7 +16,11 @@ import { Atom } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { connectionProjectionPhase } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
-import { EnvironmentCacheStore } from "../platform/persistence.ts";
+import {
+  EnvironmentCacheStore,
+  type CachedThread,
+  type ThreadResumePoint,
+} from "../platform/persistence.ts";
 import { subscribe } from "../rpc/client.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyThreadPatch } from "./threadPatch.ts";
@@ -63,29 +67,34 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           threadId,
           error: error.message,
         }),
-        Effect.as(Option.none<OrchestrationThread>()),
+        Effect.as(Option.none<CachedThread>()),
       ),
     ),
   );
+  const cachedThread = Option.map(cached, (entry) => entry.thread);
   const state = yield* SubscriptionRef.make<EnvironmentThreadState>({
-    data: cached,
-    status: statusWithoutLiveData(cached),
+    data: cachedThread,
+    status: statusWithoutLiveData(cachedThread),
     error: Option.none(),
   });
   const lastSequence = yield* SubscriptionRef.make(0);
   // The server's revision of the thread this state holds, after the last item applied in full.
   // A resubscribe sends it so the server can answer `unchanged` instead of the whole thread; any
-  // change the server did not describe with a revision clears it.
-  let resumeFrom: { readonly revision: string; readonly snapshotSequence: number } | null = null;
+  // change the server did not describe with a revision clears it. It is cached with the thread,
+  // so the first subscribe after a reload or an app restart resumes too (#227).
+  let resumeFrom: ThreadResumePoint | null = Option.match(cached, {
+    onNone: () => null,
+    onSome: (entry) => entry.resumeFrom,
+  });
   const resumeAt = (revision: string | undefined, snapshotSequence: number) => {
     resumeFrom = revision === undefined ? null : { revision, snapshotSequence };
   };
-  const persistence = yield* Queue.sliding<OrchestrationThread>(1);
+  const persistence = yield* Queue.sliding<CachedThread>(1);
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
-    thread: OrchestrationThread,
+    cachedEntry: CachedThread,
   ) {
-    yield* cache.saveThread(environmentId, thread).pipe(
+    yield* cache.saveThread(environmentId, cachedEntry).pipe(
       Effect.catch((error) =>
         Effect.logWarning("Could not persist the thread cache.").pipe(
           Effect.annotateLogs({
@@ -137,7 +146,6 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       status: "live",
       error: Option.none(),
     });
-    yield* Queue.offer(persistence, thread);
   });
 
   const setDeleted = Effect.fn("EnvironmentThreadState.setDeleted")(function* () {
@@ -160,7 +168,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     );
   });
 
-  const applyItem = Effect.fn("EnvironmentThreadState.applyItem")(function* (
+  const applyStreamItem = Effect.fn("EnvironmentThreadState.applyStreamItem")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
     if (item.kind === "snapshot") {
@@ -215,6 +223,20 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
   });
 
+  // Caches the thread with its revision whenever either changes. A new snapshot sequence under
+  // the same revision is not worth rewriting the thread: the server accepts the older one.
+  const applyItem = Effect.fn("EnvironmentThreadState.applyItem")(function* (
+    item: OrchestrationThreadStreamItem,
+  ) {
+    const before = (yield* SubscriptionRef.get(state)).data;
+    const revisionBefore = resumeFrom?.revision;
+    yield* applyStreamItem(item);
+    const after = (yield* SubscriptionRef.get(state)).data;
+    if (Option.isSome(after) && (after !== before || resumeFrom?.revision !== revisionBefore)) {
+      yield* Queue.offer(persistence, { thread: after.value, resumeFrom });
+    }
+  });
+
   yield* SubscriptionRef.changes(supervisor.state).pipe(
     Stream.runForEach((connectionState) => {
       switch (connectionProjectionPhase(connectionState)) {
@@ -256,7 +278,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       Effect.flatMap((current) =>
         Option.match(current.data, {
           onNone: () => Effect.void,
-          onSome: persist,
+          onSome: (thread) => persist({ thread, resumeFrom }),
         }),
       ),
     ),

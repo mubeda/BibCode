@@ -483,6 +483,12 @@ export const OrchestrationCheckpointSummary = Schema.Struct({
   checkpointRef: CheckpointRef,
   status: OrchestrationCheckpointStatus,
   files: Schema.Array(OrchestrationCheckpointFile),
+  /**
+   * How many files the checkpoint changed. The thread stream sends only the first 200 of
+   * them, in path order, in `files` (#227); the turn diff has them all. An older server sends
+   * every file and no total.
+   */
+  filesTotal: Schema.optional(NonNegativeInt),
   assistantMessageId: Schema.NullOr(MessageId),
   completedAt: IsoDateTime,
 });
