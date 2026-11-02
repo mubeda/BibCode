@@ -1,6 +1,6 @@
 # Side Chats
 
-Status: Proposed 2026-11-02, awaiting Mauro's approval (revision 3, after the final Codex round 3
+Status: Approved by Mauro 2026-11-02 (host-restore guard filed as #279; Codex review, 3 rounds; revision 3, after the final Codex round 3
 review). Issue #265. Verified at `fd98b43306`
 (`origin/main`). Line references are to that commit. No product code is
 written until this design is approved.
