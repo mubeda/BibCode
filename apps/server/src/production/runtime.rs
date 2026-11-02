@@ -171,6 +171,13 @@ impl ProductionRuntime {
         self.mcp_control.clone()
     }
 
+    /// Whether a tool update (CodeGraph) is running. A host that stops this server on a deadline
+    /// of its own extends it by [`crate::TOOL_UPDATE_SHUTDOWN_WAIT`] while this is true.
+    #[must_use]
+    pub fn tool_updates_running(&self) -> bool {
+        self.server_control.tool_updates_running()
+    }
+
     /// The committed `enableProfiler`, which drives a desktop host's crash monitor.
     #[must_use]
     pub fn profiler_enabled_signal(&self) -> tokio::sync::watch::Receiver<bool> {

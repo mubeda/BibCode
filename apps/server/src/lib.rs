@@ -79,6 +79,7 @@ pub use maintenance::{
     MAINTENANCE_UPDATE_STATUS_PATH, MaintenanceError, PrepareForUpdateResult, RpcAdmissionGate,
     RpcMutability, UpdateMaintenance, http_mutability, rpc_mutability,
 };
+pub use production::TOOL_UPDATE_SHUTDOWN_WAIT;
 pub use remote_update::{
     HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallKind,
     RemoteUpdateInstallMode, RemoteUpdateRequester, RemoteUpdateService, RemoteUpdateSnapshot,
