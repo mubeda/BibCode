@@ -744,6 +744,10 @@ async fn a_codex_configuration_error_fails_the_start_and_reads_back_its_reason()
     let error = report["error"].as_str().unwrap_or_default();
     assert!(error.contains(CONFIG_ERROR), "{report}");
     assert!(error.contains("config.toml"), "{report}");
+    assert!(
+        !error.contains("MCP server"),
+        "no advice that cannot help: {report}"
+    );
     let thread = report["threadId"].as_str().unwrap().to_owned();
 
     let shown = run_in(root.path(), &cwd, &["show", &thread, "--json"], "").await;

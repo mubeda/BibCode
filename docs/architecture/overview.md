@@ -1621,7 +1621,8 @@ it.
 - `delivery.failing` (#273) is recorded once for a message delivery that fails
   for good without reaching its provider: the provider refused its own
   configuration (`provider-configuration`, also when restart recovery meets
-  it), or the twentieth not-sent attempt (`attempts-exhausted`). It keeps the
+  it), or the twentieth not-sent attempt or failed restart-recovery launch
+  (`attempts-exhausted`; the recovered message then stays uncertain). It keeps the
   provider, the attempt count and that class, never the error text, and cites
   no event; each such failure also logs a `tracing::warn!`.
 - `server.getProfilerStatus` returns the 20 newest findings without evidence;
