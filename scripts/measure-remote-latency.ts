@@ -858,32 +858,46 @@ async function waitUntil(check: () => boolean, timeoutMs = 60_000): Promise<numb
   return Date.now();
 }
 
-/** Waits until a socket opened after `socketsBefore` has received a chunk of a thread subscription. */
+/**
+ * Whether a socket opened after `socketsBefore` has received a chunk of a thread subscription. A
+ * Chunk carries thread state; an Exit could be a failure. With `threadId`, only a subscription
+ * to that thread counts: a reconnect resubscribes a dozen threads and a small one can answer first.
+ */
+export function threadResyncedIn(
+  frames: ReadonlyArray<WebSocketFrame>,
+  socketsBefore: ReadonlySet<string>,
+  threadId?: string,
+): boolean {
+  const messages = decodeFrames(frames.filter((frame) => !socketsBefore.has(frame.socket)));
+  const subscriptions = new Set(
+    messages
+      .filter(
+        ({ direction, message }) =>
+          direction === "sent" &&
+          message._tag === "Request" &&
+          message.tag === "orchestration.subscribeThread" &&
+          (threadId === undefined ||
+            (message.payload as { readonly threadId?: unknown } | undefined)?.threadId ===
+              threadId),
+      )
+      .map(({ socket, message }) => `${socket}:${String(message.id)}`),
+  );
+  return messages.some(
+    ({ direction, socket, message }) =>
+      direction === "received" &&
+      message._tag === "Chunk" &&
+      subscriptions.has(`${socket}:${String(message.requestId)}`),
+  );
+}
+
+/** Waits until `threadResyncedIn` holds for the page's frames. */
 function threadResynced(
   page: CdpPage,
   socketsBefore: ReadonlySet<string>,
   timeoutMs = 60_000,
+  threadId?: string,
 ): Promise<number> {
-  // A Chunk carries thread state; an Exit could be a failure.
-  return waitUntil(() => {
-    const messages = decodeFrames(page.frames.filter((frame) => !socketsBefore.has(frame.socket)));
-    const subscriptions = new Set(
-      messages
-        .filter(
-          ({ direction, message }) =>
-            direction === "sent" &&
-            message._tag === "Request" &&
-            message.tag === "orchestration.subscribeThread",
-        )
-        .map(({ socket, message }) => `${socket}:${String(message.id)}`),
-    );
-    return messages.some(
-      ({ direction, socket, message }) =>
-        direction === "received" &&
-        message._tag === "Chunk" &&
-        subscriptions.has(`${socket}:${String(message.requestId)}`),
-    );
-  }, timeoutMs);
+  return waitUntil(() => threadResyncedIn(page.frames, socketsBefore, threadId), timeoutMs);
 }
 
 /** Waits for the frames that belong to an action after its result showed; returns when its window ends. */
@@ -1118,6 +1132,7 @@ export async function runScenarios(
 }
 
 /** The big thread of `apps/server/tests/support/load_fixture.rs`: its title and last words. */
+const BIG_THREAD_ID = "thread-large";
 const BIG_THREAD_TITLE = "Large fixture thread";
 const BIG_THREAD_FINAL_MARKER = "Fixture closing answer.";
 /** A 3G link takes minutes for what a local link does in a second. */
@@ -1188,7 +1203,7 @@ export async function runLoadScenarios(
   await measure("reconnect: dropped socket until the big thread resynced", async () => {
     const socketsBefore = new Set(page.frames.map((frame) => frame.socket));
     harness.dropSockets();
-    return threadResynced(page, socketsBefore, LOAD_TIMEOUT_MS);
+    return threadResynced(page, socketsBefore, LOAD_TIMEOUT_MS, BIG_THREAD_ID);
   });
   return results;
 }

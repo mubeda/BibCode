@@ -16,22 +16,23 @@ non-archived threads in six projects, most of them finished, with chat panels. E
 page's WebSocket traffic from the action until the link has been quiet for two seconds. "Received"
 is the WebSocket payload after the transport's deflate; "decoded" is the JSON it inflates to.
 TCP, TLS and WebSocket framing are not counted, and the web bundle is served locally, so these
-rows count RPC bytes, not bundle bytes. Two runs, one row each; sizes of the two cold rows agree
-within 0.5%.
+rows count RPC bytes, not bundle bytes. Two runs, one row each; the sizes of the two cold rows agree
+within 1%. The reconnect row waits for the big thread's own subscription to be answered, not any
+thread's.
 
 ### Load scenarios, 3G
 
-| Action                                                |  RPCs | Sequential | Sent (KB) |   Received (KB) |    Decoded (KB) | Time to visible |
-| ----------------------------------------------------- | ----: | ---------: | --------: | --------------: | --------------: | --------------: |
-| Cold connect: reload onto the big thread's route      |    58 |        1–2 |      36.6 | 2127.8 / 2128.2 | 6655.2 / 6655.6 |   46.9 / 46.4 s |
-| Open the big thread from the sidebar, no local cache  |    58 |          3 |      37.4 | 2137.7 / 2137.1 | 6665.1 / 6664.5 |   48.7 / 48.7 s |
-| Switch back to the big thread (page already holds it) | 11–13 |        0–1 |  5.8–19.0 |    25.0 / 117.5 |    25.0 / 117.5 |     3.1 / 0.9 s |
-| Reconnect: dropped socket until the thread resynced   |    55 |          1 |      31.7 |   195.5 / 187.6 |   415.7 / 407.8 |     6.6 / 4.5 s |
+| Action                                                  |  RPCs | Sequential | Sent (KB) |   Received (KB) |    Decoded (KB) | Time to visible |
+| ------------------------------------------------------- | ----: | ---------: | --------: | --------------: | --------------: | --------------: |
+| Cold connect: reload onto the big thread's route        |    58 |        1–2 | 35.8–37.1 | 2110.4 / 2120.1 | 6637.9 / 6647.5 |   46.6 / 47.5 s |
+| Open the big thread from the sidebar, no local cache    |    58 |          4 | 37.9–38.1 | 2127.4 / 2142.6 | 6654.8 / 6670.0 |   48.7 / 49.1 s |
+| Switch back to the big thread (page already holds it)   | 10–12 |          0 |  5.7–18.8 |    113.4 / 25.3 |    113.4 / 25.3 |     2.3 / 0.9 s |
+| Reconnect: dropped socket until the big thread resynced | 53–55 |          1 | 25.1–33.2 |   141.5 / 211.0 |   361.7 / 431.2 |     4.6 / 5.5 s |
 
 Run 1 / run 2 where two numbers are shown. "Sequential" is the longest chain of requests each sent
 right after a reply to the previous one, inferred from timing. The two cold rows are decided by
 bandwidth: 2.1 MB at 50,000 bytes/s is 43 s before any round trip. The switch and reconnect rows
-vary between runs (the switch row by 5x in bytes, not explained here); compare them as ranges.
+vary between runs (the switch row by 4x and the reconnect row by 1.5x in bytes, not explained here); compare them as ranges.
 
 ### Per-payload sizes (the CI byte budget)
 
