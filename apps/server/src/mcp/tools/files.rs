@@ -4,8 +4,8 @@
 //! Each tool reaches the handler the Files panel uses (`projects.*`) with the call's
 //! credential. Paths are literal and relative, checked by [`validate_paths`] before any RPC;
 //! the workspace service then binds every operation to a folder handle opened without
-//! following a symlink (`workspace::beneath`), so a folder swapped for a symlink after the
-//! check cannot route it outside. A write needs the `version` of a complete read, or
+//! following a symlink or junction (`workspace::beneath`, on Unix and Windows alike), so a
+//! folder swapped for a link after the check cannot route it outside. A write needs the `version` of a complete read, or
 //! `createOnly`. A delete goes to the system trash unless `permanent` is set. Transfers move no
 //! bytes through MCP: the URL they return names this connection's session, and the route
 //! serves it only while that session's access lasts (`production::transfer_routes`).
@@ -475,7 +475,6 @@ async fn read(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn write(call: &ToolCall<'_>) -> ToolResult {
-    changes_files_here()?;
     let place = place(
         call,
         &[
@@ -529,7 +528,6 @@ async fn write(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn create(call: &ToolCall<'_>) -> ToolResult {
-    changes_files_here()?;
     let place = place(call, &["threadId", "path", "kind"]).await?;
     let path = checked_path(call, &place.cwd, "path").await?;
     let kind = match call.required("kind")? {
@@ -549,7 +547,6 @@ async fn create(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn rename(call: &ToolCall<'_>) -> ToolResult {
-    changes_files_here()?;
     let place = place(call, &["threadId", "from", "to"]).await?;
     let from = checked_path(call, &place.cwd, "from").await?;
     let to = checked_path(call, &place.cwd, "to").await?;
@@ -573,7 +570,6 @@ async fn rename(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn delete(call: &ToolCall<'_>) -> ToolResult {
-    changes_files_here()?;
     let place = place(call, &["threadId", "path", "permanent", "clientRequestId"]).await?;
     let path = checked_path(call, &place.cwd, "path").await?;
     let permanent = call.boolean("permanent")?.unwrap_or(false);
@@ -593,24 +589,6 @@ async fn delete(call: &ToolCall<'_>) -> ToolResult {
     .await
 }
 
-/// The tools that change files run only where every step is bound to a folder handle (Unix,
-/// `workspace::beneath`). Elsewhere a folder another process swaps for a symlink between the
-/// check and the call could still redirect them, so they are refused instead.
-fn changes_files_here() -> Result<(), Value> {
-    handle_bound(cfg!(unix))
-}
-
-fn handle_bound(supported: bool) -> Result<(), Value> {
-    if supported {
-        return Ok(());
-    }
-    Err(typed_tool_failure(
-        PLATFORM_UNSUPPORTED_TAG,
-        "Changing files over MCP is not available on this server's operating system yet. Reading, listing, searching and downloading work; ask the person to make the change in BiBCode.",
-    ))
-}
-
-pub(crate) const PLATFORM_UNSUPPORTED_TAG: &str = "McpPlatformUnsupportedError";
 /// A write refused because another BiBCode writer (an upload, or a write that did not end in
 /// time) holds the file.
 const BUSY_TAG: &str = "McpFileBusyError";
@@ -671,7 +649,6 @@ async fn download(call: &ToolCall<'_>) -> ToolResult {
 }
 
 async fn upload(call: &ToolCall<'_>) -> ToolResult {
-    changes_files_here()?;
     let place = place(call, &["threadId", "directory", "fileName", "overwrite"]).await?;
     let directory = match call
         .string("directory")?
@@ -716,20 +693,4 @@ async fn upload(call: &ToolCall<'_>) -> ToolResult {
         }),
         &[],
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_file_changing_tools_are_refused_where_operations_are_not_handle_bound() {
-        assert!(handle_bound(true).is_ok());
-        let refused = handle_bound(false).unwrap_err();
-        assert_eq!(
-            refused["structuredContent"]["error"]["_tag"],
-            PLATFORM_UNSUPPORTED_TAG
-        );
-        assert_eq!(changes_files_here().is_ok(), cfg!(unix));
-    }
 }
