@@ -328,7 +328,9 @@ process is sampled, but what runs under a terminal (`other`, `terminal`,
 - **Severity:** `warn`.
 - **Raised when:** private memory keeps growing after a 15-minute warm-up. The
   detector uses 1-minute medians and a rolling 10-minute minimum, so allocator
-  sawtooth does not count. The Theil–Sen slope over 1 h must be at least
+  sawtooth does not count. Growth is measured on the highest floor since the
+  last reset, so a refill to the level held before a dip does not count. The
+  Theil–Sen slope of that high-water mark over 1 h must be at least
   max(10 MB/h, 2 %/h of baseline), with Mann–Kendall Z above 2.33, on two
   consecutive checks. A step change resets the baseline, and so does a sampling
   gap over 5 minutes, such as sleep. A smaller step, such as a cache filled

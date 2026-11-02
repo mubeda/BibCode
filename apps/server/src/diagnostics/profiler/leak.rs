@@ -1,5 +1,6 @@
 //! Leak and sustained-CPU rules over one process's 1-minute series (RESIN-style): a
 //! 15-minute warm-up, a rolling 10-minute minimum so sawtooth peaks never count as growth,
+//! growth measured on that floor's high-water mark so a refill after a dip never counts,
 //! and a baseline reset on step changes and sampling gaps.
 
 use std::collections::VecDeque;
@@ -123,10 +124,16 @@ impl LeakDetector {
         if self.floor.len() < SUSPECT_WINDOW_MIN {
             return LeakVerdict::None;
         }
+        // The floor's high-water mark since the last reset: a refill after a dip returns to a
+        // level already held, so only a rise above it counts as growth.
+        let mut high = f64::NEG_INFINITY;
         let points: Vec<(f64, f64)> = self
             .floor
             .iter()
-            .map(|(m, v)| (*m as f64 / 60.0, *v / MB))
+            .map(|(m, v)| {
+                high = high.max(*v);
+                (*m as f64 / 60.0, high / MB)
+            })
             .collect();
         let recent = &points[points.len() - SUSPECT_WINDOW_MIN..];
         // A step too small to reset the baseline (under 64 MB) still reads as steady growth
@@ -486,6 +493,39 @@ mod tests {
             let jittered = move |m: u64| (leak(m) as i64 + noise(m)) as u64;
             assert_eq!(verdicts_of(800, jittered), noisy, "{rate} MB/h with noise");
         }
+    }
+
+    /// A 40 MB process held flat for 90 minutes, then a dip to 25.8 MB and a refill in two
+    /// steps (#272). `after_refill` gives the private MB from minute 106 on.
+    fn dip_then(after_refill: impl Fn(u64) -> f64) -> impl Fn(u64) -> u64 {
+        move |m: u64| {
+            let mb = match m {
+                0..90 => 40.0,
+                90..98 => 25.8,
+                98..106 => 33.5,
+                _ => after_refill(m),
+            };
+            (mb * MB as f64) as u64
+        }
+    }
+
+    /// A refill to the level held before a dip is not growth, even in a small process where
+    /// the 10 MB/h floor is a large share of its size.
+    #[test]
+    fn recovery_after_a_dip_in_a_small_process_is_not_a_leak() {
+        let refill = dip_then(|m| 40.6 + (m.min(146) - 106) as f64 * 0.8 / 40.0);
+        assert_eq!(verdicts_of(400, refill), []);
+    }
+
+    /// A leak that carries a small process past the level it held before a dip still counts.
+    #[test]
+    fn a_leak_past_the_pre_dip_level_is_still_flagged() {
+        let leak = dip_then(|m| 40.0 + (m - 106) as f64 * 20.0 / 60.0);
+        let verdicts = verdicts_of(400, leak);
+        assert!(
+            matches!(verdicts.first(), Some((m, "suspect")) if *m <= 106 + 75),
+            "{verdicts:?}"
+        );
     }
 
     #[test]
