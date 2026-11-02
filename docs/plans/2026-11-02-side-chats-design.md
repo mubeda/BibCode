@@ -1,6 +1,6 @@
 # Side Chats
 
-Status: Proposed 2026-11-02, awaiting the maintainer's approval (revision 2, after the Codex round 2
+Status: Proposed 2026-11-02, awaiting the maintainer's approval (revision 3, after the final Codex round 3
 review). Issue #265. Verified at `fd98b43306`
 (`origin/main`). Line references are to that commit. No product code is
 written until this design is approved.
@@ -107,9 +107,13 @@ messages, which do not include the host. The activity follows the precedent of
 - The projector reads `sideChat` from `thread.created` (beside `hostThreadId`,
   `engine.rs:6775`, `:7146`). Replaying older events yields `false`, so a projection rebuild
   stays correct.
-- Client state: none. The tab label is computed from the thread's marker (see UI), so the
-  `centerPanelStore` surface shape and its version 4 stay as they are, and no client
-  migration is needed.
+- Client state: the chat surface shape is unchanged (the label comes from the title, see
+  Labels). One small persisted addition, for a tab closed while its panel was still being
+  created (review finding 12): `centerPanelStore` persists `closedBeforeCreated`, a list of
+  scoped thread keys capped at 20, oldest dropped. It joins `partialize`
+  (`centerPanelStore.ts:872-875`), `CENTER_PANEL_STORAGE_VERSION` goes from 4 to 5, and
+  `migratePersistedCenterPanelState` defaults it to empty for version 4 data. Nothing
+  changes in `clientStateMigrations.ts`, which only removes retired keys.
 
 ### Contracts and RPC
 
@@ -154,7 +158,11 @@ the payload. Host checks, the project lock and the dispatch gate are unchanged.
   1. A `/` turn returns `None`, as today, and records nothing.
   2. For a side chat that has not shared the seed, read the host's messages and compose
      them with side-chat framing. Clear a pending lost-session mark if one is set: the host
-     block stands in for it.
+     block stands in for it. The side-chat compose always returns a block, even when the
+     host has no earlier messages (today's compose returns `None` then,
+     `provider_runtime.rs:7550`). An empty host gives the framing with "The thread has no
+     messages yet." in place of the list, so the safety framing still reaches the agent and
+     `side-chat.context-shared` is recorded with `messages: 0` (review finding 13).
   3. Otherwise, today's behaviour: the pending mark and the thread's own messages.
 
   The caller appends `side-chat.context-shared` after an accepted delivery that carried
@@ -236,18 +244,23 @@ behaviour, not something side chats add.
      the host composer refuses another submit for this host. A reload then loses nothing:
      the text is still in the host composer, and a side chat the server did create is
      adopted as an empty tab.
-  2. When `createPanel` succeeds, the question is written to the side chat's persisted
-     composer draft. Then, on the `:btw` path only, the host draft is cleared only if its
+  2. When `createPanel` succeeds, the client sends the question with `startThreadTurn`.
+     The side chat's own draft is never written or cleared on success, so anything the
+     user types or attaches in the side chat while the send is pending stays (review
+     finding 11; `clearComposerDraftContent` clears prompt and attachments together,
+     `composerDraftStore.ts:728`).
+  3. When the send settles, on the `:btw` path only, the host draft is cleared only if its
      text still equals the submitted `:btw` text (the `expectedText` check that
      `applyPromptReplacement` already uses, `ChatComposer.tsx:1878-1880`) and it has no
-     attachments or contexts. If the user edited it during creation, it is left alone. The
-     menu path never touches the host draft (review finding 8).
-  3. The client sends it with `startThreadTurn`; on success the side chat's draft is cleared
-     as any send clears it. If the send fails, the question stays in the side chat's
-     composer and a toast says "Couldn't send to the side chat. Your question is in its
-     composer." A reload between 2 and 3 shows the question in the adopted side chat's
-     composer, unsent.
-  4. If `createPanel` fails, the tab closes, the host draft is untouched, and the existing
+     attachments or contexts. If the user edited it meanwhile, it is left alone. The menu
+     path never touches the host draft (review finding 8).
+  4. If the send fails, the question is merged into the side chat's composer draft (after
+     anything typed there, as plan follow-ups restore content) and a toast says "Couldn't
+     send to the side chat. Your question is in its composer." A reload while the send is
+     pending leaves the `:btw` text in the host composer, so nothing is lost; at worst the
+     user sees the answered side chat and their unsent `:btw` text, as with an ordinary send
+     interrupted by a reload.
+  5. If `createPanel` fails, the tab closes, the host draft is untouched, and the existing
      **Failed to open chat panel** toast says why.
 
   A bare `:btw` opens an empty side chat with focus in its composer.
@@ -259,6 +272,12 @@ behaviour, not something side chats add.
   close intent for a thread still in `pendingChatPanelThreadKeys` instead of archiving it.
   When `createPanel` settles, a closed side chat sends nothing, keeps the question in the
   host draft (step 2 never ran), and is archived; a failed creation just drops the intent.
+  The intent is also written to the persisted `closedBeforeCreated` list, because the
+  pending reservation is not persisted (`centerPanelStore.ts:872-875`) and a reload would
+  otherwise let adoption reopen the late-created panel (review finding 12). Adoption
+  (`centerPanelAdoption.ts:107`) checks the list first: a live panel thread in it is
+  archived instead of adopted, and its key is removed once the archive succeeds or the
+  thread is gone. This is in the shared path, so plain panels get it too.
 - **Menu.** **Side chat** sits first in the **+** menu, above the provider list, and opens an
   empty side chat of the host on the host's provider and model. When unavailable it is shown
   disabled with its reason, not hidden, so the feature stays discoverable on an older server.
@@ -267,9 +286,12 @@ behaviour, not something side chats add.
   <provider>` for tabs, adoption on other clients, the Inbox row and **Reopen closed chat**,
   in new and older clients alike. No label helper changes. The marker, not the title,
   drives behaviour (availability, seed, checkpoints). The first send from a panel's own
-  composer renames the thread to its first message (`ChatView.tsx:5856-5862`); that rename
-  skips a thread with `sideChat`, so the prefix and the label survive the first send,
-  reopening and adoption (review finding 9). Plain panels keep today's rename.
+  composer renames the thread to its first message (`ChatView.tsx:5856-5862`), in older
+  clients too, and the engine accepts any title (`engine.rs:4692-4693`). So the rule lives
+  in the engine (review findings 9 and 14): `thread.meta.update` on a side chat drops the
+  `title` field and applies the rest, so the command still succeeds and an older client's
+  send flow is not disturbed. No client change is needed for this; plain panels keep
+  today's rename.
 - **Lifecycle.** As any panel: closing interrupts and archives, **Reopen closed chat** lists
   it, deleting the host deletes it. Its runtime mode picker can change `approval-required`
   after the first turn.
@@ -401,9 +423,16 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
   `side_chat_revert_leaves_the_shared_checkout_unchanged` (host edits, an untracked file,
   and a revert to turn 0 requested for the side chat).
 - `provider_runtime.rs` `context_handoff_tests`:
-  `side_chat_seed_read_failure_sends_nothing_then_a_retry_carries_the_seed`.
-- `ChatView` send test: `first_send_in_a_side_chat_keeps_its_title`, and the label after a
-  reopen and an adoption stays `Side chat · <provider>`.
+  `side_chat_seed_read_failure_sends_nothing_then_a_retry_carries_the_seed`,
+  `side_chat_seed_with_an_empty_host_sends_the_framing_and_records_it`.
+- `orchestration/engine.rs`: `side_chat_title_survives_a_meta_update` (the first-message
+  rename an older client sends keeps `Panel — Side chat · <provider>`, and the command's
+  other fields still apply), and `plain_panel_meta_update_still_renames`.
+- `apps/web/src/centerPanelAdoption.test.ts`:
+  `a_panel_closed_before_creation_is_archived_on_adoption_after_reload` (close, reload,
+  then the panel is created late), and the key is dropped after the archive.
+- `apps/web/src/centerPanelStore.test.ts`: `migrates_version_4_to_an_empty_closed_before_created_list`
+  and the list cap.
 - `lifecycle.rs`: the descriptor assertion adds `sideChats`.
 - `mcp/tools/threads.rs` and `panels.rs`: summaries mark side chats.
 - `packages/shared/src/composerTrigger.test.ts`: `:btw`, `:btw <q>`, `:side <q>`, a
@@ -417,7 +446,9 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
 - `apps/web/src/centerPanelActions.test.ts`: `createSideChat` sends `sideChat: true`,
   `approval-required` and the host's model; the host draft keeps the question until
   creation succeeds (a simulated reload during creation keeps it); a create failure leaves
-  the host draft untouched; a send failure leaves the question in the side chat's draft;
+  the host draft untouched; a send failure merges the question into the side chat's draft;
+  `edits_in_the_side_chat_during_a_pending_send_are_kept` (text and an attachment added
+  while `startThreadTurn` waits survive its success);
   closing the tab while creation waits sends nothing, keeps the host draft and archives the
   panel once created (for a plain panel too); the menu path leaves an unsent host draft
   untouched; a host draft edited during creation is not cleared.
@@ -472,3 +503,13 @@ Codex round 2 returned REVISE with five more findings. Each was checked in sourc
 | 8   | Clearing the host draft after creation discards an unsent draft on the menu path and edits made meanwhile. | Yes, as revision 1 specified it.                                                                                                                                                       | Only the `:btw` path clears, and only when the host draft still equals the submitted text with no attachments or contexts. Regression tests for both cases.                |
 | 9   | The first send renames an empty panel to its first message, dropping the prefix and the label.             | Yes. `ChatView.tsx:5856-5862` sends `thread.meta.update` with the first message as title when `isFirstMessage` (`:5579`).                                                              | The rename skips a thread with `sideChat`. Tests cover the title after a first send, a reopen and an adoption.                                                             |
 | 10  | A seed read failure sends the question without context.                                                    | Yes. The helper returns `None` on a read error (`provider_runtime.rs:7605-7608`), and the caller then sends the raw text (`:7415`).                                                    | For a side chat that owes the seed, delivery ends `DefinitelyNotSent` and keeps the existing failed-delivery retry. A test covers the failure, then a retry with the seed. |
+
+Codex round 3 (final) returned four findings. Each was checked in source at `fd98b43306`
+and each is now a requirement with a named test. There is no further review round.
+
+| #   | Finding                                                                                                    | Verified in source                                                                                                                                                 | Requirement and test                                                                                                                                                                                                                   |
+| --- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 11  | Clearing the side chat's draft after the automatic send erases edits and attachments made while it waited. | Yes. `clearComposerDraftContent` clears prompt and attachments together (`composerDraftStore.ts:728`); ordinary sends clear before awaiting (`ChatView.tsx:5830`). | The automatic send never writes or clears the side chat's draft on success; a failure merges the question in. Test `edits_in_the_side_chat_during_a_pending_send_are_kept`.                                                            |
+| 12  | A close intent recorded during creation is lost on reload, and adoption reopens the late-created panel.    | Yes. `partialize` persists only `byThreadKey` and `activityPanes` (`centerPanelStore.ts:872-875`).                                                                 | Persisted, capped `closedBeforeCreated` list (store version 5, migrated from 4); adoption archives a listed panel instead of adopting it. Test `a_panel_closed_before_creation_is_archived_on_adoption_after_reload`.                  |
+| 13  | An empty host makes the compose return `None`, so the question goes raw, unframed and unrecorded.          | Yes. `compose_thread_context_handoff` returns `None` with no lines (`provider_runtime.rs:7550`).                                                                   | The side-chat compose always returns the framing, with "The thread has no messages yet." for an empty host, and records the activity with `messages: 0`. Test `side_chat_seed_with_an_empty_host_sends_the_framing_and_records_it`.    |
+| 14  | An older client's first-message rename, accepted by the engine, drops the side chat prefix.                | Yes. The rename runs on every client's first send (`ChatView.tsx:5856-5862`), and the engine copies any title into the event (`engine.rs:4692-4693`).              | The engine drops `title` from `thread.meta.update` on a side chat and applies the rest; this replaces the client-side skip from finding 9. Tests `side_chat_title_survives_a_meta_update` and `plain_panel_meta_update_still_renames`. |
