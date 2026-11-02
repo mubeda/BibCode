@@ -1102,6 +1102,12 @@ shutdown result, and evidence artifact location in the execution report.
 
 ### Grant-driven remote sharing
 
+The seeded remote-install lane mints its credential only through the **Another
+device** offer. If the share UI never enables **Generate pairing offer** or the
+server never widens, the lane fails with "pairing offer could not be generated"
+and does not fall back to the desktop bootstrap token, which the widening
+restart revokes (it would surface only as a coordinator 401).
+
 When pairing-offer generation, grant reach metadata, desktop exposure, or
 client revocation changes, validate the complete ceremony on every supported
 native desktop: **Another device** widens before minting and shows one pairing
@@ -1830,11 +1836,14 @@ Record fake-host UI/session evidence separately from real installation evidence.
 The seeded `remote-install` lane runs only on disposable native CI runners. It
 checks candidate boot/version, retained storage/project/backup, observed
 percent/stage, requester log count, and Linux mount/runtime ownership. Record
-whether a live native grant actually widened; `widened: false` is not a wide
-live pass. When the private credential receipt is not published, raw remote
-WebDriver logs stay withheld. The retained `remote-credential-trace.log`
-records whether the share control was found, clicked, and widened, plus the
-redacted credential error. A pairing-link failure includes the HTTP status,
+whether a live native grant actually widened. The lane fails fast when the
+share UI cannot generate a pairing offer; the desktop bootstrap token is not a
+fallback, so `widened: false` is never a passing result. When the private
+credential receipt is not published, raw remote WebDriver logs stay withheld.
+The retained `remote-credential-trace.log` records whether the share control was
+found, clicked, and widened, plus the redacted credential error, and the phase
+failure and `seed-and-install.log` repeat its last message (for example
+"Remote verification pairing offer could not be generated"). A pairing-link failure includes the HTTP status,
 attempt count, and whether the bootstrap endpoint changed during the wait. It
 does not include the endpoint or the response body. The wait re-reads the
 desktop bootstrap on each attempt because that cache updates when the restarted
