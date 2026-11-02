@@ -11,6 +11,7 @@ import {
   ClientOrchestrationCommand,
   DispatchResult,
   ModelSelection,
+  OrchestrationCheckpointSummary,
   OrchestrationCommand,
   OrchestrationEvent,
   OrchestrationMessage,
@@ -32,6 +33,7 @@ import {
   ThreadTurnStartCommand,
   ThreadCreatedPayload,
   ThreadTurnDiff,
+  ThreadTurnDiffCompletedPayload,
   ThreadTurnStartRequestedPayload,
   ThreadTurnDeliveryUpdatedPayload,
   TurnDelivery,
@@ -99,6 +101,46 @@ const decodeOlderMessage = Schema.decodeUnknownSync(
     updatedAt: Schema.String,
   }),
 );
+
+const decodeSummary = Schema.decodeUnknownSync(OrchestrationCheckpointSummary);
+const decodeTurnDiffPayload = Schema.decodeUnknownSync(ThreadTurnDiffCompletedPayload);
+// What a client built before the flag existed decodes.
+const { diffAvailable: _flag, ...legacySummaryFields } = OrchestrationCheckpointSummary.fields;
+const decodeLegacySummary = Schema.decodeUnknownSync(Schema.Struct(legacySummaryFields));
+
+describe("checkpoint diff availability", () => {
+  const summary = {
+    turnId: "turn-2",
+    checkpointTurnCount: 2,
+    checkpointRef: "refs/bibcode/checkpoints/dA/turn/2",
+    status: "ready",
+    files: [],
+    assistantMessageId: null,
+    completedAt: "2026-11-01T00:00:00.000Z",
+  };
+
+  it("decodes a summary without the flag, whose diff is then available", () => {
+    const decoded = decodeSummary(summary);
+    expect(decoded).toEqual(summary);
+    expect(decoded.diffAvailable !== false).toBe(true);
+  });
+
+  it("keeps a captured turn without a diff", () => {
+    expect(decodeSummary({ ...summary, diffAvailable: false })).toEqual({
+      ...summary,
+      diffAvailable: false,
+    });
+    const payload = { ...summary, threadId: "thread-1" };
+    expect(decodeTurnDiffPayload({ ...payload, diffAvailable: false }).diffAvailable).toBe(false);
+    expect(Object.hasOwn(decodeTurnDiffPayload(payload), "diffAvailable")).toBe(false);
+  });
+
+  it("lets an older client ignore the flag", () => {
+    const decoded = decodeLegacySummary({ ...summary, diffAvailable: false });
+    expect(decoded).toEqual(summary);
+    expect(Object.hasOwn(decoded, "diffAvailable")).toBe(false);
+  });
+});
 
 describe("delivery failure reasons", () => {
   const delivery = { state: "failed", provider: "codex" };

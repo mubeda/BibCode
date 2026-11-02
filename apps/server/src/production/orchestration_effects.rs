@@ -1190,34 +1190,19 @@ async fn ensure_baseline(
         .filter_map(|turn| turn.checkpoint_turn_count)
         .max()
         .unwrap_or(0);
-    let stale_first_baseline =
-        baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
-    // A latest turn whose capture went stale has no end state: the checkout now may hold the next
-    // turn's edits, so it does not stand in for that turn's checkpoint.
-    // Recorded `error` durably; in memory first, while that record is being written.
-    let latest_went_stale = turns
-        .iter()
-        .filter(|turn| turn.checkpoint_turn_count == Some(turn_count))
-        .any(|turn| {
-            turn.checkpoint_status.as_deref() == Some("error")
-                || turn
-                    .turn_id
-                    .as_deref()
-                    .is_some_and(|turn_id| engine.checkpoint_is_stale(thread_id, turn_id))
-        });
-    if latest_went_stale {
+    // A baseline writes ref 0 only. Ref `n >= 1` is turn `n`'s end state, written only by that
+    // turn's own capture while its hold keeps later turns out. A baseline runs unordered with the
+    // delivery of the turn it is for, so the checkout may already hold that turn's edits: a
+    // numbered ref it wrote could stand in for a turn that was never captured.
+    if turn_count >= 1 {
         return Ok(());
     }
-    let reference = checkpoint_ref(thread_id, turn_count);
+    let stale_first_baseline =
+        baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
+    let reference = checkpoint_ref(thread_id, 0);
     if stale_first_baseline || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
-        capture_checkpoint_with_cancellation(
-            &cwd,
-            Path::new("git"),
-            thread_id,
-            turn_count,
-            cancellation,
-        )
-        .await?;
+        capture_checkpoint_with_cancellation(&cwd, Path::new("git"), thread_id, 0, cancellation)
+            .await?;
     }
     Ok(())
 }
@@ -1260,7 +1245,8 @@ struct TurnCheckpoint<'a> {
     completed_at: &'a str,
 }
 
-/// Releases a turn's checkpoint hold when dropped.
+/// Releases a turn's checkpoint hold when dropped, unless the hold expired: the expiry's task
+/// then releases it after its own record, so no record of the turn lands after the release.
 struct CheckpointHoldRelease<'a> {
     engine: &'a OrchestrationEngine,
     thread_id: &'a str,
@@ -1270,7 +1256,7 @@ struct CheckpointHoldRelease<'a> {
 impl Drop for CheckpointHoldRelease<'_> {
     fn drop(&mut self) {
         self.engine
-            .release_checkpoint_hold(self.thread_id, self.turn_id);
+            .release_checkpoint_hold_unless_stale(self.thread_id, self.turn_id);
     }
 }
 
@@ -1338,7 +1324,7 @@ pub(crate) async fn record_turn_end(
         assistant_message_id: None,
         completed_at,
     };
-    let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new()).await;
+    let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new(), true).await;
     match (&recorded, hold) {
         (Err(_), Some(_)) => engine.release_checkpoint_hold(thread_id, turn_id),
         (Ok(()), Some(id)) => expire_stale_hold(engine, &checkpoint, id),
@@ -1362,9 +1348,10 @@ async fn in_git_checkout(checkout: Option<&Path>) -> bool {
 }
 
 /// Gives up hold `id` of an ended turn once the hold limit passes with its capture still pending:
-/// the turn's checkpoint is marked stale (never recorded `ready`, and the next turn's baseline
-/// does not stand in for it), the stale record is logged and shown, and the thread's turns go.
-/// A hung Git therefore never holds a thread for good.
+/// the turn's checkpoint is marked stale (never recorded `ready`), one attempt records it
+/// `error`, the stale record is logged and shown, and the thread's turns go. A hung Git therefore
+/// never holds a thread for good, and a failing database does not either: a turn left `missing`
+/// is neither a revert target nor a diff baseline, and no baseline writes its ref.
 fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, id: u64) {
     let Some(limit) = engine.checkpoint_hold_limit() else {
         return;
@@ -1390,8 +1377,9 @@ fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, i
             turn_count,
             "a turn's checkpoint was not captured in time; it is recorded stale and the thread's turns go on"
         );
-        // Recorded durably (`error`, which no capture overwrites) before the thread's turns go,
-        // so a restart cannot forget it and let a later checkout stand in for this turn.
+        // Recorded `error` (which no capture overwrites) before the thread's turns go, so the
+        // record lands before any revert. Once: if it fails, the row stays `missing`, which is
+        // just as safe, and the activity below still shows the stale capture.
         let checkpoint = TurnCheckpoint {
             thread_id: &thread_id,
             turn_id: &turn_id,
@@ -1400,9 +1388,9 @@ fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, i
             completed_at: &completed_at,
         };
         if let Err(error) =
-            dispatch_turn_checkpoint(&engine, &checkpoint, "error", Vec::new()).await
+            dispatch_turn_checkpoint(&engine, &checkpoint, "error", Vec::new(), true).await
         {
-            tracing::warn!(%thread_id, turn_count, %error, "a stale turn checkpoint could not be recorded");
+            tracing::warn!(%thread_id, turn_count, %error, "a stale turn checkpoint could not be recorded; it stays missing");
         }
         engine.release_checkpoint_hold(&thread_id, &turn_id);
         let created_at = now_iso();
@@ -1483,7 +1471,8 @@ async fn capture_missing_checkpoint(
 }
 
 /// Captures the checkout as `checkpoint`'s ref, then records the checkpoint `ready` with the
-/// files changed since the turn before it.
+/// files changed since the turn before it, or without a diff when that turn's checkpoint is not
+/// a trusted baseline.
 async fn record_checkpoint(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
@@ -1509,9 +1498,9 @@ async fn record_checkpoint(
     }
     // Always written, replacing whatever ref has this number: only a `missing` row gets here, and
     // a ref already there is a leftover (a reverted turn's ref that Git could not delete), never
-    // this turn's end state. The hold keeps every later turn, and its baseline, behind this
-    // capture. A capture that fails takes such a leftover away, so the next turn's baseline
-    // writes the ref afresh instead of keeping it.
+    // this turn's end state. The hold keeps every later turn behind this capture. A capture that
+    // fails tries to take such a leftover away; one left behind is harmless, because a `missing`
+    // row's ref is never a baseline and no baseline writes a numbered ref.
     if let Err(error) = capture_checkpoint_with_cancellation(
         cwd,
         Path::new("git"),
@@ -1558,35 +1547,49 @@ async fn record_checkpoint(
         );
     }
 
-    // `ready` means the turn's diff can be read. Without the turn before's checkpoint (its
-    // baseline capture failed) it cannot, so the turn stays `missing`; its own ref, kept, is the
-    // next turn's baseline. Nor can it from the ref of a turn given up (`error`): that ref, if
-    // one was left behind, is no turn's end state, and no baseline replaced it.
+    // `ready` means the turn's end state is captured, so it can be reverted to. Its diff also
+    // needs a trusted baseline: ref 0, or the ref of a `ready` turn before it, which only that
+    // turn's own capture wrote while its hold kept every later turn out. The ref of a `missing`
+    // or `error` turn (absent, a leftover, or written from a later checkout) never is one, and
+    // neither is a ref that is gone: the turn is then recorded without a diff.
     let from_ref = checkpoint_ref(thread_id, turn_count.saturating_sub(1));
-    let previous_given_up = turn_count > 1
-        && engine
+    let previous_ready = turn_count <= 1
+        || engine
             .repositories()
             .get_checkpoint(thread_id.to_owned(), turn_count - 1)
             .await?
-            .is_some_and(|previous| previous.status == "error");
-    if previous_given_up || !has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
-        return Err(OrchestrationEffectsError::Effect(format!(
-            "The checkpoint before turn {turn_count} is missing, so this turn's changes cannot be shown."
-        )));
-    }
-    let files =
-        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?;
-    dispatch_turn_checkpoint(engine, checkpoint, "ready", files).await?;
+            .is_some_and(|previous| previous.status == "ready");
+    let diff_available =
+        previous_ready && has_ref(cwd, Path::new("git"), &from_ref, cancellation).await?;
+    let files = if diff_available {
+        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?
+    } else {
+        Vec::new()
+    };
+    dispatch_turn_checkpoint(engine, checkpoint, "ready", files, diff_available).await?;
+    let (tone, payload) = if diff_available {
+        ("info", json!({"turnCount":turn_count,"status":"ready"}))
+    } else {
+        (
+            "warning",
+            json!({
+                "turnCount": turn_count,
+                "status": "ready",
+                "diffAvailable": false,
+                "detail": format!("The checkpoint before turn {turn_count} is missing, so this turn's changes cannot be shown. You can still revert to it."),
+            }),
+        )
+    };
     engine
         .dispatch(OrchestrationCommand::ThreadActivityAppend {
             command_id: server_id("checkpoint-captured-activity"),
             thread_id: thread_id.to_owned(),
             activity: ActivityInput {
                 id: Uuid::new_v4().to_string(),
-                tone: "info".to_owned(),
+                tone: tone.to_owned(),
                 kind: "checkpoint.captured".to_owned(),
                 summary: "Checkpoint captured".to_owned(),
-                payload: json!({"turnCount":turn_count,"status":"ready"}),
+                payload,
                 turn_id: Some(turn_id.to_owned()),
                 sequence: None,
                 created_at: completed_at.to_owned(),
@@ -1603,6 +1606,7 @@ async fn dispatch_turn_checkpoint(
     checkpoint: &TurnCheckpoint<'_>,
     status: &str,
     files: Vec<Value>,
+    diff_available: bool,
 ) -> Result<(), OrchestrationEffectsError> {
     engine
         .dispatch(OrchestrationCommand::ThreadTurnDiffComplete {
@@ -1613,6 +1617,7 @@ async fn dispatch_turn_checkpoint(
             checkpoint_ref: checkpoint_ref(checkpoint.thread_id, checkpoint.turn_count),
             status: status.to_owned(),
             files: Value::Array(files),
+            diff_available,
             assistant_message_id: checkpoint.assistant_message_id.clone(),
             completed_at: checkpoint.completed_at.to_owned(),
             created_at: checkpoint.completed_at.to_owned(),
@@ -1664,6 +1669,13 @@ async fn plan_revert(
             "Interrupt the current turn before reverting checkpoints.".to_owned(),
         ));
     }
+    // Every record of a turn lands before its hold is released, so a record still on its way
+    // (a stale turn's expiry writing it) cannot bring back a row this revert deletes.
+    if engine.turns_held_for_checkpoint(thread_id) {
+        return Err(OrchestrationEffectsError::Effect(
+            checkpoint_record_pending_detail(),
+        ));
+    }
     let cwd = resolve_workspace(engine, callbacks, thread_id)
         .await?
         .ok_or_else(|| {
@@ -1702,8 +1714,9 @@ async fn plan_revert(
                     "Checkpoint ref for turn {turn_count} is unavailable in read model."
                 ))
             })?;
-        // Only a captured checkpoint is the turn's end state. A ref of a turn not captured
-        // (`missing`) or given up (`error`) may hold a later checkout, so it is never restored.
+        // Only a captured checkpoint is the turn's end state, with or without a diff. A ref of a
+        // turn not captured (`missing`) or given up (`error`) may hold a later checkout, so it is
+        // never restored.
         if target.status != "ready" {
             return Err(uncaptured_checkpoint(turn_count));
         }
@@ -1769,6 +1782,20 @@ pub(crate) fn uncaptured_diff_detail(turn_count: i64) -> String {
     format!(
         "Turn {turn_count} has no captured checkpoint (its capture failed or timed out), so its changes cannot be shown."
     )
+}
+
+/// Why a turn captured without a trusted baseline has no one-turn diff. It is still a revert
+/// target. Shared by the app's turn patch and MCP `get_turn_diff`.
+pub(crate) fn no_baseline_diff_detail(turn_count: i64) -> String {
+    format!(
+        "Turn {turn_count} has no diff: the checkpoint before it is missing. You can still revert to it."
+    )
+}
+
+/// Why a revert waits while a turn's checkpoint record is still being written.
+pub(crate) fn checkpoint_record_pending_detail() -> String {
+    "The last turn's checkpoint is still being recorded. Try the revert again in a moment."
+        .to_owned()
 }
 
 fn missing_checkpoint(turn_count: i64) -> OrchestrationEffectsError {

@@ -2786,8 +2786,9 @@ async fn reconcile_abandoned_provider_session(
     });
     if let Some(turn_id) = abandoned_turn_id {
         // The turn the restart cut off keeps its checkpoint number, `missing`: the checkout
-        // after a restart is not where it ended. The next turn's baseline captures its ref, and
-        // a revert across it still rewinds the provider by every turn.
+        // after a restart is not where it ended. No baseline writes its ref (a baseline writes
+        // only ref 0), so the next turn is captured without a diff, and a revert across it still
+        // rewinds the provider by every turn.
         super::orchestration_effects::record_turn_end(
             engine,
             &session.thread_id,
