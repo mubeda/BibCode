@@ -378,7 +378,14 @@ type SavedState = Partial<SourceControlPanelStoreState>;
  * `null` when none of this version is saved, or storage answers later.
  */
 function readSavedState(): SavedState | null {
-  const saved = useSourceControlPanelStore.persist.getOptions().storage?.getItem(STORAGE_NAME);
+  let saved;
+  try {
+    // `persist` is absent when the browser denies storage, and saved JSON may be malformed.
+    saved = useSourceControlPanelStore.persist?.getOptions().storage?.getItem(STORAGE_NAME);
+  } catch (error) {
+    console.warn("Could not read saved Source Control state.", error);
+    return null;
+  }
   if (saved === null || saved === undefined || saved instanceof Promise) return null;
   if (saved.version !== STORAGE_VERSION) return null;
   const state: SavedState | undefined = saved.state;
