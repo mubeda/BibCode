@@ -16,7 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import type { LegendListRef } from "@legendapp/list/react";
 
 let MessagesTimelineComponent: typeof import("./MessagesTimeline").MessagesTimeline | null = null;
-const SLOW_MESSAGES_TIMELINE_IMPORT_TIMEOUT_MS = 60_000;
+// The first test's beforeEach pays for importing the whole timeline graph: about 8 s
+// alone and 42 s beside other suites, so loaded full runs crossed a 60 s bound.
+const SLOW_MESSAGES_TIMELINE_IMPORT_TIMEOUT_MS = 180_000;
 
 const h = vi.hoisted(() => ({
   legendListProps: null as Record<string, unknown> | null,
