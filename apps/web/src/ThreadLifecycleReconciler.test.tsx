@@ -12,6 +12,7 @@ interface TestThread {
 interface TestSnapshot {
   readonly snapshotSequence: number;
   readonly threads: ReadonlyArray<TestThread>;
+  readonly capped?: boolean;
 }
 
 const h = vi.hoisted(() => ({
@@ -34,6 +35,9 @@ const h = vi.hoisted(() => ({
   removeRightThread: vi.fn(),
   emptyDrafts: {},
   archivedOptions: undefined as unknown,
+  // The server's answer to `getThreadShells`: ids it does not know are missing.
+  known: new Set<string>(),
+  lookups: [] as string[][],
 }));
 
 vi.mock("@effect/atom-react", () => ({
@@ -42,6 +46,17 @@ vi.mock("@effect/atom-react", () => ({
 }));
 vi.mock("./state/shell", () => ({
   environmentShell: { stateValueAtom: () => "shell-atom" },
+}));
+vi.mock("./state/offShell", () => ({
+  requestThreadShells: async (environmentId: string, threadIds: ReadonlyArray<string>) => {
+    h.lookups.push([...threadIds]);
+    const { offShellThreads } = await import("@bibcode/client-runtime/state/off-shell-threads");
+    const store = offShellThreads.get(environmentId as never);
+    offShellThreads.applyLookup(environmentId as never, store.generation, {
+      threads: [],
+      missing: threadIds.filter((threadId) => !h.known.has(threadId)) as never,
+    });
+  },
 }));
 vi.mock("./state/terminal", () => ({
   terminalEnvironment: { metadataEvents: () => "terminal-metadata-atom" },
@@ -95,8 +110,12 @@ function render(): void {
   });
 }
 
-function setLive(snapshotSequence: number, threads: ReadonlyArray<TestThread>): void {
-  const snapshot: TestSnapshot = { snapshotSequence, threads };
+function setLive(
+  snapshotSequence: number,
+  threads: ReadonlyArray<TestThread>,
+  capped = false,
+): void {
+  const snapshot: TestSnapshot = { snapshotSequence, threads, ...(capped ? { capped } : {}) };
   h.shell = { status: "live", snapshot: { _tag: "Some", value: snapshot } };
 }
 
@@ -154,6 +173,8 @@ beforeEach(() => {
     delete h.centerByThreadKey[`${environmentId}:${threadId}`];
   });
   h.removeRightThread.mockReset();
+  h.known = new Set();
+  h.lookups = [];
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -243,5 +264,58 @@ describe("ThreadLifecycleReconciler", () => {
     render();
     expect(h.removeCenterThread).not.toHaveBeenCalled();
     expect(h.refresh).not.toHaveBeenCalled();
+  });
+});
+
+describe("ThreadLifecycleReconciler with a capped shell (#223)", () => {
+  /** A capped live shell at sequence 1 whose archived snapshot then settles with `archived`. */
+  async function settleCapped(
+    live: ReadonlyArray<TestThread>,
+    archived: ReadonlyArray<TestThread>,
+  ): Promise<void> {
+    h.serverSequence = 1;
+    setLive(1, live, true);
+    startArchivedRequest();
+    render();
+    await act(async () => {
+      settleArchived(archived);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  it("keeps panel state of a thread left out of a capped snapshot", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:older": { surfaces: [] } };
+    h.known = new Set(["older"]);
+    await settleCapped([thread("a")], []);
+    expect(h.lookups).toEqual([["older"]]);
+    expect(removedThreadIds()).toEqual([]);
+  });
+
+  it("deletes panel state only for ids getThreadShells reports missing", async () => {
+    h.centerByThreadKey = {
+      "primary:a": { surfaces: [] },
+      "primary:older": { surfaces: [] },
+      "primary:gone": { surfaces: [] },
+    };
+    h.known = new Set(["older"]);
+    await settleCapped([thread("a")], []);
+    expect(removedThreadIds()).toEqual(["gone"]);
+  });
+
+  it("keeps an archived workspace's state after a removal item and restores it on unarchive", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:archived": { surfaces: [] } };
+    // Archived: the live shell sent a removal item, which deletes nothing on its own.
+    await settleCapped([thread("a")], [thread("archived")]);
+    expect(h.lookups).toEqual([]);
+    expect(removedThreadIds()).toEqual([]);
+    // Unarchived: back in the live shell with its saved state.
+    advanceLive([thread("a"), thread("archived")]);
+    expect(h.centerByThreadKey["primary:archived"]).toBeDefined();
+  });
+
+  it("drops an archived chat panel's state", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:closed": { surfaces: [] } };
+    await settleCapped([thread("a")], [thread("closed", "panel")]);
+    expect(removedThreadIds()).toEqual(["closed"]);
   });
 });

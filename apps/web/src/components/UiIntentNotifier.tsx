@@ -10,7 +10,7 @@ import { useCenterPanelStore } from "~/centerPanelStore";
 import { useDiffPanelStore } from "~/diffPanelStore";
 import { useRightPanelStore } from "~/rightPanelStore";
 import type { AppRouter } from "~/router";
-import { readThreadShell } from "~/state/entities";
+import { readThreadShell, resolveThreadShell } from "~/state/entities";
 import { useEnvironments } from "~/state/environments";
 import { uiIntentsEnvironment } from "~/state/uiIntents";
 import { buildThreadRouteParams } from "~/threadRoutes";
@@ -57,7 +57,9 @@ export async function showUiIntent(
   intent: UiFocusIntent,
 ): Promise<void> {
   const ref = scopeThreadRef(environmentId, intent.threadId);
-  const shell = readThreadShell(ref);
+  // A capped shell may have left the panel out (#223): resolve it to find its host.
+  const resolved = await resolveThreadShell(ref);
+  const shell = resolved.kind === "resolved" ? resolved.thread : null;
   const host: ScopedThreadRef = shell?.hostThreadId
     ? scopeThreadRef(environmentId, shell.hostThreadId)
     : ref;

@@ -3,7 +3,9 @@ import {
   type EnvironmentId,
   type OrchestrationShellSnapshot,
   type OrchestrationShellStreamItem,
+  type OrchestrationSubscribeShellInput,
   type ServerConfig,
+  type ThreadId,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -28,6 +30,7 @@ import {
 import { subscribeInSession } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import { observeThreadActivity } from "./models.ts";
+import { offShellThreads } from "./offShellThreads.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import type { EnvironmentCatalogState } from "./connections.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -90,6 +93,62 @@ export function resolveEnvironmentAvailabilityStatus(input: {
 }
 
 const SHELL_SYNCHRONIZATION_ERROR_MESSAGE = "Could not synchronize environment data.";
+
+let shellIncludeHints: (environmentId: EnvironmentId) => ReadonlyArray<ThreadId> = () => [];
+
+/**
+ * Names the threads a capped shell must keep for this client (#223): its pinned and unread
+ * threads, the routed thread and the hosts of its open chat panels. Read once per subscription.
+ */
+export function setShellIncludeHints(
+  hints: (environmentId: EnvironmentId) => ReadonlyArray<ThreadId>,
+): void {
+  shellIncludeHints = hints;
+}
+
+/** The subscribe input: the cap with its include set, and the cached shell to resume from. */
+export function shellSubscribeInput(
+  environmentId: EnvironmentId,
+  cached: OrchestrationShellSnapshot | null,
+): OrchestrationSubscribeShellInput {
+  const include = shellIncludeHints(environmentId).slice(0, SHELL_INCLUDE_LIMIT);
+  return {
+    cap: { include },
+    ...(cached?.revision === undefined
+      ? {}
+      : { resume: { revision: cached.revision, snapshotSequence: cached.snapshotSequence } }),
+  };
+}
+
+/** The server keeps at most this many named threads. */
+const SHELL_INCLUDE_LIMIT = 256;
+
+function withShellRevision(
+  snapshot: OrchestrationShellSnapshot,
+  revision: string | undefined,
+): OrchestrationShellSnapshot {
+  if (snapshot.revision === revision) return snapshot;
+  if (revision !== undefined) return { ...snapshot, revision };
+  const { revision: _cleared, ...rest } = snapshot;
+  return rest;
+}
+
+/** Re-ages the threads an `unchanged` answer names, pinned to this client's receipt. */
+function withActivityAges(
+  snapshot: OrchestrationShellSnapshot,
+  ages: Readonly<Record<ThreadId, number>>,
+  receivedAt: number,
+): OrchestrationShellSnapshot {
+  return {
+    ...snapshot,
+    threads: snapshot.threads.map((thread) => {
+      const age = ages[thread.id];
+      return age === undefined
+        ? thread
+        : observeThreadActivity({ ...thread, lastActivityAgeMs: age }, receivedAt);
+    }),
+  };
+}
 
 export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")(function* () {
   const supervisor = yield* EnvironmentSupervisor;
@@ -222,9 +281,26 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       const threads = item.snapshot.threads.map((thread) =>
         observeThreadActivity(thread, receivedAt),
       );
-      nextSnapshot = threads.every((thread, index) => thread === item.snapshot.threads[index])
-        ? item.snapshot
-        : { ...item.snapshot, threads };
+      nextSnapshot = withShellRevision(
+        threads.every((thread, index) => thread === item.snapshot.threads[index])
+          ? item.snapshot
+          : { ...item.snapshot, threads },
+        item.revision,
+      );
+    } else if (item.kind === "unchanged") {
+      // The cached shell is current; only the server can age what it no longer sends.
+      if (Option.isNone(current.snapshot)) {
+        return;
+      }
+      nextSnapshot = withActivityAges(
+        {
+          ...current.snapshot.value,
+          snapshotSequence: item.snapshotSequence,
+          revision: item.revision,
+        },
+        item.activityAges,
+        receivedAt,
+      );
     } else {
       const currentAuthority = yield* Ref.get(authority);
       if (
@@ -245,10 +321,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (nextSnapshot === current.snapshot.value) {
         return;
       }
+      // Only an item that carries a revision vouches for the shell it leaves.
+      nextSnapshot = withShellRevision(nextSnapshot, item.revision);
     }
     if (nextSnapshot === null) {
       return;
     }
+    offShellThreads.onShellItem(environmentId, item);
 
     yield* Ref.set(authority, { session, generation });
     yield* SubscriptionRef.set(state, {
@@ -300,15 +379,21 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (!subscribable || session === null || !maySubscribe) {
         return Stream.empty;
       }
-      return subscribeInSession(
-        session,
-        environmentId,
-        ORCHESTRATION_WS_METHODS.subscribeShell,
-        {},
-        {
-          onExpectedFailure: (cause) =>
-            setStreamError(connection.generation, session, Cause.squash(cause)),
-        },
+      return Stream.unwrap(
+        SubscriptionRef.get(state).pipe(
+          Effect.map((current) =>
+            subscribeInSession(
+              session,
+              environmentId,
+              ORCHESTRATION_WS_METHODS.subscribeShell,
+              shellSubscribeInput(environmentId, Option.getOrNull(current.snapshot)),
+              {
+                onExpectedFailure: (cause) =>
+                  setStreamError(connection.generation, session, Cause.squash(cause)),
+              },
+            ),
+          ),
+        ),
       ).pipe(
         Stream.map((item) => ({
           generation: connection.generation,

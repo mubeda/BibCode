@@ -4,7 +4,9 @@ import type { Thread } from "../types";
 import {
   buildRootGroups,
   buildThreadActionItems,
+  createOlderThreadSearch,
   filterCommandPaletteGroups,
+  OLDER_THREAD_SEARCH_DELAY_MS,
   filterBrowseEntries,
   type CommandPaletteGroup,
 } from "./CommandPalette.logic";
@@ -279,5 +281,71 @@ describe("command palette defensive branches", () => {
       label: "Recent Threads",
     });
     expect(groups[0]?.items.map((item) => item.value)).toEqual(["recent"]);
+  });
+});
+
+describe("older threads in search (#223)", () => {
+  const build = (threads: ReadonlyArray<Thread>) =>
+    buildThreadActionItems({
+      threads,
+      projectTitleById: new Map([[PROJECT_ID, "Project"]]),
+      sortOrder: "updated_at",
+      icon: null,
+      runThread: async () => undefined,
+    });
+
+  it("appends older matches after local ones", () => {
+    const groups = filterCommandPaletteGroups({
+      activeGroups: [],
+      query: "deploy",
+      isInSubmenu: false,
+      projectSearchItems: [],
+      threadSearchItems: build([makeThread({ id: ThreadId.make("loaded"), title: "Deploy now" })]),
+      olderThreadSearchItems: build([
+        makeThread({ id: ThreadId.make("older"), title: "Deploy last spring" }),
+      ]),
+    });
+    expect(groups.map((group) => [group.value, group.label])).toEqual([
+      ["threads-search", "Threads"],
+      ["older-threads-search", "Older threads"],
+    ]);
+  });
+
+  it("finds a left-out thread without a session", () => {
+    const groups = filterCommandPaletteGroups({
+      activeGroups: [],
+      query: "notes",
+      isInSubmenu: false,
+      projectSearchItems: [],
+      threadSearchItems: [],
+      olderThreadSearchItems: build([
+        makeThread({ id: ThreadId.make("silent"), title: "Release notes", session: null }),
+      ]),
+    });
+    expect(groups[0]?.items.map((item) => item.value)).toEqual(["thread:silent"]);
+  });
+
+  it("cancels an older search when the query changes", () => {
+    vi.useFakeTimers();
+    try {
+      const runs: Array<{ query: string; signal: AbortSignal }> = [];
+      const search = createOlderThreadSearch((query, signal) => runs.push({ query, signal }), {
+        set: (callback, delayMs) => setTimeout(callback, delayMs),
+        clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      });
+      search.update("d");
+      search.update("de");
+      vi.advanceTimersByTime(OLDER_THREAD_SEARCH_DELAY_MS - 1);
+      search.update("dep");
+      vi.advanceTimersByTime(OLDER_THREAD_SEARCH_DELAY_MS);
+      expect(runs.map((run) => run.query)).toEqual(["dep"]);
+      search.update("deploy");
+      expect(runs[0]?.signal.aborted).toBe(true);
+      search.update(">actions");
+      vi.advanceTimersByTime(OLDER_THREAD_SEARCH_DELAY_MS);
+      expect(runs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

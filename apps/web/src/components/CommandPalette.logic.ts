@@ -222,6 +222,8 @@ export function filterCommandPaletteGroups(input: {
   isInSubmenu: boolean;
   projectSearchItems: ReadonlyArray<CommandPaletteActionItem>;
   threadSearchItems: ReadonlyArray<CommandPaletteActionItem>;
+  /** Threads a capped shell left out that a server search found (#223), after the rest. */
+  olderThreadSearchItems?: ReadonlyArray<CommandPaletteActionItem>;
 }): CommandPaletteGroup[] {
   const isActionsFilter = input.query.startsWith(">");
   const searchQuery = isActionsFilter ? input.query.slice(1) : input.query;
@@ -255,6 +257,13 @@ export function filterCommandPaletteGroups(input: {
         value: "threads-search",
         label: "Threads",
         items: input.threadSearchItems,
+      });
+    }
+    if ((input.olderThreadSearchItems?.length ?? 0) > 0) {
+      searchableGroups.push({
+        value: "older-threads-search",
+        label: "Older threads",
+        items: input.olderThreadSearchItems ?? [],
       });
     }
   }
@@ -364,4 +373,41 @@ export function getCommandPaletteInputPlaceholder(mode: CommandPaletteMode): str
     case "submenu-browse":
       return "Enter path (e.g. ~/projects/my-app)";
   }
+}
+
+/** How long the palette waits after typing before it searches older threads (#223). */
+export const OLDER_THREAD_SEARCH_DELAY_MS = 250;
+
+/**
+ * Searches the threads a capped shell left out once typing pauses: at least two characters,
+ * never an actions filter, and a newer query aborts the search in flight.
+ */
+export function createOlderThreadSearch(
+  run: (query: string, signal: AbortSignal) => void,
+  timers: {
+    readonly set: (callback: () => void, delayMs: number) => unknown;
+    readonly clear: (handle: unknown) => void;
+  },
+) {
+  let handle: unknown;
+  let controller: AbortController | null = null;
+  const cancel = () => {
+    if (handle !== undefined) timers.clear(handle);
+    handle = undefined;
+    controller?.abort();
+    controller = null;
+  };
+  return {
+    update(query: string): void {
+      cancel();
+      const trimmed = query.trim();
+      if (trimmed.length < 2 || trimmed.startsWith(">")) return;
+      handle = timers.set(() => {
+        handle = undefined;
+        controller = new AbortController();
+        run(trimmed, controller.signal);
+      }, OLDER_THREAD_SEARCH_DELAY_MS);
+    },
+    dispose: cancel,
+  };
 }

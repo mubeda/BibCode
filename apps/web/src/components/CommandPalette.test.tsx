@@ -201,7 +201,15 @@ vi.mock("react/compiler-runtime", () => ({
 }));
 
 vi.mock("@effect/atom-react", () => ({
-  useAtomValue: () => testState.keybindings,
+  useAtomValue: (atom: unknown) => (atom === "capped-shells" ? [] : testState.keybindings),
+}));
+vi.mock("../state/shell", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../state/shell")>()),
+  cappedShellEnvironmentsAtom: "capped-shells",
+}));
+vi.mock("../state/offShell", () => ({
+  useOffShellThreadShells: () => [],
+  loadOlderThreads: async () => "loaded",
 }));
 
 vi.mock("@tanstack/react-router", () => ({

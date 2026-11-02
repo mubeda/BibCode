@@ -39,6 +39,14 @@ vi.mock("@effect/atom-react", () => ({ useAtomValue: harness.useAtomValue }));
 vi.mock("react", async (importOriginal) => ({
   ...(await importOriginal<typeof import("react")>()),
   useMemo: (factory: () => unknown) => factory(),
+  useEffect: () => undefined,
+}));
+vi.mock("./offShell", () => ({
+  useOffShellThread: () => ({ thread: null, missing: false }),
+  isShellCapped: () => false,
+  readOffShellThreadShell: () => null,
+  requestThreadShells: async () => undefined,
+  resolveThreadShellWith: async () => ({ kind: "unknown" }),
 }));
 vi.mock("../rpc/atomRegistry", () => ({
   appAtomRegistry: { get: harness.registryGet, set: harness.registrySet },

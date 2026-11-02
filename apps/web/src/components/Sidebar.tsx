@@ -258,6 +258,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "./ui/sidebar";
+import { SidebarOlderThreads } from "./sidebar/SidebarOlderThreads";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useOpenAddProjectCommandPalette } from "../commandPaletteContext";
 import {
@@ -285,6 +286,7 @@ import {
   resolveWorkspaceDirty,
   shouldShowWorkspaceBranchText,
   summarizeWorkspaceChats,
+  addOlderChatCounts,
   workspaceCheckoutKey,
   type WorkspaceCardStatus,
   type WorkspaceChatSummary,
@@ -1779,6 +1781,20 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
           </SidebarMenuSubButton>
         </SidebarMenuSubItem>
       )}
+      {projectExpanded
+        ? project.memberProjects.map((member) =>
+            (member.olderThreads?.count ?? 0) > 0 ? (
+              <SidebarOlderThreads
+                key={member.physicalProjectKey}
+                environmentId={member.environmentId}
+                projectId={member.id}
+                projectName={project.displayName}
+                count={member.olderThreads?.count ?? 0}
+                onOpenThread={navigateToThread}
+              />
+            ) : null,
+          )
+        : null}
     </SidebarMenuSub>
   );
 });
@@ -2072,7 +2088,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         workspaceStatuses.statusOf,
       ),
     );
-    const chatSummaries = summarizeWorkspaceChats(projectThreads, workspaceStatuses.lastVisitedAt);
+    const chatSummaries = addOlderChatCounts(
+      summarizeWorkspaceChats(projectThreads, workspaceStatuses.lastVisitedAt),
+      project.memberProjects,
+    );
     return {
       chatSummaries,
       orderedProjectThreadKeys: visibleProjectThreads.map((thread) =>
@@ -2082,7 +2101,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       projectStatus,
       visibleProjectThreads,
     };
-  }, [pinnedThreadKeys, projectThreads, threadSortOrder, workspaceStatuses]);
+  }, [
+    pinnedThreadKeys,
+    project.memberProjects,
+    projectThreads,
+    threadSortOrder,
+    workspaceStatuses,
+  ]);
   const pinnedCollapsedThread = useMemo(() => {
     const activeThreadKey = activeRouteThreadKey ?? undefined;
     if (!activeThreadKey || projectExpanded) {
