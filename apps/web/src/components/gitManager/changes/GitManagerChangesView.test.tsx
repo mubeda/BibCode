@@ -1044,6 +1044,48 @@ describe("GitManagerChangesView", () => {
     expect(h.discard).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the recovery notice through the permanent-discard confirmation until dismissed", async () => {
+    h.status = statusWith("src/a.ts");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard
+      .mockResolvedValueOnce(
+        AsyncResult.success({
+          trashed: [],
+          permanentlyDiscarded: [],
+          trashUnavailable: ["src/b.ts"],
+          keptInStaging: [{ path: "src/a.ts", stagedAt: "bibcode-discard/0f3a/a.ts" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        AsyncResult.success({
+          trashed: [],
+          permanentlyDiscarded: ["src/b.ts"],
+          trashUnavailable: [],
+          keptInStaging: [],
+        }),
+      );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+
+    await act(async () => listProps.onContextMenu("src/a.ts", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("The trash couldn't take these files"),
+    );
+    expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts");
+
+    await act(async () => buttonWithText("Discard Permanently").click());
+    await vi.waitFor(() => expect(h.discard).toHaveBeenCalledTimes(2));
+    expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="Dismiss"]')?.click();
+    });
+    expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
+  });
+
   it("reveals a file through the environment-scoped file-manager command", async () => {
     h.status = statusWith("src/menu.ts");
     h.availableEditors = ["file-manager"];

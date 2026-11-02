@@ -2421,7 +2421,16 @@ pub async fn discard_paths(
     }
     let mut outcome = DiscardOutcome::default();
     let mut restore_only = Vec::new();
-    for path in &request.paths {
+    for path in &collapse_requested_paths(&request.paths) {
+        // An entry stranded earlier in this batch is never touched again: its name now belongs
+        // to something else, which a second trash or a permanent discard would remove.
+        if outcome
+            .kept_in_staging
+            .iter()
+            .any(|kept| path_matches(path, &kept.path) || path_matches(&kept.path, path))
+        {
+            continue;
+        }
         let absolute_path = request.cwd.join(path);
         let tracked_path = tracked
             .iter()
@@ -2513,6 +2522,37 @@ pub async fn discard_paths(
         outcome.trash_unavailable.extend(kept);
     }
     Ok(outcome)
+}
+
+/// The requested paths, each once and in order, without the ones a requested folder covers: a
+/// path named twice, or inside a folder that is also named, must not be discarded a second
+/// time, when the first attempt may have left something new at its name.
+fn collapse_requested_paths(paths: &[String]) -> Vec<String> {
+    let normalized: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let parts: Vec<_> = Path::new(path)
+                .components()
+                .filter_map(|part| part.as_os_str().to_str())
+                .collect();
+            if parts.is_empty() {
+                path.clone()
+            } else {
+                parts.join("/")
+            }
+        })
+        .collect();
+    let mut kept: Vec<String> = Vec::new();
+    for path in &normalized {
+        if !kept.contains(path)
+            && !normalized
+                .iter()
+                .any(|other| other != path && path_matches(other, path))
+        {
+            kept.push(path.clone());
+        }
+    }
+    kept
 }
 
 /// Refuses every path whose folder resolves outside the checkout, before anything is trashed or
@@ -4816,6 +4856,90 @@ mod tests {
                 Err(TrashUnavailable)
             })
         }
+    }
+
+    /// Writes a new file where the first staged entry came from and refuses it; every later
+    /// entry is refused untouched.
+    #[cfg(unix)]
+    struct RefusingOnceTrash {
+        recreate: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl FileTrash for RefusingOnceTrash {
+        fn trash<'a>(
+            &'a self,
+            _path: PathBuf,
+            _cancellation: &'a CancellationToken,
+        ) -> FileTrashFuture<'a> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    std::fs::write(&self.recreate, "new\n").expect("a new file appears");
+                }
+                Err(TrashUnavailable)
+            })
+        }
+    }
+
+    /// A path named twice is discarded once: the second attempt would stage the file that took
+    /// the stranded entry's name, and `permitPermanent` would then delete it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_named_twice_never_discards_the_file_that_took_a_stranded_name() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("untracked.txt"), "old\n").expect("untracked file");
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingOnceTrash {
+                recreate: fixture.path().join("untracked.txt"),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["untracked.txt".into(), "untracked.txt".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.permanently_discarded.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.kept_in_staging.len(), 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("untracked.txt")).unwrap(),
+            "new\n",
+            "the file that took the name survives"
+        );
+    }
+
+    /// A path a requested folder covers, and one named twice, are discarded with the folder or
+    /// once; nothing else changes.
+    #[test]
+    fn requested_paths_are_deduplicated_and_collapsed_into_requested_folders() {
+        let collapse = |paths: &[&str]| {
+            collapse_requested_paths(
+                &paths
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(collapse(&["x.txt", "x.txt"]), ["x.txt"]);
+        assert_eq!(collapse(&["dir/a.txt", "dir"]), ["dir"]);
+        assert_eq!(collapse(&["dir", "dir/a.txt", "dir/sub/b.txt"]), ["dir"]);
+        assert_eq!(collapse(&["dir/", "dir/a.txt"]), ["dir"]);
+        assert_eq!(
+            collapse(&["dir2/a.txt", "dir/a.txt", "dir"]),
+            ["dir2/a.txt", "dir"]
+        );
+        assert_eq!(collapse(&["a.txt", "b.txt"]), ["a.txt", "b.txt"]);
     }
 
     /// Git's own metadata is never a discard target, for any caller: `.git` as the first part of
