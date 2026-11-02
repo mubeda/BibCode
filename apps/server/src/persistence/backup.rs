@@ -1879,6 +1879,26 @@ fn inspect_child_directory(
     })
 }
 
+/// The hard-link count of the plain file at `path`, read without following links.
+pub(super) fn file_link_count(path: &Path) -> Result<u64, BackupError> {
+    let file = open_path_without_following(path, PlainPathKind::File).map_err(|source| {
+        BackupError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let metadata = file.metadata().map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(file_snapshot(&file, &metadata)
+        .map_err(|source| BackupError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .links)
+}
+
 /// The volume identity of a directory, after resolving symlinks in its path.
 pub(super) fn directory_volume(path: &Path) -> Result<u64, BackupError> {
     let canonical = fs::canonicalize(path).map_err(|source| BackupError::Io {
