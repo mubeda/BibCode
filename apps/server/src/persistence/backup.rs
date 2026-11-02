@@ -1789,6 +1789,29 @@ fn roll_forward(
         None
     };
 
+    // Before anything moves: each staged file must be in staging (its identity checked above)
+    // or already installed in the store. Otherwise finishing would leave no database.
+    if is_restore {
+        for (name, live, identity) in [
+            (BACKUP_FILE_NAME, &paths.database, journal.staged_database),
+            (
+                MARKER_FILE_NAME,
+                &paths.environment_id,
+                journal.staged_marker,
+            ),
+        ] {
+            let in_staging =
+                staging_boundary.is_some() && path_entry_exists(&staging_directory.join(name))?;
+            let installed = path_entry_exists(live)?
+                && Some(plain_path_snapshot(live, PlainPathKind::File)?.identity) == identity;
+            if !in_staging && !installed {
+                return Err(refused(
+                    "a staged file is missing from both staging and the store",
+                ));
+            }
+        }
+    }
+
     let staged = [journal.staged_database, journal.staged_marker];
     for source in [
         paths.database.clone(),
@@ -1837,20 +1860,6 @@ fn roll_forward(
         sync_directory(&paths.state_dir)?;
         remove_directory(&staging_directory)?;
         fault.inject(RecoveryFault::AfterRemoveStaging)?;
-    } else if is_restore {
-        // A restore whose staging is gone has already installed both files.
-        for (path, identity) in [
-            (&paths.database, journal.staged_database),
-            (&paths.environment_id, journal.staged_marker),
-        ] {
-            if !path_entry_exists(path)?
-                || Some(plain_path_snapshot(path, PlainPathKind::File)?.identity) != identity
-            {
-                return Err(refused(
-                    "a staged file is missing from both staging and the store",
-                ));
-            }
-        }
     }
     let journal_path = paths.recovery_journal();
     fs::remove_file(&journal_path).map_err(|source| BackupError::Io {
@@ -5264,6 +5273,10 @@ mod tests {
             "other-state-kind",
             "extra-staging-entry",
             "staged-identity",
+            "staged-marker-replaced",
+            "staged-database-missing",
+            "staged-marker-missing",
+            "both-staged-missing",
         ] {
             let fixture = restore_fixture().await;
             restore_backup_with_fault(
@@ -5295,11 +5308,24 @@ mod tests {
                 "extra-staging-entry" => {
                     fs::write(staging.join("foreign.txt"), b"foreign").expect("extra entry");
                 }
-                _ => {
-                    let staged = staging.join(BACKUP_FILE_NAME);
+                "staged-identity" | "staged-marker-replaced" => {
+                    let name = if case == "staged-identity" {
+                        BACKUP_FILE_NAME
+                    } else {
+                        MARKER_FILE_NAME
+                    };
+                    let staged = staging.join(name);
                     let bytes = fs::read(&staged).expect("staged bytes");
                     fs::remove_file(&staged).expect("remove staged");
                     fs::write(&staged, bytes).expect("same bytes, new identity");
+                }
+                missing => {
+                    if missing != "staged-marker-missing" {
+                        fs::remove_file(staging.join(BACKUP_FILE_NAME)).expect("remove db");
+                    }
+                    if missing != "staged-database-missing" {
+                        fs::remove_file(staging.join(MARKER_FILE_NAME)).expect("remove marker");
+                    }
                 }
             }
             let state_before = entries(&fixture.paths.state_dir);
