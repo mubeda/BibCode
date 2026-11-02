@@ -3191,7 +3191,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63]
+            [59, 60, 61, 62, 63, 64]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3221,7 +3221,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63]
+            [61, 62, 63, 64]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3260,7 +3260,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63]
+            [62, 63, 64]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3315,7 +3315,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63]
+            [60, 61, 62, 63, 64]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -4126,7 +4126,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=63).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=64).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4152,6 +4152,7 @@ mod tests {
         assert_eq!(MIGRATIONS[54].name, "ProjectionThreadReasoning");
         assert_eq!(MIGRATIONS[55].name, "ThreadCompactions");
         assert_eq!(MIGRATIONS[62].name, "ProjectionTurnCheckpointDiffAvailable");
+        assert_eq!(MIGRATIONS[63].name, "ThreadHistoryWindow");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -4344,7 +4345,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 47);
+        assert_eq!(second.len(), 48);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4464,7 +4465,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63
+                61, 62, 63, 64
             ]
         );
         let policy = connection.query_row(
@@ -4504,7 +4505,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63
+                62, 63, 64
             ]
         );
         let pin = connection.query_row(
@@ -4535,7 +4536,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63
+                63, 64
             ]
         );
         let pin = connection.query_row(
@@ -4677,7 +4678,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
             ]
         );
         assert_eq!(
@@ -4707,7 +4708,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 30);
+        assert_eq!(applied.len(), 31);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
