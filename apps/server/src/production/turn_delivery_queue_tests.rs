@@ -919,6 +919,8 @@ fn revert_checkout() -> tempfile::TempDir {
         &["config", "user.email", "bibcode@example.test"],
         // The checkpoint commands are production Git, which keeps its inherited settings.
         &["config", "commit.gpgSign", "false"],
+        // Git for Windows installs `core.autocrlf=true`, which rewrites the checkpointed files.
+        &["config", "core.autocrlf", "false"],
     ] {
         git(&config, cwd, args);
     }

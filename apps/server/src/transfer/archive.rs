@@ -268,7 +268,7 @@ mod tests {
     /// `.github` folder is (#139 X5 review round 6).
     #[tokio::test]
     async fn a_folder_download_leaves_out_gits_own_metadata() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = temp.path().join("folder");
         std::fs::create_dir_all(root.join("lib/.git/hooks")).unwrap();
         std::fs::write(root.join("lib/.git/config"), b"[core]\n").unwrap();
@@ -298,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn plans_and_streams_a_zip_skipping_symlinks() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = temp.path().join("folder");
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("a.txt"), b"hello").unwrap();
@@ -340,8 +340,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_folder_swapped_for_an_outside_symlink_while_it_zips_is_never_followed() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
+        let outside = crate::test_support::canonical_tempdir();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::create_dir_all(root.join("folder/sub")).unwrap();
         std::fs::write(root.join("folder/sub/mine.txt"), b"mine").unwrap();
@@ -375,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_read_failure_rejects_the_body_instead_of_completing_a_partial_zip() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = temp.path().join("folder");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("file.txt"), b"content").unwrap();
@@ -393,8 +393,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_plan_sizes_the_held_folder_never_a_swapped_link() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
+        let outside = crate::test_support::canonical_tempdir();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::create_dir_all(root.join("folder/sub")).unwrap();
         std::fs::write(root.join("folder/sub/mine.txt"), b"mine").unwrap();
@@ -418,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_folder_that_outgrows_its_limits_after_planning_fails_the_stream() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::write(root.join("a.txt"), b"1234").unwrap();
         let limits = ArchiveLimits {
@@ -457,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_rejects_oversized_trees() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         std::fs::write(temp.path().join("big"), vec![0u8; 16]).unwrap();
         let error = plan_archive_with_limits(temp.path(), 10, 8)
             .await

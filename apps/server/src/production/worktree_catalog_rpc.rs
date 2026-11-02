@@ -3966,6 +3966,8 @@ mod mutation_invalidation_tests {
             let main = root.path().join("main");
             std::fs::create_dir(&main).expect("primary directory");
             git(&main, &["init", "--initial-branch=main"]);
+            // Git for Windows installs `core.autocrlf=true`, which makes `README.md` read dirty.
+            git(&main, &["config", "core.autocrlf", "false"]);
             git(&main, &["config", "user.email", "rpc@example.invalid"]);
             git(&main, &["config", "user.name", "RPC Test"]);
             std::fs::write(main.join("README.md"), "fixture\n").expect("fixture file");

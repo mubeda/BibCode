@@ -384,7 +384,28 @@ configuration. Test fixtures that assert on checked-out file bytes pin
 `core.autocrlf=false` on the repository they create right after `git init`;
 a `"base\r\n"` versus `"base\n"` assertion failure means a fixture is missing
 that pin, not that the product rewrote line endings. Do not change the host
-Git configuration to make a suite pass.
+Git configuration to make a suite pass. A fixture whose repository production
+Git reads (a revert, a checkpoint, a worktree removal) pins `core.autocrlf=false`
+in the repository's own configuration, because the test's `IsolatedGitConfig`
+reaches only the commands the fixture runs itself.
+
+`bibcode-server` library tests run on a Windows development machine, and these
+Windows behaviors decide how a fixture is written:
+
+- `canonicalize()` returns a `\\?\C:\...` path. Git reads that as a host name
+  and refuses it ("hostname contains invalid characters"), so a path handed to
+  Git comes from `without_verbatim_prefix` (the MCP tool tests use
+  `mcp_tools_tests::canonical`). Code whose contract is a canonical root (the
+  workspace, upload and archive handles) is tested with
+  `test_support::canonical_tempdir()`, not `tempfile::tempdir()`.
+- The default terminal shell is PowerShell, not `cmd.exe`. Windows PowerShell
+  5.1 rejects `a & b`; use `a; b` in a command typed into a terminal.
+- A connection to a closed loopback port is refused after about two seconds,
+  as long as the MCP endpoint owner probe's timeout. A test that needs a fast
+  refusal is Unix only.
+- The MCP tools that change files are refused on Windows
+  (`changes_files_here`), so the tests that drive them are `cfg(unix)`; the
+  refusal is covered in `mcp::tools::files`.
 
 Run the desktop E2E support contract and the launcher contracts natively on
 Windows:
