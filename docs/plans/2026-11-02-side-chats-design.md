@@ -1,6 +1,6 @@
 # Side Chats
 
-Status: Proposed 2026-11-02, awaiting Mauro's approval (revision 1, after the Codex round 1
+Status: Proposed 2026-11-02, awaiting Mauro's approval (revision 2, after the Codex round 2
 review). Issue #265. Verified at `fd98b43306`
 (`origin/main`). Line references are to that commit. No product code is
 written until this design is approved.
@@ -175,21 +175,38 @@ the payload. Host checks, the project lock and the dispatch gate are unchanged.
 - The block holds message text only, not tool output, diffs or attachments. The agent can
   read the checkout itself. There is no pointer to `read_thread`, because the provider
   credential cannot call it.
-- If the host's messages cannot be read, the turn is sent without the seed and a
-  `tracing::warn!` names only the thread ids, as the lost-session path does today. Once that
-  turn is delivered the side chat has its own history, so it continues without the host's
-  context. Failing the turn instead would block the question on a rare read error.
+- If the host's messages cannot be read while the seed is owed, nothing is sent (review
+  finding 10). The delivery ends `DefinitelyNotSent` with "Couldn't read the thread's
+  messages for the side chat. Retry to send.", the same outcome a persistence error gets on
+  the steer path (`provider_runtime.rs:7397`), so the message keeps the existing failed
+  delivery state and retry. A `tracing::warn!` names only the thread ids. A retry after the
+  read recovers carries the seed. A normal thread's lost-session handoff keeps today's
+  behaviour (send without the handoff, keep it owed).
 - A side-chat turn's per-thread read of its own messages runs only for side chats.
 
 ### Server: checkpoints
 
-**Side chats capture no checkpoints (P0, moved up from P1).** The turn-start baseline and the
-turn-end capture skip a side chat the way they skip a turn outside a Git checkout, so its
-turns are not numbered and offer no revert. A side chat revert would restore the shared
-checkout and silently drop host edits made since, which breaks "host untouched". The check is
-one predicate at the capture entry. The Source Control panel and branch diff still show the
-checkout's changes. This touches the same functions as #247, so it lands after #247 and is
-rebased on it.
+**Side chats capture no checkpoints and cannot revert (P0, moved up from P1).**
+
+- The turn-start baseline and the turn-end capture skip a side chat the way they skip a turn
+  outside a Git checkout, so its turns are not numbered. The Source Control panel and branch
+  diff still show the checkout's changes.
+- Skipping capture alone does not stop a revert (review finding 6). The engine accepts
+  `thread.checkpoint.revert` for any thread (`engine.rs:5134`), and a revert to turn 0 with
+  no checkpoint ref falls back to `HEAD` (`orchestration_effects.rs:1694`, `:2171-2193`),
+  then runs `git restore` and `git clean -fd` (`:2212`, `:2228`), which would erase the
+  host's uncommitted work. So the engine refuses `thread.checkpoint.revert` for a side chat
+  with "Side chats can't restore files. Restore from the main thread." This also covers MCP
+  callers. The client hides the restore action in a side chat.
+- This touches the same capture functions as #247, so it lands after #247 and is rebased
+  on it.
+
+**What P0 guarantees for the shared checkout:** a side chat never writes checkpoint refs and
+never restores or cleans files. Its own file edits happen only through the provider, and
+start behind `approval-required`. A host revert while a side chat is working behaves as a
+host revert does today while any chat panel works in the same checkout: it can overwrite the
+side chat's in-flight edits, and nothing coordinates the two. That is the existing panel
+behaviour, not something side chats add.
 
 ### Client
 
@@ -220,7 +237,11 @@ rebased on it.
      the text is still in the host composer, and a side chat the server did create is
      adopted as an empty tab.
   2. When `createPanel` succeeds, the question is written to the side chat's persisted
-     composer draft, then the host draft text is cleared.
+     composer draft. Then, on the `:btw` path only, the host draft is cleared only if its
+     text still equals the submitted `:btw` text (the `expectedText` check that
+     `applyPromptReplacement` already uses, `ChatComposer.tsx:1878-1880`) and it has no
+     attachments or contexts. If the user edited it during creation, it is left alone. The
+     menu path never touches the host draft (review finding 8).
   3. The client sends it with `startThreadTurn`; on success the side chat's draft is cleared
      as any send clears it. If the send fails, the question stays in the side chat's
      composer and a toast says "Couldn't send to the side chat. Your question is in its
@@ -245,7 +266,10 @@ rebased on it.
   `panelProviderLabel(title)` (`centerPanelAdoption.ts:35`) already yields `Side chat ·
   <provider>` for tabs, adoption on other clients, the Inbox row and **Reopen closed chat**,
   in new and older clients alike. No label helper changes. The marker, not the title,
-  drives behaviour (availability, seed, checkpoints).
+  drives behaviour (availability, seed, checkpoints). The first send from a panel's own
+  composer renames the thread to its first message (`ChatView.tsx:5856-5862`); that rename
+  skips a thread with `sideChat`, so the prefix and the label survive the first send,
+  reopening and adoption (review finding 9). Plain panels keep today's rename.
 - **Lifecycle.** As any panel: closing interrupts and archives, **Reopen closed chat** lists
   it, deleting the host deletes it. Its runtime mode picker can change `approval-required`
   after the first turn.
@@ -290,7 +314,8 @@ thread, as it does today.
 | Two `:btw` in quick succession               | A second Enter on the same `:btw` is refused while the first creation is pending; a new `:btw` after it opens a second side chat.                                                               |
 | Provider switch inside the side chat         | The UI locks a panel's provider. A model change or lost session after the first turn hands off the side chat's own messages only; the host block is not resent (non-goal).                      |
 | Host's provider later switches               | No effect on existing side chats, which keep their own instance.                                                                                                                                |
-| Host reverts files while a side chat works   | Allowed in P0, as for any panel today. P1 adds the guard.                                                                                                                                       |
+| Revert requested for a side chat             | Refused by the engine; the checkout is unchanged.                                                                                                                                               |
+| Host reverts files while a side chat works   | As today for any panel in the same checkout: allowed, uncoordinated. Deferred to a separate issue (see Phasing).                                                                                |
 
 ## Seed budget
 
@@ -305,7 +330,7 @@ first-turn latency in the e2e run before changing it.
 
 **P0** (issue items 1 to 8, plus the checkpoint skip): marker, migration, capability,
 `createPanel` field, seed on first delivery, composer and menu entry points, labels,
-`approval-required`, availability reasons, no checkpoints for side chats.
+`approval-required`, availability reasons, no checkpoints and no revert for side chats.
 
 **P1**, each a separate slice on top of P0 with no further persisted shape:
 
@@ -316,11 +341,16 @@ first-turn latency in the e2e run before changing it.
   host composer as a draft. Never sent automatically. Disabled while the host runs, with
   "Available when the thread is idle." The summary is composed on the client from the side
   chat's messages; no new RPC.
-- **Host file restore guard.** `plan_revert` also refuses while any other live panel in the
-  same worktree holds a turn, and the client warns before a restore when a sibling panel
-  changed files since the target checkpoint. This covers every panel, not only side chats.
-  A conversation-only rewind does not exist today (only the provider-driven files-only
-  outcome, `orchestration_effects.rs:1800-1835`), so it is a separate design if wanted.
+- **Host file restore guard: deferred out of #265 to its own issue** (review finding 7). A
+  check in `plan_revert` races: a revert reserves only its own thread's turns
+  (`orchestration_effects.rs:934`), so a sibling can start a turn between the check and the
+  restore. A correct guard needs admission coordinated across every thread sharing a
+  checkout, held from planning through restore completion. That is a change to turn
+  admission for all panels, the same family as #129, and it is disproportionate for a side
+  chat feature. The new issue should cover all panels, the coordination design, and the
+  conversation-only rewind, which does not exist today (only the provider-driven files-only
+  outcome, `orchestration_effects.rs:1800-1835`). P0 still guarantees what the checkpoints
+  section states.
 
 **P2**: native fork for an idle host (Claude Code `--fork-session` from the thread's own
 resume cursor; Codex only if its CLI offers a fork, unverified), open as a split, ask about
@@ -337,7 +367,7 @@ provider MCP tool that reads the host for live state.
 | 4   | Native fork in v1                | No. Portable seed for every provider.                                                                                           | Fork first: full context, but Claude Code only and idle host only.                                                  |
 | 5   | Seed budget                      | 40 messages, 24,000 chars; measure with the activity counts.                                                                    | 8,000 chars: cheaper, loses context. Byte window (#226): later.                                                     |
 | 6   | First-turn runtime mode          | Create the side chat in `approval-required`; the picker can change it.                                                          | Inherit the host's mode: fewer prompts, but a question could edit the host's checkout unasked.                      |
-| 7   | Checkpoints and host rewind      | No side chat checkpoints in P0; host restore guard for every sibling panel in P1.                                               | Capture like panels: side chat can revert its own edits, but that revert also drops host edits.                     |
+| 7   | Checkpoints and host rewind      | P0: no side chat checkpoints and no side chat revert. The host restore guard moves to its own issue for all panels.             | Capture like panels: side chat can revert its own edits, but that revert also drops host edits.                     |
 | 8   | Bring back in v1                 | P1, as a host-composer draft, never sent, idle host only.                                                                       | Auto-send: faster, but writes into the host without review.                                                         |
 | 9   | Close an unused side chat        | P1: delete through engine-checked `onlyIfUnused`; a used one archives.                                                          | Always archive: simpler, but **Reopen closed chat** fills with empty entries.                                       |
 | 10  | Inbox, Agents and MCP visibility | Panel behaviour: left panel hides it, Inbox opens the host with the tab, MCP lists it with `hostThreadId` and `sideChat: true`. | Hide from MCP (as the reference does): less noise for agents, but breaks the panel rule that agents see all panels. |
@@ -367,6 +397,13 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
   `create_panel_replays_a_receipt_stored_before_side_chats` (an old-format digest still
   replays).
 - `production/orchestration_effects.rs`: `side_chat_turns_capture_no_checkpoints`.
+- `orchestration/engine.rs`: `side_chat_checkpoint_revert_is_refused`, plus an effects test
+  `side_chat_revert_leaves_the_shared_checkout_unchanged` (host edits, an untracked file,
+  and a revert to turn 0 requested for the side chat).
+- `provider_runtime.rs` `context_handoff_tests`:
+  `side_chat_seed_read_failure_sends_nothing_then_a_retry_carries_the_seed`.
+- `ChatView` send test: `first_send_in_a_side_chat_keeps_its_title`, and the label after a
+  reopen and an adoption stays `Side chat · <provider>`.
 - `lifecycle.rs`: the descriptor assertion adds `sideChats`.
 - `mcp/tools/threads.rs` and `panels.rs`: summaries mark side chats.
 - `packages/shared/src/composerTrigger.test.ts`: `:btw`, `:btw <q>`, `:side <q>`, a
@@ -382,7 +419,8 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
   creation succeeds (a simulated reload during creation keeps it); a create failure leaves
   the host draft untouched; a send failure leaves the question in the side chat's draft;
   closing the tab while creation waits sends nothing, keeps the host draft and archives the
-  panel once created (for a plain panel too).
+  panel once created (for a plain panel too); the menu path leaves an unsent host draft
+  untouched; a host draft edited during creation is not cleared.
 - `apps/web/src/centerPanelStore.test.ts`: open, close and reopen a side chat with the
   unchanged surface shape.
 - `ChatHeaderPanelMenu` test: **Side chat** enabled, and disabled with each reason.
@@ -408,8 +446,8 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
 
 - Whether any provider ships a `/btw` command today.
 - Whether the Codex CLI can fork a session (P2 only).
-- The exact first-turn latency and token cost of a 24,000-char seed; the debug counts and
-  the e2e run measure it.
+- The exact first-turn latency and token cost of a 24,000-char seed; the activity counts
+  and the e2e run measure it.
 
 ## Review findings and resolutions
 
@@ -423,3 +461,14 @@ Codex round 1 returned REVISE with five findings. Each was checked in source at
 | 3   | Closing a reserved tab archives a thread that does not exist yet, and creation then finishes and sends.                      | Yes. `cleanupRemoved` archives at once (`centerPanelActions.ts:183-207`, `:298-311`), and `thread.archive` requires the thread (`engine.rs:4625`). Plain panels have this today. | A close intent is kept for a pending panel; when creation settles nothing is sent and the panel is archived. Fixed in the shared path.                     |
 | 4   | `#[serde(default)] side_chat: bool` serializes `false` and changes the digest of every plain panel request.                  | Yes. The digest hashes the serialized input (`delivery.rs:115-120`), and a mismatch is `CommandConflict` (`worktree_catalog_rpc.rs:1178`).                                       | `skip_serializing_if = "std::ops::Not::not"`; a test replays a receipt stored before the change.                                                           |
 | 5   | Older clients label adopted panels only from the `Panel — ` title prefix, so `Side chat — …` renders "Chat".                 | Yes. `panelProviderLabel` (`centerPanelAdoption.ts:32-37`), and the tab falls back to "Chat" (`CenterPanelTabs.tsx:78`).                                                         | Title `Panel — Side chat · <provider>`, which every client labels `Side chat · <provider>`; no label helper change.                                        |
+
+Codex round 2 returned REVISE with five more findings. Each was checked in source at
+`fd98b43306`. Four are fixed; one is deferred out of this issue with what P0 then guarantees.
+
+| #   | Finding                                                                                                    | Verified in source                                                                                                                                                                     | Resolution                                                                                                                                                                 |
+| --- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 6   | No capture does not stop a side chat revert, which falls back to `HEAD` and cleans the shared checkout.    | Yes. The engine accepts the revert (`engine.rs:5134`); turn 0 falls back to `HEAD` (`orchestration_effects.rs:1694`, `:2171-2193`), then `restore` and `clean -fd` (`:2212`, `:2228`). | The engine refuses `thread.checkpoint.revert` for a side chat. Tests check the refusal and that the shared checkout is unchanged.                                          |
+| 7   | A sibling-busy check in `plan_revert` races with a sibling starting a turn.                                | Yes. A revert reserves only its own thread (`orchestration_effects.rs:934`).                                                                                                           | Deferred: the host restore guard leaves #265 for its own issue covering all panels. P0 guarantees a side chat never restores or cleans files.                              |
+| 8   | Clearing the host draft after creation discards an unsent draft on the menu path and edits made meanwhile. | Yes, as revision 1 specified it.                                                                                                                                                       | Only the `:btw` path clears, and only when the host draft still equals the submitted text with no attachments or contexts. Regression tests for both cases.                |
+| 9   | The first send renames an empty panel to its first message, dropping the prefix and the label.             | Yes. `ChatView.tsx:5856-5862` sends `thread.meta.update` with the first message as title when `isFirstMessage` (`:5579`).                                                              | The rename skips a thread with `sideChat`. Tests cover the title after a first send, a reopen and an adoption.                                                             |
+| 10  | A seed read failure sends the question without context.                                                    | Yes. The helper returns `None` on a read error (`provider_runtime.rs:7605-7608`), and the caller then sends the raw text (`:7415`).                                                    | For a side chat that owes the seed, delivery ends `DefinitelyNotSent` and keeps the existing failed-delivery retry. A test covers the failure, then a retry with the seed. |
