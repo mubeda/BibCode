@@ -79,9 +79,11 @@ struct Fixture {
     /// A folder outside it.
     #[cfg_attr(not(unix), allow(dead_code))]
     outside: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     trash: Arc<TestTrash>,
     access: TransferAccess,
     /// The workspace RPC the Files panel calls, sharing the tools' service and locks.
+    #[cfg_attr(not(unix), allow(dead_code))]
     workspace: WorkspaceRpc,
     _folders: [tempfile::TempDir; 4],
 }
@@ -93,8 +95,8 @@ async fn fixture() -> Fixture {
         tempfile::tempdir().expect("trash"),
         tempfile::tempdir().expect("state"),
     ];
-    let folder = folders[0].path().canonicalize().unwrap();
-    let outside = folders[1].path().canonicalize().unwrap();
+    let folder = super::canonical(folders[0].path());
+    let outside = super::canonical(folders[1].path());
     let trash = Arc::new(TestTrash {
         folder: folders[2].path().to_path_buf(),
         available: AtomicBool::new(true),
@@ -163,6 +165,7 @@ fn token_of(url: &Value) -> String {
     url.as_str().unwrap().rsplit('/').next().unwrap().to_owned()
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn status<T>(result: Result<T, HttpRouteError>) -> u16 {
     match result {
         Ok(_) => 200,
@@ -182,6 +185,7 @@ impl Fixture {
         std::fs::write(path, contents).unwrap();
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn read(&self, path: &str) -> Option<String> {
         std::fs::read_to_string(self.folder.join(path)).ok()
     }
@@ -195,6 +199,7 @@ impl Fixture {
         token_of(&structured(&minted)["url"])
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     async fn upload_url(&self, file_name: &str, overwrite: bool) -> String {
         let minted = self
             .call(
@@ -212,6 +217,7 @@ impl Fixture {
         )
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn uploads(&self) -> crate::production::http_routes::TransferUploadHandler {
         transfer_routes::upload_handler_with_mcp(
             self.access.clone(),
@@ -234,6 +240,7 @@ impl Fixture {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     async fn upload(&self, token: &str, overwrite_query: bool, bytes: &'static [u8]) -> u16 {
         match (self.uploads())(
             token.to_owned(),
@@ -384,6 +391,9 @@ async fn reads_come_in_pages_with_the_version_and_refuse_large_and_binary_files(
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_write_needs_the_version_it_read_or_create_only() {
     let fixture = fixture().await;
@@ -460,6 +470,9 @@ async fn a_write_needs_the_version_it_read_or_create_only() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn create_rename_list_and_search_work_in_the_threads_folder() {
     let fixture = fixture().await;
@@ -649,6 +662,9 @@ async fn no_files_tool_reads_or_changes_gits_own_metadata() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_delete_goes_to_the_trash_unless_permanent_and_never_falls_back() {
     let fixture = fixture().await;
@@ -833,6 +849,9 @@ async fn a_symlink_out_of_the_threads_folder_is_refused_by_every_tool() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn transfer_urls_use_the_bound_address_and_an_upload_binds_overwrite() {
     let fixture = fixture().await;
@@ -882,6 +901,9 @@ async fn transfer_urls_use_the_bound_address_and_an_upload_binds_overwrite() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_agents_url_ends_with_its_access_and_a_ui_url_does_not() {
     let fixture = fixture().await;
@@ -950,6 +972,9 @@ async fn an_agents_url_ends_with_its_access_and_a_ui_url_does_not() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn revoking_during_an_upload_leaves_neither_the_target_nor_a_partial() {
     let fixture = fixture().await;
@@ -1024,6 +1049,9 @@ async fn a_download_stream_stops_on_revocation_and_records_its_activity() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_upload_records_its_mint_and_its_finish_with_one_transfer_id() {
     let fixture = fixture().await;
@@ -1174,6 +1202,9 @@ async fn an_agent_may_not_write_a_hard_linked_file_and_a_person_may() {
     fixture.shutdown().await;
 }
 
+// Unix only: the tools that change files are refused where operations are not handle-bound
+// (`changes_files_here`); that refusal is tested in `mcp::tools::files`.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_upload_holds_its_file_against_the_panel_and_the_agent_until_it_installs() {
     let fixture = fixture().await;

@@ -927,6 +927,9 @@ mod imp {
                 }
             }
         }
+        // A folder that is not there is `NotFound`, as `openat` reports it; `recheck` would call
+        // it a folder swapped under the walk.
+        std::fs::symlink_metadata(&path)?;
         let dir = Dir {
             path: folder.to_path_buf(),
             root: root.clone(),

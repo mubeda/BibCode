@@ -264,6 +264,13 @@ impl Harness {
     }
 }
 
+/// `folder`'s canonical path as Git can read it. On Windows `canonicalize` spells a path
+/// `\\?\C:\...`, which Git reads as a host name and refuses ("hostname contains invalid
+/// characters"), so the prefix is dropped there; elsewhere the path is unchanged.
+pub(super) fn canonical(folder: &std::path::Path) -> std::path::PathBuf {
+    crate::git::without_verbatim_prefix(folder.canonicalize().expect("canonical folder"))
+}
+
 pub(super) fn command(value: Value) -> crate::orchestration::engine::OrchestrationCommand {
     serde_json::from_value(value).expect("command decodes")
 }

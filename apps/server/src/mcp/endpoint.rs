@@ -482,6 +482,10 @@ mod tests {
 
     /// A live pid whose recorded listener is gone, such as a pid the system gave to another
     /// program, does not pin the record.
+    // Unix only: Windows answers a connection to a closed loopback port after about two
+    // seconds, as long as `OWNER_PROBE_TIMEOUT`, so there the probe times out instead of
+    // being refused and the record is kept as a slow owner's.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_live_pid_without_its_listener_loses_the_record() {
         let dir = tempfile::tempdir().unwrap();

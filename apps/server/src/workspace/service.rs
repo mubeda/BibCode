@@ -216,10 +216,16 @@ impl Place {
 
     /// The target opened for reading, refused unless it is a regular file.
     fn open_regular(&self) -> Result<std::fs::File, WorkspaceError> {
-        let file = self
-            .folder(false)?
-            .open_file(&self.name, Open::Read)
-            .map_err(|error| self.fault("open", error))?;
+        let file = match self.folder(false)?.open_file(&self.name, Open::Read) {
+            Ok(file) => file,
+            // Windows cannot open a folder as a file; Unix can, and the check below refuses it.
+            Err(_) if matches!(self.kind(), Ok(Kind::Directory)) => {
+                return Err(WorkspaceError::NotFile {
+                    path: self.target.clone(),
+                });
+            }
+            Err(error) => return Err(self.fault("open", error)),
+        };
         let metadata = file.metadata().map_err(|error| self.fault("stat", error))?;
         if !metadata.is_file() {
             return Err(WorkspaceError::NotFile {

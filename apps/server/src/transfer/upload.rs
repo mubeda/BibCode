@@ -457,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_upload_leaves_neither_the_target_nor_a_partial() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let token = CancellationToken::new();
         // Cancelled while the body is still streaming.
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -524,7 +524,7 @@ mod tests {
         meanwhile: impl FnOnce(&Path),
         cancel: bool,
     ) -> (tempfile::TempDir, Result<PathBuf, TransferError>) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let token = CancellationToken::new();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         sender.send(Ok(Bytes::from_static(b"agent"))).unwrap();
@@ -595,8 +595,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_upload_folder_swapped_for_an_outside_symlink_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
+        let outside = crate::test_support::canonical_tempdir();
         // The route checked `root/sub`; it became a symlink before the upload opened it.
         std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
         let result = write_upload(
@@ -766,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_atomically_refuses_collisions_and_overwrites_on_request() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let written = write_upload_in(temp.path(), "a.txt", false, 1024, body(&[b"hel", b"lo"]))
             .await
             .unwrap();
@@ -795,7 +795,7 @@ mod tests {
     async fn writes_a_name_longer_than_the_partial_stem_budget() {
         // 200 bytes is past what a partial name can echo but well inside a path component, so
         // the upload must land: the budget shortens the partial, never the file.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let long = format!("{}.txt", "x".repeat(196));
         assert_eq!(long.len(), 200);
         assert!(long.len() > max_transfer_stem_bytes(UPLOAD_PARTIAL_SUFFIX));
@@ -816,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforces_the_byte_limit_and_removes_partials_and_the_reservation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         // Two chunks: the first is written to the partial before the second blows the limit,
         // so this proves already-written bytes are cleaned up, not just an empty partial.
         let error = write_upload_in(temp.path(), "big.bin", false, 4, body(&[b"1234", b"5"]))
@@ -828,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn removes_the_partial_and_the_reservation_when_the_body_stream_fails() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let body = stream::iter(vec![
             Ok(Bytes::from_static(b"12")),
             Err(axum::Error::new(std::io::Error::other("boom"))),
@@ -848,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_overwrite_that_fails_leaves_the_existing_file_intact() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         std::fs::write(temp.path().join("a.txt"), b"original").unwrap();
         let body = stream::iter(vec![
             Ok(Bytes::from_static(b"12")),
@@ -868,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserves_the_name_so_a_concurrent_upload_of_the_same_name_is_refused() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         // The second call starts while the first is still streaming, so only the reservation
         // (not the final rename) can separate them.
         let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
@@ -926,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn never_replaces_a_directory() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         std::fs::create_dir(temp.path().join("dir")).unwrap();
         for overwrite in [true, false] {
             let error = write_upload_in(temp.path(), "dir", overwrite, 1024, body(&[b"x"]))

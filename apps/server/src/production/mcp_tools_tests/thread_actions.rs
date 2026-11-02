@@ -411,6 +411,10 @@ async fn checkpointed_checkout(harness: &Harness, thread_id: &str) -> tempfile::
         &["config", "user.name", "BiBCode Test"],
         &["config", "user.email", "bibcode@example.test"],
         &["config", "commit.gpgSign", "false"],
+        // The checkpoint capture and the revert run the host's Git; Git for Windows' default
+        // `core.autocrlf=true` would turn the fixture's LF files into CRLF.
+        &["config", "core.autocrlf", "false"],
+        &["config", "core.eol", "lf"],
     ] {
         git(&config, cwd, args);
     }

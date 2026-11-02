@@ -26,6 +26,15 @@ pub(crate) use capability_probe::check_capability_probe_appimage_environment;
 pub(crate) use event::{FixtureEvent, within_fixture_deadline};
 pub(crate) use sandbox::{FixtureLease, TestSandbox};
 
+/// A temporary directory at its canonical path (on Windows `\?\C:\...`, which `tempdir()` does
+/// not give), for code whose contract is a canonical root.
+pub(crate) fn canonical_tempdir() -> tempfile::TempDir {
+    let parent = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+    tempfile::Builder::new()
+        .tempdir_in(parent)
+        .expect("temporary directory")
+}
+
 #[cfg(feature = "hermetic-test-guard")]
 pub(crate) fn reexec_without_provider_path(test_name: &str) -> bool {
     const CASE: &str = "fixture-without-provider-path";
