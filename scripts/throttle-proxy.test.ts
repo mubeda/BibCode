@@ -11,6 +11,7 @@ import * as NodeURL from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  type LinkSettings,
   parseLink,
   runThrottleProxyMain,
   startControlServer,
@@ -367,10 +368,7 @@ describe("new connections", () => {
     return Date.now() - started;
   }
 
-  const through = async (
-    targetPort: number,
-    initial: Parameters<typeof startThrottleProxy>[0]["initial"],
-  ) => {
+  const through = async (targetPort: number, initial: Partial<LinkSettings>) => {
     const proxy = await startThrottleProxy({
       listenHost: "127.0.0.1",
       listenPort: 0,
