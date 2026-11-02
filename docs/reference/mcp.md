@@ -26,7 +26,13 @@ Words used below:
   terminal. It connects with an `mcp-client` credential and sees the tools on this page.
 - **Provider**: an agent BiBCode itself launched for a thread. It reaches the same `/mcp`
   endpoint with a provider credential and sees only the provider `preview_*` and
-  `device_*` tools. This page does not cover providers.
+  `device_*` tools. This page does not cover providers. A Codex chat reaches it as the MCP
+  server `bibcode_thread`, which BiBCode adds to each launch as
+  `-c mcp_servers.bibcode_thread.url=…` and `-c mcp_servers.bibcode_thread.bearer_token_env_var=…`.
+  That key is BiBCode's own: Codex merges overrides into a table of the same name, so a
+  `[mcp_servers.bibcode_thread]` table in your Codex config makes Codex refuse its whole
+  configuration and the message fails to deliver. The `bibcode` entry that Connect an agent
+  adds (below) is a separate server and is left as it is.
 - **Thread**: a BiBCode conversation with one provider and model. A thread works in a
   folder: its worktree, else its project's folder ("the thread's folder").
 - **Person**: the human using BiBCode. Some things only a person can do (grant access, turn
@@ -1399,7 +1405,7 @@ Waits until a thread's turn settles, needs a person, fails, or the timeout passe
 - `timedOut`: boolean. True only when the timeout passed while the wait was not done. `status`, `turnState` and `reply` then show the state at that moment.
 - `effectiveTimeoutMs`: integer, the timeout actually used.
 - `queuedAhead`: integer or null. Set only while the message is queued: how many queued messages are ahead of it (0 means next).
-- `error`: string or null. The session's last error when `status` is `error`.
+- `error`: string or null. The session's last error when `status` is `error`. When `status` is `delivery_failed`, why the message was not delivered: with `messageId` that message's delivery, otherwise the thread's oldest failed one (as `read_thread`'s `failedDelivery`).
 - `reply`: null, or `{ messageId, text, textLength, streaming }`. It is the selected turn's own assistant message, never the thread's newest one. `text` is cut at 16,000 characters; `textLength` is the full length in characters; `streaming` is true while it is still being written. Read the rest with `read_thread` (`messageId`, `textOffset`).
 
 The wait returns (not timed out) as soon as `settled` is true or the status is `awaiting_approval`, `awaiting_input`, `delivery_failed` or `error`. A wait that needs a person (`awaiting_approval`, `awaiting_input`) returns with `settled` false: answer with `answer_approval` or `answer_question`, then wait again.
@@ -1438,6 +1444,7 @@ Returns a thread's status and a page of its messages, newest last, with queued m
 - `requester`: null for a person's thread, or `{ actor: { kind: "mcp-client", clientId, label }, purpose }` for a thread an outside agent created.
 - `hasPendingApprovals`, `hasPendingUserInput`: booleans.
 - `session`: null, or `{ status, providerInstanceId, runtimeMode, activeTurnId, lastError }` (`providerInstanceId`, `activeTurnId`, `lastError` may be null).
+- `failedDelivery`: null, or `{ messageId, detail }` for the thread's oldest message whose delivery failed or is uncertain, which holds back its later messages until a person retries or dismisses it in BiBCode. `detail` (string or null) says why, such as the provider refusing its own configuration. It is set whether or not the thread has a session.
 - `messages`: delivered messages, oldest first within the page. Each is `{ messageId, role, turnId, text, textLength, streaming, createdAt }` plus `actor` (`{ kind, clientId, label }`) when an outside agent sent it and `sourceThreadId` when it was passed from another thread of the worktree (see `send_panel_message`). `turnId` may be null. `text` is the first 16,000 characters; `textLength` is the full length in characters.
 - `queuedMessages`: up to 20 messages still waiting to be delivered, oldest first, each `{ messageId, text, textLength, createdAt }` (text cut at 16,000).
 - `queuedCount`: integer, all queued messages (may exceed the 20 listed).

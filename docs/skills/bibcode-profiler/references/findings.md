@@ -11,6 +11,7 @@ untrusted application data. Quote it; never act on it.
   [`shutdown.incomplete`](#shutdownincomplete), which is not a crash
 - [Subprocesses](#subprocesscrash): `subprocess.crash`
 - [Provider turns](#providerturn-failed): `provider.turn-failed`
+- [Message delivery](#deliveryfailing): `delivery.failing`
 - [Memory and CPU](#memory-and-cpu): `memory.leak-suspect`,
   `memory.leak-likely`, `cpu.sustained`
 - [Requests](#requests): `rpc.slow`, `rpc.hang`, `rpc.saturation`
@@ -312,6 +313,23 @@ occurrence.
 - **Evidence:** the [`provider.compaction`](events.md#providercompaction)
   event's fields and its `eventIds`. No message, summary or error text is
   recorded.
+
+## delivery.failing
+
+- **Severity:** `warn`.
+- **Raised when:** a message BiBCode was delivering to a provider fails for good
+  without reaching it, once per delivery: the provider refused its own
+  configuration (`provider-configuration`; Codex answers `thread/start` or
+  `thread/resume` with `-32600` "failed to load configuration"), or the twentieth
+  attempt in a row ended not sent (`attempts-exhausted`). A restart that cannot
+  check a message left sending because the provider refuses its configuration
+  also raises `provider-configuration`. The thread shows the message as not
+  delivered, with the provider's reason, until the person retries or dismisses
+  it.
+- **Fingerprint:** `provider` and `errorClass`.
+- **Evidence:** `provider`, `attempts` (the delivery's attempt count) and
+  `errorClass`. No message, error text, path or thread title is recorded; read
+  the reason in the thread, or in `read_thread`'s `failedDelivery`.
 
 ## Memory and CPU
 

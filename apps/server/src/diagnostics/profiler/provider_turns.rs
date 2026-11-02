@@ -94,6 +94,42 @@ fn turn_failure_finding(
     }
 }
 
+/// Records a message delivery that failed for good without reaching its provider as a
+/// `delivery.failing` finding: the provider, the delivery's `attempts` and the `error_class`
+/// (`provider-configuration` or `attempts-exhausted`). Never the error text, a path or a title.
+/// Does nothing while the profiler is off.
+pub fn record_delivery_failing(provider: &str, attempts: i64, error_class: &str) {
+    #[cfg(test)]
+    note_recorded(
+        "delivery.failing",
+        delivery_failing_finding(provider, attempts, error_class).evidence,
+    );
+    if !is_enabled() {
+        return;
+    }
+    record_finding(delivery_failing_finding(provider, attempts, error_class));
+}
+
+fn delivery_failing_finding(provider: &str, attempts: i64, error_class: &str) -> FindingInput {
+    let provider = provider_name(provider);
+    let error_class = identifier(error_class);
+    FindingInput {
+        kind: "delivery.failing",
+        severity: Severity::Warn,
+        source: "server".into(),
+        fingerprint_fields: vec![provider.clone(), error_class.clone()],
+        title: "Message delivery failed".into(),
+        summary: format!(
+            "A {provider} message delivery failed after {attempts} attempts ({error_class})."
+        ),
+        evidence: json!({
+            "provider": provider,
+            "attempts": attempts,
+            "errorClass": error_class,
+        }),
+    }
+}
+
 /// How a conversation compaction settled, for `provider.compaction`.
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionRecord<'a> {
@@ -281,6 +317,27 @@ mod tests {
         assert_eq!(
             turn_failure_finding("opencode", None, "context_limit").evidence["provider"],
             "opencode"
+        );
+    }
+
+    #[test]
+    fn delivery_failures_share_a_finding_per_provider_and_class() {
+        let first = delivery_failing_finding("codex", 1, "provider-configuration");
+        let later = delivery_failing_finding("codex", 20, "provider-configuration");
+        assert_eq!(first.kind, "delivery.failing");
+        assert_eq!(first.severity, Severity::Warn);
+        assert_eq!(
+            first.fingerprint_fields,
+            ["codex", "provider-configuration"]
+        );
+        assert_eq!(first.fingerprint_fields, later.fingerprint_fields);
+        assert_eq!(
+            later.evidence,
+            json!({ "provider": "codex", "attempts": 20, "errorClass": "provider-configuration" })
+        );
+        assert_ne!(
+            delivery_failing_finding("codex", 20, "attempts-exhausted").fingerprint_fields,
+            first.fingerprint_fields
         );
     }
 

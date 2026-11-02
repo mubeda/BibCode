@@ -3159,6 +3159,43 @@ async fn restart_recovery_whose_conversation_is_gone_leaves_an_explicit_retry_wo
     fixture.close().await;
 }
 
+/// #273: a restart's reconciliation launch that the provider refuses for its configuration
+/// reports that, not `Unavailable`, so recovery stops relaunching; nothing is sent.
+#[tokio::test]
+async fn restart_recovery_refused_for_provider_configuration_reports_it() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    fixture.state.lock().unwrap().start_results =
+        VecDeque::from([Err(ProviderRuntimeError::ProviderConfiguration {
+            provider: "cursor".to_owned(),
+            detail: "failed to load configuration: bad table".to_owned(),
+        })]);
+
+    let outcome = reconcile_orchestration_turn(
+        &fixture.supervisor,
+        &fixture.engine,
+        &fixture.settings.path().to_path_buf(),
+        fixture.row.clone(),
+    )
+    .await;
+
+    let ProviderReconciliationOutcome::ProviderConfiguration { detail } = outcome else {
+        panic!("a refused configuration is reported as such: {outcome:?}");
+    };
+    assert!(
+        detail.contains("failed to load configuration: bad table"),
+        "{detail}"
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.launches.len(), 1);
+    assert!(state.sends.is_empty());
+    drop(state);
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn frozen_retry_preserves_nonaccepted_fresh_delivery_outcomes() {
     for expected in [
