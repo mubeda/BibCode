@@ -1,0 +1,5 @@
+{
+  "shell": { "wireBytes": 40000, "decodedBytes": 255000 },
+  "thread": { "wireBytes": 1950000, "decodedBytes": 6500000 },
+  "resume": { "wireBytes": 256, "decodedBytes": 256 }
+}
