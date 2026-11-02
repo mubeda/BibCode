@@ -585,6 +585,14 @@ with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
 These keys and the minimap jump instead of scrolling smoothly when the system
 asks for reduced motion.
 
+A long thread opens with its latest turns, so it shows quickly on a slow link.
+Scrolling up near the top loads the turns before them and keeps the line you are
+reading in place; the top row, **Load earlier messages (N more)**, does the same
+without scrolling. While a page loads it reads **Loading earlier messages…**; if
+one fails it reads **Couldn't load earlier messages.** with **Retry**. The
+earlier turns stay loaded until you switch threads or reload. A turn whose start
+has not loaded yet shows **Worked** without a duration until it does.
+
 While a reply streams, the timeline follows it. Scrolling the timeline yourself
 stops that: the wheel, a touch, the scrollbar, or the arrow keys, PageUp,
 PageDown, Home, End, or Space while the timeline has focus (for example after
@@ -615,7 +623,11 @@ outlined instead.
 whatever find opened stay as they are, and reopening find restores the last
 search. Find searches the copy of the thread the app holds: while the
 connection is restoring, the status adds **may be out of date**, and while a
-thread is still loading it says **Loading thread…**. One chat's find is open at
+thread is still loading it says **Loading thread…**. While the thread's earlier
+turns are not loaded yet, find searches the loaded messages and says **Searched
+loaded messages.** with **Search all**, which loads every earlier turn and
+searches again; if a page fails it says **Couldn't load all earlier messages.**
+with **Retry**. Closing the bar stops Search all. One chat's find is open at
 a time; opening it in a chat panel closes the host chat's. The palette opens it
 in the chat you were using, or the chat on screen. Outside a chat, Mod+F
 keeps its usual meaning. To use another key, bind the `chat.find` command (see
