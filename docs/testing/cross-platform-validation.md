@@ -2173,8 +2173,9 @@ cargo test -p bibcode-server --test transfer_budget
 ```
 
 `--link 3g` writes the fixture's store (one 200-turn thread, a 160-thread shell) before the
-server starts, then limits the link and runs four rows: cold connect onto the big thread, open
-it from the sidebar with no cache, switch back to it, and reconnect. Each row reports RPCs,
+server starts, then limits the link and runs five rows: cold connect onto the big thread, open
+it from the sidebar with no cache, switch back to it, reconnect, and a reload onto the big thread
+while the page's cache still holds it. Each row reports RPCs,
 sequential round trips, bytes received after the transport's deflate and decoded, and time to
 visible. Static assets are served locally, so the rows count RPC bytes only. Compare against the
 latest `docs/architecture/measurements/remote-load-3g-*.md`; add a new dated capture rather than
