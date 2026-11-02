@@ -12,6 +12,7 @@ import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useLocalEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
 import {
+  toolUpdateWarning,
   collectProviderUpdateOutcomeSnapshots,
   firstRejectedProviderUpdateMessage,
   getProviderUpdateProgressToastView,
@@ -145,6 +146,11 @@ function EnvironmentUpdateRow({
       <div className="flex min-w-0 flex-col">
         <span className="truncate font-medium text-foreground">{group.label}</span>
         <span className={cn("truncate text-xs", rowToneClass(status.kind))}>{status.text}</span>
+        {toolUpdateWarning(group.candidates) === null ? null : (
+          <span className="text-xs text-muted-foreground">
+            {toolUpdateWarning(group.candidates)}
+          </span>
+        )}
       </div>
       <div className="shrink-0">{trailing}</div>
     </div>

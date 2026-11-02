@@ -299,6 +299,21 @@ describe("one-click update prompt", () => {
     expect(active.key).toBe(`codex:${latestVersion}`);
   });
 
+  it("warns before updating CodeGraph, and only then", () => {
+    testState.providers = [provider({ driver: "codegraph", latestVersion: uniqueLatestVersion() })];
+    render();
+    harness.runEffects();
+    expect(testState.toastAdds[0]!.description).toContain(
+      "Close agent sessions that use CodeGraph before updating",
+    );
+
+    testState.toastAdds.length = 0;
+    testState.providers = [provider({ latestVersion: uniqueLatestVersion() })];
+    render();
+    harness.runEffects();
+    expect(String(testState.toastAdds[0]!.description)).not.toContain("Close agent sessions");
+  });
+
   it("runs the update command for each candidate and drives the toast to success", async () => {
     const latestVersion = uniqueLatestVersion();
     const updated = provider({
