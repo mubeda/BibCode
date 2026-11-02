@@ -3874,18 +3874,19 @@ them, and can move, swap or write anything there at any moment.
   final path), so an 8.3 short name that stands for another entry (`GIT~1`) is refused. A
   file is opened without truncation and truncated only after it is known to be a plain file;
   a data reparse point (a cloud placeholder) is read as stored and never changed. Renames
-  use `FileRenameInfo` with the target folder's handle as `RootDirectory` (no-replace when
-  `ReplaceIfExists` is false, in one step); deletes set `FileDispositionInfoEx` with POSIX
+  use `FileRenameInformation` through `NtSetInformationFile` (kernel32 refuses a
+  `RootDirectory`), with the target folder's handle as `RootDirectory`: no-replace when
+  `ReplaceIfExists` is false, in one step. Deletes set `FileDispositionInfoEx` with POSIX
   semantics on the entry's own handle. `Dir::contained` compares the final paths of the
   held folder and the held root (they follow every rename). Hard links are counted with
   `FileStandardInfo` for `singleLinkOnly`. NTFS also refuses to rename any folder above one
   held open, so a held folder's ancestors cannot move while BiBCode works in it.
 - **Trash on Windows.** The native trash (`Microsoft.VisualBasic.FileIO`) takes a path, so
-  there is no staging: the entry's folder is held and pinned (`Dir::pin`: reopened without
-  `FILE_SHARE_DELETE`, refused unless the volume is NTFS or ReFS) for the whole trash call,
-  so no folder on the path can be renamed or replaced, and the trash moves a junction or
-  symlink at the entry itself, never what it names. A volume that cannot pin answers
-  `trash_unavailable`.
+  there is no staging: the entry's folder is held and pinned for the whole trash call
+  (`Dir::pin`: reopened through its own handle without `FILE_SHARE_DELETE`, refused unless
+  the volume is NTFS or ReFS), so no folder on the path can be renamed or replaced, and the
+  trash moves a junction or symlink at the entry itself, never what it names. A volume that
+  cannot pin answers `trash_unavailable`.
 - **Trash.** `projects.deleteEntry { toTrash }` uses the same `FileTrash` as Source
   Control's discard and fails `trash_unavailable` rather than deleting.
 - **Errors.** A workspace error's `failure` is kept on the tool failure, and the message is
