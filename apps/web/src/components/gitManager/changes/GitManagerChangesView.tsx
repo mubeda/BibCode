@@ -245,6 +245,9 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const [excludedPaths, setExcludedPaths] = useState<ReadonlySet<string>>(() => new Set());
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  // Where discarded files were kept. Held apart from `mutationError`, which every action
+  // clears, so it survives the permanent-discard confirmation that can follow.
+  const [recoveryNotices, setRecoveryNotices] = useState<ReadonlyArray<string>>([]);
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
   const project = useProject(stableProjectRef);
@@ -533,12 +536,11 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(message);
         throw new Error(message);
       }
-      const notes: string[] = [];
       if (result.value.keptInStaging.length > 0) {
-        notes.push(keptInStagingMessage(result.value.keptInStaging));
+        const notice = keptInStagingMessage(result.value.keptInStaging);
+        setRecoveryNotices((current) => [...current, notice]);
       }
       if (requested.disposition === "trash" && result.value.trashUnavailable.length > 0) {
-        if (notes.length > 0) setMutationError(notes.join(" "));
         setPendingDiscard({
           paths: result.value.trashUnavailable,
           disposition: "permanent",
@@ -546,9 +548,8 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         return "keep-open";
       }
       if (result.value.trashUnavailable.length > 0) {
-        notes.push(keptAfterPermanentDiscard(result.value.trashUnavailable));
+        setMutationError(keptAfterPermanentDiscard(result.value.trashUnavailable));
       }
-      if (notes.length > 0) setMutationError(notes.join(" "));
     });
   }, [cwd, discard, environmentId, pendingDiscard]);
   const handleOpenExternal = useCallback(
@@ -794,6 +795,28 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         <p aria-live="polite" className="border-t border-border px-3 py-2 text-xs text-destructive">
           {mutationError}
         </p>
+      )}
+      {recoveryNotices.length === 0 ? null : (
+        <div
+          aria-live="polite"
+          className="flex items-start gap-2 border-t border-border px-3 py-2 text-xs text-foreground"
+          role="status"
+        >
+          <div className="min-w-0 flex-1 space-y-1">
+            {recoveryNotices.map((notice) => (
+              <p key={notice}>{notice}</p>
+            ))}
+          </div>
+          <Button
+            aria-label="Dismiss"
+            size="icon-xs"
+            title="Dismiss"
+            variant="ghost"
+            onClick={() => setRecoveryNotices([])}
+          >
+            <XIcon aria-hidden="true" className="size-3.5" />
+          </Button>
+        </div>
       )}
       <GitManagerCommitBox
         branch={branch}
