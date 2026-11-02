@@ -168,8 +168,13 @@ test names are proposals. Contract and Rust shapes change together, and
     has the secret store's protection.
   - **Create:** signing secret, token file, then row. If the insert fails, remove both, as
     `rpc.rs:315-316` does today. Delete removes the signing secret and the named file.
-  - **One edit at a time per endpoint.** Every upsert and delete of an endpoint holds a
-    per-endpoint edit mutex from the file write through the removal of the replaced file.
+  - **One edit at a time per endpoint.** Every upsert and delete of an endpoint takes a
+    per-endpoint edit mutex before it reads the endpoint (`rpc.rs:254`) and validates the
+    URL and token, and holds it through the file write, the row commit and the removal of
+    the replaced file. So the "URL unchanged" check and the row it writes always see the
+    same stored URL and token, and a rename that read URL A cannot commit after another
+    edit moved the endpoint to URL B with token B. Test:
+    `a_rename_racing_a_url_and_token_change_never_pairs_the_old_url_with_the_new_token`.
     `update_endpoint` writes `bearer_secret` only when the upsert carries `bearerToken`,
     so a rename can never write back a reference it read earlier. One server process owns
     the store, so an in-process mutex is enough.
@@ -545,6 +550,8 @@ was refuted. Two are resolved by restricting a slice, the smaller correct design
 | R2.2 | P2: mixed versions. New fields are required, and the event enum is closed.                                | Confirmed. `WebhookEndpoint` fields are required (`webhooks.ts:55-75`). `eventTypes` is a closed enum (`:60`). There is no client version signal.                      | **Fixed, with one documented limit.** Capability flags and decoding defaults follow the existing pattern, and absent input fields keep stored values. `eventTypes` decodes as strings from slice 1 on. A v0.14 client fails closed on question events. Tests run in both directions ([Mixed versions](#mixed-client-and-server-versions)). |
 | R2.3 | P2: `answer --wait` can return `awaiting_input` for the question just answered.                           | Confirmed. `done()` stops on `awaiting_input` (`mcp/wait.rs:49-55`), and `wait_for_thread` takes only `threadId`, `messageId` and `timeoutMs` (`:74`).                 | **Restricted.** `--wait` is dropped from `answer`, `approve` and `decline`. A fenced wait needs a server change for a convenience.                                                                                                                                                                                                         |
 | R2.4 | P2: `bibcode mcp call files_download` prints a URL that dies when the run exits.                          | Confirmed. `controls_for` refuses a session that ended (`transfer_routes.rs:76-92`). Owned work such as a clone also stops on revoke (`mcp.md:919-929`).               | **Restricted.** One-shot `call` accepts read-only tools except `files_download`, and refuses every other tool before minting. `tools` marks `oneShot`. Tests are named.                                                                                                                                                                    |
+
+Round 3 (final, REVISE): P1, a rename that read URL A could commit after another edit moved the endpoint to URL B with token B, pairing A with B's token. Confirmed: the endpoint is read before the edit mutex (`rpc.rs:254`) and the supplied URL is written later (`store.rs:283`). **Fixed:** the edit mutex is taken before the read and validation and held through cleanup ("One edit at a time per endpoint"), with a named interleaving test.
 
 **Proportion (round 1).** Round 1 findings 2 to 4 show that named clients reach into auth issuance, recorded
 outcomes, Stop and two UI joins. Next to the urgent P0, that is disproportionate. They are
