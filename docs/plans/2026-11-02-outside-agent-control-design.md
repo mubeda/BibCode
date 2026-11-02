@@ -1,6 +1,6 @@
 # Outside Agent Control: Webhook Auth, Stable Identity, CLI
 
-Status: Proposed 2026-11-02, awaiting the maintainer's approval. Issue #271. Follows #139 and
+Status: Approved by the maintainer 2026-11-02 (all 7 slices; named clients split into #280; Codex review, 3 rounds). Issue #271. Follows #139 and
 amends one answer of the approved
 [2026-10-24 MCP design](./2026-10-24-mcp-operate-server-design.md) (see
 [Decision 2](#decision-2-a-stable-identity-across-runs)). Verified at `fd98b433068b`
