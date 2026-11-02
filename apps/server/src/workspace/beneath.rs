@@ -26,7 +26,7 @@
 //! (a symlink, junction or mount point); entries are opened by name relative to the held
 //! folder (`NtCreateFile` with `RootDirectory`), must carry the very name asked for (an 8.3
 //! short name or an alternate data stream is refused), and are renamed and deleted through
-//! their own handle (`SetFileInformationByHandle`). [`Dir::contained`] compares the final
+//! their own handle (`NtSetInformationFile`, `SetFileInformationByHandle`). [`Dir::contained`] compares the final
 //! paths of the held folder and the held root, which follow every rename.
 //!
 //! The system trash takes a path. On Unix the entry is staged by handle first
@@ -930,7 +930,7 @@ pub(crate) use imp::{folder_beneath, rename_no_replace};
 /// Windows: every folder is held by a handle opened without following a reparse point
 /// (`FILE_OPEN_REPARSE_POINT`), each entry is opened by name relative to its folder's handle
 /// (`NtCreateFile` with `RootDirectory`), and a rename or delete goes through the entry's own
-/// handle (`SetFileInformationByHandle`), so a folder swapped for a junction or symlink after
+/// handle (`NtSetInformationFile`, `SetFileInformationByHandle`), so a folder swapped for a junction or symlink after
 /// the check cannot redirect it.
 #[cfg(windows)]
 mod imp {
@@ -947,11 +947,12 @@ mod imp {
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileRenameInformation, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED,
-        HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+        HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -960,12 +961,12 @@ mod imp {
         FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO,
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FileAttributeTagInfo,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FileAttributeTagInfo,
         FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
-        FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+        FileFullDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+        SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1121,45 +1122,7 @@ mod imp {
         options: u32,
     ) -> io::Result<File> {
         let mut wide = wide_name(name)?;
-        let bytes = u16::try_from(wide.len() * 2)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
-        let unicode = UNICODE_STRING {
-            Length: bytes,
-            MaximumLength: bytes,
-            Buffer: wide.as_mut_ptr(),
-        };
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: parent.as_raw_handle(),
-            ObjectName: &raw const unicode,
-            Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: std::ptr::null(),
-            SecurityQualityOfService: std::ptr::null(),
-        };
-        let mut status_block = IO_STATUS_BLOCK::default();
-        let mut handle: HANDLE = std::ptr::null_mut();
-        // SAFETY: every pointer is to initialized storage alive for the call; on success the
-        // call returns one new handle, adopted once below.
-        let status = unsafe {
-            NtCreateFile(
-                &raw mut handle,
-                access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                &raw const attributes,
-                &raw mut status_block,
-                std::ptr::null(),
-                FILE_ATTRIBUTE_NORMAL,
-                SHARE_ALL,
-                disposition,
-                options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-                std::ptr::null(),
-                0,
-            )
-        };
-        if status < 0 {
-            return Err(nt_error(status));
-        }
-        // SAFETY: the call succeeded and returned a handle nothing else owns.
-        let file = unsafe { File::from_raw_handle(handle) };
+        let file = nt_open(parent, &mut wide, access, SHARE_ALL, disposition, options)?;
         let path = final_path(&file)?;
         let real: Vec<u16> = path
             .file_name()
@@ -1182,6 +1145,57 @@ mod imp {
             ));
         }
         Ok(file)
+    }
+
+    /// `NtCreateFile` of `name` relative to `parent` (the folder itself when `name` is empty),
+    /// never following a reparse point.
+    fn nt_open(
+        parent: &File,
+        name: &mut [u16],
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+    ) -> io::Result<File> {
+        let bytes = u16::try_from(name.len() * 2)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
+        let unicode = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: name.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &raw const unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut status_block = IO_STATUS_BLOCK::default();
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: every pointer is to initialized storage alive for the call; on success the
+        // call returns one new handle, adopted once below.
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut handle,
+                access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                &raw const attributes,
+                &raw mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            return Err(nt_error(status));
+        }
+        // SAFETY: the call succeeded and returned a handle nothing else owns.
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 
     /// The canonical root opened by its path, refused (as moved) unless it is a folder and no
@@ -1378,20 +1392,14 @@ mod imp {
                 "this file system cannot keep a folder in place while BiBCode works in it",
             ));
         }
-        // SAFETY: the held handle is open; on success the call returns a new handle.
-        let handle = unsafe {
-            ReOpenFile(
-                dir.handle.as_raw_handle(),
-                DIRECTORY_ACCESS,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a new handle nothing else owns.
-        let pinned = unsafe { File::from_raw_handle(handle) };
+        let pinned = nt_open(
+            &dir.handle,
+            &mut [],
+            DIRECTORY_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+        )?;
         contained(dir)?;
         Ok(pinned)
     }
@@ -1523,14 +1531,15 @@ mod imp {
     ) -> io::Result<()> {
         let target = wide_name(to_name)?;
         let file = open_at(&dir.handle, name, DELETE, FILE_OPEN, 0)?;
-        let header = offset_of!(FILE_RENAME_INFO, FileName);
-        let size = size_of::<FILE_RENAME_INFO>() + target.len() * size_of::<u16>();
+        let header = offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let size = size_of::<FILE_RENAME_INFORMATION>() + target.len() * size_of::<u16>();
         let mut buffer = vec![0_u64; size.div_ceil(size_of::<u64>())];
-        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status_block = IO_STATUS_BLOCK::default();
         // SAFETY: `buffer` is aligned and large enough for the header and the name; the target
         // folder's handle stays open through the call. A no-replace rename fails rather than
         // replace anything, in one step.
-        unsafe {
+        let status = unsafe {
             (*info).Anonymous.ReplaceIfExists = replace == Replace::Allowed;
             (*info).RootDirectory = to.handle.as_raw_handle();
             (*info).FileNameLength = (target.len() * size_of::<u16>()) as u32;
@@ -1539,13 +1548,18 @@ mod imp {
                 info.cast::<u8>().add(header).cast::<u16>(),
                 target.len(),
             );
-            check(SetFileInformationByHandle(
+            NtSetInformationFile(
                 file.as_raw_handle(),
-                FileRenameInfo,
+                &raw mut status_block,
                 info.cast(),
                 size as u32,
-            ))
+                FileRenameInformation,
+            )
+        };
+        if status < 0 {
+            return Err(nt_error(status));
         }
+        Ok(())
     }
 
     /// Removes the folder `name` in `dir` and everything in it, never by path: renamed through
