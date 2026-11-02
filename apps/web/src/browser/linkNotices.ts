@@ -71,6 +71,22 @@ export function copyLink(url: string): void {
   copyLinkAction(url).onClick();
 }
 
+/** The BiBCode browser couldn't open a link; the system browser may still. */
+export function showInternalBrowserFailedNotice(
+  url: string,
+  openInSystemBrowser: () => void,
+): void {
+  toastManager.add(
+    stackedThreadToast({
+      type: "error",
+      title: "Couldn't open the link in the BiBCode browser",
+      description: url,
+      actionVariant: "outline",
+      actionProps: { children: "Open in system browser", onClick: openInSystemBrowser },
+    }),
+  );
+}
+
 export function showLinkOpenFailedNotice(url: string): void {
   toastManager.add(
     stackedThreadToast({
