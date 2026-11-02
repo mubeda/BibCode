@@ -53,6 +53,7 @@ import {
   stopRemoteUploadFixture,
   removeSeededUpgradeDependencyTree,
   runBoundedCommand,
+  runTimedBuildCommand,
   seededUpgradeVitePlusExecutable,
   seededUpgradeBundleRoot,
   seededUpgradeRustTarget,
@@ -953,8 +954,22 @@ describe("seeded packaging build budgets", () => {
     }));
     const prepareSeededUpgradeBuild = vi.fn(async () => {});
     const signingEnvironment = { TAURI_SIGNING_PRIVATE_KEY: "fixture-private-key" };
+    const timings: string[] = [];
     const context = {
       NodePath,
+      NodeFS: {
+        promises: {
+          mkdir: async () => undefined,
+          appendFile: async (_path: string, text: string) => {
+            timings.push(text);
+          },
+        },
+      },
+      console,
+      setInterval,
+      clearInterval,
+      timings,
+      SeededUpgradeCommandTimeoutError,
       runCommand,
       prepareSeededUpgradeBuild,
       seededUpgradeVitePlusExecutable,
@@ -969,6 +984,7 @@ describe("seeded packaging build budgets", () => {
         arch,
         platform,
         bundle: platform === "mac" ? "dmg" : platform === "win" ? "nsis" : "appimage",
+        artifactDirectory: absolute("evidence"),
         repositoryRoot,
         candidateVersion: "9.9.9-upgrade.1",
         previousVersion: "1.2.3",
@@ -1003,25 +1019,33 @@ describe("seeded packaging build budgets", () => {
       expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(3);
       expect(owned.runCommand).toHaveBeenCalledTimes(6);
       const builds = [
-        [owned.layout.candidateCheckout, owned.layout.candidateBuildRoot, owned.candidateOverlay],
         [
+          "candidate",
+          owned.layout.candidateCheckout,
+          owned.layout.candidateBuildRoot,
+          owned.candidateOverlay,
+        ],
+        [
+          "previous-stable",
           owned.layout.previousStable.checkout,
           owned.layout.previousStable.buildRoot,
           owned.previousOverlay,
         ],
         [
+          "protected-baseline",
           owned.layout.protectedBaseline.checkout,
           owned.layout.protectedBaseline.buildRoot,
           owned.protectedOverlay,
         ],
-      ];
-      expect(new Set(builds.map(([, target]) => target)).size).toBe(3);
-      for (const [index, [checkout, target, overlay]] of builds.entries()) {
+      ] as const;
+      expect(new Set(builds.map(([, , target]) => target)).size).toBe(3);
+      for (const [index, [name, checkout, target, overlay]] of builds.entries()) {
         expect(owned.runCommand).toHaveBeenNthCalledWith(index * 2 + 1, {
           command: seededUpgradeVitePlusExecutable,
           args: ["install", "--frozen-lockfile"],
           cwd: checkout,
           inherit: true,
+          label: `${name} vp install`,
           timeoutMs: 10 * 60_000,
         });
         expect(owned.runCommand).toHaveBeenNthCalledWith(index * 2 + 2, {
@@ -1045,11 +1069,24 @@ describe("seeded packaging build budgets", () => {
             seededUpgradeRustTarget(platform, arch),
           ],
           cwd: checkout,
-          env: { ...owned.signingEnvironment, CARGO_TARGET_DIR: target },
+          // The smoke proves upgrade behaviour, not optimised codegen: a single LTO codegen unit
+          // kept Intel builds in one-core codegen for up to an hour.
+          env: {
+            ...owned.signingEnvironment,
+            CARGO_TARGET_DIR: target,
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16",
+            CARGO_PROFILE_RELEASE_LTO: "off",
+          },
           inherit: true,
+          label: `${name} vp run build`,
           timeoutMs: minutes * 60_000,
         });
       }
+      // Every install and build leaves a start and an end line even if a later one times out.
+      const lines = owned.timings.join("").trim().split("\n");
+      expect(lines).toHaveLength(12);
+      expect(lines[0]).toMatch(/^candidate vp install started \d{4}-\d\d-\d\dT/);
+      expect(lines[11]).toMatch(/^protected-baseline vp run build ended .* exit code 0$/);
     },
   );
 
@@ -1065,6 +1102,63 @@ describe("seeded packaging build budgets", () => {
       expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(1);
     },
   );
+});
+
+describe("runTimedBuildCommand", () => {
+  const withDirectory = async (body: (directory: string) => Promise<void>) => {
+    const directory = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-build-timings-"),
+    );
+    try {
+      await body(directory);
+    } finally {
+      await NodeFS.promises.rm(directory, { recursive: true, force: true });
+    }
+  };
+
+  it("records the start, end, duration, and exit code of a failed build", () =>
+    withDirectory(async (directory) => {
+      await expect(
+        runTimedBuildCommand({
+          artifactDirectory: directory,
+          command: process.execPath,
+          args: ["-e", "process.exit(3)"],
+          cwd: directory,
+          label: "candidate vp run build",
+          timeoutMs: 60_000,
+        }),
+      ).rejects.toThrow("candidate vp run build exited with code 3.");
+      const lines = (
+        await NodeFS.promises.readFile(NodePath.join(directory, "build-timings.txt"), "utf8")
+      )
+        .trim()
+        .split("\n");
+      expect(lines[0]).toMatch(/^candidate vp run build started \d{4}-\d\d-\d\dT[\d:.]+Z$/);
+      expect(lines.at(-1)).toMatch(
+        /^candidate vp run build ended \d{4}-\d\d-\d\dT[\d:.]+Z after \d+s: exit code 3$/,
+      );
+    }));
+
+  it("names the build in the timeout and leaves heartbeat evidence", () =>
+    withDirectory(async (directory) => {
+      const pending = runTimedBuildCommand({
+        artifactDirectory: directory,
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: directory,
+        heartbeatMs: 200,
+        label: "previous-stable vp run build",
+        timeoutMs: 1_500,
+      });
+      await expect(pending).rejects.toBeInstanceOf(SeededUpgradeCommandTimeoutError);
+      await expect(pending).rejects.toThrow("previous-stable vp run build timed out after 1500ms.");
+      const text = await NodeFS.promises.readFile(
+        NodePath.join(directory, "build-timings.txt"),
+        "utf8",
+      );
+      expect(text).toMatch(/^previous-stable vp run build heartbeat .*\(0 min\)$/m);
+      expect(text.trim().split("\n").at(-1)).toMatch(/: timed out$/);
+    }));
 });
 
 /** Minimal VERSIONINFO whose ProductVersion alignment is relative to the resource, not the file. */
