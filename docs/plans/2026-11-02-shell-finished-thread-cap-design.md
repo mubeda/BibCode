@@ -1,7 +1,21 @@
 # Shell Finished-Thread Cap, Older Threads and Shell Resume
 
-Status: Proposed 2026-11-02, awaiting review. Issue #223, the 2026-10-31
-addendum (proposed changes 6 to 9). No code until this is approved.
+Status: Revised for Codex review round 2 (2026-11-02). Round 1 (`e724d358d`)
+returned REVISE with one P1 and seven P2 findings; [Review
+resolutions](#review-resolutions) maps each to its change. The coordinator
+settled the open questions: caps of 25 overall plus 3 per project, workspace
+threads without a worktree are capped too, and search matches titles only.
+Issue #223, the 2026-10-31 addendum (proposed changes 6 to 9). No code until
+this is approved.
+
+Revision 2 rests on one rule:
+
+> **Absence from a capped shell never means a thread is gone.** Only an
+> explicit removal item (`thread-removed`, `project-removed`), membership in the
+> archived snapshot, or `missing` from `orchestration.getThreadShells` does.
+
+Every reader that used to infer deletion from absence (lifecycle cleanup, the
+route guard, actions) now asks for that evidence.
 
 - Builds on the shell deltas of #223 (`b286aa05f` and its review fixes): after
   the first snapshot the stream sends only the projects and threads that changed
@@ -77,166 +91,193 @@ Most of those threads are finished and nobody looks at them in this session.
   works without a shell row.
 - **Workspace cards and the worktree catalog** need the `default` thread and
   every worktree thread.
+- **AI Terminal rows.** `buildAgentRows` (`agentsSection.logic.ts:255-262`)
+  drops a terminal row whose host thread has no shell. The terminal's agent
+  status comes from the server's terminal metadata (`terminal/manager.rs`,
+  `subscribe_metadata`).
+- **Lifecycle cleanup.** `ThreadLifecycleReconciler.tsx:127-163` deletes the
+  persisted center and right panel state of every thread that is in neither
+  the live shell nor the archived snapshot.
+- **Route guard.** `missingRouteThreadRedirectDelay` (`threadRoutes.ts:84-88`)
+  bounces a route to the index 1 s after a live shell lacks its thread and no
+  detail has arrived.
+- **Entity readers.** `readThreadShell`, `useThreadShell` and `findThreadRef`
+  (`state/entities.ts`) read only the shell. Their callers:
+  - actions: `useThreadActions.ts:104,121,123,317,431` (archive returns success
+    without dispatching when it finds no shell, `:241`),
+    `centerPanelActions.ts:133,159,185`, `WorktreeRemovalDialog.tsx:115`,
+    `useHandleNewThread.ts:90`, `useAddProjectWorkflow.ts:1089`,
+    `UiIntentNotifier.tsx:60` (a panel's host);
+  - labels: `UiIntentNotifier.tsx:118`, `OpenRequestRouter.tsx:109`,
+    `MessageProvenance.tsx:48`, `deviceOwner.tsx:26`,
+    `PanelTabAgentBadge.tsx:13-14`, `WorktreeRemovalDialog.tsx:160`;
+  - the route: `_chat.$environmentId.$threadId.tsx:21`.
 
 ## Goals
 
 1. The first shell item and a reconnect carry the threads the person can see or
    act on, not every finished thread.
-2. No workspace card, live agent, unread or pinned thread disappears.
-3. Older threads stay reachable: from each project, from the Done group, and
-   from search.
-4. A reconnect or reload whose shell didn't change costs a few bytes.
-5. Old clients and old servers keep today's behavior, in both directions.
+2. No workspace card, live agent (chat or AI Terminal), unread or pinned thread
+   disappears.
+3. Older threads stay reachable: from each project, from each checkout's chats,
+   from the Done group, and from search.
+4. Nothing is cleaned up, redirected or silently skipped because a thread is
+   merely left out.
+5. A reconnect or reload whose shell didn't change costs a few bytes.
+6. Old clients and old servers keep today's behavior, in both directions.
 
 ## Design
 
 ### 1. Which threads the shell carries
 
-A subscriber that opts in (see [Wire contract](#5-wire-contract)) gets the
+A subscriber that opts in (see [Wire contract](#6-wire-contract)) gets the
 **kept set**: the union of
 
 1. **Live threads.** The session is `starting` or `running`, the latest turn is
    running, a request is pending (`hasPendingApprovals`,
    `hasPendingUserInput`), a delivery is unresolved, a compaction is unsettled,
-   or a message is queued. These are the Working, Pending Approval and Awaiting
-   Input agents, plus the states the left panel flags.
-2. **Card-backing threads.** Every `default` thread, and every `workspace`
-   thread with a `worktreePath`. No card disappears, and the worktree catalog
-   keeps every thread it pairs with.
-3. **Threads the client names** in `cap.include`: its pinned and unread thread
-   ids for this environment, and the routed thread at subscribe time. At most
-   `SHELL_INCLUDE_LIMIT` = 256 ids; the rest are ignored, and those threads
-   stay reachable through older-thread pages.
-4. **Recent finished threads.** Of the rest, the newest
-   `SHELL_RECENT_FINISHED` = 25 across the environment, plus the newest
-   `SHELL_RECENT_PER_PROJECT` = 3 of each project, so every project shows its
-   own recent work. "Newest" is `COALESCE(latest_user_message_at, updated_at)`
-   descending, then `thread_id`. This is the left panel's default sort; the
-   other sort orders only reorder what is loaded.
-5. **Panel threads of a kept host.** A `panel` thread whose `hostThreadId` is
-   kept and that is live or among the newest 3 panels of that host. The rest of
-   that host's panels are counted (§2).
+   or a message is queued.
+2. **Live AI Terminal hosts.** Threads hosting a terminal whose agent status
+   is not settled: working, waiting for input, or blocked. The terminal
+   manager already knows this (`TerminalSummary.agentStatus`); the shell stream
+   reads the set from it (§11).
+3. **Card-backing threads.** Every `default` thread, and every `workspace`
+   thread with a `worktreePath`.
+4. **Threads the client names** in `cap.include`: its pinned and unread thread
+   ids for this environment, the routed thread, and the hosts of its open chat
+   panels, at subscribe time. At most `SHELL_INCLUDE_LIMIT` = 256 ids; the rest
+   are ignored, and those threads stay reachable through §3 and §4.
+5. **Recent finished threads.** Of the rest (workspace threads without a
+   worktree and `panel` threads), the newest `SHELL_RECENT_FINISHED` = 25
+   across the environment, plus the newest `SHELL_RECENT_PER_PROJECT` = 3
+   non-panel threads of each project. "Newest" is
+   `COALESCE(latest_user_message_at, updated_at)` descending, then `thread_id`.
 
 Archived and deleted threads are never in the live shell, as today.
 
 The cap is applied in `load_shell_snapshot_rows`, in SQL, before the per-thread
-reads, so a left-out thread costs one row of the thread scan and nothing else:
-no session, message, turn or activity reads.
+reads, so a left-out thread costs one row of the thread scan and nothing else.
 
 **Sticky within a subscription.** The stream never removes a thread because it
-left the kept set, for example when a newer finished thread pushes it out of
-the newest 25. It sends `thread-removed` only when a thread is deleted,
-archived or loses its project, as today. Each re-read loads the kept set plus
-the ids `HeldShell` already holds. A fallback snapshot (lag, failed read,
-sequence overflow) uses the same union, so it never takes rows away from the
-client. The set is recomputed fresh on the next subscription. This keeps
-deltas exact and cheap, and the shell grows during a session only by the
-threads that became live or were created in it.
+left the kept set. Each re-read loads the kept set plus the ids `HeldShell`
+already holds, and a fallback snapshot (lag, failed read, sequence overflow)
+uses the same union. A left-out thread that becomes live, or whose terminal
+starts working, is now kept, so the next re-read sends it as `thread-upserted`.
 
-A left-out thread that becomes live is now in the kept set, so the next re-read
-sends it as `thread-upserted`. That is the existing delta path; nothing new is
-needed.
+**The snapshot says it is capped.** A capped snapshot carries
+`capped: true`. A client uses it, never its own request, to decide that
+absence means nothing (the rule at the top): an old server ignores the request
+and sends no marker, so its full list stays authoritative.
 
-### 2. Counting what was left out
+### 2. Counting what was left out, by checkout
 
-Each project shell gains an optional field:
+Each project shell gains an optional field, grouped exactly as the left panel
+groups chats (`workspaceCheckoutKey`, `Sidebar.logic.ts:891`):
 
 ```ts
 olderThreads: Schema.optional(Schema.Struct({
-  count: NonNegativeInt,          // left-out non-panel threads of this project
-  panels: Schema.Array(Schema.Struct({
-    hostThreadId: ThreadId,
-    count: NonNegativeInt,        // left-out panel threads of that host
+  count: NonNegativeInt,                   // left-out non-panel threads
+  chats: Schema.Array(Schema.Struct({
+    worktreePath: Schema.NullOr(TrimmedNonEmptyString), // null: the main checkout
+    count: NonNegativeInt,                 // left-out unarchived panel threads there
   })),
 })),
 ```
 
-- It is present only for an opted-in subscriber, and only when a count is above
-  zero.
-- `count` drives the left panel's **N older** row. `panels` keeps a card's
-  **N more chats** exact: the card shows its loaded panels plus its left-out
-  panel count.
-- The counts are part of the project shell's fingerprint, so a change, such as
-  an older thread archived, deleted, or becoming live, is a `project-upserted`.
-- The counts come from the same SQL pass as the kept set: one grouped count, no
-  per-thread reads.
+- A card's **N more chats** is its loaded panels in that checkout plus the
+  `chats` count for its `worktreePath`. This counts pathless panels of other
+  hosts in the main checkout as `summarizeWorkspaceChats` does.
+- `count` drives the project's **N older threads** row.
+- The counts are part of the project fingerprint, so a change is a
+  `project-upserted`.
+- One grouped `COUNT` in the same SQL pass; no per-thread reads.
 
 ### 3. `orchestration.listOlderThreads`
 
-A new unary RPC that pages the threads the shell left out, and searches.
+A new unary RPC that pages left-out threads, and searches.
 
 ```ts
 input: {
-  projectId: Schema.optional(ProjectId),
-  hostThreadId: Schema.optional(ThreadId),   // a host's panels; otherwise non-panel threads
+  scope: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("project"), projectId: ProjectId }),
+    Schema.Struct({
+      kind: Schema.Literal("checkout"),
+      projectId: ProjectId,
+      worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+    }),
+    Schema.Struct({ kind: Schema.Literal("agents") }),
+  ]),
   query: Schema.optional(TrimmedNonEmptyString),
   cursor: Schema.optional(TrimmedNonEmptyString),
   limit: Schema.optional(Int.check(between(1, 100))),  // default 20
 }
 output: {
-  threads: Schema.Array(OrchestrationThreadShell),   // the shell's own shape, with previews
-  cursor: Schema.NullOr(TrimmedNonEmptyString),      // null: nothing older
+  threads: Schema.Array(OrchestrationThreadShell),
+  cursor: Schema.NullOr(TrimmedNonEmptyString),        // null: nothing older
 }
-// typed failure: OrchestrationListOlderThreadsError (malformed cursor, unknown project)
+// typed failure: OrchestrationListOlderThreadsError (malformed cursor or input)
 ```
 
-- **Without `query`** it returns the non-archived threads outside the kept set,
-  without `cap.include` (the server doesn't know a page caller's include set),
-  newest first by the §1 key. The client drops ids it already holds. Paging is
-  keyset on `(newestKey, thread_id)`, so every left-out thread is returned once
-  for a store that doesn't change while paging. A thread that changes while the
-  client pages moves to the kept set or to an earlier page. The client
-  dedupes by id, and the thread arrives by delta if it became live.
-- **With `query`** it searches every non-archived thread of the environment, or
-  of `projectId`, kept or not, by case-insensitive title substring (`LIKE` with
-  `ESCAPE`, a `lower(title)` comparison). Newest first, same cursor. The palette
-  merges the results with its local matches by id.
-- **Cursor.** Base64url JSON `{ v: 1, key, threadId }`. It holds a timestamp
-  and an id, never content. The client only stores it and echoes it back.
-- **Rows.** Each thread is built by the same `thread_shell_with_records`, with
-  the same per-thread reads as the shell, for the page's threads only.
-- **Old server.** The client calls it only when a project shell has
-  `olderThreads` or the person searches with a capped shell, which only a new
-  server sends. An old server never sees the call.
+- **`project`**: the project's left-out non-panel threads (the **N older
+  threads** row). **`checkout`**: the left-out panel threads of one checkout,
+  grouped as in §2 (**N more chats**). **`agents`**: every left-out agent,
+  panels included, as the Agents rows list them (Done paging).
+- **Without `query`** it returns threads outside the kept set computed without
+  `cap.include` (a page caller's include set is unknown), newest first by the
+  §1 key, keyset paged on `(key, thread_id)`. The client drops ids it already
+  holds, so every left-out thread arrives once for a store that doesn't change
+  while paging.
+- **With `query`** it searches every unarchived thread of the scope, kept or
+  not, by case-insensitive title substring (`lower(title) LIKE ? ESCAPE '\'`).
+- **Cursor.** Base64url JSON `{ v: 1, scope, key, threadId }`: a timestamp and
+  ids, never content.
+- **Rows** use `thread_shell_with_records`, with the shell's per-thread reads
+  for the page's threads only.
 
-### 4. Shell resume (`unchanged`)
+### 4. `orchestration.getThreadShells`: the authority for one thread
 
-As `subscribeThread` does (see the thread resume design,
-`docs/superpowers/specs/2026-10-17-thread-resubscribe-resume-design.md`):
+```ts
+input:  { threadIds: Schema.Array(ThreadId).check(isMinLength(1), isMaxLength(100)) }
+output: {
+  threads: Schema.Array(OrchestrationThreadShell), // live or archived (archivedAt set)
+  missing: Schema.Array(ThreadId),                 // deleted, or never existed
+}
+```
 
-- An opted-in snapshot item carries `revision`: a 128-bit digest of
-  `HeldShell`'s fingerprints, the ids, the counts and the cap parameters, under
-  `ThreadRevisionKeys`-style keys secret to the server process. A restart draws
-  new keys, so every revision from before it mismatches.
+It answers "does this thread exist, and what is it" for any id, kept or not.
+It is the only source of `missing`, which is the only evidence besides a
+removal item that a thread is gone.
+
+### 5. Shell resume (`unchanged`)
+
+As `subscribeThread` does
+(`docs/superpowers/specs/2026-10-17-thread-resubscribe-resume-design.md`):
+
+- An opted-in snapshot carries `revision`: a 128-bit digest of `HeldShell`'s
+  fingerprints, ids, counts and cap parameters, under keys secret to the server
+  process. A restart draws new keys.
 - **Each delta chunk's last item** carries the revision after the chunk. The
-  client records a revision only from an item that carries one, and clears it
-  when it applies an item without one. A client that missed or dropped an item
-  therefore holds no revision, or a stale one, and gets a snapshot.
-- The client persists the revision with the cached shell (§7).
-- On subscribe with `resume: { revision, snapshotSequence }`, the server loads
-  the kept set for the request and compares. It answers
-  `{ kind: "unchanged", snapshotSequence, revision }` only when the revision is
-  equal and the server's sequence is at least the client's. It then sends
-  deltas against that shell. Anything else gets the snapshot: a change the
-  client missed, a restart, an unknown revision, a newer sequence than the
-  server's, or a different include set that changed the kept set.
-- Sticky rows from the previous subscription aren't in a fresh kept set, so a
-  client that held them gets a snapshot. That costs bytes, never correctness,
-  and only after a session that kept extra rows.
+  client records a revision only from an item that carries one and clears it
+  on one that doesn't.
+- On `resume: { revision, snapshotSequence }` the server loads the kept set and
+  answers `{ kind: "unchanged", snapshotSequence, revision, activityAges }` only
+  when the revision is equal and its sequence is at least the client's;
+  anything else gets the snapshot.
+- **`activityAges`** maps each kept thread with a `lastActivityAt` to its age
+  on the server's clock now: `Schema.Record(ThreadId, NonNegativeInt)`. The
+  revision excludes ages (they grow every second), and a cached shell loses the
+  client's receipt times (§7), so without this a cache restored an hour later
+  would show Working from its original one-second age. The client pins each
+  age on receipt of `unchanged`, exactly as for a snapshot. At 25 to 60 kept
+  threads this is about 2 KB, and only on resume.
 
-### 5. Wire contract
+### 6. Wire contract
 
 `packages/contracts/src/orchestration.ts`, schema only:
 
 ```ts
 export const OrchestrationSubscribeShellInput = Schema.Struct({
-  /** Apply the finished-thread cap; older servers ignore it and send every thread. */
-  cap: Schema.optional(
-    Schema.Struct({
-      include: Schema.optional(Schema.Array(ThreadId)),
-    }),
-  ),
-  /** The revision of the shell the client holds; older servers ignore it. */
+  cap: Schema.optional(Schema.Struct({ include: Schema.optional(Schema.Array(ThreadId)) })),
   resume: Schema.optional(
     Schema.Struct({
       revision: TrimmedNonEmptyString,
@@ -246,303 +287,363 @@ export const OrchestrationSubscribeShellInput = Schema.Struct({
 });
 ```
 
-- `subscribeShell`'s payload becomes this struct. `{}` stays valid, so an old
-  client's request decodes unchanged.
-- `OrchestrationShellStreamItem` gains `{ kind: "unchanged", snapshotSequence,
-  revision }`. The `snapshot` item and the delta items gain an optional
-  `revision`.
-- `OrchestrationProjectShell` gains the optional `olderThreads`.
-- New RPC `orchestration.listOlderThreads` in `ORCHESTRATION_WS_METHODS` and
-  `WsRpcGroup`.
-- `rpc-wire` fixtures regenerate: the `unchanged` stream shape, the new
-  method, its typed failure. Counts in the exporter, its test and
-  `apps/server/tests/rpc_wire.rs` move with them.
+- `{}` stays valid, so an old client's request decodes unchanged. Sending
+  `cap` or `resume` opts into revisions; neither gets no `revision`, no
+  `capped` and never `unchanged`.
+- `OrchestrationShellSnapshot` gains `capped: Schema.optional(Schema.Boolean)`.
+- `OrchestrationShellStreamItem` gains `unchanged` (with `activityAges`); the
+  `snapshot` and delta items gain an optional `revision`.
+- `OrchestrationProjectShell` gains `olderThreads` (§2).
+- New RPCs `orchestration.listOlderThreads` and `orchestration.getThreadShells`.
+- `rpc-wire` fixtures regenerate, with the counts in the exporter, its test and
+  `apps/server/tests/rpc_wire.rs`.
 
-`resume` without `cap` is valid: it resumes a full shell. Sending `cap` or
-`resume` is what opts a client into revisions; a request with neither, as an
-old client sends, gets no `revision` and never `unchanged`.
+### 7. Compatibility matrix
 
-### 6. Compatibility matrix
+| Client     | Server | Result                                                                                                                                                         |
+| ---------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| old        | old    | today                                                                                                                                                          |
+| old (`{}`) | new    | every thread, no `capped`, `revision` or `olderThreads`, never `unchanged`: #223's delta stream                                                                |
+| new        | old    | the server ignores `cap` and `resume`; every thread, no `capped`, so absence stays authoritative as today; no `olderThreads`, so the new RPCs are never called |
+| new        | new    | the kept set, counts, revisions, `unchanged`, older pages, the resolver                                                                                        |
 
-| Client     | Server | Result                                                                                                                                   |
-| ---------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| old        | old    | today                                                                                                                                    |
-| old (`{}`) | new    | every thread, no `revision`, no `olderThreads`, never `unchanged`: byte for byte the delta stream of #223                                |
-| new        | old    | the server ignores `cap` and `resume`; every thread, no `revision`; the client sees no `olderThreads` and never calls `listOlderThreads` |
-| new        | new    | the kept set, counts, revisions, `unchanged`, older pages                                                                                |
+- An old client never receives the new fields or items, because it never opts
+  in, and `Schema.Struct` ignores an extra key anyway.
+- **Downgraded client.** It loads a cache written by a new one, ignores
+  `revision` and `capped`, shows it `degraded`, and replaces it with its first
+  snapshot, which is full. Its own lifecycle cleanup then runs against a full
+  list, as today.
+- **Downgraded server.** A cached revision mismatches (the old server ignores
+  `resume`); the full snapshot without `capped` replaces the cache.
 
-- **Unknown fields and variants.** An old client never receives `unchanged`,
-  `revision` or `olderThreads`, because it never opts in. A new client of an
-  old server never receives them either. `Schema.Struct` ignores an extra key in
-  any case.
-- **Downgraded client.** An old client loads a cache written by a new one; the
-  `revision` key is ignored. The cache holds a capped shell, shown as
-  `degraded` until its first snapshot, which is full and replaces it.
-- **Downgraded server.** A cached revision mismatches the old server's
-  behavior (it ignores `resume`), so the full snapshot replaces the cache.
+### 8. Removal items reach left-out threads
 
-### 7. Client runtime
+A page copy or a resolved copy must not outlive its thread.
 
-- `makeEnvironmentShellState` subscribes with
-  `{ cap: { include }, resume }` when it holds a cached revision. `include` is
-  built when the subscription starts, from this environment's pinned and unread
-  thread keys and the routed thread. It is read once per subscription, so
-  pinning a thread doesn't resubscribe; a pinned thread is already loaded
-  because the person could see it to pin it.
-- **`unchanged`.** It applies like a snapshot equal to the cached one: status
-  `live`, nothing published if nothing changed, the revision kept. Like a
-  snapshot it is accepted only from the current session and generation.
-- **Revision.** Held in the shell state beside the snapshot. Set from an item
-  that carries one, cleared by one that doesn't. Persisted: `StoredShellSnapshot`
-  gains an optional `revision`, so the cache schema needs no version bump.
-- **Older pages.** A new session-only store, `olderThreads`, keyed by
-  environment and `(projectId | hostThreadId | "all", query)`. It holds the
-  loaded threads and the next cursor, is never persisted, and is cleared when
-  the session changes, since the server may have restarted. A thread that
-  later arrives in the shell wins over its page copy (the shell copy is
-  live-updated; the page copy isn't).
-- **Shell plus pages.** Readers that list finished threads (left panel older
-  rows, Done group, palette) merge the shell's threads with the loaded pages,
-  deduped by id, shell first.
+- The shell stream also collects, from the events of each coalesce window,
+  every `thread.deleted` and `thread.archived` aggregate id and every
+  `project.deleted` id. At the tick it sends `thread-removed` or
+  `project-removed` for each such id that the delta didn't already cover, held
+  or not. It is a few bytes per event and only for opted-in subscribers.
+- After `Lagged`, a failed read or any snapshot, the client drops every page
+  and resolved copy for the environment (§9), since a removal may have been
+  missed.
+- A thread that was paged, entered the shell, and is then deleted gets the
+  ordinary removal delta; the client drops it from the shell and any page.
 
-### 8. Web
+### 9. Client runtime
 
-- **Left panel, per project.** Under the project's rows, after **Show
-  more**/**Show less**, a row **N older threads** when `olderThreads.count > 0`.
-  Selecting it loads the first page inline (20 rows) as ordinary workspace rows
-  in the project's sort order. While more remain, the last row is **Load 20
-  more**. **Hide older threads** collapses them again; the loaded rows stay in
-  memory for the session.
-- **N more chats.** The count adds `olderThreads.panels` for that host. The
-  menu that lists the chats pages the host's older panels the same way.
-- **Agents view and Inbox Done.** Done lists the loaded finished agents. When
-  any project has older threads, the group ends with **Show older (N)**, paging
-  `listOlderThreads` without a project.
-- **Command palette.** Search matches the shell and loaded pages at once. When
-  the query has at least 2 characters and the shell is capped, it asks
-  `listOlderThreads({ query, limit: 20 })` after 250 ms of no typing and appends
-  the new matches under **Older threads**. A newer query cancels the request in
-  flight.
+- **Subscribe.** `{ cap: { include }, resume? }`, with `include` built at
+  subscribe time from this environment's pinned and unread thread keys, the
+  routed thread and the hosts of open chat panels.
+- **`unchanged`.** Applies like a snapshot equal to the cache: status `live`,
+  `capped` kept, the revision kept, and `activityAges` pinned to the receipt
+  time. Accepted only from the current session and generation.
+- **Revision.** Held beside the snapshot, set from items that carry one,
+  cleared by items that don't, persisted as an optional `revision` in
+  `StoredShellSnapshot`.
+- **Off-shell threads.** A session-only store per environment holds thread
+  shells that are not in the live shell: older pages (keyed by scope and query,
+  with their cursors) and threads resolved by `getThreadShells`. It is never
+  persisted. It drops an id on a removal item, drops a project's threads on
+  `project-removed`, yields to the shell when the id arrives there (the shell
+  copy is live-updated, the off-shell copy isn't), and is cleared on any
+  snapshot, `Lagged`-triggered or not, and on session change.
+- **Resolver.** One lookup in `state/entities.ts` for every reader:
+  1. the live shell;
+  2. the off-shell store;
+  3. when both miss and the shell is `capped`, `getThreadShells([id])`,
+     batched per tick, whose `threads` fill the store and whose `missing` is
+     remembered for the session.
 
-### 9. UI.md states
+  `readThreadShell`, `useThreadShell` and `findThreadRef` read steps 1 and 2
+  synchronously; `useThreadShell` also starts step 3 and re-renders when it
+  lands. A new `resolveThreadShell(ref): Promise<Resolved | Missing>` runs all
+  three. Its callers, from the list under Current behavior:
+  - **Actions** await `resolveThreadShell` and fail visibly on `Missing`
+    (**This thread no longer exists.**), never succeed silently:
+    `useThreadActions.ts` archive, unarchive, delete, rename and fork paths
+    (`:104,121,123,317,431`), `centerPanelActions.ts:133,159,185`,
+    `WorktreeRemovalDialog.tsx:115`, `useHandleNewThread.ts:90`,
+    `useAddProjectWorkflow.ts:1089`, and `UiIntentNotifier.tsx:60`, which
+    therefore finds an omitted panel's host before it routes.
+  - **Labels** use the synchronous read and its re-render:
+    `UiIntentNotifier.tsx:118`, `OpenRequestRouter.tsx:109`,
+    `MessageProvenance.tsx:48`, `deviceOwner.tsx:26`, `PanelTabAgentBadge.tsx:13-14`,
+    `WorktreeRemovalDialog.tsx:160`. While unresolved they show what they show
+    today for an unknown thread.
 
-- **Loading.** The **N older threads** row turns into **Loading older
-  threads…** with a spinner and keeps its place. The palette section shows
-  **Searching older threads…** under the local results, which stay usable.
-- **Error.** **Couldn't load older threads.** with **Retry**, in place. The
-  palette shows the same line under its local results. Loaded rows stay.
-- **Offline.** While the environment isn't live, the row reads
-  **N older threads: reconnect to load** and is disabled, with that reason as
-  its accessible description. The palette doesn't search older threads and
-  says **Older threads are searched when <name> is connected.**
-- **Empty.** A page with no rows, because the counts moved on, removes the row
-  and refreshes the count from the next project upsert. A search with no older
-  matches shows nothing extra.
-- **No surprise.** Nothing a person pinned, left unread, or has open
-  disappears. A card's **N more chats** count is unchanged by the cap.
-- **Accessibility.** The rows are buttons with their count in the name
-  ("12 older threads in <project>"). Loading and errors are announced through
-  the sidebar's existing polite live region.
+- **Lifecycle cleanup.** `ThreadLifecycleReconciler` keeps today's rule for a
+  snapshot without `capped`. For a capped one, a thread with persisted panel
+  state that is in neither the live shell, the archived snapshot nor the
+  drafts is a candidate, not a deletion: the reconciler asks
+  `getThreadShells(candidates)` in batches of 100 and deletes state only for
+  `missing` ids. Removal items delete state directly, as authoritative
+  evidence.
+- **Route guard.** `shouldRedirectMissingRouteThread` gains the capped input.
+  For a capped shell the 1 s timer never runs; the route redirects only when
+  the resolver returns `Missing` for the routed thread. Until then the route
+  shows the thread's loading state while its detail (#226's window) arrives,
+  however slow the link.
+- **Agents rows.** A terminal row whose host is not in the shell resolves the
+  host through the resolver instead of being dropped, so a terminal that turns
+  live between re-reads is never lost (§1 keeps it from the next re-read on).
 
-### 10. Server stream
+### 10. Web
 
-- `shell_stream_with_events` decodes `OrchestrationSubscribeShellInput`. A
-  decode failure ends the stream with `InvalidRequest`, as `subscribeThread`
-  does.
-- `HeldShell` gains the include set, the counts' fingerprints and the
-  `revision(keys)` method. The kept set of each re-read is `kept(include) ∪
-  held ids`.
-- `listOlderThreads` is `register_unary` in `register_orchestration_rpc_inner`,
-  next to `getArchivedShellSnapshot`.
+- **Left panel, per project.** After **Show more**/**Show less**, a row **N
+  older threads** when `olderThreads.count > 0`. Selecting it loads the first
+  `project` page inline as ordinary workspace rows; **Load 20 more** while a
+  cursor remains; **Hide older threads** collapses them for the session.
+- **N more chats.** The count adds the checkout's `chats` count. Its menu pages
+  the `checkout` scope.
+- **Agents view and Inbox Done.** When the environment's shell is capped, Done
+  ends with **Show older**, paging the `agents` scope, so finished panel chats
+  are reachable too.
+- **Command palette.** Search matches the shell and the off-shell store at
+  once. With 2 or more characters and a capped shell, it asks
+  `listOlderThreads({ scope: { kind: "agents" }, query, limit: 20 })` after
+  250 ms without typing, appends new matches under **Older threads**, and a
+  newer query cancels the request in flight.
 
-### 11. Persistence
+### 11. Server stream
 
-- **Server.** No migration. The cap's ordering uses `latest_user_message_at`
-  and `updated_at` on `projection_threads`. If #225's server-time numbers show
-  the scan matters, add an index on `(project_id, archived_at, deleted_at,
-  latest_user_message_at, updated_at)` in the same PR.
-- **Client.** The optional `revision` in `StoredShellSnapshot`. Older pages
-  are never written.
+- `shell_stream_with_events` decodes `OrchestrationSubscribeShellInput`; a
+  decode failure ends the stream with `InvalidRequest`.
+- `HeldShell` gains the include set, the counts, the removal ids collected in
+  the window (§8) and `revision(keys)`.
+- **Terminal hosts.** The stream takes the terminal manager's live-agent host
+  set when it re-reads, and the terminal metadata subscription schedules a
+  re-read when that set changes. Only the set of host ids crosses the module
+  boundary.
+- `listOlderThreads` and `getThreadShells` are `register_unary` in
+  `register_orchestration_rpc_inner`.
 
-### 12. Profiler, crash and trace coverage
+### 12. UI.md states
 
-- **The new RPC.** `listOlderThreads` is registered through
-  `registry.register_unary` (`rpc/session.rs`), which times it. It's a local
-  database read, so it is **not** added to `is_long_running`
-  (`diagnostics/profiler/latency.rs:106`). A slow one is a real `rpc.slow`.
-- **`subscribeShell`** stays a `register_stream`; its input changes, not its
-  registration.
-- **Auth.** `orchestration.listOlderThreads` joins the read scope next to
-  `orchestration.subscribeShell` (`auth/scope.rs:56`) and the read mutability
-  table tested in `production_maintenance.rs`.
-- **Logs.** A malformed cursor or input logs `tracing::warn!` with the method
-  and the reason only. A search query, thread titles and previews never reach
-  logs or profiler records; at most the query's length.
-- **Measurements.** The budget and traffic tests record counts, bytes and
-  durations only.
-- No new process, service, shutdown step, re-exec mode or removal path.
+- **Loading.** **N older threads** becomes **Loading older threads…** with a
+  spinner in place. The palette shows **Searching older threads…** under local
+  results, which stay usable. A route to a left-out thread shows the thread's
+  normal loading state, never a redirect.
+- **Error.** **Couldn't load older threads.** with **Retry**, in place; loaded
+  rows stay. An action on a thread the server reports missing says **This
+  thread no longer exists.** and changes nothing.
+- **Offline.** The row reads **N older threads: reconnect to load**, disabled,
+  with that reason as its accessible description. The palette says **Older
+  threads are searched when <name> is connected.**
+- **Empty.** A page with no rows removes the row; the next project upsert
+  refreshes the count.
+- **No surprise.** Nothing pinned, unread, open, or hosting a live AI Terminal
+  disappears; **N more chats** is unchanged by the cap; no panel state is lost
+  because a thread was left out.
+- **Accessibility.** The rows are buttons named with their count ("12 older
+  threads in <project>"); loading and errors use the sidebar's polite live
+  region.
 
-### 13. Budget
+### 13. Persistence
 
-- `transfer_budget.rs` gets a capped shell entry on #225's fixture. Its budget
-  replaces the shell's 40,000 / 255,000 bytes (deflated / decoded), set to the
-  measured capped size plus 3-5%.
-- The 3G reconnect row is re-measured with `scripts/measure-remote-latency.ts
-  --link 3g`, before and after, in the PR.
+- **Server.** No migration. If #225's server-time numbers call for it, an index
+  on `(project_id, archived_at, deleted_at, latest_user_message_at,
+  updated_at)` in the same PR.
+- **Client.** Optional `revision` and `capped` in `StoredShellSnapshot`. The
+  off-shell store is never written.
+
+### 14. Profiler, crash and trace coverage
+
+- **New RPCs.** `listOlderThreads` and `getThreadShells` register through
+  `registry.register_unary` (`rpc/session.rs`), which times them. Both are
+  local database reads, so neither joins `is_long_running`
+  (`diagnostics/profiler/latency.rs:106`); a slow one is a real `rpc.slow`.
+- **`subscribeShell`** stays a `register_stream`.
+- **Auth.** Both RPCs join the read scope beside `orchestration.subscribeShell`
+  (`auth/scope.rs:56`) and the read mutability table in
+  `production_maintenance.rs`.
+- **Logs.** Malformed input or cursors log `tracing::warn!` with the method and
+  reason only. Queries, titles and previews never reach logs or profiler
+  records; at most a query's length.
+- No new process, service, shutdown step, re-exec mode or removal path. The
+  terminal-host set is read from the existing terminal manager.
+
+### 15. Budget
+
+- `transfer_budget.rs` gets a capped shell entry on #225's fixture and lowers
+  the shell budget to the measured size plus 3-5%.
+- The 3G cold-connect and reconnect rows are re-measured before and after.
 
 ## Interaction with the shell deltas
 
-- The cap decides which threads enter `HeldShell`; deltas then work exactly as
-  in #223. Sticky ids (§1) mean a delta never removes a thread for leaving the
-  cap.
-- Counts are project fields, so they travel as `project-upserted`.
-- A fallback snapshot uses `kept ∪ held`, so it doesn't drop the client's rows.
-- The revision is computed from the same `HeldShell` fingerprints after each
-  tick, once per chunk.
+- The cap decides which threads enter `HeldShell`; deltas work as in #223.
+  Sticky ids mean a delta never removes a thread for leaving the cap.
+- Counts travel as `project-upserted`; removal items for left-out threads (§8)
+  share the chunk's sequence numbering.
+- A fallback snapshot uses `kept ∪ held`, so it never drops the client's rows.
+- The revision is computed from `HeldShell` once per chunk.
 
 ## Interaction with #226
 
-- **Separate streams, same patterns.** #226 windows a thread inside
-  `subscribeThread`; this caps the list inside `subscribeShell`. Both resume
-  with `{ revision, snapshotSequence }` and `unchanged`, under process-secret
-  keys, and both are opt-in with optional inputs.
-- **Opening a left-out thread.** The route works from the thread detail, which
-  #226 windows. The thread's shell row arrives only if it is routed at the next
-  shell subscription, pinned, or becomes live. Until then the card for a left-out
-  ad-hoc thread shows in the project's older rows (§8) with the page copy.
-- **Budgets.** #225's budget test gets both entries: a windowed thread open
-  (#226) and a capped shell (this design). The cold-connect 3G row improves by
-  both.
-- **No shared code beyond the revision helper.** The keyed digest of
-  `HeldThread::revision` moves to a small shared function used by both
-  `HeldThread` and `HeldShell`.
+- **Same patterns, separate streams.** Both resume with
+  `{ revision, snapshotSequence }` and `unchanged` under process-secret keys,
+  and both are opt-in.
+- **Opening a left-out thread.** The route resolves through §9 and never
+  redirects before the resolver answers; the thread itself arrives as #226's
+  window. The shell row joins the live shell when the thread is routed at the
+  next subscription, pinned, unread or live.
+- **Budgets.** #225's test gets a windowed thread open (#226) and a capped
+  shell (this design).
+- **Shared code.** The keyed digest of `HeldThread::revision` moves to a small
+  function used by `HeldThread` and `HeldShell`.
 
 ## Tests that prove the acceptance criteria
 
 ### Rust, `apps/server/src/persistence/repositories.rs`
 
 - `shell_rows_keep_live_card_included_and_recent_threads_of_150` — with 150
-  finished threads, the rows hold the newest 25 plus 3 per project, every live,
-  `default`, worktree and included thread, and the right `olderThreads` counts
-  per project and per host.
-- `shell_rows_read_no_sessions_or_messages_for_left_out_threads` — a
-  statement-count probe (`sqlite3_trace` profile or a counting wrapper) shows
-  per-thread reads only for kept threads.
+  finished threads: the newest 25 plus 3 per project, every live, `default`,
+  worktree and included thread, and the right `olderThreads` counts per
+  project and per checkout.
+- `shell_rows_count_main_checkout_chats_of_every_host` — pathless panels of
+  two hosts count under one main-checkout entry.
+- `shell_rows_read_no_sessions_or_messages_for_left_out_threads`.
 - `shell_rows_order_recent_finished_by_last_user_message_then_update`.
 
 ### Rust, `apps/server/src/production/orchestration_rpc.rs`
 
-- `shell_stream_without_cap_sends_every_thread` — `{}` gets today's full list
-  and no `revision`.
-- `shell_stream_cap_sends_kept_set_and_counts`.
+- `shell_stream_without_cap_sends_every_thread` — `{}`: full list, no
+  `capped`, no `revision`.
+- `shell_stream_cap_sends_kept_set_counts_and_capped`.
+- `shell_stream_keeps_a_live_terminal_host` — an old pathless workspace with a
+  working terminal and no session is kept, and becomes kept when its terminal
+  starts working.
 - `shell_stream_upserts_a_left_out_thread_that_starts_a_turn`.
-- `shell_stream_keeps_a_thread_pushed_out_of_the_cap` — no `thread-removed`.
-- `shell_stream_fallback_snapshot_keeps_held_threads` — after `Lagged`.
-- `shell_stream_resume_with_current_revision_answers_unchanged`.
-- `shell_stream_resume_with_stale_revision_or_new_keys_sends_snapshot` — a
-  missed change, a restart (fresh keys), an unknown revision, a newer sequence.
+- `shell_stream_keeps_a_thread_pushed_out_of_the_cap`.
+- `shell_stream_sends_removal_for_a_left_out_thread_deleted_or_archived`.
+- `shell_stream_fallback_snapshot_keeps_held_threads`.
+- `shell_stream_resume_with_current_revision_answers_unchanged_with_ages`.
+- `shell_stream_resume_with_stale_revision_or_new_keys_sends_snapshot`.
 - `shell_stream_delta_chunks_carry_the_revision_on_their_last_item`.
 - `list_older_threads_pages_every_left_out_thread_once_newest_first`.
-- `list_older_threads_filters_by_project_and_host`.
+- `list_older_threads_checkout_scope_matches_the_chat_grouping`.
+- `list_older_threads_agents_scope_includes_panels`.
 - `list_older_threads_searches_titles_case_insensitively_with_escaped_wildcards`.
 - `list_older_threads_rejects_a_malformed_cursor`.
+- `get_thread_shells_returns_live_and_archived_and_lists_missing`.
 
 ### Rust, integration
 
-- `apps/server/tests/production_orchestration_rpc.rs`:
-  `shell_cap_and_resume_over_the_wire`.
-- `apps/server/tests/transfer_budget.rs`: the capped shell entry.
-- `apps/server/tests/production_maintenance.rs`: `listOlderThreads` is a read.
+- `production_orchestration_rpc.rs`: `shell_cap_and_resume_over_the_wire`.
+- `transfer_budget.rs`: the capped shell entry.
+- `production_maintenance.rs`: both new RPCs are reads.
 
 ### Contracts (`vp run check:contracts`)
 
-- Regenerated `rpc-wire` fixtures for `unchanged`, `listOlderThreads` and its
-  failure; `rpcRustParity.test.ts` passes.
-- `orchestration.test.ts`: `{}` decodes as a `subscribeShell` input; an old
-  project shell without `olderThreads` decodes.
+- Regenerated fixtures; `rpcRustParity.test.ts` passes.
+- `orchestration.test.ts`: `{}` decodes as a `subscribeShell` input; a snapshot
+  and a project shell without the new fields decode.
 
 ### Client runtime
 
 - `shell-sync.test.ts`, `describe("shell cap and resume")`:
   - `subscribes with the cap, the include set and the cached revision`;
-  - `applies a capped snapshot and keeps its counts`;
-  - `takes unchanged as live without publishing`;
-  - `clears the revision on an item without one and resubscribes without it`;
+  - `takes unchanged as live and pins its activity ages`;
+  - `a cold resume after an hour shows No update, not Working` (cached shell,
+    `unchanged` with an hour-old age, then the freshness reader);
+  - `clears the revision on an item without one`;
   - `ignores unchanged from a stale session`.
-- `olderThreads.test.ts`: `pages and dedupes against the shell`,
-  `clears pages when the session changes`, `a shell copy wins over a page copy`.
-- `storage` test (`apps/web/src/connection/storage.test.ts`): a cached shell
-  with and without `revision` loads.
+- `offShellThreads.test.ts`: `pages and dedupes against the shell`,
+  `a removal item drops a page copy`, `project-removed drops its threads`,
+  `any snapshot clears the store`, `the shell copy wins`.
+- `entities` resolver tests: `resolves shell, then off-shell, then the server`,
+  `remembers missing for the session`, `batches lookups per tick`.
 
 ### Web (happy-dom, from `apps/web`)
 
-- `Sidebar.logic.test.ts`: `shows N older threads under a capped project`,
-  `adds left-out panels to N more chats`, `keeps every workspace card`.
-- `agentsSection.logic.test.ts`: `ends Done with Show older when threads were
-  left out`, `pages older agents into Done`.
-- `CommandPalette.logic.test.ts`: `appends older matches after local ones`,
-  `cancels an older search when the query changes`.
+- `ThreadLifecycleReconciler.test.tsx`:
+  `keeps panel state of a thread left out of a capped snapshot`,
+  `deletes panel state only for ids getThreadShells reports missing`,
+  `deletes on a removal item`, and the existing full-list tests unchanged.
+- `threadRoutes.test.ts`: `never redirects a capped route before the resolver
+  answers`, `redirects when the resolver reports missing`.
+- `useThreadActions.test.ts`: `archives a left-out thread through the
+  resolver`, `reports a missing thread instead of succeeding`.
+- `UiIntentNotifier.test.tsx`: `routes a left-out panel to its host`.
+- `agentsSection.agents.test.ts`: `keeps a terminal row whose host is
+  off-shell`, `pages older agents into Done, panels included`.
+- `Sidebar.logic.test.ts`: `shows N older threads`, `adds the checkout's chats
+  count to N more chats`, `keeps every workspace card`.
+- `CommandPalette.logic.test.ts`: `appends older matches`, `cancels an older
+  search when the query changes`.
 - A component test for the older row's loading, error, offline and empty
   states.
 
 ### Desktop e2e and manual
 
-- `apps/desktop/e2e/specs/main-window.e2e.ts` still passes with the cap on.
-- Manual, on #225's 3G scenario: a cold connect, a reconnect answered
-  `unchanged`, the older row, Done paging and search finding a left-out
-  thread.
+- `apps/desktop/e2e/specs/main-window.e2e.ts` passes with the cap on.
+- Manual on #225's 3G scenario: cold connect, a reconnect answered
+  `unchanged`, older rows, Done paging, search, opening a left-out thread on
+  the slow link without a redirect.
 
 ## Living docs (same PR)
 
-- `docs/architecture/rpc-and-orchestration.md`: the kept set, sticky ids,
-  counts, `listOlderThreads` and shell resume.
-- `docs/architecture/connection-runtime.md`: a cached shell's revision and
-  `unchanged`.
-- `docs/user/workspace-ui.md`: the left panel's older rows, **N more chats**,
-  Done paging and search.
-- `docs/testing/` runbooks: reviewed; the manual 3G check goes in #225's
-  slow-link scenario.
+- `docs/architecture/rpc-and-orchestration.md`: the kept set, `capped`, sticky
+  ids, counts, removal items, both RPCs, shell resume and `activityAges`.
+- `docs/architecture/connection-runtime.md`: the absence rule, the resolver,
+  the reconciler and route guard evidence, the cached revision.
+- `docs/user/workspace-ui.md`: older rows, **N more chats**, Done paging,
+  search.
+- `docs/testing/` runbooks: reviewed; the manual check goes in #225's slow-link
+  scenario.
 
 ## Options considered
 
-1. **Recommended: an opt-in kept set with sticky ids, per-project counts, a
-   paged RPC and revision resume.** It reuses the delta path, `HeldShell`, the
-   thread resume pattern and the route's detail fallback.
-2. **The server tracks unread.** Rejected for this issue. Unread and pins are
-   per device today; moving them to the server is a product change.
-3. **A global newest-N only.** Rejected. A project with only old threads would
-   show none of its own recent work.
-4. **Per-project newest-N only.** Rejected. With six projects it keeps most of
-   the 160 threads, so it barely cuts bytes.
-5. **Remove a thread that leaves the cap with `thread-removed`.** Rejected. The
-   client can't tell it from a deletion, and the row would vanish while the
-   person looks at it.
-6. **Resubscribe the shell when the routed thread changes.** Rejected. Every
-   navigation would cost a round trip and often a snapshot. The route already
-   works from the thread detail.
-7. **Search in the client over pages.** Rejected. It would have to page every
-   older thread first.
-8. **A capability flag in `server.getConfig`.** Not needed. The client learns
-   from the shell itself (`olderThreads`, `revision`) whether the server caps.
-
-## Open questions for approval
-
-1. `SHELL_RECENT_FINISHED` = 25 and `SHELL_RECENT_PER_PROJECT` = 3, to be
-   checked against #225's fixture once the capped size is measured.
-2. Whether a `workspace` thread without a worktree (an ad-hoc main-checkout
-   row) should stay card-backing. This design caps it, because those rows are
-   most of the finished list; keeping them would make the cap close to useless
-   on #225's fixture.
-3. Whether the search should also match the conversation preview. This design
-   matches titles only, as the palette does today.
+1. **Recommended: an opt-in kept set with sticky ids, a `capped` marker,
+   checkout-grouped counts, two read RPCs, removal items for left-out threads,
+   one resolver, and revision resume with ages.**
+2. **Send every thread id in a capped snapshot** so absence stays meaningful.
+   Rejected: ids alone are tens of KB on large stores, and they still don't
+   carry what readers need (host, title, archived state).
+3. **The server tracks unread and pins.** Rejected for this issue; they are
+   per device today.
+4. **Remove a thread that leaves the cap.** Rejected: indistinguishable from a
+   deletion, and rows would vanish in use.
+5. **Resubscribe the shell when the route changes.** Rejected: a round trip
+   and often a snapshot per navigation; the resolver covers the route.
+6. **Search in the client over pages.** Rejected: it must page everything
+   first.
+7. **Persist client receipt times instead of `activityAges`.** Rejected: the
+   cache would trust a clock across restarts and sleeps; the server's age is
+   authoritative.
 
 ## Residual risk
 
-- **Order differs between kept and paged rows.** The kept set is chosen by the
-  default sort; with another sort order the older rows can interleave with the
-  loaded ones once loaded.
-- **Include set staleness.** A thread pinned or marked unread on another device
-  is not in this client's include set; it shows only once paged or when it
-  becomes live.
-- **Sticky growth.** A long session that creates many threads keeps them all
-  until the next subscription.
+- **Order differs between kept and paged rows** under a non-default sort.
+- **Include-set staleness.** A thread pinned or marked unread on another
+  device appears only once paged, resolved or live.
+- **Sticky growth.** A long session keeps every thread it created until the
+  next subscription.
+- **Resolver traffic.** A view listing many off-shell ids (for example a long
+  provenance chain) costs one batched `getThreadShells` per tick.
+
+## Review resolutions
+
+### Round 1 (`e724d358d`)
+
+1. **P1, capped snapshots trigger lifecycle cleanup.** The absence rule; the
+   `capped` marker; the reconciler deletes only on removal items or
+   `getThreadShells` `missing` (§1, §4, §9).
+2. **P2, live AI Terminals lose their hosts.** Kept set item 2, read from the
+   terminal manager with re-reads on its changes (§1, §11), and the Agents
+   rows resolve an off-shell host instead of dropping it (§9).
+3. **P2, opening a left-out thread can redirect.** For a capped shell the 1 s
+   timer never runs; only a resolver `Missing` redirects (§9).
+4. **P2, actions and notifiers miss off-shell threads.** One resolver in
+   `state/entities.ts`, every caller listed with its sync or async use; actions
+   fail visibly on `Missing` (§9).
+5. **P2, page copies outlive deletion.** Removal items for left-out ids from
+   the window's lifecycle events, `project-removed` drops a project's copies,
+   and any snapshot clears the off-shell store (§8, §9).
+6. **P2, Done can't page panels.** The `agents` scope pages every left-out
+   agent, panels included (§3, §10).
+7. **P2, host-based counts disagree with checkout cards.** Counts and the
+   `checkout` scope use `workspaceCheckoutKey`'s grouping (§2, §3).
+8. **P2, cold resume resets freshness.** `unchanged` carries `activityAges`,
+   pinned on receipt; a cold-resume test (§5, §9).
