@@ -3172,6 +3172,7 @@ async fn restart_recovery_refused_for_provider_configuration_reports_it() {
         VecDeque::from([Err(ProviderRuntimeError::ProviderConfiguration {
             provider: "cursor".to_owned(),
             detail: "failed to load configuration: bad table".to_owned(),
+            config_path: "~/.codex/config.toml".to_owned(),
         })]);
 
     let outcome = reconcile_orchestration_turn(
@@ -3193,6 +3194,41 @@ async fn restart_recovery_refused_for_provider_configuration_reports_it() {
     assert_eq!(state.launches.len(), 1);
     assert!(state.sends.is_empty());
     drop(state);
+    fixture.close().await;
+}
+
+/// A restart's reconciliation launch that fails before reaching the provider (here, a process
+/// that cannot start) is reported as a failed launch, which recovery counts against its budget;
+/// a provider that answers but cannot tell yet stays `Unavailable`.
+#[tokio::test]
+async fn a_failed_restart_reconciliation_launch_is_reported_as_such() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    fixture.state.lock().unwrap().start_results =
+        VecDeque::from([Err(ProviderRuntimeError::Spawn {
+            provider: "cursor".to_owned(),
+            detail: "the app-server exited before initialize".to_owned(),
+        })]);
+
+    let outcome = reconcile_orchestration_turn(
+        &fixture.supervisor,
+        &fixture.engine,
+        &fixture.settings.path().to_path_buf(),
+        fixture.row.clone(),
+    )
+    .await;
+
+    let ProviderReconciliationOutcome::LaunchFailed { detail } = outcome else {
+        panic!("a launch that never reached the provider is reported as such: {outcome:?}");
+    };
+    assert!(
+        detail.contains("could not start: the app-server exited before initialize"),
+        "the user-facing detail: {detail}"
+    );
+    assert!(fixture.state.lock().unwrap().sends.is_empty());
     fixture.close().await;
 }
 

@@ -359,6 +359,12 @@ pub enum ProviderReconciliationOutcome {
     ProviderConfiguration {
         detail: String,
     },
+    /// The reconciliation launch failed before it reached the provider, such as an app-server
+    /// that exits before `initialize`. Restart recovery tries again with backoff, and counts
+    /// these against its launch budget so a failure that never clears cannot relaunch forever.
+    LaunchFailed {
+        detail: String,
+    },
 }
 
 pub struct ProviderDeliveryHandle {
@@ -614,9 +620,14 @@ pub enum ProviderRuntimeError {
     /// The provider refused its own configuration (Codex: a `-32600` "failed to load
     /// configuration" on `thread/start` or `thread/resume`). Every launch is refused the same
     /// way until the user fixes that configuration, so a delivery fails once with `detail`, the
-    /// provider's message. The Display equals `Provider`'s, so logs and runtime rows read as before.
+    /// provider's message, and `config_path`, the file the provider read. The Display equals
+    /// `Provider`'s, so logs and runtime rows read as before.
     #[error("{provider} provider operation failed: {detail}")]
-    ProviderConfiguration { provider: String, detail: String },
+    ProviderConfiguration {
+        provider: String,
+        detail: String,
+        config_path: String,
+    },
     /// The selected model or session refuses one of the request's own options, so the same
     /// request is refused again on every retry. Raised by:
     /// - the shape checks of Claude, Codex and OpenCode: an option without an id, and a value of
@@ -2265,12 +2276,21 @@ pub(crate) fn delivery_detail(
         ProviderRuntimeError::Spawn { provider, detail } => {
             format!("{} could not start: {detail}", label(provider))
         }
-        ProviderRuntimeError::ProviderConfiguration { provider, detail } => format!(
-            // Raised only for Codex today. Turning off BiBCode's MCP server helps when the refused
-            // table is the one BiBCode adds (`mcp_servers.bibcode_thread`).
-            "{} could not start: {}. Fix that in Codex's config.toml (~/.codex/config.toml), or              turn off MCP server in Settings → Agents → Agent integrations, then retry.",
+        // BiBCode adds its per-thread server to every Codex launch whatever the MCP setting
+        // says, so the fix is in the file Codex read.
+        ProviderRuntimeError::ProviderConfiguration {
+            provider,
+            detail,
+            config_path,
+        } => format!(
+            "{} could not start: {}. Fix or rename the conflicting entry in {config_path}, then \
+             retry.",
             label(provider),
-            detail.trim().trim_end_matches('.')
+            detail
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end_matches('.')
         ),
         ProviderRuntimeError::MissingExecutable { provider, binary } => format!(
             // Retry keeps the turn's original route, so it launches only once the executable
@@ -2504,9 +2524,11 @@ pub async fn reconcile_orchestration_turn(
                         detail: delivery_detail(&error, Some(&label)),
                     };
                 }
+                // A launch that fails, such as an app-server that exits before `initialize`,
+                // counts against restart recovery's launch budget.
                 Err(error) => {
-                    return ProviderReconciliationOutcome::Unavailable {
-                        detail: error.to_string(),
+                    return ProviderReconciliationOutcome::LaunchFailed {
+                        detail: delivery_detail(&error, Some(&label)),
                     };
                 }
             }
@@ -13236,6 +13258,8 @@ struct CodexDriver {
     provider_label: String,
     /// The instance's custom models, which the catalog offers beside Codex's model list.
     custom_models: Vec<String>,
+    /// The `config.toml` this Codex reads, named when Codex refuses it.
+    config_path: String,
 }
 
 fn codex_activity_target_ids(
@@ -13308,6 +13332,10 @@ impl CodexDriver {
                 );
             }
         }
+        let config_path = request.environment.get("CODEX_HOME").map_or_else(
+            || "~/.codex/config.toml".to_owned(),
+            |home| Path::new(home).join("config.toml").display().to_string(),
+        );
         let mut args = Vec::new();
         if let Some(mcp) = request.mcp.as_ref() {
             request.environment.insert(
@@ -13366,6 +13394,7 @@ impl CodexDriver {
             attachments,
             provider_label: request.provider_label,
             custom_models: request.custom_models,
+            config_path,
         })
     }
 
@@ -13412,7 +13441,10 @@ impl CodexDriver {
 /// opens a thread, and refuses every relaunch the same way until the user fixes it. An
 /// app-server that exits before `initialize` is not classified from its stderr, which can arrive
 /// after stdout's end; it stays retryable and the delivery attempt bound ends it.
-fn codex_start_error(error: crate::provider::codex::runtime::RuntimeError) -> ProviderRuntimeError {
+fn codex_start_error(
+    error: crate::provider::codex::runtime::RuntimeError,
+    config_path: &str,
+) -> ProviderRuntimeError {
     match error {
         crate::provider::codex::runtime::RuntimeError::Protocol(
             crate::provider::codex::protocol::ProtocolError::RemoteRequest {
@@ -13427,6 +13459,7 @@ fn codex_start_error(error: crate::provider::codex::runtime::RuntimeError) -> Pr
             ProviderRuntimeError::ProviderConfiguration {
                 provider: "codex".to_owned(),
                 detail: message,
+                config_path: config_path.to_owned(),
             }
         }
         error => provider_error("codex")(error),
@@ -13487,7 +13520,11 @@ impl ProviderDriver for CodexDriver {
     }
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
-            let session = self.runtime.start().await.map_err(codex_start_error)?;
+            let session = self
+                .runtime
+                .start()
+                .await
+                .map_err(|error| codex_start_error(error, &self.config_path))?;
             Ok(StartedSession {
                 resume_cursor: session
                     .resume_cursor
@@ -31892,14 +31929,19 @@ done
 
     /// Codex refuses its configuration the same way on every launch, so a `-32600` "failed to
     /// load configuration" on `thread/start` or `thread/resume` fails the delivery once, with
-    /// Codex's message and what to do, instead of retrying it.
+    /// Codex's message and the config file Codex read, instead of retrying it.
     #[tokio::test]
     async fn a_codex_configuration_load_error_fails_the_delivery_once() {
         let message = std::path::Path::new("invalid transport in `mcp_servers.example`");
+        let codex_home = TempDir::new().expect("codex home");
+        let config = codex_home.path().join("config.toml");
         for resume_cursor in [None, Some(json!({ "threadId": "native-codex-thread" }))] {
             let error = start_codex_fixture(
                 "codex-config-error-fixture",
-                &[("BIBCODE_TEST_CODEX_CONFIG_ERROR", message)],
+                &[
+                    ("BIBCODE_TEST_CODEX_CONFIG_ERROR", message),
+                    ("CODEX_HOME", codex_home.path()),
+                ],
                 false,
                 resume_cursor.clone(),
             )
@@ -31917,7 +31959,13 @@ done
                 "{detail}"
             );
             assert!(detail.starts_with("Work Codex "), "{detail}");
-            assert!(detail.contains("config.toml"), "{detail}");
+            assert!(
+                detail.contains(&config.display().to_string()),
+                "names the effective CODEX_HOME's config: {detail}"
+            );
+            // BiBCode adds its per-thread server whatever the MCP setting says, so turning the
+            // setting off is no fix.
+            assert!(!detail.contains("MCP server"), "{detail}");
         }
     }
 

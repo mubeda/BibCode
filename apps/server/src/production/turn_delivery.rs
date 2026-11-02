@@ -471,13 +471,14 @@ async fn run(
     let mut reconciliation_ready_at = None;
     let repositories = engine.repositories();
     let mut cohort_backoff = RETRY_BACKOFF_MIN;
-    let mut recovery_cohort: HashSet<String> = loop {
+    // Each `sending` row left by the previous run, with its failed recovery launches.
+    let mut recovery_cohort: HashMap<String, i64> = loop {
         let result = tokio::select! {
             () = stop_claiming.cancelled() => return,
             rows = repositories.list_provider_turn_deliveries(vec![TurnDeliveryState::Sending]) => rows,
         };
         match result {
-            Ok(rows) => break rows.into_iter().map(|row| row.command_id).collect(),
+            Ok(rows) => break rows.into_iter().map(|row| (row.command_id, 0)).collect(),
             Err(error) => {
                 tracing::warn!(%error, "provider delivery recovery cohort could not be loaded; retrying");
                 tokio::select! {
@@ -774,7 +775,8 @@ async fn settle_dismissed_once(
                     }
                     Ok(false)
                 }
-                ProviderReconciliationOutcome::Unavailable { .. } => Ok(true),
+                ProviderReconciliationOutcome::Unavailable { .. }
+                | ProviderReconciliationOutcome::LaunchFailed { .. } => Ok(true),
                 // A turn this runtime still holds, or a server that cannot report its status:
                 // the marker stays until a later pass finds the session idle.
                 // A relaunch refused for the provider's configuration is refused again: stop asking.
@@ -829,7 +831,7 @@ enum DispatchWait {
 }
 
 struct RecoveryCompletion {
-    cohort: HashSet<String>,
+    cohort: HashMap<String, i64>,
     result: Result<bool, String>,
 }
 
@@ -876,7 +878,7 @@ async fn recover_sending(
     engine: &OrchestrationEngine,
     reconciler: &DeliveryReconciler,
     settings_root: Option<&Path>,
-    recovery_cohort: &mut HashSet<String>,
+    recovery_cohort: &mut HashMap<String, i64>,
     in_flight_commands: &HashSet<String>,
 ) -> Result<bool, String> {
     let rows = engine
@@ -888,11 +890,11 @@ async fn recover_sending(
         .iter()
         .map(|row| row.command_id.clone())
         .collect::<HashSet<_>>();
-    recovery_cohort.retain(|command_id| sending_ids.contains(command_id));
+    recovery_cohort.retain(|command_id, _| sending_ids.contains(command_id));
     let recovery_rows = rows
         .into_iter()
         .filter(|row| {
-            recovery_cohort.contains(&row.command_id)
+            recovery_cohort.contains_key(&row.command_id)
                 && !in_flight_commands.contains(&row.command_id)
         })
         .collect::<Vec<_>>();
@@ -946,6 +948,40 @@ async fn recover_sending(
             // way: the user's Retry or Dismiss decides.
             ProviderReconciliationOutcome::ConversationLost { detail }
             | ProviderReconciliationOutcome::ProviderConfiguration { detail } => {
+                (TurnDeliveryState::Uncertain, Some(detail))
+            }
+            // A launch that never reached the provider is tried again, at most
+            // `DELIVERY_ATTEMPTS_MAX` times per server run; then whether the original send
+            // arrived stays unknown, and the user's Retry or Dismiss decides.
+            ProviderReconciliationOutcome::LaunchFailed { detail } => {
+                let failures = recovery_cohort
+                    .get_mut(&row.command_id)
+                    .map_or(1, |failures| {
+                        *failures += 1;
+                        *failures
+                    });
+                if failures < DELIVERY_ATTEMPTS_MAX {
+                    tracing::warn!(
+                        command_id = %row.command_id,
+                        provider = %row.provider_kind,
+                        failures,
+                        %detail,
+                        "provider delivery reconciliation launch failed; preserving sending state"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    command_id = %row.command_id,
+                    provider = %row.provider_kind,
+                    failures,
+                    %detail,
+                    "provider delivery reconciliation launch kept failing; marking it uncertain"
+                );
+                crate::diagnostics::profiler::provider_turns::record_delivery_failing(
+                    &row.provider_kind,
+                    failures,
+                    "attempts-exhausted",
+                );
                 (TurnDeliveryState::Uncertain, Some(detail))
             }
             ProviderReconciliationOutcome::Unavailable { detail }
@@ -2436,6 +2472,103 @@ mod tests {
         assert_eq!(row.state, TurnDeliveryState::Uncertain);
         assert_eq!(row.last_error.as_deref(), Some("conversation lost"));
         assert_eq!(routed.load(Ordering::SeqCst), 0);
+
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    /// #273 review: a Codex row left `sending` by a crash whose reconciliation launch keeps
+    /// failing before it reaches Codex (an app-server that exits before `initialize`) relaunched
+    /// without limit, never counting an attempt. After the twentieth failed launch it becomes
+    /// uncertain with the last error, records `delivery.failing`, and nothing is resent.
+    #[tokio::test(start_paused = true)]
+    async fn restart_recovery_whose_launch_keeps_failing_gives_up_after_its_budget() {
+        const DETAIL: &str = "Codex could not start: the app-server exited before initialize";
+        let database = Database::open_in_memory().await.expect("database");
+        database.call(|connection| {
+            run_migrations(connection, None)?;
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('recover', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 0, 'accepted', NULL, 'digest')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('recover', 'thread-1', 'message-1', 'codex', 'codex', NULL, 'key', '{}', 'sending', 1, NULL, '2026-08-01T00:00:00Z', '2026-08-01T00:00:01Z')",
+                [],
+            )?;
+            Ok(())
+        }).await.expect("seed");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        let routed = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let routed = routed.clone();
+            move |_, _| {
+                routed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Accepted { turn_id: None }))
+            }
+        });
+        let launches = Arc::new(AtomicUsize::new(0));
+        let service = TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            1,
+            router,
+            Arc::new({
+                let launches = launches.clone();
+                move |_| {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(ready(ProviderReconciliationOutcome::LaunchFailed {
+                        detail: DETAIL.to_owned(),
+                    }))
+                }
+            }),
+        );
+
+        // Virtual time: the recovery backoff (up to 10 s a pass) passes at once. The bound is on
+        // passes, not on the clock, so a regression fails instead of hanging.
+        let mut row = None;
+        for _ in 0..10_000 {
+            let current = engine
+                .repositories()
+                .get_provider_turn_delivery("recover".to_owned())
+                .await
+                .expect("outbox")
+                .expect("delivery");
+            if current.state != TurnDeliveryState::Sending {
+                row = Some(current);
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        let row = row.unwrap_or_else(|| {
+            panic!(
+                "recovery gives up; still sending after {} launches",
+                launches.load(Ordering::SeqCst)
+            )
+        });
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(row.last_error.as_deref(), Some(DETAIL));
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            DELIVERY_ATTEMPTS_MAX as usize
+        );
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            0,
+            "nothing is resent by itself"
+        );
+        assert_eq!(
+            crate::diagnostics::profiler::provider_turns::take_recorded(),
+            [(
+                "delivery.failing",
+                serde_json::json!({
+                    "provider": "codex",
+                    "attempts": DELIVERY_ATTEMPTS_MAX,
+                    "errorClass": "attempts-exhausted",
+                })
+            )]
+        );
 
         service.shutdown().await;
         engine.shutdown().await;
