@@ -254,6 +254,7 @@ import { RegistryContext } from "@effect/atom-react";
 import { PreviewAutomationHosts } from "./PreviewAutomationHosts";
 import { registerPreviewRuntimeCapabilities } from "~/previewRuntimeCapabilities";
 import {
+  PreviewAutomationInvalidInputError,
   PreviewAutomationOperationError,
   PreviewAutomationPageUnreachableError,
   PreviewAutomationRecordingNotActiveError,
@@ -1013,7 +1014,7 @@ describe("handleRequest: navigate + resize", () => {
       makeRequest({
         operation: "resize",
         tabId: "tab-1",
-        input: { viewport: FILL_PREVIEW_VIEWPORT } as unknown,
+        input: { mode: "fill" } as unknown,
       }),
     )) as Record<string, unknown>;
 
@@ -1032,7 +1033,7 @@ describe("handleRequest: navigate + resize", () => {
     h.commandResults.resize = () => ({ _tag: "Failure", error: new Error("resize boom") });
 
     const error = await handle(
-      makeRequest({ operation: "resize", tabId: "tab-1", input: {} as unknown }),
+      makeRequest({ operation: "resize", tabId: "tab-1", input: { mode: "fill" } as unknown }),
     ).then(
       () => null,
       (e) => e,
@@ -1042,22 +1043,20 @@ describe("handleRequest: navigate + resize", () => {
 });
 
 describe("handleRequest: passthrough bridge operations", () => {
-  const cases: Array<[PreviewAutomationRequest["operation"], string]> = [
-    ["snapshot", "snapshot"],
-    ["click", "click"],
-    ["type", "type"],
-    ["press", "press"],
-    ["scroll", "scroll"],
-    ["evaluate", "evaluate"],
-    ["waitFor", "waitFor"],
+  const cases: Array<[PreviewAutomationRequest["operation"], string, unknown]> = [
+    ["snapshot", "snapshot", {}],
+    ["click", "click", { locator: "text=Continue" }],
+    ["type", "type", { text: "hello" }],
+    ["press", "press", { key: "Enter" }],
+    ["scroll", "scroll", { deltaY: 120 }],
+    ["evaluate", "evaluate", { expression: "document.title" }],
+    ["waitFor", "waitFor", { text: "Done" }],
   ];
-  for (const [operation, key] of cases) {
+  for (const [operation, key, input] of cases) {
     it(`forwards ${operation} to the bridge automation surface`, async () => {
       const handle = mountHost();
       seedReadyTab("tab-1");
-      const result = await handle(
-        makeRequest({ operation, tabId: "tab-1", input: { any: true } as unknown }),
-      );
+      const result = await handle(makeRequest({ operation, tabId: "tab-1", input }));
       const expected =
         operation === "evaluate" ? h.automationEvaluateResult : h.automationResults[key];
       expect(result).toEqual(expected);
@@ -1099,6 +1098,155 @@ describe("handleRequest: passthrough bridge operations", () => {
       (e) => e,
     );
     expect(error).toBeInstanceOf(PreviewAutomationOperationError);
+  });
+});
+
+describe("handleRequest: invalid input", () => {
+  const invalid: Array<[PreviewAutomationRequest["operation"], unknown, string]> = [
+    ["click", {}, "Provide exactly one click target."],
+    ["click", { locator: "a", x: 1, y: 2 }, "Provide exactly one click target."],
+    ["type", { text: 5 }, "text"],
+    ["press", { key: "" }, "key"],
+    ["scroll", {}, "Provide deltaX or deltaY."],
+    ["evaluate", { expression: "  " }, "expression"],
+    ["waitFor", {}, "Provide at least one wait condition."],
+    [
+      "navigate",
+      { url: "example.com", target: { kind: "environment-port", port: 3000 } },
+      "exactly one",
+    ],
+    ["resize", { mode: "preset" }, "Preset mode requires a preset"],
+  ];
+  for (const [operation, input, reason] of invalid) {
+    it(`rejects ${operation} arguments the contract refuses, naming the problem`, async () => {
+      const handle = mountHost();
+      seedReadyTab("tab-1");
+
+      const error = await handle(makeRequest({ operation, tabId: "tab-1", input })).then(
+        () => null,
+        (e) => e,
+      );
+
+      expect(error).toBeInstanceOf(PreviewAutomationInvalidInputError);
+      expect(error.responseTag).toBe("PreviewAutomationInvalidInputError");
+      expect(error.message).toContain(reason);
+    });
+  }
+
+  it("rejects an explicit tab with reuseExistingTab false, as the broker sends it", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+
+    // The server moves the agent's tabId out of the arguments into the request.
+    const error = await handle(
+      makeRequest({
+        operation: "open",
+        tabId: "tab-1",
+        tabIdExplicit: true,
+        input: { reuseExistingTab: false } as unknown,
+      }),
+    ).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationInvalidInputError);
+    expect(error.message).toContain("tabId");
+    expect(h.commandCalls.some((c) => c.label === "open")).toBe(false);
+  });
+
+  it("does not hold a server-assigned default tab against reuseExistingTab false", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+
+    await handle(
+      makeRequest({
+        operation: "open",
+        tabId: "tab-1",
+        tabIdExplicit: false,
+        input: { reuseExistingTab: false } as unknown,
+      }),
+    );
+
+    expect(h.commandCalls.some((c) => c.label === "open")).toBe(true);
+  });
+
+  it("still accepts addresses padded with whitespace, as normalization always did", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+    await handle(
+      makeRequest({
+        operation: "open",
+        input: { url: "  http://localhost:5173\n", show: false } as unknown,
+      }),
+    );
+    expect(h.resolveCalls).toEqual([{ kind: "url", url: "http://localhost:5173" }]);
+
+    h.resolveCalls.length = 0;
+    seedReadyTab("tab-1");
+    await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { url: "\texample.com \n" } as unknown,
+      }),
+    );
+    await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { target: { kind: "url", url: " http://localhost:3000\n" } } as unknown,
+      }),
+    );
+    expect(h.resolveCalls).toEqual([
+      { kind: "url", url: "example.com" },
+      { kind: "url", url: "http://localhost:3000" },
+    ]);
+  });
+
+  it("rejects before looking for a ready tab", async () => {
+    const handle = mountHost();
+    h.previewBridge = null;
+
+    const error = await handle(makeRequest({ operation: "click", input: {} })).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationInvalidInputError);
+  });
+
+  it("hands the bridge only the decoded fields", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    const seen: unknown[] = [];
+    (
+      h.previewBridge as {
+        automation: { click: (tab: string, input: unknown) => Promise<unknown> };
+      }
+    ).automation.click = (_tab, input) => {
+      seen.push(input);
+      return Promise.resolve(null);
+    };
+
+    await handle(
+      makeRequest({
+        operation: "click",
+        tabId: "tab-1",
+        input: { locator: "  text=Go  ", stray: true },
+      }),
+    );
+
+    expect(seen).toEqual([{ locator: "text=Go" }]);
   });
 });
 

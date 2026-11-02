@@ -159,6 +159,81 @@ export class PreviewAutomationPageUnreachableError extends Schema.TaggedError<Pr
   }
 }
 
+/**
+ * The agent's arguments do not match the operation's contract (for example a
+ * click with no target). The reason names fields and rules, never values, and
+ * travels in the message so the agent can correct the call.
+ */
+export class PreviewAutomationInvalidInputError extends Schema.TaggedError<PreviewAutomationInvalidInputError>()(
+  "PreviewAutomationInvalidInputError",
+  {
+    requestId: TrimmedNonEmptyString,
+    operation: PreviewAutomationOperation,
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    tabId: Schema.NullOr(PreviewTabId),
+    reason: Schema.String,
+  },
+) {
+  get responseTag() {
+    return "PreviewAutomationInvalidInputError" as const;
+  }
+
+  override get message(): string {
+    return `Invalid arguments for preview ${this.operation}: ${this.reason}`;
+  }
+}
+
+const trimString = (object: Record<string, unknown>, key: string): Record<string, unknown> => {
+  const value = object[key];
+  if (typeof value === "string") object[key] = value.trim();
+  return object;
+};
+
+/**
+ * Decodes an agent's arguments with the operation's contract instead of
+ * casting them; the decoded value drops unknown fields and trims locators.
+ */
+export function decodePreviewAutomationInput<S extends Schema.Decoder<unknown>>(
+  schema: S,
+  environmentId: EnvironmentId,
+  request: PreviewAutomationRequest,
+): S["Type"] {
+  try {
+    const { input } = request;
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return Schema.decodeUnknownSync(schema)(input);
+    }
+    // The server moves an explicit `tabId` out of the arguments; put it back so the contract's
+    // tab rules (open: tabId with reuseExistingTab false) see the whole call. A default tab
+    // the server assigned is not the agent's argument.
+    const candidate: Record<string, unknown> = { ...input };
+    if (request.tabIdExplicit && request.tabId !== undefined) candidate.tabId = request.tabId;
+    // Addresses were always trimmed before use; keep accepting padded ones.
+    trimString(candidate, "url");
+    const { target } = candidate;
+    if (typeof target === "object" && target !== null && !Array.isArray(target)) {
+      candidate.target = trimString({ ...target }, "url");
+    }
+    const decoded = Schema.decodeUnknownSync(schema)(candidate);
+    // The tab travels as `request.tabId`, as before; the bridge is not given it twice.
+    if (typeof decoded === "object" && decoded !== null && "tabId" in decoded) {
+      const { tabId: _tabId, ...rest } = decoded;
+      return rest;
+    }
+    return decoded;
+  } catch (cause) {
+    throw new PreviewAutomationInvalidInputError({
+      requestId: request.requestId,
+      operation: request.operation,
+      environmentId,
+      threadId: request.threadId,
+      tabId: request.tabId ?? null,
+      reason: (cause instanceof Error ? cause.message : String(cause)).slice(0, 500),
+    });
+  }
+}
+
 const targetNotEditableDiagnostics = (
   cause: unknown,
 ): {
@@ -238,6 +313,7 @@ export const PreviewAutomationHostError = Schema.Union([
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetNotEditableHostError,
   PreviewAutomationPageUnreachableError,
+  PreviewAutomationInvalidInputError,
   PreviewAutomationOperationError,
 ]);
 export type PreviewAutomationHostError = typeof PreviewAutomationHostError.Type;

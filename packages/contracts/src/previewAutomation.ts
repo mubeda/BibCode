@@ -93,7 +93,7 @@ export const PreviewAutomationOpenInput = Schema.Struct({
   reuseExistingTab: Schema.optional(
     Schema.Boolean.annotate({
       description:
-        "Reuse tabId when supplied, otherwise this agent session's current tab. Defaults to true; set false to create a new tab.",
+        "Reuse tabId when supplied, otherwise this agent session's current tab. Defaults to true; set false to create a new tab, which cannot be combined with tabId.",
     }),
   ),
 })
