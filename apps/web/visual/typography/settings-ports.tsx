@@ -66,6 +66,11 @@ export const primaryServerSettingsAtom = Atom.make<
 export const primaryServerProvidersAtom = Atom.make<
   Atom.Type<typeof ServerPorts.primaryServerProvidersAtom>
 >([liveProvider]);
+export const primaryUpdateSubjectsAtom = Atom.make<
+  Atom.Type<typeof ServerPorts.primaryUpdateSubjectsAtom>
+>([liveProvider]);
+export const primaryServerToolsAtom =
+  Atom.make<Atom.Type<typeof ServerPorts.primaryServerToolsAtom>>(undefined);
 export const primaryServerKeybindingsAtom =
   Atom.make<Atom.Type<typeof ServerPorts.primaryServerKeybindingsAtom>>(keybindings);
 export const primaryServerKeybindingsConfigPathAtom =
