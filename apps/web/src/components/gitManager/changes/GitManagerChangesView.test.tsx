@@ -8,6 +8,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { useGitDiscardRecoveryStore } from "../../../gitDiscardRecoveryStore";
 import { useGitManagerStore } from "../../../gitManagerStore";
 import { useSourceControlPanelStore } from "../../../sourceControlPanelStore";
 import type { ChangeRow } from "./changesList.logic";
@@ -346,6 +347,7 @@ beforeEach(() => {
     }),
   );
   useGitManagerStore.setState({ byProjectKey: {} });
+  useGitDiscardRecoveryStore.setState({ noticesByCheckout: {} });
   useSourceControlPanelStore.setState({ byThreadKey: {}, byCwdKey: {} });
   container = document.createElement("div");
   document.body.append(container);
@@ -1083,6 +1085,36 @@ describe("GitManagerChangesView", () => {
     await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="Dismiss"]')?.click();
     });
+    expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
+  });
+
+  it("keeps the recovery notice when the panel is left and opened again, for its checkout only", async () => {
+    h.status = statusWith("src/a.ts");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard.mockResolvedValueOnce(
+      AsyncResult.success({
+        trashed: [],
+        permanentlyDiscarded: [],
+        trashUnavailable: [],
+        keptInStaging: [{ path: "src/a.ts", stagedAt: "bibcode-discard/0f3a/a.ts" }],
+      }),
+    );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+    await act(async () => listProps.onContextMenu("src/a.ts", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+    await vi.waitFor(() => expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts"));
+
+    // Leave the tab (the panel unmounts), then come back.
+    await act(async () => root?.render(null));
+    expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
+    await renderView();
+    expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts");
+
+    // Another checkout does not show it.
+    await renderView("/repo/other");
     expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
   });
 
