@@ -826,15 +826,20 @@ Compaction:
     `state.sqlite-journal`. Each case gives `NotCompactable`, no backup, no
     new sidecar, and `state.sqlite` and the journal byte for byte unchanged.
 12. `compact_refuses_a_locked_database_without_waiting` (findings 1 and r2-4):
-    two cases, each with another connection holding `BEGIN EXCLUSIVE` and a
-    pending write: a normal WAL store, and a store just restored from a
-    backup (`journal_mode = DELETE`, no sidecars). `compact` fails with
+    a normal WAL store whose other connection holds `BEGIN EXCLUSIVE` with a
+    pending write, and a store just restored from a backup
+    (`journal_mode = DELETE`, no sidecars) whose other connection holds
+    `BEGIN EXCLUSIVE` with no write. Each `compact` fails with
     `DatabaseLocked` in under 1 s (less than the classifier's 5 s and
-    `BUSY_TIMEOUT`), no backup is taken, and after the other connection rolls
-    back the database, `-wal` and `-shm` bytes equal the original (the
-    restored store stays in `DELETE` mode). In the restored case
+    `BUSY_TIMEOUT`), and no backup is taken. In the restored case
     `compact --dry-run` succeeds with `sqliteLock: "not-checked"` and changes
-    nothing, which pins the documented limit.
+    nothing, which pins the documented limit. Then the restored store's other
+    connection makes a pending write: in rollback mode SQLite creates
+    `state.sqlite-journal` immediately, so the step-3 file check refuses with
+    `NotCompactable`, also in under 1 s and with no backup (implementation
+    finding, accepted). After the other connection rolls back, the database,
+    `-wal` and `-shm` bytes equal the original in every case, and the restored
+    store stays in `DELETE` mode.
 13. `compact_refuses_insufficient_disk_space_before_the_backup`: through
     `CompactTestHook::FreeSpace`, `InsufficientSpace` with both numbers and
     no backup. Run on three stores: clean WAL-mode with no sidecars, the
@@ -933,19 +938,19 @@ this repository yet. Each is proven by a real-SQLite test in the
 implementation PR, and a failing test reopens the design rather than being
 weakened.
 
-| Behavior relied on                                                                                                            | Proven by        |
-| ----------------------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `auto_vacuum = INCREMENTAL` set on the zero-page staging connection before `journal_mode = WAL` takes effect                  | Test 6           |
-| `VACUUM` in WAL mode switches an existing store to `incremental` and leaves `freelist_count = 0`                              | Test 9           |
-| `immutable=1` opens create no files; a plain read-only open creates nothing when both sidecars exist                          | Tests 1, 3, 4    |
-| `locking_mode = EXCLUSIVE` before first access creates no `-shm`, and replays a crash-left WAL with or without `-shm`         | Tests 9, 10      |
-| `busy_timeout = 0` plus `BEGIN EXCLUSIVE` fails at once against a held lock, in WAL and `DELETE` modes                        | Tests 12, 21     |
-| The online-backup copy works from the connection that holds the exclusive lock                                                | Test 9           |
-| `NO_CKPT_ON_CLOSE` leaves a pre-existing WAL and the main file untouched on close                                             | Tests 13, 14, 15 |
-| Without the flag, closing a connection whose WAL has no committed frames writes nothing to the main file and deletes the WAL  | Tests 13, 15     |
-| A heap-index close deletes the WAL but leaves a crash-left `-shm`, which compaction then removes                              | Test 10          |
-| The pre-check plus a progress handler stops `VACUUM` before and during execution, and a cancelled `VACUUM` rolls back cleanly | Tests 15, 16     |
-| A zero-length database is initialized by the first write transaction, so it must be refused before one                        | Test 11          |
+| Behavior relied on                                                                                                                                                                                                              | Proven by        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| `auto_vacuum = INCREMENTAL` set on the zero-page staging connection before `journal_mode = WAL` takes effect                                                                                                                    | Test 6           |
+| `VACUUM` in WAL mode switches an existing store to `incremental` and leaves `freelist_count = 0`                                                                                                                                | Test 9           |
+| `immutable=1` opens create no files; a plain read-only open creates nothing when both sidecars exist                                                                                                                            | Tests 1, 3, 4    |
+| `locking_mode = EXCLUSIVE` before first access creates no `-shm`, and replays a crash-left WAL with or without `-shm`                                                                                                           | Tests 9, 10      |
+| `busy_timeout = 0` plus `BEGIN EXCLUSIVE` fails at once against a held lock, in WAL and `DELETE` modes (`DatabaseLocked`); a pending `DELETE`-mode write creates `-journal` at once, which step 3 refuses with `NotCompactable` | Tests 12, 21     |
+| The online-backup copy works from the connection that holds the exclusive lock                                                                                                                                                  | Test 9           |
+| `NO_CKPT_ON_CLOSE` leaves a pre-existing WAL and the main file untouched on close                                                                                                                                               | Tests 13, 14, 15 |
+| Without the flag, closing a connection whose WAL has no committed frames writes nothing to the main file and deletes the WAL                                                                                                    | Tests 13, 15     |
+| A heap-index close deletes the WAL but leaves a crash-left `-shm`, which compaction then removes                                                                                                                                | Test 10          |
+| The pre-check plus a progress handler stops `VACUUM` before and during execution, and a cancelled `VACUUM` rolls back cleanly                                                                                                   | Tests 15, 16     |
+| A zero-length database is initialized by the first write transaction, so it must be refused before one                                                                                                                          | Test 11          |
 
 ## Risks and unmeasured
 
