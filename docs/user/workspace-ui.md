@@ -1486,8 +1486,8 @@ plain HTTP from that server, and every other link opens a new browser tab.
 
 - **Chat:** Ctrl/Cmd-, Shift-, or Alt-click or middle-click opens the other
   target. Right-click on an `http(s)` link offers **Open in BiBCode browser**,
-  **Open in system browser**, and **Copy link**. A link or file in a chat
-  panel opens in its host thread's right panel, the one on screen. If the
+  **Open in system browser**, and **Copy link**. A link, file, or turn diff in a
+  chat panel opens in its host thread's right panel, the one on screen. If the
   BiBCode browser can't open a link, a notice says so and offers **Open in
   system browser**. Any
   modifier-click on an `.html`, `.htm`, or `.pdf` file chip opens

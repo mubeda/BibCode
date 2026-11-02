@@ -103,6 +103,32 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("shows a chat panel's diff in its host's Diff surface, across a reload", () => {
+    const store = useRightPanelStore.getState();
+    store.openDiff(refA, refB.threadId);
+    const diff = { id: "diff", kind: "diff", threadId: refB.threadId };
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual(
+      diff,
+    );
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: { "env-1:thread-A": { activeSurfaceId: "diff", surfaces: [diff] } },
+      }).byThreadKey["env-1:thread-A"]?.surfaces,
+    ).toEqual([diff]);
+
+    // The host's own Diff (or its own thread) shows the host's diff again.
+    store.open(refA, "diff");
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      id: "diff",
+      kind: "diff",
+    });
+    store.openDiff(refA, refB.threadId);
+    store.openDiff(refA, refA.threadId);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([{ id: "diff", kind: "diff" }]);
+  });
+
   it("open sets the active panel for a thread", () => {
     useRightPanelStore.getState().open(refA, "preview");
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe("preview");
