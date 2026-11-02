@@ -525,6 +525,7 @@ export function applyThreadDetailEvent(
         checkpointRef: event.payload.checkpointRef,
         status: event.payload.status,
         files: event.payload.files,
+        ...(event.payload.diffAvailable === false ? { diffAvailable: false } : {}),
         assistantMessageId: event.payload.assistantMessageId,
         completedAt: event.payload.completedAt,
       };

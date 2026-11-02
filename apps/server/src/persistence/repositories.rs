@@ -1649,20 +1649,20 @@ impl Repositories {
     /// Checkpoints are projection-turn rows.  This transaction clears a
     /// conflicting checkpoint key before inserting/updating the canonical turn.
     pub async fn upsert_checkpoint(&self, row: ProjectionCheckpoint) -> Result<()> {
-        self.database.call(move |connection| { let transaction = connection.transaction()?; transaction.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count = ?", params![row.thread_id,row.checkpoint_turn_count])?; transaction.execute(TURN_UPSERT_SQL, params![row.thread_id,row.turn_id,Option::<String>::None,Option::<String>::None,Option::<String>::None,row.assistant_message_id,if row.status == "error" { "error" } else { "completed" },row.completed_at,row.completed_at,row.completed_at,row.checkpoint_turn_count,row.checkpoint_ref,row.status,encode_json(&row.files)?])?; transaction.commit()?; Ok(()) }).await
+        self.database.call(move |connection| { let transaction = connection.transaction()?; transaction.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count = ?", params![row.thread_id,row.checkpoint_turn_count])?; transaction.execute(TURN_UPSERT_SQL, params![row.thread_id,row.turn_id,Option::<String>::None,Option::<String>::None,Option::<String>::None,row.assistant_message_id,if row.status == "error" { "error" } else { "completed" },row.completed_at,row.completed_at,row.completed_at,row.checkpoint_turn_count,row.checkpoint_ref,row.status,encode_json(&row.files)?])?; transaction.execute("UPDATE projection_turns SET checkpoint_diff_available = ? WHERE thread_id = ? AND turn_id = ?", params![row.diff_available,row.thread_id,row.turn_id])?; transaction.commit()?; Ok(()) }).await
     }
     pub async fn list_checkpoints_by_thread(
         &self,
         thread_id: String,
     ) -> Result<Vec<ProjectionCheckpoint>> {
-        self.database.call(move |connection| collect(connection, "SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL ORDER BY checkpoint_turn_count ASC", [thread_id], decode_checkpoint)).await
+        self.database.call(move |connection| collect(connection, "SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at, checkpoint_diff_available FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL ORDER BY checkpoint_turn_count ASC", [thread_id], decode_checkpoint)).await
     }
     pub async fn get_checkpoint(
         &self,
         thread_id: String,
         checkpoint_turn_count: i64,
     ) -> Result<Option<ProjectionCheckpoint>> {
-        self.database.call(move |connection| connection.query_row("SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count = ?", params![thread_id,checkpoint_turn_count], decode_checkpoint).optional().map_err(Into::into)).await
+        self.database.call(move |connection| connection.query_row("SELECT thread_id, turn_id, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json, assistant_message_id, completed_at, checkpoint_diff_available FROM projection_turns WHERE thread_id = ? AND checkpoint_turn_count = ?", params![thread_id,checkpoint_turn_count], decode_checkpoint).optional().map_err(Into::into)).await
     }
     pub async fn delete_checkpoints_by_thread(&self, thread_id: String) -> Result<()> {
         self.database.call(move |connection| { connection.execute("UPDATE projection_turns SET checkpoint_turn_count=NULL, checkpoint_ref=NULL, checkpoint_status=NULL, checkpoint_files_json='[]' WHERE thread_id = ? AND checkpoint_turn_count IS NOT NULL", [thread_id])?; Ok(()) }).await
@@ -3179,6 +3179,9 @@ pub struct ProjectionCheckpoint {
     pub checkpoint_ref: String,
     pub status: String,
     pub files: Value,
+    /// Whether the turn before's checkpoint is a trusted baseline, so `files` and the one-turn
+    /// patch are this turn's change. A `ready` turn without it can still be reverted to.
+    pub diff_available: bool,
     pub assistant_message_id: Option<String>,
     pub completed_at: Timestamp,
 }
@@ -4543,6 +4546,7 @@ fn decode_checkpoint(row: &Row<'_>) -> rusqlite::Result<ProjectionCheckpoint> {
         files: decode_json(row.get(5)?, "checkpoint_files_json")?,
         assistant_message_id: row.get(6)?,
         completed_at: row.get(7)?,
+        diff_available: row.get(8)?,
     })
 }
 fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
