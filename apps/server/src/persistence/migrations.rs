@@ -138,7 +138,19 @@ pub(crate) fn validate_existing_bibcode_store_immutable(
             detail: integrity,
         });
     }
-    if !table_exists(&connection, "effect_sql_migrations")
+    validate_bibcode_schema(&connection, path, cancellation, deadline)
+}
+
+/// The migration-ledger prefix and required-table checks every store validator runs. They
+/// read a few rows, so their cost does not grow with the database.
+pub(crate) fn validate_bibcode_schema(
+    connection: &Connection,
+    path: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> std::result::Result<(), ExistingStoreValidationError> {
+    ensure_validation_active(path, cancellation, deadline)?;
+    if !table_exists(connection, "effect_sql_migrations")
         .map_err(|source| map_unrecognized_inspection_error(path, cancellation, deadline, source))?
     {
         return Err(ExistingStoreValidationError::Unrecognized {
@@ -146,6 +158,8 @@ pub(crate) fn validate_existing_bibcode_store_immutable(
             detail: "migration ledger is missing".to_owned(),
         });
     }
+
+    ensure_validation_active(path, cancellation, deadline)?;
     let mut statement = connection
         .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
         .map_err(|source| {
@@ -160,8 +174,13 @@ pub(crate) fn validate_existing_bibcode_store_immutable(
             map_unrecognized_inspection_error(path, cancellation, deadline, source)
         })?;
     ensure_validation_active(path, cancellation, deadline)?;
-    if recorded.is_empty()
-        || recorded.len() > MIGRATIONS.len()
+    if recorded.is_empty() {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is empty".to_owned(),
+        });
+    }
+    if recorded.len() > MIGRATIONS.len()
         || recorded
             .iter()
             .zip(MIGRATIONS)
@@ -172,13 +191,14 @@ pub(crate) fn validate_existing_bibcode_store_immutable(
             detail: "migration ledger is not an exact prefix of this binary".to_owned(),
         });
     }
+
     let latest_migration_id = recorded.last().expect("non-empty ledger").0;
     for (_, table) in CORE_TABLES
         .iter()
         .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
     {
         ensure_validation_active(path, cancellation, deadline)?;
-        if !table_exists(&connection, table).map_err(|source| {
+        if !table_exists(connection, table).map_err(|source| {
             map_unrecognized_inspection_error(path, cancellation, deadline, source)
         })? {
             return Err(ExistingStoreValidationError::Unrecognized {
@@ -318,67 +338,7 @@ where
             detail: integrity,
         });
     }
-
-    ensure_validation_active(path, cancellation, deadline)?;
-    if !table_exists(&connection, "effect_sql_migrations")
-        .map_err(|source| map_unrecognized_inspection_error(path, cancellation, deadline, source))?
-    {
-        return Err(ExistingStoreValidationError::Unrecognized {
-            path: path.to_path_buf(),
-            detail: "migration ledger is missing".to_owned(),
-        });
-    }
-
-    ensure_validation_active(path, cancellation, deadline)?;
-    let mut statement = connection
-        .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
-        .map_err(|source| {
-            map_unrecognized_inspection_error(path, cancellation, deadline, source)
-        })?;
-    let recorded = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
-        })
-        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-        .map_err(|source| {
-            map_unrecognized_inspection_error(path, cancellation, deadline, source)
-        })?;
-    ensure_validation_active(path, cancellation, deadline)?;
-    if recorded.is_empty() {
-        return Err(ExistingStoreValidationError::Unrecognized {
-            path: path.to_path_buf(),
-            detail: "migration ledger is empty".to_owned(),
-        });
-    }
-    if recorded.len() > MIGRATIONS.len()
-        || recorded
-            .iter()
-            .zip(MIGRATIONS)
-            .any(|((id, name), expected)| *id != expected.id || name != expected.name)
-    {
-        return Err(ExistingStoreValidationError::Unrecognized {
-            path: path.to_path_buf(),
-            detail: "migration ledger is not an exact prefix of this binary".to_owned(),
-        });
-    }
-
-    let latest_migration_id = recorded.last().expect("non-empty ledger").0;
-    for (_, table) in CORE_TABLES
-        .iter()
-        .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
-    {
-        ensure_validation_active(path, cancellation, deadline)?;
-        if !table_exists(&connection, table).map_err(|source| {
-            map_unrecognized_inspection_error(path, cancellation, deadline, source)
-        })? {
-            return Err(ExistingStoreValidationError::Unrecognized {
-                path: path.to_path_buf(),
-                detail: format!("required table {table} is missing"),
-            });
-        }
-    }
-    ensure_validation_active(path, cancellation, deadline)?;
-    Ok(())
+    validate_bibcode_schema(&connection, path, cancellation, deadline)
 }
 
 fn coherent_validation_snapshot<F, G>(

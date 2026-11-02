@@ -306,7 +306,7 @@ export interface DesktopProjectDataStatusChangedEvent {
 export interface DesktopProjectDataBackup {
   backupId: string;
   createdAt: string;
-  trigger: "pre-migration" | "pre-update";
+  trigger: "pre-migration" | "pre-update" | "pre-compact";
   appVersion: string;
   schemaVersion: number;
   sizeBytes: number;
@@ -315,7 +315,7 @@ export interface DesktopProjectDataBackup {
 export const DesktopProjectDataBackupSchema = Schema.Struct({
   backupId: Schema.String,
   createdAt: Schema.String,
-  trigger: Schema.Literals(["pre-migration", "pre-update"]),
+  trigger: Schema.Literals(["pre-migration", "pre-update", "pre-compact"]),
   appVersion: Schema.String,
   schemaVersion: Schema.Finite,
   sizeBytes: Schema.Finite,
