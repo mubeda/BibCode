@@ -2037,14 +2037,14 @@ fn file_snapshot(_file: &File, metadata: &fs::Metadata) -> std::io::Result<Plain
 }
 
 #[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     metadata.file_attributes() & 0x400 != 0
 }
 
 #[cfg(not(windows))]
-fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+pub(super) fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 

@@ -160,8 +160,11 @@ The command:
 5. runs `VACUUM`, which also switches the store to `auto_vacuum = incremental`,
    then checks its integrity.
 
-Every refusal before the backup leaves `state.sqlite` and its sidecars exactly
-as they were. Progress goes to stderr; stdout carries one JSON report with
+Compaction refuses a store whose state directory or `state.sqlite` is a
+symbolic link or junction, because SQLite keeps its recovery files beside the
+link target. If a cancelled or failed `VACUUM` had already switched an
+`auto_vacuum = full` store to `incremental`, it switches it back. Every refusal
+before the backup leaves `state.sqlite` and its sidecars exactly as they were. Progress goes to stderr; stdout carries one JSON report with
 `before`, `plan`, `backupId`, `after` and `reclaimedBytes`. Press Ctrl-C to
 cancel: before or during `VACUUM` the database is left as it was, and the
 pre-compact backup is kept.

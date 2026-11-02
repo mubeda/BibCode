@@ -834,6 +834,8 @@ impl Database {
             if cancellation.is_cancelled() {
                 return Ok(VacuumOutcome::Cancelled);
             }
+            let original_mode: i64 =
+                connection.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
             let handler_token = cancellation.clone();
             connection.progress_handler(
@@ -845,6 +847,12 @@ impl Database {
             )?;
             let result = connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
             connection.progress_handler(0, None::<fn() -> bool>)?;
+            // Switching FULL to INCREMENTAL commits at once, outside VACUUM's transaction, so
+            // a VACUUM that does not finish must switch it back. From NONE the pragma takes
+            // effect only through VACUUM itself.
+            if result.is_err() && original_mode == 1 {
+                connection.pragma_update(None, "auto_vacuum", "FULL")?;
+            }
             match result {
                 Ok(()) => Ok(VacuumOutcome::Completed),
                 Err(error)
