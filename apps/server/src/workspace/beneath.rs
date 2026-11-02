@@ -305,11 +305,19 @@ impl Dir {
     }
 
     /// This folder held so that nothing can rename or delete it, nor (NTFS and ReFS refuse it
-    /// for any folder above an open one) a folder above it, until the handle is dropped. Other
-    /// file systems are refused (`ErrorKind::Unsupported`).
+    /// for any folder above an open one) a folder above it, until the handle is dropped. The
+    /// pinned folder must be this one and still be at this folder's path. Other file systems
+    /// are refused (`ErrorKind::Unsupported`).
     #[cfg(windows)]
     pub(crate) fn pin(&self) -> io::Result<File> {
         imp::pin(self)
+    }
+
+    /// The full name of the entry `name`, checked through its handle: an 8.3 short name
+    /// (`GIT~1` for `.git`) is refused, so a path built from it names what the check saw.
+    #[cfg(windows)]
+    pub(crate) fn long_name(&self, name: &OsStr) -> io::Result<OsString> {
+        imp::long_name(self, name)
     }
 
     /// Removes the folder `name` and everything in it. It is first renamed through the handle
@@ -1124,27 +1132,33 @@ mod imp {
         let mut wide = wide_name(name)?;
         let file = nt_open(parent, &mut wide, access, SHARE_ALL, disposition, options)?;
         let path = final_path(&file)?;
-        let real: Vec<u16> = path
-            .file_name()
-            .map(|real| real.encode_wide().collect())
-            .unwrap_or_default();
-        // SAFETY: both slices are valid for the lengths passed.
-        let same = unsafe {
-            CompareStringOrdinal(
-                real.as_ptr(),
-                real.len() as i32,
-                wide.as_ptr(),
-                wide.len() as i32,
-                1,
-            )
-        } == CSTR_EQUAL;
-        if !same {
+        if !same_text(path.file_name().unwrap_or_default(), name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "a short (8.3) name is refused; use the entry's full name",
             ));
         }
         Ok(file)
+    }
+
+    /// Whether `a` and `b` are one name to the file system: equal, ignoring case.
+    fn same_text(a: &OsStr, b: &OsStr) -> bool {
+        let (a, b): (Vec<u16>, Vec<u16>) = (a.encode_wide().collect(), b.encode_wide().collect());
+        // SAFETY: both slices are valid for the lengths passed.
+        let order = unsafe {
+            CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1)
+        };
+        order == CSTR_EQUAL
+    }
+
+    /// The full (long) name of the entry `name` in `dir`, refused when `name` is not that very
+    /// name in some letter case (an 8.3 short name), for a call that takes a path.
+    pub(super) fn long_name(dir: &Dir, name: &OsStr) -> io::Result<OsString> {
+        let entry = open_at(&dir.handle, name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0)?;
+        final_path(&entry)?
+            .file_name()
+            .map(OsStr::to_os_string)
+            .ok_or_else(escape)
     }
 
     /// `NtCreateFile` of `name` relative to `parent` (the folder itself when `name` is empty),
@@ -1400,6 +1414,20 @@ mod imp {
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
         )?;
+        // The pinned folder must be the one held, and its path must name it now: a folder put
+        // at that path before the pin would stay unpinned, free to become a junction.
+        let id = identity(&dir.handle)?;
+        let at_path = match open_root(&dir.path) {
+            Ok(at_path) => at_path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(escape()),
+            Err(error) => return Err(error),
+        };
+        if identity(&pinned)? != id
+            || identity(&at_path)? != id
+            || !same_text(final_path(&pinned)?.as_os_str(), dir.path.as_os_str())
+        {
+            return Err(escape());
+        }
         contained(dir)?;
         Ok(pinned)
     }
@@ -2058,6 +2086,25 @@ mod tests {
         // Without the pin, only the folders above the held one stay.
         std::fs::rename(root_path.join("a/b"), root_path.join("a/c")).unwrap();
         assert!(is_escape(&dir.recheck().unwrap_err()));
+    }
+
+    /// The held folder renamed away and another put at its path before the pin: the pin would
+    /// hold the moved folder while the path handed to the trash names the unpinned stand-in,
+    /// which could then become a junction out of the root. Refused (#216 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_pin_refuses_a_folder_replaced_at_its_path_before_it_was_pinned() {
+        let (_root, root_path) = canonical_root();
+        std::fs::create_dir(root_path.join("sub")).unwrap();
+        let root = Root::new(&root_path).unwrap();
+        let dir = Dir::open(&root, &root_path.join("sub"), false).unwrap();
+        std::fs::rename(root_path.join("sub"), root_path.join("held")).unwrap();
+        std::fs::create_dir(root_path.join("sub")).unwrap();
+        let error = dir.pin().expect_err("a stand-in folder is refused");
+        assert!(is_escape(&error), "{error}");
+        // With nothing swapped the pin holds.
+        let held = Dir::open(&root, &root_path.join("held"), false).unwrap();
+        drop(held.pin().unwrap());
     }
 
     /// An alternate data stream (`name:stream`), a separator, `.` or `..` is not one entry of

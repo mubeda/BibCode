@@ -1074,8 +1074,10 @@ impl WorkspaceService {
                     place.fault("open", error)
                 }
             })?;
+            // The entry's own full name: a short name (`GIT~1`) is refused, never trashed.
             let checked = dir
-                .checked_path(&place.name)
+                .long_name(&place.name)
+                .and_then(|name| dir.checked_path(&name))
                 .map_err(|error| place.fault("open", error))?;
             Ok(((dir, pin), checked))
         })
