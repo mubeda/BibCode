@@ -744,10 +744,16 @@ impl Database {
                 connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?;
-            if busy != 0 || checkpointed_pages < log_pages {
+            if !wal_checkpoint_complete(busy, log_pages, checkpointed_pages) {
                 return Err(PersistenceError::BackupStopped(format!(
                     "WAL checkpoint remained busy ({checkpointed_pages}/{log_pages} pages)"
                 )));
+            }
+            if busy != 0 {
+                tracing::debug!(
+                    log_pages,
+                    "WAL checkpoint moved every page but a reader kept the WAL from being reset"
+                );
             }
             Ok(())
         })
@@ -921,6 +927,17 @@ impl Database {
         })
         .await
     }
+}
+
+/// Whether a `wal_checkpoint(TRUNCATE)` result leaves no committed page only in the WAL.
+/// Busy with every page moved means only the WAL reset waited on a reader (#263); busy with
+/// `-1` counts means another checkpointer held the lock and nothing was moved. `-1` without
+/// busy is a database that is not in WAL mode.
+fn wal_checkpoint_complete(busy: i64, log_pages: i64, checkpointed_pages: i64) -> bool {
+    if busy == 0 {
+        return checkpointed_pages >= log_pages;
+    }
+    log_pages >= 0 && checkpointed_pages >= log_pages
 }
 
 fn ensure_backup_active(cancellation: &CancellationToken, deadline: Instant) -> Result<()> {
@@ -1365,6 +1382,87 @@ mod tests {
                 .is_some(),
             "a new observer may start after the prior guard is dropped"
         );
+    }
+
+    async fn wal_fixture(temp: &TempDir) -> (Database, PathBuf) {
+        let path = temp.path().join("state.sqlite");
+        let database = Database::create_new(&path).await.expect("database opens");
+        database
+            .call(|connection| {
+                connection.execute_batch("CREATE TABLE rows (value INTEGER NOT NULL);")?;
+                Ok(())
+            })
+            .await
+            .expect("fixture schema");
+        (database, path)
+    }
+
+    async fn insert_rows(database: &Database) {
+        database
+            .call(|connection| {
+                for value in 0..50 {
+                    connection.execute("INSERT INTO rows (value) VALUES (?1)", [value])?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("fixture rows");
+    }
+
+    /// A reader holding a snapshot of every committed page keeps the WAL from being reset, but
+    /// the checkpoint still moved everything into the database file (#263).
+    #[tokio::test]
+    async fn a_checkpoint_that_moved_every_page_succeeds_while_a_reader_holds_the_wal() {
+        let temp = TempDir::new().expect("temporary database directory");
+        let (database, path) = wal_fixture(&temp).await;
+        insert_rows(&database).await;
+        let reader = Connection::open(&path).expect("reader opens");
+        reader.execute_batch("BEGIN").expect("reader transaction");
+        let count: i64 = reader
+            .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
+            .expect("reader snapshot");
+        assert_eq!(count, 50);
+
+        database
+            .checkpoint_wal()
+            .await
+            .expect("every committed page reached the database file");
+    }
+
+    #[test]
+    fn a_busy_checkpoint_is_complete_only_when_every_page_moved() {
+        assert!(wal_checkpoint_complete(0, 52, 52));
+        assert!(wal_checkpoint_complete(0, -1, -1), "not in WAL mode");
+        assert!(
+            wal_checkpoint_complete(1, 52, 52),
+            "only the WAL reset waited"
+        );
+        assert!(!wal_checkpoint_complete(1, 52, 10), "pages left in the WAL");
+        assert!(
+            !wal_checkpoint_complete(1, -1, -1),
+            "another checkpointer held the lock"
+        );
+        assert!(!wal_checkpoint_complete(0, 52, 10));
+    }
+
+    /// A reader whose snapshot predates the writes keeps their pages in the WAL, so the
+    /// checkpoint still fails.
+    #[tokio::test]
+    async fn a_checkpoint_that_leaves_committed_pages_behind_still_fails() {
+        let temp = TempDir::new().expect("temporary database directory");
+        let (database, path) = wal_fixture(&temp).await;
+        let reader = Connection::open(&path).expect("reader opens");
+        reader.execute_batch("BEGIN").expect("reader transaction");
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
+            .expect("reader snapshot");
+        insert_rows(&database).await;
+
+        let error = database
+            .checkpoint_wal()
+            .await
+            .expect_err("pages newer than the reader's snapshot stay in the WAL");
+        assert!(error.to_string().contains("remained busy"), "{error}");
     }
 
     #[tokio::test]

@@ -3928,7 +3928,17 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
 `ReservedClone::transfer` runs Git with:
 
 - the URL is `https://`, written as the URL parser would write it, without user
-  information, and the folder name does not start with `-` (`clone_url_refused`);
+  information, or `ssh://[user@]host[:port]/path` written plainly (a plain user, no
+  password, a host that is an address or a DNS name with a non-numeric last label), and the
+  folder name does not start with `-` (`clone_url_refused`; the scp-like `host:path` and
+  `git+ssh://` get a message naming the `ssh://` spelling);
+- an `ssh://` URL needs the Terminals gate (#217, option A1):
+  `GitVcsRpcServices::agent_acts_as_server_user` reads the live MCP settings
+  (`with_mcp_settings`) and the session's live `mcpAccess` (`AuthService::mcp_client_access`)
+  and applies `mcp::control::acts_as_server_user`, the predicate the terminal tools use
+  (MCP on, Terminals on, effective ceiling Full access, `terminal:operate`); otherwise
+  `clone_ssh_not_allowed`, naming the `https://` URL on a known forge, before Git or DNS
+  run;
 - Git is 2.37 or later, for `http.curloptResolve` (`clone_git_too_old`);
 - every Git command of the clone runs with an isolated configuration:
   `GIT_CONFIG_GLOBAL` is the null device, `GIT_CONFIG_NOSYSTEM=1`,
@@ -3939,8 +3949,11 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   `LANG`, `LC_*`, `TZ`, and the Windows system variables), with `HOME` the null device, and
   the clone gets `--template=` so no hooks are copied;
 - `git ls-remote --get-url -- <url>` gives the URL after any `insteadOf` left (the clone
-  folder's enclosing repository), which must pass the same checks;
-- every address of the original and the rewritten host is globally reachable: no range the
+  folder's enclosing repository, which `git ls-remote` reads and `git clone` does not, so
+  Git clones the URL as written): an HTTPS expansion must pass the same checks and may not
+  be SSH, and an SSH URL whose expansion differs from it is refused;
+- every address of the original and the rewritten host (an SSH URL's written host) is
+  globally reachable: no range the
   IANA special-purpose registries mark otherwise, no multicast, no IPv6 outside `2000::/3`,
   and mapped, NAT64 and 6to4 addresses judged by the IPv4 address they embed
   (`clone_host_refused`, or `clone_host_unresolved`);
@@ -3948,7 +3961,23 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false`, one
   `http.curloptResolve=<host>:<port>:<first address>` per named host, `http.proxy=`,
   `core.hooksPath` and `core.fsmonitor` off, an empty and optional `filter.lfs` smudge and
-  process, `GIT_LFS_SKIP_SMUDGE=1` and `submodule.recurse=false`.
+  process, `GIT_LFS_SKIP_SMUDGE=1` and `submodule.recurse=false`;
+- an SSH plan instead admits `protocol.ssh.allow=always` and `GIT_ALLOW_PROTOCOL=ssh`, sets
+  no `curloptResolve`, and pins ssh through `GIT_SSH_COMMAND` (above `core.sshCommand`) with
+  `GIT_SSH_VARIANT=ssh`: `-F none`, `HostName=<first checked address>`,
+  `HostKeyAlias=<host>` (`[<host>]:<port>` off port 22), strict host key checking against
+  the server user's `~/.ssh/known_hosts` and `known_hosts2` without writing them,
+  `IdentityFile=none` with `IdentityAgent=SSH_AUTH_SOCK`, no proxy, multiplexing or
+  forwarding, `ConnectTimeout=30` and `ServerAliveInterval=15` x `ServerAliveCountMax=4`.
+  The known_hosts paths are refused when they hold `${` or a control character, `%`-escaped,
+  quoted for ssh's `argv_split`, and then quoted for Git's `sh -c`. `SSH_AUTH_SOCK` is passed
+  when the agent is a socket (Linux, macOS, an MSYS agent on Windows); on Windows without it,
+  the Windows OpenSSH client uses its agent service's pipe. No agent is
+  `clone_ssh_unavailable`. ssh runs as Git's child inside the clone's supervised process
+  group, so cancel, the 24-hour bound and reaping cover it. A failed SSH transfer keeps its
+  `GitCommandError` and gets one line built from the plan (`ClonePlan::explain_failure`):
+  unknown host key, changed key, publickey denial, host certificate off port 22, and an ssh
+  without an option (`reason: clone_ssh_unavailable`).
 
 For an agent principal `vcs.clone` also refuses `detach: true` (`clone_detach_refused`): a
 long clone goes through `clone_repository`, which owns it. A clone records the agent session

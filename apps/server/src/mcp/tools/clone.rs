@@ -1,5 +1,6 @@
-//! The clone tools (#139 slice X6): clone a public HTTPS repository next to a registered
-//! project and register it, read how a clone went, and cancel one.
+//! The clone tools (#139 slice X6): clone a public HTTPS repository, or over SSH for an agent
+//! that passes the Terminals gate (#217), next to a registered project and register it, read
+//! how a clone went, and cancel one.
 //!
 //! `clone_repository` is always one owned mutation ([`ToolCall::recorded`]), keyed by the
 //! agent's `clientRequestId` or, without one, by a key the server mints; that key is the
@@ -13,9 +14,10 @@
 //! joined, such as one a person started. A clone stopped before Git finished is `unknown`,
 //! because Git may have finished at the same instant.
 //!
-//! `vcs.clone` applies the agent clone policy itself (`git::clone_policy`): HTTPS only, public
-//! hosts, the checked address pinned, redirects and LFS smudge off. A refusal is the clone's
-//! recorded failure, a `GitCommandError` with its `reason`.
+//! `vcs.clone` applies the agent clone policy itself (`git::clone_policy`): HTTPS, or SSH
+//! behind the Terminals gate, public hosts, the checked address pinned, redirects and LFS
+//! smudge off. A refusal is the clone's recorded failure, a `GitCommandError` with its
+//! `reason`.
 
 use std::{
     collections::HashMap,
@@ -129,10 +131,10 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
         json!({ "type": "string", "description": "cloneId as clone_repository returned it." });
     Some(match name {
         "clone_repository" => (
-            "Clones a repository into the folder that holds a registered project (beside it), then adds it as a project unless addAsProject is false. The URL must be https:// with no user name or token, and its host must be public: SSH, host:path, git://, file:// and local or private network addresses are refused (clone those in BiBCode yourself). Git LFS files stay pointer files, and redirects are not followed. Waits up to 50 seconds; a longer clone returns state running with its cloneId, and clone_status reads it later. A finished clone of the same URL already in the folder is reused, not cloned again.",
+            "Clones a repository into the folder that holds a registered project (beside it), then adds it as a project unless addAsProject is false. The URL must be https:// with no user name or token, and its host must be public: host:path, git://, file:// and local or private network addresses are refused (clone those in BiBCode yourself). An ssh:// URL uses the person's SSH agent, so it needs Terminals on, Agents may at Full access and a credential approved with terminals; otherwise the refusal names the https:// URL to use. Git LFS files stay pointer files, and redirects are not followed. Waits up to 50 seconds; a longer clone returns state running with its cloneId, and clone_status reads it later. A finished clone of the same URL already in the folder is reused, not cloned again.",
             object_schema(
                 json!({
-                    "url": { "type": "string", "description": "An https:// clone URL, such as https://github.com/owner/repo.git." },
+                    "url": { "type": "string", "description": "An https:// clone URL, such as https://github.com/owner/repo.git, or an ssh:// one, such as ssh://git@github.com/owner/repo.git, for an agent that may use terminals." },
                     "parentProjectId": { "type": "string", "description": "A project id, as list_projects_and_threads returns it. The clone goes into the folder that holds this project's folder." },
                     "directoryName": { "type": "string", "description": "The new folder's name; the URL's last part without .git unless set. One name: no slashes, and not starting with -." },
                     "addAsProject": { "type": "boolean", "description": "Add the clone as a project. true unless set." },

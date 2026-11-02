@@ -205,6 +205,24 @@ impl McpCapabilities {
     }
 }
 
+/// Whether an outside agent may act as the server's user: MCP on, the Terminals set on, an
+/// effective ceiling (the credential's `ceiling`, at most the setting's) of Full access, and a
+/// credential holding `terminal:operate`. The terminal tools and an agent's SSH clone (#217,
+/// option A1, which offers the person's SSH agent) share it, so neither gate drifts.
+#[must_use]
+pub(crate) fn acts_as_server_user(
+    settings: McpServerSettings,
+    ceiling: McpAccess,
+    scopes: &[String],
+) -> bool {
+    settings.enabled
+        && settings.capabilities.allows(McpCapability::Terminals)
+        && ceiling.min(settings.access) == McpAccess::FullAccess
+        && scopes
+            .iter()
+            .any(|scope| scope == crate::auth::SCOPE_TERMINAL_OPERATE)
+}
+
 /// The committed `enableMcpServer`, `mcpServerAccess` and `mcpCapabilities`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpServerSettings {
@@ -717,6 +735,16 @@ impl McpControl {
     #[must_use]
     pub fn effective_ceiling(&self, principal: &ClientPrincipal) -> McpAccess {
         principal.ceiling.min(self.settings().access)
+    }
+
+    /// Whether `principal` may act as the server's user now ([`acts_as_server_user`]).
+    #[must_use]
+    pub(crate) fn acts_as_server_user(&self, principal: &ClientPrincipal) -> bool {
+        acts_as_server_user(
+            self.settings(),
+            principal.ceiling,
+            &principal.principal.scopes,
+        )
     }
 
     /// The tools this principal may call now: a set that is off hides its tools, the operate
