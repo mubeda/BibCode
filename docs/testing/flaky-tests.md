@@ -17,6 +17,15 @@ its process is gone, rather than from the fixture. The server gives Codex one
 second to shut down gracefully and then kills it. A fixture that records
 `shutdown` itself misses that record whenever it gets no CPU in that second.
 
+A terminal closed just as its command exits used to fail its close on macOS
+under load (#237). macOS refuses (`EPERM`) a `killpg` whose members have all
+exited unreaped, and the close could arrive before the PTY waiter signalled
+the group. The close path, the PTY waiter, and the supervised runner share
+`process::group_kill_refusal_is_stopped`: `EPERM` counts as stopped only once
+the root has exited, and stays a failure while it runs. A failed
+`terminal.close` in a test is therefore a product signal, not a reason to wait
+longer.
+
 For an in-flight HTTP body, a client-side stream poll proves only that the
 client produced bytes, not that the server admitted the request. The Claude
 terminal dormant-hook test uses `Expect: 100-continue` and waits for the

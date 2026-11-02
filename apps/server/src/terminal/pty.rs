@@ -537,9 +537,10 @@ impl PortablePtyBackend {
                     #[cfg(test)]
                     observe_waiter_reservation(reservation.map(|_| ()));
                     loop {
-                        match kill_reserved_unix_process_group_after_root_exit(
+                        match kill_reserved_unix_process_group(
                             process_group,
                             &waiter_process_group_ownership,
+                            || true,
                         ) {
                             Ok(()) => break,
                             Err(error) => {
@@ -1113,8 +1114,15 @@ impl PtyProcess for PortablePtyProcess {
     fn kill(&self) -> Result<(), String> {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
-            return kill_reserved_unix_process_group(process_group, &self.process_group_ownership)
-                .map_err(|error| error.to_string());
+            // The root may have exited moments before the waiter signals its group; read
+            // without reaping, so the waiter still owns the root's status.
+            let pid = self.pid;
+            return kill_reserved_unix_process_group(
+                process_group,
+                &self.process_group_ownership,
+                || matches!(probe_unix_child_exit_without_reaping(pid), Ok(true)),
+            )
+            .map_err(|error| error.to_string());
         }
         #[cfg(windows)]
         {
@@ -1219,29 +1227,23 @@ fn signal_reserved_unix_process_group_with(
     Ok(())
 }
 
+/// Kills the owned group once. `root_exited` is asked only when the kill is refused: with the
+/// root exited but kept waitable, `EPERM` means the group has no signalable member left (any
+/// live same-user descendant would make the signal succeed), so the group counts as stopped.
 #[cfg(unix)]
 fn kill_reserved_unix_process_group(
     process_group: i32,
     ownership: &Mutex<UnixProcessGroupOwnership>,
-) -> std::io::Result<()> {
-    signal_reserved_unix_process_group_with(process_group, ownership, kill_unix_process_group)
-}
-
-#[cfg(unix)]
-fn kill_reserved_unix_process_group_after_root_exit(
-    process_group: i32,
-    ownership: &Mutex<UnixProcessGroupOwnership>,
+    root_exited: impl FnOnce() -> bool,
 ) -> std::io::Result<()> {
     signal_reserved_unix_process_group_with(process_group, ownership, |process_group| {
-        match kill_unix_process_group(process_group) {
-            Ok(()) => Ok(()),
-            // Once the owned root is observed exited but kept waitable,
-            // EPERM means the group contains no signalable process. Any live
-            // descendant of this same-user ownership unit would make the
-            // group signal succeed, so there is no owned live member left.
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(()),
-            Err(error) => Err(error),
-        }
+        kill_unix_process_group(process_group).or_else(|error| {
+            if crate::process::group_kill_refusal_is_stopped(error.raw_os_error(), root_exited()) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
     })
 }
 
