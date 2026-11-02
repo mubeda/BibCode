@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
@@ -212,7 +212,10 @@ const MAX_SKILL_SCAN_ENTRIES: usize = 10_000;
 /// already walked tree costs nothing and the budget covers the whole scan.
 #[derive(Default)]
 struct SkillScan {
-    visited: HashSet<PathBuf>,
+    /// Shallowest depth each canonical folder was explored at. A folder is entered
+    /// again only from a shallower depth, because the depth limit may have cut off
+    /// part of it the first time.
+    visited: HashMap<PathBuf, usize>,
     names: HashSet<String>,
     entries: usize,
     exhausted: bool,
@@ -255,9 +258,10 @@ async fn scan_skills(
                 continue;
             }
         };
-        if !scan.visited.insert(canonical) {
-            continue;
-        }
+        match scan.visited.get(&canonical) {
+            Some(&explored_at) if explored_at <= depth => continue,
+            _ => scan.visited.insert(canonical, depth),
+        };
         let path = folder.join("SKILL.md");
         match fs::metadata(&path).await {
             Ok(metadata) if metadata.is_file() => {
@@ -555,5 +559,22 @@ mod tests {
                 .unwrap()
                 .contains(".agents")
         );
+    }
+
+    #[tokio::test]
+    async fn a_root_inside_an_earlier_root_still_reaches_what_the_depth_limit_cut_off() {
+        let outer = tempfile::tempdir().unwrap();
+        let levels = (1..=10)
+            .map(|level| format!("d{level}"))
+            .collect::<Vec<_>>();
+        let inner = outer.path().join(levels.join("/"));
+        skill(&inner, "review");
+        let mut scan = SkillScan::default();
+        let mut found = CursorWorkspaceCapabilities::default();
+        scan_skills(outer.path(), "project", &mut scan, &mut found).await;
+        assert!(found.skills.is_empty());
+        scan_skills(&inner, "user", &mut scan, &mut found).await;
+        assert_eq!(names(&found), ["review"]);
+        assert_eq!(found.issues.len(), 1, "{:?}", found.issues);
     }
 }
