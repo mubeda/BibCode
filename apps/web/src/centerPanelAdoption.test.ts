@@ -12,6 +12,7 @@ import {
   selectThreadCenterPanelState,
   useCenterPanelStore,
 } from "./centerPanelStore";
+import { useRightPanelStore } from "./rightPanelStore";
 import { reserveTerminalId } from "./terminalIdReservations";
 
 const release = vi.hoisted(() => vi.fn());
@@ -268,5 +269,20 @@ describe("center panel adoption", () => {
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
     expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-b", "chat:panel-a"]);
     expect(activeSurfaceId()).toBe(HOST_SURFACE_ID);
+  });
+
+  it("drops the host's Diff on a panel's thread when the panel closes", () => {
+    const tracker = createCenterPanelAdoptionTracker();
+    const panelId = ThreadId.make("panel-a");
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
+    useRightPanelStore.setState({ byThreadKey: {} });
+    useRightPanelStore.getState().openDiff(HOST, panelId);
+
+    // Closed (archived) here or elsewhere: it leaves the live list.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread]);
+
+    expect(useRightPanelStore.getState().byThreadKey[scopedThreadKey(HOST)]?.surfaces).toEqual([
+      { id: "diff", kind: "diff" },
+    ]);
   });
 });

@@ -40,6 +40,7 @@ import {
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
+import { PanelDiffPendingState } from "./chat/PanelDiffPendingState";
 import { RightPanelThreadContext } from "./chat/rightPanelThread";
 import {
   attachmentUploadFailureCopy,
@@ -299,7 +300,7 @@ import {
   serverEnvironment,
 } from "../state/server";
 import { terminalEnvironment } from "../state/terminal";
-import { threadEnvironment } from "../state/threads";
+import { threadEnvironment, useThreadFindLoadState } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
@@ -1588,6 +1589,8 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThreadRef, diffSurfaceThreadId],
   );
   const diffSurfaceThread = useThread(diffSurfaceThreadRef);
+  const diffSurfaceLoad = useThreadFindLoadState(diffSurfaceThreadRef);
+  const diffSurfaceFailed = diffSurfaceLoad.status === "deleted" || diffSurfaceLoad.error !== null;
   // Each chat pane shows its own thread's Activity, inline above its composer.
   const activityScope = useMemo(
     () => resolveActivityScope(activeThreadRef, { _tag: "thread" }),
@@ -7004,14 +7007,21 @@ function ChatViewContent(props: ChatViewProps) {
         workspaceUnavailable={workspaceUnavailable}
       />
     ) : activeRightPanelSurface?.kind === "diff" ? (
-      <Suspense fallback={null}>
-        <DiffPanel
-          mode="embedded"
-          composerDraftTarget={diffSurfaceThreadRef ?? composerDraftTarget}
-          thread={diffSurfaceThreadRef ? diffSurfaceThread : activeThread}
-          workspaceUnavailable={workspaceUnavailable}
+      diffSurfaceThreadRef !== null && diffSurfaceThread === null ? (
+        <PanelDiffPendingState
+          failed={diffSurfaceFailed}
+          onShowOwnDiff={() => useRightPanelStore.getState().open(activeThreadRef, "diff")}
         />
-      </Suspense>
+      ) : (
+        <Suspense fallback={null}>
+          <DiffPanel
+            mode="embedded"
+            composerDraftTarget={diffSurfaceThreadRef ?? composerDraftTarget}
+            thread={diffSurfaceThread ?? activeThread}
+            workspaceUnavailable={workspaceUnavailable}
+          />
+        </Suspense>
+      )
     ) : activeRightPanelSurface?.kind === "sourceControl" ? (
       <Suspense fallback={null}>
         <SourceControlPanel

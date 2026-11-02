@@ -85,6 +85,7 @@ const h = vi.hoisted(() => {
     environments: [] as unknown[],
     primaryEnvironment: null as unknown,
     threadsByKey: new Map<string, unknown>(),
+    threadLoadStatesByKey: new Map<string, unknown>(),
     projectsByKey: new Map<string, unknown>(),
     allProjects: [] as unknown[],
     threadRefs: [] as unknown[],
@@ -167,6 +168,12 @@ vi.mock("../state/use-atom-command", () => ({
 }));
 
 vi.mock("../state/threads", () => ({
+  useThreadFindLoadState: (ref: { environmentId: string; threadId: string } | null) =>
+    (ref ? h.threadLoadStatesByKey.get(`${ref.environmentId}:${ref.threadId}`) : undefined) ?? {
+      status: "live",
+      hasData: true,
+      error: null,
+    },
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
@@ -1071,6 +1078,7 @@ beforeEach(() => {
   h.environments = [];
   h.primaryEnvironment = null;
   h.threadsByKey.clear();
+  h.threadLoadStatesByKey.clear();
   h.projectsByKey.clear();
   h.allProjects = [];
   h.threadRefs = [];
@@ -4624,6 +4632,105 @@ describe("ChatView", () => {
         act(() => useRightPanelStore.getState().open(threadRef, "diff"));
         await vi.waitFor(() =>
           expect(capturedProps<{ thread: { id: string } }>("diffPanel").thread.id).toBe(threadId),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("waits for a panel thread that arrives late, never pairing the host's diff with it", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-late");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      // After a reload the host's Diff still shows the panel, whose thread is not loaded yet.
+      useRightPanelStore.getState().openDiff(threadRef, panelThreadId);
+      h.threadLoadStatesByKey.set(`${environmentId}:${panelThreadId}`, {
+        status: "synchronizing",
+        hasData: false,
+        error: null,
+      });
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      try {
+        await render();
+        expect(container.textContent).toContain("Loading the chat panel's diff");
+        expect(h.captured["diffPanel"]).toBeUndefined();
+
+        h.threadsByKey.set(
+          `${environmentId}:${panelThreadId}`,
+          makeThread({ id: panelThreadId, title: "Panel thread" }),
+        );
+        h.threadLoadStatesByKey.delete(`${environmentId}:${panelThreadId}`);
+        await render();
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(panelThreadId);
+        expect(diffPanel.composerDraftTarget).toEqual(panelThreadRef);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("says when a panel thread fails to load and offers this chat's diff", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-failed");
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().openDiff(threadRef, panelThreadId);
+      h.threadLoadStatesByKey.set(`${environmentId}:${panelThreadId}`, {
+        status: "synchronizing",
+        hasData: false,
+        error: "Thread stream failed.",
+      });
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      try {
+        await render();
+        expect(container.textContent).toContain("Couldn't load the chat panel's diff.");
+        expect(h.captured["diffPanel"]).toBeUndefined();
+
+        const button = [...container.querySelectorAll("button")].find(
+          (candidate) => candidate.textContent === "Show this chat's diff",
+        );
+        expect(button).toBeDefined();
+        await act(async () => button!.click());
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(threadId);
+        expect(diffPanel.composerDraftTarget).not.toEqual(
+          scopeThreadRef(environmentId, panelThreadId),
         );
       } finally {
         await act(async () => root.unmount());
