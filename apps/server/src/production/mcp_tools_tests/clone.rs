@@ -1736,13 +1736,18 @@ async fn a_silent_ssh_server_ends_the_clone_without_a_cancel() {
     for banner in [None, Some(&b"SSH-2.0-OpenSSH_9.9\r\n"[..])] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let silent = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((mut stream, _)) = listener.accept().await {
-                if let Some(banner) = banner {
-                    let _ = stream.write_all(banner).await;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let silent = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                let mut held = Vec::new();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    if let Some(banner) = banner {
+                        let _ = stream.write_all(banner).await;
+                    }
+                    held.push(stream);
                 }
-                held.push(stream);
             }
         });
         let started = std::time::Instant::now();
@@ -1754,7 +1759,10 @@ async fn a_silent_ssh_server_ends_the_clone_without_a_cancel() {
             .await;
         let elapsed = started.elapsed();
         silent.abort();
+        // ssh reached the server and Git failed: not a policy refusal.
         assert_eq!(error_tag(&result), "GitCommandError", "{result}");
+        assert!(reason(&result).is_empty(), "{result}");
+        assert!(accepted.load(Ordering::SeqCst) > 0, "ssh never connected");
         assert!(
             elapsed < Duration::from_secs(30),
             "the silent server held the clone for {elapsed:?}"
