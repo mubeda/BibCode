@@ -1547,7 +1547,7 @@ Reverts a thread to its checkpoint after turn `turnCount` (0 means before its fi
 **Errors:**
 
 - `McpTurnRunningError`: a turn is running on the thread. Stop it with `interrupt_turn`, then revert.
-- `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
+- `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail; a turn's checkpoint still being recorded is retried in a moment), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
 - `McpInvalidArgumentError`: `turnCount` is above the latest turn that has a checkpoint.
 - `McpAccessCeilingError`: the thread runs above this connection's limit.
 - `McpThreadNotFoundError`, `OrchestrationDispatchCommandError`.
@@ -1579,7 +1579,7 @@ Stops a thread's running turn: the one `turnId` names, else the thread's latest 
 
 #### `get_turn_diff`
 
-Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only (a project outside Git has none). Turns that ended before BiBCode recorded checkpoints have none. A turn whose capture failed or that a restart cut off is not captured (the default skips it); asked for by `turnCount`, its patch also holds anything changed before the next turn started. A turn whose capture was still pending after 120 seconds has no patch at all, and the next turn's patch cannot be read either. While a turn's checkpoint is being captured, the thread's next turn waits. In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
+Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only (a project outside Git has none). Turns that ended before BiBCode recorded checkpoints have none. A turn whose capture failed or that a restart cut off is not captured (the default skips it); asked for by `turnCount`, its patch also holds anything changed before the next turn started. A turn whose capture was still pending after 120 seconds has no patch at all. The turn after one that was not captured has no patch either (the default skips it), but it can still be reverted to. While a turn's checkpoint is being captured, the thread's next turn waits. In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
 
 - **Set / scope:** Workspace · `orchestration:read`
 - **Access:** any level
@@ -1603,7 +1603,7 @@ Returns the file changes one turn made, as a patch: the changed files first, the
 
 **Errors:**
 
-- `McpNoTurnDiffError`: no `turnCount` was given and the thread has no turn with a captured checkpoint yet (none has ended since BiBCode recorded checkpoints, the project is not a Git checkout, or its only turn is still being captured); or the `turnCount` asked for has no captured checkpoint (its capture failed or timed out), refused before anything is read, as `revert_thread_to_turn` refuses it.
+- `McpNoTurnDiffError`: no `turnCount` was given and the thread has no turn with a captured checkpoint yet (none has ended since BiBCode recorded checkpoints, the project is not a Git checkout, or its only turn is still being captured); or the `turnCount` asked for has no captured checkpoint (its capture failed or timed out), refused before anything is read, as `revert_thread_to_turn` refuses it; or the turn was captured but the checkpoint before it is missing ("Turn n has no diff: the checkpoint before it is missing. You can still revert to it.").
 - `McpInvalidArgumentError`: `turnCount` is 0, or the cursor is malformed.
 - `OrchestrationGetTurnDiffError`: the checkpoint for a turn is no longer in the repository, or the workspace could not be resolved.
 - `WorkspaceUnavailableError`: the thread's workspace is being removed or is gone.
