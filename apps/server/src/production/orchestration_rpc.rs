@@ -893,7 +893,7 @@ async fn prepare_attachments(
     Ok((command, None))
 }
 
-async fn handle_query(
+pub(super) async fn handle_query(
     engine: &OrchestrationEngine,
     availability: Option<&WorkspaceAdmissionController>,
     request: RpcRequest,
@@ -973,24 +973,29 @@ async fn diff(
     let tag = request.error_tag;
     // Only a captured checkpoint is a turn's end state, as for revert: a ref of a turn not
     // captured (`missing`) or given up (`error`) may hold a later checkout. Turn 0 is the ref 0
-    // baseline. The start of a one-turn range is vouched for by its end being `ready`, which
-    // required that ref.
+    // baseline. The start of a one-turn range is vouched for only by its end's diff: its end was
+    // captured against that start as a trusted baseline.
+    let one_turn = request.to_turn_count == request.from_turn_count + 1;
     for turn_count in [request.from_turn_count, request.to_turn_count] {
-        let vouched = turn_count == 0
-            || (turn_count == request.from_turn_count && request.to_turn_count == turn_count + 1);
-        if vouched {
+        if turn_count == 0 || (one_turn && turn_count == request.from_turn_count) {
             continue;
         }
-        let captured = engine
+        let Some(checkpoint) = engine
             .repositories()
             .get_checkpoint(request.thread_id.clone(), turn_count)
             .await
             .map_err(|error| orchestration_error(tag, error))?
-            .is_some_and(|checkpoint| checkpoint.status == "ready");
-        if !captured {
+            .filter(|checkpoint| checkpoint.status == "ready")
+        else {
             return Err(orchestration_error(
                 tag,
                 super::orchestration_effects::uncaptured_diff_detail(turn_count),
+            ));
+        };
+        if one_turn && !checkpoint.diff_available {
+            return Err(orchestration_error(
+                tag,
+                super::orchestration_effects::no_baseline_diff_detail(turn_count),
             ));
         }
     }
@@ -1790,7 +1795,7 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
             rows.checkpoints
                 .iter()
                 .map(|row| {
-                    json!({
+                    let mut checkpoint = json!({
                         "turnId": row.turn_id,
                         "checkpointTurnCount": row.checkpoint_turn_count,
                         "checkpointRef": row.checkpoint_ref,
@@ -1798,7 +1803,12 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
                         "files": row.files,
                         "assistantMessageId": row.assistant_message_id,
                         "completedAt": row.completed_at,
-                    })
+                    });
+                    // Absent means true, so older clients and fixtures read it unchanged.
+                    if !row.diff_available {
+                        checkpoint["diffAvailable"] = json!(false);
+                    }
+                    checkpoint
                 })
                 .collect(),
         ),
@@ -2995,6 +3005,7 @@ mod tests {
                 checkpoint_ref: "refs/checkpoint/1".to_owned(),
                 status: "ready".to_owned(),
                 files: json!([]),
+                diff_available: true,
                 assistant_message_id: None,
                 completed_at: "2026-07-11T00:00:06.000Z".to_owned(),
             })
@@ -3443,6 +3454,7 @@ mod tests {
             checkpoint_ref: "refs/checkpoints/owned".to_owned(),
             status: "ready".to_owned(),
             files: json!([]),
+            diff_available: true,
             assistant_message_id: None,
             completed_at: CREATED_AT.to_owned(),
         }];
@@ -3523,6 +3535,7 @@ mod tests {
             checkpoint_turn_count: i64::try_from(turn).unwrap(),
             checkpoint_ref: format!("refs/checkpoints/{turn}"),
             status: "ready".to_owned(),
+            diff_available: true,
             files: Value::Array(
                 (0..count)
                     .map(|index| {
@@ -9062,5 +9075,182 @@ mod turn_diff_tests {
         assert!(!pid_file.exists(), "the refused read never started Git");
         drop(removal);
         engine.shutdown().await;
+    }
+
+    /// Records turn `turn_count` of `thread_id` as the effects worker does with `status`, and
+    /// with `diffAvailable: false` when `diff_available` is false.
+    async fn record_turn(
+        engine: &OrchestrationEngine,
+        thread_id: &str,
+        turn_count: i64,
+        status: &str,
+        diff_available: bool,
+        files: Value,
+    ) {
+        let mut command = json!({
+            "type": "thread.turn.diff.complete",
+            "commandId": format!("recorded-{turn_count}"),
+            "threadId": thread_id,
+            "turnId": format!("turn-{turn_count}"),
+            "checkpointTurnCount": turn_count,
+            "checkpointRef": super::super::orchestration_effects::checkpoint_ref(thread_id, turn_count),
+            "status": status,
+            "files": files,
+            "assistantMessageId": null,
+            "completedAt": CREATED_AT,
+            "createdAt": CREATED_AT,
+        });
+        if !diff_available {
+            command["diffAvailable"] = json!(false);
+        }
+        engine
+            .dispatch(serde_json::from_value(command).expect("checkpoint command"))
+            .await
+            .expect("recorded checkpoint");
+    }
+
+    /// Captures `lines.txt` with line 20 replaced by `line` as checkpoint `turn_count`.
+    async fn capture_line_twenty(root: &Path, thread_id: &str, turn_count: i64, line: &str) {
+        std::fs::write(
+            root.join("lines.txt"),
+            twenty_lines()
+                .replace("line 10\n", "line ten\n")
+                .replace("line 20\n", &format!("{line}\n")),
+        )
+        .expect("changed line");
+        capture_checkpoint(root, thread_id, turn_count)
+            .await
+            .expect("checkpoint");
+    }
+
+    #[tokio::test]
+    async fn a_one_turn_diff_without_a_baseline_is_refused_but_a_wider_range_is_served() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&engine, &root, &thread_id).await;
+        capture_line_twenty(&root, &thread_id, 2, "line twenty").await;
+        record_turn(&engine, &thread_id, 2, "ready", false, json!([])).await;
+
+        let refused = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 1, "toTurnCount": 2}),
+        )
+        .await
+        .expect_err("a turn without a baseline has no one-turn patch");
+        assert_eq!(refused["_tag"], "OrchestrationGetTurnDiffError");
+        assert_eq!(
+            refused["message"],
+            super::super::orchestration_effects::no_baseline_diff_detail(2)
+        );
+
+        // Both ends of a wider range are end states, so it is still served.
+        let wider = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 2}),
+        )
+        .await
+        .expect("a wider range");
+        let diff = wider["diff"].as_str().expect("diff text");
+        assert!(diff.contains("+line ten"), "{diff}");
+        assert!(diff.contains("+line twenty"), "{diff}");
+        let full = handle_query(
+            &engine,
+            None,
+            request(
+                "orchestration.getFullThreadDiff",
+                json!({"threadId": thread_id, "toTurnCount": 2}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("full-thread patch");
+        assert_eq!(full, wider);
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_ready_turn_after_a_missing_one_has_no_one_turn_diff() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&engine, &root, &thread_id).await;
+        capture_line_twenty(&root, &thread_id, 2, "line two").await;
+        record_turn(&engine, &thread_id, 2, "ready", true, json!([])).await;
+        // Turn 3 was never captured; its ref is a leftover that old code read turn 4 against.
+        capture_line_twenty(&root, &thread_id, 3, "leftover").await;
+        record_turn(&engine, &thread_id, 3, "missing", true, json!([])).await;
+        capture_line_twenty(&root, &thread_id, 4, "line four").await;
+        record_turn(
+            &engine,
+            &thread_id,
+            4,
+            "ready",
+            true,
+            json!([{"path": "lines.txt", "kind": "modified", "additions": 1, "deletions": 1}]),
+        )
+        .await;
+        // Back to the schema a v0.14 server wrote (migration 62), then upgraded.
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let has_column = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('projection_turns') \
+                     WHERE name = 'checkpoint_diff_available'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? == 1;
+                if has_column {
+                    connection.execute_batch(
+                        "ALTER TABLE projection_turns DROP COLUMN checkpoint_diff_available;
+                         DELETE FROM effect_sql_migrations
+                           WHERE name = 'ProjectionTurnCheckpointDiffAvailable';",
+                    )?;
+                }
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("upgraded");
+
+        let refused = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 3, "toTurnCount": 4}),
+        )
+        .await
+        .expect_err("an upgraded turn after a missing one has no one-turn patch");
+        assert_eq!(
+            refused["message"],
+            super::super::orchestration_effects::no_baseline_diff_detail(4)
+        );
+        let served = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 2, "toTurnCount": 4}),
+        )
+        .await
+        .expect("a range between two captured turns");
+        assert!(
+            served["diff"].as_str().unwrap().contains("+line four"),
+            "{served}"
+        );
+        let snapshot = thread_snapshot(&engine, &thread_id)
+            .await
+            .expect("thread snapshot");
+        let checkpoint = |turn_count: i64| {
+            snapshot["thread"]["checkpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|checkpoint| checkpoint["checkpointTurnCount"] == turn_count)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(checkpoint(4)["diffAvailable"], false);
+        assert_eq!(checkpoint(4)["files"], json!([]));
+        assert!(checkpoint(2).get("diffAvailable").is_none());
     }
 }

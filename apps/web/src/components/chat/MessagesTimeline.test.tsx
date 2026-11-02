@@ -1156,6 +1156,39 @@ describe("MessagesTimeline assistant rows", () => {
     expect(markup).toContain("alpha.ts");
     expect(markup).toContain("beta.ts");
   });
+
+  it("says when a captured turn's changes cannot be shown", async () => {
+    const assistantMessageId = MessageId.make("message-assistant-no-diff");
+    const markup = await renderTimeline({
+      timelineEntries: [
+        buildUserTimelineEntry("Change files."),
+        buildAssistantTimelineEntry({
+          id: "entry-2",
+          messageId: "message-assistant-no-diff",
+          text: "Changed a file.",
+          turnId: TURN_ID,
+        }),
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [
+          assistantMessageId,
+          {
+            turnId: TURN_ID,
+            checkpointTurnCount: 2,
+            checkpointRef: CheckpointRef.make("checkpoint-2"),
+            status: "ready" as const,
+            files: [],
+            diffAvailable: false,
+            assistantMessageId,
+            completedAt: LATER_CREATED_AT,
+          },
+        ],
+      ]),
+    });
+
+    expect(markup).toContain("for this turn: the checkpoint before it is missing.");
+    expect(markup).not.toContain("View diff");
+  });
 });
 
 describe("MessagesTimeline turn folds", () => {

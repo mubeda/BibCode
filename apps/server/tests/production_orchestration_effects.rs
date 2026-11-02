@@ -738,6 +738,100 @@ async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff()
     engine.shutdown().await;
 }
 
+/// A turn captured after its baseline went missing is `ready` without a diff: its own ref is
+/// its end state, so it can be reverted to, but no patch is read against a missing ref.
+#[tokio::test]
+async fn a_turn_without_its_baseline_is_ready_without_a_diff_and_can_be_reverted_to() {
+    let repository = initialize_repository().await;
+    let engine = engine(repository.path()).await;
+    let callbacks = Arc::new(CallbackState::default());
+    *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
+    let effects = OrchestrationEffects::start(
+        engine.clone(),
+        Arc::new(GitRepository::default()),
+        callbacks,
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 0)
+        .await
+        .unwrap();
+    std::fs::write(repository.path().join("tracked.txt"), "one\n").unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 1)
+        .await
+        .unwrap();
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.turn.diff.complete", "commandId":"diff-1", "threadId":"t1",
+            "turnId":"turn-1", "checkpointTurnCount":1,
+            "checkpointRef":orchestration_effects::checkpoint_ref("t1", 1),
+            "status":"ready", "files":[], "assistantMessageId":"a-1",
+            "completedAt":NOW, "createdAt":NOW
+        }),
+    )
+    .await;
+    // Turn 2's baseline is gone before turn 2 is captured.
+    git(
+        repository.path(),
+        &[
+            "update-ref",
+            "-d",
+            &orchestration_effects::checkpoint_ref("t1", 1),
+        ],
+    );
+    std::fs::write(repository.path().join("tracked.txt"), "two\n").unwrap();
+    let mut events = engine.subscribe_events();
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.turn.diff.complete", "commandId":"end-2", "threadId":"t1",
+            "turnId":"turn-2", "checkpointTurnCount":2,
+            "checkpointRef":orchestration_effects::checkpoint_ref("t1", 2),
+            "status":"missing", "files":[], "assistantMessageId":"a-2",
+            "completedAt":NOW, "createdAt":NOW
+        }),
+    )
+    .await;
+    let recorded = wait_for_event(&mut events, "thread.turn-diff-completed", |event| {
+        event.event.payload["turnId"] == "turn-2" && event.event.payload["status"] == "ready"
+    })
+    .await;
+    assert_eq!(recorded.event.payload["diffAvailable"], false);
+    let checkpoint = engine
+        .repositories()
+        .get_checkpoint("t1".to_owned(), 2)
+        .await
+        .unwrap()
+        .expect("checkpoint 2");
+    assert_eq!(checkpoint.status, "ready");
+    assert_eq!(checkpoint.files, json!([]));
+    assert!(!checkpoint.diff_available);
+
+    std::fs::write(repository.path().join("tracked.txt"), "after two\n").unwrap();
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.checkpoint.revert", "commandId":"revert-2", "threadId":"t1",
+            "turnCount":2, "createdAt":NOW
+        }),
+    )
+    .await;
+    wait_for_event(&mut events, "thread.reverted", |event| {
+        event.event.payload["threadId"] == "t1" && event.event.payload["turnCount"] == 2
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "two\n"
+    );
+    effects.shutdown().await;
+    engine.shutdown().await;
+}
+
 /// A thread whose turns predate turn checkpoints keeps the ref 0 of its very first turn. The
 /// first turn it starts afterwards captures ref 0 again, so that turn's diff, and a revert to
 /// 0, cover that turn alone rather than everything since the thread began.

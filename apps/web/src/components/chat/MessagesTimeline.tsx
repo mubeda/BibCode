@@ -1910,6 +1910,14 @@ const AssistantChangedFilesSection = memo(function AssistantChangedFilesSection(
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
 }) {
   if (!turnSummary) return null;
+  // Captured, so still a revert target, but with no baseline to read its changes against.
+  if (turnSummary.status === "ready" && turnSummary.diffAvailable === false) {
+    return (
+      <p className="mt-2 text-muted-foreground text-xs">
+        Changes can't be shown for this turn: the checkpoint before it is missing.
+      </p>
+    );
+  }
   const checkpointFiles = turnSummary.files;
   // The thread stream sends at most 200 files of a checkpoint and their total (#227).
   if ((turnSummary.filesTotal ?? checkpointFiles.length) === 0) return null;
