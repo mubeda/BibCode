@@ -1205,6 +1205,17 @@ export async function runLoadScenarios(
     harness.dropSockets();
     return threadResynced(page, socketsBefore, LOAD_TIMEOUT_MS, BIG_THREAD_ID);
   });
+
+  // The page's cache kept the big thread (and, since #227, its revision): a reload resumes it.
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  await measure("cold reload onto the big thread's route, thread cached", async () => {
+    await page.evaluate("window.__beforeReload = true");
+    await page.navigate(`${harness.origin}${threadPath}`);
+    return page.waitFor(
+      `!window.__beforeReload && ${bodyIncludes(BIG_THREAD_FINAL_MARKER)}`,
+      LOAD_TIMEOUT_MS,
+    );
+  });
   return results;
 }
 

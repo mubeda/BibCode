@@ -2520,6 +2520,59 @@ describe("MessagesTimeline mounted interactions", () => {
     expect(onOpenTurnDiff).toHaveBeenCalledWith(TURN_ID, "src/a.ts");
   });
 
+  // The thread stream sends 200 files of a large checkpoint and the total (#227).
+  it.each([
+    { shown: 2, total: 2_000, label: `and ${(1_998).toLocaleString()} more files` },
+    { shown: 0, total: 40, label: "40 files changed" },
+  ])("opens the turn diff from a capped file list ($shown of $total)", async (input) => {
+    const onOpenTurnDiff = vi.fn();
+    const assistantMessageId = MessageId.make("message-assistant-capped");
+    const container = await mountTimeline({
+      timelineEntries: [
+        buildUserTimelineEntry("Format everything"),
+        buildAssistantTimelineEntry({
+          id: "entry-assistant-capped",
+          messageId: "message-assistant-capped",
+          text: "Done",
+          turnId: TURN_ID,
+        }),
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [
+          assistantMessageId,
+          {
+            turnId: TURN_ID,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("checkpoint-capped"),
+            status: "ready" as const,
+            files: Array.from({ length: input.shown }, (_, index) => ({
+              path: `src/file-${index}.ts`,
+              kind: "modified",
+              additions: 1,
+              deletions: 1,
+            })),
+            filesTotal: input.total,
+            assistantMessageId,
+            completedAt: LATER_CREATED_AT,
+          },
+        ],
+      ]),
+      onOpenTurnDiff,
+    });
+
+    const heading = Array.from(container.querySelectorAll("p")).find((paragraph) =>
+      paragraph.textContent?.startsWith("Changed files"),
+    );
+    // No line totals: counted from the shown files only, they would understate the turn.
+    expect(heading?.textContent).toBe(`Changed files (${input.total.toLocaleString()})`);
+    const more = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent === input.label,
+    );
+    expect(more).toBeDefined();
+    await click(more!);
+    expect(onOpenTurnDiff).toHaveBeenCalledWith(TURN_ID);
+  });
+
   it("toggles a work row with Enter and Space while preventing their defaults", async () => {
     const container = await mountTimeline({
       activeTurnInProgress: true,

@@ -262,7 +262,11 @@ async fn the_fixture_is_a_big_thread_in_a_big_shell() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|checkpoint| checkpoint["files"].as_array().unwrap().len())
+        .map(|checkpoint| {
+            // The stream sends 200 files of a checkpoint and their total (#227).
+            assert!(checkpoint["files"].as_array().unwrap().len() <= 200);
+            checkpoint["filesTotal"].as_u64().unwrap()
+        })
         .max()
         .unwrap();
     assert!(widest >= 2_000, "{widest}");

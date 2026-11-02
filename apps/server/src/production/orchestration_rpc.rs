@@ -1615,6 +1615,7 @@ fn thread_snapshot_value(snapshot: &crate::orchestration::Snapshot, thread_id: &
         .unwrap_or(0);
     let rows = thread_detail_rows(snapshot, thread);
     let mut detail = thread_detail(thread, &rows);
+    cap_checkpoint_files(&mut detail);
     // Only the thread stream carries reasoning; a client that does not know the field drops it.
     detail
         .as_object_mut()
@@ -1640,6 +1641,28 @@ fn thread_snapshot_value(snapshot: &crate::orchestration::Snapshot, thread_id: &
             ),
         );
     Ok(json!({ "snapshotSequence": sequence, "thread": detail }))
+}
+
+/// The most changed files one checkpoint sends in the thread stream (#227). A turn that touched
+/// thousands of files (a formatter run, a lockfile, a generated folder) made every open of its
+/// thread carry all of them; the turn diff has the full list.
+const CHECKPOINT_FILES_LIMIT: usize = 200;
+
+/// Keeps the first [`CHECKPOINT_FILES_LIMIT`] files of each checkpoint, in their stored (path)
+/// order so patches do not churn, and says how many there are in `filesTotal`. The HTTP read
+/// model keeps every file.
+fn cap_checkpoint_files(detail: &mut Value) {
+    let Some(checkpoints) = detail.get_mut("checkpoints").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for checkpoint in checkpoints {
+        let Some(files) = checkpoint.get_mut("files").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let total = files.len();
+        files.truncate(CHECKPOINT_FILES_LIMIT);
+        checkpoint["filesTotal"] = json!(total);
+    }
 }
 
 fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Value {
@@ -3461,6 +3484,73 @@ mod tests {
             ws["latestTurn"]["sourceProposedPlan"],
             json!({ "threadId": "thread-source", "planId": "plan-source" })
         );
+    }
+
+    fn checkpoint_with_files(
+        turn: usize,
+        count: usize,
+    ) -> crate::orchestration::engine::ProjectionCheckpointRow {
+        crate::orchestration::engine::ProjectionCheckpointRow {
+            thread_id: "thread-live".to_owned(),
+            turn_id: format!("turn-{turn}"),
+            checkpoint_turn_count: i64::try_from(turn).unwrap(),
+            checkpoint_ref: format!("refs/checkpoints/{turn}"),
+            status: "ready".to_owned(),
+            files: Value::Array(
+                (0..count)
+                    .map(|index| {
+                        json!({"path": format!("src/{index:05}.rs"), "kind": "modified", "additions": 1, "deletions": 0})
+                    })
+                    .collect(),
+            ),
+            assistant_message_id: None,
+            completed_at: CREATED_AT.to_owned(),
+        }
+    }
+
+    /// A turn that touched thousands of files sends 200 of them and the total (#227).
+    #[test]
+    fn thread_snapshots_cap_checkpoint_files_and_send_the_total() {
+        let mut snapshot = http_read_model_fixture();
+        snapshot.checkpoints = vec![
+            checkpoint_with_files(1, 2_000),
+            checkpoint_with_files(2, 50),
+        ];
+        let first = thread_snapshot_value(&snapshot, "thread-live").expect("thread snapshot");
+        let checkpoints = first["thread"]["checkpoints"]
+            .as_array()
+            .expect("checkpoints");
+        let big = checkpoints[0]["files"].as_array().expect("files");
+        assert_eq!(big.len(), 200);
+        assert_eq!(checkpoints[0]["filesTotal"], 2_000);
+        // The first 200 in stored (path) order, the same in every snapshot.
+        assert_eq!(
+            &big[..],
+            &snapshot.checkpoints[0].files.as_array().unwrap()[..200]
+        );
+        assert_eq!(checkpoints[1]["files"], snapshot.checkpoints[1].files);
+        assert_eq!(checkpoints[1]["filesTotal"], 50);
+
+        let again = thread_snapshot_value(&snapshot, "thread-live").expect("thread snapshot");
+        let held = HeldThread::of(&first, std::hash::RandomState::new()).expect("a thread");
+        assert!(
+            thread_patch(&held, &again).is_none(),
+            "an unchanged thread sends no patch"
+        );
+        snapshot.checkpoints.push(checkpoint_with_files(3, 1));
+        let next = thread_snapshot_value(&snapshot, "thread-live").expect("thread snapshot");
+        let patch = thread_patch(&held, &next).expect("a new checkpoint");
+        assert_eq!(
+            patch["patch"]["arrays"]["checkpoints"],
+            json!({"length": 3, "changes": [[2, next["thread"]["checkpoints"][2]]]}),
+            "only the new checkpoint is sent"
+        );
+
+        // The HTTP read model keeps every file and no total.
+        let model = read_model_snapshot(&snapshot, CREATED_AT);
+        let checkpoint = &model["threads"][0]["checkpoints"][0];
+        assert_eq!(checkpoint["files"].as_array().map(Vec::len), Some(2_000));
+        assert!(checkpoint.get("filesTotal").is_none());
     }
 
     struct NeverFactory;
