@@ -2473,8 +2473,7 @@ pub async fn discard_paths(
     // What was queued before an entry stranded may now name a file that took its place (the
     // same file through another letter case, or a folder holding it): nothing deferred below
     // unstages, restores or removes it. It is left in place, and the stranded entry reports it.
-    outcome.permanently_discarded =
-        without_stranded(&outcome.permanently_discarded, &outcome.kept_in_staging);
+    leave_stranded_names_alone(&mut outcome);
     let mut discarded_paths = without_stranded(&outcome.trashed, &outcome.kept_in_staging);
     discarded_paths.extend(outcome.permanently_discarded.iter().cloned());
     discarded_paths.extend(without_stranded(&restore_only, &outcome.kept_in_staging));
@@ -2535,6 +2534,18 @@ fn overlaps_stranded(path: &str, stranded: &[KeptInStaging]) -> bool {
         let kept = kept.path.to_lowercase();
         path_matches(&path, &kept) || path_matches(&kept, &path)
     })
+}
+
+/// Takes out of the lists a client acts on (a permanent discard, or a retry that offers one)
+/// every path overlapping an entry that stranded in this batch: it names the replacement file.
+fn leave_stranded_names_alone(outcome: &mut DiscardOutcome) {
+    let stranded = &outcome.kept_in_staging;
+    let (permanent, unavailable) = (
+        without_stranded(&outcome.permanently_discarded, stranded),
+        without_stranded(&outcome.trash_unavailable, stranded),
+    );
+    outcome.permanently_discarded = permanent;
+    outcome.trash_unavailable = unavailable;
 }
 
 /// `paths` without those that overlap an entry in `stranded` (see [`overlaps_stranded`]).
@@ -5010,6 +5021,47 @@ mod tests {
         );
     }
 
+    /// The same without `permitPermanent`: the first refusal went back and is listed as refused;
+    /// the second strands. The refused list must not name the replacement, or the permanent
+    /// retry a client offers would delete it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_listed_before_a_stranding_never_offers_the_replacement_for_deletion() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("victim.txt"), "old\n").expect("untracked file");
+        if !fixture.path().join("VICTIM.TXT").exists() {
+            return;
+        }
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingOnceTrash {
+                recreate: fixture.path().join("victim.txt"),
+                recreate_on: 1,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["victim.txt".into(), "VICTIM.TXT".into()],
+                permit_permanent: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.trash_unavailable.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.kept_in_staging.len(), 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("victim.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
     /// What was queued before an entry stranded is dropped from the deferred work by the same
     /// overlap rule.
     #[test]
@@ -5021,6 +5073,16 @@ mod tests {
         let queued = ["victim.txt".to_owned(), "other.txt".to_owned()];
         assert_eq!(without_stranded(&queued, &stranded), ["other.txt"]);
         assert_eq!(without_stranded(&queued, &[]), queued);
+
+        let mut outcome = DiscardOutcome {
+            permanently_discarded: vec!["victim.txt".into(), "kept.txt".into()],
+            trash_unavailable: vec!["Victim.Txt".into(), "refused.txt".into()],
+            kept_in_staging: stranded.to_vec(),
+            ..Default::default()
+        };
+        leave_stranded_names_alone(&mut outcome);
+        assert_eq!(outcome.permanently_discarded, ["kept.txt"]);
+        assert_eq!(outcome.trash_unavailable, ["refused.txt"]);
     }
 
     /// A path a requested folder covers, and one named twice, are discarded with the folder or
