@@ -11213,7 +11213,7 @@ async fn project_provider_event(
         && settled_command(&event.payload)
             .is_some_and(crate::source_control::pr_create_command::creates_pull_request)
     {
-        engine.report_local_change(&launch.cwd);
+        engine.report_pull_request_change(&launch.cwd);
     }
     if event.event_type == "turn.completed" {
         let state = event
@@ -33074,7 +33074,7 @@ done
         launch.thread_id = "t1".to_owned();
         let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = reported.clone();
-        engine.set_local_change_observer(Arc::new(move |cwd: &std::path::Path| {
+        engine.set_pull_request_change_observer(Arc::new(move |cwd: &std::path::Path| {
             recorder.lock().unwrap().push(cwd.to_path_buf());
         }));
         for (event_type, payload) in events {

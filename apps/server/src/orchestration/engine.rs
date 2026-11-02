@@ -1976,8 +1976,8 @@ enum WorkerEnvelope {
     DeliveryTransition(DeliveryTransitionEnvelope),
 }
 
-/// Receives the working directory of a provider command that changed local or hosting state.
-pub type LocalChangeObserver = Arc<dyn Fn(&Path) + Send + Sync>;
+/// Receives the working directory of a provider command that may have created a pull request.
+pub type PullRequestChangeObserver = Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct OrchestrationEngine {
@@ -1989,7 +1989,7 @@ pub struct OrchestrationEngine {
     bootstrap_effects: Arc<StdMutex<Option<Arc<dyn ThreadTurnBootstrapEffects>>>>,
     turn_delivery_wake: Arc<StdMutex<Option<Arc<Notify>>>>,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
-    local_change_observer: Arc<StdMutex<Option<LocalChangeObserver>>>,
+    pull_request_change_observer: Arc<StdMutex<Option<PullRequestChangeObserver>>>,
     command_admission: CommandAdmissionFence,
     workspace_ownership: WorkspaceOwnershipFence,
     thread_turns: ThreadTurnFence,
@@ -2087,7 +2087,7 @@ impl OrchestrationEngine {
             bootstrap_effects: Arc::new(StdMutex::new(None)),
             turn_delivery_wake,
             project_command_effects,
-            local_change_observer: Arc::new(StdMutex::new(None)),
+            pull_request_change_observer: Arc::new(StdMutex::new(None)),
             command_admission: CommandAdmissionFence::default(),
             workspace_ownership: WorkspaceOwnershipFence::default(),
             thread_turns: ThreadTurnFence::default(),
@@ -2959,18 +2959,18 @@ impl OrchestrationEngine {
         }
     }
 
-    /// Registers where a provider command that changed a worktree's hosting state (an agent
-    /// running `gh pr create`) is reported. It must only schedule work, never block.
-    pub fn set_local_change_observer(&self, observer: LocalChangeObserver) {
+    /// Registers where a provider command that may have created a pull request (an agent running
+    /// `gh pr create`) is reported. It must only schedule work, never block.
+    pub fn set_pull_request_change_observer(&self, observer: PullRequestChangeObserver) {
         *self
-            .local_change_observer
+            .pull_request_change_observer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
     }
 
-    pub(crate) fn report_local_change(&self, cwd: &Path) {
+    pub(crate) fn report_pull_request_change(&self, cwd: &Path) {
         let observer = self
-            .local_change_observer
+            .pull_request_change_observer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();

@@ -174,10 +174,13 @@ flowchart TB
   deepest active canonical worktree ancestor after terminal exit publication.
   A settled provider command item (a Codex or Cursor `command_execution`, a
   Claude `Bash` call with a result) that runs `gh pr create` or
-  `glab mr create` at command position reports a local change for the thread's
-  cwd the same way, through the orchestration engine's local-change observer;
-  only the match is used, never the command text. Other provider, session, and
-  delivery events do not notify. Commands typed inside a
+  `glab mr create` at command position (repository flags such as `-R` allowed)
+  reports a possible pull request for the thread's own cwd through the
+  orchestration engine's pull-request change observer: that worktree's open-PR
+  lookups are forgotten, its passive summary restarts even when no status view
+  watches it, and an active status view reads its remote again. Nothing is
+  redirected to a parent checkout. Only the match is used, never the command
+  text. Other provider, session, and delivery events do not notify. Commands typed inside a
   persistent interactive shell have no structured completion boundary and
   therefore converge through native watcher events or the safety read. Native
   watching covers only filesystem paths visible to the server execution host;
