@@ -356,7 +356,9 @@ process is sampled, but what runs under a terminal (`other`, `terminal`,
   detector uses 1-minute medians and a rolling 10-minute minimum, so allocator
   sawtooth does not count. The Theil–Sen slope over 1 h must be at least
   max(10 MB/h, 2 %/h of baseline), with Mann–Kendall Z above 2.33, on two
-  consecutive checks. A step change resets the baseline, and so does a sampling
+  consecutive checks. Both the floor and its high-water mark since the last
+  reset must pass, so memory freed again does not count, and neither does a
+  refill to the level held before a dip. A step change resets the baseline, and so does a sampling
   gap over 5 minutes, such as sleep. A smaller step, such as a cache filled
   once, gives no verdict while one minute's rise of the floor is at least half
   of the hour's growth.
