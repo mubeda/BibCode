@@ -31,10 +31,30 @@ fn command_creates_pull_request(words: &[String]) -> bool {
                 word.eq_ignore_ascii_case("-c") || word.eq_ignore_ascii_case("-command")
             })
             .is_some_and(|flag| creates_pull_request(&words[flag + 2..].join(" "))),
-        "gh" => matches!(words.get(1..3), Some([noun, verb]) if noun == "pr" && is_create(verb)),
-        "glab" => matches!(words.get(1..3), Some([noun, verb]) if noun == "mr" && is_create(verb)),
+        "gh" => matches!(leading_positionals(&words[1..])[..], ["pr", verb] if is_create(verb)),
+        "glab" => matches!(leading_positionals(&words[1..])[..], ["mr", verb] if is_create(verb)),
         _ => false,
     }
+}
+
+/// The first two words that are not flags, so `gh -R o/r pr create` and `gh pr --repo o/r create`
+/// read like `gh pr create`. Only the flags that name a repository or host take a value here.
+fn leading_positionals(words: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if let Some(flag) = word.strip_prefix('-') {
+            if !flag.contains('=') && matches!(flag, "R" | "-repo" | "H" | "-hostname") {
+                words.next();
+            }
+        } else {
+            positionals.push(word.as_str());
+            if positionals.len() == 2 {
+                break;
+            }
+        }
+    }
+    positionals
 }
 
 fn is_create(verb: &str) -> bool {
@@ -82,7 +102,7 @@ fn simple_commands(command: &str) -> Vec<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    let mut heredocs = Vec::<String>::new();
+    let mut heredocs = Vec::<(String, bool)>::new();
     let mut index = 0;
     macro_rules! end_word {
         () => {
@@ -147,7 +167,7 @@ fn simple_commands(command: &str) -> Vec<Vec<String>> {
             '\n' => {
                 end_command!();
                 // Each pending heredoc body runs to its delimiter line.
-                for delimiter in heredocs.drain(..) {
+                for (delimiter, tabs_allowed) in heredocs.drain(..) {
                     while index < chars.len() {
                         let end = chars[index..]
                             .iter()
@@ -155,7 +175,14 @@ fn simple_commands(command: &str) -> Vec<Vec<String>> {
                             .map_or(chars.len(), |offset| index + offset);
                         let line = chars[index..end].iter().collect::<String>();
                         index = end + 1;
-                        if line.trim() == delimiter {
+                        // Only `<<-` lets the terminator lead with tabs; spaces never do.
+                        let line = line.trim_end_matches('\r');
+                        if (if tabs_allowed {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line
+                        }) == delimiter
+                        {
                             break;
                         }
                     }
@@ -167,7 +194,8 @@ fn simple_commands(command: &str) -> Vec<Vec<String>> {
             '<' if chars.get(index) == Some(&'<') && chars.get(index + 1) != Some(&'<') => {
                 end_word!();
                 index += 1;
-                if chars.get(index) == Some(&'-') {
+                let tabs_allowed = chars.get(index) == Some(&'-');
+                if tabs_allowed {
                     index += 1;
                 }
                 while chars.get(index).is_some_and(|c| *c == ' ' || *c == '\t') {
@@ -184,7 +212,7 @@ fn simple_commands(command: &str) -> Vec<Vec<String>> {
                     index += 1;
                 }
                 if !delimiter.is_empty() {
-                    heredocs.push(delimiter);
+                    heredocs.push((delimiter, tabs_allowed));
                 }
             }
             '<' | '>' => {
@@ -222,6 +250,13 @@ mod tests {
             r#""C:\Program Files\GitHub CLI\gh.exe" pr create --fill"#,
             "GH_PROMPT_DISABLED=1 gh pr create --fill",
             "gh pr new --fill",
+            "gh -R owner/repo pr create --fill",
+            "gh --repo owner/repo pr create --fill",
+            "gh pr --repo owner/repo create --fill",
+            "gh pr -R=owner/repo create --fill",
+            "glab -R owner/repo mr create --fill",
+            "glab mr --repo owner/repo create --fill --yes",
+            "glab mr create --fill",
         ] {
             assert!(creates_pull_request(command), "{command}");
         }
@@ -264,6 +299,22 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_terminators_must_start_the_line() {
+        // Spaces never indent a `<<` terminator, so the create below is still heredoc text.
+        for command in [
+            "cat <<EOF\n  EOF\ngh pr create --fill\nEOF",
+            "cat <<EOF\n\tEOF\ngh pr create --fill\nEOF",
+            "cat <<-EOF\n  EOF\ngh pr create --fill\nEOF",
+        ] {
+            assert!(!creates_pull_request(command), "{command}");
+        }
+        // `<<-` strips leading tabs, so the create below runs.
+        assert!(creates_pull_request(
+            "cat <<-EOF\n\tEOF\ngh pr create --fill"
+        ));
+    }
+
+    #[test]
     fn mentions_are_not_creates() {
         for command in [
             r#"echo "gh pr create""#,
@@ -286,6 +337,9 @@ mod tests {
             "gh pr list --head feature",
             "glab mr list",
             "gh pr view 42 --json url",
+            "gh -R owner/repo pr view create",
+            "glab -R owner/repo mr list",
+            "gh pr --repo owner/repo view",
             "gh api repos/o/r/pulls -f title=x",
             "gh issue create --title x",
             "gh",

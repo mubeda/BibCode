@@ -29,6 +29,7 @@ use crate::{
         validate_pathspecs,
     },
     maintenance::RpcPermit,
+    orchestration::engine::PullRequestChangeObserver,
     persistence::{Repositories, WorktreeRemovalReceipt},
     pull_requests::CreatedRequestObserver,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcSessionContext, RpcStreamChunk},
@@ -512,6 +513,33 @@ impl GitVcsRpcServices {
 
     pub(crate) fn clone_operations(&self) -> CloneRuntime {
         self.clone_operations.clone()
+    }
+
+    /// Reports that a provider command, an agent running `gh pr create`, may have created a pull
+    /// request for the branch of `cwd` (#221). The worktree's own lookups are forgotten and its
+    /// passive summary restarts even when no status view watches it, and an active status view
+    /// reads its remote again, since the command changed no Git state. Nothing is redirected to
+    /// a parent checkout. The reporter only schedules the work.
+    pub(crate) fn pull_request_change_reporter(&self) -> PullRequestChangeObserver {
+        let (broadcaster, summary, pull_requests) = (
+            self.broadcaster.clone(),
+            self.summary.clone(),
+            self.pull_requests.clone(),
+        );
+        Arc::new(move |cwd| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let (broadcaster, summary, pull_requests) =
+                (broadcaster.clone(), summary.clone(), pull_requests.clone());
+            let cwd = cwd.to_path_buf();
+            handle.spawn(async move {
+                let cwd = tokio::fs::canonicalize(&cwd).await.unwrap_or(cwd);
+                pull_requests.invalidate_open_pull_request_lookups(&cwd);
+                summary.notify_local_change(&cwd).await;
+                broadcaster.notify_pull_request_change(&cwd).await;
+            });
+        })
     }
 
     pub(crate) fn status_broadcaster(&self) -> StatusBroadcaster {
@@ -7478,50 +7506,122 @@ esac
         cancellation.cancel();
     }
 
+    fn subscribe_request(cwd: &Path) -> RpcRequest {
+        RpcRequest {
+            id: RequestId::try_from("3").expect("request id"),
+            tag: "subscribeVcsStatus".to_owned(),
+            payload: json!({ "cwd": cwd }),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        }
+    }
+
+    /// Waits until the fake forge has been asked about `branch` `count` times.
+    async fn wait_for_lookups(fixture: &Fixture, branch: &str, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture
+                .lookups()
+                .iter()
+                .filter(|lookup| *lookup == branch)
+                .count()
+                < count
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{branch} looked up {count} times: {:?}", fixture.lookups()));
+    }
+
     #[tokio::test]
-    async fn a_provider_reported_change_runs_a_fresh_lookup_before_the_ttl() {
+    async fn a_provider_reported_pull_request_reaches_an_active_status_stream() {
         let fixture = Fixture::new("pr-lookup-provider-change");
         let cancellation = CancellationToken::new();
-        let mut stream = fixture.services.status_stream(
-            RpcRequest {
-                id: RequestId::try_from("3").expect("request id"),
-                tag: "subscribeVcsStatus".to_owned(),
-                payload: json!({ "cwd": fixture.repository }),
-                headers: Vec::new(),
-                trace_id: None,
-                span_id: None,
-                sampled: None,
-            },
-            cancellation.clone(),
-        );
+        let mut stream = fixture
+            .services
+            .status_stream(subscribe_request(&fixture.repository), cancellation.clone());
         stream
             .recv()
             .await
             .expect("status stream stays open")
             .expect("status snapshot");
-        fixture.refresh().await;
-        let cached = fixture.refresh().await;
-        assert!(cached["pr"].is_null(), "{cached}");
-        assert_eq!(fixture.lookups(), ["main"]);
+        wait_for_lookups(&fixture, "main", 1).await;
 
-        // An agent's `gh pr create` settles; the provider runtime reports it synchronously.
+        // An agent's `gh pr create` on a pushed branch settles. No Git state changed, so only the
+        // report can make the stream look the request up again, well inside the lookup TTL.
         fixture.set("open", "");
-        let report = fixture.services.broadcaster.local_change_reporter();
-        report(&fixture.repository);
-        // Well inside the 10-second lookup TTL.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let status = fixture.refresh().await;
-            if status["pr"]["number"] == 42 {
-                break;
+        fixture.services.pull_request_change_reporter()(&fixture.repository);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let chunk = stream
+                    .recv()
+                    .await
+                    .expect("status stream stays open")
+                    .expect("status stream event");
+                if chunk[0]["remote"]["pr"]["number"] == 42 {
+                    break;
+                }
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the cached lookup was reused: {status}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        })
+        .await
+        .expect("the active stream must publish the created pull request");
         assert_eq!(fixture.lookups(), ["main", "main"]);
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_provider_reported_pull_request_refreshes_an_unwatched_nested_worktree_only() {
+        let fixture = Fixture::new("pr-lookup-provider-nested");
+        let cancellation = CancellationToken::new();
+        // The checkout is watched; the thread's worktree inside it has a passive summary only.
+        let mut stream = fixture
+            .services
+            .status_stream(subscribe_request(&fixture.repository), cancellation.clone());
+        stream
+            .recv()
+            .await
+            .expect("status stream stays open")
+            .expect("status snapshot");
+        let worktree = fixture.repository.join("wt");
+        git(
+            &fixture.repository,
+            &["worktree", "add", "-q", "-b", "feature", "wt"],
+        );
+        let mut summaries = fixture
+            .services
+            .summary
+            .subscribe(worktree.clone())
+            .await
+            .expect("summary subscription");
+        wait_for_lookups(&fixture, "main", 1).await;
+        wait_for_lookups(&fixture, "feature", 1).await;
+
+        fixture.set("open", "");
+        fixture.services.pull_request_change_reporter()(&worktree);
+        let pr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(summary)) = summaries.borrow_and_update().as_ref()
+                    && let Some(pr) = &summary.pr
+                {
+                    break pr.clone();
+                }
+                summaries
+                    .changed()
+                    .await
+                    .expect("summary producer stays alive");
+            }
+        })
+        .await
+        .expect("the passive summary must show the created pull request");
+        assert_eq!(pr.number, 42);
+        assert_eq!(
+            fixture.lookups().iter().filter(|b| *b == "main").count(),
+            1,
+            "the parent checkout is not refreshed: {:?}",
+            fixture.lookups()
+        );
         cancellation.cancel();
     }
 

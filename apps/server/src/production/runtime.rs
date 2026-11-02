@@ -549,9 +549,8 @@ impl ProductionRuntime {
                 status_broadcaster.notify_local_change(&cwd).await;
             })
         }));
-        // A provider command that created a pull request (#221) is reported the same way.
-        orchestration
-            .set_local_change_observer(Arc::new(status_broadcaster.local_change_reporter()));
+        // An agent's `gh pr create` (#221) refreshes the thread's own worktree.
+        orchestration.set_pull_request_change_observer(git_vcs.pull_request_change_reporter());
         // One system trash for Source Control's discard and the Files tools' delete (#139 X5).
         let file_trash: Arc<dyn crate::git::FileTrash> =
             Arc::new(crate::git::NativeFileTrash::default());
