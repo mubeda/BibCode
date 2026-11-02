@@ -382,8 +382,9 @@ the same command.
   place, syncs the state directory, removes the empty staging directory,
   removes the journal and syncs the data root. Each step is a rename decided
   from the files, so an interrupted `--resume` is finished by the next one. A
-  start-empty journal only finishes preserving. With no journal it reports
-  that there is nothing to resume and changes nothing.
+  start-empty journal only finishes preserving. With no journal it clears an
+  operation abandoned before its journal was published (O4's rule), or
+  reports that there is nothing to resume and changes nothing.
 - It refuses, leaving every file as it is, when the journal is not version 2,
   does not parse, names another state kind, or the files match none of the
   states above: an unexpected entry in staging, or a staged file whose

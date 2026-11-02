@@ -8,10 +8,12 @@ mod store;
 
 pub use backup::{
     BackupError, BackupInventory, BackupInventoryIssue, BackupManifest, BackupTrigger,
-    DatabaseSpace, DatabaseStatsUnavailable, RecoveryAction, RecoveryError, RecoveryResult,
-    StoreInspection, StoreInspectionStatus, StoreOperationGuard, StoreRuntimeGuard, VerifiedBackup,
-    create_verified_backup, format_bytes, inspect_store, inspect_store_for_integration_test,
-    inventory_verified_backups, preserve_and_start_empty, restore_backup,
+    DatabaseSpace, DatabaseStatsUnavailable, RECOVERY_TIMEOUT, RESUME_COMMAND, RecoveryAction,
+    RecoveryError, RecoveryResult, ResumeResult, StoreInspection, StoreInspectionStatus,
+    StoreIoBudget, StoreOperationGuard, StoreRuntimeGuard, VerifiedBackup, create_verified_backup,
+    create_verified_backup_with, format_bytes, format_duration_words, inspect_store,
+    inspect_store_for_integration_test, interrupted_recovery_message, inventory_verified_backups,
+    preserve_and_start_empty, restore_backup, resume_recovery,
 };
 pub use compaction::{
     AvailableFreeBytes, CompactOptions, CompactPlan, CompactProgress, CompactReport, CompactStats,
@@ -26,6 +28,6 @@ pub use state_files::{
     StateFileError, StateKind, StatePaths, read_json, write_bytes_atomically, write_json_atomically,
 };
 pub use store::{
-    PreparedStore, StorageInstanceId, StoreClassification, StoreStartupError, prepare_store,
-    read_storage_instance_id,
+    PreparedStore, StorageInstanceId, StoreClassification, StoreStartupError,
+    ensure_no_interrupted_recovery, prepare_store, read_storage_instance_id,
 };

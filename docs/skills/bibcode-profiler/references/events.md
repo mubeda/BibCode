@@ -372,10 +372,13 @@ The `end` event adds:
   when the step that measures them did not run;
 - `backupMs`, `vacuumMs`: how long the pre-compact backup and `VACUUM` took,
   or `null`;
+- `backupBudgetMs`: the pre-compact backup's deadline, 30 s plus 4 minutes per
+  GiB of the store, or `null` when the backup did not start;
 - `durationMs`: the whole command after it took the runtime lock.
 
 A `failed` or `cancelled` outcome after `backup` means a pre-compact backup was
-published; the command's own error names it.
+published; the command's own error names it. With `failedStep: "backup"` no
+backup was published.
 
 ### worktree.removal
 

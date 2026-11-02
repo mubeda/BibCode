@@ -720,6 +720,9 @@ pub(crate) async fn open_store(
     let guard = crate::persistence::StoreRuntimeGuard::acquire(&options.root.effective)
         .await
         .map_err(|error| error.to_string())?;
+    // Under the shared runtime lock, so a restore or `--resume` cannot start meanwhile.
+    crate::persistence::ensure_no_interrupted_recovery(&options.paths())
+        .map_err(|error| error.to_string())?;
     let database = crate::persistence::Database::open_existing(&options.paths().database)
         .await
         .map_err(|error| error.to_string())?;
