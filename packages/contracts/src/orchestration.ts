@@ -30,6 +30,7 @@ export const ORCHESTRATION_WS_METHODS = {
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
   replayEvents: "orchestration.replayEvents",
+  getThreadHistoryPage: "orchestration.getThreadHistoryPage",
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
@@ -562,6 +563,45 @@ export const OrchestrationThreadCompaction = Schema.Struct({
 });
 export type OrchestrationThreadCompaction = typeof OrchestrationThreadCompaction.Type;
 
+/**
+ * A history row's place in the timeline (#226): `createdAt`, then its kind's rank (message 0,
+ * activity 1, reasoning 2, proposed plan 3), then its id.
+ */
+export const OrchestrationThreadHistoryKey = Schema.Struct({
+  createdAt: Schema.String,
+  rank: NonNegativeInt,
+  id: Schema.String,
+});
+export type OrchestrationThreadHistoryKey = typeof OrchestrationThreadHistoryKey.Type;
+
+/**
+ * A windowed thread's history (#226): the thread holds recent history, older rows load in pages
+ * from `orchestration.getThreadHistoryPage`. Present only on a thread from a stream the client
+ * asked for a window.
+ */
+export const OrchestrationThreadHistory = Schema.Struct({
+  /** Opaque: the client stores it, echoes it on resubscribe and pages from it. */
+  floor: TrimmedNonEmptyString,
+  hasOlder: Schema.Boolean,
+  /** History rows the window doesn't hold. */
+  olderRows: NonNegativeInt,
+  /**
+   * State rows the window doesn't hold but current state needs: open requests, the effective
+   * context-window and MCP status rows, the newest plan and the source plan of a running
+   * implementation. State readers read them; the timeline doesn't show them.
+   */
+  carried: Schema.Struct({
+    activities: Schema.Array(OrchestrationThreadActivity),
+    proposedPlans: Schema.Array(OrchestrationProposedPlan),
+  }),
+  /**
+   * Set by the client runtime on the thread it publishes, never by a server: where loaded
+   * history starts, or `null` once nothing is older.
+   */
+  loadedFrom: Schema.optional(Schema.NullOr(OrchestrationThreadHistoryKey)),
+});
+export type OrchestrationThreadHistory = typeof OrchestrationThreadHistory.Type;
+
 export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
@@ -596,6 +636,8 @@ export const OrchestrationThread = Schema.Struct({
   session: Schema.NullOr(OrchestrationSession),
   /** Present while a conversation compaction is unsettled; absent from older servers. */
   compaction: Schema.optional(OrchestrationThreadCompaction),
+  /** A windowed thread's history; absent from a whole thread and from older servers. */
+  history: Schema.optional(OrchestrationThreadHistory),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;
 
@@ -750,6 +792,15 @@ export const OrchestrationSubscribeThreadInput = Schema.Struct({
     Schema.Struct({
       revision: TrimmedNonEmptyString,
       snapshotSequence: NonNegativeInt,
+    }),
+  ),
+  /**
+   * Open a history window (#226): recent history, with older rows in pages. A client that
+   * holds a window echoes its `floor`. Older servers ignore it and send the whole thread.
+   */
+  history: Schema.optional(
+    Schema.Struct({
+      floor: Schema.optional(TrimmedNonEmptyString),
     }),
   ),
 });
@@ -1854,6 +1905,27 @@ const OrchestrationReplayEventsResult = Schema.Union([
 ]);
 export type OrchestrationReplayEventsResult = typeof OrchestrationReplayEventsResult.Type;
 
+export const OrchestrationGetThreadHistoryPageInput = Schema.Struct({
+  threadId: ThreadId,
+  cursor: TrimmedNonEmptyString,
+});
+export type OrchestrationGetThreadHistoryPageInput =
+  typeof OrchestrationGetThreadHistoryPageInput.Type;
+
+/** History rows older than the cursor, newest first, with the full checkpoints of their turns. */
+export const OrchestrationThreadHistoryPage = Schema.Struct({
+  messages: Schema.Array(OrchestrationMessage),
+  activities: Schema.Array(OrchestrationThreadActivity),
+  reasoning: Schema.Array(OrchestrationReasoning),
+  proposedPlans: Schema.Array(OrchestrationProposedPlan),
+  checkpoints: Schema.Array(OrchestrationCheckpointSummary),
+  /** The next page's cursor; `null` when nothing is older. */
+  cursor: Schema.NullOr(TrimmedNonEmptyString),
+  /** History rows still older than this page. */
+  olderRows: NonNegativeInt,
+});
+export type OrchestrationThreadHistoryPage = typeof OrchestrationThreadHistoryPage.Type;
+
 export const OrchestrationRpcSchemas = {
   dispatchCommand: {
     input: ClientOrchestrationCommand,
@@ -1870,6 +1942,10 @@ export const OrchestrationRpcSchemas = {
   replayEvents: {
     input: OrchestrationReplayEventsInput,
     output: OrchestrationReplayEventsResult,
+  },
+  getThreadHistoryPage: {
+    input: OrchestrationGetThreadHistoryPageInput,
+    output: OrchestrationThreadHistoryPage,
   },
   getArchivedShellSnapshot: {
     input: Schema.Struct({}),
@@ -1914,6 +1990,22 @@ export class OrchestrationGetFullThreadDiffError extends Schema.TaggedError<Orch
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+/** The page cursor is from before a revert of the thread: the window must be opened again. */
+export class OrchestrationThreadHistoryStaleError extends Schema.TaggedError<OrchestrationThreadHistoryStaleError>()(
+  "OrchestrationThreadHistoryStaleError",
+  {
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
+/** A malformed cursor, or a thread that can't be read. */
+export class OrchestrationGetThreadHistoryPageError extends Schema.TaggedError<OrchestrationGetThreadHistoryPageError>()(
+  "OrchestrationGetThreadHistoryPageError",
+  {
+    message: TrimmedNonEmptyString,
   },
 ) {}
 
