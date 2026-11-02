@@ -522,14 +522,24 @@ impl CloneRuntime {
                 stopped_unexpectedly(&request.destination(), &join_error.to_string())
             }
         };
+        // An agent's SSH clone whose ssh lacks an option says so in `reason` (#217).
+        let reason = request
+            .plan
+            .as_deref()
+            .and_then(|plan| plan.failure_reason(&error.detail));
+        let failed = |error| {
+            let mut failure = serialize(error);
+            if let Some(reason) = reason {
+                failure["reason"] = reason.into();
+            }
+            CloneOutcome::Failed(failure)
+        };
         match reserved.remove_destination().await {
             Ok(()) if root.is_cancelled() => CloneOutcome::Cancelled,
-            Ok(()) => CloneOutcome::Failed(serialize(error)),
+            Ok(()) => failed(error),
             // A cancelled clone whose folder could not be removed reports the leftover, not a
             // clean cancel.
-            Err(cleanup_error) => CloneOutcome::Failed(serialize(
-                reserved.with_cleanup_failure(error, &cleanup_error),
-            )),
+            Err(cleanup_error) => failed(reserved.with_cleanup_failure(error, &cleanup_error)),
         }
     }
 

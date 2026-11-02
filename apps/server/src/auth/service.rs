@@ -1247,6 +1247,25 @@ impl AuthService {
             .then_some(session.expires_at_ms)
     }
 
+    /// The live `mcpAccess` of an outside agent's session while it is active: after a Take
+    /// over it is `read-only`. `None` for any other session, and on a repository failure, so
+    /// callers fail closed.
+    pub(crate) async fn mcp_client_access(&self, session_id: &str) -> Option<String> {
+        let observed_at = now_ms();
+        self.refresh_session_from_repository(session_id, observed_at)
+            .await
+            .ok()?;
+        let state = self.state.lock().await;
+        let session = state.sessions.get(session_id)?;
+        if session.revoked_at_ms.is_some()
+            || session.expires_at_ms <= observed_at
+            || session.subject != MCP_CLIENT_SUBJECT
+        {
+            return None;
+        }
+        session.mcp_access.clone()
+    }
+
     async fn refresh_session_from_repository(
         &self,
         session_id: &str,
