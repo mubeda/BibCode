@@ -16,6 +16,9 @@ import {
   OrchestrationMessage,
   OrchestrationProject,
   OrchestrationProjectShell,
+  OrchestrationShellSnapshot,
+  OrchestrationShellStreamItem,
+  OrchestrationSubscribeShellInput,
   OrchestrationThreadShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
@@ -1772,5 +1775,56 @@ describe("reasoning contracts", () => {
     ]) {
       expect(decodeReasoningCommand(command).type).toBe(command.type);
     }
+  });
+});
+
+const decodeSubscribeShellInput = Schema.decodeUnknownSync(OrchestrationSubscribeShellInput);
+const decodeShellSnapshot = Schema.decodeUnknownSync(OrchestrationShellSnapshot);
+const decodeShellStreamItem = Schema.decodeUnknownSync(OrchestrationShellStreamItem);
+
+describe("shell cap and resume wire (#223)", () => {
+  it("decodes an old client's `{}` and the new input", () => {
+    const decode = decodeSubscribeShellInput;
+    expect(decode({})).toEqual({});
+    expect(
+      decode({ cap: { include: ["t1"] }, resume: { revision: "r", snapshotSequence: 3 } }),
+    ).toEqual({ cap: { include: ["t1"] }, resume: { revision: "r", snapshotSequence: 3 } });
+  });
+
+  it("decodes an old server's snapshot and project shell without the new fields", () => {
+    const snapshot = decodeShellSnapshot({
+      snapshotSequence: 1,
+      projects: [
+        {
+          id: "p",
+          title: "P",
+          workspaceRoot: "/p",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z",
+        },
+      ],
+      threads: [],
+      updatedAt: "2026-07-11T00:00:00.000Z",
+    });
+    expect(snapshot.capped).toBeUndefined();
+    expect(snapshot.revision).toBeUndefined();
+    expect(snapshot.projects[0]?.olderThreads).toBeUndefined();
+  });
+
+  it("decodes `unchanged` with its activity ages", () => {
+    const item = decodeShellStreamItem({
+      kind: "unchanged",
+      snapshotSequence: 4,
+      revision: "r",
+      activityAges: { t1: 1200 },
+    });
+    expect(item).toEqual({
+      kind: "unchanged",
+      snapshotSequence: 4,
+      revision: "r",
+      activityAges: { t1: 1200 },
+    });
   });
 });

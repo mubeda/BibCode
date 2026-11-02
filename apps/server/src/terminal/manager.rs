@@ -4340,6 +4340,15 @@ pub struct TerminalMetadataAttachment {
 }
 
 impl TerminalMetadataAttachment {
+    /// An attachment fed by the caller, for a consumer's tests.
+    #[cfg(test)]
+    pub fn for_test(
+        initial: Vec<TerminalSummary>,
+        events: broadcast::Receiver<TerminalMetadataEvent>,
+    ) -> Self {
+        Self { initial, events }
+    }
+
     pub async fn recv(&mut self) -> Option<TerminalMetadataEvent> {
         loop {
             match self.events.recv().await {

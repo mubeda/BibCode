@@ -6,42 +6,42 @@
       "kind": "thread-upserted",
       "sequence": 4,
       "thread": {
-        "id": "{bvEq4(Yke",
-        "projectId": "4294967295",
-        "title": "-1",
+        "id": "\u0000",
+        "projectId": "Eq4(Yke5LK",
+        "title": "�",
         "modelSelection": {
-          "instanceId": "mLpO08M6oy",
-          "model": "",
-          "options": [
-            {
-              "id": "]f25iS:s57",
-              "value": "qGQjr:"
-            },
-            {
-              "id": ";xUg2;",
-              "value": "4294967295"
-            }
-          ]
+          "instanceId": "rEOUynapsK",
+          "model": "\u0000"
         },
-        "runtimeMode": "approval-required",
-        "interactionMode": "plan",
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
         "branch": null,
-        "worktreePath": null,
+        "worktreePath": "25iS:s57",
         "latestTurn": {
-          "turnId": "",
-          "state": "running",
-          "requestedAt": "😀",
-          "startedAt": "\"5|Y91//xO",
-          "completedAt": "FEb1ueIQ/3",
+          "turnId": "GQjr:vhS;",
+          "state": "error",
+          "requestedAt": ";2",
+          "startedAt": "\t",
+          "completedAt": null,
           "assistantMessageId": null
         },
-        "createdAt": "'RfU+'P",
-        "updatedAt": "+-Ff$T`@yt",
-        "archivedAt": "",
-        "session": null,
+        "createdAt": "4294967295",
+        "updatedAt": "\t",
+        "archivedAt": "😀",
+        "session": {
+          "threadId": "|",
+          "status": "interrupted",
+          "providerName": "",
+          "providerInstanceId": "aCXq3j7V",
+          "runtimeMode": "approval-required",
+          "activeTurnId": null,
+          "lastError": "toString",
+          "lastErrorClass": "validation_error",
+          "updatedAt": "0"
+        },
         "latestUserMessageAt": null,
         "hasPendingApprovals": true,
-        "hasPendingUserInput": true,
+        "hasPendingUserInput": false,
         "hasActionableProposedPlan": true
       }
     }

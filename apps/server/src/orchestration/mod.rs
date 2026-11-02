@@ -10,7 +10,8 @@ pub use delivery::{
 pub(crate) use engine::{AskRecoveryHold, EXTERNALLY_RESUMABLE_PROVIDERS};
 pub use engine::{
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, Snapshot,
-    load_shell_snapshot, load_snapshot, load_thread_snapshot,
+    load_capped_shell_snapshot, load_shell_snapshot, load_snapshot, load_thread_snapshot,
+    shell_rows_snapshot,
 };
 pub use process_ownership::StartupProcessOwnership;
 

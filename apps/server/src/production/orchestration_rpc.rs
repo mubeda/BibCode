@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{broadcast, mpsc};
@@ -19,10 +19,11 @@ use crate::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
         OrchestrationError, canonical_command_digest,
         engine::{CommandLifetimeGuard, OptionalNullable, TurnDeliveryResolutionAction},
-        load_shell_snapshot, load_thread_snapshot,
+        load_capped_shell_snapshot, load_shell_snapshot, load_thread_snapshot, shell_rows_snapshot,
     },
     persistence::{
-        EVENT_PAGE_SIZE, OrchestrationEvent, PersistenceError, ProjectionThread, Repositories,
+        EVENT_PAGE_SIZE, OlderThreadsScope, OrchestrationEvent, PersistenceError, ProjectionThread,
+        Repositories, shell_recency_key,
     },
     provider::attachments::{
         AttachmentMaterializationError, AttachmentMaterializer, PreparedAttachmentBatch,
@@ -33,6 +34,7 @@ use crate::{
         response_too_large_failure,
     },
     server_settings::ProviderSettingsStore,
+    terminal::{TerminalAgentStatusState, TerminalManager, TerminalMetadataEvent, TerminalSummary},
     transfer::staging::{UploadOwner, UploadRegistry},
     worktree_catalog::{
         WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
@@ -52,7 +54,7 @@ const STREAM_CAPACITY: usize = 16;
 const REPLAY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 
 pub fn register_orchestration_rpc(registry: &mut RpcRegistry, engine: OrchestrationEngine) {
-    register_orchestration_rpc_inner(registry, engine, None, None);
+    register_orchestration_rpc_inner(registry, engine, None, None, None);
 }
 
 pub fn register_orchestration_rpc_with_availability(
@@ -60,7 +62,7 @@ pub fn register_orchestration_rpc_with_availability(
     engine: OrchestrationEngine,
     availability: WorkspaceAvailabilityRegistry,
 ) {
-    register_orchestration_rpc_inner(registry, engine, None, Some(availability));
+    register_orchestration_rpc_inner(registry, engine, None, Some(availability), None);
 }
 
 pub fn register_orchestration_rpc_with_delivery(
@@ -83,9 +85,13 @@ pub fn register_orchestration_rpc_with_delivery(
             uploads,
         }),
         None,
+        None,
     );
 }
 
+/// The production registration. `terminals` lets a capped shell keep the hosts of AI
+/// Terminals whose agent is working, blocked or waiting (#223).
+#[allow(clippy::too_many_arguments)]
 pub fn register_orchestration_rpc_with_delivery_and_availability(
     registry: &mut RpcRegistry,
     engine: OrchestrationEngine,
@@ -94,6 +100,7 @@ pub fn register_orchestration_rpc_with_delivery_and_availability(
     turn_delivery: Arc<TurnDeliveryService>,
     availability: WorkspaceAvailabilityRegistry,
     uploads: UploadRegistry,
+    terminals: Option<TerminalManager>,
 ) {
     let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
     register_orchestration_rpc_inner(
@@ -107,6 +114,7 @@ pub fn register_orchestration_rpc_with_delivery_and_availability(
             uploads,
         }),
         Some(availability),
+        terminals,
     );
 }
 
@@ -124,6 +132,7 @@ fn register_orchestration_rpc_inner(
     engine: OrchestrationEngine,
     provider: Option<ProviderRegistration>,
     availability: Option<WorkspaceAvailabilityRegistry>,
+    terminals: Option<TerminalManager>,
 ) {
     install_project_command_effects(&engine);
     let availability = availability
@@ -254,10 +263,22 @@ fn register_orchestration_rpc_inner(
         });
     }
 
+    let older = (engine.clone(), terminals.clone());
+    registry.register_unary("orchestration.listOlderThreads", move |request, _| {
+        let (engine, terminals) = older.clone();
+        async move { list_older_threads(&engine, terminals.as_ref(), request).await }
+    });
+    let shells = engine.clone();
+    registry.register_unary("orchestration.getThreadShells", move |request, _| {
+        let engine = shells.clone();
+        async move { get_thread_shells(&engine, request).await }
+    });
     let shell = engine.clone();
     registry.register_stream(
         "orchestration.subscribeShell",
-        move |_request, cancellation| shell_stream(shell.clone(), cancellation),
+        move |request, cancellation| {
+            subscribe_shell(shell.clone(), terminals.clone(), request, cancellation)
+        },
     );
     registry.register_stream(
         "orchestration.subscribeThread",
@@ -1155,29 +1176,159 @@ fn turn_diff_workspace_lost(tag: &str, loss: &WorkspaceAdmissionCancellation) ->
     )
 }
 
+/// An uncapped shell stream for `{}`, as an old client subscribes.
+#[cfg(test)]
 fn shell_stream(
     engine: OrchestrationEngine,
     cancellation: CancellationToken,
 ) -> mpsc::Receiver<RpcStreamChunk> {
-    // Subscribe before loading the initial snapshot so an event committed in
-    // between is queued for the stream instead of disappearing in that gap.
     let events = engine.subscribe_events();
     shell_stream_with_events(engine, events, cancellation)
 }
 
 /// `shell_stream` over the given event receiver; tests pass a small one to make it lag.
+#[cfg(test)]
 fn shell_stream_with_events(
     engine: OrchestrationEngine,
+    events: broadcast::Receiver<OrchestrationEvent>,
+    cancellation: CancellationToken,
+) -> mpsc::Receiver<RpcStreamChunk> {
+    shell_stream_with(
+        engine,
+        None,
+        SubscribeShellInput::default(),
+        events,
+        cancellation,
+        default_thread_revision_keys(),
+    )
+}
+
+/// `orchestration.subscribeShell`.
+fn subscribe_shell(
+    engine: OrchestrationEngine,
+    terminals: Option<TerminalManager>,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> mpsc::Receiver<RpcStreamChunk> {
+    // Subscribe before loading the initial snapshot so an event committed in
+    // between is queued for the stream instead of disappearing in that gap.
+    let events = engine.subscribe_events();
+    let input = if request.payload.is_null() {
+        Ok(SubscribeShellInput::default())
+    } else {
+        decode::<SubscribeShellInput>(request)
+    };
+    match input {
+        Ok(input) => shell_stream_with(
+            engine,
+            terminals.map(ShellTerminals::Manager),
+            input,
+            events,
+            cancellation,
+            default_thread_revision_keys(),
+        ),
+        Err(error) => {
+            let (sender, receiver) = mpsc::channel(1);
+            tokio::spawn(async move {
+                let _ = sender.send(Err(error)).await;
+            });
+            receiver
+        }
+    }
+}
+
+/// How many thread ids a capped shell keeps on the client's word (#223).
+const SHELL_INCLUDE_LIMIT: usize = 256;
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SubscribeShellInput {
+    /// Leave finished threads out (#223), keeping these too.
+    cap: Option<ShellCapInput>,
+    /// The revision and sequence of the shell the client holds.
+    resume: Option<ShellResumeInput>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ShellCapInput {
+    include: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellResumeInput {
+    revision: String,
+    snapshot_sequence: i64,
+}
+
+/// The live shell stream: a snapshot (or `unchanged` for a client that resumes the shell it
+/// holds), then only what changed (#223).
+/// Where a capped shell learns which threads host a live AI Terminal.
+enum ShellTerminals {
+    Manager(TerminalManager),
+    #[cfg(test)]
+    Attached(crate::terminal::TerminalMetadataAttachment),
+}
+
+fn shell_stream_with(
+    engine: OrchestrationEngine,
+    terminals: Option<ShellTerminals>,
+    input: SubscribeShellInput,
     mut events: broadcast::Receiver<OrchestrationEvent>,
     cancellation: CancellationToken,
+    keys: &'static ThreadRevisionKeys,
 ) -> mpsc::Receiver<RpcStreamChunk> {
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
     tokio::spawn(async move {
-        // Random keys, secret to this stream, as for `HeldThread`.
-        let keys = std::hash::RandomState::new();
-        let first = shell_snapshot(&engine, false).await;
-        let mut held = first.as_ref().ok().map(|shell| HeldShell::of(shell, &keys));
-        if send_snapshot(&sender, first, None).await.is_err() {
+        // Sending `cap` or `resume` opts into revisions; `{}` gets today's stream.
+        let opted = input.cap.is_some() || input.resume.is_some();
+        let include = input.cap.map(|cap| {
+            cap.include
+                .into_iter()
+                .take(SHELL_INCLUDE_LIMIT)
+                .collect::<HashSet<_>>()
+        });
+        let mut metadata = match (&include, terminals) {
+            (Some(_), Some(ShellTerminals::Manager(terminals))) => {
+                Some(terminals.subscribe_metadata().await)
+            }
+            #[cfg(test)]
+            (Some(_), Some(ShellTerminals::Attached(attachment))) => Some(attachment),
+            _ => None,
+        };
+        let mut hosts = TerminalAgentHosts::default();
+        if let Some(metadata) = &metadata {
+            hosts.reset(&metadata.initial);
+        }
+        let first = read_live_shell(&engine, forced_ids(include.as_ref(), None, &hosts)).await;
+        let mut held = first
+            .as_ref()
+            .ok()
+            .map(|shell| HeldShell::of(shell, &keys.fields));
+        let revision_of = |held: &HeldShell| opted.then(|| held.revision(keys));
+        let opened = match (&first, &held, &input.resume) {
+            // The client holds exactly this shell: everything else would resend it.
+            (Ok(shell), Some(current), Some(resume))
+                if current.revision(keys) == resume.revision
+                    && current.sequence >= resume.snapshot_sequence =>
+            {
+                sender
+                    .send(Ok(vec![json!({
+                        "kind": "unchanged",
+                        "snapshotSequence": current.sequence,
+                        "revision": current.revision(keys),
+                        "activityAges": activity_ages(shell),
+                    })]))
+                    .await
+                    .map_err(|_| ())
+            }
+            _ => {
+                let revision = held.as_ref().and_then(revision_of);
+                send_snapshot(&sender, first, revision).await
+            }
+        };
+        if opened.is_err() {
             return;
         }
         // A burst of events yields one trailing update: every event changed the shell, but
@@ -1185,18 +1336,32 @@ fn shell_stream_with_events(
         let mut due: Option<tokio::time::Instant> = None;
         // Lost events: send a whole snapshot rather than trust a comparison.
         let mut lagged = false;
+        // Threads archived, deleted or unarchived in this window: candidates for a removal
+        // item even when this client was never sent them (#223).
+        let mut lifecycle = HashSet::<String>::new();
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 () = async { tokio::time::sleep_until(due.expect("guarded")).await }, if due.is_some() => {
                     due = None;
-                    let next = shell_snapshot(&engine, false).await;
-                    let next_held = next.as_ref().ok().map(|shell| HeldShell::of(shell, &keys));
+                    let candidates = std::mem::take(&mut lifecycle);
+                    let next = read_live_shell(
+                        &engine,
+                        forced_ids(include.as_ref(), held.as_ref(), &hosts),
+                    )
+                    .await;
+                    let mut next_held = next.as_ref().ok().map(|shell| HeldShell::of(shell, &keys.fields));
+                    let removed = match (&held, &next_held) {
+                        (Some(before), Some(after)) if include.is_some() => {
+                            left_out_removals(&engine, candidates, before, after).await
+                        }
+                        _ => Ok(Vec::new()),
+                    };
                     // Only the projects and threads that changed or left (#223): the whole
                     // list per update re-sent every thread while one streamed.
-                    let delta = match (&next, &held, &next_held) {
-                        (Ok(next), Some(held), Some(next_held)) if !lagged => {
-                            held.delta(next, next_held)
+                    let delta = match (&next, &held, &mut next_held, removed) {
+                        (Ok(next), Some(held), Some(next_held), Ok(removed)) if !lagged => {
+                            Some(held.delta(next, next_held, &removed))
                         }
                         _ => None,
                     };
@@ -1204,7 +1369,16 @@ fn shell_stream_with_events(
                     let sent = match (delta, next) {
                         // Nothing changed: the client keeps what it holds, sequence included.
                         (Some(items), _) if items.is_empty() => continue,
-                        (Some(items), _) => sender.send(Ok(items)).await.map_err(|_| ()),
+                        (Some(mut items), _) => {
+                            // The last item of a chunk carries the revision after it.
+                            if let (Some(revision), Some(last)) = (
+                                next_held.as_ref().and_then(revision_of),
+                                items.last_mut(),
+                            ) {
+                                last["revision"] = json!(revision);
+                            }
+                            sender.send(Ok(items)).await.map_err(|_| ())
+                        }
                         // A failed re-read would end the stream, and the client does not
                         // resubscribe until its session changes: keep the stream, retry, and
                         // send a whole snapshot once a read succeeds (`held` is cleared).
@@ -1214,7 +1388,10 @@ fn shell_stream_with_events(
                             due = Some(tokio::time::Instant::now() + SHELL_READ_RETRY);
                             Ok(())
                         }
-                        (None, Ok(next)) => send_snapshot(&sender, Ok(next), None).await,
+                        (None, Ok(next)) => {
+                            let revision = next_held.as_ref().and_then(revision_of);
+                            send_snapshot(&sender, Ok(next), revision).await
+                        }
                     };
                     if sent.is_err() {
                         return;
@@ -1222,7 +1399,16 @@ fn shell_stream_with_events(
                     held = next_held;
                 }
                 event = events.recv() => match event {
-                    Ok(_) => {
+                    Ok(event) => {
+                        if include.is_some()
+                            && event.event.aggregate_kind == "thread"
+                            && matches!(
+                                event.event.event_type.as_str(),
+                                "thread.archived" | "thread.deleted" | "thread.unarchived"
+                            )
+                        {
+                            lifecycle.insert(event.event.aggregate_id.clone());
+                        }
                         due.get_or_insert_with(|| tokio::time::Instant::now() + SHELL_SNAPSHOT_COALESCE);
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1230,18 +1416,386 @@ fn shell_stream_with_events(
                         due.get_or_insert_with(|| tokio::time::Instant::now() + SHELL_SNAPSHOT_COALESCE);
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
-                }
+                },
+                update = async { metadata.as_mut().expect("guarded").recv().await }, if metadata.is_some() => match update {
+                    Some(update) => {
+                        if hosts.apply(&update) {
+                            due.get_or_insert_with(|| tokio::time::Instant::now() + SHELL_SNAPSHOT_COALESCE);
+                        }
+                    }
+                    None => metadata = None,
+                },
             }
         }
     });
     receiver
 }
 
+/// What a capped read must keep besides its live, card-backing and recent threads: the client's
+/// ids, the threads it already holds (a capped shell never drops a thread for leaving the cap),
+/// and the hosts of live AI Terminals. `None` reads the whole live shell.
+fn forced_ids(
+    include: Option<&HashSet<String>>,
+    held: Option<&HeldShell>,
+    hosts: &TerminalAgentHosts,
+) -> Option<HashSet<String>> {
+    let mut forced = include?.clone();
+    if let Some(held) = held {
+        forced.extend(held.threads.keys().cloned());
+    }
+    forced.extend(hosts.hosts());
+    Some(forced)
+}
+
+async fn read_live_shell(
+    engine: &OrchestrationEngine,
+    forced: Option<HashSet<String>>,
+) -> RpcResult {
+    match forced {
+        None => shell_snapshot(engine, false).await,
+        Some(forced) => capped_shell_snapshot(engine, forced).await,
+    }
+}
+
+/// The live shell capped for #223, marked `capped`, with each project's left-out counts.
+async fn capped_shell_snapshot(engine: &OrchestrationEngine, forced: HashSet<String>) -> RpcResult {
+    let (snapshot, older) = load_capped_shell_snapshot(&engine.repositories(), forced)
+        .await
+        .map_err(|error| orchestration_error("OrchestrationGetSnapshotError", error))?;
+    let mut shell = shell_snapshot_value(&snapshot, false);
+    let mut by_project = HashMap::<&str, (usize, Vec<Value>)>::new();
+    for count in &older {
+        let entry = by_project.entry(count.project_id.as_str()).or_default();
+        match &count.chats_in {
+            None => entry.0 += count.count,
+            Some(worktree_path) => entry
+                .1
+                .push(json!({ "worktreePath": worktree_path, "count": count.count })),
+        }
+    }
+    for project in shell["projects"].as_array_mut().into_iter().flatten() {
+        let id = project["id"].as_str().unwrap_or_default().to_owned();
+        if let Some((count, chats)) = by_project.remove(id.as_str()) {
+            project["olderThreads"] = json!({ "count": count, "chats": chats });
+        }
+    }
+    shell["capped"] = json!(true);
+    Ok(shell)
+}
+
+/// Removal items for the window's archived, deleted or unarchived threads that the delta does
+/// not cover, decided by their state now: an archive undone in the same window sends nothing.
+async fn left_out_removals(
+    engine: &OrchestrationEngine,
+    candidates: HashSet<String>,
+    before: &HeldShell,
+    after: &HeldShell,
+) -> Result<Vec<String>, ()> {
+    let unknown = candidates
+        .into_iter()
+        .filter(|id| !before.threads.contains_key(id) && !after.threads.contains_key(id))
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(Vec::new());
+    }
+    let live = engine
+        .repositories()
+        .live_shell_thread_ids_among(unknown.clone())
+        .await
+        .map_err(|_| ())?;
+    let mut removed = unknown
+        .into_iter()
+        .filter(|id| !live.contains(id))
+        .collect::<Vec<_>>();
+    removed.sort();
+    Ok(removed)
+}
+
+/// Each thread's provider-progress age now, for an `unchanged` answer: a cached shell cannot
+/// age what the server no longer sends.
+fn activity_ages(shell: &Value) -> Value {
+    Value::Object(
+        shell["threads"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|thread| {
+                Some((
+                    thread.get("id")?.as_str()?.to_owned(),
+                    thread.get("lastActivityAgeMs")?.clone(),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// The threads hosting an AI Terminal whose agent is working, blocked or waiting (#223).
+#[derive(Default)]
+struct TerminalAgentHosts {
+    live: HashSet<(String, String)>,
+}
+
+impl TerminalAgentHosts {
+    fn is_live(terminal: &TerminalSummary) -> bool {
+        matches!(
+            terminal.agent_status.as_ref().map(|status| &status.state),
+            Some(
+                TerminalAgentStatusState::Working
+                    | TerminalAgentStatusState::Blocked
+                    | TerminalAgentStatusState::Waiting
+            )
+        )
+    }
+
+    fn reset(&mut self, terminals: &[TerminalSummary]) {
+        self.live = terminals
+            .iter()
+            .filter(|terminal| Self::is_live(terminal))
+            .map(|terminal| (terminal.thread_id.clone(), terminal.terminal_id.clone()))
+            .collect();
+    }
+
+    /// Applies a metadata update; true when the host set changed.
+    fn apply(&mut self, update: &TerminalMetadataEvent) -> bool {
+        let before = self.hosts();
+        match update {
+            TerminalMetadataEvent::Snapshot { terminals } => self.reset(terminals),
+            TerminalMetadataEvent::Upsert { terminal } => {
+                let key = (terminal.thread_id.clone(), terminal.terminal_id.clone());
+                if Self::is_live(terminal) {
+                    self.live.insert(key);
+                } else {
+                    self.live.remove(&key);
+                }
+            }
+            TerminalMetadataEvent::Remove {
+                thread_id,
+                terminal_id,
+                ..
+            } => {
+                self.live.remove(&(thread_id.clone(), terminal_id.clone()));
+            }
+        }
+        self.hosts() != before
+    }
+
+    fn hosts(&self) -> HashSet<String> {
+        self.live
+            .iter()
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect()
+    }
+}
+
+/// The hosts of live AI Terminals now, for an older-threads page.
+async fn terminal_agent_hosts(terminals: Option<&TerminalManager>) -> HashSet<String> {
+    let mut hosts = TerminalAgentHosts::default();
+    if let Some(terminals) = terminals {
+        hosts.reset(&terminals.subscribe_metadata().await.initial);
+    }
+    hosts.hosts()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListOlderThreadsInput {
+    scope: OlderThreadsScopeInput,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum OlderThreadsScopeInput {
+    #[serde(rename_all = "camelCase")]
+    Project {
+        project_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Checkout {
+        project_id: String,
+        worktree_path: Option<String>,
+    },
+    Agents,
+    Search,
+}
+
+/// An older-threads cursor: the scope it pages, and the newest-first key and id of the last
+/// thread returned. Timestamps and ids only, never content.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OlderThreadsCursor {
+    v: u8,
+    scope: String,
+    key: String,
+    thread_id: String,
+}
+
+const OLDER_THREADS_ERROR: &str = "OrchestrationListOlderThreadsError";
+
+/// `orchestration.listOlderThreads`: a page of the threads a capped shell leaves out, or of
+/// every unarchived thread matching a title search (#223).
+async fn list_older_threads(
+    engine: &OrchestrationEngine,
+    terminals: Option<&TerminalManager>,
+    request: RpcRequest,
+) -> RpcResult {
+    use base64::Engine as _;
+
+    let input = decode::<ListOlderThreadsInput>(request)?;
+    let (scope, scope_name) = match input.scope {
+        OlderThreadsScopeInput::Project { project_id } => {
+            (OlderThreadsScope::Project(project_id), "project")
+        }
+        OlderThreadsScopeInput::Checkout {
+            project_id,
+            worktree_path,
+        } => (
+            OlderThreadsScope::Checkout(project_id, worktree_path),
+            "checkout",
+        ),
+        OlderThreadsScopeInput::Agents => (OlderThreadsScope::Agents, "agents"),
+        OlderThreadsScopeInput::Search => (OlderThreadsScope::Search, "search"),
+    };
+    let query = input.query.filter(|query| !query.trim().is_empty());
+    if scope == OlderThreadsScope::Search && query.is_none() {
+        tracing::warn!(
+            method = "orchestration.listOlderThreads",
+            "search without a query"
+        );
+        return Err(orchestration_error(
+            OLDER_THREADS_ERROR,
+            "A search needs a query.",
+        ));
+    }
+    let after = match input.cursor {
+        None => None,
+        Some(cursor) => {
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor.as_bytes())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<OlderThreadsCursor>(&bytes).ok())
+                .filter(|cursor| cursor.v == 1 && cursor.scope == scope_name);
+            let Some(cursor) = decoded else {
+                tracing::warn!(
+                    method = "orchestration.listOlderThreads",
+                    "malformed cursor"
+                );
+                return Err(orchestration_error(
+                    OLDER_THREADS_ERROR,
+                    "The cursor is not valid.",
+                ));
+            };
+            Some((cursor.key, cursor.thread_id))
+        }
+    };
+    let limit = input.limit.unwrap_or(20).clamp(1, 100);
+    let forced = terminal_agent_hosts(terminals).await;
+    let (rows, more) = engine
+        .repositories()
+        .list_older_thread_rows(scope, query, after, limit, forced)
+        .await
+        .map_err(|error| orchestration_error("OrchestrationGetSnapshotError", error))?;
+    let order = rows
+        .threads
+        .iter()
+        .map(|thread| {
+            (
+                thread.thread_id.clone(),
+                shell_recency_key(thread).to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let threads = ordered_thread_shells(&shell_rows_snapshot(rows), &order);
+    let cursor = more
+        .then(|| order.last())
+        .flatten()
+        .map(|(thread_id, key)| {
+            let cursor = OlderThreadsCursor {
+                v: 1,
+                scope: scope_name.to_owned(),
+                key: key.clone(),
+                thread_id: thread_id.clone(),
+            };
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&cursor).expect("cursor serializes"))
+        });
+    Ok(json!({ "threads": threads, "cursor": cursor }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetThreadShellsInput {
+    thread_ids: Vec<String>,
+}
+
+/// `orchestration.getThreadShells`: the named threads, live or archived, and the ids that are
+/// gone, which is the only evidence a capped shell's client has of a deletion (#223).
+async fn get_thread_shells(engine: &OrchestrationEngine, request: RpcRequest) -> RpcResult {
+    let tag = request.tag.clone();
+    let input = decode::<GetThreadShellsInput>(request)?;
+    if input.thread_ids.is_empty() || input.thread_ids.len() > 100 {
+        return Err(invalid_request(&tag, "threadIds must hold 1 to 100 ids."));
+    }
+    let mut ids = Vec::new();
+    for id in input.thread_ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let rows = engine
+        .repositories()
+        .load_thread_shell_rows(ids.clone())
+        .await
+        .map_err(|error| orchestration_error("OrchestrationGetSnapshotError", error))?;
+    let found = rows
+        .threads
+        .iter()
+        .map(|thread| thread.thread_id.clone())
+        .collect::<HashSet<_>>();
+    let order = ids
+        .iter()
+        .filter(|id| found.contains(*id))
+        .map(|id| (id.clone(), String::new()))
+        .collect::<Vec<_>>();
+    let threads = ordered_thread_shells(&shell_rows_snapshot(rows), &order);
+    let missing = ids
+        .into_iter()
+        .filter(|id| !found.contains(id))
+        .collect::<Vec<_>>();
+    Ok(json!({ "threads": threads, "missing": missing }))
+}
+
+/// The shells of `snapshot`'s threads in `order` (ids first), aged as the shell stream sends
+/// them, whether live or archived.
+fn ordered_thread_shells(
+    snapshot: &crate::orchestration::Snapshot,
+    order: &[(String, String)],
+) -> Vec<Value> {
+    let previews = build_conversation_previews(snapshot);
+    let by_id = snapshot
+        .threads
+        .iter()
+        .map(|thread| (thread.thread_id.as_str(), thread))
+        .collect::<HashMap<_, _>>();
+    order
+        .iter()
+        .filter_map(|(id, _)| by_id.get(id.as_str()))
+        .map(|thread| aged_thread_shell(thread, snapshot, &previews))
+        .collect()
+}
+
 /// What a shell subscriber keeps of the last shell it sent: a fingerprint of each project and
-/// thread by id, never the shell itself, and the sequence the client then holds.
+/// thread by id, never the shell itself, whether it was capped, and the sequence the client
+/// then holds.
 struct HeldShell {
     projects: HashMap<String, u64>,
     threads: HashMap<String, u64>,
+    capped: bool,
     sequence: i64,
 }
 
@@ -1261,16 +1815,46 @@ impl HeldShell {
         Self {
             projects: held("projects"),
             threads: held("threads"),
+            capped: shell["capped"] == json!(true),
             sequence: shell["snapshotSequence"].as_i64().unwrap_or(0),
         }
     }
 
+    /// The shell's revision: a 128-bit digest, under the process's keys, of its fingerprints,
+    /// ids and cap. A restart draws new keys, so an older revision never matches.
+    fn revision(&self, keys: &ThreadRevisionKeys) -> String {
+        use std::hash::{BuildHasher, Hasher};
+
+        fn sorted(held: &HashMap<String, u64>) -> Vec<(&String, &u64)> {
+            let mut entries = held.iter().collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+        let (projects, threads) = (sorted(&self.projects), sorted(&self.threads));
+        let digest = |state: &std::hash::RandomState| {
+            let mut hasher = state.build_hasher();
+            hasher.write_u8(u8::from(self.capped));
+            for entries in [&projects, &threads] {
+                hasher.write_usize(entries.len());
+                for (id, fingerprint) in entries {
+                    hasher.write_usize(id.len());
+                    hasher.write(id.as_bytes());
+                    hasher.write_u64(**fingerprint);
+                }
+            }
+            hasher.finish()
+        };
+        format!("{:016x}{:016x}", digest(&keys.first), digest(&keys.second))
+    }
+
     /// The items that turn this shell into `next` (held as `next_held`): upserts for the
-    /// projects and threads that changed or appeared, then removals for those that left. They
-    /// take consecutive sequences ending at `next`'s, so the client's reducer, which drops an
-    /// item at or below the sequence it holds, applies each one. `None` when they do not fit
-    /// above the sequence the client holds; the caller then sends a snapshot.
-    fn delta(&self, next: &Value, next_held: &Self) -> Option<Vec<Value>> {
+    /// projects and threads that changed or appeared, then removals for those that left and
+    /// for the left-out threads in `removed`. They take consecutive sequences ending at
+    /// `next`'s, so the client's reducer, which drops an item at or below the sequence it
+    /// holds, applies each one; when the window had fewer events than items (a terminal's
+    /// agent started working, say), they continue past it instead. `next_held` takes the
+    /// last one, the sequence the client then holds.
+    fn delta(&self, next: &Value, next_held: &mut Self, removed: &[String]) -> Vec<Value> {
         let mut items = Vec::new();
         // Projects first, so a new thread's project is there when the thread arrives.
         for (list, before, after, kind, field) in [
@@ -1317,14 +1901,18 @@ impl HeldShell {
                     .map(|id| json!({ "kind": kind, field: id })),
             );
         }
-        let first = next_held.sequence - i64::try_from(items.len()).ok()? + 1;
-        if !items.is_empty() && first <= self.sequence {
-            return None;
-        }
+        items.extend(
+            removed
+                .iter()
+                .map(|id| json!({ "kind": "thread-removed", "threadId": id })),
+        );
+        let count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let first = (next_held.sequence - count + 1).max(self.sequence + 1);
         for (sequence, item) in (first..).zip(&mut items) {
             item["sequence"] = json!(sequence);
+            next_held.sequence = sequence;
         }
-        Some(items)
+        items
     }
 }
 
@@ -1715,13 +2303,7 @@ fn shell_snapshot_value(snapshot: &crate::orchestration::Snapshot, archived: boo
         .threads
         .iter()
         .filter(|thread| thread.deleted_at.is_none() && (thread.archived_at.is_some()) == archived)
-        .map(|thread| {
-            let mut shell = thread_shell(thread, snapshot, previews.get(thread.thread_id.as_str()));
-            if let Some(age_ms) = last_activity_age_ms(thread.last_activity_at.as_deref()) {
-                shell["lastActivityAgeMs"] = json!(age_ms);
-            }
-            shell
-        })
+        .map(|thread| aged_thread_shell(thread, snapshot, &previews))
         .collect::<Vec<_>>();
     json!({
         "snapshotSequence": sequence,
@@ -1729,6 +2311,19 @@ fn shell_snapshot_value(snapshot: &crate::orchestration::Snapshot, archived: boo
         "threads": threads,
         "updatedAt": now_iso(),
     })
+}
+
+/// A thread's shell as the shell stream sends it, aged on this server's clock.
+fn aged_thread_shell(
+    thread: &ProjectionThread,
+    snapshot: &crate::orchestration::Snapshot,
+    previews: &HashMap<&str, ConversationPreview>,
+) -> Value {
+    let mut shell = thread_shell(thread, snapshot, previews.get(thread.thread_id.as_str()));
+    if let Some(age_ms) = last_activity_age_ms(thread.last_activity_at.as_deref()) {
+        shell["lastActivityAgeMs"] = json!(age_ms);
+    }
+    shell
 }
 
 /// How old a thread's provider-progress time is on this server's clock as its shell is built,
@@ -5735,6 +6330,7 @@ mod tests {
             delivery.clone(),
             availability.clone(),
             test_upload_registry(),
+            None,
         );
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(state.path())
@@ -7921,6 +8517,952 @@ mod tests {
         assert_eq!(held["snapshotSequence"], fresh["snapshotSequence"]);
         assert_eq!(comparable_shell(held), comparable_shell(fresh));
         cancellation.cancel();
+        engine.shutdown().await;
+    }
+
+    // --- #223 addendum: the capped shell, older threads, getThreadShells and shell resume.
+
+    /// A timestamp `index` seconds into the fixture day, so a higher index is newer.
+    fn cap_at(index: usize) -> String {
+        format!(
+            "2026-07-11T{:02}:{:02}:{:02}.000Z",
+            index / 3_600,
+            (index / 60) % 60,
+            index % 60
+        )
+    }
+
+    async fn seed_cap_project(repositories: &Repositories, project_id: &str) {
+        let mut project = http_read_model_fixture().projects.remove(0);
+        project.project_id = project_id.to_owned();
+        project.workspace_root = format!("/cap/{project_id}");
+        repositories.upsert_project(project).await.unwrap();
+    }
+
+    /// A finished thread of `kind` whose newest-first key is `cap_at(index)`.
+    async fn seed_cap_thread(
+        repositories: &Repositories,
+        thread_id: &str,
+        project_id: &str,
+        kind: &str,
+        worktree_path: Option<&str>,
+        index: usize,
+    ) -> ProjectionThread {
+        let mut thread = store_thread(thread_id, project_id, None);
+        thread.kind = kind.to_owned();
+        thread.worktree_path = worktree_path.map(str::to_owned);
+        thread.latest_user_message_at = Some(cap_at(index));
+        thread.updated_at = cap_at(index);
+        repositories.upsert_thread(thread.clone()).await.unwrap();
+        thread
+    }
+
+    async fn seed_cap_session(repositories: &Repositories, thread_id: &str, status: &str) {
+        repositories
+            .upsert_thread_session(crate::persistence::ProjectionThreadSession {
+                thread_id: thread_id.to_owned(),
+                status: status.to_owned(),
+                provider_name: Some("codex".to_owned()),
+                provider_instance_id: Some("codex".to_owned()),
+                runtime_mode: "full-access".to_owned(),
+                active_turn_id: None,
+                last_error: None,
+                last_error_class: None,
+                updated_at: CREATED_AT.to_owned(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn ids(threads: &[ProjectionThread]) -> HashSet<String> {
+        threads
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect()
+    }
+
+    /// With 150 finished threads in five projects the capped rows hold the newest 25, the
+    /// newest 3 of each project, and every live, card-backing and named thread; the rest are
+    /// counted per project.
+    #[tokio::test]
+    async fn shell_rows_keep_live_card_included_and_recent_threads_of_150() {
+        let repositories = seeded_cap_repositories().await;
+        let mut expected = HashSet::new();
+        let mut finished = Vec::new();
+        for project in 0..5 {
+            let project_id = format!("p{project}");
+            seed_cap_project(&repositories, &project_id).await;
+            seed_cap_thread(
+                &repositories,
+                &format!("default-{project}"),
+                &project_id,
+                "default",
+                None,
+                0,
+            )
+            .await;
+            expected.insert(format!("default-{project}"));
+        }
+        for index in 0..150 {
+            let project_id = format!("p{}", index % 5);
+            // p4 gets only the oldest threads, so only its own newest 3 keep it visible.
+            let index_key = if index % 5 == 4 {
+                index / 50
+            } else {
+                200 + index
+            };
+            let id = format!("t{index:03}");
+            finished.push((index_key, id.clone(), project_id.clone()));
+            seed_cap_thread(
+                &repositories,
+                &id,
+                &project_id,
+                "workspace",
+                None,
+                index_key,
+            )
+            .await;
+        }
+        seed_cap_thread(
+            &repositories,
+            "worktree",
+            "p0",
+            "workspace",
+            Some("/cap/p0/wt"),
+            1,
+        )
+        .await;
+        seed_cap_thread(&repositories, "live", "p0", "workspace", None, 1).await;
+        seed_cap_session(&repositories, "live", "running").await;
+        seed_cap_thread(&repositories, "named", "p1", "workspace", None, 1).await;
+        expected.extend(["worktree", "live", "named"].map(str::to_owned));
+        finished.sort_by(|left, right| (right.0, &right.1).cmp(&(left.0, &left.1)));
+        let mut per_project = HashMap::<String, usize>::new();
+        for (position, (_, id, project_id)) in finished.iter().enumerate() {
+            let seen = per_project.entry(project_id.clone()).or_default();
+            *seen += 1;
+            if position < 25 || *seen <= 3 {
+                expected.insert(id.clone());
+            }
+        }
+
+        let (rows, older) = repositories
+            .load_capped_shell_snapshot_rows(HashSet::from(["named".to_owned()]))
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&rows.threads), expected);
+        let mut left_out = HashMap::<String, usize>::new();
+        for (_, id, project_id) in &finished {
+            if !expected.contains(id) {
+                *left_out.entry(project_id.clone()).or_default() += 1;
+            }
+        }
+        let counted = older
+            .iter()
+            .map(|count| {
+                assert_eq!(count.chats_in, None);
+                (count.project_id.clone(), count.count)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(counted, left_out);
+        assert!(
+            rows.threads
+                .iter()
+                .all(|thread| thread.thread_id != "t004" || expected.contains("t004"))
+        );
+    }
+
+    async fn seeded_cap_repositories() -> Repositories {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        Repositories::new(database)
+    }
+
+    /// Chat panels are counted by checkout, as the left panel groups them: pathless panels of
+    /// two hosts share the main checkout's entry, and a worktree's panels have their own.
+    #[tokio::test]
+    async fn shell_rows_count_main_checkout_chats_of_every_host() {
+        let repositories = seeded_cap_repositories().await;
+        seed_cap_project(&repositories, "p").await;
+        for index in 0..30 {
+            seed_cap_thread(
+                &repositories,
+                &format!("recent-{index:02}"),
+                "p",
+                "workspace",
+                None,
+                100 + index,
+            )
+            .await;
+        }
+        for (id, worktree) in [
+            ("panel-a", None),
+            ("panel-b", None),
+            ("panel-c", Some("/cap/p/wt")),
+        ] {
+            let mut panel = seed_cap_thread(&repositories, id, "p", "panel", worktree, 1).await;
+            panel.host_thread_id = Some(
+                if id == "panel-b" {
+                    "recent-01"
+                } else {
+                    "recent-00"
+                }
+                .to_owned(),
+            );
+            repositories.upsert_thread(panel).await.unwrap();
+        }
+
+        let (_, older) = repositories
+            .load_capped_shell_snapshot_rows(HashSet::new())
+            .await
+            .unwrap();
+
+        let chats = older
+            .iter()
+            .filter(|count| count.chats_in.is_some())
+            .map(|count| (count.chats_in.clone().unwrap(), count.count))
+            .collect::<Vec<_>>();
+        assert_eq!(chats, [(None, 2), (Some("/cap/p/wt".to_owned()), 1)]);
+    }
+
+    /// The per-thread reads cover kept threads only.
+    #[tokio::test]
+    async fn shell_rows_read_no_sessions_or_messages_for_left_out_threads() {
+        let repositories = seeded_cap_repositories().await;
+        seed_cap_project(&repositories, "p").await;
+        for index in 0..40 {
+            let id = format!("t{index:02}");
+            seed_cap_thread(&repositories, &id, "p", "workspace", None, index).await;
+            seed_cap_session(&repositories, &id, "ready").await;
+            repositories
+                .upsert_message(store_message(
+                    &format!("{id}-m"),
+                    &id,
+                    "user",
+                    "hi",
+                    &cap_at(index),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let (rows, _) = repositories
+            .load_capped_shell_snapshot_rows(HashSet::new())
+            .await
+            .unwrap();
+
+        let kept = ids(&rows.threads);
+        assert_eq!(kept.len(), 25);
+        assert!(
+            rows.sessions
+                .iter()
+                .all(|session| kept.contains(&session.thread_id))
+        );
+        assert!(
+            rows.preview_messages
+                .iter()
+                .all(|message| kept.contains(&message.thread_id))
+        );
+        assert_eq!(rows.sessions.len(), 25);
+    }
+
+    /// "Newest" is the last user message, else the last update, then the id.
+    #[tokio::test]
+    async fn shell_rows_order_recent_finished_by_last_user_message_then_update() {
+        let repositories = seeded_cap_repositories().await;
+        seed_cap_project(&repositories, "p").await;
+        for index in 0..30 {
+            seed_cap_thread(
+                &repositories,
+                &format!("t{index:02}"),
+                "p",
+                "panel",
+                None,
+                100 + index,
+            )
+            .await;
+        }
+        // No user message, but updated after every other thread: newest of all.
+        let mut silent = seed_cap_thread(&repositories, "silent", "p", "panel", None, 0).await;
+        silent.latest_user_message_at = None;
+        silent.updated_at = cap_at(500);
+        repositories.upsert_thread(silent).await.unwrap();
+        // Ties at the cut: the larger id wins.
+        for id in ["tie-a", "tie-b"] {
+            seed_cap_thread(&repositories, id, "p", "panel", None, 105).await;
+        }
+
+        let (rows, _) = repositories
+            .load_capped_shell_snapshot_rows(HashSet::new())
+            .await
+            .unwrap();
+
+        let kept = ids(&rows.threads);
+        assert!(kept.contains("silent"));
+        // Panels get no per-project slots: exactly the newest 25.
+        assert_eq!(kept.len(), 25);
+        // 1 silent + t29..t06 (24 threads, keys 129..106) fill the cap before any key-105 tie.
+        assert!(!kept.contains("tie-a") && !kept.contains("tie-b") && !kept.contains("t05"));
+        assert!(kept.contains("t06"));
+    }
+
+    /// Creates a thread whose newest-first key is `cap_at(index)`.
+    async fn create_keyed_thread(engine: &OrchestrationEngine, thread_id: &str, index: usize) {
+        create_thread(engine, thread_id).await;
+        let repositories = engine.repositories();
+        let mut thread = repositories
+            .load_thread_shell_rows(vec![thread_id.to_owned()])
+            .await
+            .unwrap()
+            .threads
+            .remove(0);
+        thread.latest_user_message_at = Some(cap_at(index));
+        repositories.upsert_thread(thread).await.unwrap();
+    }
+
+    /// The engine of `created_project_thread` with `count` more threads, created in order so
+    /// that each is newer than the one before.
+    async fn capped_engine(count: usize) -> (OrchestrationEngine, Vec<String>) {
+        let engine = migrated_engine().await;
+        created_project_thread(&engine).await;
+        let mut created = Vec::new();
+        for index in 0..count {
+            let id = format!("t{index:03}");
+            create_keyed_thread(&engine, &id, index + 1).await;
+            created.push(id);
+        }
+        (engine, created)
+    }
+
+    fn capped_request(payload: Value) -> RpcRequest {
+        request("orchestration.subscribeShell", payload)
+    }
+
+    fn thread_ids_of(snapshot: &Value) -> HashSet<String> {
+        snapshot["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|thread| thread["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// An old client's `{}` gets every thread, with no cap marker and no revision.
+    #[tokio::test]
+    async fn shell_stream_without_cap_sends_every_thread() {
+        let (engine, created) = capped_engine(30).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({})),
+            CancellationToken::new(),
+        );
+        let item = next_items(&mut stream).await.remove(0);
+        assert_eq!(item["kind"], "snapshot");
+        assert!(item.get("revision").is_none());
+        assert!(item["snapshot"].get("capped").is_none());
+        assert_eq!(thread_ids_of(&item["snapshot"]).len(), created.len() + 1);
+        assert!(
+            item["snapshot"]["projects"][0]
+                .get("olderThreads")
+                .is_none()
+        );
+        engine.shutdown().await;
+    }
+
+    /// A client that asks for the cap gets the kept set, `capped`, a revision and the count.
+    #[tokio::test]
+    async fn shell_stream_cap_sends_kept_set_counts_and_capped() {
+        let (engine, created) = capped_engine(30).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": { "include": ["t000"] } })),
+            CancellationToken::new(),
+        );
+        let item = next_items(&mut stream).await.remove(0);
+        assert_eq!(item["kind"], "snapshot");
+        assert!(
+            item["revision"]
+                .as_str()
+                .is_some_and(|revision| revision.len() == 32)
+        );
+        assert_eq!(item["snapshot"]["capped"], true);
+        let kept = thread_ids_of(&item["snapshot"]);
+        // The default thread, the newest 25 (t029..t005), and the named t000.
+        assert_eq!(kept.len(), 27, "{kept:?}");
+        assert!(kept.contains("t000") && kept.contains("t005") && !kept.contains("t004"));
+        assert_eq!(
+            item["snapshot"]["projects"][0]["olderThreads"],
+            json!({ "count": 4, "chats": [] })
+        );
+        assert_eq!(created.len(), 30);
+        engine.shutdown().await;
+    }
+
+    fn terminal_summary(thread_id: &str, state: &str) -> TerminalSummary {
+        serde_json::from_value(json!({
+            "threadId": thread_id,
+            "terminalId": "agent",
+            "cwd": "C:/repo",
+            "worktreePath": null,
+            "status": "running",
+            "pid": null,
+            "exitCode": null,
+            "exitSignal": null,
+            "hasRunningSubprocess": true,
+            "label": "Claude",
+            "updatedAt": CREATED_AT,
+            "agentStatus": { "state": state, "failed": false },
+        }))
+        .expect("terminal summary")
+    }
+
+    /// An old pathless workspace with no session but a working AI Terminal is kept, and one
+    /// whose terminal starts working is sent when it does.
+    #[tokio::test]
+    async fn shell_stream_keeps_a_live_terminal_host() {
+        let (engine, _) = capped_engine(30).await;
+        let (updates, receiver) = broadcast::channel(8);
+        let attachment = crate::terminal::TerminalMetadataAttachment::for_test(
+            vec![terminal_summary("t000", "working")],
+            receiver,
+        );
+        let mut stream = shell_stream_with(
+            engine.clone(),
+            Some(ShellTerminals::Attached(attachment)),
+            SubscribeShellInput {
+                cap: Some(ShellCapInput::default()),
+                resume: None,
+            },
+            engine.subscribe_events(),
+            CancellationToken::new(),
+            default_thread_revision_keys(),
+        );
+        let first = next_items(&mut stream).await.remove(0);
+        let kept = thread_ids_of(&first["snapshot"]);
+        assert!(kept.contains("t000") && !kept.contains("t001"));
+
+        updates
+            .send(TerminalMetadataEvent::Upsert {
+                terminal: Box::new(terminal_summary("t001", "waiting")),
+            })
+            .unwrap();
+        let items = next_items(&mut stream).await;
+        assert!(
+            items
+                .iter()
+                .any(|item| item["kind"] == "thread-upserted" && item["thread"]["id"] == "t001"),
+            "{items:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// A left-out thread that starts a turn is sent as an upsert.
+    #[tokio::test]
+    async fn shell_stream_upserts_a_left_out_thread_that_starts_a_turn() {
+        let (engine, _) = capped_engine(30).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        assert!(!thread_ids_of(&next_items(&mut stream).await[0]["snapshot"]).contains("t000"));
+        seed_cap_session(&engine.repositories(), "t000", "running").await;
+        // Any engine event triggers the re-read, as the provider runtime's would.
+        rename(&engine, "t010", 1).await;
+        let items = next_items(&mut stream).await;
+        assert!(
+            items
+                .iter()
+                .any(|item| item["kind"] == "thread-upserted" && item["thread"]["id"] == "t000"),
+            "{items:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// A thread that newer ones push out of the newest 25 stays: the client can't tell leaving
+    /// the cap from a deletion.
+    #[tokio::test]
+    async fn shell_stream_keeps_a_thread_pushed_out_of_the_cap() {
+        let (engine, _) = capped_engine(25).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        assert!(thread_ids_of(&next_items(&mut stream).await[0]["snapshot"]).contains("t000"));
+        for index in 0..3 {
+            create_keyed_thread(&engine, &format!("new-{index}"), 1_000 + index).await;
+        }
+        tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 3).await;
+        let mut items = Vec::new();
+        while let Ok(chunk) = stream.try_recv() {
+            items.extend(chunk.unwrap());
+        }
+        assert!(
+            items.iter().all(|item| item["kind"] != "thread-removed"),
+            "{items:?}"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item["kind"] == "thread-upserted")
+                .count(),
+            3,
+            "{items:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Archiving or deleting a thread the client was never sent still names it, so a page
+    /// copy can't outlive it.
+    #[tokio::test]
+    async fn shell_stream_sends_removal_for_a_left_out_thread_deleted_or_archived() {
+        let (engine, _) = capped_engine(30).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        let kept = thread_ids_of(&next_items(&mut stream).await[0]["snapshot"]);
+        assert!(!kept.contains("t000") && !kept.contains("t001"));
+        for (command, thread_id) in [("thread.archive", "t000"), ("thread.delete", "t001")] {
+            engine
+                .dispatch(decode_command(json!({
+                    "type": command,
+                    "commandId": format!("{command}-{thread_id}"),
+                    "threadId": thread_id,
+                })))
+                .await
+                .unwrap();
+            let items = next_items(&mut stream).await;
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item["kind"] == "thread-removed" && item["threadId"] == thread_id),
+                "{items:?}"
+            );
+        }
+        engine.shutdown().await;
+    }
+
+    /// An archive undone in the same window sends no removal: removals come from final state.
+    #[tokio::test]
+    async fn shell_stream_sends_no_removal_for_archive_then_unarchive_in_one_window() {
+        let (engine, _) = capped_engine(30).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        next_items(&mut stream).await;
+        for command in ["thread.archive", "thread.unarchive"] {
+            engine
+                .dispatch(decode_command(json!({
+                    "type": command,
+                    "commandId": format!("{command}-t000"),
+                    "threadId": "t000",
+                })))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(SHELL_SNAPSHOT_COALESCE * 3).await;
+        let mut items = Vec::new();
+        while let Ok(chunk) = stream.try_recv() {
+            items.extend(chunk.unwrap());
+        }
+        assert!(
+            items.iter().all(|item| item["kind"] != "thread-removed"),
+            "{items:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// A fallback snapshot after `Lagged` keeps every thread the client holds, even one the
+    /// cap would now leave out.
+    #[tokio::test]
+    async fn shell_stream_fallback_snapshot_keeps_held_threads() {
+        let (engine, _) = capped_engine(25).await;
+        let mut tap = engine.subscribe_events();
+        let (events, receiver) = broadcast::channel(1);
+        let mut stream = shell_stream_with(
+            engine.clone(),
+            None,
+            SubscribeShellInput {
+                cap: Some(ShellCapInput::default()),
+                resume: None,
+            },
+            receiver,
+            CancellationToken::new(),
+            default_thread_revision_keys(),
+        );
+        let held = thread_ids_of(&next_items(&mut stream).await[0]["snapshot"]);
+        assert!(held.contains("t000"));
+        create_keyed_thread(&engine, "new-0", 1_000).await;
+        let event = tap.recv().await.unwrap();
+        events.send(event.clone()).unwrap();
+        events.send(event).unwrap();
+        let item = next_items(&mut stream).await.remove(0);
+        assert_eq!(item["kind"], "snapshot");
+        let after = thread_ids_of(&item["snapshot"]);
+        assert!(held.is_subset(&after), "{held:?} {after:?}");
+        engine.shutdown().await;
+    }
+
+    /// A resubscribe with the revision the client holds is answered `unchanged`, with each
+    /// kept thread's activity age now.
+    #[tokio::test]
+    async fn shell_stream_resume_with_current_revision_answers_unchanged_with_ages() {
+        let (engine, _) = capped_engine(3).await;
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE projection_threads SET last_activity_at = '2026-07-11T00:00:00.000Z'                      WHERE thread_id = 't000'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut first = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        let item = next_items(&mut first).await.remove(0);
+        let revision = item["revision"].as_str().unwrap().to_owned();
+        let sequence = item["snapshot"]["snapshotSequence"].clone();
+
+        let mut resumed = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(
+                json!({ "cap": {}, "resume": { "revision": revision, "snapshotSequence": sequence } }),
+            ),
+            CancellationToken::new(),
+        );
+        let answer = next_items(&mut resumed).await.remove(0);
+        assert_eq!(answer["kind"], "unchanged");
+        assert_eq!(answer["revision"], json!(revision));
+        assert_eq!(answer["snapshotSequence"], sequence);
+        assert!(
+            answer["activityAges"]["t000"]
+                .as_u64()
+                .is_some_and(|age| age > 0)
+        );
+        assert!(answer["activityAges"].get("t001").is_none());
+        engine.shutdown().await;
+    }
+
+    /// Anything but the current revision gets the snapshot: a missed change, new keys (a
+    /// restart), an unknown revision, or a sequence newer than the server's.
+    #[tokio::test]
+    async fn shell_stream_resume_with_stale_revision_or_new_keys_sends_snapshot() {
+        let (engine, _) = capped_engine(3).await;
+        let mut first = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        let item = next_items(&mut first).await.remove(0);
+        let revision = item["revision"].as_str().unwrap().to_owned();
+        let sequence = item["snapshot"]["snapshotSequence"].as_i64().unwrap();
+        let resume = |revision: &str, sequence: i64| SubscribeShellInput {
+            cap: Some(ShellCapInput::default()),
+            resume: Some(ShellResumeInput {
+                revision: revision.to_owned(),
+                snapshot_sequence: sequence,
+            }),
+        };
+        let restarted: &'static ThreadRevisionKeys = Box::leak(Box::new(ThreadRevisionKeys::new()));
+        for (input, keys) in [
+            (
+                resume("0123456789abcdef0123456789abcdef", sequence),
+                default_thread_revision_keys(),
+            ),
+            (
+                resume(&revision, sequence + 1),
+                default_thread_revision_keys(),
+            ),
+            (resume(&revision, sequence), restarted),
+        ] {
+            let mut stream = shell_stream_with(
+                engine.clone(),
+                None,
+                input,
+                engine.subscribe_events(),
+                CancellationToken::new(),
+                keys,
+            );
+            assert_eq!(next_items(&mut stream).await[0]["kind"], "snapshot");
+        }
+        rename(&engine, "t000", 1).await;
+        let mut missed = shell_stream_with(
+            engine.clone(),
+            None,
+            resume(&revision, sequence),
+            engine.subscribe_events(),
+            CancellationToken::new(),
+            default_thread_revision_keys(),
+        );
+        assert_eq!(next_items(&mut missed).await[0]["kind"], "snapshot");
+        engine.shutdown().await;
+    }
+
+    /// A delta chunk carries the revision after it on its last item only, and resuming from
+    /// it is `unchanged`.
+    #[tokio::test]
+    async fn shell_stream_delta_chunks_carry_the_revision_on_their_last_item() {
+        let (engine, _) = capped_engine(3).await;
+        let mut stream = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(json!({ "cap": {} })),
+            CancellationToken::new(),
+        );
+        next_items(&mut stream).await;
+        rename(&engine, "t000", 1).await;
+        rename(&engine, "t001", 2).await;
+        let items = next_items(&mut stream).await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items[0].get("revision").is_none());
+        let revision = items[1]["revision"].as_str().unwrap().to_owned();
+        let mut resumed = subscribe_shell(
+            engine.clone(),
+            None,
+            capped_request(
+                json!({ "cap": {}, "resume": { "revision": revision, "snapshotSequence": items[1]["sequence"] } }),
+            ),
+            CancellationToken::new(),
+        );
+        assert_eq!(next_items(&mut resumed).await[0]["kind"], "unchanged");
+        engine.shutdown().await;
+    }
+
+    async fn older_page(engine: &OrchestrationEngine, payload: Value) -> RpcResult {
+        list_older_threads(
+            engine,
+            None,
+            request("orchestration.listOlderThreads", payload),
+        )
+        .await
+    }
+
+    fn page_ids(page: &Value) -> Vec<String> {
+        page["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|thread| thread["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Paging the project returns every left-out thread once, newest first.
+    #[tokio::test]
+    async fn list_older_threads_pages_every_left_out_thread_once_newest_first() {
+        let (engine, _) = capped_engine(40).await;
+        let mut seen = Vec::new();
+        let mut cursor = Value::Null;
+        loop {
+            let mut payload =
+                json!({ "scope": { "kind": "project", "projectId": "project" }, "limit": 4 });
+            if !cursor.is_null() {
+                payload["cursor"] = cursor.clone();
+            }
+            let page = older_page(&engine, payload).await.unwrap();
+            seen.extend(page_ids(&page));
+            cursor = page["cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+        }
+        // The cap keeps t039..t015; t014..t000 are left out.
+        let expected = (0..15)
+            .rev()
+            .map(|index| format!("t{index:03}"))
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected);
+        engine.shutdown().await;
+    }
+
+    /// The checkout scope lists left-out panels grouped as the shell counts them.
+    #[tokio::test]
+    async fn list_older_threads_checkout_scope_matches_the_chat_grouping() {
+        let (engine, _) = capped_engine(30).await;
+        let repositories = engine.repositories();
+        seed_cap_thread(&repositories, "panel-main", "project", "panel", None, 0).await;
+        seed_cap_thread(
+            &repositories,
+            "panel-wt",
+            "project",
+            "panel",
+            Some("C:/repo/wt"),
+            0,
+        )
+        .await;
+        let main = older_page(&engine, json!({ "scope": { "kind": "checkout", "projectId": "project", "worktreePath": null } })).await.unwrap();
+        assert_eq!(page_ids(&main), ["panel-main"]);
+        let worktree = older_page(&engine, json!({ "scope": { "kind": "checkout", "projectId": "project", "worktreePath": "C:/repo/wt" } })).await.unwrap();
+        assert_eq!(page_ids(&worktree), ["panel-wt"]);
+        let project = older_page(
+            &engine,
+            json!({ "scope": { "kind": "project", "projectId": "project" } }),
+        )
+        .await
+        .unwrap();
+        assert!(!page_ids(&project).iter().any(|id| id.starts_with("panel")));
+        engine.shutdown().await;
+    }
+
+    /// The agents scope lists every left-out thread with a session, panels included.
+    #[tokio::test]
+    async fn list_older_threads_agents_scope_includes_panels() {
+        let (engine, _) = capped_engine(30).await;
+        let repositories = engine.repositories();
+        seed_cap_thread(&repositories, "panel-agent", "project", "panel", None, 0).await;
+        seed_cap_session(&repositories, "panel-agent", "ready").await;
+        seed_cap_session(&repositories, "t000", "ready").await;
+        let page = older_page(&engine, json!({ "scope": { "kind": "agents" } }))
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page), ["t000", "panel-agent"]);
+        engine.shutdown().await;
+    }
+
+    /// The search scope finds any unarchived thread by title, with or without a session.
+    #[tokio::test]
+    async fn list_older_threads_search_scope_finds_threads_without_sessions() {
+        let (engine, _) = capped_engine(30).await;
+        rename(&engine, "t000", 7).await;
+        let page = older_page(
+            &engine,
+            json!({ "scope": { "kind": "search" }, "query": "title 7" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page_ids(&page), ["t000"]);
+        assert!(page["threads"][0]["session"].is_null());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_older_threads_search_scope_requires_a_query() {
+        let (engine, _) = capped_engine(1).await;
+        let error = older_page(&engine, json!({ "scope": { "kind": "search" } }))
+            .await
+            .unwrap_err();
+        assert_eq!(error["_tag"], "OrchestrationListOlderThreadsError");
+        engine.shutdown().await;
+    }
+
+    /// `%` and `_` are literal: the search is a substring match, never a pattern.
+    #[tokio::test]
+    async fn list_older_threads_searches_titles_case_insensitively_with_escaped_wildcards() {
+        let (engine, _) = capped_engine(3).await;
+        for (thread_id, title) in [
+            ("t000", "Fix 100% CPU"),
+            ("t001", "fix 1000 cpu"),
+            ("t002", "FIX_A"),
+        ] {
+            engine
+                .dispatch(decode_command(json!({
+                    "type": "thread.meta.update",
+                    "commandId": format!("title-{thread_id}"),
+                    "threadId": thread_id,
+                    "title": title,
+                })))
+                .await
+                .unwrap();
+        }
+        let percent = older_page(
+            &engine,
+            json!({ "scope": { "kind": "search" }, "query": "100%" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page_ids(&percent), ["t000"]);
+        let underscore = older_page(
+            &engine,
+            json!({ "scope": { "kind": "search" }, "query": "x_" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page_ids(&underscore), ["t002"]);
+        let case = older_page(
+            &engine,
+            json!({ "scope": { "kind": "search" }, "query": "FIX 1" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page_ids(&case), ["t001", "t000"]);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_older_threads_rejects_a_malformed_cursor() {
+        let (engine, _) = capped_engine(1).await;
+        for cursor in ["not-base64!", "e30"] {
+            let error = older_page(
+                &engine,
+                json!({ "scope": { "kind": "agents" }, "cursor": cursor }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error["_tag"], "OrchestrationListOlderThreadsError",
+                "{cursor}"
+            );
+        }
+        engine.shutdown().await;
+    }
+
+    /// The authority on whether a thread exists: live and archived threads come back, deleted
+    /// and unknown ids are `missing`.
+    #[tokio::test]
+    async fn get_thread_shells_returns_live_and_archived_and_lists_missing() {
+        let (engine, _) = capped_engine(3).await;
+        for (command, thread_id) in [("thread.archive", "t001"), ("thread.delete", "t002")] {
+            engine
+                .dispatch(decode_command(json!({ "type": command, "commandId": format!("{command}-{thread_id}"), "threadId": thread_id })))
+                .await
+                .unwrap();
+        }
+        let answer = get_thread_shells(
+            &engine,
+            request(
+                "orchestration.getThreadShells",
+                json!({ "threadIds": ["t000", "t001", "t002", "nope"] }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page_ids(&answer), ["t000", "t001"]);
+        assert!(answer["threads"][0]["archivedAt"].is_null());
+        assert!(answer["threads"][1]["archivedAt"].is_string());
+        assert_eq!(answer["missing"], json!(["t002", "nope"]));
+        let error = get_thread_shells(
+            &engine,
+            request("orchestration.getThreadShells", json!({ "threadIds": [] })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error["_tag"], "InvalidRequest");
         engine.shutdown().await;
     }
 

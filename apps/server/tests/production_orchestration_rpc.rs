@@ -1934,6 +1934,86 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
     finish_test(harness, outcome).await;
 }
 
+/// The finished-thread cap over the real wire (#223): a capped snapshot with its count and
+/// revision, `unchanged` on resume, older pages, and lookups by id.
+#[tokio::test]
+async fn shell_cap_and_resume_over_the_wire() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let mut socket = harness.connect().await;
+        dispatch_command(
+            &mut socket,
+            "1",
+            create_project("project-cap", &harness.workspace_root("project-cap")),
+        )
+        .await;
+        for index in 0..30 {
+            dispatch_command(
+                &mut socket,
+                &format!("{}", 10 + index),
+                create_public_thread(&format!("cap-{index:02}"), "project-cap", &format!("Cap {index}")),
+            )
+            .await;
+        }
+
+        rpc_request(&mut socket, "100", "orchestration.subscribeShell", json!({ "cap": {} })).await;
+        let first = expect_chunk(&mut socket, "100").await.remove(0);
+        assert_eq!(first["kind"], json!("snapshot"));
+        let snapshot = &first["snapshot"];
+        assert_eq!(snapshot["capped"], json!(true));
+        // The default thread and the newest 25 of the 30.
+        assert_eq!(snapshot["threads"].as_array().unwrap().len(), 26);
+        assert_eq!(snapshot["projects"][0]["olderThreads"]["count"], json!(5));
+        let revision = first["revision"].clone();
+        assert!(revision.is_string());
+        acknowledge(&mut socket, "100").await;
+        interrupt_request(&mut socket, "100").await;
+        expect_interrupt_exit(&mut socket, "100").await;
+
+        rpc_request(
+            &mut socket,
+            "101",
+            "orchestration.subscribeShell",
+            json!({
+                "cap": {},
+                "resume": { "revision": revision, "snapshotSequence": snapshot["snapshotSequence"] },
+            }),
+        )
+        .await;
+        let resumed = expect_chunk(&mut socket, "101").await;
+        assert_eq!(resumed[0]["kind"], json!("unchanged"));
+        acknowledge(&mut socket, "101").await;
+        interrupt_request(&mut socket, "101").await;
+        expect_interrupt_exit(&mut socket, "101").await;
+
+        let page = unary_success(
+            &mut socket,
+            "102",
+            "orchestration.listOlderThreads",
+            json!({ "scope": { "kind": "project", "projectId": "project-cap" } }),
+        )
+        .await;
+        let older = page["threads"].as_array().unwrap();
+        assert_eq!(older.len(), 5);
+        assert_eq!(page["cursor"], Value::Null);
+        let older_id = older[0]["id"].clone();
+
+        let shells = unary_success(
+            &mut socket,
+            "103",
+            "orchestration.getThreadShells",
+            json!({ "threadIds": [older_id, "never-existed"] }),
+        )
+        .await;
+        assert_eq!(shells["threads"][0]["id"], older_id);
+        assert_eq!(shells["missing"], json!(["never-existed"]));
+        socket.close(None).await.expect("close socket");
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
 #[tokio::test]
 async fn replay_events_pages_are_byte_bounded_and_match_unpaged_replay() {
     let harness = harness().await;
