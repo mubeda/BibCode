@@ -33,6 +33,7 @@ mod repository_identity;
 pub mod runtime;
 pub mod server_terminal;
 pub mod step_gate;
+mod tool_maintenance;
 pub mod transfer_routes;
 pub mod turn_delivery;
 pub(crate) mod ui_intents_rpc;

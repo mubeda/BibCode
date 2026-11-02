@@ -445,6 +445,13 @@ impl ProviderMaintenanceCapabilities {
     /// installation path did not name the package, the installed major decides it, for the
     /// advisory and the package-manager update action alike.
     pub(crate) fn for_installed_version(mut self, driver: &str, version: Option<&str>) -> Self {
+        if driver == "codegraph" {
+            let major = version.and_then(|value| value.split('.').next()?.parse::<u64>().ok());
+            if major.is_some_and(|major| major > CODEGRAPH_VERIFIED_MAJOR) {
+                self.update = None;
+            }
+            return self;
+        }
         use crate::provider::opencode::{OpenCodeCliSupport, OpenCodeProtocol, cli_support};
         if driver != "opencode"
             || self.latest != Some(LatestVersionSource::Npm("opencode-ai"))
@@ -584,6 +591,7 @@ pub(crate) fn capabilities_for_paths_with_claude_hints(
 ) -> ProviderMaintenanceCapabilities {
     match driver {
         "cursor" => cursor_capabilities(binary_path, resolved, canonical),
+        "codegraph" => codegraph_capabilities(binary_path, resolved, canonical),
         "grok" => ProviderMaintenanceCapabilities::unknown(),
         _ => resolve_package_managed_capabilities(
             driver,
@@ -592,6 +600,55 @@ pub(crate) fn capabilities_for_paths_with_claude_hints(
             canonical,
             claude_hints,
         ),
+    }
+}
+
+/// The newest CodeGraph major whose updater honors `CODEGRAPH_NO_PROMPT_HOOK` and
+/// `CODEGRAPH_NO_INSTALL_REFRESH` (verified against 1.6.2). A newer major updates by hand until
+/// those variables are re-verified.
+const CODEGRAPH_VERIFIED_MAJOR: u64 = 1;
+pub(crate) const CODEGRAPH_PACKAGE: &str = "@colbymchenry/codegraph";
+
+fn codegraph_capabilities(
+    binary_path: &str,
+    resolved: Option<&Path>,
+    canonical: Option<&Path>,
+) -> ProviderMaintenanceCapabilities {
+    let resolved_path = resolved.map(normalized_path);
+    let canonical_path = canonical.map(normalized_path);
+    let Ok(ownership) = reconcile_installation_ownership(
+        "codegraph",
+        resolved_path.as_deref(),
+        canonical_path.as_deref(),
+    ) else {
+        return ProviderMaintenanceCapabilities::unknown();
+    };
+    let latest = LatestVersionSource::Npm(CODEGRAPH_PACKAGE);
+    let package = format!("{CODEGRAPH_PACKAGE}@latest");
+    let package_command = |executable: &str, verb: [&str; 2], lock_key: &'static str| {
+        ProviderMaintenanceCapabilities::executable(
+            latest,
+            VersionScheme::Semver,
+            executable,
+            [verb[0], verb[1], package.as_str()],
+            lock_key,
+        )
+    };
+    match ownership {
+        Some(InstallationOwnership::CodegraphStandalone) => {
+            ProviderMaintenanceCapabilities::executable(
+                latest,
+                VersionScheme::Semver,
+                resolved_or_configured_binary(binary_path, resolved),
+                ["upgrade"],
+                "codegraph-standalone",
+            )
+        }
+        Some(InstallationOwnership::Npm) => package_command("npm", ["install", "-g"], "npm"),
+        Some(InstallationOwnership::Pnpm) => package_command("pnpm", ["add", "-g"], "pnpm"),
+        Some(InstallationOwnership::Bun) => package_command("bun", ["i", "-g"], "bun"),
+        Some(InstallationOwnership::VitePlus) => package_command("vp", ["i", "-g"], "vite-plus"),
+        _ => ProviderMaintenanceCapabilities::unknown(),
     }
 }
 
@@ -888,6 +945,7 @@ fn normalized_path(path: &Path) -> String {
 enum InstallationOwnership {
     Native,
     CodexStandalone,
+    CodegraphStandalone,
     ClaudeStableCask,
     ClaudeLatestCask,
     ClaudeWinget,
@@ -986,6 +1044,9 @@ fn path_ownership_evidence(driver: &str, path: &str) -> PathOwnershipEvidence {
     if driver == "codex" && is_codex_standalone_path(path, &components) {
         return PathOwnershipEvidence::Owned(InstallationOwnership::CodexStandalone);
     }
+    if driver == "codegraph" && is_codegraph_standalone_path(path, &components) {
+        return PathOwnershipEvidence::Owned(InstallationOwnership::CodegraphStandalone);
+    }
     PathOwnershipEvidence::None
 }
 
@@ -1002,6 +1063,7 @@ fn exact_ownership_evidence(
 
 fn provider_binary_name(driver: &str) -> &str {
     match driver {
+        "codegraph" => "codegraph",
         "claudeAgent" => "claude",
         "opencode" => "opencode",
         _ => "codex",
@@ -1092,6 +1154,7 @@ fn global_package_ownership(driver: &str, components: &[&str]) -> Option<Install
         "codex" => &[&["@openai", "codex"]],
         "claudeAgent" => &[&["@anthropic-ai", "claude-code"]],
         "opencode" => &[&["opencode-ai"], &["@opencode", "cli"]],
+        "codegraph" => &[&["@colbymchenry", "codegraph"]],
         _ => return None,
     };
     if !expected
@@ -1241,6 +1304,12 @@ fn resolved_or_configured_binary(binary_path: &str, resolved: Option<&Path>) -> 
     resolved
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| binary_path.to_owned())
+}
+
+/// The standalone installer's layout: `<root>/codegraph/current/bin/codegraph`.
+fn is_codegraph_standalone_path(path: &str, components: &[&str]) -> bool {
+    matches!(components, [.., "codegraph", "current", "bin", _])
+        && exact_provider_basename(path, "codegraph")
 }
 
 fn is_claude_native_path(path: &str) -> bool {
@@ -1793,6 +1862,108 @@ mod tests {
                 "{resolved}"
             );
         }
+    }
+
+    #[test]
+    fn resolves_codegraph_installation_sources() {
+        let npm = "npm install -g @colbymchenry/codegraph@latest";
+        let cases = [
+            (
+                "C:/Users/me/AppData/Local/codegraph/current/bin/codegraph.cmd",
+                None,
+                Some("C:/Users/me/AppData/Local/codegraph/current/bin/codegraph.cmd upgrade"),
+                Some("codegraph-standalone"),
+            ),
+            (
+                "/home/me/.local/share/codegraph/current/bin/codegraph",
+                Some("/home/me/.local/share/codegraph/versions/1.6.2/bin/codegraph"),
+                Some("/home/me/.local/share/codegraph/current/bin/codegraph upgrade"),
+                Some("codegraph-standalone"),
+            ),
+            (
+                "C:/Users/me/AppData/Roaming/npm/codegraph.cmd",
+                Some(
+                    "C:/Users/me/AppData/Roaming/npm/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+                ),
+                Some(npm),
+                Some("npm"),
+            ),
+            (
+                "/usr/local/bin/codegraph",
+                Some("/usr/local/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js"),
+                Some(npm),
+                Some("npm"),
+            ),
+            // A wrapper or an unknown layout is never guessed at.
+            (
+                "/opt/tools/codegraph",
+                Some("/opt/tools/codegraph"),
+                None,
+                None,
+            ),
+            (
+                "/srv/codegraph/current/bin/codegraph-wrapper",
+                None,
+                None,
+                None,
+            ),
+            (
+                "/home/me/project/node_modules/.bin/codegraph",
+                Some("/home/me/project/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js"),
+                None,
+                None,
+            ),
+        ];
+        for (resolved, canonical, expected_display, expected_lock) in cases {
+            let capabilities = capabilities_for_paths_with_claude_hints(
+                "codegraph",
+                "codegraph",
+                Some(Path::new(resolved)),
+                canonical.map(Path::new),
+                &ClaudeSourceHints::default(),
+            );
+            assert_eq!(
+                capabilities
+                    .update
+                    .as_ref()
+                    .map(|update| update.display.as_str()),
+                expected_display,
+                "{resolved}"
+            );
+            assert_eq!(
+                capabilities.update.as_ref().map(|update| update.lock_key),
+                expected_lock,
+                "{resolved}"
+            );
+            assert_eq!(
+                capabilities.latest.is_some(),
+                expected_display.is_some(),
+                "{resolved}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_codegraph_major_updates_by_hand_until_its_environment_is_verified() {
+        let capabilities = capabilities_for_paths_with_claude_hints(
+            "codegraph",
+            "codegraph",
+            Some(Path::new(
+                "/home/me/.local/share/codegraph/current/bin/codegraph",
+            )),
+            None,
+            &ClaudeSourceHints::default(),
+        );
+        assert!(
+            capabilities
+                .clone()
+                .for_installed_version("codegraph", Some("1.9.0"))
+                .update
+                .is_some()
+        );
+        let newer = capabilities.for_installed_version("codegraph", Some("2.0.0"));
+        assert!(newer.update.is_none());
+        assert!(newer.latest.is_some());
     }
 
     #[test]
