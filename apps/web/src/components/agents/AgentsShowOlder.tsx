@@ -12,9 +12,13 @@ const AGENTS_PAGE_KEY = olderPageKey(AGENTS_SCOPE);
 
 /**
  * The end of the Done group when a capped shell left finished agents out (#223): pages them in,
- * chat panels included, from every live environment.
+ * chat panels included, from every live environment. With no Done group (every finished agent
+ * was left out) it stands alone and says what it shows.
  */
-export function AgentsShowOlder() {
+export function AgentsShowOlder(props: {
+  /** Names what it shows when no Done group heads it: every finished agent is older. */
+  readonly standalone?: boolean;
+}) {
   // Re-render as pages land; the rows themselves come from `useAgentRows`.
   useOffShellThreadShells();
   const [phase, setPhase] = useState<"idle" | "loading" | "error">("idle");
@@ -60,7 +64,9 @@ export function AgentsShowOlder() {
         {...(anyLive ? {} : { "aria-description": "Reconnect to load older agents." })}
         onClick={() => void load()}
       >
-        {phase === "error" ? "Retry" : anyLive ? "Show older" : "Show older: reconnect to load"}
+        {phase === "error"
+          ? "Retry"
+          : `${props.standalone === true ? "Show older finished agents" : "Show older"}${anyLive ? "" : ": reconnect to load"}`}
       </button>
     </div>
   );

@@ -196,7 +196,9 @@ vi.mock("../ui/sidebar", async (importOriginal) => ({
 }));
 
 vi.mock("./AgentsShowOlder", () => ({
-  AgentsShowOlder: () => <div data-testid="agents-show-older" />,
+  AgentsShowOlder: (props: { standalone?: boolean }) => (
+    <div data-testid="agents-show-older" data-standalone={String(props.standalone === true)} />
+  ),
 }));
 
 vi.mock("../ui/tooltip", () => ({
@@ -567,6 +569,14 @@ describe("AgentsPage", () => {
     await rerender({ container, root: mountedTrees.at(-1)!.root }, <AgentsPage />);
     expect(container.querySelector('[data-testid="agents-group-status:done"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="agents-show-older"]')).not.toBeNull();
+  });
+
+  it("offers Show older when every finished agent was left out (#223)", async () => {
+    h.shells = [workingShell()];
+    const { container } = await mount(<AgentsPage />);
+    expect(container.querySelector('[data-testid="agents-group-status:done"]')).toBeNull();
+    const older = container.querySelector('[data-testid="agents-show-older"]');
+    expect(older?.getAttribute("data-standalone")).toBe("true");
   });
 
   it("counts unread agents from the full row set", async () => {

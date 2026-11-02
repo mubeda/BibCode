@@ -145,6 +145,16 @@ describe("off-shell threads (#223)", () => {
     expect(store.get(ENVIRONMENT).threads.size).toBe(0);
   });
 
+  it("forgets a removed environment, so no list shows its threads", () => {
+    const store = createOffShellThreads();
+    store.applyLookup(ENVIRONMENT, 0, { threads: [thread("a")], missing: [] });
+    const before = store.version();
+    store.forget(ENVIRONMENT);
+    expect(store.environmentIds()).toEqual([]);
+    expect(store.get(ENVIRONMENT).threads.size).toBe(0);
+    expect(store.version()).toBeGreaterThan(before);
+  });
+
   it("an upsert does not invalidate replies in flight", () => {
     const store = createOffShellThreads();
     const sentAt = store.get(ENVIRONMENT).generation;

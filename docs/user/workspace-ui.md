@@ -199,7 +199,8 @@ older threads**; selecting it loads them 20 at a time (**Load 20 more**), and
 **Hide older threads** folds them away again. While the server is not
 connected the row reads **N older threads: reconnect to load**. In the Agents
 view and the Inbox, the **Done** group ends with **Show older**, which loads
-the finished agents the panel did not load, chat panels included. The command
+the finished agents the panel did not load, chat panels included; when none
+loaded, the Agents view offers **Show older finished agents** instead. The command
 palette's search also asks the server once you pause typing, and lists matches
 the panel did not load under **Older threads**. Under its results it says
 **Searching older threads…** until the server answers, offers **Retry** when

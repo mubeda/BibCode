@@ -41,6 +41,8 @@ const h = vi.hoisted(() => ({
   lookups: [] as string[][],
   // While set, a lookup waits for it before it answers.
   holdLookups: null as Promise<void> | null,
+  // Ids the server reports archived, with their kind.
+  archivedKnown: new Map<string, "default" | "panel">(),
 }));
 
 vi.mock("@effect/atom-react", () => ({
@@ -57,10 +59,18 @@ vi.mock("./state/offShell", () => ({
     const generation = offShellThreads.get(environmentId as never).generation;
     if (h.holdLookups !== null) await h.holdLookups;
     offShellThreads.applyLookup(environmentId as never, generation, {
-      threads: threadIds
-        .filter((threadId) => h.known.has(threadId))
-        .map((threadId) => ({ id: threadId, kind: "default", archivedAt: null })) as never,
-      missing: threadIds.filter((threadId) => !h.known.has(threadId)) as never,
+      threads: [
+        ...threadIds
+          .filter((threadId) => h.known.has(threadId))
+          .map((threadId) => ({ id: threadId, kind: "default", archivedAt: null })),
+        ...threadIds.flatMap((threadId) => {
+          const kind = h.archivedKnown.get(threadId);
+          return kind === undefined ? [] : [{ id: threadId, kind, archivedAt: "2026-11-02" }];
+        }),
+      ] as never,
+      missing: threadIds.filter(
+        (threadId) => !h.known.has(threadId) && !h.archivedKnown.has(threadId),
+      ) as never,
     });
   },
 }));
@@ -184,6 +194,7 @@ beforeEach(() => {
   h.known = new Set();
   h.lookups = [];
   h.holdLookups = null;
+  h.archivedKnown = new Map();
   offShellThreads.reset("primary" as never);
   container = document.createElement("div");
   document.body.append(container);
@@ -327,6 +338,21 @@ describe("ThreadLifecycleReconciler with a capped shell (#223)", () => {
     h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:closed": { surfaces: [] } };
     await settleCapped([thread("a")], [thread("closed", "panel")]);
     expect(removedThreadIds()).toEqual(["closed"]);
+  });
+
+  it("drops a panel the lookup finds closed, and keeps a workspace it finds archived", async () => {
+    h.centerByThreadKey = {
+      "primary:a": { surfaces: [] },
+      "primary:closed-elsewhere": { surfaces: [] },
+      "primary:archived-workspace": { surfaces: [] },
+    };
+    // Closed or archived after the archived snapshot, while the capped shell left them out.
+    h.archivedKnown = new Map([
+      ["closed-elsewhere", "panel"],
+      ["archived-workspace", "default"],
+    ]);
+    await settleCapped([thread("a")], []);
+    expect(removedThreadIds()).toEqual(["closed-elsewhere"]);
   });
 
   it("does not look a resolved thread up again on every shell update", async () => {

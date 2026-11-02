@@ -129,6 +129,8 @@ export interface OffShellThreads {
   readonly onShellItem: (environmentId: EnvironmentId, item: OrchestrationShellStreamItem) => void;
   /** A new session: nothing loaded before it is trusted. */
   readonly reset: (environmentId: EnvironmentId) => void;
+  /** A removed environment: drops everything it loaded, so no list shows it again. */
+  readonly forget: (environmentId: EnvironmentId) => void;
   readonly applyPage: (
     environmentId: EnvironmentId,
     generation: number,
@@ -168,6 +170,11 @@ export function createOffShellThreads(): OffShellThreads {
     },
     reset: (environmentId) => {
       set(environmentId, { ...EMPTY, generation: get(environmentId).generation + 1 });
+    },
+    forget: (environmentId) => {
+      if (!states.delete(environmentId)) return;
+      version += 1;
+      for (const listener of listeners) listener();
     },
     applyPage: (environmentId, generation, key, result, append) =>
       set(environmentId, offShellWithPage(get(environmentId), generation, key, result, append)),
