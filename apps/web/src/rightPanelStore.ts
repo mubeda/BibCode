@@ -8,11 +8,12 @@
  * workspace paths, and diff/plan/files/sourceControl remain singleton
  * surfaces.
  */
-import { scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   type DevicePlatform,
   type ScopedThreadRef,
   SourceControlProviderKind,
+  ThreadId,
 } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 import { create } from "zustand";
@@ -69,7 +70,8 @@ export type RightPanelSurface =
       activeTerminalId: string;
       splitDirection?: "horizontal" | "vertical";
     }
-  | { id: "diff"; kind: "diff" }
+  /** `threadId` names a chat panel's thread when its host's panel shows that thread's diff. */
+  | { id: "diff"; kind: "diff"; threadId?: ThreadId }
   | { id: "sourceControl"; kind: "sourceControl" }
   | { id: "files"; kind: "files" }
   | {
@@ -98,6 +100,8 @@ interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
   open: (ref: ScopedThreadRef, kind: GenericRightPanelKind) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
+  /** Opens `ref`'s Diff surface on `threadId`'s diff: a chat panel's, in its host's panel. */
+  openDiff: (ref: ScopedThreadRef, threadId: ThreadId) => void;
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
   openPullRequest: (
     ref: ScopedThreadRef,
@@ -249,6 +253,22 @@ const upsertSurface = (
   activeSurfaceId: activate ? surface.id : current.activeSurfaceId,
 });
 
+const diffSurface = (ref: ScopedThreadRef, threadId: ThreadId): RightPanelSurface =>
+  threadId === ref.threadId ? { id: "diff", kind: "diff" } : { id: "diff", kind: "diff", threadId };
+
+/** Like `upsertSurface`, but replaces a surface with the same id (a Diff on another thread). */
+const replaceSurface = (
+  current: ThreadRightPanelState,
+  surface: RightPanelSurface,
+): ThreadRightPanelState =>
+  upsertSurface(
+    {
+      ...current,
+      surfaces: current.surfaces.map((entry) => (entry.id === surface.id ? surface : entry)),
+    },
+    surface,
+  );
+
 const updateThread = (
   byThreadKey: Record<string, ThreadRightPanelState>,
   threadKey: string,
@@ -275,7 +295,10 @@ function normalizePersistedSurface(value: unknown): RightPanelSurface | null {
 
   switch (value.kind) {
     case "diff":
-      return value.id === "diff" ? { id: "diff", kind: "diff" } : null;
+      if (value.id !== "diff") return null;
+      return typeof value.threadId === "string" && value.threadId.length > 0
+        ? { id: "diff", kind: "diff", threadId: ThreadId.make(value.threadId) }
+        : { id: "diff", kind: "diff" };
     case "sourceControl":
       return value.id === "sourceControl" ? { id: "sourceControl", kind: "sourceControl" } : null;
     case "files":
@@ -420,8 +443,17 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               const existing = current.surfaces.find((surface) => surface.kind === "preview");
               return upsertSurface(current, existing ?? browserSurface(null));
             }
-            return upsertSurface(current, singletonSurface(kind));
+            // Diff replaces one showing a chat panel's thread; other surfaces keep their state.
+            return kind === "diff"
+              ? replaceSurface(current, singletonSurface(kind))
+              : upsertSurface(current, singletonSurface(kind));
           }),
+        })),
+      openDiff: (ref, threadId) =>
+        set((state) => ({
+          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) =>
+            replaceSurface(current, diffSurface(ref, threadId)),
+          ),
         })),
       openBrowser: (ref, tabId) =>
         set((state) => ({
@@ -834,15 +866,32 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               const existing = current.surfaces.find((surface) => surface.kind === "preview");
               return upsertSurface(current, existing ?? browserSurface(null));
             }
-            return upsertSurface(current, singletonSurface(kind));
+            // Diff replaces one showing a chat panel's thread; other surfaces keep their state.
+            return kind === "diff"
+              ? replaceSurface(current, singletonSurface(kind))
+              : upsertSurface(current, singletonSurface(kind));
           }),
         })),
       removeThread: (ref) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
-          if (!(threadKey in state.byThreadKey)) return state;
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
-          return { byThreadKey: rest };
+          // A host's Diff on this (chat panel) thread goes back to the host's own diff.
+          let changed = threadKey in state.byThreadKey;
+          for (const [key, thread] of Object.entries(rest)) {
+            if (parseScopedThreadKey(key)?.environmentId !== ref.environmentId) continue;
+            if (!thread.surfaces.some((s) => s.kind === "diff" && s.threadId === ref.threadId)) {
+              continue;
+            }
+            changed = true;
+            rest[key] = {
+              ...thread,
+              surfaces: thread.surfaces.map((s) =>
+                s.kind === "diff" && s.threadId === ref.threadId ? { id: "diff", kind: "diff" } : s,
+              ),
+            };
+          }
+          return changed ? { byThreadKey: rest } : state;
         }),
     }),
     {

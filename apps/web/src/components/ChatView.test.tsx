@@ -20,6 +20,7 @@ import {
   type ReactElement,
   type ReactNode,
   type RefObject,
+  use,
   useEffect,
   useLayoutEffect,
   useState,
@@ -84,6 +85,7 @@ const h = vi.hoisted(() => {
     environments: [] as unknown[],
     primaryEnvironment: null as unknown,
     threadsByKey: new Map<string, unknown>(),
+    threadLoadStatesByKey: new Map<string, unknown>(),
     projectsByKey: new Map<string, unknown>(),
     allProjects: [] as unknown[],
     threadRefs: [] as unknown[],
@@ -167,6 +169,12 @@ vi.mock("../state/use-atom-command", () => ({
 
 vi.mock("../state/threads", () => ({
   useThreadOlderHistory: () => null,
+  useThreadFindLoadState: (ref: { environmentId: string; threadId: string } | null) =>
+    (ref ? h.threadLoadStatesByKey.get(`${ref.environmentId}:${ref.threadId}`) : undefined) ?? {
+      status: "live",
+      hasData: true,
+      error: null,
+    },
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
@@ -508,29 +516,33 @@ vi.mock("./chat/threadFind/useThreadFind", () => ({
   },
 }));
 
-vi.mock("./chat/MessagesTimeline", () => ({
-  MessagesTimeline: (props: Record<string, unknown>) => {
-    h.captured["messagesTimeline"] = props;
-    // A new instance is a new find session: its query and selection start over.
-    useState(() => ++h.messagesTimelineInstanceCount);
-    if (h.timelineList !== null) {
-      (props["listRef"] as { current: unknown }).current = h.timelineList;
-    }
-    // The list reports that it mounted, as LegendList's ref does.
-    const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
-    useLayoutEffect(() => {
-      if (h.timelineList === null) return undefined;
-      onListMount?.(h.timelineList);
-      return () => onListMount?.(null);
-    }, [onListMount]);
-    return (
-      <div
-        data-mock="messages-timeline"
-        data-entry-count={String((props["timelineEntries"] as readonly unknown[]).length)}
-      />
-    );
-  },
-}));
+vi.mock("./chat/MessagesTimeline", async () => {
+  const { RightPanelThreadContext } = await import("./chat/rightPanelThread");
+  return {
+    MessagesTimeline: (props: Record<string, unknown>) => {
+      h.captured["messagesTimeline"] = props;
+      h.captured["rightPanelThread"] = use(RightPanelThreadContext);
+      // A new instance is a new find session: its query and selection start over.
+      useState(() => ++h.messagesTimelineInstanceCount);
+      if (h.timelineList !== null) {
+        (props["listRef"] as { current: unknown }).current = h.timelineList;
+      }
+      // The list reports that it mounted, as LegendList's ref does.
+      const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
+      useLayoutEffect(() => {
+        if (h.timelineList === null) return undefined;
+        onListMount?.(h.timelineList);
+        return () => onListMount?.(null);
+      }, [onListMount]);
+      return (
+        <div
+          data-mock="messages-timeline"
+          data-entry-count={String((props["timelineEntries"] as readonly unknown[]).length)}
+        />
+      );
+    },
+  };
+});
 
 vi.mock("./chat/ChatHeaderActions", () => ({
   ChatHeaderActions: (props: Record<string, unknown>) => {
@@ -710,7 +722,10 @@ vi.mock("./preview/PreviewPanel", () => ({
   PreviewPanel: () => <div data-mock="preview-panel" />,
 }));
 vi.mock("./DiffPanel", () => ({
-  default: () => <div data-mock="diff-panel" />,
+  default: (props: Record<string, unknown>) => {
+    h.captured["diffPanel"] = props;
+    return <div data-mock="diff-panel" />;
+  },
 }));
 vi.mock("./SourceControlPanel", () => ({
   default: () => <div data-mock="source-control-panel" />,
@@ -1064,6 +1079,7 @@ beforeEach(() => {
   h.environments = [];
   h.primaryEnvironment = null;
   h.threadsByKey.clear();
+  h.threadLoadStatesByKey.clear();
   h.projectsByKey.clear();
   h.allProjects = [];
   h.threadRefs = [];
@@ -4540,6 +4556,187 @@ describe("ChatView", () => {
       expect(composer["routeKind"]).toBe("server");
       expect(composer["isServerThread"]).toBe(true);
       expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
+    });
+
+    it("opens its chat's links and files in its host's right panel", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      const hostRef = scopeThreadRef(environmentId, ThreadId.make("thread-host"));
+
+      renderToStaticMarkup(
+        <ChatView
+          variant="panel"
+          panelThreadRef={threadRef}
+          activityPaneHostRef={hostRef}
+          workspaceUnavailable={null}
+        />,
+      );
+      expect(h.captured["rightPanelThread"]).toEqual(hostRef);
+
+      renderServerRoute();
+      expect(h.captured["rightPanelThread"]).toBeNull();
+    });
+
+    it("opens a turn's diff in its host's Diff surface, showing the panel's thread", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-diff");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Panel thread" }));
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+
+      renderToStaticMarkup(
+        <ChatView
+          variant="panel"
+          panelThreadRef={panelThreadRef}
+          activityPaneHostRef={threadRef}
+          workspaceUnavailable={null}
+        />,
+      );
+      const timeline = capturedProps<{
+        onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+      }>("messagesTimeline");
+      act(() => timeline.onOpenTurnDiff(TurnId.make("turn-panel-1"), "src/index.ts"));
+
+      const byThreadKey = useRightPanelStore.getState().byThreadKey;
+      expect(byThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
+        isOpen: true,
+        activeSurfaceId: "diff",
+        surfaces: [{ id: "diff", kind: "diff", threadId: panelThreadId }],
+      });
+      expect(byThreadKey[scopedThreadKey(panelThreadRef)]).toBeUndefined();
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(panelThreadId);
+        expect(diffPanel.composerDraftTarget).toEqual(panelThreadRef);
+
+        // The host's own Diff action shows the host's diff again.
+        act(() => useRightPanelStore.getState().open(threadRef, "diff"));
+        await vi.waitFor(() =>
+          expect(capturedProps<{ thread: { id: string } }>("diffPanel").thread.id).toBe(threadId),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("waits for a panel thread that arrives late, never pairing the host's diff with it", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-late");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      // After a reload the host's Diff still shows the panel, whose thread is not loaded yet.
+      useRightPanelStore.getState().openDiff(threadRef, panelThreadId);
+      h.threadLoadStatesByKey.set(`${environmentId}:${panelThreadId}`, {
+        status: "synchronizing",
+        hasData: false,
+        error: null,
+      });
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      try {
+        await render();
+        expect(container.textContent).toContain("Loading the chat panel's diff");
+        expect(h.captured["diffPanel"]).toBeUndefined();
+
+        h.threadsByKey.set(
+          `${environmentId}:${panelThreadId}`,
+          makeThread({ id: panelThreadId, title: "Panel thread" }),
+        );
+        h.threadLoadStatesByKey.delete(`${environmentId}:${panelThreadId}`);
+        await render();
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(panelThreadId);
+        expect(diffPanel.composerDraftTarget).toEqual(panelThreadRef);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("says when a panel thread fails to load and offers this chat's diff", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-failed");
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().openDiff(threadRef, panelThreadId);
+      h.threadLoadStatesByKey.set(`${environmentId}:${panelThreadId}`, {
+        status: "synchronizing",
+        hasData: false,
+        error: "Thread stream failed.",
+      });
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      try {
+        await render();
+        expect(container.textContent).toContain("Couldn't load the chat panel's diff.");
+        expect(h.captured["diffPanel"]).toBeUndefined();
+
+        const button = [...container.querySelectorAll("button")].find(
+          (candidate) => candidate.textContent === "Show this chat's diff",
+        );
+        expect(button).toBeDefined();
+        await act(async () => button!.click());
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(threadId);
+        expect(diffPanel.composerDraftTarget).not.toEqual(
+          scopeThreadRef(environmentId, panelThreadId),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
     });
 
     it("shows an opening state instead of the global empty state before its thread arrives", () => {

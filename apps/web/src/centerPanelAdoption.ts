@@ -21,6 +21,7 @@ import {
 } from "@bibcode/contracts";
 
 import { useCenterPanelStore } from "./centerPanelStore";
+import { useRightPanelStore } from "./rightPanelStore";
 import { isTerminalIdReserved } from "./terminalIdReservations";
 
 export interface CenterPanelAdoptionTracker {
@@ -130,6 +131,8 @@ export function applyPanelThreadAdoption(
     const panelRef = scopeThreadRef(environmentId, ThreadId.make(threadId));
     if (!store.pendingChatPanelThreadKeys.has(scopedThreadKey(panelRef))) {
       store.removeThread(panelRef);
+      // Also drops a host Diff that showed this panel's thread.
+      useRightPanelStore.getState().removeThread(panelRef);
     }
   }
 }

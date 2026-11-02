@@ -40,6 +40,8 @@ import {
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
+import { PanelDiffPendingState } from "./chat/PanelDiffPendingState";
+import { RightPanelThreadContext } from "./chat/rightPanelThread";
 import {
   attachmentUploadFailureCopy,
   type PendingAttachmentUpload,
@@ -300,7 +302,7 @@ import {
 } from "../state/server";
 import { terminalEnvironment } from "../state/terminal";
 import { runOlderHistoryLoad } from "../state/olderHistoryLoad";
-import { threadEnvironment, useThreadOlderHistory } from "../state/threads";
+import { threadEnvironment, useThreadFindLoadState, useThreadOlderHistory } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
@@ -1578,6 +1580,19 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  // A Diff surface can show a chat panel's thread, which has no right panel of its own.
+  const diffSurfaceThreadId =
+    activeRightPanelSurface?.kind === "diff" ? activeRightPanelSurface.threadId : undefined;
+  const diffSurfaceThreadRef = useMemo(
+    () =>
+      diffSurfaceThreadId !== undefined && activeThreadRef !== null
+        ? scopeThreadRef(activeThreadRef.environmentId, diffSurfaceThreadId)
+        : null,
+    [activeThreadRef, diffSurfaceThreadId],
+  );
+  const diffSurfaceThread = useThread(diffSurfaceThreadRef);
+  const diffSurfaceLoad = useThreadFindLoadState(diffSurfaceThreadRef);
+  const diffSurfaceFailed = diffSurfaceLoad.status === "deleted" || diffSurfaceLoad.error !== null;
   // Each chat pane shows its own thread's Activity, inline above its composer.
   const activityScope = useMemo(
     () => resolveActivityScope(activeThreadRef, { _tag: "thread" }),
@@ -6934,10 +6949,13 @@ function ChatViewContent(props: ChatViewProps) {
     (turnId: TurnId, filePath?: string) => {
       if (!isServerThread || !activeThreadRef) return;
       useDiffPanelStore.getState().selectTurn(activeThreadRef, turnId, filePath);
-      useRightPanelStore.getState().open(activeThreadRef, "diff");
+      // A chat panel renders no right panel: its host's shows this thread's diff.
+      useRightPanelStore
+        .getState()
+        .openDiff(activityPaneHostRef ?? activeThreadRef, activeThreadRef.threadId);
       onDiffPanelOpen?.();
     },
-    [activeThreadRef, isServerThread, onDiffPanelOpen],
+    [activeThreadRef, activityPaneHostRef, isServerThread, onDiffPanelOpen],
   );
   // Both the Map and the revert handler are read from refs at call-time so
   // the callback reference is fully stable and never busts context identity.
@@ -7010,14 +7028,21 @@ function ChatViewContent(props: ChatViewProps) {
         workspaceUnavailable={workspaceUnavailable}
       />
     ) : activeRightPanelSurface?.kind === "diff" ? (
-      <Suspense fallback={null}>
-        <DiffPanel
-          mode="embedded"
-          composerDraftTarget={composerDraftTarget}
-          thread={activeThread}
-          workspaceUnavailable={workspaceUnavailable}
+      diffSurfaceThreadRef !== null && diffSurfaceThread === null ? (
+        <PanelDiffPendingState
+          failed={diffSurfaceFailed}
+          onShowOwnDiff={() => useRightPanelStore.getState().open(activeThreadRef, "diff")}
         />
-      </Suspense>
+      ) : (
+        <Suspense fallback={null}>
+          <DiffPanel
+            mode="embedded"
+            composerDraftTarget={diffSurfaceThreadRef ?? composerDraftTarget}
+            thread={diffSurfaceThread ?? activeThread}
+            workspaceUnavailable={workspaceUnavailable}
+          />
+        </Suspense>
+      )
     ) : activeRightPanelSurface?.kind === "sourceControl" ? (
       <Suspense fallback={null}>
         <SourceControlPanel
@@ -7521,7 +7546,10 @@ function ChatViewContent(props: ChatViewProps) {
 export default function ChatView(props: ChatViewProps) {
   return (
     <DiffWorkerPoolProvider>
-      <ChatViewContent {...props} />
+      {/* A chat panel renders no right panel: what its chat opens goes to its host's. */}
+      <RightPanelThreadContext value={props.activityPaneHostRef ?? null}>
+        <ChatViewContent {...props} />
+      </RightPanelThreadContext>
     </DiffWorkerPoolProvider>
   );
 }

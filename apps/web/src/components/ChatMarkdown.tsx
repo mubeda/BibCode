@@ -47,6 +47,7 @@ import {
   type MarkdownFileLinks,
 } from "./chatMarkdownPipeline";
 import { CHAT_FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
+import { RightPanelThreadContext } from "./chat/rightPanelThread";
 import { HighlightedCodeLines } from "./chat/HighlightedCodeLines";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { Button } from "./ui/button";
@@ -88,7 +89,11 @@ import {
   openFileInPreview,
   BrowserPreviewUnavailableError,
 } from "../browser/openFileInPreview";
-import { copyLink, showFileOutsideWorkspaceNotice } from "../browser/linkNotices";
+import {
+  copyLink,
+  showFileOutsideWorkspaceNotice,
+  showInternalBrowserFailedNotice,
+} from "../browser/linkNotices";
 import { openLink } from "../browser/openLink";
 
 class CodeHighlightErrorBoundary extends React.Component<
@@ -1153,19 +1158,27 @@ function MarkdownAnchor({ node, href, children, ...props }: MarkdownComponentPro
     const isSameDocumentLink = href?.startsWith("#") ?? false;
     const onClick = props.onClick;
     const canOpenInPreview = Boolean(threadRef) && canPreviewAnyUrlInRuntime();
-    const routeLink = (event: ReactMouseEvent<HTMLAnchorElement>, invert: boolean) => {
-      if (!href || !isHttpUrl(href)) return;
-      event.preventDefault();
+    const openHref = (url: string, invert: boolean) => {
       const outcome = openLink({
-        url: href,
+        url,
         threadRef: threadRef ?? null,
         environmentId,
         invert,
         openPreview,
-        onError: (cause) =>
-          reportMarkdownActionFailure({ operation: "open-link", target: href }, cause),
+        onError: (cause) => {
+          reportMarkdownActionFailure({ operation: "open-link", target: url }, cause);
+          // Inverting an "app" setting, or keeping a "system" one, opens the system browser.
+          showInternalBrowserFailedNotice(url, () =>
+            openHref(url, getClientSettings().browserLinkTarget === "app"),
+          );
+        },
       });
-      if (outcome === "unavailable") reportLinkUnavailable(href);
+      if (outcome === "unavailable") reportLinkUnavailable(url);
+    };
+    const routeLink = (event: ReactMouseEvent<HTMLAnchorElement>, invert: boolean) => {
+      if (!href || !isHttpUrl(href)) return;
+      event.preventDefault();
+      openHref(href, invert);
     };
     const anchor = (
       <a
@@ -1206,16 +1219,7 @@ function MarkdownAnchor({ node, href, children, ...props }: MarkdownComponentPro
               } else if (clicked === "open-in-browser" || clicked === "open-external") {
                 const wantApp = clicked === "open-in-browser";
                 const setting = getClientSettings().browserLinkTarget;
-                const outcome = openLink({
-                  url: href,
-                  threadRef: threadRef ?? null,
-                  environmentId,
-                  invert: wantApp ? setting === "system" : setting === "app",
-                  openPreview,
-                  onError: (cause) =>
-                    reportMarkdownActionFailure({ operation: "open-link", target: href }, cause),
-                });
-                if (outcome === "unavailable") reportLinkUnavailable(href);
+                openHref(href, wantApp ? setting === "system" : setting === "app");
               }
             } catch (cause) {
               reportMarkdownActionFailure(
@@ -1359,7 +1363,7 @@ const CHAT_MARKDOWN_COMPONENTS: Components = {
 function ChatMarkdown({
   text,
   cwd,
-  threadRef,
+  threadRef: messageThreadRef,
   onTaskListChange,
   isStreaming = false,
   skills = EMPTY_MARKDOWN_SKILLS,
@@ -1369,6 +1373,8 @@ function ChatMarkdown({
   onDetailsOpenChange,
   findScope,
 }: ChatMarkdownProps) {
+  // Links and files open in the right panel on screen: a chat panel's is its host's.
+  const threadRef = use(RightPanelThreadContext) ?? messageThreadRef;
   const { resolvedTheme } = useTheme();
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
