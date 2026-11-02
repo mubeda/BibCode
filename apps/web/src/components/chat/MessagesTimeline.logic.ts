@@ -47,7 +47,18 @@ export function resolveTimelineMaintainScrollAtEnd(input: {
  * A row that changes size above the first visible one, such as a Mermaid diagram replacing its
  * source, keeps the line the reader reads in place.
  */
-const TIMELINE_KEEPS_CONTENT_POSITION = { data: true, size: true };
+const TIMELINE_KEEPS_CONTENT_POSITION: {
+  readonly data: boolean;
+  readonly size: boolean;
+  readonly shouldRestorePosition?: (item: MessagesTimelineRow) => boolean;
+} = {
+  data: true,
+  size: true,
+  // The "Load earlier messages" row stays at the top while a page lands below it: anchored on
+  // it, the list would push the conversation being read down by the page (#226). The first
+  // visible row of the conversation is the anchor instead.
+  shouldRestorePosition: (item) => item.kind !== "history-start",
+};
 const TIMELINE_KEEPS_NO_CONTENT_POSITION = { data: false, size: false };
 
 /**
