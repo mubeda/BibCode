@@ -1762,7 +1762,7 @@ export function TerminalViewport({
               }
               const localPath = match.text.startsWith("file://")
                 ? fileUrlToPath(match.text)
-                : match.text;
+                : (match.target ?? match.text);
               if (localPath === null) {
                 writeSystemMessage(latestTerminal, "Unable to open this file link.");
                 return;

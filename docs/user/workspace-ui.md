@@ -1548,7 +1548,11 @@ plain HTTP from that server, and every other link opens a new browser tab.
   `\\.\…`) is refused with "Network paths can't be opened from the terminal."
   A `file://` URL with a host shows "Unable to open this file link." Relative
   links under a network working directory, such as a WSL `\\wsl.localhost\…`
-  folder, still open. A hyperlink a program emits (OSC 8)
+  folder, still open. On Windows, relative paths with backslashes
+  (`src\index.ts:12`, `.\a.ts`, `..\a.ts`) and `~\` or `~/` paths are links
+  too, `~` resolves against a home folder written in any case or with forward
+  slashes, and a path in quotes keeps its spaces (put `:line` inside the
+  quotes). A hyperlink a program emits (OSC 8)
   needs the same Ctrl/Cmd activation. When its visible text doesn't match its
   destination, a menu shows **Open …** with the destination and **Copy link**.
 - **Browser tabs:** popups and `target=_blank` links inside a preview tab open

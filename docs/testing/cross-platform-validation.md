@@ -3791,6 +3791,16 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
   relative `x.html` under a UNC working directory (WSL `\\wsl.localhost\…`)
   still opens. With the thread's environment disconnected, an HTML path shows
   "Couldn't preview this file" with **Open in editor**.
+- Windows terminal paths: `echo src\index.ts:12` (also `.\src\index.ts:12`)
+  underlines the whole path. For quoted paths the terminal must print the
+  quotes, which PowerShell `echo "…"` does not, so single-quote the argument:
+  `echo '"C:\Users\Jane Doe\a.ts:3"'`, `echo '"C:\Users\Jane Doe\a.ts":3:7'`,
+  and a relative `echo '"My Dir\src\a.ts:3"'` each underline the whole path,
+  spaces included, and Ctrl-click opens it in the editor at that line (and
+  column). The quotes are excluded from the link, except a closing quote
+  followed by a `:line` suffix. `~\x.ts` and
+  `~/x.ts` open under the home folder even when the working directory is
+  written `c:\users\jane\…` or `C:/Users/Jane/…`.
 - Preview tab `target=_blank` link and `window.open` popup open a new tab in the
   same thread; `window.open('about:blank')` opens nothing. Git Manager pull
   request title opens in the system browser, not nowhere.

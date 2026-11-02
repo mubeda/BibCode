@@ -85,6 +85,76 @@ describe("extractTerminalLinks", () => {
     ]);
   });
 
+  it.each([
+    ["src\\index.ts:12", ["src\\index.ts:12"]],
+    [".\\src\\index.ts:12:7", [".\\src\\index.ts:12:7"]],
+    ["..\\src\\index.ts:12", ["..\\src\\index.ts:12"]],
+    ["..\\..\\a\\b.ts:1:2", ["..\\..\\a\\b.ts:1:2"]],
+    ["src\\a.ts:12:", ["src\\a.ts:12"]],
+    ["(src\\a.ts:12)", ["src\\a.ts:12"]],
+    ["C:\\Users\\Jane\\p\\i.ts:12", ["C:\\Users\\Jane\\p\\i.ts:12"]],
+    ['"C:\\Users\\Jane Doe\\p\\i.ts:12"', ["C:\\Users\\Jane Doe\\p\\i.ts:12"]],
+    ["'.\\a b\\c.ts'", [".\\a b\\c.ts"]],
+    ["`C:\\My Dir\\c.ts`", ["C:\\My Dir\\c.ts"]],
+    ['cat "~/my dir/c.ts" now', ["~/my dir/c.ts"]],
+    ['"src\\my dir\\a.ts:12"', ["src\\my dir\\a.ts:12"]],
+    ['cat "src/my dir/a.ts" now', ["src/my dir/a.ts"]],
+    ["'my-pkg\\a b\\c.tsx:3:4'", ["my-pkg\\a b\\c.tsx:3:4"]],
+    ['"C:\\My Dir\\report!"', ["C:\\My Dir\\report!"]],
+    ['"C:\\My Dir\\notes."', ["C:\\My Dir\\notes."]],
+    ['"./my dir/a(b)"', ["./my dir/a(b)"]],
+    ['"My Project\\src\\index.ts:12"', ["My Project\\src\\index.ts:12"]],
+    ['"my dir/a.ts"', ["my dir/a.ts"]],
+    ['"My Project\\.editorconfig":12', ['My Project\\.editorconfig":12']],
+    ['"My Project\\src\\.gitattributes"', ["My Project\\src\\.gitattributes"]],
+    ['"C:\\Users\\Jane Doe\\p\\i.ts":12:7', ['C:\\Users\\Jane Doe\\p\\i.ts":12:7']],
+    ["'./a b.ts':3", ["./a b.ts':3"]],
+    ['"and/or maybe" ok', ["and/or"]],
+    ['"a b c" and "d e f"', []],
+    ["src/index.ts:12", ["src/index.ts:12"]],
+    // Prompts, ratios, versions and prose in quotes must not become links.
+    ["PS C:\\>", []],
+    ['saw "1/2 of the v1.5" here', ["1/2"]],
+    ["see v1.2.3 and 1.5", []],
+    ["see https://example.com/a and src\\a.ts:3", ["https://example.com/a", "src\\a.ts:3"]],
+    ["\\\\server\\share\\a.ts", ["\\\\server\\share\\a.ts"]],
+  ])("extracts links from %j", (line, texts) => {
+    expect(extractTerminalLinks(line).map((match) => match.text)).toEqual(texts);
+  });
+
+  it.each([
+    [" ".repeat(10_000)],
+    ["\\".repeat(10_000)],
+    ['"\\ '.repeat(3_000)],
+    ["\"a/ 'a/ `a\\ ".repeat(1_000)],
+    [`"C:\\${" ".repeat(10_000)}`],
+    [`"a/${"b ".repeat(5_000)}`],
+    ['"a a '.repeat(3_000)],
+    [`"${"a ".repeat(5_000)}`],
+    [`"${"a ".repeat(5_000)}/`],
+  ])("scans a long pathological line in linear time", (line) => {
+    const startedAt = performance.now();
+    extractTerminalLinks(line);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+  });
+
+  it("targets the quoted path without its closing quote when :line follows the quote", () => {
+    const [match] = extractTerminalLinks('"C:\\Users\\Jane Doe\\p\\i.ts":12:7');
+    expect(match?.target).toBe("C:\\Users\\Jane Doe\\p\\i.ts:12:7");
+    expect(resolvePathLinkTarget(match?.target ?? "", "C:\\repo")).toBe(
+      "C:\\Users\\Jane Doe\\p\\i.ts:12:7",
+    );
+    const [single] = extractTerminalLinks("'./a b.ts':3");
+    expect(single?.target).toBe("./a b.ts:3");
+    expect(extractTerminalLinks('"C:\\a b\\c.ts:3"')[0]?.target).toBeUndefined();
+  });
+
+  it("reports ranges that exclude the surrounding quotes", () => {
+    expect(extractTerminalLinks('x "C:\\a b\\c.ts" y')).toEqual([
+      { kind: "path", text: "C:\\a b\\c.ts", start: 3, end: 14 },
+    ]);
+  });
+
   it("trims only unbalanced closing delimiters and keeps balanced ones", () => {
     expect(extractTerminalLinks("(https://example.test/a(b)) [./a[b].ts] {./a{b}.ts}")).toEqual([
       expect.objectContaining({ kind: "url", text: "https://example.test/a(b)" }),
@@ -236,6 +306,22 @@ describe("resolveWrappedTerminalLinkRange", () => {
     expect(wrappedTerminalLinkRangeIntersectsBufferLine(range, 4)).toBe(false);
   });
 
+  it("maps a quoted path with spaces that wraps across two rows", () => {
+    const first = 'open "C:\\Users\\Jane Do';
+    const second = 'e\\p\\i.ts:12" now';
+    const lines = [createBufferLine(first), createBufferLine(second, true)];
+    const wrappedLine = collectWrappedTerminalLinkLine(2, (index) => lines[index]);
+    if (!wrappedLine) throw new Error("Expected wrapped terminal line to be present.");
+
+    const [match] = extractTerminalLinks(wrappedLine.text);
+    expect(match?.text).toBe("C:\\Users\\Jane Doe\\p\\i.ts:12");
+    if (!match) throw new Error("Expected match.");
+    expect(resolveWrappedTerminalLinkRange(wrappedLine, match)).toEqual({
+      start: { x: 7, y: 1 },
+      end: { x: 11, y: 2 },
+    });
+  });
+
   it("clamps character positions beyond the final or an empty segment list", () => {
     expect(
       resolveWrappedTerminalLinkRange(
@@ -305,6 +391,32 @@ describe("resolvePathLinkTarget", () => {
   it("joins relative Windows paths and trims existing cwd separators", () => {
     expect(resolvePathLinkTarget("src/a.ts", "C:\\repo\\")).toBe("C:\\repo\\src\\a.ts");
     expect(resolvePathLinkTarget("/absolute/a.ts", "/repo///")).toBe("/absolute/a.ts");
+  });
+
+  it.each([
+    ["~/x.ts", "C:\\Users\\Jane\\proj", "C:\\Users\\Jane\\x.ts"],
+    ["~\\x.ts", "C:\\Users\\Jane\\proj", "C:\\Users\\Jane\\x.ts"],
+    ["~/x.ts", "c:\\users\\jane\\proj", "c:\\users\\jane\\x.ts"],
+    ["~\\x.ts", "c:\\users\\jane\\proj", "c:\\users\\jane\\x.ts"],
+    ["~/x.ts", "C:/Users/Jane/proj", "C:/Users/Jane/x.ts"],
+    ["~\\x.ts", "C:/Users/Jane/proj", "C:/Users/Jane/x.ts"],
+    ["~/x.ts:3", "c:/USERS/jane/proj", "c:/USERS/jane/x.ts:3"],
+    ["~\\x.ts", "c:/USERS/jane/proj", "c:/USERS/jane/x.ts"],
+    [".\\src\\a.ts:3", "C:\\repo", "C:\\repo\\.\\src\\a.ts:3"],
+    [".\\src\\a.ts:3", "C:\\repo\\", "C:\\repo\\.\\src\\a.ts:3"],
+    ["src\\a.ts", "C:\\repo", "C:\\repo\\src\\a.ts"],
+    ["src\\a.ts", "C:\\repo\\", "C:\\repo\\src\\a.ts"],
+    ["..\\lib\\a.ts:3", "C:\\repo", "C:\\repo\\..\\lib\\a.ts:3"],
+    ["~/x.ts", "/Users/alice/p", "/Users/alice/x.ts"],
+    ["~\\x.ts", "/Users/alice/p", "~\\x.ts"],
+    // A backslash in a POSIX filename is part of the name, not a separator.
+    ["~/src/a\\b.ts:3", "/home/alice/project", "/home/alice/src/a\\b.ts:3"],
+    ["~/src/a\\b.ts", "/Users/alice/p", "/Users/alice/src/a\\b.ts"],
+    ["~/src/a\\b.ts", "C:\\Users\\alice\\p", "C:\\Users\\alice\\src\\a\\b.ts"],
+    ["./src/a.ts", "/repo", "/repo/./src/a.ts"],
+    ["My Project\\src\\index.ts:12", "C:\\repo", "C:\\repo\\My Project\\src\\index.ts:12"],
+  ])("resolves %s against %s", (raw, cwd, expected) => {
+    expect(resolvePathLinkTarget(raw, cwd)).toBe(expected);
   });
 });
 
