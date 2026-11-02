@@ -5,10 +5,16 @@ import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime"
 import {
   FILL_PREVIEW_VIEWPORT,
   PREVIEW_AUTOMATION_OPERATIONS,
+  PreviewAutomationClickInput,
+  PreviewAutomationEvaluateInput,
+  PreviewAutomationNavigateInput,
+  PreviewAutomationOpenInput,
+  PreviewAutomationPressInput,
+  PreviewAutomationResizeInput,
+  PreviewAutomationScrollInput,
+  PreviewAutomationTypeInput,
+  PreviewAutomationWaitForInput,
   type EnvironmentId,
-  type PreviewAutomationNavigateInput,
-  type PreviewAutomationOpenInput,
-  type PreviewAutomationResizeInput,
   type PreviewAutomationResizeResult,
   type PreviewAutomationHost as PreviewAutomationHostState,
   type PreviewAutomationRequest,
@@ -54,6 +60,7 @@ import { enqueueOpenPrompt } from "~/browser/openPromptQueue";
 
 import { isBrowserMode, previewBridge } from "./previewBridge";
 import {
+  decodePreviewAutomationInput,
   PreviewAutomationNavigationTimeoutError,
   PreviewAutomationOperationError,
   PreviewAutomationOverlayTimeoutError,
@@ -111,7 +118,10 @@ const handleBrowserModeRequest = (
   request: PreviewAutomationRequest,
 ): PreviewAutomationStatus | { readonly status: "pending-user" } => {
   const url =
-    request.operation === "open" ? (request.input as PreviewAutomationOpenInput).url : undefined;
+    request.operation === "open"
+      ? decodePreviewAutomationInput(PreviewAutomationOpenInput, threadRef.environmentId, request)
+          .url
+      : undefined;
   if (url === undefined) return NO_AUTOMATION_STATUS;
   // Both throw: an address that is not http(s), or one this client can never reach.
   const canonicalUrl = resolveBrowserNavigationTarget(threadRef.environmentId, {
@@ -518,7 +528,11 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             return status;
           }
           case "open": {
-            const input = request.input as PreviewAutomationOpenInput;
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationOpenInput,
+              environmentId,
+              request,
+            );
             let activeTabId = resolvePreviewAutomationOpenTab(
               state,
               request.tabId,
@@ -591,8 +605,12 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             return status;
           }
           case "navigate": {
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationNavigateInput,
+              environmentId,
+              request,
+            );
             const ready = await requireReadyTab();
-            const input = request.input as PreviewAutomationNavigateInput;
             const resolution = resolveBrowserNavigationTarget(
               environmentId,
               input.target ?? {
@@ -620,8 +638,12 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             return await currentStatus(threadRef, ready.tabId);
           }
           case "resize": {
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationResizeInput,
+              environmentId,
+              request,
+            );
             const ready = await requireReadyTab();
-            const input = request.input as PreviewAutomationResizeInput;
             const setting = resolvePreviewViewport(input);
             const result = await resize({
               environmentId,
@@ -656,46 +678,58 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             return await ready.bridge.automation.snapshot(ready.tabId);
           }
           case "click": {
-            const ready = await requireReadyTab();
-            return await ready.bridge.automation.click(
-              ready.tabId,
-              request.input as Parameters<typeof ready.bridge.automation.click>[1],
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationClickInput,
+              environmentId,
+              request,
             );
+            const ready = await requireReadyTab();
+            return await ready.bridge.automation.click(ready.tabId, input);
           }
           case "type": {
-            const ready = await requireReadyTab();
-            return await ready.bridge.automation.type(
-              ready.tabId,
-              request.input as Parameters<typeof ready.bridge.automation.type>[1],
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationTypeInput,
+              environmentId,
+              request,
             );
+            const ready = await requireReadyTab();
+            return await ready.bridge.automation.type(ready.tabId, input);
           }
           case "press": {
-            const ready = await requireReadyTab();
-            return await ready.bridge.automation.press(
-              ready.tabId,
-              request.input as Parameters<typeof ready.bridge.automation.press>[1],
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationPressInput,
+              environmentId,
+              request,
             );
+            const ready = await requireReadyTab();
+            return await ready.bridge.automation.press(ready.tabId, input);
           }
           case "scroll": {
-            const ready = await requireReadyTab();
-            return await ready.bridge.automation.scroll(
-              ready.tabId,
-              request.input as Parameters<typeof ready.bridge.automation.scroll>[1],
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationScrollInput,
+              environmentId,
+              request,
             );
+            const ready = await requireReadyTab();
+            return await ready.bridge.automation.scroll(ready.tabId, input);
           }
           case "evaluate": {
-            const ready = await requireReadyTab();
-            return await ready.bridge.automation.evaluate(
-              ready.tabId,
-              request.input as Parameters<typeof ready.bridge.automation.evaluate>[1],
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationEvaluateInput,
+              environmentId,
+              request,
             );
+            const ready = await requireReadyTab();
+            return await ready.bridge.automation.evaluate(ready.tabId, input);
           }
           case "waitFor": {
-            const ready = await requireReadyTab();
-            return await ready.bridge.automation.waitFor(
-              ready.tabId,
-              request.input as Parameters<typeof ready.bridge.automation.waitFor>[1],
+            const input = decodePreviewAutomationInput(
+              PreviewAutomationWaitForInput,
+              environmentId,
+              request,
             );
+            const ready = await requireReadyTab();
+            return await ready.bridge.automation.waitFor(ready.tabId, input);
           }
           case "recordingStart": {
             const ready = await requireReadyTab();

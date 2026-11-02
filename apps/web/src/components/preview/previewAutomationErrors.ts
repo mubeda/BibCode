@@ -159,6 +159,54 @@ export class PreviewAutomationPageUnreachableError extends Schema.TaggedError<Pr
   }
 }
 
+/**
+ * The agent's arguments do not match the operation's contract (for example a
+ * click with no target). The reason names fields and rules, never values, and
+ * travels in the message so the agent can correct the call.
+ */
+export class PreviewAutomationInvalidInputError extends Schema.TaggedError<PreviewAutomationInvalidInputError>()(
+  "PreviewAutomationInvalidInputError",
+  {
+    requestId: TrimmedNonEmptyString,
+    operation: PreviewAutomationOperation,
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    tabId: Schema.NullOr(PreviewTabId),
+    reason: Schema.String,
+  },
+) {
+  get responseTag() {
+    return "PreviewAutomationInvalidInputError" as const;
+  }
+
+  override get message(): string {
+    return `Invalid arguments for preview ${this.operation}: ${this.reason}`;
+  }
+}
+
+/**
+ * Decodes an agent's arguments with the operation's contract instead of
+ * casting them; the decoded value drops unknown fields and trims locators.
+ */
+export function decodePreviewAutomationInput<S extends Schema.Decoder<unknown>>(
+  schema: S,
+  environmentId: EnvironmentId,
+  request: PreviewAutomationRequest,
+): S["Type"] {
+  try {
+    return Schema.decodeUnknownSync(schema)(request.input);
+  } catch (cause) {
+    throw new PreviewAutomationInvalidInputError({
+      requestId: request.requestId,
+      operation: request.operation,
+      environmentId,
+      threadId: request.threadId,
+      tabId: request.tabId ?? null,
+      reason: (cause instanceof Error ? cause.message : String(cause)).slice(0, 500),
+    });
+  }
+}
+
 const targetNotEditableDiagnostics = (
   cause: unknown,
 ): {
@@ -238,6 +286,7 @@ export const PreviewAutomationHostError = Schema.Union([
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetNotEditableHostError,
   PreviewAutomationPageUnreachableError,
+  PreviewAutomationInvalidInputError,
   PreviewAutomationOperationError,
 ]);
 export type PreviewAutomationHostError = typeof PreviewAutomationHostError.Type;

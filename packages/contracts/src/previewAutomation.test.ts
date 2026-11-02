@@ -1,5 +1,11 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+
 import { Exit, Option, Schema, SchemaIssue } from "effect";
 import { describe, expect, it } from "vite-plus/test";
+
+import { previewToolFixture } from "../scripts/previewToolSchemas.ts";
 
 import { EnvironmentId, ThreadId } from "./baseSchemas.ts";
 import {
@@ -899,5 +905,69 @@ describe("PreviewAutomationError", () => {
     expect(new PreviewAutomationResultTooLargeError(remote).message).toBe(
       "Preview automation type produced a result that is too large.",
     );
+  });
+});
+
+describe("preview MCP tool schemas", () => {
+  const fixture = previewToolFixture();
+  const toolName = (operation: string) =>
+    `preview_${operation.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`;
+
+  it("gives every automation operation its own tool schema", () => {
+    expect(Object.keys(fixture).toSorted()).toEqual(
+      PREVIEW_AUTOMATION_OPERATIONS.map(toolName).toSorted(),
+    );
+  });
+
+  it("is committed as the Rust server's fixture", () => {
+    const committed = NodeFS.readFileSync(
+      NodePath.resolve(import.meta.dirname, "../fixtures/mcp-tools/preview-tools.json"),
+      "utf8",
+    );
+    expect(JSON.parse(committed)).toEqual(fixture);
+  });
+
+  it("advertises no open object, safe-integer bound, null branch or regex pattern", () => {
+    const text = JSON.stringify(fixture);
+    expect(text).not.toContain('"additionalProperties"');
+    expect(text).not.toContain("9007199254740991");
+    expect(text).not.toContain('"null"');
+    expect(text).not.toContain('"pattern"');
+    expect(text).not.toContain('"anyOf"');
+  });
+
+  it("states what a refinement requires, which a JSON schema cannot", () => {
+    expect(fixture.preview_open!.description).toContain("tabId cannot be combined");
+    expect(JSON.stringify(fixture.preview_open!.inputSchema)).toContain(
+      "cannot be combined with tabId",
+    );
+    expect(fixture.preview_click!.description).toContain("exactly one");
+    expect(fixture.preview_navigate!.description).toContain("exactly one of url or target");
+  });
+
+  it("requires what the contract requires and no more", () => {
+    const required = Object.fromEntries(
+      Object.entries(fixture).map(([name, tool]) => [name, tool.inputSchema.required ?? []]),
+    );
+    expect(required).toMatchObject({
+      preview_status: [],
+      preview_open: [],
+      preview_resize: ["mode"],
+      preview_type: ["text"],
+      preview_press: ["key"],
+      preview_evaluate: ["expression"],
+    });
+    // The merged navigation target keeps one object with both variants' fields.
+    const target = (
+      fixture.preview_navigate!.inputSchema.properties as Record<string, Record<string, unknown>>
+    ).target!;
+    expect(target.required).toEqual(["kind"]);
+    expect(Object.keys(target.properties as object)).toEqual([
+      "kind",
+      "url",
+      "port",
+      "protocol",
+      "path",
+    ]);
   });
 });

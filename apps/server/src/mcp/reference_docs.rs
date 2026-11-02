@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, path::Path};
 
 use super::{
     control::{PrincipalKind, tool_specs},
-    tools::feed::ERRORS,
+    tools::{feed::ERRORS, previews::PREVIEW_SCHEMAS},
 };
 use crate::webhooks::events::{EVENT_TYPES, WEBHOOK_TEST};
 
@@ -56,6 +56,39 @@ fn every_client_tool_has_its_own_entry_in_the_mcp_reference() {
         stale.is_empty(),
         "docs/reference/mcp.md documents tools that are not registered: {stale:?}"
     );
+}
+
+/// The lines of the `` #### `name` `` entry in `text`, up to the next heading.
+fn tool_section<'a>(text: &'a str, name: &str) -> String {
+    let heading = format!("#### `{name}`");
+    text.lines()
+        .skip_while(|line| *line != heading)
+        .skip(1)
+        .take_while(|line| !line.starts_with("#### "))
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+#[test]
+fn every_preview_argument_is_in_its_mcp_reference_entry() {
+    let text = reference("mcp.md");
+    for (name, tool) in PREVIEW_SCHEMAS.iter() {
+        let section = tool_section(&text, name);
+        assert!(!section.is_empty(), "{name} has an entry");
+        let documented = backticked(&section);
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        let missing: Vec<&String> = properties
+            .keys()
+            .filter(|argument| !documented.contains(argument.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "document these arguments of {name} in docs/reference/mcp.md: {missing:?}"
+        );
+    }
 }
 
 #[test]

@@ -46,7 +46,9 @@ state kind.
   environment unchanged.
 - `vp run build:marketing`: build the Astro marketing site.
 - `vp run check:contracts`: typecheck the schema-only contracts package, verify
-  deterministic RPC fixture export, regenerate the fixtures, run the
+  deterministic RPC fixture export, regenerate the fixtures (including the
+  compact `preview_*` MCP tool schemas in `fixtures/mcp-tools/`, which the
+  server embeds), run the
   TypeScript/Rust RPC parity and Rust fixture round-trip checks, and finally
   fail if the regenerated fixtures differ from the committed tree
   (`git diff --exit-code --stat -- packages/contracts/fixtures`). A contract

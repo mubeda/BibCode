@@ -2620,6 +2620,22 @@ other client tool (see [Outside agents over MCP](#outside-agents-over-mcp)).
 environment, thread, and owner ids with the operation at `debug`, never the
 arguments.
 
+**Preview tool schemas.** Every `preview_*` tool, provider and client twin,
+advertises the compact input schema and description in
+`packages/contracts/fixtures/mcp-tools/preview-tools.json`. It is generated
+from the `PreviewAutomation*Input` schemas in
+`packages/contracts/src/previewAutomation.ts` by
+`packages/contracts/scripts/previewToolSchemas.ts` (`vp run check:contracts`
+regenerates it and fails on drift), and `mcp/tools/previews.rs` embeds it. The
+advertised schema drops what an agent cannot use: no `additionalProperties`, no
+safe-integer bounds, no `null` branch on optional fields, no regex patterns,
+and one object for a tagged union (`target`). Rules a JSON schema cannot state
+(exactly one click target, `tabId` with `reuseExistingTab: false`) are in the
+tool description. Decoding keeps the full contract: the web automation host
+decodes `request.input` with the operation's schema and answers a refusal with
+`PreviewAutomationInvalidInputError`, which names the fields and rules, never
+the values. A client twin adds a required `threadId` to the same schema.
+
 **Ownership and shutdown.** `ProductionRuntime` calls
 `DeviceManager::shutdown` after the preview gateway and before process
 ownership is frozen, so emulators and simulators stop gracefully rather than
