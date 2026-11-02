@@ -227,10 +227,19 @@ struct Visit {
     cut_off: bool,
 }
 
-/// Marks a folder and its ancestors in the current walk as cut off by the depth limit.
-fn mark_cut_off(scan: &mut SkillScan, chain: &[(Option<usize>, PathBuf)], mut node: Option<usize>) {
+/// Marks a folder and its ancestors in the current walk as cut off by the depth
+/// limit, stopping before `until` when given.
+fn mark_cut_off(
+    scan: &mut SkillScan,
+    chain: &[(Option<usize>, PathBuf)],
+    mut node: Option<usize>,
+    until: Option<&Path>,
+) {
     while let Some(index) = node {
         let (parent, canonical) = &chain[index];
+        if until == Some(canonical.as_path()) {
+            break;
+        }
         if let Some(visit) = scan.visited.get_mut(canonical) {
             visit.cut_off = true;
         }
@@ -247,20 +256,10 @@ async fn scan_skills(
     let first = capabilities.skills.len();
     // `chain[i]` is the i-th entered folder: its parent's index and canonical path.
     let mut chain: Vec<(Option<usize>, PathBuf)> = Vec::new();
-    let mut pending = vec![(root.to_path_buf(), 0, None)];
+    let mut pending: Vec<(PathBuf, usize, Option<usize>)> = vec![(root.to_path_buf(), 0, None)];
     while let Some((folder, depth, parent)) = pending.pop() {
         if scan.exhausted {
             break;
-        }
-        if depth > MAX_SKILL_DEPTH {
-            mark_cut_off(scan, &chain, parent);
-            if !std::mem::replace(&mut scan.depth_reported, true) {
-                capabilities.issues.push(format!(
-                    "Skill list is incomplete: skipped folders deeper than {MAX_SKILL_DEPTH} under {}",
-                    root.display()
-                ));
-            }
-            continue;
         }
         let canonical = match fs::canonicalize(&folder).await {
             Ok(path) => path,
@@ -280,8 +279,24 @@ async fn scan_skills(
         if let Some(visit) = scan.visited.get(&canonical)
             && !(visit.cut_off && depth < visit.depth)
         {
+            // shortcut: back-links into an in-progress folder conservatively allow re-entry, which can re-charge entries; track visit dependencies if budgets run out in practice
+            let in_progress = std::iter::successors(parent, |&index| chain[index].0)
+                .any(|index| chain[index].1 == canonical);
             if visit.cut_off {
-                mark_cut_off(scan, &chain, parent);
+                mark_cut_off(scan, &chain, parent, None);
+            } else if in_progress {
+                // The folder itself is unaffected by a link back to it; the branch below it is.
+                mark_cut_off(scan, &chain, parent, Some(&canonical));
+            }
+            continue;
+        }
+        if depth > MAX_SKILL_DEPTH {
+            mark_cut_off(scan, &chain, parent, None);
+            if !std::mem::replace(&mut scan.depth_reported, true) {
+                capabilities.issues.push(format!(
+                    "Skill list is incomplete: skipped folders deeper than {MAX_SKILL_DEPTH} under {}",
+                    root.display()
+                ));
             }
             continue;
         }
@@ -633,5 +648,71 @@ mod tests {
         scan_skills(later.path(), "user", &mut scan, &mut found).await;
         assert_eq!(names(&found), ["z-known", "later"]);
         assert!(found.issues.is_empty(), "{:?}", found.issues);
+    }
+
+    /// A symlink on unix, a junction on Windows (needs no privilege).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    fn nested(root: &Path, levels: usize) -> PathBuf {
+        (1..=levels).fold(root.to_path_buf(), |path, level| {
+            path.join(format!("d{level}"))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cycle_back_to_a_known_folder_is_not_a_depth_cut_off() {
+        let first = tempfile::tempdir().unwrap();
+        let inner = first.path().join("inner");
+        files(&inner.join("bulk"), 6_000);
+        // `inner` is at depth 1; the link back to it is at depth 11.
+        let deep = nested(&inner, 9);
+        std::fs::create_dir_all(&deep).unwrap();
+        link_dir(&inner, &deep.join("back"));
+        let second = tempfile::tempdir().unwrap();
+        link_dir(&inner, &second.path().join("skills"));
+        let later = tempfile::tempdir().unwrap();
+        skill(later.path(), "later");
+        let mut scan = SkillScan::default();
+        let mut found = CursorWorkspaceCapabilities::default();
+        scan_skills(first.path(), "project", &mut scan, &mut found).await;
+        let charged = scan.entries;
+        scan_skills(&second.path().join("skills"), "user", &mut scan, &mut found).await;
+        assert_eq!(scan.entries, charged, "scanned again");
+        scan_skills(later.path(), "user", &mut scan, &mut found).await;
+        assert_eq!(names(&found), ["later"]);
+        assert!(found.issues.is_empty(), "{:?}", found.issues);
+    }
+
+    #[tokio::test]
+    async fn a_back_link_into_a_folder_still_being_walked_does_not_hide_a_cut_off_branch() {
+        let first = tempfile::tempdir().unwrap();
+        // `folder` is at depth 8; `z/more/hidden` is cut off by the depth limit.
+        let folder = nested(first.path(), 8);
+        std::fs::create_dir_all(folder.join("a")).unwrap();
+        link_dir(&folder, &folder.join("a").join("back"));
+        skill(&folder, "z/more/hidden");
+        let mut scan = SkillScan::default();
+        let mut found = CursorWorkspaceCapabilities::default();
+        scan_skills(first.path(), "project", &mut scan, &mut found).await;
+        assert!(found.skills.is_empty());
+        // From `a` the skill is four levels down.
+        scan_skills(&folder.join("a"), "user", &mut scan, &mut found).await;
+        assert_eq!(names(&found), ["hidden"]);
     }
 }
