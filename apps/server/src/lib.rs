@@ -106,6 +106,10 @@ pub enum RunError {
     OpenBrowser(#[source] std::io::Error),
     #[error(transparent)]
     Recovery(#[from] persistence::RecoveryError),
+    #[error(
+        "BiBCode is using this data root. Quit the BiBCode app, stop `bibcode serve` and any WSL backend, and stop the background service (`bibcode service status` shows it), then retry."
+    )]
+    StoreRunning,
     #[error("failed to encode storage command output")]
     StorageOutput(#[source] serde_json::Error),
     #[error("could not issue a pairing credential: {0}")]
@@ -202,7 +206,30 @@ async fn run_server(config: ServerConfig) -> Result<(), RunError> {
 }
 
 async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
-    let (value, json_output) = match command {
+    let (value, json_output) =
+        storage_command_output(command)
+            .await
+            .map_err(|error| match error {
+                RunError::Recovery(persistence::RecoveryError::StoreRunning) => {
+                    RunError::StoreRunning
+                }
+                other => other,
+            })?;
+    if json_output {
+        println!("{value}");
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(RunError::StorageOutput)?
+        );
+    }
+    Ok(())
+}
+
+async fn storage_command_output(
+    command: StorageCommand,
+) -> Result<(serde_json::Value, bool), RunError> {
+    Ok(match command {
         StorageCommand::Inspect { root, json } => {
             let inspection = persistence::inspect_store(&root).await?;
             let backups = inspection
@@ -223,6 +250,7 @@ async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
             (
                 json!({
                     "classification": inspection.classification,
+                    "database": inspection.database,
                     "storageInstanceId": inspection.storage_instance_id,
                     "backups": backups,
                     "backupIssues": issues,
@@ -248,16 +276,77 @@ async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
                 .map_err(RunError::StorageOutput)?,
             json,
         ),
+        StorageCommand::Compact {
+            root,
+            dry_run,
+            json,
+        } => (
+            serde_json::to_value(run_storage_compact(&root, dry_run).await?)
+                .map_err(RunError::StorageOutput)?,
+            json,
+        ),
+    })
+}
+
+/// Runs `bibcode storage compact`. Stdout carries only the JSON report; progress and the
+/// summary go to stderr because a real run can take minutes.
+async fn run_storage_compact(
+    root: &ResolvedDataRoot,
+    dry_run: bool,
+) -> Result<persistence::CompactReport, RunError> {
+    use persistence::{CompactProgress, format_bytes};
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let options = persistence::CompactOptions {
+        dry_run,
+        cancellation: cancellation.clone(),
+        on_progress: Some(std::sync::Arc::new(|phase| match phase {
+            CompactProgress::BackingUp { bytes } => {
+                eprintln!("Backing up {} before compacting…", format_bytes(bytes));
+            }
+            CompactProgress::Compacting => eprintln!("Compacting…"),
+            CompactProgress::CheckingIntegrity => eprintln!("Checking integrity…"),
+        })),
     };
-    if json_output {
-        println!("{value}");
+    let compaction = persistence::compact_store(root, options);
+    tokio::pin!(compaction);
+    let report = tokio::select! {
+        result = &mut compaction => result,
+        signal = termination_signal() => {
+            if signal.is_ok() {
+                eprintln!("Cancelling…");
+                cancellation.cancel();
+            }
+            compaction.await
+        }
+    }?;
+    let backup = format_bytes(report.plan.backup_bytes);
+    if report.dry_run {
+        match report.plan.estimated_reclaim_bytes {
+            Some(reclaim) => eprintln!(
+                "Compaction would reclaim about {} and first take a {backup} backup.",
+                format_bytes(reclaim)
+            ),
+            None => eprintln!(
+                "The real run first writes back the changes left in state.sqlite-wal, then takes a backup of at most {backup}."
+            ),
+        }
+        eprintln!(
+            "A dry run does not check whether another program has the database open. The real run refuses at once if one does, before taking the backup."
+        );
     } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(RunError::StorageOutput)?
+        let before = report.before.file_bytes + report.before.wal_bytes;
+        let after = report
+            .after
+            .as_ref()
+            .map_or(0, |after| after.file_bytes + after.wal_bytes);
+        eprintln!(
+            "Done: {} → {}. The pre-compact backup ({backup}) is kept until newer backups replace it.",
+            format_bytes(before),
+            format_bytes(after)
         );
     }
-    Ok(())
+    Ok(report)
 }
 
 #[derive(Serialize)]

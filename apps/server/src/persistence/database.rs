@@ -14,7 +14,9 @@ use std::{
 use rusqlite::{
     Connection, ErrorCode, MAIN_DB, OpenFlags,
     backup::{Backup, StepResult},
+    config::DbConfig,
 };
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -25,6 +27,68 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WAL_AUTOCHECKPOINT_PAGES: u32 = 1_000;
 const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+const VACUUM_PROGRESS_OPS: i32 = 1_000;
+
+/// SQLite's `auto_vacuum` mode as `PRAGMA auto_vacuum` reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoVacuumMode {
+    None,
+    Full,
+    Incremental,
+}
+
+/// Header-level space numbers of one database. Reading them does not grow with its size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageStats {
+    pub page_size: u64,
+    pub page_count: u64,
+    pub freelist_count: u64,
+    pub auto_vacuum: AutoVacuumMode,
+}
+
+pub(crate) fn page_stats(connection: &Connection) -> rusqlite::Result<PageStats> {
+    let read = |pragma: &str| {
+        connection
+            .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+            .map(|value| u64::try_from(value).unwrap_or(0))
+    };
+    Ok(PageStats {
+        page_size: read("page_size")?,
+        page_count: read("page_count")?,
+        freelist_count: read("freelist_count")?,
+        auto_vacuum: match read("auto_vacuum")? {
+            1 => AutoVacuumMode::Full,
+            2 => AutoVacuumMode::Incremental,
+            _ => AutoVacuumMode::None,
+        },
+    })
+}
+
+/// Opens `path` as `immutable=1`, which takes no SQLite locks and never creates sidecars.
+/// Callers must know that no other process can change the file meanwhile.
+pub(crate) fn open_immutable(path: &Path) -> rusqlite::Result<Connection> {
+    let mut uri = url::Url::from_file_path(path)
+        .map_err(|()| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+    uri.query_pairs_mut().append_pair("immutable", "1");
+    Connection::open_with_flags(
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+pub(crate) fn read_page_stats_immutable(path: &Path) -> rusqlite::Result<PageStats> {
+    page_stats(&open_immutable(path)?)
+}
+
+/// How a compaction's `VACUUM` ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VacuumOutcome {
+    Completed,
+    Cancelled,
+}
 
 type DatabaseJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
@@ -402,7 +466,21 @@ impl Database {
     }
 
     pub(crate) async fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner_with_identity(Some(path.as_ref().to_path_buf()), None, true).await
+        Self::open_inner_with_identity(Some(path.as_ref().to_path_buf()), None, true, false).await
+    }
+
+    /// Opens one writable connection that holds `path` exclusively for offline maintenance.
+    ///
+    /// Nothing is written before the caller writes: `busy_timeout` is zero and
+    /// `locking_mode = EXCLUSIVE` is set before the first access, so SQLite keeps the WAL index
+    /// in heap memory (no `-shm`), and the `BEGIN EXCLUSIVE; COMMIT` probe fails at once with
+    /// `SQLITE_BUSY` while another connection has the database open. The journal mode is not
+    /// changed. When a `-wal` already existed, closing never checkpoints or deletes it until
+    /// the caller clears `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`; a `-wal` this open creates is
+    /// empty and SQLite's normal close deletes it.
+    pub(crate) async fn open_for_maintenance(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        Self::spawn_worker(move || open_maintenance_connection(&path)).await
     }
 
     pub async fn create_new(path: impl AsRef<Path>) -> Result<Self> {
@@ -436,6 +514,7 @@ impl Database {
             Some(staging_path.clone()),
             Some(reservation.identity),
             false,
+            true,
         )
         .await
         {
@@ -482,8 +561,13 @@ impl Database {
             return Err(PersistenceError::OwnershipChanged { path });
         }
 
-        match Self::open_inner_with_identity(Some(path.clone()), Some(reservation.identity), false)
-            .await
+        match Self::open_inner_with_identity(
+            Some(path.clone()),
+            Some(reservation.identity),
+            false,
+            false,
+        )
+        .await
         {
             Ok(database) => {
                 reservation.cleanup();
@@ -502,14 +586,25 @@ impl Database {
     }
 
     async fn open_inner(path: Option<PathBuf>) -> Result<Self> {
-        Self::open_inner_with_identity(path, None, false).await
+        Self::open_inner_with_identity(path, None, false, false).await
     }
 
     async fn open_inner_with_identity(
         path: Option<PathBuf>,
         expected_identity: Option<FileIdentity>,
         read_only: bool,
+        create_new: bool,
     ) -> Result<Self> {
+        Self::spawn_worker(move || {
+            open_connection(path.as_deref(), expected_identity, read_only, create_new)
+        })
+        .await
+    }
+
+    async fn spawn_worker<O>(open: O) -> Result<Self>
+    where
+        O: FnOnce() -> Result<Connection> + Send + 'static,
+    {
         let (sender, mut receiver) = mpsc::channel::<DatabaseMessage>(DATABASE_QUEUE_CAPACITY);
         let closing = Arc::new(AtomicBool::new(false));
         let queue_diagnostics = Arc::new(DatabaseQueueDiagnostics::new());
@@ -518,8 +613,7 @@ impl Database {
         thread::Builder::new()
             .name("bibcode-sqlite".to_owned())
             .spawn(move || {
-                let connection = open_connection(path.as_deref(), expected_identity, read_only);
-                match connection {
+                match open() {
                     Ok(mut connection) => {
                         if ready_sender.send(Ok(())).is_ok() {
                             while let Some(message) = receiver.blocking_recv() {
@@ -723,6 +817,73 @@ impl Database {
         .await
     }
 
+    /// Converts the store to WAL and runs `PRAGMA auto_vacuum = INCREMENTAL; VACUUM` in one
+    /// worker job. A cancelled token stops it before the statement starts or, through the
+    /// progress handler, while VACUUM copies rows; SQLite then rolls the VACUUM back.
+    /// `on_progress` runs on each progress callback before the token is read.
+    pub(crate) async fn vacuum_incremental<P>(
+        &self,
+        cancellation: CancellationToken,
+        mut on_progress: P,
+    ) -> Result<VacuumOutcome>
+    where
+        P: FnMut() + Send + 'static,
+    {
+        self.call(move |connection| {
+            // `sqlite3_interrupt` with no running statement is lost, so check first.
+            if cancellation.is_cancelled() {
+                return Ok(VacuumOutcome::Cancelled);
+            }
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            let handler_token = cancellation.clone();
+            connection.progress_handler(
+                VACUUM_PROGRESS_OPS,
+                Some(move || {
+                    on_progress();
+                    handler_token.is_cancelled()
+                }),
+            )?;
+            let result = connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;");
+            connection.progress_handler(0, None::<fn() -> bool>)?;
+            match result {
+                Ok(()) => Ok(VacuumOutcome::Completed),
+                Err(error)
+                    if error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
+                        && cancellation.is_cancelled() =>
+                {
+                    Ok(VacuumOutcome::Cancelled)
+                }
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await
+    }
+
+    /// `PRAGMA wal_checkpoint(TRUNCATE)`; returns whether every WAL frame was checkpointed.
+    pub(crate) async fn checkpoint_truncate(&self) -> Result<bool> {
+        self.call(|connection| {
+            let (busy, log_pages, checkpointed_pages): (i64, i64, i64) =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            Ok(busy == 0 && checkpointed_pages >= log_pages)
+        })
+        .await
+    }
+
+    pub(crate) async fn page_stats(&self) -> Result<PageStats> {
+        self.call(|connection| Ok(page_stats(connection)?)).await
+    }
+
+    /// Lets the close checkpoint and delete the WAL again, as a normal shutdown does.
+    pub(crate) async fn allow_checkpoint_on_close(&self) -> Result<()> {
+        self.call(|connection| {
+            connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn quick_check(&self) -> Result<()> {
         self.call(|connection| {
             let result =
@@ -749,10 +910,70 @@ fn ensure_backup_active(cancellation: &CancellationToken, deadline: Instant) -> 
     }
 }
 
+fn open_maintenance_connection(path: &Path) -> Result<Connection> {
+    // The caller holds the exclusive runtime lock, so no BiBCode process can change this.
+    let wal_existed = std::fs::symlink_metadata(sqlite_sidecar_path(path, "-wal")).is_ok();
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| PersistenceError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if wal_existed {
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .map_err(PersistenceError::Configure)?;
+    }
+    connection
+        .busy_timeout(Duration::ZERO)
+        .map_err(PersistenceError::Configure)?;
+    connection
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .map_err(PersistenceError::Configure)?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(PersistenceError::Configure)?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(PersistenceError::Configure)?;
+    connection
+        .pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)
+        .map_err(PersistenceError::Configure)?;
+    connection
+        .pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT_BYTES)
+        .map_err(PersistenceError::Configure)?;
+    // In exclusive locking mode the lock outlives the commit until the connection closes.
+    connection.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+    Ok(connection)
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+impl PersistenceError {
+    /// Whether SQLite refused because another connection holds a lock.
+    pub(crate) fn is_busy(&self) -> bool {
+        let source = match self {
+            Self::Open { source, .. } | Self::Configure(source) | Self::Sql(source) => source,
+            _ => return false,
+        };
+        matches!(
+            source.sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    }
+}
+
 fn open_connection(
     path: Option<&Path>,
     expected_identity: Option<FileIdentity>,
     read_only: bool,
+    create_new: bool,
 ) -> Result<Connection> {
     if let (Some(path), Some(expected_identity)) = (path, expected_identity) {
         ensure_path_identity(path, expected_identity)?;
@@ -785,6 +1006,12 @@ fn open_connection(
         .map_err(PersistenceError::Configure)?;
     if read_only {
         return Ok(connection);
+    }
+    if create_new {
+        // Takes effect only before the first table exists and before WAL is enabled.
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .map_err(PersistenceError::Configure)?;
     }
     connection
         .pragma_update(None, "foreign_keys", true)
@@ -1168,6 +1395,46 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(synchronous, 2, "SQLite durability must remain FULL");
+    }
+
+    #[tokio::test]
+    async fn open_for_maintenance_fails_at_once_on_a_locked_database() {
+        for wal in [true, false] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("state.sqlite");
+            let setup = Connection::open(&path).expect("fixture database");
+            if wal {
+                setup
+                    .pragma_update(None, "journal_mode", "WAL")
+                    .expect("WAL mode");
+            }
+            setup
+                .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+                .expect("fixture rows");
+            drop(setup);
+            let other = Connection::open(&path).expect("other connection");
+            other
+                .execute_batch("BEGIN EXCLUSIVE;")
+                .expect("hold an exclusive lock");
+
+            let started = Instant::now();
+            let error = Database::open_for_maintenance(&path)
+                .await
+                .expect_err("a locked database refuses the maintenance open");
+
+            assert!(error.is_busy(), "WAL {wal}: {error:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "WAL {wal}: refused after {:?}",
+                started.elapsed()
+            );
+            other.execute_batch("ROLLBACK").expect("release the lock");
+            drop(other);
+            let database = Database::open_for_maintenance(&path)
+                .await
+                .expect("an unlocked database opens");
+            database.close().await;
+        }
     }
 
     #[tokio::test]
