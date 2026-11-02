@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "type": "providerStatuses",
+  "payload": {
+    "providers": [],
+    "tools": [
+      {
+        "toolId": "codegraph",
+        "displayName": "CodeGraph",
+        "installed": true,
+        "version": "1.6.2",
+        "checkedAt": "2026-11-02T00:00:00.000Z",
+        "versionAdvisory": {
+          "status": "behind_latest",
+          "currentVersion": "1.6.2",
+          "latestVersion": "1.6.3",
+          "updateCommand": "codegraph upgrade",
+          "canUpdate": true,
+          "checkedAt": "2026-11-02T00:00:00.000Z",
+          "message": null
+        }
+      }
+    ]
+  }
+}

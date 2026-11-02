@@ -17,6 +17,7 @@ import { CommandPalette } from "../components/CommandPalette";
 import { AppStatusBar, SlowRequestsStatusBar } from "../components/status-bar/AppStatusBar";
 import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
+import { ExternalUpdateNotice } from "../components/ExternalUpdateNotice";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
 import { Button } from "../components/ui/button";
 import {
@@ -234,6 +235,7 @@ function RootRouteView() {
         {/* Reads the primary's Connect link state, so only once the primary authenticated. */}
         {primaryEnvironmentAuthenticated ? <ManagedEndpointRelink /> : null}
         {primaryEnvironmentAuthenticated ? <ProviderUpdateLaunchNotification /> : null}
+        {primaryEnvironmentAuthenticated ? <ExternalUpdateNotice /> : null}
         {appShell}
       </AnchoredToastProvider>
     </ToastProvider>

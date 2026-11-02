@@ -498,6 +498,10 @@
       "mode": "unary"
     },
     {
+      "name": "server.updateTool",
+      "mode": "unary"
+    },
+    {
       "name": "server.upsertKeybinding",
       "mode": "unary"
     },
@@ -1112,6 +1116,8 @@
     "typed-failures/server__updateSettings-00.json",
     "typed-failures/server__updateSettings-01.json",
     "typed-failures/server__updateSettings-02.json",
+    "typed-failures/server__updateTool-00.json",
+    "typed-failures/server__updateTool-01.json",
     "typed-failures/server__upsertKeybinding-00.json",
     "typed-failures/server__upsertKeybinding-01.json",
     "typed-failures/shell__openInEditor-00.json",
@@ -1551,6 +1557,8 @@
     "typed-failures/server__updateSettings-00.json": "b141caed2961004d11a558adc37cfee4944f1ee49667137d1a553b3d1ad9d623",
     "typed-failures/server__updateSettings-01.json": "04c45b7df7dea65ad83335f3da86a2e397a561e28b5273c5cd1b7504d2392e51",
     "typed-failures/server__updateSettings-02.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
+    "typed-failures/server__updateTool-00.json": "98af2145baf30df959a92889fb4d86aa570713200d77066707505ebe83c0f42c",
+    "typed-failures/server__updateTool-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/server__upsertKeybinding-00.json": "c298bc2037cf8f13bb324ee4577dde33c4aac1d29bcc147d06286b00b5c83ea8",
     "typed-failures/server__upsertKeybinding-01.json": "7f6bbb7ff086ccc73c564912cb634891ff80995e071b203c997fba0c153f3578",
     "typed-failures/shell__openInEditor-00.json": "3812c794428ef9d9dfb0eea92068097aa767ba31a44ff60a9759eec8c7133023",
@@ -1588,9 +1596,9 @@
     "stream-shapes/subscribePreviewEvents-04.json": "0e8bac1a898590398b306a6611fd4676d2c1d122d5029999c62a462fdf938ea5",
     "stream-shapes/subscribePreviewEvents-05.json": "e90b7e4ce2b85d04010ece2f05878ca18fcfc97a7e00e6675717aea37f63da1c",
     "stream-shapes/subscribeProjectEntries-00.json": "fb0eccee51b5c2656e762ae9e52783c5c9a78ef4b3f7c46a9a1dcdfa609c8670",
-    "stream-shapes/subscribeServerConfig-00.json": "0164437badcfda90e6cc0dbff7afe643a5f817e3c7407d770cbe7a48cd9557d6",
+    "stream-shapes/subscribeServerConfig-00.json": "bb4bf9094b858420586124f054bbfd7c5904e9c01e764b8c1c75b6aa60e71ad8",
     "stream-shapes/subscribeServerConfig-01.json": "cf4979d2d52440102cf23f92653caeb3570e2df19a7b5a68bcb6602e06a33120",
-    "stream-shapes/subscribeServerConfig-02.json": "2005009f8a5fa67a57b693b663b2d4b015c59bfd2b098035ee8a0f54d7e69464",
+    "stream-shapes/subscribeServerConfig-02.json": "74829cdb5c69fe2af382e44bf68e40cf90e8f3b782139eef4c38036461e2abfb",
     "stream-shapes/subscribeServerConfig-03.json": "dad237962e9f609b7d9320e96a244dc4ad55b6677aba454fd989e753b1da3770",
     "stream-shapes/subscribeServerLifecycle-00.json": "69df2248ee07bd0105a6ec0978539f887ce139b75ad57fe65212450cfd1e0072",
     "stream-shapes/subscribeServerLifecycle-01.json": "d9c64e346ba79dfc2f5bd319eadbad4c191700826b5db2d2d5768405131c152f",
@@ -2143,6 +2151,8 @@
     "typed-failures/server__updateSettings-00.json",
     "typed-failures/server__updateSettings-01.json",
     "typed-failures/server__updateSettings-02.json",
+    "typed-failures/server__updateTool-00.json",
+    "typed-failures/server__updateTool-01.json",
     "typed-failures/server__upsertKeybinding-00.json",
     "typed-failures/server__upsertKeybinding-01.json",
     "typed-failures/shell__openInEditor-00.json",

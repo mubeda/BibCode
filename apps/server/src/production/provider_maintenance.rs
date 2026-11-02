@@ -1473,9 +1473,18 @@ pub(crate) fn provider_version_regressed(
 fn provider_version_scheme(driver: &str) -> Option<latest::VersionScheme> {
     match driver {
         "cursor" => Some(latest::VersionScheme::CursorRelease),
-        "claudeAgent" | "codex" | "opencode" => Some(latest::VersionScheme::Semver),
+        "claudeAgent" | "codex" | "codegraph" | "opencode" => Some(latest::VersionScheme::Semver),
         _ => None,
     }
+}
+
+/// What a probe observed about an installation, as an advisory needs it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProbeFields<'a> {
+    pub(crate) enabled: bool,
+    pub(crate) installed: bool,
+    pub(crate) version: Option<&'a str>,
+    pub(crate) checked_at: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2007,22 +2016,40 @@ impl ProviderMaintenance {
         snapshot: &mut Value,
         checks_enabled: bool,
     ) {
-        let current = snapshot
-            .get("version")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty());
+        let advisory = self
+            .enrich_advisory(
+                target,
+                ProbeFields {
+                    enabled: snapshot.get("enabled").and_then(Value::as_bool) == Some(true),
+                    installed: snapshot.get("installed").and_then(Value::as_bool) == Some(true),
+                    version: snapshot
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty()),
+                    checked_at: snapshot.get("checkedAt").and_then(Value::as_str),
+                },
+                checks_enabled,
+            )
+            .await;
+        snapshot["versionAdvisory"] = advisory;
+    }
+
+    /// The version advisory for a target from the fields a probe produced. Providers read the
+    /// fields from their snapshot JSON; a tool, which has no `enabled` flag, passes `true`.
+    pub(crate) async fn enrich_advisory(
+        &self,
+        target: &ProviderMaintenanceTarget,
+        fields: ProbeFields<'_>,
+        checks_enabled: bool,
+    ) -> Value {
+        let current = fields.version;
         let capabilities = self
             .capabilities(target)
             .await
             .for_installed_version(&target.driver, current);
-        let should_check = checks_enabled
-            && snapshot.get("enabled").and_then(Value::as_bool) == Some(true)
-            && snapshot.get("installed").and_then(Value::as_bool) == Some(true)
-            && current.is_some();
-        let probe_checked_at = snapshot
-            .get("checkedAt")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let should_check =
+            checks_enabled && fields.enabled && fields.installed && current.is_some();
+        let probe_checked_at = fields.checked_at.map(str::to_owned);
         let latest_check = match (should_check, capabilities.latest) {
             (true, Some(source)) => Some(self.latest_version(source, probe_checked_at).await),
             _ => None,
@@ -2045,7 +2072,7 @@ impl ProviderMaintenance {
             _ if check_failed => Some(UPDATE_CHECK_FAILED_MESSAGE),
             _ => None,
         };
-        snapshot["versionAdvisory"] = json!({
+        json!({
             "status": status,
             "currentVersion": current,
             "latestVersion": latest,
@@ -2053,7 +2080,7 @@ impl ProviderMaintenance {
             "canUpdate": capabilities.update.is_some(),
             "checkedAt": checked_at,
             "message": message,
-        });
+        })
     }
 
     async fn latest_version(

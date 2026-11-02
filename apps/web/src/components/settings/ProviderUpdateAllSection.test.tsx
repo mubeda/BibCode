@@ -206,6 +206,37 @@ afterEach(async () => {
 });
 
 describe("ProviderUpdateAllSection", () => {
+  it("warns in the confirmation only when CodeGraph is among the updates", async () => {
+    state.environments = [
+      {
+        environmentId: local,
+        label: "macOS",
+        connected: true,
+        providers: [
+          provider(codex, "codex"),
+          provider(ProviderDriverKind.make("codegraph"), "codegraph"),
+        ],
+      },
+    ];
+    const withTool = await mount();
+    await click(button(withTool, "Update all…"));
+    expect(withTool.textContent).toContain(
+      "Close agent sessions that use CodeGraph before updating",
+    );
+
+    state.environments = [
+      {
+        environmentId: local,
+        label: "macOS",
+        connected: true,
+        providers: [provider(codex, "codex")],
+      },
+    ];
+    const withoutTool = await mount();
+    await click(button(withoutTool, "Update all…"));
+    expect(withoutTool.textContent).not.toContain("Close agent sessions");
+  });
+
   it("renders nothing when no environment has an outdated provider", async () => {
     state.environments = [
       {

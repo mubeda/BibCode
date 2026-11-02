@@ -72,18 +72,19 @@ export function useDismissedProviderUpdateNotificationKeys() {
 
   const dismissedKeySet = useMemo(() => new Set(dismissedKeys), [dismissedKeys]);
 
+  // Merged into what is stored now, not into the list this render captured, so two dismissals
+  // issued together (two environments announcing in one effect) both survive.
   const dismissNotificationKey = useCallback(
     (key: string) => {
       const trimmedKey = key.trim();
-      if (trimmedKey.length === 0 || dismissedKeySet.has(trimmedKey)) {
+      if (trimmedKey.length === 0) {
         return;
       }
-
-      setDismissals({
-        keys: [...dismissedKeys, trimmedKey],
-      });
+      setDismissals((current) =>
+        current.keys.includes(trimmedKey) ? current : { keys: [...current.keys, trimmedKey] },
+      );
     },
-    [dismissedKeySet, dismissedKeys, setDismissals],
+    [setDismissals],
   );
 
   return {

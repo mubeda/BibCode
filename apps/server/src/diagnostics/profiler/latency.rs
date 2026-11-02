@@ -158,6 +158,8 @@ pub fn is_long_running(method: &str) -> bool {
             | "updater.check"
             | "updater.install"
             | "server.updateProvider"
+            // A background update of a tool such as CodeGraph, which the call waits for.
+            | "server.updateTool"
             | "server.refreshProviders"
             | "server.refreshProviderUsage"
             // Served from a cache, but a cold one waits on the provider's probe (#107).
