@@ -417,21 +417,34 @@ it, and add the clone as a project. These tools are in the **Workspace** set.
 
 | Tool               | What it does                                                                                                    |
 | ------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `clone_repository` | Clones an `https://` URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)   |
+| `clone_repository` | Clones a URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)               |
 | `clone_status`     | How a clone this connection started is going: `running`, the finished folder and project, or why it failed      |
 | `cancel_clone`     | Stops a clone this connection started and removes its folder; a clone you started that the agent joined goes on |
 
-- **HTTPS from public hosts only.** The URL must start with `https://`, with no user name or
-  token in it. SSH, `host:path`, `git://`, `file://` and other transports are refused, and so
-  is any host that does not resolve to a public internet address. Clone those in BiBCode
-  yourself: your own clones are unchanged. The address BiBCode checked is the one Git
+- **HTTPS from public hosts.** The URL must start with `https://`, with no user name or
+  token in it. `host:path`, `git://`, `file://` and other transports are refused, and so is
+  any host that does not resolve to a public internet address. Clone those in BiBCode
+  yourself: your own clones are unchanged.
+- **SSH only for agents you let use terminals.** An `ssh://git@host/owner/repo` URL uses
+  the keys loaded in your SSH agent, so BiBCode accepts it only from an agent that could
+  already run `git clone` in a terminal: Terminals on, **Agents may** at Full access, and the
+  agent approved with terminals. Any other agent is told the `https://` URL to use instead.
+  The SSH clone connects to the address BiBCode checked, reads none of your `~/.ssh/config`,
+  offers only keys in your agent, and checks the host's key against your
+  `~/.ssh/known_hosts` without ever adding one. If the host is not there yet, the error
+  gives the `ssh` command that trusts it: run it yourself, compare the fingerprint with the
+  one the host publishes, then retry. Start `ssh-agent` (on Windows, the OpenSSH
+  Authentication Agent service) and `ssh-add` your key first; a server started over SSH or
+  in WSL sees an agent only when its own environment has one. A key added with
+  `ssh-add -c` makes your agent ask you to confirm, and the clone waits until you answer or
+  cancel it. The address BiBCode checked is the one Git
   connects to, and a repository that redirects elsewhere fails with a message naming the
   redirect; clone the address it moved to.
 - **Your Git settings do not apply.** An agent's clone ignores your global and system Git
   configuration (rewrites, credentials, proxies, hooks, filters and URL-specific settings)
   and the server's environment variables beyond the basics (`PATH`, temporary folders,
-  language and time zone), proxies and Git variables included, so it reaches only public
-  repositories directly, and copies no hooks into the clone. On a
+  language and time zone), proxies and Git variables included, so over HTTPS it reaches
+  only public repositories directly, and copies no hooks into the clone. On a
   network that allows the internet only through a proxy, clone in BiBCode yourself.
 - **No Git LFS downloads.** LFS files stay pointer files, because a repository's
   `.lfsconfig` could point the download at any host. Run `git lfs pull` in the clone
