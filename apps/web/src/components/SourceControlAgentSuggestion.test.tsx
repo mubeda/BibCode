@@ -314,7 +314,7 @@ describe("SourceControlAgentSuggestion", () => {
     await act(async () => useSourceControlPanelStore.getState().setCwdMessage(CWD_KEY, "Fix it!"));
     expect(container.textContent).not.toContain("Message from");
     // A successful commit clears the draft; the pending suggestion stays out of it.
-    await act(async () => useSourceControlPanelStore.getState().clearCwdDraft(CWD_KEY));
+    await act(async () => useSourceControlPanelStore.getState().clearCwdDraft(CWD_KEY, "Fix it!"));
     await emit(registry, [sent]);
     expect(textarea().value).toBe("");
   });

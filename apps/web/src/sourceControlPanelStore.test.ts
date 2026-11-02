@@ -49,15 +49,19 @@ describe("sourceControlPanelStore", () => {
       agentSuggestionOutcome(store().agentSuggestionByCwdKey[CWD], intentId);
     const persisted = new Map<string, string>();
     const saved = () => JSON.parse(persisted.get(STORAGE_NAME) ?? "{}").state;
+    const savedDraft = (cwdKey: string) => {
+      const entry = persisted.get(`${STORAGE_NAME}:draft:${cwdKey}`);
+      return entry === undefined ? undefined : JSON.parse(entry).state;
+    };
     /** What another tab saved after this one loaded. */
-    const otherTabSaved = (byCwdKey: Record<string, { message: string }>) =>
-      persisted.set(
-        STORAGE_NAME,
-        JSON.stringify({
-          state: { byThreadKey: {}, byCwdKey, agentSuggestionByCwdKey: {} },
-          version: 2,
-        }),
-      );
+    const otherTabSaved = (byCwdKey: Record<string, { message: string }>) => {
+      for (const [cwdKey, draft] of Object.entries(byCwdKey)) {
+        persisted.set(
+          `${STORAGE_NAME}:draft:${cwdKey}`,
+          JSON.stringify({ state: draft, version: 1 }),
+        );
+      }
+    };
 
     beforeEach(() => {
       persisted.clear();
@@ -105,7 +109,7 @@ describe("sourceControlPanelStore", () => {
         outcome: "filled",
       });
       // A commit clears the draft; the same suggestion, still pending, does not come back.
-      store().clearCwdDraft(CWD);
+      store().clearCwdDraft(CWD, "Fix the parser");
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Fix the parser");
       expect(store().byCwdKey[CWD]).toBeUndefined();
     });
@@ -153,14 +157,14 @@ describe("sourceControlPanelStore", () => {
       store().setCwdMessage(CWD, "Fix");
       otherTabSaved({ [CWD]: { message: "Fix parser" } });
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Agent message");
-      expect(saved().byCwdKey[CWD]).toEqual({ message: "Fix parser" });
+      expect(savedDraft(CWD)).toEqual({ message: "Fix parser" });
       expect(outcome("intent-1")).toBe("offered");
     });
 
     it("offers, and writes nothing, when only the saved draft has text", () => {
       otherTabSaved({ [CWD]: { message: "tab A words" } });
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Agent message");
-      expect(saved().byCwdKey[CWD]).toEqual({ message: "tab A words" });
+      expect(savedDraft(CWD)).toEqual({ message: "tab A words" });
       expect(store().byCwdKey[CWD]).toBeUndefined();
       expect(outcome("intent-1")).toBe("offered");
     });
@@ -169,8 +173,8 @@ describe("sourceControlPanelStore", () => {
       otherTabSaved({ [OTHER]: { message: "other folder words" } });
       store().receiveAgentCommitSuggestion(CWD, "intent-1", "Agent message");
       expect(store().byCwdKey[CWD]?.message).toBe("Agent message");
-      expect(saved().byCwdKey[OTHER]).toEqual({ message: "other folder words" });
-      expect(saved().byCwdKey[CWD]).toEqual({ message: "Agent message" });
+      expect(savedDraft(OTHER)).toEqual({ message: "other folder words" });
+      expect(savedDraft(CWD)).toEqual({ message: "Agent message" });
     });
 
     it("promotes a draft from before folder drafts before it applies a suggestion", () => {

@@ -17,6 +17,7 @@ import {
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
 import { Input } from "~/components/ui/input";
+import { SourceControlDraftConflict } from "~/components/SourceControlDraftConflict";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { Textarea } from "~/components/ui/textarea";
 import { useSourceControlDraft } from "~/sourceControlDraft";
@@ -152,6 +153,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
     const effectiveSummary = summary.trim() || placeholderSummary || "Empty commit";
     submittingRef.current = true;
     setIsSubmitting(true);
+    const submittedDraft = message;
     try {
       await onCommit({
         message: buildCommitMessage({
@@ -167,7 +169,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
         allowEmpty,
         amend: isAmending,
       });
-      clearDraft();
+      clearDraft(submittedDraft);
       setCoAuthors([]);
       setCoAuthorInput("");
       setIsAmending(false);
@@ -184,6 +186,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
     description,
     enabled,
     isAmending,
+    message,
     noVerify,
     onCommit,
     placeholderSummary,
@@ -262,6 +265,7 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
             onChange={handleDescriptionChange}
           />
         </label>
+        <SourceControlDraftConflict environmentId={scope.environmentId} cwd={scope.cwd} />
 
         <div className="space-y-1">
           <label className="block text-xs font-medium" htmlFor="git-manager-co-author">
