@@ -1171,6 +1171,7 @@ mod tests {
             .finish();
         let inspection = StoreInspection {
             classification: StoreInspectionStatus::Existing,
+            database: None,
             storage_instance_id: None,
             backups: Vec::new(),
             backup_issues: vec![persistence::BackupInventoryIssue {

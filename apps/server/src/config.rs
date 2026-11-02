@@ -520,6 +520,43 @@ mod tests {
     }
 
     #[test]
+    fn storage_compact_parses_dry_run_and_json() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let base_dir = temp.path().to_string_lossy().into_owned();
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec!["bibcode", "storage", "compact", "--base-dir", &base_dir];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+
+        let action = parse(&[])
+            .expect("parse storage compact")
+            .into_action()
+            .expect("compact action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Compact {
+                dry_run: false,
+                json: false,
+                ..
+            })
+        ));
+        let action = parse(&["--dry-run", "--json"])
+            .expect("parse storage compact --dry-run --json")
+            .into_action()
+            .expect("compact action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Compact {
+                dry_run: true,
+                json: true,
+                ..
+            })
+        ));
+        assert!(parse(&["--force"]).is_err(), "unknown flags are rejected");
+    }
+
+    #[test]
     fn cli_parses_open_url_without_data_root() {
         // Control: a relative explicit data root cannot be resolved.
         let unusable_root = "relative-root";
@@ -757,6 +794,16 @@ enum StorageSubcommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Back up, then compact an offline project-data store to reclaim free space.")]
+    Compact {
+        #[arg(
+            long,
+            help = "Report what compaction would reclaim and need, without changing anything."
+        )]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -935,6 +982,11 @@ pub enum StorageCommand {
         root: ResolvedDataRoot,
         json: bool,
     },
+    Compact {
+        root: ResolvedDataRoot,
+        dry_run: bool,
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -1082,6 +1134,11 @@ impl Cli {
                     StorageSubcommand::StartEmpty { json } => {
                         StorageCommand::StartEmpty { root, json }
                     }
+                    StorageSubcommand::Compact { dry_run, json } => StorageCommand::Compact {
+                        root,
+                        dry_run,
+                        json,
+                    },
                 }));
             }
             Some(CliCommand::Pairing(pairing)) => {

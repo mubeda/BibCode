@@ -18,6 +18,8 @@ use uuid::Uuid;
 use super::{
     Database, MIGRATIONS, PersistenceError, PreparedStore, StateKind, StatePaths,
     StorageInstanceId, StoreStartupError,
+    database::{AutoVacuumMode, read_page_stats_immutable},
+    store::{InspectionOutcome, InspectionOwnership},
 };
 use crate::{
     ServerConfig,
@@ -27,19 +29,23 @@ use crate::{
 const BACKUP_FILE_NAME: &str = "state.sqlite";
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const RETAINED_GENERATIONS: usize = 3;
-const BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const SQLITE_PROGRESS_OPS: i32 = 1_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_PUBLICATION_TIME_SKEW: Duration = Duration::from_secs(60);
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+// `created_at` is taken before the copy, so a creation budget at or above the publication skew
+// would publish generations that fail their own reload verification.
+const _: () = assert!(BACKUP_TIMEOUT.as_secs() < MAX_PUBLICATION_TIME_SKEW.as_secs());
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackupTrigger {
     PreMigration,
     PreUpdate,
+    PreCompact,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -201,9 +207,34 @@ pub enum StoreInspectionStatus {
     RecoveryIncomplete,
 }
 
+/// The `database` object of `bibcode storage inspect`. Sizes are always reported; page
+/// statistics only when a non-mutating header read is possible.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseSpace {
+    pub file_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub page_size: Option<u64>,
+    pub page_count: Option<u64>,
+    pub freelist_count: Option<u64>,
+    pub reclaimable_bytes: Option<u64>,
+    pub auto_vacuum: Option<AutoVacuumMode>,
+    pub database_stats_unavailable: Option<DatabaseStatsUnavailable>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseStatsUnavailable {
+    StoreRunning,
+    UncheckpointedWal,
+    Unreadable,
+}
+
 #[derive(Clone, Debug)]
 pub struct StoreInspection {
     pub classification: StoreInspectionStatus,
+    pub database: Option<DatabaseSpace>,
     pub storage_instance_id: Option<StorageInstanceId>,
     pub backups: Vec<VerifiedBackup>,
     pub backup_issues: Vec<BackupInventoryIssue>,
@@ -248,6 +279,88 @@ pub enum RecoveryError {
     Backup(#[from] BackupError),
     #[error("project-data recovery worker failed")]
     Worker(#[source] tokio::task::JoinError),
+    #[error("Another program has the database open. Close it, then retry.")]
+    DatabaseLocked,
+    #[error("{}", insufficient_space_message(volume, *available, *store_required, *temp_required))]
+    InsufficientSpace {
+        /// The volume that is short: `store` (the data root) or `temp` (SQLite's temporary
+        /// files).
+        volume: &'static str,
+        required: u64,
+        available: u64,
+        /// Bytes needed on the data-root volume (both needs when it is also the temp volume).
+        store_required: u64,
+        /// Bytes needed on a separate temporary-files volume; `None` when it is the same one.
+        temp_required: Option<u64>,
+    },
+    #[error("{detail}")]
+    NotCompactable { detail: String },
+    #[error("{}", cancelled_message(*backup_id))]
+    Cancelled { backup_id: Option<Uuid> },
+    #[error("{message}")]
+    CompactFailed {
+        phase: &'static str,
+        backup_id: Option<Uuid>,
+        message: String,
+    },
+}
+
+fn cancelled_message(backup_id: Option<Uuid>) -> String {
+    match backup_id {
+        Some(backup_id) => format!(
+            "Compaction was cancelled. The database was not changed. The pre-compact backup {backup_id} is kept."
+        ),
+        None => "Compaction was cancelled. The database was not changed.".to_owned(),
+    }
+}
+
+fn insufficient_space_message(
+    volume: &str,
+    available: u64,
+    store_required: u64,
+    temp_required: Option<u64>,
+) -> String {
+    let needs = match temp_required {
+        Some(temp) => format!(
+            "{} free on the data-root volume and {} on the temporary-files volume",
+            format_bytes(store_required),
+            format_bytes(temp)
+        ),
+        None => format!(
+            "{} free on the data-root volume",
+            format_bytes(store_required)
+        ),
+    };
+    let short = if volume == "temp" {
+        "temporary-files"
+    } else {
+        "data-root"
+    };
+    let hint = if cfg!(unix) {
+        "Free up space or set SQLITE_TMPDIR or TMPDIR to a larger volume, then retry."
+    } else {
+        "Free up space, then retry."
+    };
+    format!(
+        "Compaction needs {needs}; {} is free on the {short} volume. {hint}",
+        format_bytes(available)
+    )
+}
+
+/// Decimal units with one fraction digit, as people read disk sizes: `11.2 GB`.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = bytes as f64 / 1_000.0;
+    let mut unit = 0;
+    while value >= 1_000.0 && unit + 1 < UNITS.len() {
+        value /= 1_000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -348,12 +461,31 @@ impl Drop for StoreRuntimeGuard {
     }
 }
 
-struct OfflineRecoveryGuard {
+pub(super) struct OfflineRecoveryGuard {
     lock_file: File,
 }
 
 impl OfflineRecoveryGuard {
-    fn acquire(paths: &StatePaths) -> Result<Self, RecoveryError> {
+    /// Takes the runtime lock exclusively without creating its file. `Ok(None)` means the lock
+    /// file does not exist, so no BiBCode process has ever owned the root; `StoreRunning`
+    /// means a process holds it now.
+    pub(super) fn try_acquire_existing(paths: &StatePaths) -> Result<Option<Self>, RecoveryError> {
+        let path = paths.runtime_lock();
+        let lock_file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(BackupError::Io { path, source }.into()),
+        };
+        match lock_file.try_lock() {
+            Ok(()) => Ok(Some(Self { lock_file })),
+            Err(std::fs::TryLockError::WouldBlock) => Err(RecoveryError::StoreRunning),
+            Err(std::fs::TryLockError::Error(source)) => {
+                Err(BackupError::Io { path, source }.into())
+            }
+        }
+    }
+
+    pub(super) fn acquire(paths: &StatePaths) -> Result<Self, RecoveryError> {
         let path = paths.runtime_lock();
         let lock_file = open_private_lock_file(&path)?;
         match lock_file.try_lock() {
@@ -605,33 +737,46 @@ pub async fn inventory_verified_backups(
 }
 
 pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, RecoveryError> {
-    let current = resolve_data_root(DataRootRequest {
-        source: root.source,
-        requested: Some(root.requested.clone()),
-        home_dir: PathBuf::new(),
-    })
-    .map_err(|_| RecoveryError::RootChanged)?;
-    if current.effective != root.effective {
-        return Err(RecoveryError::RootChanged);
-    }
-    let mut config = ServerConfig::new(&current.effective);
-    config.base_dir.clone_from(&current.effective);
-    config.resolved_data_root = Some(current.clone());
-    let paths = StatePaths::from_config(&config);
+    inspect_store_inner(root, || {}).await
+}
+
+/// [`inspect_store`] with `before_inventory` called once the runtime lock has been released
+/// and the backup inventory is about to start.
+#[doc(hidden)]
+pub async fn inspect_store_for_integration_test<F>(
+    root: &ResolvedDataRoot,
+    before_inventory: F,
+) -> Result<StoreInspection, RecoveryError>
+where
+    F: FnOnce(),
+{
+    inspect_store_inner(root, before_inventory).await
+}
+
+/// The issue reported when inspection would have to create SQLite files to read the store.
+pub(super) const UNOPENED_SIDECARS_ISSUE: &str = "The database has SQLite sidecar files \
+    (state.sqlite-wal or -shm) that cannot be inspected without creating files. Start BiBCode \
+    once and quit it, or run `bibcode storage compact`, which recovers them under its own lock.";
+
+/// What the state directory shows before SQLite is opened.
+pub(super) struct StoreFiles {
+    /// `Existing` or `ExistingUnmarked` when the database exists and nothing else needs
+    /// attention; the SQLite classifier may still refine it.
+    pub(super) classification: StoreInspectionStatus,
+    pub(super) storage_instance_id: Option<StorageInstanceId>,
+    pub(super) issue: Option<String>,
+}
+
+pub(super) fn classify_store_files(paths: &StatePaths) -> Result<StoreFiles, BackupError> {
     if !path_entry_exists(&paths.base_dir)? {
-        return Ok(StoreInspection {
+        return Ok(StoreFiles {
             classification: StoreInspectionStatus::FirstRun,
             storage_instance_id: None,
-            backups: Vec::new(),
-            backup_issues: Vec::new(),
-            requested_root: current.requested,
-            effective_root: current.effective,
-            is_filesystem_alias: current.is_filesystem_alias,
             issue: None,
         });
     }
     let journal_exists = path_entry_exists(&paths.recovery_journal())?;
-    let staging = find_recovery_staging_entry(&paths)?;
+    let staging = find_recovery_staging_entry(paths)?;
     let database_exists = path_entry_exists(&paths.database)?;
     let marker_exists = path_entry_exists(&paths.environment_id)?;
     let marker = if marker_exists {
@@ -663,34 +808,126 @@ pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, R
                 StoreInspectionStatus::DatabaseMissing,
                 Some("The database is missing while its storage marker remains.".to_owned()),
             ),
-            (true, marker) => {
-                match super::store::validate_existing_store_for_inspection(&paths.database).await {
-                    Ok(()) if marker.is_some() => (StoreInspectionStatus::Existing, None),
-                    Ok(()) => (StoreInspectionStatus::ExistingUnmarked, None),
-                    Err(error) => {
-                        let status = match &error {
-                            StoreStartupError::CorruptDatabase { .. } => {
-                                StoreInspectionStatus::CorruptDatabase
-                            }
-                            StoreStartupError::UnrecognizedStore { .. } => {
-                                StoreInspectionStatus::UnrecognizedStore
-                            }
-                            _ => StoreInspectionStatus::UnsafeDatabaseState,
-                        };
-                        (status, Some(error.to_string()))
-                    }
+            (true, Some(_)) => (StoreInspectionStatus::Existing, None),
+            (true, None) => (StoreInspectionStatus::ExistingUnmarked, None),
+        }
+    };
+    Ok(StoreFiles {
+        classification,
+        storage_instance_id: marker,
+        issue,
+    })
+}
+
+/// Sizes of `state.sqlite`, `-wal` and `-shm`; `None` when the database does not exist. An
+/// absent sidecar is `0`.
+pub(super) fn database_file_sizes(database: &Path) -> Result<Option<(u64, u64, u64)>, BackupError> {
+    let size = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(BackupError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    };
+    let Some(file_bytes) = size(database)? else {
+        return Ok(None);
+    };
+    let wal_bytes = size(&sqlite_sidecar_path(database, "-wal"))?.unwrap_or(0);
+    let shm_bytes = size(&sqlite_sidecar_path(database, "-shm"))?.unwrap_or(0);
+    Ok(Some((file_bytes, wal_bytes, shm_bytes)))
+}
+
+/// Whether `-wal` and `-shm` exist beside `database`.
+pub(super) fn sqlite_sidecars_present(database: &Path) -> Result<(bool, bool), BackupError> {
+    Ok((
+        path_entry_exists(&sqlite_sidecar_path(database, "-wal"))?,
+        path_entry_exists(&sqlite_sidecar_path(database, "-shm"))?,
+    ))
+}
+
+async fn inspect_store_inner<F>(
+    root: &ResolvedDataRoot,
+    before_inventory: F,
+) -> Result<StoreInspection, RecoveryError>
+where
+    F: FnOnce(),
+{
+    let current = resolve_data_root(DataRootRequest {
+        source: root.source,
+        requested: Some(root.requested.clone()),
+        home_dir: PathBuf::new(),
+    })
+    .map_err(|_| RecoveryError::RootChanged)?;
+    if current.effective != root.effective {
+        return Err(RecoveryError::RootChanged);
+    }
+    let mut config = ServerConfig::new(&current.effective);
+    config.base_dir.clone_from(&current.effective);
+    config.resolved_data_root = Some(current.clone());
+    let paths = StatePaths::from_config(&config);
+    if !path_entry_exists(&paths.base_dir)? {
+        return Ok(StoreInspection {
+            classification: StoreInspectionStatus::FirstRun,
+            database: None,
+            storage_instance_id: None,
+            backups: Vec::new(),
+            backup_issues: Vec::new(),
+            requested_root: current.requested,
+            effective_root: current.effective,
+            is_filesystem_alias: current.is_filesystem_alias,
+            issue: None,
+        });
+    }
+    // Whether SQLite may be opened is decided from this lock, held through classification and
+    // the stats read, never from an earlier file check.
+    let (guard, ownership) = match OfflineRecoveryGuard::try_acquire_existing(&paths) {
+        Ok(Some(guard)) => (Some(guard), InspectionOwnership::Offline),
+        Ok(None) => (None, InspectionOwnership::NeverOwned),
+        Err(RecoveryError::StoreRunning) => (None, InspectionOwnership::Owned),
+        Err(error) => return Err(error),
+    };
+    let files = classify_store_files(&paths)?;
+    let (classification, issue) = match files.classification {
+        StoreInspectionStatus::Existing | StoreInspectionStatus::ExistingUnmarked => {
+            match super::store::validate_existing_store_for_inspection(&paths.database, ownership)
+                .await
+            {
+                Ok(InspectionOutcome::Classified) => (files.classification, None),
+                Ok(InspectionOutcome::SidecarsNotOpened) => (
+                    StoreInspectionStatus::UnsafeDatabaseState,
+                    Some(UNOPENED_SIDECARS_ISSUE.to_owned()),
+                ),
+                Err(error) => {
+                    let status = match &error {
+                        StoreStartupError::CorruptDatabase { .. } => {
+                            StoreInspectionStatus::CorruptDatabase
+                        }
+                        StoreStartupError::UnrecognizedStore { .. } => {
+                            StoreInspectionStatus::UnrecognizedStore
+                        }
+                        _ => StoreInspectionStatus::UnsafeDatabaseState,
+                    };
+                    (status, Some(error.to_string()))
                 }
             }
         }
+        other => (other, files.issue),
     };
-    let inventory = if let Some(storage_instance_id) = marker {
+    let database = inspect_database_space(&paths.database, ownership).await?;
+    // The inventory reads only `backups/`; its own budget must not stack on a starting
+    // server's lock wait.
+    drop(guard);
+    before_inventory();
+    let inventory = if let Some(storage_instance_id) = files.storage_instance_id {
         inventory_verified_backups(&paths, storage_instance_id).await?
     } else {
         inventory_all_verified_backups(&paths).await?
     };
     Ok(StoreInspection {
         classification,
-        storage_instance_id: marker,
+        database,
+        storage_instance_id: files.storage_instance_id,
         backups: inventory.verified,
         backup_issues: inventory.issues,
         requested_root: current.requested,
@@ -698,6 +935,55 @@ pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, R
         is_filesystem_alias: current.is_filesystem_alias,
         issue,
     })
+}
+
+/// Sizes always; page statistics through an `immutable=1` read only when no BiBCode process
+/// owns the root and no sidecar may hold newer pages.
+async fn inspect_database_space(
+    database: &Path,
+    ownership: InspectionOwnership,
+) -> Result<Option<DatabaseSpace>, BackupError> {
+    let database = database.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Some((file_bytes, wal_bytes, shm_bytes)) = database_file_sizes(&database)? else {
+            return Ok(None);
+        };
+        let (wal, shm) = sqlite_sidecars_present(&database)?;
+        let stats = if ownership == InspectionOwnership::Owned {
+            Err(DatabaseStatsUnavailable::StoreRunning)
+        } else if wal || shm {
+            Err(DatabaseStatsUnavailable::UncheckpointedWal)
+        } else {
+            read_page_stats_immutable(&database).map_err(|_| DatabaseStatsUnavailable::Unreadable)
+        };
+        let space = match stats {
+            Ok(stats) => DatabaseSpace {
+                file_bytes,
+                wal_bytes,
+                shm_bytes,
+                page_size: Some(stats.page_size),
+                page_count: Some(stats.page_count),
+                freelist_count: Some(stats.freelist_count),
+                reclaimable_bytes: Some(stats.freelist_count.saturating_mul(stats.page_size)),
+                auto_vacuum: Some(stats.auto_vacuum),
+                database_stats_unavailable: None,
+            },
+            Err(reason) => DatabaseSpace {
+                file_bytes,
+                wal_bytes,
+                shm_bytes,
+                page_size: None,
+                page_count: None,
+                freelist_count: None,
+                reclaimable_bytes: None,
+                auto_vacuum: None,
+                database_stats_unavailable: Some(reason),
+            },
+        };
+        Ok(Some(space))
+    })
+    .await
+    .map_err(BackupError::Worker)?
 }
 
 async fn inventory_all_verified_backups(
@@ -767,7 +1053,7 @@ async fn inventory_all_verified_backups(
     .map_err(BackupError::Worker)?
 }
 
-fn path_entry_exists(path: &Path) -> Result<bool, BackupError> {
+pub(super) fn path_entry_exists(path: &Path) -> Result<bool, BackupError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1193,20 +1479,27 @@ fn find_verified_backup_for_recovery(
                 });
             }
         };
-        let Ok(inventory) =
-            inventory_blocking(paths, storage_id, Some(cancellation), Some(deadline))
-        else {
-            selected_entry_failed_verification |= selected_entry_exists;
+        if !selected_entry_exists {
             continue;
-        };
-        if let Some(backup) = inventory
-            .verified
-            .into_iter()
-            .find(|backup| backup.manifest.backup_id == backup_id)
-        {
-            return Ok(Some(backup));
         }
-        selected_entry_failed_verification |= selected_entry_exists;
+        // Verify only the selected generation: unrelated backups must not spend restore's
+        // budget.
+        let verified = BackupStoreBoundary::open_existing(paths, storage_id).and_then(|boundary| {
+            let boundary = boundary
+                .ok_or_else(|| BackupError::Verification("backup store disappeared".to_owned()))?;
+            verify_generation(
+                &boundary,
+                &selected_path,
+                backup_id,
+                storage_id,
+                Some(cancellation),
+                Some(deadline),
+            )
+        });
+        match verified {
+            Ok(backup) => return Ok(Some(backup)),
+            Err(_) => selected_entry_failed_verification = true,
+        }
     }
     if selected_entry_failed_verification {
         return Err(BackupError::Verification(
@@ -1471,7 +1764,7 @@ impl BoundDirectory {
     }
 }
 
-fn state_kind_name(state_kind: StateKind) -> &'static str {
+pub(super) fn state_kind_name(state_kind: StateKind) -> &'static str {
     match state_kind {
         StateKind::Userdata => "userdata",
         StateKind::Dev => "dev",
@@ -1584,6 +1877,17 @@ fn inspect_child_directory(
         identity: snapshot.identity,
         volume: parent.volume,
     })
+}
+
+/// The volume identity of a directory, after resolving symlinks in its path.
+pub(super) fn directory_volume(path: &Path) -> Result<u64, BackupError> {
+    let canonical = fs::canonicalize(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(plain_path_snapshot(&canonical, PlainPathKind::Directory)?
+        .identity
+        .volume)
 }
 
 #[derive(Clone, Copy)]
@@ -2176,11 +2480,21 @@ fn apply_retention(
             "ignored untrusted backup inventory entry"
         );
     }
-    let removal_count = inventory
-        .verified
-        .len()
-        .saturating_sub(RETAINED_GENERATIONS);
-    for backup in inventory.verified.iter().take(removal_count) {
+    // A new pre-compact generation expires the older ones first, so repeated compaction
+    // displaces at most one other generation from the newest three.
+    let published_is_pre_compact = inventory.verified.iter().any(|backup| {
+        backup.manifest.backup_id == published_backup_id
+            && backup.manifest.trigger == BackupTrigger::PreCompact
+    });
+    let (mut removals, kept): (Vec<&VerifiedBackup>, Vec<&VerifiedBackup>) =
+        inventory.verified.iter().partition(|backup| {
+            published_is_pre_compact
+                && backup.manifest.trigger == BackupTrigger::PreCompact
+                && backup.manifest.backup_id != published_backup_id
+        });
+    let removal_count = kept.len().saturating_sub(RETAINED_GENERATIONS);
+    removals.extend(kept.into_iter().take(removal_count));
+    for backup in removals {
         ensure_active(cancellation, Some(deadline))?;
         if backup.manifest.backup_id == published_backup_id {
             continue;
@@ -2679,6 +2993,162 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version")
+    }
+
+    struct BackupFixture {
+        _root: TempDir,
+        paths: StatePaths,
+        database: Database,
+        prepared: PreparedStore,
+    }
+
+    async fn backup_fixture() -> BackupFixture {
+        let root = TempDir::new().expect("backup fixture root");
+        let mut config = ServerConfig::new(root.path());
+        let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+        config.base_dir.clone_from(&resolved.effective);
+        config.resolved_data_root = Some(resolved);
+        let paths = StatePaths::from_config(&config);
+        fs::create_dir_all(&paths.state_dir).expect("state directory");
+        let mut setup = Connection::open(&paths.database).expect("source database");
+        run_migrations(&mut setup, None).expect("source schema");
+        drop(setup);
+        let storage_instance_id = StorageInstanceId::from_uuid(Uuid::new_v4());
+        fs::write(&paths.environment_id, format!("{storage_instance_id}\n"))
+            .expect("source marker");
+        let database = Database::open_existing(&paths.database)
+            .await
+            .expect("source worker");
+        let prepared = PreparedStore {
+            database: database.clone(),
+            storage_instance_id,
+            classification: crate::persistence::StoreClassification::Existing,
+            paths: paths.clone(),
+        };
+        BackupFixture {
+            _root: root,
+            paths,
+            database,
+            prepared,
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_compact_retention_keeps_one_pre_compact_and_two_older_generations() {
+        let fixture = backup_fixture().await;
+        let mut published = Vec::new();
+        for trigger in [
+            BackupTrigger::PreUpdate,
+            BackupTrigger::PreMigration,
+            BackupTrigger::PreCompact,
+            BackupTrigger::PreCompact,
+        ] {
+            published.push(
+                create_verified_backup(&fixture.database, &fixture.prepared, trigger, "test")
+                    .await
+                    .expect("verified backup")
+                    .manifest
+                    .backup_id,
+            );
+        }
+
+        let inventory =
+            inventory_verified_backups(&fixture.paths, fixture.prepared.storage_instance_id)
+                .await
+                .expect("inventory");
+        let kept = inventory
+            .verified
+            .iter()
+            .map(|backup| (backup.manifest.backup_id, backup.manifest.trigger))
+            .collect::<Vec<_>>();
+        // The second compaction expired the first pre-compact generation, not a pre-update or
+        // pre-migration one.
+        assert_eq!(
+            kept,
+            vec![
+                (published[0], BackupTrigger::PreUpdate),
+                (published[1], BackupTrigger::PreMigration),
+                (published[3], BackupTrigger::PreCompact),
+            ]
+        );
+
+        // Other triggers keep the newest three, whatever their kind.
+        let next = create_verified_backup(
+            &fixture.database,
+            &fixture.prepared,
+            BackupTrigger::PreUpdate,
+            "test",
+        )
+        .await
+        .expect("verified backup")
+        .manifest
+        .backup_id;
+        let inventory =
+            inventory_verified_backups(&fixture.paths, fixture.prepared.storage_instance_id)
+                .await
+                .expect("inventory");
+        let kept = inventory
+            .verified
+            .iter()
+            .map(|backup| backup.manifest.backup_id)
+            .collect::<Vec<_>>();
+        assert_eq!(kept, vec![published[1], published[3], next]);
+        fixture.database.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_lookup_verifies_only_the_selected_generation() {
+        const LARGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        let fixture = backup_fixture().await;
+        // Two older generations become sparse 8 GiB files with matching manifests, so a lookup
+        // that verifies them cannot finish inside its deadline, whatever the directory order.
+        let mut large = Vec::new();
+        for _ in 0..2 {
+            large.push(
+                create_verified_backup(
+                    &fixture.database,
+                    &fixture.prepared,
+                    BackupTrigger::PreUpdate,
+                    "test",
+                )
+                .await
+                .expect("older backup"),
+            );
+        }
+        let selected = create_verified_backup(
+            &fixture.database,
+            &fixture.prepared,
+            BackupTrigger::PreCompact,
+            "test",
+        )
+        .await
+        .expect("selected backup");
+        fixture.database.close().await;
+        for backup in &large {
+            OpenOptions::new()
+                .write(true)
+                .open(&backup.database)
+                .expect("older backup database")
+                .set_len(LARGE_BYTES)
+                .expect("sparse 8 GiB backup");
+            let mut manifest = backup.manifest.clone();
+            manifest.database_size_bytes = LARGE_BYTES;
+            let mut contents = serde_json::to_vec_pretty(&manifest).expect("manifest JSON");
+            contents.push(b'\n');
+            fs::write(&backup.manifest_path, contents).expect("rewrite manifest size");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let found = find_verified_backup_for_recovery(
+            &fixture.paths,
+            selected.manifest.backup_id,
+            &CancellationToken::new(),
+            deadline,
+        )
+        .expect("lookup verifies only the selected generation")
+        .expect("selected backup found");
+        assert_eq!(found.manifest.backup_id, selected.manifest.backup_id);
     }
 
     #[test]

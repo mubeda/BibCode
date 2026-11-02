@@ -4,9 +4,12 @@ mod hermetic_providers;
 use bibcode_server::{
     ServerConfig, ServerRuntime,
     persistence::{
-        BackupTrigger, PreparedStore, RecoveryError, StatePaths, StoreClassification,
-        StoreInspectionStatus, StoreStartupError, create_verified_backup, inspect_store,
-        prepare_store, preserve_and_start_empty, restore_backup, run_migrations,
+        AutoVacuumMode, BackupTrigger, CompactOptions, CompactReport, CompactTestHook,
+        DatabaseStatsUnavailable, PreparedStore, RecoveryError, StatePaths, StorageInstanceId,
+        StoreClassification, StoreInspectionStatus, StoreStartupError,
+        compact_store_for_integration_test, create_verified_backup, inspect_store,
+        inspect_store_for_integration_test, inventory_verified_backups, prepare_store,
+        preserve_and_start_empty, restore_backup, run_migrations,
     },
     production::jwt::PersistentJwtCodec,
     resolve_data_root,
@@ -28,6 +31,7 @@ use std::os::unix::fs::symlink;
 
 const CRASH_STORE_CHILD_ROOT: &str = "BIBCODE_CRASH_STORE_CHILD_ROOT";
 const CRASH_STORE_CHILD_READY: &str = "BIBCODE_CRASH_STORE_CHILD_READY";
+const CRASH_STORE_CHILD_ROWS: &str = "BIBCODE_CRASH_STORE_CHILD_ROWS";
 
 struct StoreFixture {
     _root: TempDir,
@@ -600,7 +604,7 @@ async fn concurrent_adoption_of_a_recognized_store_converges_on_one_identity() {
 
 #[tokio::test]
 async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() {
-    let (_root, config, paths) = crashed_store_fixture();
+    let (_root, config, paths) = crashed_store_fixture(0);
     let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
     assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
     assert!(sqlite_sidecar(&paths.database, "-shm").is_file());
@@ -634,7 +638,7 @@ async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() 
 
 #[tokio::test]
 async fn crash_left_wal_without_shm_restarts_with_only_sqlite_coordination_recreated() {
-    let (_root, config, paths) = crashed_store_fixture();
+    let (_root, config, paths) = crashed_store_fixture(0);
     let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
     let shared_memory = sqlite_sidecar(&paths.database, "-shm");
     std::fs::remove_file(&shared_memory).expect("remove crash-left SHM fixture");
@@ -696,10 +700,14 @@ async fn crash_store_fixture_child() {
     config.resolved_data_root = Some(resolved);
     let paths = StatePaths::from_config(&config);
     std::fs::create_dir_all(&paths.state_dir).expect("child state directory");
+    let extra_rows = std::env::var(CRASH_STORE_CHILD_ROWS)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
     let prepared = prepare_store(&config).await.expect("child store starts");
     prepared
         .database
-        .call(|connection| {
+        .call(move |connection| {
             connection.pragma_update(None, "wal_autocheckpoint", 0)?;
             connection.execute(
                 "INSERT INTO projection_projects (
@@ -708,6 +716,17 @@ async fn crash_store_fixture_child() {
                  ) VALUES ('crash-project', 'Crash project', '/tmp/crash-project', NULL, '{}',
                            '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL)",
                 [],
+            )?;
+            // Pages that exist only in the WAL, beyond the physical end of the main file.
+            connection.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                 INSERT INTO projection_projects (
+                   project_id, title, workspace_root, default_model_selection_json,
+                   scripts_json, created_at, updated_at, deleted_at
+                 ) SELECT 'wal-only-' || i, hex(randomblob(500)), '/tmp/wal-only', NULL, '{}',
+                          '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL
+                   FROM n WHERE ?1 > 0",
+                [extra_rows],
             )?;
             Ok(())
         })
@@ -1146,7 +1165,7 @@ async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified
 
 #[tokio::test]
 async fn recovery_start_empty_preserves_crash_left_sqlite_files_before_new_identity_creation() {
-    let (_root, config, paths) = crashed_store_fixture();
+    let (_root, config, paths) = crashed_store_fixture(0);
     let old_marker = std::fs::read_to_string(&paths.environment_id)
         .expect("crash-left marker")
         .trim()
@@ -1331,6 +1350,19 @@ async fn recovery_refuses_to_mutate_a_store_owned_by_a_running_server() {
 #[tokio::test]
 async fn recovery_inspection_reports_verified_store_state_without_mutating_it() {
     let fixture = StoreFixture::with_project("Inspectable project").await;
+    let connection = Connection::open(&fixture.paths.database).expect("fixture database");
+    connection
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+             INSERT INTO projection_projects (
+               project_id, title, workspace_root, default_model_selection_json,
+               scripts_json, created_at, updated_at, deleted_at
+             ) SELECT 'deleted-' || i, hex(randomblob(400)), '/tmp/deleted', NULL, '{}',
+                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z', NULL FROM n;
+             DELETE FROM projection_projects WHERE project_id LIKE 'deleted-%';",
+        )
+        .expect("rows that leave free pages");
+    drop(connection);
     let storage_instance_id = Uuid::new_v4();
     fixture.write_marker(storage_instance_id);
     let prepared = fixture.prepare().await.expect("prepare inspection fixture");
@@ -1346,6 +1378,11 @@ async fn recovery_inspection_reports_verified_store_state_without_mutating_it() 
     let database_before = std::fs::read(&fixture.paths.database).expect("database bytes");
     let marker_before = std::fs::read(&fixture.paths.environment_id).expect("marker bytes");
     let entries_before = directory_entry_names(&fixture.paths.state_dir);
+    let listing_before = base_listing(&fixture.paths.base_dir);
+    assert!(!fixture.paths.runtime_lock().exists());
+    let (page_size, page_count, freelist_count, auto_vacuum) =
+        immutable_stats(&fixture.paths.database);
+    assert!(freelist_count > 0, "the fixture has free pages");
 
     let inspection = inspect_store(
         fixture
@@ -1358,6 +1395,17 @@ async fn recovery_inspection_reports_verified_store_state_without_mutating_it() 
     .expect("inspect store");
 
     assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    let database = inspection.database.as_ref().expect("database space");
+    assert_eq!(database.file_bytes, database_before.len() as u64);
+    assert_eq!(database.wal_bytes, 0);
+    assert_eq!(database.shm_bytes, 0);
+    assert_eq!(database.page_size, Some(page_size));
+    assert_eq!(database.page_count, Some(page_count));
+    assert_eq!(database.freelist_count, Some(freelist_count));
+    assert_eq!(database.reclaimable_bytes, Some(freelist_count * page_size));
+    assert_eq!(auto_vacuum, 0);
+    assert_eq!(database.auto_vacuum, Some(AutoVacuumMode::None));
+    assert_eq!(database.database_stats_unavailable, None);
     assert_eq!(
         inspection
             .storage_instance_id
@@ -1390,6 +1438,8 @@ async fn recovery_inspection_reports_verified_store_state_without_mutating_it() 
         directory_entry_names(&fixture.paths.state_dir),
         entries_before
     );
+    assert_eq!(base_listing(&fixture.paths.base_dir), listing_before);
+    assert!(!fixture.paths.runtime_lock().exists());
 }
 
 #[tokio::test]
@@ -1426,7 +1476,7 @@ fn marker_text(bytes: &[u8]) -> String {
         .to_owned()
 }
 
-fn crashed_store_fixture() -> (TempDir, ServerConfig, StatePaths) {
+fn crashed_store_fixture(extra_rows: u32) -> (TempDir, ServerConfig, StatePaths) {
     let root = TempDir::new().expect("temporary crash-store root");
     let ready = root.path().join("crash-store-ready");
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
@@ -1435,6 +1485,7 @@ fn crashed_store_fixture() -> (TempDir, ServerConfig, StatePaths) {
         .arg("--nocapture")
         .env(CRASH_STORE_CHILD_ROOT, root.path())
         .env(CRASH_STORE_CHILD_READY, &ready)
+        .env(CRASH_STORE_CHILD_ROWS, extra_rows.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1473,4 +1524,1072 @@ fn wait_for_path(path: &Path, child: &mut std::process::Child) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+// ---- Storage space reporting and compaction (issue 230) ----
+
+const TS: &str = "2026-11-01T00:00:00Z";
+
+fn root_of(config: &ServerConfig) -> &bibcode_server::ResolvedDataRoot {
+    config
+        .resolved_data_root
+        .as_ref()
+        .expect("resolved data root")
+}
+
+async fn compact(
+    config: &ServerConfig,
+    dry_run: bool,
+    hook: CompactTestHook,
+) -> Result<CompactReport, RecoveryError> {
+    compact_store_for_integration_test(
+        root_of(config),
+        CompactOptions {
+            dry_run,
+            ..CompactOptions::default()
+        },
+        hook,
+    )
+    .await
+}
+
+/// Enough free space for every fixture, on split volumes.
+const PLENTY: CompactTestHook = CompactTestHook::FreeSpace {
+    store: u64::MAX / 4,
+    temp: u64::MAX / 4,
+    same_volume: false,
+};
+
+/// A marked WAL-mode store with a project, a thread, messages, and deleted rows that left
+/// free pages; offline and without sidecars or lock files.
+fn offline_store_with_free_pages() -> StoreFixture {
+    let fixture = StoreFixture::new();
+    let mut connection = Connection::open(&fixture.paths.database).expect("fixture database");
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("fixture WAL mode");
+    run_migrations(&mut connection, None).expect("fixture migrations");
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO projection_projects (
+               project_id, title, workspace_root, default_model_selection_json,
+               scripts_json, created_at, updated_at, deleted_at
+             ) VALUES ('protected-project', 'Compacted project', '/tmp/protected-project',
+                       NULL, '{{}}', '{TS}', '{TS}', NULL);
+             INSERT INTO projection_threads (
+               thread_id, project_id, title, model_selection_json, runtime_mode,
+               interaction_mode, created_at, updated_at
+             ) VALUES ('thread-1', 'protected-project', 'Kept thread', '{{}}', 'full-access',
+                       'default', '{TS}', '{TS}');
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+             INSERT INTO projection_thread_messages (
+               message_id, thread_id, role, text, is_streaming, created_at, updated_at
+             ) SELECT 'message-' || i, 'thread-1', 'user', 'Message ' || i, 0, '{TS}', '{TS}'
+               FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+             INSERT INTO projection_projects (
+               project_id, title, workspace_root, default_model_selection_json,
+               scripts_json, created_at, updated_at, deleted_at
+             ) SELECT 'bulk-' || i, hex(randomblob(400)), '/tmp/bulk', NULL, '{{}}',
+                      '{TS}', '{TS}', NULL FROM n;
+             DELETE FROM projection_projects WHERE project_id LIKE 'bulk-%';"
+        ))
+        .expect("fixture rows");
+    connection.close().expect("close fixture database");
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-wal").exists());
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-shm").exists());
+    fixture.write_marker(Uuid::new_v4());
+    fixture
+}
+
+/// A store just restored from a verified backup: `journal_mode = DELETE`, no sidecars.
+async fn restored_store_fixture() -> StoreFixture {
+    let fixture = StoreFixture::with_project("Restored project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare restore fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("restore fixture backup");
+    close_prepared_store_for_offline_fixture(prepared).await;
+    restore_backup(root_of(&fixture.config), backup.manifest.backup_id)
+        .await
+        .expect("restore fixture");
+    assert_eq!(journal_header_versions(&fixture.paths.database), (1, 1));
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-wal").exists());
+    fixture
+}
+
+/// `state.sqlite`, `-wal`, `-shm` and `-journal` bytes; `None` for an absent file.
+fn sqlite_bytes(database: &Path) -> Vec<Option<Vec<u8>>> {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| std::fs::read(sqlite_sidecar(database, suffix)).ok())
+        .collect()
+}
+
+/// Header bytes 18 and 19: 1 for rollback-journal mode, 2 for WAL.
+fn journal_header_versions(database: &Path) -> (u8, u8) {
+    let header = std::fs::read(database).expect("database header");
+    (header[18], header[19])
+}
+
+/// Every entry under `base`, relative and sorted: the state directory, `backups/` and both
+/// lock files.
+fn base_listing(base: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, directory: &Path, entries: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("listing directory") {
+            let entry = entry.expect("listing entry");
+            let path = entry.path();
+            entries.push(
+                path.strip_prefix(root)
+                    .expect("relative entry")
+                    .to_path_buf(),
+            );
+            if entry.file_type().expect("entry type").is_dir() {
+                walk(root, &path, entries);
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    walk(base, base, &mut entries);
+    entries.sort();
+    entries
+}
+
+fn backup_entries(paths: &StatePaths) -> Vec<PathBuf> {
+    if paths.backups_dir.exists() {
+        base_listing(&paths.backups_dir)
+    } else {
+        Vec::new()
+    }
+}
+
+/// `(page_size, page_count, freelist_count, auto_vacuum)` through an `immutable=1` read.
+fn immutable_stats(database: &Path) -> (u64, u64, u64, i64) {
+    let mut uri = url::Url::from_file_path(database).expect("database URI");
+    uri.query_pairs_mut().append_pair("immutable", "1");
+    let connection = Connection::open_with_flags(
+        uri.as_str(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("immutable database");
+    let read = |pragma: &str| {
+        connection
+            .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+            .expect("pragma")
+    };
+    (
+        u64::try_from(read("page_size")).expect("page size"),
+        u64::try_from(read("page_count")).expect("page count"),
+        u64::try_from(read("freelist_count")).expect("freelist"),
+        read("auto_vacuum"),
+    )
+}
+
+type Rows = Vec<Vec<rusqlite::types::Value>>;
+
+/// Every project, thread and message row.
+fn projection_snapshot(connection: &Connection) -> Vec<Rows> {
+    [
+        "projection_projects",
+        "projection_threads",
+        "projection_thread_messages",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+            .expect("snapshot statement");
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("snapshot rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("snapshot values")
+    })
+    .collect()
+}
+
+fn snapshot_file(database: &Path) -> Vec<Rows> {
+    projection_snapshot(&Connection::open(database).expect("snapshot database"))
+}
+
+fn crash_project_present(database: &Path) -> bool {
+    Connection::open(database)
+        .expect("database with crash rows")
+        .query_row(
+            "SELECT COUNT(*) FROM projection_projects WHERE project_id = 'crash-project'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("crash project count")
+        == 1
+}
+
+fn storage_id(paths: &StatePaths) -> StorageInstanceId {
+    StorageInstanceId::from_uuid(
+        Uuid::parse_str(
+            marker_text(&std::fs::read(&paths.environment_id).expect("marker")).as_str(),
+        )
+        .expect("marker UUID"),
+    )
+}
+
+fn hold_runtime_lock_shared(paths: &StatePaths) -> std::fs::File {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.runtime_lock())
+        .expect("runtime lock file");
+    lock.try_lock_shared().expect("shared runtime lock");
+    lock
+}
+
+async fn start_server_on(config: &ServerConfig) -> bibcode_server::ServerHandle {
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+    ServerRuntime::start(ServerConfig::new(&root_of(config).effective).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start store owner")
+}
+
+#[tokio::test]
+async fn inspection_while_a_server_owns_the_store_reports_sizes_and_store_running() {
+    let root = TempDir::new().expect("temporary active-store root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root.path()).state_dir(),
+        json!({}),
+    );
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start active store owner");
+    let resolved = handle.data_root().clone();
+    let mut config = ServerConfig::new(&resolved.effective);
+    config.base_dir.clone_from(&resolved.effective);
+    config.resolved_data_root = Some(resolved.clone());
+    let paths = StatePaths::from_config(&config);
+    let database_before = std::fs::read(&paths.database).expect("active database bytes");
+    let marker_before = std::fs::read(&paths.environment_id).expect("active marker bytes");
+    let listing_before = base_listing(&paths.base_dir);
+
+    let inspection = inspect_store(&resolved).await.expect("inspect owned store");
+
+    let database = inspection.database.expect("database sizes");
+    assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    assert!(database.file_bytes > 0);
+    assert_eq!(database.page_count, None);
+    assert_eq!(database.freelist_count, None);
+    assert_eq!(database.auto_vacuum, None);
+    assert_eq!(
+        database.database_stats_unavailable,
+        Some(DatabaseStatsUnavailable::StoreRunning)
+    );
+    assert_eq!(
+        std::fs::read(&paths.database).expect("database"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("marker"),
+        marker_before
+    );
+    assert_eq!(base_listing(&paths.base_dir), listing_before);
+    handle.shutdown();
+    handle.join().await.expect("active store owner stops");
+}
+
+#[tokio::test]
+async fn inspection_of_an_owned_store_never_opens_sqlite() {
+    let (_root, config, paths) = crashed_store_fixture(0);
+    std::fs::remove_file(sqlite_sidecar(&paths.database, "-shm")).expect("remove SHM");
+    let _owner = hold_runtime_lock_shared(&paths);
+    let listing_before = base_listing(&paths.base_dir);
+    let bytes_before = sqlite_bytes(&paths.database);
+
+    let inspection = inspect_store(root_of(&config))
+        .await
+        .expect("inspect owned store");
+
+    assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    assert_eq!(
+        inspection
+            .database
+            .expect("database sizes")
+            .database_stats_unavailable,
+        Some(DatabaseStatsUnavailable::StoreRunning)
+    );
+    assert!(!sqlite_sidecar(&paths.database, "-shm").exists());
+    assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+    assert_eq!(base_listing(&paths.base_dir), listing_before);
+}
+
+#[tokio::test]
+async fn inspection_of_an_offline_store_with_one_sidecar_creates_nothing() {
+    for with_lock_file in [true, false] {
+        let (_root, config, paths) = crashed_store_fixture(0);
+        std::fs::remove_file(sqlite_sidecar(&paths.database, "-shm")).expect("remove SHM");
+        if with_lock_file {
+            std::fs::write(paths.runtime_lock(), b"").expect("existing runtime lock");
+        }
+        let listing_before = base_listing(&paths.base_dir);
+        let bytes_before = sqlite_bytes(&paths.database);
+
+        let inspection = inspect_store(root_of(&config))
+            .await
+            .expect("inspect store");
+
+        assert_eq!(
+            inspection.classification,
+            StoreInspectionStatus::UnsafeDatabaseState,
+            "lock file {with_lock_file}"
+        );
+        assert!(
+            inspection
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("bibcode storage compact")),
+            "{:?}",
+            inspection.issue
+        );
+        assert_eq!(
+            inspection
+                .database
+                .expect("database sizes")
+                .database_stats_unavailable,
+            Some(DatabaseStatsUnavailable::UncheckpointedWal)
+        );
+        assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+        assert_eq!(base_listing(&paths.base_dir), listing_before);
+    }
+}
+
+#[tokio::test]
+async fn inspection_releases_the_runtime_lock_before_the_backup_inventory() {
+    let fixture = StoreFixture::with_project("Inventoried project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare inventory fixture");
+    create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("inventory fixture backup");
+    close_prepared_store_for_offline_fixture(prepared).await;
+    std::fs::write(fixture.paths.runtime_lock(), b"").expect("existing runtime lock");
+    hermetic_providers::write_hermetic_settings(&fixture.config.state_dir(), json!({}));
+    let lock_path = fixture.paths.runtime_lock();
+    let server_root = root_of(&fixture.config).effective.clone();
+    let mut server = None;
+
+    let inspection = inspect_store_for_integration_test(root_of(&fixture.config), || {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("runtime lock file");
+        lock.try_lock_shared()
+            .expect("a starting server takes the shared lock while the inventory runs");
+        lock.unlock().expect("release probe lock");
+        server = Some(tokio::spawn(ServerRuntime::start(
+            ServerConfig::new(&server_root).with_bind("127.0.0.1", 0),
+        )));
+    })
+    .await
+    .expect("inspect store");
+
+    assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    assert_eq!(inspection.backups.len(), 1);
+    let handle = tokio::time::timeout(
+        Duration::from_secs(60),
+        server.expect("server start spawned"),
+    )
+    .await
+    .expect("server start deadline")
+    .expect("server task joins")
+    .expect("server starts beside the inventory");
+    handle.shutdown();
+    handle.join().await.expect("server stops");
+}
+
+#[tokio::test]
+async fn first_run_store_reports_incremental_auto_vacuum_and_a_fixture_keeps_none() {
+    let first_run = StoreFixture::new();
+    let prepared = first_run.prepare().await.expect("first run");
+    assert_eq!(prepared.classification, StoreClassification::FirstRun);
+    close_prepared_store_for_offline_fixture(prepared).await;
+    let inspection = inspect_store(root_of(&first_run.config))
+        .await
+        .expect("inspect first-run store");
+    assert_eq!(
+        inspection.database.expect("database").auto_vacuum,
+        Some(AutoVacuumMode::Incremental)
+    );
+
+    let fixture = offline_store_with_free_pages();
+    let inspection = inspect_store(root_of(&fixture.config))
+        .await
+        .expect("inspect fixture store");
+    assert_eq!(
+        inspection.database.expect("database").auto_vacuum,
+        Some(AutoVacuumMode::None)
+    );
+    let prepared = fixture.prepare().await.expect("restart keeps the mode");
+    close_prepared_store_for_offline_fixture(prepared).await;
+    let inspection = inspect_store(root_of(&fixture.config))
+        .await
+        .expect("inspect restarted fixture store");
+    assert_eq!(
+        inspection.database.expect("database").auto_vacuum,
+        Some(AutoVacuumMode::None),
+        "an existing store keeps NONE until it is compacted"
+    );
+
+    compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("compact fixture store");
+    let inspection = inspect_store(root_of(&fixture.config))
+        .await
+        .expect("inspect compacted store");
+    assert_eq!(
+        inspection.database.expect("database").auto_vacuum,
+        Some(AutoVacuumMode::Incremental)
+    );
+}
+
+#[tokio::test]
+async fn compact_dry_run_reports_reclaim_and_changes_nothing() {
+    let fixture = offline_store_with_free_pages();
+    assert!(!fixture.paths.runtime_lock().exists());
+    let (page_size, _, freelist_count, _) = immutable_stats(&fixture.paths.database);
+    assert!(freelist_count > 0);
+    let bytes_before = sqlite_bytes(&fixture.paths.database);
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("marker");
+    let listing_before = base_listing(&fixture.paths.base_dir);
+
+    let report = compact(&fixture.config, true, PLENTY)
+        .await
+        .expect("dry run");
+
+    assert!(report.dry_run);
+    assert_eq!(report.plan.sqlite_lock, "not-checked");
+    assert_eq!(report.backup_id, None);
+    let expected = freelist_count * page_size;
+    let estimate = report
+        .plan
+        .estimated_reclaim_bytes
+        .expect("reclaim estimate");
+    assert!(
+        estimate.abs_diff(expected) * 100 <= expected,
+        "estimate {estimate} vs {expected}"
+    );
+    assert_eq!(report.before.freelist_count, Some(freelist_count));
+    assert_eq!(sqlite_bytes(&fixture.paths.database), bytes_before);
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("marker"),
+        marker_before
+    );
+    assert_eq!(base_listing(&fixture.paths.base_dir), listing_before);
+    assert!(!fixture.paths.runtime_lock().exists());
+}
+
+#[tokio::test]
+async fn compact_dry_run_on_a_crash_left_wal_reports_upper_bounds_and_changes_nothing() {
+    let (_root, config, paths) = crashed_store_fixture(0);
+    let bytes_before = sqlite_bytes(&paths.database);
+    let listing_before = base_listing(&paths.base_dir);
+    let file_bytes = bytes_before[0].as_ref().expect("database").len() as u64;
+    let wal_bytes = bytes_before[1].as_ref().expect("WAL").len() as u64;
+    assert!(bytes_before[2].is_some(), "fixture has -shm");
+
+    let report = compact(&config, true, PLENTY).await.expect("dry run");
+
+    assert_eq!(report.before.page_count, None);
+    assert_eq!(report.before.freelist_count, None);
+    assert_eq!(
+        report.before.database_stats_unavailable,
+        Some(DatabaseStatsUnavailable::UncheckpointedWal)
+    );
+    assert_eq!(report.plan.estimated_reclaim_bytes, None);
+    assert_eq!(report.plan.backup_bytes, file_bytes + wal_bytes);
+    assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+    assert_eq!(base_listing(&paths.base_dir), listing_before);
+}
+
+#[tokio::test]
+async fn compact_reclaims_space_behind_exactly_one_verified_pre_compact_backup() {
+    let fixture = offline_store_with_free_pages();
+    let file_before = std::fs::metadata(&fixture.paths.database)
+        .expect("database")
+        .len();
+    let rows_before = snapshot_file(&fixture.paths.database);
+    let inventory_before = inventory_verified_backups(&fixture.paths, storage_id(&fixture.paths))
+        .await
+        .expect("inventory before");
+    assert!(inventory_before.verified.is_empty());
+
+    let report = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("compact store");
+
+    let inventory = inventory_verified_backups(&fixture.paths, storage_id(&fixture.paths))
+        .await
+        .expect("inventory after");
+    assert_eq!(inventory.verified.len(), 1);
+    assert!(inventory.issues.is_empty(), "{:?}", inventory.issues);
+    let backup = &inventory.verified[0];
+    assert_eq!(backup.manifest.trigger, BackupTrigger::PreCompact);
+    assert_eq!(
+        report.backup_id.as_deref(),
+        Some(backup.manifest.backup_id.to_string().as_str())
+    );
+    assert_eq!(snapshot_file(&backup.database), rows_before);
+    assert_eq!(report.plan.sqlite_lock, "locked");
+    assert_eq!(report.checkpoint, Some("complete"));
+
+    let file_after = std::fs::metadata(&fixture.paths.database)
+        .expect("database")
+        .len();
+    assert!(file_after < file_before, "{file_after} < {file_before}");
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-wal").exists());
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-shm").exists());
+    let (_, _, freelist_count, auto_vacuum) = immutable_stats(&fixture.paths.database);
+    assert_eq!(freelist_count, 0);
+    assert_eq!(auto_vacuum, 2, "auto_vacuum = INCREMENTAL");
+    let after = report.after.expect("after stats");
+    assert_eq!(after.file_bytes, file_after);
+    assert_eq!(after.freelist_count, Some(0));
+    assert_eq!(after.auto_vacuum, Some(AutoVacuumMode::Incremental));
+    assert_eq!(snapshot_file(&fixture.paths.database), rows_before);
+    assert_eq!(journal_header_versions(&fixture.paths.database), (2, 2));
+}
+
+#[tokio::test]
+async fn compact_recovers_a_crash_left_wal_under_its_lock() {
+    for keep_shm in [true, false] {
+        let (_root, config, paths) = crashed_store_fixture(0);
+        if !keep_shm {
+            std::fs::remove_file(sqlite_sidecar(&paths.database, "-shm")).expect("remove SHM");
+        }
+
+        let report = compact(&config, false, PLENTY)
+            .await
+            .expect("compact crash-left store");
+
+        let inventory = inventory_verified_backups(&paths, storage_id(&paths))
+            .await
+            .expect("inventory");
+        let backup = inventory
+            .verified
+            .iter()
+            .find(|backup| backup.manifest.trigger == BackupTrigger::PreCompact)
+            .expect("pre-compact backup");
+        assert_eq!(
+            report.backup_id.as_deref(),
+            Some(backup.manifest.backup_id.to_string().as_str())
+        );
+        assert!(
+            crash_project_present(&backup.database),
+            "backup has WAL rows"
+        );
+        assert!(
+            !sqlite_sidecar(&paths.database, "-wal").exists(),
+            "shm {keep_shm}"
+        );
+        assert!(
+            !sqlite_sidecar(&paths.database, "-shm").exists(),
+            "shm {keep_shm}"
+        );
+        let inspection = inspect_store(root_of(&config)).await.expect("inspect");
+        assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+        assert!(crash_project_present(&paths.database), "store has WAL rows");
+    }
+}
+
+#[tokio::test]
+async fn compact_refuses_while_a_server_owns_the_store() {
+    let fixture = offline_store_with_free_pages();
+    let handle = start_server_on(&fixture.config).await;
+    let database_before = std::fs::read(&fixture.paths.database).expect("database bytes");
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("marker bytes");
+
+    let error = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect_err("running store blocks compaction");
+
+    assert!(matches!(error, RecoveryError::StoreRunning), "{error:?}");
+    assert!(backup_entries(&fixture.paths).is_empty());
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("marker remains"),
+        marker_before
+    );
+    let error = compact(&fixture.config, true, PLENTY)
+        .await
+        .expect_err("running store blocks the dry run too");
+    assert!(matches!(error, RecoveryError::StoreRunning), "{error:?}");
+    handle.shutdown();
+    handle.join().await.expect("store owner stops");
+}
+
+#[tokio::test]
+async fn compact_refuses_an_empty_or_headerless_database_before_any_write() {
+    enum Case {
+        Empty,
+        Foreign,
+        Journal,
+    }
+    for case in [Case::Empty, Case::Foreign, Case::Journal] {
+        let fixture = offline_store_with_free_pages();
+        match case {
+            Case::Empty => std::fs::write(&fixture.paths.database, b"").expect("empty"),
+            Case::Foreign => {
+                std::fs::write(&fixture.paths.database, vec![0x5a_u8; 4096]).expect("foreign");
+            }
+            Case::Journal => std::fs::write(
+                sqlite_sidecar(&fixture.paths.database, "-journal"),
+                b"interrupted rollback journal",
+            )
+            .expect("journal"),
+        }
+        let bytes_before = sqlite_bytes(&fixture.paths.database);
+
+        let error = compact(&fixture.config, false, PLENTY)
+            .await
+            .expect_err("compaction refuses");
+
+        assert!(
+            matches!(error, RecoveryError::NotCompactable { .. }),
+            "{error:?}"
+        );
+        assert!(backup_entries(&fixture.paths).is_empty());
+        assert_eq!(sqlite_bytes(&fixture.paths.database), bytes_before);
+    }
+}
+
+#[tokio::test]
+async fn compact_refuses_a_locked_database_without_waiting() {
+    // A WAL store whose other connection holds BEGIN EXCLUSIVE with a pending write.
+    let fixture = offline_store_with_free_pages();
+    let bytes_before = sqlite_bytes(&fixture.paths.database);
+    let other = Connection::open(&fixture.paths.database).expect("other connection");
+    other
+        .execute_batch(
+            "BEGIN EXCLUSIVE;
+             UPDATE projection_projects SET title = 'pending' WHERE project_id = 'protected-project';",
+        )
+        .expect("hold the lock with a pending write");
+    let started = Instant::now();
+    let error = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect_err("locked database refuses");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(matches!(error, RecoveryError::DatabaseLocked), "{error:?}");
+    assert!(backup_entries(&fixture.paths).is_empty());
+    other.execute_batch("ROLLBACK").expect("roll back");
+    drop(other);
+    assert_eq!(sqlite_bytes(&fixture.paths.database), bytes_before);
+
+    // A just-restored DELETE-mode store whose other connection holds BEGIN EXCLUSIVE.
+    let fixture = restored_store_fixture().await;
+    let bytes_before = sqlite_bytes(&fixture.paths.database);
+    let backups_before = backup_entries(&fixture.paths);
+    let other = Connection::open(&fixture.paths.database).expect("other connection");
+    other
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold the lock");
+    let started = Instant::now();
+    let error = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect_err("locked restored database refuses");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(matches!(error, RecoveryError::DatabaseLocked), "{error:?}");
+    let report = compact(&fixture.config, true, PLENTY)
+        .await
+        .expect("the dry run does not check SQLite locks");
+    assert_eq!(report.plan.sqlite_lock, "not-checked");
+    assert_eq!(backup_entries(&fixture.paths), backups_before);
+
+    // With a pending write SQLite has already created `-journal`, which the file checks refuse
+    // before any SQLite open.
+    other
+        .execute_batch(
+            "UPDATE projection_projects SET title = 'pending' WHERE project_id = 'protected-project';",
+        )
+        .expect("pending write");
+    assert!(sqlite_sidecar(&fixture.paths.database, "-journal").exists());
+    let started = Instant::now();
+    let error = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect_err("pending rollback-mode write refuses");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(error, RecoveryError::NotCompactable { .. }),
+        "{error:?}"
+    );
+    other.execute_batch("ROLLBACK").expect("roll back");
+    drop(other);
+    assert_eq!(backup_entries(&fixture.paths), backups_before);
+    assert_eq!(sqlite_bytes(&fixture.paths.database), bytes_before);
+    assert_eq!(journal_header_versions(&fixture.paths.database), (1, 1));
+}
+
+#[tokio::test]
+async fn compact_refuses_insufficient_disk_space_before_the_backup() {
+    let clean = offline_store_with_free_pages();
+    let (crashed_root, crashed_config, crashed_paths) = crashed_store_fixture(0);
+    let restored = restored_store_fixture().await;
+    let stores = [
+        (&clean.config, &clean.paths),
+        (&crashed_config, &crashed_paths),
+        (&restored.config, &restored.paths),
+    ];
+    for (config, paths) in stores {
+        let bytes_before = sqlite_bytes(&paths.database);
+        let backups_before = backup_entries(paths);
+        let header_before = journal_header_versions(&paths.database);
+
+        let error = compact(
+            config,
+            false,
+            CompactTestHook::FreeSpace {
+                store: 1024,
+                temp: u64::MAX / 4,
+                same_volume: false,
+            },
+        )
+        .await
+        .expect_err("insufficient space refuses");
+
+        match error {
+            RecoveryError::InsufficientSpace {
+                volume,
+                required,
+                available,
+                ..
+            } => {
+                assert_eq!(volume, "store");
+                assert_eq!(available, 1024);
+                assert!(required > available);
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+        assert_eq!(backup_entries(paths), backups_before);
+        assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+        assert_eq!(journal_header_versions(&paths.database), header_before);
+    }
+    let error = compact(
+        &clean.config,
+        false,
+        CompactTestHook::FreeSpace {
+            store: u64::MAX / 4,
+            temp: 1024,
+            same_volume: false,
+        },
+    )
+    .await
+    .expect_err("insufficient temp space refuses");
+    assert!(
+        matches!(
+            error,
+            RecoveryError::InsufficientSpace { volume: "temp", .. }
+        ),
+        "{error:?}"
+    );
+    let inspection = inspect_store(root_of(&clean.config))
+        .await
+        .expect("inspect");
+    assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    drop(crashed_root);
+}
+
+#[tokio::test]
+async fn compact_counts_main_file_growth_held_in_a_crash_left_wal() {
+    let (_root, config, paths) = crashed_store_fixture(3_000);
+    let bytes_before = sqlite_bytes(&paths.database);
+    let file_before = bytes_before[0].as_ref().expect("database").len() as u64;
+    let probe = |store| CompactTestHook::FreeSpace {
+        store,
+        temp: u64::MAX / 4,
+        same_volume: false,
+    };
+
+    let RecoveryError::InsufficientSpace {
+        required,
+        temp_required,
+        ..
+    } = compact(&config, false, probe(0))
+        .await
+        .expect_err("probe the requirement")
+    else {
+        panic!("expected insufficient space");
+    };
+    let compacted = temp_required.expect("split volumes") - 64 * 1024 * 1024;
+    assert!(
+        compacted > file_before,
+        "the WAL holds pages beyond the main file: {compacted} > {file_before}"
+    );
+
+    let error = compact(&config, false, probe(required - 1))
+        .await
+        .expect_err("one byte short refuses");
+    assert!(
+        matches!(
+            error,
+            RecoveryError::InsufficientSpace {
+                volume: "store",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(backup_entries(&paths).is_empty());
+    assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+
+    let report = compact(&config, false, probe(required))
+        .await
+        .expect("exactly enough space compacts");
+    let inventory = inventory_verified_backups(&paths, storage_id(&paths))
+        .await
+        .expect("inventory");
+    let backup = inventory
+        .verified
+        .iter()
+        .find(|backup| backup.manifest.trigger == BackupTrigger::PreCompact)
+        .expect("pre-compact backup");
+    // The revision-3 formula left out the growth the final checkpoint adds to the main file.
+    let growth = compacted - file_before;
+    assert_eq!(
+        required,
+        backup.manifest.database_size_bytes + compacted + growth + 64 * 1024 * 1024
+    );
+    assert_eq!(report.plan.required_free_bytes.store, required);
+    assert!(!sqlite_sidecar(&paths.database, "-wal").exists());
+}
+
+#[tokio::test]
+async fn compact_cancelled_after_the_backup_leaves_the_store_unchanged() {
+    let clean = offline_store_with_free_pages();
+    let (_crashed_root, crashed_config, crashed_paths) = crashed_store_fixture(0);
+    for (config, paths) in [
+        (&clean.config, &clean.paths),
+        (&crashed_config, &crashed_paths),
+    ] {
+        let bytes_before = sqlite_bytes(&paths.database);
+
+        let error = compact(config, false, CompactTestHook::CancelAfterBackup)
+            .await
+            .expect_err("cancelled after the backup");
+
+        let RecoveryError::Cancelled {
+            backup_id: Some(backup_id),
+        } = error
+        else {
+            panic!("unexpected error {error:?}");
+        };
+        let inventory = inventory_verified_backups(paths, storage_id(paths))
+            .await
+            .expect("inventory");
+        assert!(
+            inventory
+                .verified
+                .iter()
+                .any(|backup| backup.manifest.backup_id == backup_id
+                    && backup.manifest.trigger == BackupTrigger::PreCompact)
+        );
+        assert_eq!(sqlite_bytes(&paths.database), bytes_before);
+    }
+}
+
+#[tokio::test]
+async fn compact_cancelled_during_vacuum_rolls_back_and_restarts_cleanly() {
+    let fixture = offline_store_with_free_pages();
+    let rows_before = snapshot_file(&fixture.paths.database);
+    let (_, _, freelist_before, auto_vacuum_before) = immutable_stats(&fixture.paths.database);
+
+    let error = compact(&fixture.config, false, CompactTestHook::CancelDuringVacuum)
+        .await
+        .expect_err("cancelled during VACUUM");
+
+    let RecoveryError::Cancelled {
+        backup_id: Some(backup_id),
+    } = error
+    else {
+        panic!("unexpected error {error:?}");
+    };
+    let prepared = fixture.prepare().await.expect("normal restart");
+    let (rows, freelist, auto_vacuum) = prepared
+        .database
+        .call(|connection| {
+            Ok((
+                projection_snapshot(connection),
+                connection.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
+                connection.query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))?,
+            ))
+        })
+        .await
+        .expect("read restarted store");
+    close_prepared_store_for_offline_fixture(prepared).await;
+    assert_eq!(rows, rows_before);
+    assert_eq!(u64::try_from(freelist).expect("freelist"), freelist_before);
+    assert_eq!(auto_vacuum, auto_vacuum_before);
+    assert_eq!(auto_vacuum, 0, "auto_vacuum stays NONE");
+    let inventory = inventory_verified_backups(&fixture.paths, storage_id(&fixture.paths))
+        .await
+        .expect("inventory");
+    assert!(
+        inventory
+            .verified
+            .iter()
+            .any(|backup| backup.manifest.backup_id == backup_id)
+    );
+}
+
+#[tokio::test]
+async fn inventory_keeps_other_backups_beside_a_manifest_with_an_unknown_trigger() {
+    let fixture = StoreFixture::with_project("Older reader").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare fixture");
+    let mut created = Vec::new();
+    for _ in 0..2 {
+        created.push(
+            create_verified_backup(
+                &prepared.database,
+                &prepared,
+                BackupTrigger::PreUpdate,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .await
+            .expect("backup"),
+        );
+    }
+    // A trigger this build does not know, as `pre-compact` is to an older build.
+    let unknown = &created[0];
+    let manifest = std::fs::read_to_string(&unknown.manifest_path).expect("manifest");
+    std::fs::write(
+        &unknown.manifest_path,
+        manifest.replace("\"pre-update\"", "\"from-a-future-build\""),
+    )
+    .expect("rewrite manifest trigger");
+
+    let inventory = inventory_verified_backups(&fixture.paths, prepared.storage_instance_id)
+        .await
+        .expect("inventory");
+    assert_eq!(inventory.verified.len(), 1);
+    assert_eq!(
+        inventory.verified[0].manifest.backup_id,
+        created[1].manifest.backup_id
+    );
+    assert_eq!(inventory.issues.len(), 1);
+    assert_eq!(
+        inventory.issues[0].entry_name,
+        unknown.manifest.backup_id.to_string()
+    );
+
+    for _ in 0..3 {
+        create_verified_backup(
+            &prepared.database,
+            &prepared,
+            BackupTrigger::PreUpdate,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await
+        .expect("later backup");
+    }
+    let inventory = inventory_verified_backups(&fixture.paths, prepared.storage_instance_id)
+        .await
+        .expect("inventory after retention");
+    assert_eq!(inventory.verified.len(), 3);
+    assert!(
+        unknown.manifest_path.is_file(),
+        "retention never deletes it"
+    );
+    assert!(unknown.database.is_file());
+    close_prepared_store_for_offline_fixture(prepared).await;
+}
+
+#[tokio::test]
+async fn pre_compact_backup_restores_with_restore_backup_id() {
+    let fixture = offline_store_with_free_pages();
+    let storage_instance_id = storage_id(&fixture.paths);
+    let prepared = fixture.prepare().await.expect("prepare fixture");
+    let older = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("older pre-update backup");
+    let other_identity = PreparedStore {
+        database: prepared.database.clone(),
+        storage_instance_id: StorageInstanceId::from_uuid(Uuid::new_v4()),
+        classification: StoreClassification::Existing,
+        paths: prepared.paths.clone(),
+    };
+    create_verified_backup(
+        &prepared.database,
+        &other_identity,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("generation of another identity");
+    drop(other_identity);
+    close_prepared_store_for_offline_fixture(prepared).await;
+    let rows_before = snapshot_file(&fixture.paths.database);
+
+    let report = compact(&fixture.config, false, PLENTY)
+        .await
+        .expect("compact");
+    let backup_id =
+        Uuid::parse_str(report.backup_id.as_deref().expect("backup id")).expect("backup UUID");
+    Connection::open(&fixture.paths.database)
+        .expect("compacted store")
+        .execute(
+            "UPDATE projection_projects SET title = 'After compaction' WHERE project_id = 'protected-project'",
+            [],
+        )
+        .expect("change after compaction");
+
+    restore_backup(root_of(&fixture.config), backup_id)
+        .await
+        .expect("restore the pre-compact backup");
+
+    assert_eq!(snapshot_file(&fixture.paths.database), rows_before);
+    assert_eq!(storage_id(&fixture.paths), storage_instance_id);
+    let inventory = inventory_verified_backups(&fixture.paths, storage_instance_id)
+        .await
+        .expect("inventory");
+    assert!(
+        inventory
+            .verified
+            .iter()
+            .any(|backup| backup.manifest.backup_id == older.manifest.backup_id)
+    );
 }

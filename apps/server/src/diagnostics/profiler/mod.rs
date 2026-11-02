@@ -119,6 +119,52 @@ pub fn note_exit(cause: &str, detail: Option<&str>) {
     }
 }
 
+/// Records the events of one offline CLI command, with source `cli`, when no server runs.
+///
+/// It writes no session sentinel, so crash and clean-shutdown detection are untouched. Start it
+/// only while holding the store's exclusive runtime lock, so it is never a second writer beside
+/// a live server. Dropping it flushes within 2 s.
+pub struct OfflineWriter {
+    store: Option<store::ProfilerStore>,
+}
+
+impl OfflineWriter {
+    pub fn emit(&self, kind: &'static str, payload: Value) {
+        if let Some(store) = &self.store {
+            store.sender().send(event::ProfilerEvent {
+                kind,
+                source: "cli".into(),
+                payload,
+            });
+        }
+    }
+}
+
+impl Drop for OfflineWriter {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            if store
+                .sender()
+                .flush_within(std::time::Duration::from_secs(2))
+            {
+                store.shutdown();
+            } else {
+                // A stuck disk must not hold the command open; the process exits next.
+                std::mem::forget(store);
+            }
+        }
+    }
+}
+
+/// An [`OfflineWriter`] for `state_dir` when its persisted `enableProfiler` setting is on.
+pub fn offline_writer(state_dir: &Path) -> Option<OfflineWriter> {
+    persisted_enabled(state_dir).then(|| OfflineWriter {
+        store: Some(store::ProfilerStore::start(store::StoreConfig::new(
+            profiler_dir(state_dir),
+        ))),
+    })
+}
+
 /// Queues one server event and returns its `eventId`, which a finding the event explains
 /// cites in `evidence.eventIds`. Does nothing while the profiler is off; never blocks.
 pub fn emit(kind: &'static str, payload: Value) -> Option<store::EventId> {
