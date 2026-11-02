@@ -45,34 +45,42 @@ approval.
 
 ## Options
 
-**A. Own key for the per-thread server, and turn off a registered `bibcode` for
-chat launches (recommended).**
+The two servers are not duplicates. The per-thread server's credential is a
+provider credential, which lists only this thread's `preview_*` and `device_*`
+tools; the registered relay is a client credential with the thread, Git, file
+and other client tools (`connect_mcp/tests.rs`, the provider/client `tools/list`
+assertions; `mcp/control.rs` scope docs). A registered user needs both in a
+Codex chat.
 
-- The chat launch writes its server as `mcp_servers.bibcode_thread.*`. No user
-  entry or registration uses that key, so the collision cannot recur, whatever
-  the user, a project config or a profile holds under `bibcode`.
-- When the effective `CODEX_HOME/config.toml` defines `[mcp_servers.bibcode]`,
-  the launch also passes `-c mcp_servers.bibcode.enabled=false`. Without it, chat
-  would load both servers: duplicate tool sets, an extra `bibcode mcp` relay per
-  session, and tools that are not attributed to the thread, so a child thread
-  started through them is not linked to its parent. The flag is added only when
-  the table was found, because on an absent entry Codex refuses to start (last
-  row above). A `bibcode` entry that only a project config or profile defines is
-  not detected; chat then gets the duplicate, which still works.
-- What changes for people: in a Codex chat the BiBCode tools appear under the
-  server name `bibcode_thread`. The terminal, other providers, the registration
-  and what it writes do not change. The user's own `bibcode` entry keeps working
-  everywhere except inside BiBCode's own Codex chats, where the per-thread
-  server replaces it.
-- Cost: one read and TOML parse of a small file per Codex chat launch, with the
-  `toml` workspace dependency added to `bibcode-server`. A missing, unreadable
-  or unparsable file counts as "not found" and is logged at debug level.
+**A. Own key for the per-thread server; the registered entry is untouched
+(recommended).**
 
-**B. Skip the per-thread server when a user `bibcode` entry exists.** Smallest
-code change, but chat then uses the user's stdio relay: no per-thread
-attribution or parent link, and the access level is the relay's rather than the
-thread's. It also keeps the trap for the next override BiBCode adds under
-`bibcode`. Not recommended.
+- The chat launch writes its server as `mcp_servers.bibcode_thread.url` and
+  `mcp_servers.bibcode_thread.bearer_token_env_var`. No registration or user
+  entry BiBCode writes uses that key, so the merge cannot happen, whatever the
+  user, a project config or a profile holds under `bibcode`.
+- BiBCode reads no Codex config and adds no `enabled=false`. There is no
+  decision to race with a registration change, and Codex's own loading of
+  `bibcode` is unchanged.
+- What changes for people: in a Codex chat the per-thread preview and device
+  tools appear under the server name `bibcode_thread`; the registered `bibcode`
+  tools keep their name. Nothing in BiBCode's prompts, skills or living docs
+  names the per-thread server. The terminal, other providers, the registration
+  and what it writes do not change.
+- Residual: a user who hand-writes a `[mcp_servers.bibcode_thread]` table hits
+  the same merge. That key is documented as BiBCode's own in
+  `docs/reference/mcp.md`, and the delivery fails visibly (part 1 below) rather
+  than silently.
+
+**B. Skip the per-thread server when a user `bibcode` entry exists.** Chat then
+loses this thread's preview and device tools, BiBCode must read Codex's config
+before each launch (racing a registration change), and the trap stays for the
+next override BiBCode adds under `bibcode`. Not recommended.
+
+Turning the registered entry off for chat launches (`bibcode.enabled=false`)
+was considered and dropped: it removes the client tools above, and on an absent
+entry Codex refuses to start, so a registration removed between BiBCode's read
+and Codex's load would break a valid configuration.
 
 **C. Register under another name (`bibcode-desktop`) and migrate existing
 entries.** Changes what registration writes in five clients' config files, needs
@@ -87,11 +95,12 @@ These keep registration as it is and follow the issue's scope.
    JSON-RPC `-32600` whose message starts with `failed to load configuration`,
    or an `app-server` that exits before answering `initialize` with a config
    error on stderr, becomes a new `ProviderRuntimeError::ProviderConfiguration
-   { provider, detail }`. `launch_failure_outcome` maps it to `Rejected`, like
-   `MissingExecutable`, so the delivery fails once with Codex's own message as
-   `failure_reason` and the thread shows `delivery_failed`. The panel shows the
-   message and what to do (fix `~/.codex/config.toml`, or turn off BiBCode's
-   MCP server). `read_thread` and `wait_for_thread` report the same failed state
+   { provider, detail }`. `launch_failure_outcome` maps it to `Rejected { detail }`,
+   like `MissingExecutable`, so the delivery fails once through the existing
+   path: `failure_reason` keeps its typed category, and Codex's message is the
+   delivery detail (`last_error`, `delivery.detail`) that the panel already
+   shows. No persisted or wire shape changes. The detail adds what to do: fix
+   `~/.codex/config.toml`, or turn off BiBCode's MCP server. `read_thread` and `wait_for_thread` report the same failed state
    and reason that the panel shows, with a contract test each.
 2. **Retries are bounded.** A delivery that keeps ending `DefinitelyNotSent`
    fails after 20 attempts (about 8 minutes with the 30 s backoff cap) with the
@@ -110,8 +119,9 @@ These keep registration as it is and follow the issue's scope.
      `codex` that, like Codex 0.166.0, rejects a `bibcode` table holding both
      `command` and `url`, with a `CODEX_HOME` holding a registered stdio
      `bibcode` and BiBCode's MCP enabled, and asserts `thread/start` succeeds
-     and the launch arguments use `bibcode_thread` and `bibcode.enabled=false`.
-   - Without the registered entry, no `enabled=false` is passed.
+     and the launch arguments name only `bibcode_thread`, never `bibcode`.
+   - The provider credential's `tools/list` through `bibcode_thread` still
+     lists the preview and device tools (the existing scope test, kept).
    - A config-load `-32600` ends the delivery `failed` with the reason visible
      through the thread read, `read_thread` and `wait_for_thread`.
    - The attempt bound fails a delivery after the twentieth `DefinitelyNotSent`.
@@ -132,3 +142,15 @@ These keep registration as it is and follow the issue's scope.
   thread reads; `cargo fmt --all --check`, Clippy with warnings denied,
   `vp check` and `vp run typecheck`. A web test for the panel's failure copy, with
   the UI.md and `vercel-react-best-practices` reviews.
+
+## Review findings and resolutions
+
+Codex, round 1 (REVISE):
+
+- P1, disabling the registered entry removes the client tools: accepted.
+  Verified in `connect_mcp/tests.rs` (a provider lists only `preview_*` and
+  `device_*`). Option A no longer touches the registered entry.
+- P2, Codex's text belongs in the delivery detail, not `failure_reason`:
+  accepted; part 1 uses the existing `Rejected { detail }` path.
+- P2, the config read races a registration removal: resolved by dropping the
+  config read and `enabled=false` altogether.
