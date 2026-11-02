@@ -3034,6 +3034,14 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   `canOpenPullRequestInPanel` (Pull Requests setting on, not Bitbucket or Azure
   DevOps). Persisted `pullRequest` entries are validated on load, so a corrupted
   one drops without losing the thread's other tabs.
+- The Git Manager's Changes tab stacks the file list, the selected diff and the
+  commit form. `GitManagerChangesPanes` reuses `useResizableWidth` with
+  `axis: "y"` for the list height (`bibcode:git-changes-list-height`) and the
+  commit form's maximum height (`bibcode:git-changes-commit-height`); the diff
+  takes the rest. Previous/Next change (`diff.nextChange`/`diff.previousChange`,
+  default F7/Shift+F7, `diffFocus`) is decided by `resolveChangeStep`: within the
+  selected file's blocks first, then into the adjacent file of the visible list
+  at its first or last block, with no wrap.
 - Git Manager force-push always uses `--force-with-lease`. Its execution paths
   forbid bare `--force`, `--ignore-other-worktrees`, forced
   `git worktree add -f`, and plumbing `update-ref` as ways to bypass the

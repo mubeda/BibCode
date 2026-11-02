@@ -13,8 +13,10 @@ import {
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import * as AsyncResult from "effect/reactivity/AsyncResult";
+import { useAtomValue } from "@effect/atom-react";
 import { SearchIcon, XIcon } from "lucide-react";
 import {
+  type KeyboardEvent,
   memo,
   useCallback,
   useDeferredValue,
@@ -29,12 +31,18 @@ import { Button } from "~/components/ui/button";
 import { RetryButton, type RetryButtonProps } from "~/components/ui/retry-button";
 import { Checkbox } from "~/components/ui/checkbox";
 import { useOpenInPreferredEditor } from "~/editorPreferences";
+import {
+  DIFF_FOCUS_CONTEXT,
+  diffChangeCommandForEvent,
+  resolveShortcutCommand,
+} from "~/keybindings";
 import { readLocalApi } from "~/localApi";
 
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../../gitManagerStore";
 import { useProject, useServerConfigs } from "../../../state/entities";
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
+import { primaryServerKeybindingsAtom } from "../../../state/server";
 import { shellEnvironment } from "../../../state/shell";
 import { useAtomCommand } from "../../../state/use-atom-command";
 import { vcsEnvironment } from "../../../state/vcs";
@@ -42,9 +50,14 @@ import { GitManagerRepositoryUnavailable } from "../GitManagerRepositoryUnavaila
 import type { RepositoryUnavailable } from "../gitManagerRepositoryAvailability";
 import { joinWorkspacePath, parentRelativePath } from "../../files/FileTreeContextMenu.logic";
 import { GitManagerAgentActivity } from "./GitManagerAgentActivity";
+import { GitManagerChangesSplit, GitManagerCommitPane } from "./GitManagerChangesPanes";
 import { GitManagerCommitBox, type GitManagerCommitSubmission } from "./GitManagerCommitBox";
 import { GitManagerDiscardDialog } from "./GitManagerDiscardDialog";
-import { GitManagerDiffPane, type GitManagerPartialArea } from "./GitManagerDiffPane";
+import {
+  GitManagerDiffPane,
+  type GitManagerDiffPaneHandle,
+  type GitManagerPartialArea,
+} from "./GitManagerDiffPane";
 import { GitManagerChangesList } from "./GitManagerChangesList";
 import {
   buildChangeRows,
@@ -359,10 +372,50 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     return ["unstaged", "staged"];
   }, [selectedRow?.area]);
 
+  const [arrival, setArrival] = useState<{
+    readonly path: string;
+    readonly edge: "first" | "last";
+  } | null>(null);
   const handleSelect = useCallback(
-    (path: string) => setSelectedFile(stableProjectRef, path),
+    (path: string) => {
+      setArrival(null);
+      setSelectedFile(stableProjectRef, path);
+    },
     [setSelectedFile, stableProjectRef],
   );
+  // Next and Previous change walk the changes of the selected file, then enter the next or
+  // previous file of the list at its first or last change.
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
+  const diffPaneRef = useRef<GitManagerDiffPaneHandle>(null);
+  const selectedIndex = rows.findIndex((row) => row.path === selectedRow?.path);
+  const stepFile = (direction: 1 | -1) => {
+    const target = rows[selectedIndex + direction];
+    if (target === undefined) {
+      setArrival(null);
+      return;
+    }
+    setArrival({ path: target.path, edge: direction === 1 ? "first" : "last" });
+    setSelectedFile(stableProjectRef, target.path);
+  };
+  const handleNavigationKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const step = diffChangeCommandForEvent(
+      resolveShortcutCommand(event, keybindings, { context: DIFF_FOCUS_CONTEXT }),
+      event,
+      keybindings,
+    );
+    if (step === null) return;
+    event.preventDefault();
+    const direction = step === "diff.nextChange" ? 1 : -1;
+    if (diffPaneRef.current !== null) {
+      diffPaneRef.current.goToChange(direction);
+      return;
+    }
+    // Nothing is selected yet: start from the first (or last) file.
+    const start = direction === 1 ? rows[0] : rows.at(-1);
+    if (start === undefined) return;
+    setArrival({ path: start.path, edge: direction === 1 ? "first" : "last" });
+    setSelectedFile(stableProjectRef, start.path);
+  };
   const handleToggle = useCallback((path: string) => {
     setExcludedPaths((current) => {
       const next = new Set(current);
@@ -747,25 +800,40 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
               </span>
             ) : null}
           </div>
-          <GitManagerChangesList
-            rows={rows}
-            selectedPath={selectedPath}
-            onContextMenu={handleContextMenu}
-            onOpenExternal={handleOpenExternal}
-            onSelect={handleSelect}
-            onToggle={handleToggle}
+          <GitManagerChangesSplit
+            diff={
+              selectedRow === null ? null : (
+                <GitManagerDiffPane
+                  availableAreas={selectedAreas}
+                  key={selectedRow.path}
+                  mutationBusy={mutationBusy}
+                  navigation={{
+                    fileIndex: selectedIndex,
+                    fileCount: rows.length,
+                    keybindings,
+                    arrival: arrival?.path === selectedRow.path ? arrival.edge : null,
+                    paneRef: diffPaneRef,
+                    onStepFile: stepFile,
+                  }}
+                  partialStagingDisabledReason={partialStagingDisabledReason}
+                  path={selectedRow.path}
+                  projectRef={stableProjectRef}
+                  scope={scope}
+                />
+              )
+            }
+            list={
+              <GitManagerChangesList
+                rows={rows}
+                selectedPath={selectedPath}
+                onContextMenu={handleContextMenu}
+                onOpenExternal={handleOpenExternal}
+                onSelect={handleSelect}
+                onToggle={handleToggle}
+              />
+            }
+            onKeyDown={handleNavigationKeyDown}
           />
-          {selectedRow === null ? null : (
-            <GitManagerDiffPane
-              availableAreas={selectedAreas}
-              key={selectedRow.path}
-              mutationBusy={mutationBusy}
-              partialStagingDisabledReason={partialStagingDisabledReason}
-              path={selectedRow.path}
-              projectRef={stableProjectRef}
-              scope={scope}
-            />
-          )}
         </>
       )}
       {mutationError === null ? null : (
@@ -773,17 +841,19 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
           {mutationError}
         </p>
       )}
-      <GitManagerCommitBox
-        branch={branch}
-        disabledReason={commitDisabledReason}
-        includedPaths={includedPaths}
-        isBusy={mutationBusy}
-        latestCommit={latestLocalCommit}
-        scope={scope}
-        workingTreeDirty={refsQuery.data.isDirty === true}
-        onCommit={handleCommit}
-        onUndo={handleUndo}
-      />
+      <GitManagerCommitPane>
+        <GitManagerCommitBox
+          branch={branch}
+          disabledReason={commitDisabledReason}
+          includedPaths={includedPaths}
+          isBusy={mutationBusy}
+          latestCommit={latestLocalCommit}
+          scope={scope}
+          workingTreeDirty={refsQuery.data.isDirty === true}
+          onCommit={handleCommit}
+          onUndo={handleUndo}
+        />
+      </GitManagerCommitPane>
       {pendingDiscard === null ? null : (
         <GitManagerDiscardDialog
           disposition={pendingDiscard.disposition}

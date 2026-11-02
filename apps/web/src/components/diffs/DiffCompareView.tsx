@@ -47,6 +47,7 @@ import {
 import { resolveFileDiffPath } from "~/lib/diffRendering";
 import { cn } from "~/lib/utils";
 import {
+  DIFF_FOCUS_CONTEXT,
   diffChangeCommandForEvent,
   diffChangeShortcutLabel,
   resolveShortcutCommand,
@@ -57,12 +58,12 @@ import { primaryServerKeybindingsAtom } from "~/state/server";
 
 import { Button } from "../ui/button";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
-import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   AnnotatableCodeView,
   type AnnotatableCodeViewHandle,
   type AnnotatableCodeViewProps,
 } from "./AnnotatableCodeView";
+import { ChangeNavigationButton } from "./ChangeNavigationButton";
 import { DiffFileFilterControls, DiffFileList, DiffFilePicker } from "./DiffFileList";
 import { useCommentDraftStore } from "./useCommentDraftStore";
 
@@ -218,14 +219,6 @@ export function DiffCompareView(props: DiffCompareViewProps) {
 }
 
 const NARROW_COMPARE_WIDTH = 640;
-
-const DIFF_FOCUS_CONTEXT = {
-  diffFocus: true,
-  terminalFocus: false,
-  terminalOpen: false,
-  previewFocus: false,
-  previewOpen: false,
-} as const;
 
 /** Moves the diff to the next (+1) or previous (-1) block of changes. */
 interface ComparePaneHandle {
@@ -498,48 +491,6 @@ function DiffComparePane({
         </>
       )}
     </>
-  );
-}
-
-/**
- * Previous or Next change. At either end it stays focusable, so its tooltip can say why it does
- * nothing, instead of turning into a control that cannot explain itself.
- */
-function ChangeNavigationButton({
-  disabled,
-  label,
-  shortcut,
-  onClick,
-  children,
-}: {
-  readonly disabled: boolean;
-  readonly label: string;
-  readonly shortcut: string | null;
-  readonly onClick: () => void;
-  readonly children: ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <Button
-            aria-disabled={disabled}
-            aria-label={label}
-            className={cn("shrink-0", disabled && "opacity-64")}
-            size="icon-xs"
-            variant="ghost"
-            onClick={() => {
-              if (!disabled) onClick();
-            }}
-          />
-        }
-      >
-        {children}
-      </TooltipTrigger>
-      <TooltipPopup side="bottom">
-        {disabled ? "No more changes." : shortcut ? `${label} (${shortcut})` : label}
-      </TooltipPopup>
-    </Tooltip>
   );
 }
 

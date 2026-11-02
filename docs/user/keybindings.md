@@ -106,11 +106,16 @@ surface them.
 - `rightPanel.toggle`: open/close the right tool panel
 - `diff.toggle`: open/close the thread diff view
 - `diff.nextChange` / `diff.previousChange`: in the Diff panel's Compare view,
-  scroll the selected file to the next or previous block of changes. They have
+  scroll the selected file to the next or previous block of changes. In the Git
+  Manager's **Changes** tab they do the same and, past the last (or before the
+  first) change of a file, continue into the next (or previous) file of the
+  list, landing on its first (or last) change. They have
   no default rule: Compare answers the built-in **F7** and **Shift+F7** until a
   rule names the command, which then replaces that key. An older client cannot
   decode a server configuration that names them, as with `chat.find`. At the last or first change
-  they do nothing, and the matching buttons say "No more changes."
+  they do nothing (in Changes, the last or first change of the whole list), and the
+  matching buttons say why: "No more changes." in Compare, "This is the last change in the
+  list." or "This is the first change in the list." in Changes.
 - `preview.toggle`: open/close the in-app browser preview when the active host exposes preview support
 - `preview.refresh`: reload the active preview tab (in focused preview context by default)
 - `preview.focusUrl`: focus the URL input of the preview panel (in focused preview context by default)
@@ -193,8 +198,9 @@ or nowhere. No default rule uses it; it is there for `chat.find` rules such as
 `{ "key": "mod+shift+f", "command": "chat.find", "when": "chatFocus" }`.
 
 `terminalFocus` is true when either a center or right-panel terminal owns focus.
-`diffFocus` is true while focus is in the Diff panel's Compare view: its file
-list or its diff.
+`diffFocus` is true while focus is in the Diff panel's Compare view (its file
+list or its diff) or in the Git Manager's Changes file list and diff, not its
+commit form.
 `terminalOpen` is true when the active thread has at least one terminal surface
 in the center or right panel. The retired bottom terminal drawer is not part of
 either context.
