@@ -1163,6 +1163,34 @@ describe("applyThreadDetailEvent", () => {
       }
     });
 
+    it("keeps a captured turn's missing diff", () => {
+      const result = applyThreadDetailEvent(baseThread, {
+        ...baseEventFields,
+        sequence: 13,
+        occurredAt: "2026-04-01T12:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.turn-diff-completed",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          turnId: TurnId.make("turn-1"),
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("ref-1"),
+          status: "ready",
+          files: [],
+          diffAvailable: false,
+          assistantMessageId: MessageId.make("msg-3"),
+          completedAt: "2026-04-01T12:00:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.checkpoints[0]?.status).toBe("ready");
+        expect(result.thread.checkpoints[0]?.diffAvailable).toBe(false);
+      }
+    });
+
     it.each(["interrupted", "error"] as const)(
       "keeps a %s turn's state and answer when its checkpoint lands",
       (state) => {

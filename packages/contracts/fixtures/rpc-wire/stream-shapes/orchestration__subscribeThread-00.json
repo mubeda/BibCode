@@ -37,40 +37,46 @@
           "activities": [],
           "checkpoints": [
             {
-              "turnId": "usmP7",
-              "checkpointTurnCount": 60,
-              "checkpointRef": "0",
-              "status": "error",
-              "files": [],
-              "assistantMessageId": "V",
-              "completedAt": ""
-            },
-            {
-              "turnId": "\u0000",
-              "checkpointTurnCount": 100,
+              "turnId": "s",
+              "checkpointTurnCount": 51,
               "checkpointRef": "�",
-              "status": "error",
-              "files": [],
-              "assistantMessageId": null,
-              "completedAt": "%HS"
-            },
-            {
-              "turnId": "�",
-              "checkpointTurnCount": 3,
-              "checkpointRef": "4294967295",
-              "status": "error",
+              "status": "missing",
               "files": [
                 {
-                  "path": ")",
-                  "kind": "s",
-                  "additions": 98,
-                  "deletions": 3
+                  "path": "'",
+                  "kind": "V",
+                  "additions": 0,
+                  "deletions": 34
+                },
+                {
+                  "path": "-1",
+                  "kind": "mv!B",
+                  "additions": 51,
+                  "deletions": 31
+                },
+                {
+                  "path": "-1",
+                  "kind": "H",
+                  "additions": 1,
+                  "deletions": 94
+                },
+                {
+                  "path": "x)f",
+                  "kind": "",
+                  "additions": 90,
+                  "deletions": 24
                 },
                 {
                   "path": "4294967295",
-                  "kind": "{t*Y",
-                  "additions": 98,
-                  "deletions": 3
+                  "kind": "4294967295",
+                  "additions": 86,
+                  "deletions": 100
+                },
+                {
+                  "path": "__proto__",
+                  "kind": "�",
+                  "additions": 34,
+                  "deletions": 56
                 },
                 {
                   "path": "�",
@@ -95,114 +101,99 @@
                   "kind": "😀",
                   "additions": 4,
                   "deletions": 5
-                },
-                {
-                  "path": "zMy!t%",
-                  "kind": "\u0000",
-                  "additions": 96,
-                  "deletions": 78
-                },
-                {
-                  "path": "q5Sq}",
-                  "kind": "",
-                  "additions": 5,
-                  "deletions": 94
-                },
-                {
-                  "path": "7",
-                  "kind": "�",
-                  "additions": 95,
-                  "deletions": 33
-                },
-                {
-                  "path": "qUsR%p2l{*",
-                  "kind": "",
-                  "additions": 0,
-                  "deletions": 1
                 }
               ],
               "assistantMessageId": null,
-              "completedAt": "-1"
+              "completedAt": "My!t%*9/tC"
             },
             {
-              "turnId": "'tKI(`~",
-              "checkpointTurnCount": 6,
-              "checkpointRef": "4294967295",
+              "turnId": "q5Sq}",
+              "checkpointTurnCount": 2,
+              "checkpointRef": "�",
               "status": "missing",
-              "files": [
-                {
-                  "path": "__proto__",
-                  "kind": "^INjmAx,%i",
-                  "additions": 90,
-                  "deletions": 3
-                },
-                {
-                  "path": "prototype",
-                  "kind": "4294967295",
-                  "additions": 4,
-                  "deletions": 6
-                },
-                {
-                  "path": "k2>\\",
-                  "kind": "Gy#Gd0$?,w",
-                  "additions": 4,
-                  "deletions": 32
-                },
-                {
-                  "path": ";)R6#LW7u&",
-                  "kind": "WXiUob_O%o",
-                  "additions": 2,
-                  "deletions": 0
-                },
-                {
-                  "path": "-1",
-                  "kind": "I",
-                  "additions": 8,
-                  "deletions": 82
-                },
-                {
-                  "path": "",
-                  "kind": "�",
-                  "additions": 10,
-                  "deletions": 4
-                },
-                {
-                  "path": "0",
-                  "kind": "😀",
-                  "additions": 96,
-                  "deletions": 78
-                },
-                {
-                  "path": "�",
-                  "kind": ":",
-                  "additions": 44,
-                  "deletions": 94
-                },
-                {
-                  "path": "@",
-                  "kind": "X",
-                  "additions": 68,
-                  "deletions": 5
-                },
-                {
-                  "path": "",
-                  "kind": "0",
-                  "additions": 2,
-                  "deletions": 22
-                }
-              ],
+              "files": [],
+              "diffAvailable": false,
               "assistantMessageId": null,
-              "completedAt": "NN}L#}d?Hb"
+              "completedAt": "\t"
             },
             {
-              "turnId": "%dhxf5|+R",
+              "turnId": "?t%~qUsR",
+              "checkpointTurnCount": 95,
+              "checkpointRef": "C",
+              "status": "ready",
+              "files": [],
+              "assistantMessageId": "$",
+              "completedAt": "�"
+            },
+            {
+              "turnId": "�",
+              "checkpointTurnCount": 0,
+              "checkpointRef": "#",
+              "status": "error",
+              "files": [],
+              "assistantMessageId": "__proto__",
+              "completedAt": "__proto__"
+            },
+            {
+              "turnId": "NjmAx",
+              "checkpointTurnCount": 5,
+              "checkpointRef": "8",
+              "status": "missing",
+              "files": [],
+              "assistantMessageId": "0",
+              "completedAt": "(zta<"
+            },
+            {
+              "turnId": "0",
               "checkpointTurnCount": 55,
-              "checkpointRef": "s",
+              "checkpointRef": "y#Gd0",
               "status": "ready",
               "files": [
                 {
-                  "path": "a\"EUo2",
+                  "path": "\\l>g2\\;)R6",
+                  "kind": "4294967295",
+                  "additions": 24,
+                  "deletions": 7
+                },
+                {
+                  "path": "WXiUob_O%o",
                   "kind": "0",
+                  "additions": 1,
+                  "deletions": 2
+                },
+                {
+                  "path": "I",
+                  "kind": "m<1=um),)[",
+                  "additions": 0,
+                  "deletions": 42
+                },
+                {
+                  "path": "j'l~AC:tJ&",
+                  "kind": "G",
+                  "additions": 6,
+                  "deletions": 4
+                },
+                {
+                  "path": "<e1%0",
+                  "kind": "-1",
+                  "additions": 41,
+                  "deletions": 22
+                },
+                {
+                  "path": "hNN}",
+                  "kind": "",
+                  "additions": 72,
+                  "deletions": 4
+                },
+                {
+                  "path": "%dhxf5|+R",
+                  "kind": ",|s'zy",
+                  "additions": 75,
+                  "deletions": 70
+                },
+                {
+                  "path": "-1",
+                  "kind": "1?",
                   "additions": 5,
                   "deletions": 10
                 },
@@ -217,233 +208,171 @@
                   "kind": "t",
                   "additions": 6,
                   "deletions": 1
-                },
-                {
-                  "path": "",
-                  "kind": "�",
-                  "additions": 21,
-                  "deletions": 85
-                },
-                {
-                  "path": "-1",
-                  "kind": "",
-                  "additions": 0,
-                  "deletions": 62
-                },
-                {
-                  "path": "k",
-                  "kind": "",
-                  "additions": 0,
-                  "deletions": 96
-                },
-                {
-                  "path": "#",
-                  "kind": "",
-                  "additions": 100,
-                  "deletions": 97
-                },
-                {
-                  "path": "+",
-                  "kind": "0",
-                  "additions": 0,
-                  "deletions": 10
-                },
-                {
-                  "path": "$",
-                  "kind": "ocV`i",
-                  "additions": 4,
-                  "deletions": 0
-                },
-                {
-                  "path": "!",
-                  "kind": "",
-                  "additions": 0,
-                  "deletions": 6
                 }
               ],
-              "assistantMessageId": null,
-              "completedAt": "0"
-            },
-            {
-              "turnId": "�",
-              "checkpointTurnCount": 4,
-              "checkpointRef": "",
-              "status": "ready",
-              "files": [
-                {
-                  "path": "4294967295",
-                  "kind": "Gz_4^m7-",
-                  "additions": 96,
-                  "deletions": 95
-                },
-                {
-                  "path": "0",
-                  "kind": "YcSN$D+ UD",
-                  "additions": 2,
-                  "deletions": 3
-                },
-                {
-                  "path": "C",
-                  "kind": "4294967295",
-                  "additions": 2,
-                  "deletions": 4
-                },
-                {
-                  "path": "",
-                  "kind": "gEP+UdK]>L",
-                  "additions": 2,
-                  "deletions": 6
-                },
-                {
-                  "path": "x/7ln4t)CQ",
-                  "kind": "((BS[7;^0Z",
-                  "additions": 96,
-                  "deletions": 44
-                },
-                {
-                  "path": "",
-                  "kind": "OM",
-                  "additions": 49,
-                  "deletions": 90
-                },
-                {
-                  "path": "Uo",
-                  "kind": "toString",
-                  "additions": 17,
-                  "deletions": 96
-                },
-                {
-                  "path": "",
-                  "kind": "eI_k'EW",
-                  "additions": 2,
-                  "deletions": 100
-                },
-                {
-                  "path": "k,58=v",
-                  "kind": "MdH$bhZ",
-                  "additions": 26,
-                  "deletions": 1
-                },
-                {
-                  "path": "1",
-                  "kind": "",
-                  "additions": 40,
-                  "deletions": 37
-                }
-              ],
+              "diffAvailable": false,
               "assistantMessageId": "\u0000",
-              "completedAt": "\\P:&~b?fkz"
-            },
-            {
-              "turnId": "5R)wN\\HG",
-              "checkpointTurnCount": 92,
-              "checkpointRef": ",;'W$",
-              "status": "missing",
-              "files": [
-                {
-                  "path": "",
-                  "kind": "F&lLDc\":<Z",
-                  "additions": 55,
-                  "deletions": 4
-                },
-                {
-                  "path": "}S|*",
-                  "kind": "?o\"SNEg;",
-                  "additions": 6,
-                  "deletions": 3
-                },
-                {
-                  "path": "-1",
-                  "kind": "u&7,fV",
-                  "additions": 89,
-                  "deletions": 64
-                },
-                {
-                  "path": "4294967295",
-                  "kind": "toString",
-                  "additions": 18,
-                  "deletions": 77
-                },
-                {
-                  "path": "5br8#'",
-                  "kind": "",
-                  "additions": 91,
-                  "deletions": 54
-                }
-              ],
-              "assistantMessageId": "�",
-              "completedAt": "__proto__"
-            },
-            {
-              "turnId": "'`9Uk.7)=^",
-              "checkpointTurnCount": 49,
-              "checkpointRef": "\u0000",
-              "status": "ready",
-              "files": [
-                {
-                  "path": "Dx\\p~LElOk",
-                  "kind": "Z6Z=|5X)R2",
-                  "additions": 0,
-                  "deletions": 6
-                }
-              ],
-              "assistantMessageId": "%ch+#T?v^'",
-              "completedAt": ""
+              "completedAt": "Xp"
             },
             {
               "turnId": "",
-              "checkpointTurnCount": 1,
-              "checkpointRef": "k",
-              "status": "missing",
+              "checkpointTurnCount": 6,
+              "checkpointRef": "_'k&*=<\"*",
+              "status": "error",
               "files": [
                 {
-                  "path": "R",
-                  "kind": "%",
-                  "additions": 23,
-                  "deletions": 78
+                  "path": "-1",
+                  "kind": "0",
+                  "additions": 6,
+                  "deletions": 11
                 },
                 {
-                  "path": "\u0000",
-                  "kind": "😀",
-                  "additions": 2,
+                  "path": "A",
+                  "kind": "AFZ(^)Yf)$",
+                  "additions": 55,
                   "deletions": 0
                 },
                 {
-                  "path": "toString",
-                  "kind": "K[",
-                  "additions": 6,
-                  "deletions": 64
-                },
-                {
-                  "path": "\"p]-5b:FP",
-                  "kind": "5m03sG",
-                  "additions": 7,
-                  "deletions": 4
-                },
-                {
-                  "path": "Yy^v&Dpv})",
+                  "path": "`iF!X<",
                   "kind": "",
-                  "additions": 5,
-                  "deletions": 34
+                  "additions": 43,
+                  "deletions": 0
                 },
                 {
                   "path": "",
-                  "kind": "6d0s3%L} J",
+                  "kind": "",
+                  "additions": 6,
+                  "deletions": 33
+                },
+                {
+                  "path": "-1",
+                  "kind": "%",
+                  "additions": 1,
+                  "deletions": 3
+                },
+                {
+                  "path": "Gz_4^m7-",
+                  "kind": "�",
+                  "additions": 6,
+                  "deletions": 2
+                },
+                {
+                  "path": "YcSN$D+ UD",
+                  "kind": "-1",
+                  "additions": 94,
+                  "deletions": 8
+                },
+                {
+                  "path": "N",
+                  "kind": "",
                   "additions": 2,
-                  "deletions": 71
+                  "deletions": 17
+                },
+                {
+                  "path": "prototype",
+                  "kind": "toString",
+                  "additions": 39,
+                  "deletions": 11
+                },
+                {
+                  "path": "]>LEA",
+                  "kind": "",
+                  "additions": 91,
+                  "deletions": 91
                 }
               ],
               "assistantMessageId": null,
-              "completedAt": "3raXM^k=$`"
+              "completedAt": "ln4t)CQ{fv"
             },
             {
-              "turnId": "Gle>",
-              "checkpointTurnCount": 78,
-              "checkpointRef": "toString",
+              "turnId": "0",
+              "checkpointTurnCount": 62,
+              "checkpointRef": "\u0000",
+              "status": "missing",
+              "files": [
+                {
+                  "path": "toString",
+                  "kind": "__proto__",
+                  "additions": 1,
+                  "deletions": 58
+                },
+                {
+                  "path": "4294967295",
+                  "kind": "toString",
+                  "additions": 100,
+                  "deletions": 62
+                },
+                {
+                  "path": "__proto__",
+                  "kind": "|",
+                  "additions": 5,
+                  "deletions": 0
+                },
+                {
+                  "path": "eI_k'EW",
+                  "kind": "prototype",
+                  "additions": 6,
+                  "deletions": 79
+                },
+                {
+                  "path": ",58=vbS[",
+                  "kind": "toString",
+                  "additions": 4,
+                  "deletions": 62
+                },
+                {
+                  "path": "*",
+                  "kind": "toString",
+                  "additions": 95,
+                  "deletions": 5
+                },
+                {
+                  "path": "�",
+                  "kind": "4294967295",
+                  "additions": 5,
+                  "deletions": 98
+                },
+                {
+                  "path": "~",
+                  "kind": "k",
+                  "additions": 80,
+                  "deletions": 75
+                },
+                {
+                  "path": "4294967295",
+                  "kind": "�",
+                  "additions": 3,
+                  "deletions": 100
+                },
+                {
+                  "path": ",;'W$",
+                  "kind": "5%P 8",
+                  "additions": 5,
+                  "deletions": 5
+                }
+              ],
+              "assistantMessageId": "\u0000",
+              "completedAt": "9CZ}b?"
+            },
+            {
+              "turnId": "{[",
+              "checkpointTurnCount": 33,
+              "checkpointRef": "NEg;*(q\"TO",
               "status": "missing",
               "files": [],
+              "diffAvailable": true,
               "assistantMessageId": null,
-              "completedAt": "\t"
+              "completedAt": ""
+            },
+            {
+              "turnId": "c\\*N4hR1_",
+              "checkpointTurnCount": 52,
+              "checkpointRef": "br8",
+              "status": "ready",
+              "files": [],
+              "diffAvailable": true,
+              "assistantMessageId": "R-GqGYWOv",
+              "completedAt": "prototype"
             }
           ],
           "session": null

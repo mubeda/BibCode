@@ -483,6 +483,9 @@ export const OrchestrationCheckpointSummary = Schema.Struct({
   checkpointRef: CheckpointRef,
   status: OrchestrationCheckpointStatus,
   files: Schema.Array(OrchestrationCheckpointFile),
+  /** `false`: captured (a revert target) but the turn before's checkpoint is missing, so its
+   *  changes cannot be shown. Absent means `true`; older clients ignore it. */
+  diffAvailable: Schema.optional(Schema.Boolean),
   assistantMessageId: Schema.NullOr(MessageId),
   completedAt: IsoDateTime,
 });
@@ -1194,6 +1197,7 @@ const ThreadTurnDiffCompleteCommand = Schema.Struct({
   checkpointRef: CheckpointRef,
   status: OrchestrationCheckpointStatus,
   files: Schema.Array(OrchestrationCheckpointFile),
+  diffAvailable: Schema.optional(Schema.Boolean),
   assistantMessageId: Schema.optional(MessageId),
   checkpointTurnCount: NonNegativeInt,
   createdAt: IsoDateTime,
@@ -1493,6 +1497,7 @@ export const ThreadTurnDiffCompletedPayload = Schema.Struct({
   checkpointRef: CheckpointRef,
   status: OrchestrationCheckpointStatus,
   files: Schema.Array(OrchestrationCheckpointFile),
+  diffAvailable: Schema.optional(Schema.Boolean),
   assistantMessageId: Schema.NullOr(MessageId),
   completedAt: IsoDateTime,
 });
