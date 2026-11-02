@@ -1812,7 +1812,8 @@ it.
   on its CPU. A tick over 50 ms doubles the interval, up to 60 s; ten fast ticks
   in a row halve it again.
 - **Leak and CPU rules** (`leak.rs`, after RESIN). After a 15-minute warm-up and
-  on a rolling 10-minute minimum, `memory.leak-suspect` (warn) needs a Theil–Sen
+  on the high-water mark of a rolling 10-minute minimum, so a refill after a dip
+  is not growth, `memory.leak-suspect` (warn) needs a Theil–Sen
   slope of at least max(10 MB/h, 2% of the baseline per hour) over 1 h with a
   Mann–Kendall Z above 2.33. `memory.leak-likely` (error) needs 6 h of that
   growth fitting a line (R² > 0.8), or growth of at least 50% and 200 MB since
