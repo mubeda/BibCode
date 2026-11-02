@@ -1612,6 +1612,8 @@ describe("ChatComposer attachments", () => {
     await flushMicrotasks();
 
     expect(markup).toContain('aria-label="Preview shot.png"');
+    // Draft thumbnails load lazily, so a long draft does not fetch every image at once.
+    expect(markup).toMatch(/<img[^>]*alt="shot.png"[^>]*loading="lazy"/);
     expect(markup).toContain("plain.png");
     expect(markup).toContain("Draft attachment may not persist");
 

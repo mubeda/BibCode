@@ -1995,6 +1995,22 @@ The Files surface is a full file manager for the active workspace:
 - Git-ignored files and directory roots remain visible with ignored styling,
   and the contents below an ignored directory are loaded eagerly with the rest
   of the tree.
+- Opening a file shows it in the panel by its extension, before any text read.
+  Text and code open in the editor. Images (PNG, JPEG, GIF, WebP, AVIF, ICO)
+  show as pictures, with their pixel size and a **Fit** / **Actual size**
+  switch. **SVG** shows as an image, never as live markup, so a script inside it
+  cannot run; **View source** opens its XML in the editor, and the editor's
+  switch brings the image back. A **PDF** opens in the browser's or webview's own
+  viewer, and audio (MP3, M4A, WAV, OGG, OGA, WebM, FLAC) plays in the native
+  player. These previews come from the same size-capped file route as the
+  integrated browser, so a file over 10 MiB, or one the viewer cannot decode,
+  explains itself instead of failing: it says the file is too large (or cannot be
+  shown) and points at **Open in** in the header, or at the machine the
+  environment runs on when the environment is remote. Other binary files (an
+  archive, an executable) say that no preview exists for their type. Video is not
+  previewed. The PDF viewer depends on the host webview; where it has none (some
+  Linux builds), use **Open in**. Message images and draft thumbnails load only
+  when they scroll near the viewport.
 - Right-click files, folders, or the tree background to create files/folders,
   rename, delete, duplicate, copy paths, add a folder as a project, download or
   upload files, open in an external editor, or open previewable files in the
