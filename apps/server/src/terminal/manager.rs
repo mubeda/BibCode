@@ -46,8 +46,9 @@ const QUIET_AFTER_UNCHANGED_SAMPLES: u32 = 2;
 /// A quiet terminal is still sampled once per this many ticks, which bounds how late a child
 /// that starts and prints nothing is reported (#232; 10 s chosen by the user on 2026-11-01).
 const QUIET_RESAMPLE_TICKS: u32 = 10;
-/// How long the activity tick waits for one terminal's publication lock before retrying it on
-/// the next tick, so a terminal held by a slow close or restart cannot stall the others.
+/// How long the activity tick waits for one terminal's publication and session locks before
+/// retrying it on the next tick, so a terminal held by a slow close, restart or worktree removal
+/// cannot stall the others.
 const ACTIVITY_PUBLICATION_WAIT: Duration = Duration::from_millis(100);
 const OBSERVER_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// A hard stop for a preparer that asks to be waited for too long. It sits above every provider's
@@ -2972,19 +2973,27 @@ impl TerminalManager {
         terminal: &ActivityPoll,
         inspection: SubprocessInspection,
     ) -> ActivitySample {
-        // Close holds this lock through process cleanup after cancelling the generation; one
-        // terminal's lock must not hold up every other terminal's sample.
+        // Close holds the publication lock through process cleanup after cancelling the
+        // generation, and worktree removal holds the session lock through filesystem checks; one
+        // terminal's locks must not hold up every other terminal's sample.
+        let deadline = tokio::time::sleep(ACTIVITY_PUBLICATION_WAIT);
+        tokio::pin!(deadline);
         let _publication = tokio::select! {
             biased;
             () = terminal.generation.cancellation.cancelled() => return ActivitySample::Ended,
             guard = terminal.generation.publication.lock() => guard,
-            () = tokio::time::sleep(ACTIVITY_PUBLICATION_WAIT) => return ActivitySample::Busy,
+            () = &mut deadline => return ActivitySample::Busy,
         };
         if terminal.generation.is_invalidated() {
             return ActivitySample::Ended;
         }
         let (event, summary) = {
-            let mut session = terminal.session.lock().await;
+            let mut session = tokio::select! {
+                biased;
+                () = terminal.generation.cancellation.cancelled() => return ActivitySample::Ended,
+                guard = terminal.session.lock() => guard,
+                () = &mut deadline => return ActivitySample::Busy,
+            };
             if session.status != TerminalStatus::Running || session.pid != Some(terminal.pid) {
                 return ActivitySample::Ended;
             }
@@ -7459,6 +7468,34 @@ mod tests {
         );
         // The busy terminal is sampled again once its lock is free.
         drop(publication);
+        inspector.set_child(1, Some("sleep"));
+        poll_ticks(1).await;
+        assert_eq!(drain_activity(&mut events), [true]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_session_lock_does_not_stall_other_terminals() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        // Worktree removal holds a session's lock through filesystem checks.
+        let held = manager
+            .require_session("thread-poll", "term-0")
+            .await
+            .unwrap();
+        let session = held.lock().await;
+        inspector.set_child(2, Some("sleep"));
+
+        poll_ticks(1).await;
+        tokio::time::sleep(DEFAULT_SUBPROCESS_POLL_INTERVAL / 2).await;
+        assert_eq!(
+            drain_activity(&mut events),
+            [true],
+            "the other terminal waited on a held session lock"
+        );
+        // The held terminal is sampled again once its lock is free.
+        drop(session);
         inspector.set_child(1, Some("sleep"));
         poll_ticks(1).await;
         assert_eq!(drain_activity(&mut events), [true]);
