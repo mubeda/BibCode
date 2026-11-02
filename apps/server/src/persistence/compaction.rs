@@ -23,7 +23,8 @@ use super::{
     backup::{
         BACKUP_TIMEOUT, DatabaseStatsUnavailable, OfflineRecoveryGuard, RECOVERY_TIMEOUT,
         classify_store_files, create_verified_backup, database_file_sizes, directory_volume,
-        is_reparse_point, path_entry_exists, sqlite_sidecars_present, state_kind_name,
+        file_link_count, is_reparse_point, path_entry_exists, sqlite_sidecars_present,
+        state_kind_name,
     },
     database::{AutoVacuumMode, PageStats, VacuumOutcome, open_immutable, page_stats},
     migrations::validate_bibcode_schema,
@@ -524,6 +525,15 @@ fn check_compactable_files(paths: &StatePaths) -> Result<StorageInstanceId, Reco
                 ),
             });
         }
+    }
+    // Another name for the same file has its own sidecars, which SQLite would not see here.
+    if file_link_count(&paths.database)? > 1 {
+        return Err(RecoveryError::NotCompactable {
+            detail: "state.sqlite has another hard link, so it cannot be compacted safely: a \
+                     second name for the same file can hold uncheckpointed changes beside it. \
+                     Remove the other link, then retry."
+                .to_owned(),
+        });
     }
     // A zero-length file would be initialized by the first write transaction.
     check_database_header(&paths.database)?;

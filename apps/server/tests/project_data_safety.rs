@@ -2654,6 +2654,53 @@ async fn compact_refuses_a_linked_database_before_touching_the_target() {
         eprintln!("skipped the file-link case: this account cannot create file symlinks");
     }
 
+    // The database file is a hard link to a valid store whose WAL, beside the other name,
+    // holds committed changes the main file lacks.
+    let shared = offline_store_with_free_pages();
+    let writer = Connection::open(&shared.paths.database).expect("shared store writer");
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("keep changes in the WAL");
+    writer
+        .execute(
+            "UPDATE projection_projects SET title = 'Only in the WAL' WHERE project_id = 'protected-project'",
+            [],
+        )
+        .expect("WAL-only change");
+    writer
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .expect("leave the WAL on close");
+    writer.close().expect("close the shared store writer");
+    let shared_bytes = sqlite_bytes(&shared.paths.database);
+    assert!(shared_bytes[1].is_some(), "the shared store has a WAL");
+    let hard_linked = StoreFixture::new();
+    std::fs::hard_link(&shared.paths.database, &hard_linked.paths.database)
+        .expect("hard-linked database");
+    std::fs::copy(
+        &shared.paths.environment_id,
+        &hard_linked.paths.environment_id,
+    )
+    .expect("hard-linked store marker");
+    let error = compact(&hard_linked.config, false, refuse)
+        .await
+        .expect_err("a hard-linked database refuses");
+    assert!(
+        matches!(error, RecoveryError::NotCompactable { .. }),
+        "{error:?}"
+    );
+    let error = compact(&hard_linked.config, true, PLENTY)
+        .await
+        .expect_err("the dry run refuses too");
+    assert!(
+        matches!(error, RecoveryError::NotCompactable { .. }),
+        "{error:?}"
+    );
+    assert_eq!(sqlite_bytes(&shared.paths.database), shared_bytes);
+    assert!(backup_entries(&hard_linked.paths).is_empty());
+
     // The state directory is a link (a junction on Windows).
     let root = TempDir::new().expect("linked root");
     let mut config = ServerConfig::new(root.path());
