@@ -4,9 +4,10 @@ import {
   scopedProjectKey,
   scopedThreadKey,
 } from "@bibcode/client-runtime/environment";
-import type {
-  EnvironmentProject,
-  EnvironmentThreadShell,
+import {
+  type EnvironmentProject,
+  type EnvironmentThreadShell,
+  threadActivityAgeMs,
 } from "@bibcode/client-runtime/state/models";
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import {
@@ -244,7 +245,7 @@ export function buildAgentRows(input: {
             evidenceAt: input.freshness.evidenceAt(
               key,
               shell.lastActivityAt,
-              shell.lastActivityAgeMs,
+              threadActivityAgeMs(shell, Date.now()),
               live,
             ),
           },

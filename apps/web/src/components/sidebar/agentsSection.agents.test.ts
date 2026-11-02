@@ -11,6 +11,7 @@ import {
 import { createModelSelection } from "@bibcode/shared/model";
 import { describe, expect, it } from "vite-plus/test";
 
+import { agentEvidenceAt, resetAgentEvidenceStampsForTests } from "../../hooks/useAgentFreshness";
 import { AGENT_STATUS_STALE_AFTER_MS } from "../Sidebar.logic";
 import {
   AGENT_GROUP_ORDER,
@@ -172,6 +173,28 @@ describe("agent groups (#187)", () => {
       unknownReason: "stale",
       pill: { label: "No update" },
     });
+  });
+
+  it("ages a thread from its receipt, not its first render (#223)", () => {
+    resetAgentEvidenceStampsForTests();
+    // Received 31 minutes ago with 1 minute of age, then not sent again because it did not
+    // change, and rendered for the first time now: its evidence is 32 minutes old.
+    const receivedAt = Date.now() - 31 * 60_000;
+    const [row] = rows({
+      shells: [
+        shell("unseen", "running", {
+          lastActivityAt: AT,
+          lastActivityAgeMs: 60_000,
+          lastActivityObservedAt: receivedAt - 60_000,
+        }),
+      ],
+      freshness: {
+        now: Date.now(),
+        evidenceAt: (key, evidence, ageMs, live) => agentEvidenceAt(key, evidence, ageMs, live),
+      },
+    });
+    resetAgentEvidenceStampsForTests();
+    expect(row).toMatchObject({ group: "unknown", unknownReason: "stale" });
   });
 
   it("lists a disconnected environment's agents as unknown and offline", () => {

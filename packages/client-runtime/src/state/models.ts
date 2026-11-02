@@ -12,8 +12,42 @@ export interface EnvironmentProject extends OrchestrationProjectShell {
   readonly environmentId: EnvironmentId;
 }
 
-export interface EnvironmentThreadShell extends OrchestrationThreadShell {
+/** A thread shell as this client received it. */
+export interface ReceivedThreadShell extends OrchestrationThreadShell {
+  /**
+   * When `lastActivityAt` happened on this client's clock: the shell's receipt time less
+   * `lastActivityAgeMs`. Recorded on receipt because an unchanged thread is not sent again,
+   * so its age stays as old as the item that carried it. Absent without that age, and from
+   * cached shells.
+   */
+  readonly lastActivityObservedAt?: number;
+}
+
+export interface EnvironmentThreadShell extends ReceivedThreadShell {
   readonly environmentId: EnvironmentId;
+}
+
+/** `thread` with its activity age pinned to `receivedAt`; the same object when it has none. */
+export function observeThreadActivity<T extends OrchestrationThreadShell>(
+  thread: T,
+  receivedAt: number,
+): T & ReceivedThreadShell {
+  return thread.lastActivityAgeMs === undefined
+    ? thread
+    : { ...thread, lastActivityObservedAt: receivedAt - thread.lastActivityAgeMs };
+}
+
+/** How old the thread's provider progress is at `now`, on this client's clock. */
+export function threadActivityAgeMs(
+  thread: {
+    readonly lastActivityAgeMs?: number | undefined;
+    readonly lastActivityObservedAt?: number | undefined;
+  },
+  now: number,
+): number | undefined {
+  return thread.lastActivityObservedAt === undefined
+    ? thread.lastActivityAgeMs
+    : Math.max(0, now - thread.lastActivityObservedAt);
 }
 
 export type EnvironmentMessage = OrchestrationMessage;
