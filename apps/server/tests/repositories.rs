@@ -1724,6 +1724,8 @@ async fn turn_and_checkpoint_repositories_preserve_conflicts_and_roll_back_trans
         checkpoint_ref: "checkpoint-new".to_owned(),
         status: "ready".to_owned(),
         files: json!([{"path": "src/lib.rs", "sha": "abc123"}]),
+        // Read back from its own column, not assumed.
+        diff_available: false,
         assistant_message_id: Some("assistant-checkpoint".to_owned()),
         completed_at: TIME_3.to_owned(),
     };

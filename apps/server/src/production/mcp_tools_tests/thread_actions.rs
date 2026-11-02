@@ -772,6 +772,89 @@ async fn get_turn_diff_reads_only_captured_turns() {
     harness.shutdown().await;
 }
 
+/// A turn captured without a trusted baseline (`ready`, `diffAvailable: false`) has no diff:
+/// `get_turn_diff` refuses it, typed, and does not pick it as the latest turn with changes. It
+/// is still a revert target, and a revert to it restores its files.
+#[tokio::test]
+async fn get_turn_diff_refuses_a_turn_without_a_baseline_and_revert_accepts_it() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    let (other_id, _) = start(&harness, &agent, basic_start()).await;
+    let checkout = checkpointed_checkout(&harness, &thread_id).await;
+    std::fs::write(checkout.path().join("tracked.txt"), "three\n").unwrap();
+    capture_checkpoint(checkout.path(), &thread_id, 3)
+        .await
+        .unwrap();
+    for (thread, turn_count) in [(&thread_id, 3), (&other_id, 1)] {
+        harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.turn.diff.complete", "commandId": format!("diff-{thread}-{turn_count}"),
+                "threadId": thread, "turnId": format!("turn-{turn_count}"),
+                "checkpointTurnCount": turn_count,
+                "checkpointRef": checkpoint_ref(thread, turn_count), "status": "ready",
+                "diffAvailable": false, "files": [], "assistantMessageId": null,
+                "completedAt": CREATED_AT, "createdAt": CREATED_AT,
+            })))
+            .await
+            .unwrap();
+    }
+
+    let refused = harness
+        .call(
+            &agent,
+            "get_turn_diff",
+            json!({ "threadId": thread_id, "turnCount": 3 }),
+        )
+        .await;
+    assert_eq!(error_tag(&refused), "McpNoTurnDiffError", "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["error"]["message"],
+        crate::production::orchestration_effects::no_baseline_diff_detail(3),
+        "{refused}"
+    );
+    // The latest turn with changes skips a turn without a diff.
+    let latest = harness
+        .call(&agent, "get_turn_diff", json!({ "threadId": other_id }))
+        .await;
+    assert_eq!(error_tag(&latest), "McpNoTurnDiffError", "{latest}");
+    assert!(
+        latest["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no turn with recorded changes"),
+        "{latest}"
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let effects = OrchestrationEffects::start(
+        harness.engine.clone(),
+        Arc::new(crate::git::GitRepository::default()),
+        Arc::new(Rewinds::new(&thread_id, checkout.path(), elsewhere.path())),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+    std::fs::write(checkout.path().join("tracked.txt"), "after three\n").unwrap();
+    let reverted = harness
+        .call(
+            &agent,
+            "revert_thread_to_turn",
+            json!({ "threadId": thread_id, "turnCount": 3 }),
+        )
+        .await;
+    assert_eq!(structured(&reverted)["reverted"], true, "{reverted}");
+    assert_eq!(
+        std::fs::read_to_string(checkout.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "three\n"
+    );
+    effects.shutdown().await;
+    harness.shutdown().await;
+}
+
 fn attachment(name: &str, mime_type: &str, bytes: &[u8]) -> Value {
     json!({ "name": name, "mimeType": mime_type, "data": STANDARD.encode(bytes) })
 }
