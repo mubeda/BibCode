@@ -49,7 +49,7 @@ export interface LinkSettings {
 
 export const UNTHROTTLED: LinkSettings = { down: 0, up: 0, frozen: false, delay: 0, jitter: 0 };
 
-/** Named links. 3g matches T3 Code's preset: 400 kbps each way, a 400 ms round trip. */
+/** Named links. 3g is a common 3G preset: 400 kbps each way, a 400 ms round trip. */
 export const LINK_PRESETS: Readonly<Record<string, Partial<LinkSettings>>> = {
   "3g": { down: 50_000, up: 50_000, delay: 200 },
 };
