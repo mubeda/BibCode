@@ -23,6 +23,33 @@ probes the configured executable and reports installation, authentication, and
 model discovery independently; a driver being supported does not guarantee
 that its local CLI is installed or ready.
 
+## Tools and Claude Code's own updates
+
+BiBCode also keeps one command-line tool that is not an agent provider up to
+date: **CodeGraph**. When a newer version exists, it appears in the same update
+notice, sidebar pill and **Update all…** as a provider, and **Settings →
+Providers → Tools** lists what is installed and what is available, with an
+**Update** button. It follows the install it finds on the server's own computer
+(a WSL or remote environment checks its own): the standalone installer updates
+with `codegraph upgrade`, and a global npm, pnpm, Bun or Vite+ install updates
+with that package manager. Any other install is shown with the reason and the
+command to run yourself. Nothing is installed when it is missing. BiBCode runs
+the update with CodeGraph's agent-configuration side effects switched off, so
+it never rewrites your agents' instructions or MCP settings.
+
+**Update** comes with a reminder to close agent sessions that use CodeGraph
+first, because an update replaces files a running CodeGraph may hold open. The
+update keeps running if you close the window, and quitting the desktop app waits
+for it (up to 30 seconds beyond the usual stop). If it was interrupted, or the
+server stopped before it finished, **Settings → Providers → Tools** says
+**CodeGraph may be damaged** and offers a reinstall, and it says **still being
+updated by an earlier BiBCode session** instead while that updater is running.
+Sessions that were already running keep the old version until they restart.
+
+Claude Code updates itself in the background. When BiBCode sees its version
+rise without an update it ran, a notice says **Claude updated to
+`<version>`**, once per version.
+
 ## Updating providers on every environment
 
 When a provider is outdated on any environment, or a connected remote server

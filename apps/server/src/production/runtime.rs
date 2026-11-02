@@ -171,6 +171,13 @@ impl ProductionRuntime {
         self.mcp_control.clone()
     }
 
+    /// Whether a tool update (CodeGraph) is running. A host that stops this server on a deadline
+    /// of its own extends it by [`crate::TOOL_UPDATE_SHUTDOWN_WAIT`] while this is true.
+    #[must_use]
+    pub fn tool_updates_running(&self) -> bool {
+        self.server_control.tool_updates_running()
+    }
+
     /// The committed `enableProfiler`, which drives a desktop host's crash monitor.
     #[must_use]
     pub fn profiler_enabled_signal(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -282,6 +289,7 @@ impl ProductionRuntime {
         let provider_update_checks = control.start_provider_update_checks();
         // Built before the profiler, whose sampler reads it; it has no dependencies.
         let process_attribution = ProcessAttributionRegistry::new();
+        control.attach_process_attribution(process_attribution.clone());
         let device_env = crate::device::android::sdk::SdkEnv::from_process();
         let android_devices = crate::device::android::AndroidBackend::new(
             crate::device::android::AndroidBackendConfig {
@@ -962,6 +970,9 @@ impl ProductionRuntime {
         self.webhooks.shutdown().await;
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
+        // Waits for a running tool update, which must not be killed mid-replacement, and
+        // before the profiler's teardown.
+        self.server_control.shutdown_tool_updates().await;
         self.server_control.shutdown_capability_discovery().await;
         self.preview_gateway.shutdown().await;
         // Stops emulators gracefully before ownership teardown, which would only kill them.

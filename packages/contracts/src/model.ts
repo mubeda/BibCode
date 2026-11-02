@@ -203,6 +203,11 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
 
 // ── Provider display names ────────────────────────────────────────────
 
+/** The tools BiBCode maintains besides providers, by tool id (`ServerTool.toolId`). */
+export const TOOL_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  codegraph: "CodeGraph",
+};
+
 export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: "Codex",
   [CLAUDE_DRIVER_KIND]: "Claude",

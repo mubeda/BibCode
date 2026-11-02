@@ -183,6 +183,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_stream("server.subscribeDiagnosticLogsRelay"),
     mutation_unary("server.updateProvider"),
     mutation_unary("server.updateSettings"),
+    mutation_unary("server.updateTool"),
     mutation_unary("server.upsertKeybinding"),
     mutation_unary("shell.openInEditor"),
     mutation_unary("sourceControl.cloneRepository"),

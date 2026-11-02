@@ -150,6 +150,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.reportProfilerClientBatch"
         | "server.signalProcess"
         | "server.updateProvider"
+        | "server.updateTool"
         | "server.updateSettings"
         | "server.upsertKeybinding"
         | "updater.check"

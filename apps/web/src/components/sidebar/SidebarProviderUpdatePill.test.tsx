@@ -30,7 +30,7 @@ vi.mock("react", async (importOriginal) => ({
 }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => harness.navigate }));
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => harness.providers }));
-vi.mock("../../state/server", () => ({ primaryServerProvidersAtom: { name: "providers" } }));
+vi.mock("../../state/server", () => ({ primaryUpdateSubjectsAtom: { name: "providers" } }));
 vi.mock("../ProviderUpdateLaunchNotification.logic", () => ({
   getProviderUpdateSidebarPillView: (...args: unknown[]) => {
     harness.getView(...args);

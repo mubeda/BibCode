@@ -1096,6 +1096,60 @@ clients keep their previous `checkedAt` until a content change or a
 user-triggered refresh publishes, or until they reconnect and receive a fresh
 snapshot.
 
+### Tools
+
+A command-line tool that is not an agent provider (CodeGraph) reuses the same
+maintenance backend without becoming a provider. The server reports it as a
+`ServerTool` in `ServerConfig.tools` and in the optional `tools` key of the
+`providerStatuses` stream payload; it never appears in provider lists, pickers
+or sessions. The design and its reviewed trade-offs are in
+[Tool update notices](../superpowers/specs/2026-11-02-tool-update-notices-design.md).
+
+- **Source and action.** `ProviderMaintenance::enrich_advisory` takes the probe
+  fields directly (a tool has no `enabled` flag; `enrich_snapshot` is a wrapper
+  over it). The standalone `<root>/codegraph/current/bin/codegraph` install
+  updates with the resolved `codegraph upgrade`; a recognized global npm, pnpm,
+  Bun or Vite+ install updates with the package manager; any other path is
+  manual-only with its reason. The latest version is npm
+  `@colbymchenry/codegraph`. A CodeGraph major newer than the verified one has
+  no executable action.
+- **Server-owned update.** `server.updateTool { toolId }` validates and reserves
+  the tool, then runs the update in a server-owned task (`tool_maintenance.rs`)
+  that a client disconnect cannot cancel, because killing the updater mid-
+  replacement can leave a half-swapped install. The task keeps the request's
+  maintenance admission permit until it publishes its outcome, so a server
+  self-update drain names it. Shutdown waits up to 30 seconds for it and never
+  asks it to stop earlier. A host that stops the server on a deadline of its own
+  extends it by `TOOL_UPDATE_SHUTDOWN_WAIT` while `ServerHandle::tool_updates_probe`
+  reports a running update; the desktop's in-process backend does (it would
+  otherwise cut the update short at its 5-second stop). Tool update state lives in its own map, so
+  provider settings validation and full-refresh pruning cannot discard it.
+- **Agent configuration.** The command always carries
+  `CODEGRAPH_NO_PROMPT_HOOK=1` and `CODEGRAPH_NO_INSTALL_REFRESH=1`, which stop
+  `codegraph upgrade` from writing Claude's prompt hook and running
+  `codegraph install --refresh`.
+- **Recovery.** A marker file per tool in the server state directory
+  (`tool-updates/<tool>.json`) records the install path, the version before,
+  and the updater's pid and process start time before the update starts. A
+  verified finish removes it. A marker found at startup or after an unverified
+  finish reports the install as possibly damaged regardless of what
+  `--version` prints (it reads `package.json` without loading the runtime) or
+  whether PATH still finds the launcher, and offers a reinstall (`upgrade
+  --force`). If the marker's pid and start time still name a live process, an
+  updater survived a killed server: the tool reports it is still being updated
+  and refuses a reinstall until that process exits.
+- **Wire.** `tools` is optional everywhere. An absent `tools` in a
+  `providerStatuses` event means unchanged. A client never calls
+  `server.updateTool` on an environment whose snapshot lacks the `tools` key.
+  The web client lists a tool through an adapter into the same rows the update
+  surfaces already read, and sends its update through the one
+  `serverEnvironment.updateProvider` command, which routes a tool id to
+  `server.updateTool`.
+- **Profiler.** The updater runs through `process::supervised`, registers its
+  identity with the process attribution registry (a `helper` labelled
+  `<tool> update`) for its lifetime, and `server.updateTool` is in
+  `is_long_running`.
+
 Clients start updates only through `server.updateProvider` on the environment
 that owns the provider. The primary toast and the desktop-local rows update
 their own targets. **Settings → Providers → Update all…** is client

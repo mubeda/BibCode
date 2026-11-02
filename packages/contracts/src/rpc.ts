@@ -350,6 +350,9 @@ import {
   ServerProviderCapabilitiesError,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
+  ServerToolUpdateError,
+  ServerToolUpdateInput,
+  ServerToolUpdatedPayload,
   ServerLifecycleStreamEvent,
   ServerRemoveKeybindingInput,
   ServerRemoveKeybindingResult,
@@ -675,6 +678,7 @@ export const WS_METHODS = {
   serverGetProviderCapabilities: "server.getProviderCapabilities",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
+  serverUpdateTool: "server.updateTool",
   serverUpsertKeybinding: "server.upsertKeybinding",
   serverRemoveKeybinding: "server.removeKeybinding",
   serverGetSettings: "server.getSettings",
@@ -822,6 +826,12 @@ export const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvide
   payload: ServerProviderUpdateInput,
   success: ServerProviderUpdatedPayload,
   error: Schema.Union([ServerProviderUpdateError, EnvironmentRpcError]),
+});
+
+export const WsServerUpdateToolRpc = Rpc.make(WS_METHODS.serverUpdateTool, {
+  payload: ServerToolUpdateInput,
+  success: ServerToolUpdatedPayload,
+  error: Schema.Union([ServerToolUpdateError, EnvironmentRpcError]),
 });
 
 export const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
@@ -2292,6 +2302,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
+  WsServerUpdateToolRpc,
   WsServerUpsertKeybindingRpc,
   WsServerRemoveKeybindingRpc,
   WsServerGetSettingsRpc,

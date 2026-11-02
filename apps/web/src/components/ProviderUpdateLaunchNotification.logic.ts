@@ -1,12 +1,14 @@
 import {
   defaultInstanceIdForDriver,
   PROVIDER_DISPLAY_NAMES,
+  TOOL_DISPLAY_NAMES,
   type EnvironmentId,
   type ExecutionEnvironmentPlatformOs,
   type ProviderDriverKind,
   type ProviderInstanceId,
   type ServerProvider,
 } from "@bibcode/contracts";
+import { isToolId } from "@bibcode/client-runtime/state/server-tools";
 import {
   squashAtomCommandFailure,
   type AtomCommandResult,
@@ -107,13 +109,24 @@ function dedupeProvidersByInstanceId<T extends ServerProvider>(providers: Readon
 }
 
 function getProviderUpdatedTitle(provider: Pick<ServerProvider, "driver" | "version">): string {
-  const providerName = PROVIDER_DISPLAY_NAMES[provider.driver] ?? provider.driver;
+  const providerName = updateSubjectName(provider.driver);
   return provider.version
     ? `${providerName} updated: ${formatVersion(provider.version)}`
     : `${providerName} updated`;
 }
 
-function getProviderUpdatedDescription(providerCount: number): string {
+/** A provider's name, or a tool's (CodeGraph), as the update notices call it. */
+export function updateSubjectName(driver: ProviderDriverKind): string {
+  return PROVIDER_DISPLAY_NAMES[driver] ?? TOOL_DISPLAY_NAMES[driver] ?? driver;
+}
+
+function getProviderUpdatedDescription(
+  providerCount: number,
+  providers: ReadonlyArray<Pick<ServerProvider, "driver">>,
+): string {
+  if (providers.length > 0 && providers.every((provider) => isToolId(provider.driver))) {
+    return "Agent sessions that are already running keep the old version until they restart.";
+  }
   return providerCount === 1
     ? "New sessions will use the updated provider."
     : "New sessions will use the updated providers.";
@@ -122,7 +135,7 @@ function getProviderUpdatedDescription(providerCount: number): string {
 function getProviderFailedUpdateTitle(
   provider: Pick<ServerProvider, "driver" | "versionAdvisory">,
 ): string {
-  const providerName = PROVIDER_DISPLAY_NAMES[provider.driver] ?? provider.driver;
+  const providerName = updateSubjectName(provider.driver);
   const attemptedVersion = provider.versionAdvisory?.latestVersion;
   return attemptedVersion
     ? `${providerName} ${formatVersion(attemptedVersion)} update failed`
@@ -207,13 +220,25 @@ export function providerUpdateCandidateKey(provider: ProviderUpdateCandidate): s
 }
 
 export function formatProviderList(providers: ReadonlyArray<Pick<ServerProvider, "driver">>) {
-  const names = providers.map(
-    (provider) => PROVIDER_DISPLAY_NAMES[provider.driver] ?? provider.driver,
-  );
+  const names = providers.map((provider) => updateSubjectName(provider.driver));
   if (names.length <= 2) {
     return names.join(" and ");
   }
   return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+/**
+ * An update replaces files a running CodeGraph (an MCP server, a sync) may hold open, and the
+ * first cut does not check for one, so every place a CodeGraph update can start says so.
+ */
+export const TOOL_UPDATE_WARNING =
+  "Close agent sessions that use CodeGraph before updating. Sessions already running keep the old version until they restart.";
+
+/** The warning to show beside an update that includes a tool, or `null` when it includes none. */
+export function toolUpdateWarning(
+  providers: ReadonlyArray<Pick<ServerProvider, "driver">>,
+): string | null {
+  return providers.some((provider) => isToolId(provider.driver)) ? TOOL_UPDATE_WARNING : null;
 }
 
 export function getProviderUpdateInitialToastView(input: {
@@ -226,7 +251,12 @@ export function getProviderUpdateInitialToastView(input: {
     title: getProviderUpdateInitialToastTitle(input.updateProviders),
     description:
       input.oneClickProviders.length > 0
-        ? "Install the update now or review provider settings."
+        ? [
+            "Install the update now or review provider settings.",
+            toolUpdateWarning(input.oneClickProviders),
+          ]
+            .filter((part) => part !== null)
+            .join(" ")
         : `${formatProviderList(input.updateProviders)} can be updated from provider settings.`,
   };
 }
@@ -304,7 +334,7 @@ export function getProviderUpdateProgressToastView(input: {
       phase: "succeeded",
       type: "success",
       title: input.providerCount === 1 ? "Provider updated" : "Provider updates finished",
-      description: getProviderUpdatedDescription(input.providerCount),
+      description: getProviderUpdatedDescription(input.providerCount, providers),
       dismissAfterVisibleMs: PROVIDER_UPDATE_SUCCESS_VISIBLE_MS,
     };
   }
@@ -319,7 +349,7 @@ export function getSingleProviderUpdateProgressToastView(
     providers: [provider],
     providerCount: 1,
   });
-  const providerName = PROVIDER_DISPLAY_NAMES[provider.driver] ?? provider.driver;
+  const providerName = updateSubjectName(provider.driver);
 
   switch (view.phase) {
     case "running":
@@ -417,8 +447,7 @@ export function getProviderUpdateSidebarPillView(
   const activeProviders = dedupedProviders.filter(isProviderUpdateActive);
   if (activeProviders.length > 0) {
     const activeProvider = activeProviders[0]!;
-    const activeProviderName =
-      PROVIDER_DISPLAY_NAMES[activeProvider.driver] ?? activeProvider.driver;
+    const activeProviderName = updateSubjectName(activeProvider.driver);
     return {
       key: `loading:${activeProviders
         .map((provider) => `${provider.driver}:${provider.updateState?.status ?? "idle"}`)
@@ -469,8 +498,7 @@ export function getProviderUpdateSidebarPillView(
   );
   if (unchangedProviders.length > 0) {
     const unchangedProvider = unchangedProviders[0]!;
-    const unchangedProviderName =
-      PROVIDER_DISPLAY_NAMES[unchangedProvider.driver] ?? unchangedProvider.driver;
+    const unchangedProviderName = updateSubjectName(unchangedProvider.driver);
     const unchangedMessage =
       unchangedProviders.length === 1 ? unchangedProvider.updateState?.message : null;
     terminalCandidates.push({
@@ -513,7 +541,7 @@ export function getProviderUpdateSidebarPillView(
         succeededProviders.length === 1
           ? getProviderUpdatedTitle(succeededProvider)
           : `${succeededProviders.length} providers updated`,
-      description: getProviderUpdatedDescription(succeededProviders.length),
+      description: getProviderUpdatedDescription(succeededProviders.length, succeededProviders),
       dismissAfterVisibleMs: PROVIDER_UPDATE_SUCCESS_VISIBLE_MS,
     });
   }
@@ -546,7 +574,7 @@ function getProviderUpdateInitialToastTitle(
 ): string {
   if (providers.length === 1) {
     const provider = providers[0]!;
-    const providerName = PROVIDER_DISPLAY_NAMES[provider.driver] ?? provider.driver;
+    const providerName = updateSubjectName(provider.driver);
     return `Update Available: ${providerName} ${formatVersion(provider.versionAdvisory.latestVersion)}`;
   }
   return `Updates Available: ${providers.length} providers`;
@@ -784,9 +812,7 @@ export interface ProviderUpdateRowStatus {
 }
 
 function environmentProviderNames(group: LocalEnvironmentUpdateGroup): string {
-  return group.candidates
-    .map((candidate) => PROVIDER_DISPLAY_NAMES[candidate.driver] ?? candidate.driver)
-    .join(", ");
+  return group.candidates.map((candidate) => updateSubjectName(candidate.driver)).join(", ");
 }
 
 /**
