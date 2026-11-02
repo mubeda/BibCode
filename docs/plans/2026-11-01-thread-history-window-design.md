@@ -1,6 +1,6 @@
 # Thread History Window
 
-Status: Draft for approval, revision 3, 2026-11-01. Issue #226.
+Status: Approved 2026-11-01 (Codex review, 4 rounds; final page-order finding fixed in revision 4). Issue #226. Lands after #227.
 
 - Depends on #225, the 3G baseline and the byte-budget test.
 - Lands after #227, because it reuses #227's `filesTotal` checkpoint field.
@@ -445,8 +445,12 @@ the same either way.
     lower-precedence source is dropped when a higher one holds the id. The
     window's copy is the server's current version.
   - **Order:** each merged array is put in **the server's canonical order for
-    that collection**. Each source is already sorted, so this is a linear
-    merge of three sorted lists, not a concatenation:
+    that collection** by sorting the deduplicated result with that
+    collection's comparator. A linear merge is not enough: pages arrive
+    newest-first by `K`, so accumulated older rows are not in canonical order
+    (an unrelated `(sequence 100)` row can precede a stale `(sequence 10)`
+    status row). The sort runs only when the window or `older` changes. Test:
+    `merge_restores_canonical_activity_order_across_newest_first_pages`:
     - **Activities:** `sequence` (null first), then `createdAt`, then `id`,
       as in `ACTIVITY_LIST_ORDER` (`repositories.rs:3398`). After a clock
       correction, an effective status row can have the highest `sequence` but
