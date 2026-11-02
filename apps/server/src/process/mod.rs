@@ -23,6 +23,8 @@ pub use background::{
     configure_supervised_background_command_wrap,
 };
 pub(crate) use cleanup::ProcessCleanupReport;
+#[cfg(unix)]
+pub(crate) use cleanup::group_kill_refusal_is_stopped;
 pub(crate) use executable::{
     PreparedLaunch, SpawnPlan, launch_executable_extensions, locate_executable,
     wrap_launch_program, wrap_windows_batch_command,

@@ -10064,12 +10064,28 @@ mod tests {
             .await
             .unwrap();
         manager.clear("thread-unit", "term-unit").await.unwrap();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), attachment.recv())
-                .await
-                .unwrap(),
-            Some(AttachmentItem::Event(TerminalEvent::Cleared { .. }))
-        ));
+        // The write and resize above can publish output, resize, or activity events first.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match attachment.recv().await {
+                    Some(AttachmentItem::Event(TerminalEvent::Cleared { .. })) => break,
+                    Some(AttachmentItem::Event(
+                        TerminalEvent::Output { .. }
+                        | TerminalEvent::Resized { .. }
+                        | TerminalEvent::Activity { .. },
+                    )) => {}
+                    Some(AttachmentItem::Event(event)) => {
+                        panic!("expected the clear, got {event:?}")
+                    }
+                    Some(AttachmentItem::Resync { .. }) => {
+                        panic!("expected the clear, got a resync")
+                    }
+                    None => panic!("the attachment ended before the clear"),
+                }
+            }
+        })
+        .await
+        .expect("cleared event");
 
         let restarted = manager.restart(input).await.unwrap();
         assert_eq!(restarted.status, TerminalStatus::Running);

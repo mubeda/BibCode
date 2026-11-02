@@ -811,7 +811,6 @@ impl FakeSdk {
     }
 
     pub(crate) fn write(self) -> Self {
-        use std::{fs, os::unix::fs::PermissionsExt};
         let avds = self
             .avds
             .iter()
@@ -830,10 +829,11 @@ impl FakeSdk {
             calls = self.list_avds_calls_file().display(),
             delay = self.list_avds_delay_secs
         );
+        // A child writes each script: an in-process write leaves a writable descriptor that a
+        // sibling test's fork can inherit, and then running the script fails with ETXTBSY.
         let write_script = |path: &Path, body: &str| {
-            fs::create_dir_all(path.parent().expect("script parent")).expect("script dir");
-            fs::write(path, body).expect("write script");
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+            std::fs::create_dir_all(path.parent().expect("script parent")).expect("script dir");
+            crate::test_support::executable_fixture::write_executable(path, body);
         };
         write_script(&self.dir.path().join("emulator/emulator"), &emulator);
         write_script(&launch, &self.launch_script());
