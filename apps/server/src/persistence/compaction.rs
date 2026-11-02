@@ -23,7 +23,7 @@ use super::{
     backup::{
         BACKUP_TIMEOUT, DatabaseStatsUnavailable, OfflineRecoveryGuard, RECOVERY_TIMEOUT,
         classify_store_files, create_verified_backup, database_file_sizes, directory_volume,
-        path_entry_exists, sqlite_sidecars_present, state_kind_name,
+        is_reparse_point, path_entry_exists, sqlite_sidecars_present, state_kind_name,
     },
     database::{AutoVacuumMode, PageStats, VacuumOutcome, open_immutable, page_stats},
     migrations::validate_bibcode_schema,
@@ -70,6 +70,8 @@ pub enum CompactTestHook {
     CancelAfterBackup,
     /// The `VACUUM` progress handler cancels the token on its first call.
     CancelDuringVacuum,
+    /// Removing the stale `-shm` after a verified compaction fails.
+    FailCleanup,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -239,24 +241,37 @@ async fn compact_locked(
     let mut report = locked?;
 
     trace.step = "cleanup";
+    // Every error from here on names the published backup.
+    let backup_id = report
+        .backup_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let backup_label = report.backup_id.clone().unwrap_or_default();
+    let cleanup_failed = |detail: String| RecoveryError::CompactFailed {
+        phase: "cleanup",
+        backup_id,
+        message: format!(
+            "The database was compacted, but its cleanup failed: {detail}. The pre-compact \
+             backup {backup_label} is kept. Run `bibcode storage compact` again to finish."
+        ),
+    };
     // In exclusive locking mode SQLite never opens `-shm`, so its close leaves a crash-left one
     // beside no WAL. Nothing else can have it open while the runtime lock is held.
-    let (wal, shm) = sqlite_sidecars_present(&paths.database)?;
+    let (wal, shm) = sqlite_sidecars_present(&paths.database)
+        .map_err(|error| cleanup_failed(error_chain(&error)))?;
     if !wal && shm {
-        let shm_path = sidecar(&paths.database, "-shm");
-        std::fs::remove_file(&shm_path).map_err(|source| RecoveryError::CompactFailed {
-            phase: "cleanup",
-            backup_id: report
-                .backup_id
-                .as_deref()
-                .and_then(|id| Uuid::parse_str(id).ok()),
-            message: format!(
-                "The database was compacted, but its stale state.sqlite-shm could not be \
-                 removed: {source}. Run `bibcode storage compact` again to finish."
-            ),
+        let removed = if hook == CompactTestHook::FailCleanup {
+            Err(std::io::Error::other("injected cleanup failure"))
+        } else {
+            std::fs::remove_file(sidecar(&paths.database, "-shm"))
+        };
+        removed.map_err(|source| {
+            cleanup_failed(format!("state.sqlite-shm could not be removed: {source}"))
         })?;
     }
-    let (after_file, after_wal, _) = database_file_sizes(&paths.database)?.unwrap_or_default();
+    let (after_file, after_wal, _) = database_file_sizes(&paths.database)
+        .map_err(|error| cleanup_failed(error_chain(&error)))?
+        .unwrap_or_default();
     if let Some(after) = &mut report.after {
         after.file_bytes = after_file;
         after.wal_bytes = after_wal;
@@ -490,6 +505,26 @@ fn check_compactable_files(paths: &StatePaths) -> Result<StorageInstanceId, Reco
         (StoreInspectionStatus::Existing, Some(storage_instance_id)) => storage_instance_id,
         (classification, _) => return Err(not_compactable(classification, files.issue)),
     };
+    // SQLite resolves links and keeps its sidecars beside the target, where none of the checks
+    // below would look.
+    for (path, name) in [
+        (&paths.state_dir, "The state directory"),
+        (&paths.database, "state.sqlite"),
+    ] {
+        let metadata = std::fs::symlink_metadata(path).map_err(|source| BackupError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err(RecoveryError::NotCompactable {
+                detail: format!(
+                    "{name} is a symbolic link or junction, so it cannot be compacted safely: \
+                     SQLite keeps its recovery files beside the link target. Point BiBCode at \
+                     the real location, then retry."
+                ),
+            });
+        }
+    }
     // A zero-length file would be initialized by the first write transaction.
     check_database_header(&paths.database)?;
     // The first access would roll a hot journal back into the file.
@@ -713,25 +748,36 @@ fn check_free_space(
 fn sqlite_temp_dir() -> PathBuf {
     #[cfg(unix)]
     {
-        for variable in ["SQLITE_TMPDIR", "TMPDIR"] {
-            if let Some(directory) = std::env::var_os(variable).map(PathBuf::from)
-                && directory.is_dir()
-            {
-                return directory;
-            }
-        }
-        for directory in ["/var/tmp", "/usr/tmp", "/tmp"] {
-            let directory = PathBuf::from(directory);
-            if directory.is_dir() {
-                return directory;
-            }
-        }
-        PathBuf::from(".")
+        let from_environment = ["SQLITE_TMPDIR", "TMPDIR"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from);
+        first_usable_temp_dir(
+            from_environment.chain(["/var/tmp", "/usr/tmp", "/tmp", "."].map(PathBuf::from)),
+        )
     }
     #[cfg(not(unix))]
     {
         std::env::temp_dir()
     }
+}
+
+/// The first candidate that is a directory the process may write and search, as SQLite's
+/// `unixTempFileDir` requires.
+#[cfg(unix)]
+fn first_usable_temp_dir(candidates: impl IntoIterator<Item = PathBuf>) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    candidates
+        .into_iter()
+        .find(|directory| {
+            directory.is_dir()
+                && std::ffi::CString::new(directory.as_os_str().as_bytes()).is_ok_and(|path| {
+                    // SAFETY: `path` is NUL-terminated and outlives the call.
+                    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+                })
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(windows)]
@@ -1001,6 +1047,35 @@ mod tests {
         let (same, _) = required_free_bytes(60 * MIB, 50 * MIB, 10 * MIB, true);
         assert_eq!(same.store, required.store + required.temp);
         assert_eq!(same.temp, required.temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_dir_selection_skips_a_directory_sqlite_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root may write to any directory");
+            return;
+        }
+        let root = tempfile::TempDir::new().expect("temp-dir fixture root");
+        let unwritable = root.path().join("unwritable");
+        let writable = root.path().join("writable");
+        std::fs::create_dir(&unwritable).expect("unwritable directory");
+        std::fs::create_dir(&writable).expect("writable directory");
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500))
+            .expect("make the directory read-only");
+
+        let chosen = first_usable_temp_dir([
+            root.path().join("missing"),
+            unwritable.clone(),
+            writable.clone(),
+        ]);
+
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert_eq!(chosen, writable);
     }
 
     #[test]

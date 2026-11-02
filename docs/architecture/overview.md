@@ -720,7 +720,9 @@ preservation therefore leaves recoverable files and an explicit incomplete
 operation instead of silently converting the root into a first-run store.
 
 `bibcode storage compact` takes the same two locks, then checks the store from
-its files (a marked store, a SQLite header, no rollback journal) and opens one
+its files (a marked store, no symbolic link or junction for the state directory
+or `state.sqlite`, since SQLite keeps sidecars beside a link's target, a SQLite
+header, no rollback journal) and opens one
 writable connection with `busy_timeout = 0` and `locking_mode = EXCLUSIVE` set
 before its first access, so SQLite keeps the WAL index in heap memory and a
 `BEGIN EXCLUSIVE` probe refuses at once while another program has the database
@@ -1561,7 +1563,10 @@ are listed in the
   cannot reach the global handle. While it holds the store's exclusive runtime
   lock, and only when the persisted `enableProfiler` is on, it starts an
   `OfflineWriter`: a `ProfilerStore` with a fresh `sid` that writes events with
-  source `cli`, writes no `session.json`, and flushes within 2 s when dropped.
+  source `cli` and writes no `session.json`. It holds `profiler/.lock` for its
+  life, with the runtime's brief retry, and records nothing when another writer
+  still holds it. Dropping it waits at most 2 s for the writer to finish, and a
+  writer stuck on disk keeps its lock until it does.
   It records `storage.compact` `start` and `end` (outcome, failed step, page
   size, before and after sizes, free pages and `auto_vacuum`, and timings),
   never paths, IDs or error text. A refusal because BiBCode owns the store is

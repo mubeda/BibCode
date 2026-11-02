@@ -121,16 +121,20 @@ pub fn note_exit(cause: &str, detail: Option<&str>) {
 
 /// Records the events of one offline CLI command, with source `cli`, when no server runs.
 ///
-/// It writes no session sentinel, so crash and clean-shutdown detection are untouched. Start it
-/// only while holding the store's exclusive runtime lock, so it is never a second writer beside
-/// a live server. Dropping it flushes within 2 s.
+/// It writes no session sentinel, so crash and clean-shutdown detection are untouched. It holds
+/// `profiler/.lock` for its whole life, like a server runtime, so it is never a second writer
+/// beside one that is still tearing down. Dropping it waits at most 2 s for the writer to
+/// finish; a stuck disk leaves the writer, and its lock, to finish on its own.
 pub struct OfflineWriter {
-    store: Option<store::ProfilerStore>,
+    store: Option<(store::ProfilerStore, std::fs::File)>,
 }
+
+/// How long dropping an [`OfflineWriter`] may wait for its writer thread.
+const OFFLINE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl OfflineWriter {
     pub fn emit(&self, kind: &'static str, payload: Value) {
-        if let Some(store) = &self.store {
+        if let Some((store, _lock)) = &self.store {
             store.sender().send(event::ProfilerEvent {
                 kind,
                 source: "cli".into(),
@@ -142,26 +146,51 @@ impl OfflineWriter {
 
 impl Drop for OfflineWriter {
     fn drop(&mut self) {
-        if let Some(store) = self.store.take() {
-            if store
-                .sender()
-                .flush_within(std::time::Duration::from_secs(2))
-            {
+        if let Some((store, lock)) = self.store.take() {
+            // The lock is released only once the writer has finished.
+            run_within(OFFLINE_SHUTDOWN_TIMEOUT, move || {
                 store.shutdown();
-            } else {
-                // A stuck disk must not hold the command open; the process exits next.
-                std::mem::forget(store);
-            }
+                drop(lock);
+            });
         }
     }
 }
 
-/// An [`OfflineWriter`] for `state_dir` when its persisted `enableProfiler` setting is on.
+/// Runs `work` on its own thread and waits at most `timeout` for it. Returns whether it
+/// finished in time; work that did not keeps running detached.
+fn run_within<F>(timeout: std::time::Duration, work: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (done, finished) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("bibcode-profiler-offline-shutdown".into())
+        .spawn(move || {
+            work();
+            let _ = done.send(());
+        });
+    spawned.is_ok() && finished.recv_timeout(timeout).is_ok()
+}
+
+/// An [`OfflineWriter`] for `state_dir` when its persisted `enableProfiler` setting is on and
+/// no other process holds `profiler/.lock`.
 pub fn offline_writer(state_dir: &Path) -> Option<OfflineWriter> {
-    persisted_enabled(state_dir).then(|| OfflineWriter {
-        store: Some(store::ProfilerStore::start(store::StoreConfig::new(
-            profiler_dir(state_dir),
-        ))),
+    if !persisted_enabled(state_dir) {
+        return None;
+    }
+    let dir = profiler_dir(state_dir);
+    let lock = match runtime::lock_dir(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(%error, "the profiler directory is busy; offline events are not recorded");
+            return None;
+        }
+    };
+    Some(OfflineWriter {
+        store: Some((
+            store::ProfilerStore::start(store::StoreConfig::new(dir)),
+            lock,
+        )),
     })
 }
 
@@ -216,5 +245,68 @@ pub fn amend_finding(occurrence: &findings::Occurrence, extra: Map<String, Value
                 time::OffsetDateTime::now_utc(),
                 &handle.sender,
             );
+    }
+}
+
+#[cfg(test)]
+mod offline_writer_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn enable_profiler(state_dir: &Path) {
+        std::fs::write(
+            state_dir.join("settings.json"),
+            br#"{"enableProfiler": true}"#,
+        )
+        .expect("profiler settings");
+    }
+
+    #[test]
+    fn offline_writer_records_nothing_while_another_writer_holds_the_profiler_lock() {
+        let state_dir = tempfile::tempdir().expect("state directory");
+        enable_profiler(state_dir.path());
+        let runtime_lock = runtime::lock_dir(&profiler_dir(state_dir.path()))
+            .expect("a runtime writer still holds the lock");
+
+        assert!(offline_writer(state_dir.path()).is_none());
+
+        drop(runtime_lock);
+        let writer = offline_writer(state_dir.path()).expect("free lock gives a writer");
+        assert!(
+            runtime::lock_dir(&profiler_dir(state_dir.path())).is_err(),
+            "the offline writer holds the lock for its life"
+        );
+        writer.emit("storage.compact", serde_json::json!({ "phase": "start" }));
+        drop(writer);
+        let lock = runtime::lock_dir(&profiler_dir(state_dir.path()))
+            .expect("dropping the writer releases the lock");
+        drop(lock);
+        let events = std::fs::read_dir(profiler_dir(state_dir.path()))
+            .expect("profiler directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("events-"))
+            .map(|entry| std::fs::read_to_string(entry.path()).expect("events file"))
+            .collect::<String>();
+        assert!(events.contains("\"source\":\"cli\""), "{events}");
+    }
+
+    #[test]
+    fn offline_shutdown_is_bounded_even_when_the_writer_never_finishes() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+
+        let finished = run_within(Duration::from_millis(200), move || {
+            let _ = blocked.recv();
+        });
+
+        assert!(!finished);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(release);
+        assert!(run_within(Duration::from_secs(5), || {}));
     }
 }

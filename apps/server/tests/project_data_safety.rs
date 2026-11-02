@@ -2593,3 +2593,161 @@ async fn pre_compact_backup_restores_with_restore_backup_id() {
             .any(|backup| backup.manifest.backup_id == older.manifest.backup_id)
     );
 }
+
+/// Links `link` to the file `target`; `false` when this platform or account cannot.
+fn link_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        symlink(target, link).expect("file symlink");
+        true
+    }
+    #[cfg(windows)]
+    {
+        // Windows file symlinks need Developer Mode or an elevated account.
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+}
+
+/// Links the directory `link` to `target`: a symlink on Unix, a junction on Windows (no
+/// privilege needed).
+fn link_directory(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    symlink(target, link).expect("directory symlink");
+    #[cfg(windows)]
+    junction::create(target, link).expect("directory junction");
+}
+
+#[tokio::test]
+async fn compact_refuses_a_linked_database_before_touching_the_target() {
+    // The target is a crash-left WAL store; SQLite would recover and checkpoint the WAL beside
+    // the link target, which the sidecar checks next to the link never see.
+    let (_target_root, _target_config, target) = crashed_store_fixture(0);
+    let target_bytes = sqlite_bytes(&target.database);
+    let refuse = CompactTestHook::FreeSpace {
+        store: 1024,
+        temp: u64::MAX / 4,
+        same_volume: false,
+    };
+
+    // The database file itself is a link.
+    let linked = StoreFixture::new();
+    if link_file(&target.database, &linked.paths.database) {
+        std::fs::copy(&target.environment_id, &linked.paths.environment_id)
+            .expect("linked store marker");
+        let error = compact(&linked.config, false, refuse)
+            .await
+            .expect_err("a linked database refuses");
+        assert!(
+            matches!(error, RecoveryError::NotCompactable { .. }),
+            "{error:?}"
+        );
+        let error = compact(&linked.config, true, PLENTY)
+            .await
+            .expect_err("the dry run refuses too");
+        assert!(
+            matches!(error, RecoveryError::NotCompactable { .. }),
+            "{error:?}"
+        );
+        assert_eq!(sqlite_bytes(&target.database), target_bytes);
+        assert!(backup_entries(&linked.paths).is_empty());
+    } else {
+        eprintln!("skipped the file-link case: this account cannot create file symlinks");
+    }
+
+    // The state directory is a link (a junction on Windows).
+    let root = TempDir::new().expect("linked root");
+    let mut config = ServerConfig::new(root.path());
+    let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+    config.base_dir = resolved.effective.clone();
+    config.resolved_data_root = Some(resolved);
+    let paths = StatePaths::from_config(&config);
+    link_directory(&target.state_dir, &paths.state_dir);
+    let error = compact(&config, false, refuse)
+        .await
+        .expect_err("a linked state directory refuses");
+    assert!(
+        matches!(error, RecoveryError::NotCompactable { .. }),
+        "{error:?}"
+    );
+    assert_eq!(sqlite_bytes(&target.database), target_bytes);
+    assert!(backup_entries(&paths).is_empty());
+    assert!(backup_entries(&target).is_empty());
+}
+
+#[tokio::test]
+async fn compact_cancelled_during_vacuum_keeps_a_full_auto_vacuum_mode() {
+    let fixture = StoreFixture::new();
+    let mut connection = Connection::open(&fixture.paths.database).expect("fixture database");
+    connection
+        .pragma_update(None, "auto_vacuum", "FULL")
+        .expect("FULL before the first table");
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("fixture WAL mode");
+    run_migrations(&mut connection, None).expect("fixture migrations");
+    connection
+        .execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO projection_projects (
+               project_id, title, workspace_root, default_model_selection_json,
+               scripts_json, created_at, updated_at, deleted_at
+             ) SELECT 'kept-' || i, hex(randomblob(200)), '/tmp/kept', NULL, '{{}}',
+                      '{TS}', '{TS}', NULL FROM n;"
+        ))
+        .expect("fixture rows");
+    connection.close().expect("close fixture database");
+    fixture.write_marker(Uuid::new_v4());
+    assert_eq!(
+        immutable_stats(&fixture.paths.database).3,
+        1,
+        "fixture is FULL"
+    );
+    let rows_before = snapshot_file(&fixture.paths.database);
+
+    let error = compact(&fixture.config, false, CompactTestHook::CancelDuringVacuum)
+        .await
+        .expect_err("cancelled during VACUUM");
+
+    assert!(
+        matches!(error, RecoveryError::Cancelled { backup_id: Some(_) }),
+        "{error:?}"
+    );
+    assert_eq!(
+        immutable_stats(&fixture.paths.database).3,
+        1,
+        "a cancelled compaction leaves auto_vacuum FULL"
+    );
+    assert_eq!(snapshot_file(&fixture.paths.database), rows_before);
+}
+
+#[tokio::test]
+async fn compact_cleanup_failure_names_the_pre_compact_backup() {
+    let (_root, config, paths) = crashed_store_fixture(0);
+
+    let error = compact(&config, false, CompactTestHook::FailCleanup)
+        .await
+        .expect_err("cleanup failure");
+
+    let RecoveryError::CompactFailed {
+        phase,
+        backup_id: Some(backup_id),
+        ..
+    } = &error
+    else {
+        panic!("unexpected error {error:?}");
+    };
+    assert_eq!(*phase, "cleanup");
+    assert!(
+        error.to_string().contains(&backup_id.to_string()),
+        "the displayed error names the backup: {error}"
+    );
+    let inventory = inventory_verified_backups(&paths, storage_id(&paths))
+        .await
+        .expect("inventory");
+    assert!(
+        inventory
+            .verified
+            .iter()
+            .any(|backup| backup.manifest.backup_id == *backup_id)
+    );
+}
