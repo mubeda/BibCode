@@ -1189,15 +1189,17 @@ impl DeviceFixture {
     }
 }
 
-/// Polls `done` for up to ten seconds.
+/// Polls `done` for up to a minute. It returns the moment `done` holds; the limit only bounds a
+/// failure, and the device tests run pinned to two CPUs, where a fake `adb` or a stopping
+/// helper can wait seconds for a core.
 pub(crate) async fn wait_until(done: impl Fn() -> bool) {
-    for _ in 0..400 {
+    for _ in 0..2_400 {
         if done() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("condition not reached within ten seconds");
+    panic!("condition not reached within a minute");
 }
 
 /// A loopback stand-in for scrcpy-server v4.1 behind `adb forward`: the first connection
