@@ -29,8 +29,10 @@ The recovery dialog shows:
 - **Storage ID:** the persistent `storageInstanceId` stored in the
   `environment-id` marker.
 - **Verified backups:** the newest three verified generations for that storage
-  identity and state kind. Backups are created before a migration and before a
-  coordinated in-app update.
+  identity and state kind. Backups are created before a migration, a
+  coordinated in-app update, or a compaction. At most one of the three is a
+  `pre-compact` backup: a new compaction replaces the previous pre-compact
+  backup instead of pushing out an older pre-update or pre-migration one.
 
 An alias warning means that the requested and effective roots differ. It is not
 itself corruption, but changing the target of an alias selects different data.
@@ -92,6 +94,95 @@ storage mismatch, and recovery. **No projects yet** is valid only after the
 environment catalog has loaded, at least one environment is desired, and every
 desired environment has supplied a successful live authoritative snapshot that
 is genuinely empty.
+
+## Reclaim database space
+
+SQLite keeps the pages that deleted rows free inside `state.sqlite`, so the
+file does not shrink on its own. Check how much space a store could give back
+with:
+
+```sh
+bibcode storage inspect
+```
+
+Its `database` object reports:
+
+- `fileBytes`, `walBytes` and `shmBytes`: the sizes of `state.sqlite` and its
+  sidecars, always.
+- `pageSize`, `pageCount`, `freelistCount`, `reclaimableBytes`
+  (`freelistCount × pageSize`) and `autoVacuum` (`none`, `full` or
+  `incremental`): read from the database header only when it can be done
+  without creating or changing any file. Otherwise they are `null` and
+  `databaseStatsUnavailable` says why: `store-running` (a BiBCode app, server,
+  MCP relay or pairing command owns the data root), `uncheckpointed-wal` (a
+  `state.sqlite-wal` or `-shm` file is present, so the header would be out of
+  date) or `unreadable`.
+
+Inspection never opens SQLite while a BiBCode process owns the data root, and
+it reports the store from its files instead. If an offline store has exactly
+one sidecar, or has sidecars but has never been owned by a server, inspection
+reports `unsafe-database-state` rather than create a file. Start BiBCode once
+and quit it, or run `bibcode storage compact`, which recovers the sidecars under
+its own lock.
+
+To reclaim the space, quit the BiBCode app, stop `bibcode serve` and any WSL
+backend, and stop the background service (`bibcode service status` shows it).
+Then preview the compaction:
+
+```sh
+bibcode storage compact --dry-run
+```
+
+The dry run changes nothing and creates no files. It reports the expected
+reclaim, the size of the backup the real run takes, and the free space it
+needs on the data-root volume and on the volume that holds SQLite's temporary
+files. It refuses, with the same error and exit status as the real run, when a
+BiBCode process owns the store, the store is not in a compactable state, the
+schema is not recognized, or there is not enough free space. It does not check
+whether another program has the database open, and it cannot predict whether
+the backup fits its time budget.
+
+Then compact:
+
+```sh
+bibcode storage compact
+```
+
+The command:
+
+1. takes the store's exclusive runtime lock and storage-operation lock, and
+   refuses if any BiBCode process owns the data root;
+2. opens the database exclusively and refuses at once if another program has
+   it open; changes left in `state.sqlite-wal` by a crash are written back
+   under this lock, as a server start would;
+3. checks the free space and refuses with the numbers if there is not enough;
+4. takes a verified `pre-compact` backup of the whole store;
+5. runs `VACUUM`, which also switches the store to `auto_vacuum = incremental`,
+   then checks its integrity.
+
+Every refusal before the backup leaves `state.sqlite` and its sidecars exactly
+as they were. Progress goes to stderr; stdout carries one JSON report with
+`before`, `plan`, `backupId`, `after` and `reclaimedBytes`. Press Ctrl-C to
+cancel: before or during `VACUUM` the database is left as it was, and the
+pre-compact backup is kept.
+
+Compaction temporarily uses more disk, not less: right after it, the store
+uses its compacted size plus the pre-compact backup, which is as large as the
+store was. Older backups are also full-size copies. They shrink only as newer
+backups replace them.
+
+If verification fails after `VACUUM`, the error names the pre-compact backup.
+Restore it with:
+
+```sh
+bibcode storage restore --backup-id <backup-id>
+```
+
+Stores created by this release start with `auto_vacuum = incremental`.
+Existing stores report `none` until they are compacted. BiBCode does not yet
+return free pages in the background, and compaction of a store whose backup
+takes more than 30 seconds is not supported yet; such a store is refused before
+anything is written.
 
 ## Limits and unrelated leftovers
 
