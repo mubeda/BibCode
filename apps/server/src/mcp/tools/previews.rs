@@ -3,21 +3,30 @@
 //! agents get client twins of the same names (slice D), which take the thread as `threadId`
 //! and are checked per call. Both kinds reach [`run`], so they share one implementation.
 
-use serde_json::{Value, json};
+use std::sync::LazyLock;
+
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::SCOPE_ORCHESTRATION_OPERATE,
     device::DeviceOpError,
     mcp::{
-        control::{
-            Family, McpAccess, ProgressSink, ToolCall, ToolFuture, ToolResult, ToolSpec,
-            object_schema,
-        },
+        control::{Family, McpAccess, ProgressSink, ToolCall, ToolFuture, ToolResult, ToolSpec},
         protocol::{tool_result, typed_tool_failure},
     },
     production::connect_mcp::{DeviceTools, PreviewInvoker, PreviewScope, device_tool_descriptors},
 };
+
+/// Each `preview_*` tool's description and compact input schema, generated from the contracts'
+/// `PreviewAutomation*Input` schemas (`vp run check:contracts` keeps the file in step), so a
+/// provider's tool and its client twin advertise the arguments the preview host decodes.
+pub(crate) static PREVIEW_SCHEMAS: LazyLock<Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!(
+        "../../../../../packages/contracts/fixtures/mcp-tools/preview-tools.json"
+    ))
+    .expect("the preview tool schema fixture is JSON")
+});
 
 const OPERATE: &str = SCOPE_ORCHESTRATION_OPERATE;
 
@@ -117,9 +126,9 @@ macro_rules! device_text {
     };
 }
 
-/// Each client twin's description and input schema. A preview tool's other arguments go to
-/// the preview host as they are, as a provider's do; a device tool takes the provider tool's
-/// arguments.
+/// Each client twin's description and input schema: the provider tool's, with the thread. The
+/// preview host validates a preview tool's arguments against the full contract; a device tool
+/// takes the provider tool's arguments.
 fn text(name: &str) -> Option<(&'static str, Value)> {
     let description = match name {
         "preview_status" => preview_text!(
@@ -188,17 +197,10 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
         input["required"] = std::iter::once(json!("threadId")).chain(required).collect();
         input
     } else {
-        let mut input = object_schema(
-            json!({
-                "threadId": thread,
-                "tabId": {
-                    "type": "string",
-                    "description": "A tab other than this connection's own.",
-                },
-            }),
-            &["threadId"],
-        );
-        input["additionalProperties"] = json!(true);
+        let mut input = PREVIEW_SCHEMAS.get(name)?["inputSchema"].clone();
+        input["properties"]["threadId"] = thread;
+        let required = input["required"].as_array().cloned().unwrap_or_default();
+        input["required"] = std::iter::once(json!("threadId")).chain(required).collect();
         input
     };
     Some((description, input))
@@ -477,10 +479,11 @@ pub(crate) fn preview_tool_descriptors() -> Vec<Value> {
         .map(|operation| {
             let name = format!("preview_{operation}");
             let read_only = matches!(*operation, "status" | "snapshot" | "wait_for");
+            let schema = &PREVIEW_SCHEMAS[&name];
             json!({
                 "name":name,
-                "description":format!("Control the collaborative browser preview ({operation})."),
-                "inputSchema":{"type":"object","additionalProperties":true},
+                "description":schema["description"],
+                "inputSchema":schema["inputSchema"],
                 "annotations":{
                     "title":format!("Preview {operation}"),
                     "readOnlyHint":read_only,
@@ -496,6 +499,78 @@ pub(crate) fn preview_tool_descriptors() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `true` if `schema` is open anywhere: `additionalProperties: true` at any depth.
+    fn is_open(schema: &Value) -> bool {
+        match schema {
+            Value::Object(map) => {
+                map.get("additionalProperties") == Some(&json!(true)) || map.values().any(is_open)
+            }
+            Value::Array(items) => items.iter().any(is_open),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn every_preview_tool_has_a_generated_compact_schema() {
+        let mut names: Vec<String> = TOOL_OPERATIONS
+            .iter()
+            .map(|operation| format!("preview_{operation}"))
+            .collect();
+        // The fixture is keyed alphabetically here, the descriptors follow `TOOL_OPERATIONS`.
+        let mut keys: Vec<String> = PREVIEW_SCHEMAS.keys().cloned().collect();
+        keys.sort();
+        names.sort();
+        assert_eq!(keys, names);
+        names = TOOL_OPERATIONS
+            .iter()
+            .map(|operation| format!("preview_{operation}"))
+            .collect();
+        let descriptors = preview_tool_descriptors();
+        for (descriptor, name) in descriptors.iter().zip(&names) {
+            let fixture = &PREVIEW_SCHEMAS[name];
+            assert_eq!(descriptor["inputSchema"], fixture["inputSchema"], "{name}");
+            assert_eq!(descriptor["description"], fixture["description"], "{name}");
+            assert!(!is_open(&descriptor["inputSchema"]), "{name} is open");
+            assert_eq!(descriptor["inputSchema"]["type"], "object", "{name}");
+            assert!(
+                descriptor["inputSchema"]["properties"]["tabId"].is_object(),
+                "{name} takes tabId"
+            );
+            assert_ne!(
+                descriptor["description"],
+                format!("Control the collaborative browser preview ({name})."),
+                "{name} says what it does"
+            );
+        }
+    }
+
+    #[test]
+    fn a_twin_declares_the_provider_arguments_and_requires_the_thread() {
+        for operation in TOOL_OPERATIONS {
+            let name = format!("preview_{operation}");
+            let (_, twin) = text(&name).expect("a twin text");
+            let provider = &PREVIEW_SCHEMAS[&name]["inputSchema"];
+            let mut expected_properties = provider["properties"].clone();
+            expected_properties["threadId"] = twin["properties"]["threadId"].clone();
+            assert_eq!(twin["properties"], expected_properties, "{name}");
+            assert!(twin["properties"]["threadId"]["type"] == "string", "{name}");
+            let mut required = vec![json!("threadId")];
+            required.extend(provider["required"].as_array().cloned().unwrap_or_default());
+            assert_eq!(twin["required"], json!(required), "{name}");
+            assert!(!is_open(&twin), "{name} is open");
+        }
+        // Fields the contract requires stay required next to the thread.
+        for (name, required) in [
+            ("preview_resize", json!(["threadId", "mode"])),
+            ("preview_type", json!(["threadId", "text"])),
+            ("preview_press", json!(["threadId", "key"])),
+            ("preview_evaluate", json!(["threadId", "expression"])),
+            ("preview_click", json!(["threadId"])),
+        ] {
+            assert_eq!(text(name).unwrap().1["required"], required, "{name}");
+        }
+    }
 
     #[test]
     fn a_device_failure_keeps_the_ids_and_states_an_agent_can_act_on() {
