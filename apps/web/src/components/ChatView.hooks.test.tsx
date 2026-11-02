@@ -186,6 +186,7 @@ vi.mock("../state/use-atom-command", () => ({
 }));
 
 vi.mock("../state/threads", () => ({
+  useThreadFindLoadState: () => ({ status: "live", hasData: true, error: null }),
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
