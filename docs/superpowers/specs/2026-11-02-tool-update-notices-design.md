@@ -1,6 +1,6 @@
 # Tool Update Notices Design (Claude Code and CodeGraph)
 
-Status: Revised for Codex review round 2. Option A, the Claude Code external
+Status: Revised for Codex review round 3. Option A, the Claude Code external
 update toast, and "no in-use guard in the first cut" are decided. Nothing in
 this document is implemented except the Claude Code regression tests named
 under "Claude Code today".
@@ -166,25 +166,67 @@ So `server.updateTool` does not run the command in its own handler:
   `tracing::warn!` with the tool and proceeds (shutdown's process cleanup and
   the Windows job object then reap it), and the recovery below covers the
   result.
-- **Recovery if interrupted.** After any update that ends without a verified
-  success (timeout, non-zero exit, shutdown, crash) and on every startup, the
-  next probe runs `codegraph --version`. A probe that fails or prints no
-  version for an executable that still resolves, or a resolved path whose
-  install directory no longer exists, is reported as a **broken install**:
-  `installed: true`, `version: null`, advisory `unknown` with the message
-  "CodeGraph looks damaged (the last update may have been interrupted)." The
-  one-click action becomes a reinstall (`codegraph upgrade --force`, or the npm
-  install command for an npm install) when the executable still runs;
-  otherwise the row shows the manual reinstall instructions. BiBCode never
-  deletes or repairs files itself.
+- **Maintenance admission.** The detached task keeps the request's maintenance
+  admission permit (`RpcPermit`) until the update has settled and published its
+  outcome, the way `clone_operations.rs` holds `admission` in its spawned task.
+  A server self-update or other maintenance drain therefore names this update
+  and cannot quiesce while CodeGraph is replacing files, even after the caller
+  disconnected. Locals drop in reverse order, so the final state is published
+  first and the permit is released last. Test: start `server.updateTool` with a
+  slow injected updater, drop the request, begin a maintenance drain, and
+  assert the drain stays pending and reports the tool update until the updater
+  finishes, then completes.
+- **Tool states are not provider states.** Two provider-only paths would
+  otherwise discard a running tool reservation: the settings-save validation in
+  `control.rs` (`invalidate_update_lifecycles` keeps a lifecycle only if
+  `provider_inventory::maintenance_target` still finds its target, and tools are
+  not in settings) and the full-refresh pruning (`prune_update_states` keeps only
+  identities present in the provider array). Tool update lifecycles and states
+  live in a **separate map** in `ProviderMaintenance` (keyed by tool id), and
+  both functions iterate only the provider map, so they cannot see or remove a
+  tool entry. A tool reservation is invalidated only by its own completion or by
+  shutdown. Tests: save settings (a change to any provider instance) during a
+  tool update and assert the reservation, the running `updateState` and the
+  command lock survive; run a full provider refresh and a provider-only
+  `server.updateProvider` during a tool update and assert the same.
+- **Recovery if interrupted.** `--version` cannot be the health signal:
+  CodeGraph 1.6.2 reads `package.json` for it without loading the runtime, so a
+  partial swap (runtime files missing) still prints a version, and if the
+  launcher itself vanished, PATH resolution reports "not installed" and hides
+  the damage. Recovery therefore rests on a persisted marker, not on the probe:
+  - Before spawning, the task writes an **update-in-progress marker** (one small
+    JSON file per tool in the server data directory, written atomically and
+    synced) holding the tool id, the resolved install path, the version before
+    the update, and the start time. It is removed only after a **verified
+    finish** (exit zero and the post-update reprobe shows `current` or an
+    advanced version).
+  - If a marker is present at startup, or an update ends unverified (timeout,
+    non-zero exit, shutdown, crash), the tool is reported as **possibly
+    broken**, regardless of what `--version` says or whether the launcher still
+    resolves: `installed: true` (even when PATH no longer finds it, as the
+    marker names the path), `version` as probed or `null`, advisory `unknown`,
+    message "CodeGraph may be damaged (the last update did not finish
+    cleanly)." The one-click action is a reinstall (`codegraph upgrade --force`,
+    or the npm install command for an npm install) when the marker's install
+    path still holds a runnable launcher; otherwise the row shows the
+    installer's manual reinstall instructions. A successful reinstall clears
+    the marker the same way as any verified finish.
+  - A marker whose process is alive (an update running in this server) is not
+    stale; a marker found at startup never is, because the server that wrote it
+    exited. BiBCode never deletes or repairs install files itself.
 - Tests: with an injected updater command that renames a marker file, sleeps,
   then restores it (a stand-in for the rollback journal), start
   `server.updateTool` and drop the request mid-sleep. Assert the child is still
   alive, finishes and restores the marker, `updateState` ends
-  `succeeded`/`unchanged`, and the broken-install state appears only when the
-  marker is left unrestored and the following probe fails. A second test
-  asserts shutdown during an update waits up to the stated budget and does not
-  kill earlier.
+  `succeeded`/`unchanged`, and the in-progress marker is gone. Then two
+  partial-swap cases, each ending with the updater killed and a server restart:
+  (a) a **missing runtime file** where `--version` still succeeds, and (b) a
+  **missing launcher** where PATH resolution finds nothing. Both must be
+  reported as possibly broken with the reinstall action (or manual
+  instructions for b) because the marker is present, and must clear after a
+  verified reinstall. A further test shows a clean verified update leaves no
+  marker, and a shutdown during an update waits up to the stated budget without
+  killing earlier.
 
 ## Agent configuration
 
@@ -300,7 +342,7 @@ they started with, and the toast says so.
 Fails-before tests at each layer, with no real installs (injected version,
 registry and command sources): `source.rs` recognition rows (standalone, npm,
 unknown, broken install); the adapter advisory/progress test; the
-disconnect-during-update, shutdown-budget and identity-registration tests; the
+disconnect-during-update, marker-recovery (missing runtime file, missing launcher), settings-save and provider-refresh survival, maintenance-drain and identity-registration tests, plus the shutdown-budget test; the
 environment propagation test; contracts schema tests plus the old/new wire
 fixtures (`vp run check:contracts`); web logic tests for the shared candidate
 type, the capability gate (no call to servers without `tools`), the Tools group
