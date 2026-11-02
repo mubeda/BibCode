@@ -526,14 +526,36 @@ fn check_compactable_files(paths: &StatePaths) -> Result<StorageInstanceId, Reco
             });
         }
     }
-    // Another name for the same file has its own sidecars, which SQLite would not see here.
-    if file_link_count(&paths.database)? > 1 {
-        return Err(RecoveryError::NotCompactable {
-            detail: "state.sqlite has another hard link, so it cannot be compacted safely: a \
-                     second name for the same file can hold uncheckpointed changes beside it. \
-                     Remove the other link, then retry."
-                .to_owned(),
-        });
+    // Another name for the database or a sidecar belongs to a second store whose changes
+    // SQLite would not see here, or would truncate.
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = sidecar(&paths.database, suffix);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if !suffix.is_empty() && source.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(source) => return Err(BackupError::Io { path, source }.into()),
+        };
+        let name = format!("state.sqlite{suffix}");
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err(RecoveryError::NotCompactable {
+                detail: format!(
+                    "{name} is a symbolic link or junction, so the store cannot be compacted \
+                     safely. Point BiBCode at the real location, then retry."
+                ),
+            });
+        }
+        if file_link_count(&path)? > 1 {
+            return Err(RecoveryError::NotCompactable {
+                detail: format!(
+                    "{name} has another name (a hard link), so the store cannot be compacted \
+                     safely: the other name may hold changes that are not written into it yet. \
+                     Open that store with BiBCode under its original name and quit it normally \
+                     so its changes are written, then remove the extra name and retry."
+                ),
+            });
+        }
     }
     // A zero-length file would be initialized by the first write transaction.
     check_database_header(&paths.database)?;
