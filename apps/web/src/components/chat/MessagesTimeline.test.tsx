@@ -3044,11 +3044,16 @@ describe("MessagesTimeline older history", () => {
     const anchor = (inView: ReadonlyArray<string>) => {
       const rows = h.legendListProps?.data as ReadonlyArray<{ id: string }>;
       const keep = (
-        h.legendListProps?.maintainVisibleContentPosition as {
-          data?: boolean;
-          shouldRestorePosition?: (item: { id: string }, index: number, data: unknown) => boolean;
-        }
-      ).shouldRestorePosition;
+        h.legendListProps?.maintainVisibleContentPosition as
+          | {
+              shouldRestorePosition?: (
+                item: { id: string },
+                index: number,
+                data: unknown,
+              ) => boolean;
+            }
+          | undefined
+      )?.shouldRestorePosition;
       return inView.find((id) => {
         const index = rows.findIndex((row) => row.id === id);
         return index >= 0 && (keep === undefined || keep(rows[index]!, index, rows));
