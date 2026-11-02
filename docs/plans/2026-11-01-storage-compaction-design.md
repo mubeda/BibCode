@@ -224,7 +224,7 @@ inspect document into a typed struct without `deny_unknown_fields`
 | Option                                                                                                 | Trade-off                                                                                                                                                                                              |
 | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Every `open_connection`                                                                                | Silently ignored on existing stores. But it sets the connection's next-`VACUUM` mode, so any future `VACUUM` would switch the mode without saying so. Hidden policy.                                   |
-| In `migrate`, before the first migration                                                               | Too late: `create_new` has already run `journal_mode = WAL` on the staged file, and SQLite's guidance (and T3's `Sqlite.ts:25`) is to set it before WAL is enabled.                                    |
+| In `migrate`, before the first migration                                                               | Too late: `create_new` has already run `journal_mode = WAL` on the staged file, and SQLite's guidance (and the reference implementation's `Sqlite.ts:25`) is to set it before WAL is enabled.          |
 | **The staging open in `Database::create_new_inner`, as the first pragma, before `journal_mode = WAL`** | The only zero-page connection. One flag, one call site. Restore and start-empty are covered without extra code: start-empty's next startup is a first run, and restore installs the backup's own mode. |
 
 **Recommendation:** add a create flag to `open_connection`, used only by the
@@ -407,10 +407,10 @@ exclusive runtime lock prevents any startup from running during the operation.
 
 ### D4. Running server or background service: refuse, do not stop it
 
-| Option                                        | Trade-off                                                                                                                                                                                                                                                                                                                           |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stop and restart the service like `t3 doctor` | Convenient. But `bibcode service` has only `install` / `uninstall` / `status` (`config.rs:834`), so we would add per-OS stop/start (systemd, launchd, Windows) to a data-safety command. It also cannot stop the desktop app or WSL backends, and a restart failure would leave the user without a server they did not ask to stop. |
-| **Refuse with an actionable message**         | No new process control. Matches `restore` and `start-empty`.                                                                                                                                                                                                                                                                        |
+| Option                                                              | Trade-off                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stop and restart the service like a reference tool's doctor command | Convenient. But `bibcode service` has only `install` / `uninstall` / `status` (`config.rs:834`), so we would add per-OS stop/start (systemd, launchd, Windows) to a data-safety command. It also cannot stop the desktop app or WSL backends, and a restart failure would leave the user without a server they did not ask to stop. |
+| **Refuse with an actionable message**                               | No new process control. Matches `restore` and `start-empty`.                                                                                                                                                                                                                                                                        |
 
 **Recommendation: refuse.** The CLI maps `StoreRunning` for every storage
 command to: "BiBCode is using this data root. Quit the BiBCode app, stop
@@ -425,7 +425,7 @@ follow-up.
 
 | Option                                                                            | Trade-off                                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No backup (T3)                                                                    | Least disk use. The issue rejects it.                                                                                                                                                                            |
+| No backup (reference tool)                                                        | Least disk use. The issue rejects it.                                                                                                                                                                            |
 | `VACUUM INTO` the staging file                                                    | The backup is small. But it is itself a vacuumed artifact (rowids may be renumbered, pages rewritten), so a `VACUUM`-induced problem would be in the backup too. That defeats the point of a pre-compact backup. |
 | VACUUM INTO, verify, then swap it in with the restore machinery                   | One rewrite instead of two. But restore preserves the live file forever, so disk use rises, and getting the space back would need a new code path that deletes user data.                                        |
 | **Existing `create_verified_backup` (page copy) with a new `PreCompact` trigger** | A byte-faithful image of the pre-compact store, through code that is already verified and tested. Cost: the backup is as large as the uncompacted file, free pages included.                                     |
@@ -704,13 +704,13 @@ a verified backup, and errors after the backup always carry its ID.
 ### D13. Recommend-to-compact threshold
 
 None in this change. The dry run's numbers answer the question, and a UI
-notice is out of scope. If a notice is added later, T3's 1 GiB is a starting
+notice is out of scope. If a notice is added later, the reference tool's 1 GiB is a starting
 point, to be checked against #225's measurements.
 
 ### D14. Event-history pruning
 
 Out of scope. When pruning lands it can run before step 8 under the same locks,
-which is the order T3's doctor uses. That is its own design.
+which is the order a reference tool's doctor uses. That is its own design.
 
 ## Code changes (for the implementation PR)
 
@@ -933,7 +933,7 @@ warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`,
 ## Verification by implementation
 
 The design relies on these SQLite behaviors. They come from SQLite's
-documentation and source, and from T3's report. None has been observed in
+documentation and source, and from the reference tool's report. None has been observed in
 this repository yet. Each is proven by a real-SQLite test in the
 implementation PR, and a failing test reopens the design rather than being
 weakened.
