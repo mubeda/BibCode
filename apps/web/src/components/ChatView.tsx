@@ -1577,6 +1577,17 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  // A Diff surface can show a chat panel's thread, which has no right panel of its own.
+  const diffSurfaceThreadId =
+    activeRightPanelSurface?.kind === "diff" ? activeRightPanelSurface.threadId : undefined;
+  const diffSurfaceThreadRef = useMemo(
+    () =>
+      diffSurfaceThreadId !== undefined && activeThreadRef !== null
+        ? scopeThreadRef(activeThreadRef.environmentId, diffSurfaceThreadId)
+        : null,
+    [activeThreadRef, diffSurfaceThreadId],
+  );
+  const diffSurfaceThread = useThread(diffSurfaceThreadRef);
   // Each chat pane shows its own thread's Activity, inline above its composer.
   const activityScope = useMemo(
     () => resolveActivityScope(activeThreadRef, { _tag: "thread" }),
@@ -6914,10 +6925,13 @@ function ChatViewContent(props: ChatViewProps) {
     (turnId: TurnId, filePath?: string) => {
       if (!isServerThread || !activeThreadRef) return;
       useDiffPanelStore.getState().selectTurn(activeThreadRef, turnId, filePath);
-      useRightPanelStore.getState().open(activeThreadRef, "diff");
+      // A chat panel renders no right panel: its host's shows this thread's diff.
+      useRightPanelStore
+        .getState()
+        .openDiff(activityPaneHostRef ?? activeThreadRef, activeThreadRef.threadId);
       onDiffPanelOpen?.();
     },
-    [activeThreadRef, isServerThread, onDiffPanelOpen],
+    [activeThreadRef, activityPaneHostRef, isServerThread, onDiffPanelOpen],
   );
   // Both the Map and the revert handler are read from refs at call-time so
   // the callback reference is fully stable and never busts context identity.
@@ -6993,8 +7007,8 @@ function ChatViewContent(props: ChatViewProps) {
       <Suspense fallback={null}>
         <DiffPanel
           mode="embedded"
-          composerDraftTarget={composerDraftTarget}
-          thread={activeThread}
+          composerDraftTarget={diffSurfaceThreadRef ?? composerDraftTarget}
+          thread={diffSurfaceThreadRef ? diffSurfaceThread : activeThread}
           workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>

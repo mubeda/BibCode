@@ -714,7 +714,10 @@ vi.mock("./preview/PreviewPanel", () => ({
   PreviewPanel: () => <div data-mock="preview-panel" />,
 }));
 vi.mock("./DiffPanel", () => ({
-  default: () => <div data-mock="diff-panel" />,
+  default: (props: Record<string, unknown>) => {
+    h.captured["diffPanel"] = props;
+    return <div data-mock="diff-panel" />;
+  },
 }));
 vi.mock("./SourceControlPanel", () => ({
   default: () => <div data-mock="source-control-panel" />,
@@ -4565,6 +4568,67 @@ describe("ChatView", () => {
 
       renderServerRoute();
       expect(h.captured["rightPanelThread"]).toBeNull();
+    });
+
+    it("opens a turn's diff in its host's Diff surface, showing the panel's thread", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-diff");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Panel thread" }));
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+
+      renderToStaticMarkup(
+        <ChatView
+          variant="panel"
+          panelThreadRef={panelThreadRef}
+          activityPaneHostRef={threadRef}
+          workspaceUnavailable={null}
+        />,
+      );
+      const timeline = capturedProps<{
+        onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+      }>("messagesTimeline");
+      act(() => timeline.onOpenTurnDiff(TurnId.make("turn-panel-1"), "src/index.ts"));
+
+      const byThreadKey = useRightPanelStore.getState().byThreadKey;
+      expect(byThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
+        isOpen: true,
+        activeSurfaceId: "diff",
+        surfaces: [{ id: "diff", kind: "diff", threadId: panelThreadId }],
+      });
+      expect(byThreadKey[scopedThreadKey(panelThreadRef)]).toBeUndefined();
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(panelThreadId);
+        expect(diffPanel.composerDraftTarget).toEqual(panelThreadRef);
+
+        // The host's own Diff action shows the host's diff again.
+        act(() => useRightPanelStore.getState().open(threadRef, "diff"));
+        await vi.waitFor(() =>
+          expect(capturedProps<{ thread: { id: string } }>("diffPanel").thread.id).toBe(threadId),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
     });
 
     it("shows an opening state instead of the global empty state before its thread arrives", () => {
