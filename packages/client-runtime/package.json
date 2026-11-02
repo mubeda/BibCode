@@ -107,6 +107,10 @@
       "types": "./src/state/models.ts",
       "default": "./src/state/models.ts"
     },
+    "./state/off-shell-threads": {
+      "types": "./src/state/offShellThreads.ts",
+      "default": "./src/state/offShellThreads.ts"
+    },
     "./state/orchestration": {
       "types": "./src/state/orchestration.ts",
       "default": "./src/state/orchestration.ts"

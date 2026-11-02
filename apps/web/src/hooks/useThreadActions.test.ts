@@ -37,6 +37,9 @@ const h = vi.hoisted(() => {
     commandResults: {} as Record<string, (input: unknown) => unknown>,
     defaultCommandResult: (() => undefined) as (input?: unknown) => unknown,
     shellsById: new Map<string, unknown>(),
+    // What the server knows of threads the shell left out (#223); otherwise `unknown`.
+    offShellById: new Map<string, unknown>(),
+    missingIds: new Set<string>(),
     threadRefs: [] as ScopedThreadRef[],
     localApi: null as unknown,
     settings: {} as Record<string, unknown>,
@@ -131,6 +134,11 @@ vi.mock("./useHandleNewThread", () => ({
 
 vi.mock("../state/entities", () => ({
   readThreadShell: (ref: { threadId: string }) => h.shellsById.get(ref.threadId) ?? null,
+  resolveThreadShell: async (ref: { threadId: string }) => {
+    const thread = h.shellsById.get(ref.threadId) ?? h.offShellById.get(ref.threadId);
+    if (thread !== undefined) return { kind: "resolved", thread };
+    return h.missingIds.has(ref.threadId) ? { kind: "missing" } : { kind: "unknown" };
+  },
   readEnvironmentThreadRefs: (_environmentId: unknown) => h.threadRefs,
 }));
 
@@ -147,7 +155,11 @@ vi.mock("../components/ui/toast", () => ({
   stackedThreadToast: (toast: unknown) => toast,
 }));
 
-import { ThreadArchiveBlockedError, useThreadActions } from "./useThreadActions";
+import {
+  ThreadArchiveBlockedError,
+  ThreadMissingError,
+  useThreadActions,
+} from "./useThreadActions";
 import { useCenterPanelStore } from "../centerPanelStore";
 import { useRightPanelStore } from "../rightPanelStore";
 
@@ -245,6 +257,8 @@ function commandKeys(): string[] {
 
 beforeEach(() => {
   h.commandCalls.length = 0;
+  h.offShellById.clear();
+  h.missingIds.clear();
   h.commandResults = {};
   h.commandResults["worktree.removeFromBibCode"] = () =>
     AsyncResult.success({
@@ -287,6 +301,36 @@ describe("ThreadArchiveBlockedError", () => {
       threadId: "thread-1",
     });
     expect(error.message).toBe("Cannot archive a running thread.");
+  });
+});
+
+describe("threads a capped shell left out (#223)", () => {
+  it("archives a left-out thread through the resolver", async () => {
+    h.offShellById.set("older", makeShell("older"));
+    const actions = renderActions();
+    const result = await actions.archiveThread(scopeThreadRef(ENV, ThreadId.make("older")));
+    expect(result._tag).toBe("Success");
+    expect(commandKeys()).toContain("thread.archive");
+  });
+
+  it("reports a missing thread instead of succeeding", async () => {
+    h.missingIds.add("gone");
+    const actions = renderActions();
+    const result = await actions.archiveThread(scopeThreadRef(ENV, ThreadId.make("gone")));
+    expect(result._tag).toBe("Failure");
+    expect(commandKeys()).not.toContain("thread.archive");
+    if (result._tag !== "Failure") return;
+    const squashed = Cause.squash(result.cause as Cause.Cause<unknown>);
+    expect(squashed).toBeInstanceOf(ThreadMissingError);
+    expect((squashed as Error).message).toBe("This thread no longer exists.");
+  });
+
+  it("unarchives and deletes an archived thread by direct dispatch against an old server", async () => {
+    const actions = renderActions();
+    const ref = scopeThreadRef(ENV, ThreadId.make("archived-old-server"));
+    expect((await actions.unarchiveThread(ref))._tag).toBe("Success");
+    expect((await actions.deleteThread(ref))._tag).toBe("Success");
+    expect(commandKeys()).toEqual(["thread.unarchive", "thread.delete"]);
   });
 });
 

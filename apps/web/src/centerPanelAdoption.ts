@@ -6,7 +6,10 @@
  * Only an explicit server `remove` drops a terminal tab; a reconnect or server
  * restart snapshot never does, so terminals can relaunch from their tab. A
  * tracked chat panel that leaves the live thread list (closed, so archived, or
- * deleted elsewhere) loses its tab, and is adopted again if it is reopened.
+ * deleted elsewhere) loses its tab, and is adopted again if it is reopened. A
+ * capped list (#223) leaves finished panels out, so leaving it proves nothing:
+ * the panel keeps its tab, and the lifecycle reconciler drops it once the server
+ * reports it archived or missing.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -97,6 +100,7 @@ export function applyPanelThreadAdoption(
   threads: ReadonlyArray<
     Pick<OrchestrationThreadShell, "id" | "kind" | "hostThreadId" | "title" | "archivedAt">
   >,
+  capped = false,
 ): void {
   const liveThreadIds = new Set<string>(
     threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
@@ -120,6 +124,7 @@ export function applyPanelThreadAdoption(
   for (const threadId of tracker.panelThreadIds) {
     if (liveThreadIds.has(threadId)) continue;
     tracker.panelThreadIds.delete(threadId);
+    if (capped) continue;
     const panelRef = scopeThreadRef(environmentId, ThreadId.make(threadId));
     if (!store.pendingChatPanelThreadKeys.has(scopedThreadKey(panelRef))) {
       store.removeThread(panelRef);

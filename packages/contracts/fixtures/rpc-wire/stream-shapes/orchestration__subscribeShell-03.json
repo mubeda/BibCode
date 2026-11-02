@@ -1,0 +1,49 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "thread-upserted",
+      "sequence": 4,
+      "thread": {
+        "id": "\u0000",
+        "projectId": "Eq4(Yke5LK",
+        "title": "�",
+        "modelSelection": {
+          "instanceId": "rEOUynapsK",
+          "model": "\u0000"
+        },
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "branch": null,
+        "worktreePath": "25iS:s57",
+        "latestTurn": {
+          "turnId": "GQjr:vhS;",
+          "state": "error",
+          "requestedAt": ";2",
+          "startedAt": "\t",
+          "completedAt": null,
+          "assistantMessageId": null
+        },
+        "createdAt": "4294967295",
+        "updatedAt": "\t",
+        "archivedAt": "😀",
+        "session": {
+          "threadId": "|",
+          "status": "interrupted",
+          "providerName": "",
+          "providerInstanceId": "aCXq3j7V",
+          "runtimeMode": "approval-required",
+          "activeTurnId": null,
+          "lastError": "toString",
+          "lastErrorClass": "validation_error",
+          "updatedAt": "0"
+        },
+        "latestUserMessageAt": null,
+        "hasPendingApprovals": true,
+        "hasPendingUserInput": false,
+        "hasActionableProposedPlan": true
+      }
+    }
+  ]
+}

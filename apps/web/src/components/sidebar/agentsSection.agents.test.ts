@@ -11,12 +11,15 @@ import {
 import { createModelSelection } from "@bibcode/shared/model";
 import { describe, expect, it } from "vite-plus/test";
 
+import { agentEvidenceAt, resetAgentEvidenceStampsForTests } from "../../hooks/useAgentFreshness";
 import { AGENT_STATUS_STALE_AFTER_MS } from "../Sidebar.logic";
 import {
   AGENT_GROUP_ORDER,
   type AgentRowFreshness,
   agentRowUnreadKey,
   buildAgentRows,
+  mergeOffShellThreads,
+  terminalHostsMissing,
   buildAgentViewGroups,
   countUnreadAgentRows,
   resolveAgentGroup,
@@ -174,9 +177,61 @@ describe("agent groups (#187)", () => {
     });
   });
 
+  it("ages a thread from its receipt, not its first render (#223)", () => {
+    resetAgentEvidenceStampsForTests();
+    // Received 31 minutes ago with 1 minute of age, then not sent again because it did not
+    // change, and rendered for the first time now: its evidence is 32 minutes old.
+    const receivedAt = Date.now() - 31 * 60_000;
+    const [row] = rows({
+      shells: [
+        shell("unseen", "running", {
+          lastActivityAt: AT,
+          lastActivityAgeMs: 60_000,
+          lastActivityObservedAt: receivedAt - 60_000,
+        }),
+      ],
+      freshness: {
+        now: Date.now(),
+        evidenceAt: (key, evidence, ageMs, live) => agentEvidenceAt(key, evidence, ageMs, live),
+      },
+    });
+    resetAgentEvidenceStampsForTests();
+    expect(row).toMatchObject({ group: "unknown", unknownReason: "stale" });
+  });
+
   it("lists a disconnected environment's agents as unknown and offline", () => {
     const [row] = rows({ shells: [shell("cached", "running")], availability: "unavailable" });
     expect(row).toMatchObject({ group: "unknown", unknownReason: "offline" });
+  });
+});
+
+describe("threads a capped shell left out (#223)", () => {
+  it("keeps a terminal row whose host is off-shell", () => {
+    const terminals = [
+      aiTerminal("old-host", "t-claude", "claudeAgent", { state: "working", failed: false }),
+    ];
+    // The live shell lacks the host: the row would be dropped, so the host is looked up.
+    expect(
+      terminalHostsMissing(
+        [shell("other", "ready")],
+        [{ environmentId: ENVIRONMENT, rows: terminals }],
+      ),
+    ).toEqual(new Map([[ENVIRONMENT, ["old-host"]]]));
+    // Once resolved off-shell, the merged shells keep the terminal's row.
+    const merged = mergeOffShellThreads([shell("other", "ready")], [shell("old-host", null)]);
+    const listed = rows({ shells: merged, terminals });
+    expect(listed.map((row) => row.terminalId)).toContain("t-claude");
+  });
+
+  it("pages older agents into Done, panels included", () => {
+    const panel = shell("older-panel", "ready", {
+      kind: "panel",
+      hostThreadId: ThreadId.make("host"),
+    });
+    const merged = mergeOffShellThreads([shell("host", "ready")], [panel, shell("host", "ready")]);
+    expect(merged.map((entry) => entry.id)).toEqual(["host", "older-panel"]);
+    const done = rows({ shells: merged }).filter((row) => row.group === "done");
+    expect(done.map((row) => row.key)).toContain(keyOf("older-panel"));
   });
 });
 

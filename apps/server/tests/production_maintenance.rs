@@ -372,6 +372,15 @@ fn every_public_mutation_boundary_is_classified_centrally() {
         rpc_mutability("orchestration.subscribeShell"),
         RpcMutability::Read
     );
+    // Older-thread pages and thread lookups only read (#223).
+    assert_eq!(
+        rpc_mutability("orchestration.listOlderThreads"),
+        RpcMutability::Read
+    );
+    assert_eq!(
+        rpc_mutability("orchestration.getThreadShells"),
+        RpcMutability::Read
+    );
     assert_eq!(
         rpc_mutability("subscribeVcsStatusSummary"),
         RpcMutability::Read
