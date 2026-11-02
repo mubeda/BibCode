@@ -533,7 +533,8 @@ impl ProductionRuntime {
             provider_hosts,
         )
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
-        .with_availability_registry(workspace_availability.clone());
+        .with_availability_registry(workspace_availability.clone())
+        .with_mcp_settings(control.mcp_server_signal());
         let git_vcs = if let Some(dir) = &config.hosting_executable_dir_for_integration_test {
             git_vcs.with_hosting_executable_dir_for_integration_test(dir.clone())
         } else {

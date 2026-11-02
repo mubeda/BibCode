@@ -399,6 +399,13 @@ impl RpcSessionContext {
         self.principal.as_ref()
     }
 
+    /// The auth service that authenticated this connection, for a handler that reads its
+    /// session's live state; `None` on an unauthenticated server.
+    #[must_use]
+    pub(crate) fn auth(&self) -> Option<&AuthService> {
+        self.auth.as_ref()
+    }
+
     /// Authorizes this connection's session for `scope` on top of the method's own, for a
     /// handler whose input asks for more (crash dumps in a diagnostic bundle). The refusal is
     /// the same `EnvironmentAuthorizationError` the method scope check sends. An
