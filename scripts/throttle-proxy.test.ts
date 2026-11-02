@@ -4,12 +4,19 @@
 // @effect-diagnostics globalFetch:off - The test drives the proxy's loopback control API.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeEvents from "node:events";
+import * as NodeHttp from "node:http";
 import * as NodeNet from "node:net";
 import * as NodeURL from "node:url";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { startThrottleProxy, startControlServer, runThrottleProxyMain } from "./throttle-proxy.ts";
+import {
+  type LinkSettings,
+  parseLink,
+  runThrottleProxyMain,
+  startControlServer,
+  startThrottleProxy,
+} from "./throttle-proxy.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -242,5 +249,158 @@ describe("startThrottleProxy", () => {
 
   it("does not start a CLI server when imported", async () => {
     expect(await runThrottleProxyMain(false, [])).toBe(false);
+  });
+});
+
+const THREE_G = { down: 50_000, up: 50_000, frozen: false, delay: 200, jitter: 0 };
+
+describe("link presets", () => {
+  it("gives 50,000 B/s each way and a 200 ms one-way delay for 3g, and explicit options override it", () => {
+    expect(parseLink((name) => (name === "preset" ? "3g" : undefined))).toEqual({
+      down: 50_000,
+      up: 50_000,
+      delay: 200,
+    });
+    const explicit: Record<string, string> = { preset: "3g", down: "1000", delay: "0" };
+    expect(parseLink((name) => explicit[name])).toEqual({ down: 1000, up: 50_000, delay: 0 });
+    expect(() => parseLink((name) => (name === "preset" ? "5g" : undefined))).toThrow(/5g/);
+  });
+
+  it("applies --preset 3g from the command line", async () => {
+    const child = NodeChildProcess.spawn(
+      process.execPath,
+      [
+        NodeURL.fileURLToPath(new URL("./throttle-proxy.ts", import.meta.url)),
+        "--listen",
+        "127.0.0.1:0",
+        "--target",
+        "127.0.0.1:1",
+        "--control",
+        "127.0.0.1:0",
+        "--preset",
+        "3g",
+        "--delay",
+        "50",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    cleanups.push(async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const stopped = NodeEvents.once(child, "exit");
+      child.kill();
+      await stopped;
+    });
+    let output = "";
+    child.stdout.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    await vi.waitFor(() => expect(output).toMatch(/control http:\/\/127\.0\.0\.1:\d+/));
+    const controlPort = Number(output.match(/control http:\/\/127\.0\.0\.1:(\d+)/)![1]);
+    expect(await (await fetch(`http://127.0.0.1:${controlPort}/state`)).json()).toEqual({
+      ...THREE_G,
+      delay: 50,
+    });
+  });
+
+  it("applies preset=3g on /set, lets explicit parameters override it, and rejects an unknown one", async () => {
+    const targetPort = await servePayload(Buffer.from("x"));
+    const proxy = await startThrottleProxy({
+      listenHost: "127.0.0.1",
+      listenPort: 0,
+      targetHost: "127.0.0.1",
+      targetPort,
+    });
+    cleanups.push(proxy.close);
+    const control = await startControlServer(proxy, "127.0.0.1", 0);
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve) => {
+          control.closeAllConnections();
+          control.close(() => resolve());
+        }),
+    );
+    const base = `http://127.0.0.1:${(control.address() as NodeNet.AddressInfo).port}`;
+    expect(await (await fetch(`${base}/set?preset=3g`)).json()).toEqual(THREE_G);
+    expect(await (await fetch(`${base}/set?preset=3g&delay=10&up=7`)).json()).toEqual({
+      ...THREE_G,
+      delay: 10,
+      up: 7,
+    });
+    expect((await fetch(`${base}/set?preset=5g`)).status).toBe(400);
+    expect(proxy.settings().delay).toBe(10);
+  });
+});
+
+describe("new connections", () => {
+  async function serveHttp(): Promise<{
+    readonly port: number;
+    readonly connections: () => number;
+  }> {
+    let connections = 0;
+    const server = NodeHttp.createServer((_request, response) => response.end("ok"));
+    server.on("connection", () => {
+      connections++;
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve());
+        }),
+    );
+    return { port: (server.address() as NodeNet.AddressInfo).port, connections: () => connections };
+  }
+
+  /** Two sequential requests from a client that keeps connections alive; returns how long they took. */
+  async function twoRequests(port: number): Promise<number> {
+    const agent = new NodeHttp.Agent({ keepAlive: true });
+    cleanups.push(async () => agent.destroy());
+    const started = Date.now();
+    for (let request = 0; request < 2; request++) {
+      await new Promise<void>((resolve, reject) => {
+        NodeHttp.get({ host: "127.0.0.1", port, agent }, (response) => {
+          response.resume();
+          response.on("end", resolve);
+        }).on("error", reject);
+      });
+    }
+    return Date.now() - started;
+  }
+
+  const through = async (targetPort: number, initial: Partial<LinkSettings>) => {
+    const proxy = await startThrottleProxy({
+      listenHost: "127.0.0.1",
+      listenPort: 0,
+      targetHost: "127.0.0.1",
+      targetPort,
+      initial,
+    });
+    cleanups.push(proxy.close);
+    return proxy;
+  };
+
+  it("reuses one upstream connection for a keep-alive client by default", async () => {
+    const server = await serveHttp();
+    const proxy = await through(server.port, {});
+    await twoRequests(proxy.port);
+    expect(server.connections()).toBe(1);
+  });
+
+  it("opens a second upstream connection for a second request, each paying its own handshake", async () => {
+    const server = await serveHttp();
+    const proxy = await through(server.port, { delay: 40, newConnections: true });
+    const elapsed = await twoRequests(proxy.port);
+    expect(server.connections()).toBe(2);
+    // Per request: a 80 ms handshake and two 40 ms one-way delays.
+    expect(elapsed).toBeGreaterThanOrEqual(2 * 160 - 20);
+  });
+
+  it("leaves a protocol upgrade on its connection", async () => {
+    const head =
+      "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    const target = await servePayload(Buffer.from(`${head}frame`));
+    const proxy = await through(target, { newConnections: true });
+    expect((await readAll(proxy.port)).toString()).toBe(`${head}frame`);
   });
 });
