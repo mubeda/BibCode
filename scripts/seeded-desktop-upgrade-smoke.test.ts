@@ -2242,11 +2242,13 @@ describe("seeded packaged desktop upgrade harness", () => {
         require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
       }, 125);
     `;
+    // Detached: on Windows, Node puts children in a kill-on-close job, so an
+    // attached writer dies with its parent and never writes the late tail.
     const parentSource = `
       const writer = require("node:child_process").spawn(
         process.execPath,
         ["-e", ${JSON.stringify(writerSource)}],
-        { stdio: ["ignore", "inherit", "inherit"] }
+        { detached: true, stdio: ["ignore", "inherit", "inherit"] }
       );
       writer.once("spawn", () => {
         process.stdout.write("early|");
@@ -2258,7 +2260,8 @@ describe("seeded packaged desktop upgrade harness", () => {
         command: process.execPath,
         args: ["-e", parentSource],
         cwd: root,
-        timeoutMs: 2_000,
+        // Two Node startups on a loaded host; the bound only stops a hung test.
+        timeoutMs: 20_000,
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe("early|late-tail");
@@ -2269,7 +2272,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       await waitForUpgradeCondition({
         description: "synthetic writer completion",
         intervalMs: 10,
-        timeoutMs: 2_000,
+        timeoutMs: 20_000,
         probe: async () => NodeFS.existsSync(finishedPath),
       });
       await NodeFS.promises.rm(root, { recursive: true, force: true });
