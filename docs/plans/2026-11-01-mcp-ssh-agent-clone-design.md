@@ -1,6 +1,6 @@
 # MCP clone: SSH agent clones pinned to the checked address (#217)
 
-Status: **Approved 2026-11-01 (user: A1; Codex review, 3 rounds)** (see [Decision](#decision)).
+Status: Approved by the maintainer 2026-11-02 (option A1; Codex review, 3 rounds)
 Revisions 1 and 2 answer Codex's REVISE reviews (see [Revision 1](#revision-1-codex-review),
 [Revision 2](#revision-2-codex-round-2)); Codex approved the third round.
 Issue: #217. Follows #139 slice X6 and its Revision 4 (`docs/plans/2026-10-30-mcp-remaining-slices-design.md`,
