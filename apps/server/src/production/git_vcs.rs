@@ -1389,6 +1389,8 @@ impl GitVcsRpcServices {
                 }
             };
             let mut enrichment: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
+            // The remote and branch the latest enrichment was started for.
+            let mut enriching: Option<(VcsStatusRemoteResult, Option<String>)> = None;
             loop {
                 tokio::select! {
                     biased;
@@ -1409,11 +1411,19 @@ impl GitVcsRpcServices {
                             }
                             None => break,
                         };
+                        let interrupted = enrichment
+                            .as_ref()
+                            .is_some_and(|(_, task)| !task.is_finished());
                         stop_status_stream_enrichment(&mut enrichment).await;
+                        // A local update on the same branch must not lose a lookup still in
+                        // flight: its fence is stale now, so the lookup starts again.
                         let enrichment_remote = match &publication.value {
                             VcsStatusStreamEvent::Snapshot { remote, .. }
                             | VcsStatusStreamEvent::RemoteUpdated { remote } => remote.clone(),
-                            VcsStatusStreamEvent::LocalUpdated { .. } => None,
+                            VcsStatusStreamEvent::LocalUpdated { local } => enriching
+                                .as_ref()
+                                .filter(|(_, ref_name)| interrupted && *ref_name == local.ref_name)
+                                .map(|(remote, _)| remote.clone()),
                         };
                         if !send_status_stream_event(
                             &sender,
@@ -1434,6 +1444,7 @@ impl GitVcsRpcServices {
                             let task_cwd = input.cwd.clone();
                             let task_local = publication.local;
                             let task_fence = publication.fence;
+                            enriching = Some((remote.clone(), task_local.ref_name.clone()));
                             #[cfg(test)]
                             let task_test_hook = enrichment_test_hook.clone();
                             let task = tokio::spawn(async move {
@@ -7622,6 +7633,42 @@ esac
             "the parent checkout is not refreshed: {:?}",
             fixture.lookups()
         );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_local_update_does_not_lose_a_pull_request_lookup_in_flight() {
+        let fixture = Fixture::new("pr-lookup-local-update");
+        fixture.set("open", "");
+        fixture.set("slow", "2");
+        let cancellation = CancellationToken::new();
+        let mut stream = fixture
+            .services
+            .status_stream(subscribe_request(&fixture.repository), cancellation.clone());
+        wait_for_lookups(&fixture, "main", 1).await;
+
+        // A file is saved while the forge still answers: the local update must not cancel the
+        // lookup without starting it again.
+        std::fs::write(fixture.repository.join("saved.txt"), "saved\n").expect("fixture file");
+        fixture
+            .services
+            .broadcaster
+            .notify_local_change(&fixture.repository)
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let chunk = stream
+                    .recv()
+                    .await
+                    .expect("status stream stays open")
+                    .expect("status stream event");
+                if chunk[0]["remote"]["pr"]["number"] == 42 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the active stream must still publish the open pull request");
         cancellation.cancel();
     }
 

@@ -12,6 +12,69 @@ pub(crate) fn creates_pull_request(command: &str) -> bool {
     simple_commands(command)
         .iter()
         .any(|words| command_creates_pull_request(words))
+        || substitutions(command)
+            .iter()
+            .any(|inner| creates_pull_request(inner))
+}
+
+/// The text of every `$(...)` and backtick substitution that runs: outside quotes and inside
+/// double quotes, but not inside single quotes or comments. A `)` inside a quoted string within
+/// `$(...)` ends it early, and a heredoc with a quoted delimiter is still scanned; both only
+/// risk a harmless extra refresh.
+fn substitutions(command: &str) -> Vec<String> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut found = Vec::new();
+    let mut double_quoted = false;
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 1,
+            '\'' if !double_quoted => {
+                index += 1;
+                while index < chars.len() && chars[index] != '\'' {
+                    index += 1;
+                }
+            }
+            '"' => double_quoted = !double_quoted,
+            '#' if !double_quoted
+                && (index == 0
+                    || chars[index - 1].is_whitespace()
+                    || ";&|(".contains(chars[index - 1])) =>
+            {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '`' => {
+                let start = index + 1;
+                index = start;
+                while index < chars.len() && chars[index] != '`' {
+                    index += if chars[index] == '\\' { 2 } else { 1 };
+                }
+                found.push(chars[start..index.min(chars.len())].iter().collect());
+            }
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                let start = index + 2;
+                let mut depth = 1;
+                index = start;
+                while index < chars.len() {
+                    match chars[index] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    index += 1;
+                }
+                found.push(chars[start..index.min(chars.len())].iter().collect());
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    found
 }
 
 fn command_creates_pull_request(words: &[String]) -> bool {
@@ -296,6 +359,30 @@ mod tests {
         assert!(creates_pull_request(command));
         let wrapped = "bash -lc 'git push && glab mr create --description-file - <<EOF\nBody\nEOF'";
         assert!(creates_pull_request(wrapped));
+    }
+
+    #[test]
+    fn command_substitutions_run_their_contents() {
+        for command in [
+            r#"pr_url="$(gh pr create --fill)""#,
+            "pr_url=$(gh pr create --fill)",
+            "url=`gh pr create --fill`",
+            r#"echo "created: $(glab mr create --fill --yes)""#,
+            "echo $(git push && gh pr create --fill)",
+            "bash -lc 'url=$(gh -R o/r pr create --fill)'",
+            "echo $(echo $(gh pr create --fill))",
+        ] {
+            assert!(creates_pull_request(command), "{command}");
+        }
+        for command in [
+            r#"echo "gh pr create""#,
+            "echo '$(gh pr create)'",
+            r#"echo "$(gh pr view)""#,
+            "echo hi # $(gh pr create)",
+            "echo '`gh pr create`'",
+        ] {
+            assert!(!creates_pull_request(command), "{command}");
+        }
     }
 
     #[test]
