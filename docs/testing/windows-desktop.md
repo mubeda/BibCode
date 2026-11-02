@@ -403,9 +403,6 @@ Windows behaviors decide how a fixture is written:
 - A connection to a closed loopback port is refused after about two seconds,
   as long as the MCP endpoint owner probe's timeout. A test that needs a fast
   refusal is Unix only.
-- The MCP tools that change files are refused on Windows
-  (`changes_files_here`), so the tests that drive them are `cfg(unix)`; the
-  refusal is covered in `mcp::tools::files`.
 
 Run the desktop E2E support contract and the launcher contracts natively on
 Windows:
