@@ -2097,6 +2097,7 @@ fn registrar_source_contains_every_owned_rpc_name() {
         "server.removeKeybinding",
         "server.signalProcess",
         "server.updateProvider",
+        "server.updateTool",
         "server.updateSettings",
         "server.upsertKeybinding",
         "subscribeServerConfig",

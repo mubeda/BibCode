@@ -1,3 +1,4 @@
+import * as NodeFS from "node:fs";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import { describe, expect, it } from "vite-plus/test";
@@ -8,11 +9,16 @@ import {
   DiagnosticLogsRelayEvent,
   DiagnosticLogsRelayItem,
   isProviderAvailable,
+  ServerConfig,
+  ServerConfigProviderStatusesPayload,
   ServerProcessDiagnosticsEntry,
   ServerProcessResourceTotals,
   ServerProvider,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
+  ServerTool,
+  ServerToolUpdateError,
+  ServerToolUpdateInput,
   ServerTraceDiagnosticsRecentFailure,
   ServerTraceDiagnosticsSpanOccurrence,
   ServerTraceDiagnosticsSpanSummary,
@@ -37,6 +43,23 @@ const decodeTraceFailure = Schema.decodeUnknownSync(
 );
 const decodeTraceSummary = Schema.decodeUnknownSync(ServerTraceDiagnosticsSpanSummary);
 const decodeEvent = Schema.decodeUnknownSync(DiagnosticLogsDownloadEvent);
+
+// What a client or server from before tool maintenance understands.
+const { tools: _legacyPayloadTools, ...legacyPayloadFields } =
+  ServerConfigProviderStatusesPayload.fields;
+const LegacyProviderStatusesPayload = Schema.Struct(legacyPayloadFields);
+const ConfigFields = Schema.Struct({
+  providers: ServerConfig.fields.providers,
+  tools: ServerConfig.fields.tools,
+});
+const LegacyConfigFields = Schema.Struct({ providers: ServerConfig.fields.providers });
+const decodeTool = Schema.decodeUnknownSync(ServerTool);
+const encodeToolUpdateError = Schema.encodeSync(ServerToolUpdateError);
+const decodeToolUpdateError = Schema.decodeUnknownSync(ServerToolUpdateError);
+const decodeConfigFields = Schema.decodeUnknownSync(ConfigFields);
+const decodeLegacyConfigFields = Schema.decodeUnknownSync(LegacyConfigFields);
+const decodeStatusesPayload = Schema.decodeUnknownSync(ServerConfigProviderStatusesPayload);
+const decodeLegacyStatusesPayload = Schema.decodeUnknownSync(LegacyProviderStatusesPayload);
 
 const baseProviderSnapshot = {
   instanceId: "codex",
@@ -416,5 +439,76 @@ describe("diagnostic logs relay (#201)", () => {
     ).toMatchObject({ _tag: "Failed", reason: "unknown-environment" });
     expect(() => decodeItem({ _tag: "Failed", reason: "made-up", message: "x" })).toThrow();
     expect(decodeItem({ _tag: "Finished" })._tag).toBe("Finished");
+  });
+});
+
+describe("tool update contracts", () => {
+  const readCompat = (name: string): Record<string, any> =>
+    JSON.parse(
+      NodeFS.readFileSync(
+        new URL(`../fixtures/server-config-compat/${name}.json`, import.meta.url),
+        "utf8",
+      ),
+    ) as Record<string, any>;
+  const tool = {
+    toolId: "codegraph",
+    displayName: "CodeGraph",
+    installed: true,
+    version: "1.6.2",
+    checkedAt: "2026-11-02T00:00:00.000Z",
+    versionAdvisory: {
+      status: "behind_latest",
+      currentVersion: "1.6.2",
+      latestVersion: "1.6.3",
+      updateCommand: "codegraph upgrade",
+      canUpdate: true,
+      checkedAt: "2026-11-02T00:00:00.000Z",
+      message: null,
+    },
+  };
+
+  it("decodes a tool with its advisory and update state", () => {
+    const decoded = decodeTool({
+      ...tool,
+      updateState: {
+        status: "running",
+        startedAt: "2026-11-02T00:00:01.000Z",
+        finishedAt: null,
+        message: "Updating tool.",
+        output: null,
+      },
+    });
+    expect(decoded.versionAdvisory?.canUpdate).toBe(true);
+    expect(decoded.updateState?.status).toBe("running");
+  });
+
+  it("rejects an update input without a tool id", () => {
+    expectDecodeFailure(
+      ServerToolUpdateInput,
+      { toolId: "" },
+      { rootTag: "Composite", paths: [["toolId"]], containsTag: "InvalidValue" },
+    );
+  });
+
+  it("round-trips the tagged update error", () => {
+    const error = new ServerToolUpdateError({ toolId: "codegraph", reason: "still updating" });
+    expect(error.message).toBe("Tool update failed for codegraph: still updating");
+    const encoded = encodeToolUpdateError(error);
+    expect(decodeToolUpdateError(encoded)._tag).toBe("ServerToolUpdateError");
+  });
+
+  it("old server, new client: a config and a status event without tools still decode", () => {
+    expect(decodeConfigFields(readCompat("old-server-config-fields")).tools).toBe(undefined);
+    const event = readCompat("old-server-provider-statuses");
+    expect(decodeStatusesPayload(event.payload).tools).toBe(undefined);
+  });
+
+  it("new server, old client: the added tools key is ignored by the previous schema", () => {
+    const config = readCompat("new-server-config-fields");
+    expect(decodeConfigFields(config).tools).toHaveLength(1);
+    expect(decodeLegacyConfigFields(config)).not.toHaveProperty("tools");
+    const event = readCompat("new-server-provider-statuses");
+    expect(decodeStatusesPayload(event.payload).tools).toHaveLength(1);
+    expect(decodeLegacyStatusesPayload(event.payload)).not.toHaveProperty("tools");
   });
 });
