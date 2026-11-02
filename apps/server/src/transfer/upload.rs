@@ -592,13 +592,16 @@ mod tests {
         assert_eq!(entries(temp.path()), ["a.txt"]);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_upload_folder_swapped_for_an_outside_symlink_is_refused() {
         let root = crate::test_support::canonical_tempdir();
         let outside = crate::test_support::canonical_tempdir();
-        // The route checked `root/sub`; it became a symlink before the upload opened it.
+        // The route checked `root/sub`; it became a symlink (a junction on Windows) before the
+        // upload opened it.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
+        #[cfg(windows)]
+        junction::create(outside.path(), root.path().join("sub")).unwrap();
         let result = write_upload(
             root.path(),
             &root.path().join("sub"),
