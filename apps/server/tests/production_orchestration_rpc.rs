@@ -1863,13 +1863,20 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
             create_public_thread("thread-unrelated", "project-streams", "Unrelated thread"),
         )
         .await;
-        let shell_after_unrelated = expect_snapshot_chunk(&mut shell_socket, "101").await;
+        // After its snapshot the shell sends only the threads that changed (#223).
+        let shell_after_unrelated = expect_chunk(&mut shell_socket, "101").await;
         assert!(
-            shell_after_unrelated["threads"]
-                .as_array()
-                .unwrap()
+            shell_after_unrelated.iter().any(|item| {
+                item["kind"] == json!("thread-upserted")
+                    && item["thread"]["id"] == json!("thread-unrelated")
+            }),
+            "{shell_after_unrelated:?}"
+        );
+        assert!(
+            shell_after_unrelated
                 .iter()
-                .any(|thread| thread["id"] == json!("thread-unrelated"))
+                .all(|item| item["thread"]["id"] != json!("thread-watched")),
+            "{shell_after_unrelated:?}"
         );
         acknowledge(&mut shell_socket, "101").await;
 
@@ -1886,16 +1893,16 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
         )
         .await;
 
-        let shell_after_relevant = expect_snapshot_chunk(&mut shell_socket, "101").await;
-        assert!(
-            shell_after_relevant["threads"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|thread| {
-                    thread["id"] == json!("thread-watched")
-                        && thread["title"] == json!("Watched thread updated")
-                })
+        let shell_after_relevant = expect_chunk(&mut shell_socket, "101").await;
+        assert_eq!(shell_after_relevant.len(), 1, "{shell_after_relevant:?}");
+        assert_eq!(shell_after_relevant[0]["kind"], json!("thread-upserted"));
+        assert_eq!(
+            shell_after_relevant[0]["thread"]["id"],
+            json!("thread-watched")
+        );
+        assert_eq!(
+            shell_after_relevant[0]["thread"]["title"],
+            json!("Watched thread updated")
         );
         acknowledge(&mut shell_socket, "101").await;
 

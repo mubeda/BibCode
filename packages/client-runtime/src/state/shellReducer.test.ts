@@ -189,6 +189,42 @@ describe("applyShellStreamEvent", () => {
     });
   });
 
+  it("applies a server delta chunk once, keeping untouched threads and the upsert's activity age", () => {
+    const untouched = { ...stubThread, id: ThreadId.make("thread-2"), title: "Untouched" };
+    const removed = { ...stubThread, id: ThreadId.make("thread-3") };
+    const snapshot: OrchestrationShellSnapshot = {
+      ...baseSnapshot,
+      snapshotSequence: 10,
+      projects: [stubProject],
+      threads: [stubThread, untouched, removed],
+    };
+    // One coalesced tick as the server numbers it: consecutive sequences ending at its own.
+    const chunk: ReadonlyArray<OrchestrationShellStreamEvent> = [
+      { kind: "project-upserted", sequence: 12, project: { ...stubProject, title: "Renamed" } },
+      {
+        kind: "thread-upserted",
+        sequence: 13,
+        thread: {
+          ...stubThread,
+          title: "Streaming",
+          lastActivityAt: "2026-04-01T00:00:05.000Z",
+          lastActivityAgeMs: 1_200,
+        },
+      },
+      { kind: "thread-removed", sequence: 14, threadId: removed.id },
+    ];
+
+    const next = chunk.reduce(applyShellStreamEvent, snapshot);
+
+    expect(next.snapshotSequence).toBe(14);
+    expect(next.projects.map((project) => project.title)).toEqual(["Renamed"]);
+    expect(next.threads.map((thread) => thread.id)).toEqual(["thread-1", "thread-2"]);
+    expect(next.threads[0]).toMatchObject({ title: "Streaming", lastActivityAgeMs: 1_200 });
+    expect(next.threads[1]).toBe(untouched);
+    // A duplicate delivery of the same chunk is stale and changes nothing.
+    expect(chunk.reduce(applyShellStreamEvent, next)).toBe(next);
+  });
+
   it("returns original snapshot for unrecognized event kinds", () => {
     const unknownEvent = { kind: "unknown-future-event", sequence: 99 } as any;
     const next = applyShellStreamEvent(baseSnapshot, unknownEvent);

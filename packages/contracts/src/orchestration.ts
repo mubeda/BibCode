@@ -722,12 +722,17 @@ export const OrchestrationShellStreamEvent = Schema.Union([
 ]);
 export type OrchestrationShellStreamEvent = typeof OrchestrationShellStreamEvent.Type;
 
+/**
+ * The first item is a `snapshot`; later items are the projects and threads that changed or
+ * left, or another `snapshot` when the server cannot vouch for a delta. The events are listed
+ * flat so each one has its own wire fixture; the encoding is the same as a nested union.
+ */
 export const OrchestrationShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     snapshot: OrchestrationShellSnapshot,
   }),
-  OrchestrationShellStreamEvent,
+  ...OrchestrationShellStreamEvent.members,
 ]);
 export type OrchestrationShellStreamItem = typeof OrchestrationShellStreamItem.Type;
 

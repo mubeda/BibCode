@@ -58,6 +58,23 @@ describe("Rust RPC fixture parity", () => {
   const readFixture = (name: string): unknown =>
     JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
 
+  it("pins a subscribeShell fixture for the snapshot and every delta item", () => {
+    const manifest = readFixture("manifest.json") as Manifest;
+    // Arbitrary samples need not pass refinements, so only their kinds are compared.
+    const kinds = manifest.streamShapeFixtures
+      .filter((name) => name.startsWith("stream-shapes/orchestration__subscribeShell-"))
+      .flatMap((name) => (readFixture(name) as { values: ReadonlyArray<{ kind: string }> }).values)
+      .map((value) => value.kind);
+
+    expect(kinds.toSorted()).toEqual([
+      "project-removed",
+      "project-upserted",
+      "snapshot",
+      "thread-removed",
+      "thread-upserted",
+    ]);
+  });
+
   it("decodes the populated HTTP read model emitted by the Rust snapshot projection", () => {
     const fixture: unknown = JSON.parse(
       NodeFS.readFileSync(
