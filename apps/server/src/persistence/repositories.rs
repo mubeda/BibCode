@@ -3903,13 +3903,15 @@ pub fn shell_kept_ids(
             || thread.pending_user_input_count > 0
             || thread.unresolved_delivery_state.is_some()
             || thread.compaction.is_some();
-        if card
-            || live_row
-            || live.contains(&thread.thread_id)
-            || forced.contains(&thread.thread_id)
-        {
+        if card || live_row || live.contains(&thread.thread_id) {
             kept.insert(thread.thread_id.clone());
         } else {
+            // A forced thread keeps its place in the ranking below: taken out of it, the
+            // threads a stream already holds would hand their recent slots to older ones, and
+            // every re-read would widen the cap.
+            if forced.contains(&thread.thread_id) {
+                kept.insert(thread.thread_id.clone());
+            }
             rest.push(thread);
         }
     }

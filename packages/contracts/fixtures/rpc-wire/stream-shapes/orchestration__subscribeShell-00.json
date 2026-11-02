@@ -5,7 +5,7 @@
     {
       "kind": "snapshot",
       "snapshot": {
-        "snapshotSequence": 100,
+        "snapshotSequence": 94,
         "projects": [
           {
             "id": "",
@@ -1254,7 +1254,8 @@
           }
         ],
         "updatedAt": "\t",
-        "capped": true
+        "capped": true,
+        "engineSequence": 50
       }
     }
   ]
