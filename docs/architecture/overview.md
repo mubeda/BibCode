@@ -1145,7 +1145,10 @@ through `RightPanelThreadContext`, so a link or file its chat Markdown opens in
 the BiBCode browser or file viewer goes to the host's right panel, the one on
 screen. A turn's changed files and **View diff** open the host's Diff surface
 on the panel's thread (`openDiff`; the surface keeps that `threadId`, and the
-host's own Diff action resets it). A command's open request
+host's own Diff action resets it). Removing the panel's thread, or the panel
+leaving the live list when it closes, resets it too. Until the panel's thread
+loads, the surface shows a loading state, or an error with **Show this chat's
+diff** if it fails; it never pairs the host's diff with the panel's composer. A command's open request
 (`OpenRequestRouter`) for a panel thread still uses the system browser.
 
 Center-panel layout is renderer-local, but the panels it holds are shared.

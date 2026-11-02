@@ -8,7 +8,7 @@
  * workspace paths, and diff/plan/files/sourceControl remain singleton
  * surfaces.
  */
-import { scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   type DevicePlatform,
   type ScopedThreadRef,
@@ -875,9 +875,23 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       removeThread: (ref) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
-          if (!(threadKey in state.byThreadKey)) return state;
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
-          return { byThreadKey: rest };
+          // A host's Diff on this (chat panel) thread goes back to the host's own diff.
+          let changed = threadKey in state.byThreadKey;
+          for (const [key, thread] of Object.entries(rest)) {
+            if (parseScopedThreadKey(key)?.environmentId !== ref.environmentId) continue;
+            if (!thread.surfaces.some((s) => s.kind === "diff" && s.threadId === ref.threadId)) {
+              continue;
+            }
+            changed = true;
+            rest[key] = {
+              ...thread,
+              surfaces: thread.surfaces.map((s) =>
+                s.kind === "diff" && s.threadId === ref.threadId ? { id: "diff", kind: "diff" } : s,
+              ),
+            };
+          }
+          return changed ? { byThreadKey: rest } : state;
         }),
     }),
     {

@@ -129,6 +129,26 @@ describe("rightPanelStore", () => {
     ).toEqual([{ id: "diff", kind: "diff" }]);
   });
 
+  it("drops a host's Diff on a thread when that thread is removed", () => {
+    const refC = scopeThreadRef("env-2" as EnvironmentId, refB.threadId);
+    const store = useRightPanelStore.getState();
+    store.openDiff(refA, refB.threadId);
+    store.openDiff(refC, ThreadId.make("thread-C"));
+    store.open(refB, "files");
+
+    store.removeThread(refB);
+
+    const byThreadKey = useRightPanelStore.getState().byThreadKey;
+    expect(selectActiveRightPanelSurface(byThreadKey, refA)).toEqual({ id: "diff", kind: "diff" });
+    expect(selectThreadRightPanelState(byThreadKey, refB).surfaces).toEqual([]);
+    // Another environment's thread with the same id is a different thread.
+    expect(selectActiveRightPanelSurface(byThreadKey, refC)).toEqual({
+      id: "diff",
+      kind: "diff",
+      threadId: ThreadId.make("thread-C"),
+    });
+  });
+
   it("open sets the active panel for a thread", () => {
     useRightPanelStore.getState().open(refA, "preview");
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe("preview");
