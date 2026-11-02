@@ -1001,7 +1001,14 @@ export default function FilePreviewPanel({
               : previewKind === "svg"
                 ? {
                     rendered: false,
-                    onRenderedChange: () => setSourceView({ path: null, revealRequestId }),
+                    // The image reads the file from disk, so wait for edits to be saved; if the
+                    // save fails, stay on the source with the edits (the toolbar says so).
+                    onRenderedChange: () => {
+                      void (async () => {
+                        if ((await session?.settle()) === "failed") return;
+                        setSourceView({ path: null, revealRequestId });
+                      })();
+                    },
                     showSourceLabel: "Show SVG source",
                     showRenderedLabel: "Show SVG as image",
                   }

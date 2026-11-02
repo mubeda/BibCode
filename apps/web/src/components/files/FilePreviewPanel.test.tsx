@@ -1246,7 +1246,7 @@ describe("binary file previews", () => {
     });
   });
 
-  it("opens an SVG linked to a line as source, and lets an explicit image choice win until the next link", () => {
+  it("opens an SVG linked to a line as source, and lets an explicit image choice win until the next link", async () => {
     setFileData("<svg/>");
     const seedChoice = (requestId: number | null) =>
       harness.seedState(
@@ -1266,6 +1266,7 @@ describe("binary file previews", () => {
 
     // "Show SVG as image" records the choice against the current link.
     markdownView.onRenderedChange(true);
+    await flushPromises();
     expect(
       harness.setStateCalls.some(
         (call) =>
@@ -1287,6 +1288,52 @@ describe("binary file previews", () => {
       baseProps({ relativePath: "logo.svg", revealLine: 12, revealRequestId: 5 }),
     );
     expect(markup).not.toContain("data-file-media");
+  });
+
+  describe("switching an SVG back to its image while edits are unsaved", () => {
+    const imageChoices = () =>
+      harness.setStateCalls.filter(
+        (call) =>
+          (call.next as { path?: string | null } | null)?.path === null &&
+          "revealRequestId" in (call.next as object),
+      );
+
+    function showImageAfterSettle(settled: Promise<string>) {
+      setFileData("<svg/>");
+      renderPanel(baseProps({ relativePath: "logo.svg", revealLine: 3, revealRequestId: 1 }));
+      const coordinator = testState.coordinators.at(-1)!;
+      coordinator.settle.mockReturnValueOnce(settled);
+      harness.setStateCalls.length = 0;
+      const view = ui.find("FileEditorToolbar").markdownView as {
+        onRenderedChange: (rendered: boolean) => void;
+      };
+      view.onRenderedChange(true);
+      return coordinator;
+    }
+
+    it("waits for the in-flight save before mounting the image, so it reads the saved file", async () => {
+      let finishSave: (result: string) => void = () => {};
+      const coordinator = showImageAfterSettle(
+        new Promise<string>((resolve) => {
+          finishSave = resolve;
+        }),
+      );
+      await flushPromises();
+
+      expect(coordinator.settle).toHaveBeenCalledTimes(1);
+      expect(imageChoices()).toHaveLength(0);
+
+      finishSave("saved");
+      await flushPromises();
+      expect(imageChoices()).toHaveLength(1);
+    });
+
+    it("stays on the source with its edits when the save fails", async () => {
+      showImageAfterSettle(Promise.resolve("failed"));
+      await flushPromises();
+
+      expect(imageChoices()).toHaveLength(0);
+    });
   });
 
   it("does not offer a source switch for images that are not SVG", () => {
