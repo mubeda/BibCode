@@ -27,8 +27,12 @@ pub(crate) async fn discover_capabilities(
     let mut capabilities = if definition.driver == "cursor" {
         let discovered = tokio::select! {
             () = cancellation.cancelled() => return Err("Skill discovery was cancelled.".to_owned()),
-            result = timeout(CURSOR_DISCOVERY_TIMEOUT, cursor::discover_workspace_capabilities_with_environment(cwd, &definition.environment)) =>
-                result.map_err(|_| "Skill discovery timed out. Retry to reload the catalog.".to_owned())?,
+            result = discover_cursor_within(CURSOR_DISCOVERY_TIMEOUT, |found| {
+                let (cwd, environment) = (cwd.to_path_buf(), definition.environment.clone());
+                Box::pin(async move {
+                    cursor::discover_workspace_capabilities_into(&cwd, &environment, found).await;
+                })
+            }) => result,
         };
         ProviderCapabilities {
             slash_commands: discovered.slash_commands,
@@ -135,6 +139,24 @@ pub(crate) async fn discover_capabilities(
         built_in_slash_commands(&definition.driver),
     );
     serde_json::to_value(capabilities).map_err(|error| error.to_string())
+}
+
+/// A scan that outlives `limit` (a slow network folder) keeps what it found,
+/// marked incomplete, instead of failing the whole catalog.
+async fn discover_cursor_within(
+    limit: Duration,
+    discover: impl for<'a> FnOnce(
+        &'a mut cursor::CursorWorkspaceCapabilities,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+) -> cursor::CursorWorkspaceCapabilities {
+    let mut found = cursor::CursorWorkspaceCapabilities::default();
+    let timed_out = timeout(limit, discover(&mut found)).await.is_err();
+    if timed_out {
+        found
+            .issues
+            .push("Skill list is incomplete: discovery timed out. Retry to reload it.".to_owned());
+    }
+    found
 }
 
 async fn codex_capabilities(
@@ -286,6 +308,30 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::test_support::TestSandbox;
+
+    #[tokio::test]
+    async fn a_cursor_scan_slower_than_the_timeout_keeps_the_skills_it_found() {
+        let found = discover_cursor_within(Duration::from_millis(50), |found| {
+            Box::pin(async move {
+                found.skills.push(json!({"name": "early"}));
+                std::future::pending::<()>().await;
+            })
+        })
+        .await;
+        assert_eq!(found.skills, [json!({"name": "early"})]);
+        assert_eq!(found.issues.len(), 1, "{:?}", found.issues);
+        assert!(found.issues[0].starts_with("Skill list is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn a_cursor_scan_that_finishes_in_time_adds_no_issue() {
+        let found = discover_cursor_within(Duration::from_secs(5), |found| {
+            Box::pin(async move { found.skills.push(json!({"name": "done"})) })
+        })
+        .await;
+        assert_eq!(found.skills.len(), 1);
+        assert!(found.issues.is_empty());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
