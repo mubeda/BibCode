@@ -353,6 +353,7 @@ children 60 minutes, and Linux children 45 minutes. Each checkout's frozen depen
 10 minutes. The complete macOS jobs allow 360 minutes: 270 for packaging, 30
 for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
 The other four native rows and the separate WSL job retain 240 minutes.
+The smoke builds override the release profile with 16 codegen units and LTO off, because they prove upgrade behaviour, not optimised code; a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs.
 The `remote-install` lane reuses the protected package rather than building a
 fourth package. These are build/job limits, not expected durations or changes
 to product, WebDriver, or restart deadlines.
@@ -425,7 +426,7 @@ are recorded, and the missing-backup message points to it. Credentials
 stay in a private receipt outside retained evidence and are redacted from logs.
 The upload receipt is also private and immutable. Evidence redaction removes
 full, truncated and escaped transfer-capability labels before applying size
-bounds. An invalid private receipt prevents evidence retention; only fixed
+bounds. An invalid private receipt prevents lane evidence retention (the secret-free `build-timings.txt` is already written); only fixed
 upload-witness booleans and bounds are added to the public result.
 Present `null` receipts are invalid. Once remote WebDriver launch is attempted,
 both phase logs and final evidence require the bootstrap receipt, even if
