@@ -2,12 +2,15 @@ import { PROVIDER_DISPLAY_NAMES } from "@bibcode/contracts";
 import { useEffect, useRef } from "react";
 
 import { useEnvironments } from "~/state/environments";
+import { useDismissedProviderUpdateNotificationKeys } from "../providerUpdateDismissal";
 import {
   detectExternalUpdates,
   type ProviderVersionObservation,
+  type RememberedVersion,
 } from "./externalUpdateNotice.logic";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
+/** Notices shown this session, until the persisted dismissal catches up. */
 const announcedNoticeKeys = new Set<string>();
 
 /**
@@ -17,7 +20,9 @@ const announcedNoticeKeys = new Set<string>();
  */
 export function ExternalUpdateNotice() {
   const { environments } = useEnvironments();
-  const lastVersions = useRef<ReadonlyMap<string, string>>(new Map());
+  const lastVersions = useRef<ReadonlyMap<string, RememberedVersion>>(new Map());
+  const { dismissedNotificationKeys, dismissNotificationKey } =
+    useDismissedProviderUpdateNotificationKeys();
 
   useEffect(() => {
     const observations: ProviderVersionObservation[] = [];
@@ -30,19 +35,23 @@ export function ExternalUpdateNotice() {
           driver: provider.driver,
           displayName: PROVIDER_DISPLAY_NAMES[provider.driver] ?? provider.driver,
           version: provider.version,
-          updatedByBiBCode: provider.updateState !== undefined,
+          updateActive:
+            provider.updateState?.status === "queued" || provider.updateState?.status === "running",
+          updateFinishedAt: provider.updateState?.finishedAt ?? null,
         });
       }
     }
     const { notices, next } = detectExternalUpdates(
       lastVersions.current,
       observations,
-      announcedNoticeKeys,
+      new Set([...announcedNoticeKeys, ...dismissedNotificationKeys]),
       environments.length > 1,
     );
     lastVersions.current = next;
     for (const notice of notices) {
       announcedNoticeKeys.add(notice.key);
+      // Shown once per version, and not again after a reload or a rollback and re-upgrade.
+      dismissNotificationKey(notice.key);
       toastManager.add(
         stackedThreadToast({
           type: "info",
@@ -53,7 +62,7 @@ export function ExternalUpdateNotice() {
         }),
       );
     }
-  }, [environments]);
+  }, [environments, dismissedNotificationKeys, dismissNotificationKey]);
 
   return null;
 }

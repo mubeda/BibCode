@@ -3380,9 +3380,14 @@ sizes. Cover relevant:
   `PATH` at a stub `codegraph` that records its environment and arguments,
   never the real CLI or a real agent configuration, to confirm **Update** runs
   `upgrade` with `CODEGRAPH_NO_PROMPT_HOOK=1` and `CODEGRAPH_NO_INSTALL_REFRESH=1`
-  and leaves a sentinel agent-config file untouched. Close the window mid-
-  update: the stub keeps running and the row shows the result on return, and a
-  server restart while it runs says **still being updated** with no reinstall.
+  and leaves a sentinel agent-config file untouched. The row shows **Close
+  agent sessions that use CodeGraph before updating** next to **Update**. Close
+  the window or disconnect mid-update: the stub keeps running and the row shows
+  the result on return. Quit the desktop app mid-update: it waits for the stub (up
+  to 30 s beyond its usual 5 s stop) before exiting, and a stub that outlasts that
+  leaves **may be damaged** with a reinstall on the next start, or **still being
+  updated** with no reinstall while it still runs. Kill the server process outright:
+  the next start says the same.
   A stub that exits non-zero leaves **may be damaged** with a reinstall; a
   wrapper outside the installer layout is shown as manual with the reason. A
   WSL or remote environment reports its own CodeGraph, and an older server that

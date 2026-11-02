@@ -438,7 +438,7 @@ describe("server update command", () => {
     checkedAt: "2026-11-02T00:00:00.000Z",
   };
 
-  const run = (provider: string) =>
+  const run = (provider: string, config: unknown = { tools: [tool] }) =>
     Effect.gen(function* () {
       const environmentId = EnvironmentId.make("environment-update");
       const calls: Array<{ readonly method: string; readonly input: unknown }> = [];
@@ -470,7 +470,7 @@ describe("server update command", () => {
       } as never);
       const atoms = createServerEnvironmentAtoms(
         Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
-        { initialConfigValueAtom: () => Atom.make(null) },
+        { initialConfigValueAtom: () => Atom.make(config as ServerConfig | null) },
       );
       const atomRegistry = AtomRegistry.make();
       const result = yield* Effect.promise(() =>
@@ -498,9 +498,20 @@ describe("server update command", () => {
     }),
   );
 
+  it.effect("sends nothing to a server whose current config reports no tools", () =>
+    Effect.gen(function* () {
+      // A saved Update-all confirmation can outlive a reconnect to an older server.
+      const { calls, result } = yield* run("codegraph", { providers: [] });
+      expect(calls).toEqual([]);
+      expect(result._tag).toBe("Failure");
+      const unconfigured = yield* run("codegraph", null);
+      expect(unconfigured.calls).toEqual([]);
+    }),
+  );
+
   it.effect("keeps sending a provider to server.updateProvider", () =>
     Effect.gen(function* () {
-      const { calls } = yield* run("codex");
+      const { calls } = yield* run("codex", { providers: [] });
       expect(calls.map((call) => call.method)).toEqual([WS_METHODS.serverUpdateProvider]);
     }),
   );
