@@ -1,0 +1,385 @@
+{
+  "preview_status": {
+    "description": "Report the preview tab's state: whether it is available and visible, its tabId, URL, title, loading flag and viewport.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        }
+      }
+    }
+  },
+  "preview_open": {
+    "description": "Open the collaborative browser preview, optionally at url, and return its status. tabId cannot be combined with reuseExistingTab false.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional initial page URL, for example https://example.com or localhost:5173. Omit to open a blank tab.",
+          "maxLength": 2048
+        },
+        "show": {
+          "type": "boolean",
+          "description": "Whether to reveal the preview panel to the human. Defaults to true."
+        },
+        "reuseExistingTab": {
+          "type": "boolean",
+          "description": "Reuse tabId when supplied, otherwise this agent session's current tab. Defaults to true; set false to create a new tab, which cannot be combined with tabId."
+        }
+      }
+    }
+  },
+  "preview_navigate": {
+    "description": "Navigate the preview tab and return its status once it is ready. Give exactly one of url or target; target is {kind:'url', url} or {kind:'environment-port', port, protocol?, path?}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Website URL, for example https://example.com. Use this for public pages and directly reachable URLs.",
+          "maxLength": 2048
+        },
+        "target": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": ["url", "environment-port"]
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Absolute http(s) URL or a schemeless host such as example.com or localhost:5173. Schemeless public hosts use https; loopback hosts use http.",
+              "maxLength": 2048
+            },
+            "port": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 65536,
+              "description": "Dev-server TCP port inside the current environment."
+            },
+            "protocol": {
+              "type": "string",
+              "enum": ["http", "https"],
+              "description": "Dev-server protocol. Defaults to http."
+            },
+            "path": {
+              "type": "string",
+              "description": "Optional path, query, and fragment, for example /settings?tab=account."
+            }
+          },
+          "required": ["kind"],
+          "description": "Environment-relative target. Prefer {kind:'environment-port',port:5173} for a dev server in the current environment."
+        },
+        "readiness": {
+          "type": "string",
+          "enum": ["load", "domContentLoaded", "none"],
+          "description": "Readiness milestone before returning. 'load' is the default; use 'none' only when a later wait call will verify the page."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "description": "Maximum wait in milliseconds. Defaults to 15000; maximum 60000."
+        }
+      }
+    }
+  },
+  "preview_resize": {
+    "description": "Resize the preview viewport and return the applied setting and measured viewport. fill takes no other field; freeform needs width and height; preset needs preset and may take orientation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["fill", "freeform", "preset"],
+          "description": "Viewport mode: fill follows the preview panel, freeform uses exact independently resizable dimensions, and preset uses a named device size."
+        },
+        "preset": {
+          "type": "string",
+          "enum": [
+            "iphone-se",
+            "iphone-xr",
+            "iphone-12-pro",
+            "iphone-14-pro-max",
+            "pixel-7",
+            "samsung-galaxy-s8-plus",
+            "samsung-galaxy-s20-ultra",
+            "ipad-mini",
+            "ipad-air",
+            "ipad-pro",
+            "surface-pro-7",
+            "surface-duo",
+            "galaxy-z-fold-5",
+            "asus-zenbook-fold",
+            "samsung-galaxy-a51-71",
+            "nest-hub",
+            "nest-hub-max"
+          ],
+          "description": "Named device size. Required only when mode is preset."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 240,
+          "maximum": 3840,
+          "description": "Freeform viewport width in CSS pixels. Required only in freeform mode."
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 240,
+          "maximum": 3840,
+          "description": "Freeform viewport height in CSS pixels. Required only in freeform mode."
+        },
+        "orientation": {
+          "type": "string",
+          "enum": ["portrait", "landscape"],
+          "description": "Orientation for a named device preset. It is not accepted in fill or freeform mode."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "description": "Maximum wait in milliseconds. Defaults to 15000; maximum 60000."
+        }
+      },
+      "required": ["mode"]
+    }
+  },
+  "preview_snapshot": {
+    "description": "Snapshot the preview tab: visible text, interactive elements with selectors, console and network entries, and a screenshot as image content. Take one before acting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        }
+      }
+    }
+  },
+  "preview_click": {
+    "description": "Click in the preview page. Give exactly one of locator, selector, or the x and y pair.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "selector": {
+          "type": "string",
+          "description": "Legacy CSS selector such as button[type='submit']. Prefer locator for resilient role/text targeting."
+        },
+        "locator": {
+          "type": "string",
+          "description": "Playwright selector, preferably role/text based, for example role=button[name='Send'] or text=Continue. Use snapshot first to inspect the page."
+        },
+        "x": {
+          "type": "number",
+          "description": "Viewport-relative X coordinate in CSS pixels. Must be paired with y."
+        },
+        "y": {
+          "type": "number",
+          "description": "Viewport-relative Y coordinate in CSS pixels. Must be paired with x."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "description": "Maximum wait in milliseconds. Defaults to 15000; maximum 60000."
+        }
+      }
+    }
+  },
+  "preview_type": {
+    "description": "Type text into the preview page: into locator or selector (at most one), or into the focused element when neither is given.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "text": {
+          "type": "string",
+          "description": "Literal text to insert."
+        },
+        "selector": {
+          "type": "string",
+          "description": "Legacy CSS selector for the input. Prefer locator."
+        },
+        "locator": {
+          "type": "string",
+          "description": "Playwright selector for the input, for example role=textbox[name='Message'] or textarea[placeholder*='Message']."
+        },
+        "clear": {
+          "type": "boolean",
+          "description": "Clear the existing input value before inserting text. Defaults to false."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "description": "Maximum wait in milliseconds. Defaults to 15000; maximum 60000."
+        }
+      },
+      "required": ["text"]
+    }
+  },
+  "preview_press": {
+    "description": "Press one keyboard key in the preview page, with optional modifiers held.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Keyboard key name such as Enter, Escape, Tab, ArrowDown, Backspace, or a single character."
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["Alt", "Control", "Meta", "Shift"]
+          },
+          "description": "Modifier keys held while pressing key."
+        }
+      },
+      "required": ["key"]
+    }
+  },
+  "preview_scroll": {
+    "description": "Scroll the preview page, or the container at locator or selector (at most one), by deltaX and/or deltaY. Give at least one delta.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "deltaX": {
+          "type": "number",
+          "description": "Horizontal scroll delta in CSS pixels. Positive scrolls right. Defaults to 0."
+        },
+        "deltaY": {
+          "type": "number",
+          "description": "Vertical scroll delta in CSS pixels. Positive scrolls down. Defaults to 0."
+        },
+        "selector": {
+          "type": "string",
+          "description": "Legacy CSS selector for a scrollable container. Omit to scroll the viewport."
+        },
+        "locator": {
+          "type": "string",
+          "description": "Playwright selector for a scrollable container. Omit to scroll the viewport."
+        }
+      }
+    }
+  },
+  "preview_evaluate": {
+    "description": "Run a JavaScript expression in the preview page and return its value. It runs as the page, in the user's preview; prefer preview_snapshot and the action tools.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "expression": {
+          "type": "string",
+          "minLength": 1,
+          "description": "JavaScript expression evaluated in the page's main frame, for example document.title or (() => ({href: location.href}))().",
+          "maxLength": 64000
+        },
+        "awaitPromise": {
+          "type": "boolean",
+          "description": "Await a returned Promise. Defaults to true."
+        },
+        "returnByValue": {
+          "type": "boolean",
+          "description": "Serialize and return the value instead of a remote object reference. Defaults to true."
+        }
+      },
+      "required": ["expression"]
+    }
+  },
+  "preview_wait_for": {
+    "description": "Wait until every given condition holds: locator or selector (at most one), text, urlIncludes. Give at least one. Use it after an action that changes the page asynchronously.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        },
+        "selector": {
+          "type": "string",
+          "description": "Legacy CSS selector that must match an element. Prefer locator."
+        },
+        "locator": {
+          "type": "string",
+          "description": "Playwright selector that must match an element, for example role=button[name='Send']."
+        },
+        "text": {
+          "type": "string",
+          "description": "Case-sensitive substring that must appear in visible document text."
+        },
+        "urlIncludes": {
+          "type": "string",
+          "description": "Substring that must appear in the current absolute URL."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 60000,
+          "description": "Maximum wait in milliseconds. Defaults to 15000; maximum 60000."
+        }
+      }
+    }
+  },
+  "preview_recording_start": {
+    "description": "Start recording the preview tab; returns when the recording began.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        }
+      }
+    }
+  },
+  "preview_recording_stop": {
+    "description": "Stop recording the preview tab and return the recording (id, path, mimeType, size).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "string",
+          "description": "Exact collaborative browser tab to target. Omit to use this agent session's current tab."
+        }
+      }
+    }
+  }
+}

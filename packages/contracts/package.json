@@ -23,6 +23,7 @@
   "scripts": {
     "generate:rust-auth-fixtures": "node scripts/export-rust-auth-fixtures.ts",
     "generate:rust-rpc-fixtures": "node scripts/export-rust-rpc-fixtures.ts",
+    "generate:mcp-tool-fixtures": "node scripts/export-mcp-tool-fixtures.ts",
     "typecheck": "tsc --noEmit",
     "test": "node ../../scripts/run-local-vp.mjs test run"
   },
