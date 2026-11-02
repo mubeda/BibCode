@@ -1,8 +1,9 @@
 # Shell Finished-Thread Cap, Older Threads and Shell Resume
 
-Status: Revised for Codex review round 2 (2026-11-02). Round 1 (`e724d358d`)
-returned REVISE with one P1 and seven P2 findings; [Review
-resolutions](#review-resolutions) maps each to its change. The coordinator
+Status: Revised for Codex review round 3 (2026-11-02). Round 1 (`e724d358d`)
+returned REVISE with one P1 and seven P2 findings, round 2 (`38a523683`) with
+one P1 and four P2; [Review resolutions](#review-resolutions) maps each to its
+change. The coordinator
 settled the open questions: caps of 25 overall plus 3 per project, workspace
 threads without a worktree are capped too, and search matches titles only.
 Issue #223, the 2026-10-31 addendum (proposed changes 6 to 9). No code until
@@ -10,12 +11,15 @@ this is approved.
 
 Revision 2 rests on one rule:
 
-> **Absence from a capped shell never means a thread is gone.** Only an
-> explicit removal item (`thread-removed`, `project-removed`), membership in the
-> archived snapshot, or `missing` from `orchestration.getThreadShells` does.
+> **Absence from a capped shell never means a thread is gone.** Only `missing`
+> from `orchestration.getThreadShells`, or absence from both an uncapped live
+> shell and the archived snapshot (today's rule), means it was deleted. A
+> removal item means only "no longer in the live shell": it updates lists, never
+> persisted state.
 
 Every reader that used to infer deletion from absence (lifecycle cleanup, the
-route guard, actions) now asks for that evidence.
+route guard, actions) now asks for that evidence, and archiving keeps today's
+behavior: an archived workspace keeps its saved tabs and layout.
 
 - Builds on the shell deltas of #223 (`b286aa05f` and its review fixes): after
   the first snapshot the stream sends only the projects and threads that changed
@@ -206,6 +210,7 @@ input: {
       worktreePath: Schema.NullOr(TrimmedNonEmptyString),
     }),
     Schema.Struct({ kind: Schema.Literal("agents") }),
+    Schema.Struct({ kind: Schema.Literal("search") }), // requires `query`
   ]),
   query: Schema.optional(TrimmedNonEmptyString),
   cursor: Schema.optional(TrimmedNonEmptyString),
@@ -221,7 +226,11 @@ output: {
 - **`project`**: the project's left-out non-panel threads (the **N older
   threads** row). **`checkout`**: the left-out panel threads of one checkout,
   grouped as in §2 (**N more chats**). **`agents`**: every left-out agent,
-  panels included, as the Agents rows list them (Done paging).
+  panels included, as the Agents rows list them (Done paging). **`search`**:
+  every unarchived thread of the environment, of any kind, with or without a
+  session, kept or not; it requires `query` and is what the palette uses,
+  because the Agents rows skip threads without a session
+  (`agentsSection.logic.ts:147-148`).
 - **Without `query`** it returns threads outside the kept set computed without
   `cap.include` (a page caller's include set is unknown), newest first by the
   §1 key, keyset paged on `(key, thread_id)`. The client drops ids it already
@@ -229,6 +238,7 @@ output: {
   while paging.
 - **With `query`** it searches every unarchived thread of the scope, kept or
   not, by case-insensitive title substring (`lower(title) LIKE ? ESCAPE '\'`).
+  `search` without `query` is an `OrchestrationListOlderThreadsError`.
 - **Cursor.** Base64url JSON `{ v: 1, scope, key, threadId }`: a timestamp and
   ids, never content.
 - **Rows** use `thread_shell_with_records`, with the shell's per-thread reads
@@ -320,11 +330,16 @@ export const OrchestrationSubscribeShellInput = Schema.Struct({
 
 A page copy or a resolved copy must not outlive its thread.
 
-- The shell stream also collects, from the events of each coalesce window,
-  every `thread.deleted` and `thread.archived` aggregate id and every
-  `project.deleted` id. At the tick it sends `thread-removed` or
-  `project-removed` for each such id that the delta didn't already cover, held
-  or not. It is a few bytes per event and only for opted-in subscribers.
+- The shell stream also collects, from the events of each coalesce window, the
+  aggregate ids of every `thread.deleted`, `thread.archived`,
+  `thread.unarchived` and `project.deleted` event. These are only candidates.
+  At the tick, after the re-read, it reads the **final** state of those ids
+  (one `SELECT thread_id, archived_at, deleted_at … WHERE thread_id IN (…)`,
+  plus the project rows) and sends `thread-removed` or `project-removed` only
+  for ids that are, at that point, not live-shell threads (archived, deleted
+  or without a project) and that the delta didn't already cover, held or not.
+  An archive and an unarchive in one window therefore send nothing. It is a few
+  bytes per event and only for opted-in subscribers.
 - After `Lagged`, a failed read or any snapshot, the client drops every page
   and resolved copy for the environment (§9), since a removal may have been
   missed.
@@ -349,21 +364,36 @@ A page copy or a resolved copy must not outlive its thread.
   `project-removed`, yields to the shell when the id arrives there (the shell
   copy is live-updated, the off-shell copy isn't), and is cleared on any
   snapshot, `Lagged`-triggered or not, and on session change.
+- **Generation fence.** The store has a `generation` counter that every
+  removal item, snapshot, `unchanged` and session change bumps. Each
+  `listOlderThreads` or `getThreadShells` request records the generation it was
+  sent at, and its reply is dropped if the generation moved meanwhile; a
+  reader still waiting re-issues it. A reply that was in flight across a
+  deletion therefore never brings the row back.
 - **Resolver.** One lookup in `state/entities.ts` for every reader:
   1. the live shell;
   2. the off-shell store;
   3. when both miss and the shell is `capped`, `getThreadShells([id])`,
      batched per tick, whose `threads` fill the store and whose `missing` is
-     remembered for the session.
+     remembered for the session. A shell without `capped` comes from an old
+     server, which has no `getThreadShells`: the resolver answers `Unknown`,
+     never `Missing`.
 
   `readThreadShell`, `useThreadShell` and `findThreadRef` read steps 1 and 2
   synchronously; `useThreadShell` also starts step 3 and re-renders when it
-  lands. A new `resolveThreadShell(ref): Promise<Resolved | Missing>` runs all
-  three. Its callers, from the list under Current behavior:
-  - **Actions** await `resolveThreadShell` and fail visibly on `Missing`
-    (**This thread no longer exists.**), never succeed silently:
-    `useThreadActions.ts` archive, unarchive, delete, rename and fork paths
-    (`:104,121,123,317,431`), `centerPanelActions.ts:133,159,185`,
+  lands. A new `resolveThreadShell(ref): Promise<Resolved | Missing | Unknown>`
+  runs all three. `getThreadShells` returns archived threads too, so a resolved
+  thread may carry `archivedAt`. Its callers, from the list under Current
+  behavior:
+  - **Unarchive and delete** keep today's direct dispatch
+    (`useThreadActions.ts:286-313`): their commands are valid for an archived
+    thread the live shell never holds, so they never wait on the resolver and
+    work against old servers exactly as today. Delete still uses a resolved
+    shell, when there is one, for its worktree handling.
+  - **Other actions** await `resolveThreadShell` and fail visibly on `Missing`
+    (**This thread no longer exists.**), never succeed silently; on `Unknown`
+    (old server) they behave as today: `useThreadActions.ts` archive, rename
+    and fork paths (`:104,121,123,431`), `centerPanelActions.ts:133,159,185`,
     `WorktreeRemovalDialog.tsx:115`, `useHandleNewThread.ts:90`,
     `useAddProjectWorkflow.ts:1089`, and `UiIntentNotifier.tsx:60`, which
     therefore finds an omitted panel's host before it routes.
@@ -374,12 +404,15 @@ A page copy or a resolved copy must not outlive its thread.
     today for an unknown thread.
 
 - **Lifecycle cleanup.** `ThreadLifecycleReconciler` keeps today's rule for a
-  snapshot without `capped`. For a capped one, a thread with persisted panel
-  state that is in neither the live shell, the archived snapshot nor the
-  drafts is a candidate, not a deletion: the reconciler asks
-  `getThreadShells(candidates)` in batches of 100 and deletes state only for
-  `missing` ids. Removal items delete state directly, as authoritative
-  evidence.
+  snapshot without `capped`, and today's archive handling in both cases: an
+  archived non-panel thread keeps its state, a closed (archived) chat panel
+  does not (`ThreadLifecycleReconciler.tsx:153-161`). For a capped shell, a
+  thread with persisted panel state that is in neither the live shell, the
+  archived snapshot nor the drafts is a candidate, not a deletion: the
+  reconciler asks `getThreadShells(candidates)` in batches of 100, retains every
+  returned thread except an archived panel, and deletes state only for
+  `missing` ids. Removal items never delete state: they change live membership,
+  which, as today, refetches the archived snapshot that decides.
 - **Route guard.** `shouldRedirectMissingRouteThread` gains the capped input.
   For a capped shell the 1 s timer never runs; the route redirects only when
   the resolver returns `Missing` for the routed thread. Until then the route
@@ -402,7 +435,7 @@ A page copy or a resolved copy must not outlive its thread.
   are reachable too.
 - **Command palette.** Search matches the shell and the off-shell store at
   once. With 2 or more characters and a capped shell, it asks
-  `listOlderThreads({ scope: { kind: "agents" }, query, limit: 20 })` after
+  `listOlderThreads({ scope: { kind: "search" }, query, limit: 20 })` after
   250 ms without typing, appends new matches under **Older threads**, and a
   newer query cancels the request in flight.
 
@@ -410,8 +443,9 @@ A page copy or a resolved copy must not outlive its thread.
 
 - `shell_stream_with_events` decodes `OrchestrationSubscribeShellInput`; a
   decode failure ends the stream with `InvalidRequest`.
-- `HeldShell` gains the include set, the counts, the removal ids collected in
-  the window (§8) and `revision(keys)`.
+- `HeldShell` gains the include set, the counts, the lifecycle candidate ids
+  collected in the window (§8, resolved against final state at the tick) and
+  `revision(keys)`.
 - **Terminal hosts.** The stream takes the terminal manager's live-agent host
   set when it re-reads, and the terminal metadata subscription schedules a
   re-read when that set changes. Only the set of host ids crosses the module
@@ -517,6 +551,7 @@ A page copy or a resolved copy must not outlive its thread.
 - `shell_stream_upserts_a_left_out_thread_that_starts_a_turn`.
 - `shell_stream_keeps_a_thread_pushed_out_of_the_cap`.
 - `shell_stream_sends_removal_for_a_left_out_thread_deleted_or_archived`.
+- `shell_stream_sends_no_removal_for_archive_then_unarchive_in_one_window`.
 - `shell_stream_fallback_snapshot_keeps_held_threads`.
 - `shell_stream_resume_with_current_revision_answers_unchanged_with_ages`.
 - `shell_stream_resume_with_stale_revision_or_new_keys_sends_snapshot`.
@@ -524,6 +559,8 @@ A page copy or a resolved copy must not outlive its thread.
 - `list_older_threads_pages_every_left_out_thread_once_newest_first`.
 - `list_older_threads_checkout_scope_matches_the_chat_grouping`.
 - `list_older_threads_agents_scope_includes_panels`.
+- `list_older_threads_search_scope_finds_threads_without_sessions`.
+- `list_older_threads_search_scope_requires_a_query`.
 - `list_older_threads_searches_titles_case_insensitively_with_escaped_wildcards`.
 - `list_older_threads_rejects_a_malformed_cursor`.
 - `get_thread_shells_returns_live_and_archived_and_lists_missing`.
@@ -551,26 +588,34 @@ A page copy or a resolved copy must not outlive its thread.
   - `ignores unchanged from a stale session`.
 - `offShellThreads.test.ts`: `pages and dedupes against the shell`,
   `a removal item drops a page copy`, `project-removed drops its threads`,
-  `any snapshot clears the store`, `the shell copy wins`.
+  `any snapshot clears the store`, `the shell copy wins`,
+  `drops a page reply that completes after a removal`,
+  `drops a lookup reply that completes after a snapshot`.
 - `entities` resolver tests: `resolves shell, then off-shell, then the server`,
-  `remembers missing for the session`, `batches lookups per tick`.
+  `remembers missing for the session`, `batches lookups per tick`,
+  `answers Unknown, never Missing, for an uncapped shell`,
+  `resolves an archived thread with archivedAt`.
 
 ### Web (happy-dom, from `apps/web`)
 
 - `ThreadLifecycleReconciler.test.tsx`:
   `keeps panel state of a thread left out of a capped snapshot`,
   `deletes panel state only for ids getThreadShells reports missing`,
-  `deletes on a removal item`, and the existing full-list tests unchanged.
+  `keeps an archived workspace's state after a removal item and restores it on
+  unarchive`, `drops an archived chat panel's state`, and the existing
+  full-list tests unchanged.
 - `threadRoutes.test.ts`: `never redirects a capped route before the resolver
   answers`, `redirects when the resolver reports missing`.
 - `useThreadActions.test.ts`: `archives a left-out thread through the
-  resolver`, `reports a missing thread instead of succeeding`.
+  resolver`, `reports a missing thread instead of succeeding`,
+  `unarchives and deletes an archived thread by direct dispatch against an old
+  server`.
 - `UiIntentNotifier.test.tsx`: `routes a left-out panel to its host`.
 - `agentsSection.agents.test.ts`: `keeps a terminal row whose host is
   off-shell`, `pages older agents into Done, panels included`.
 - `Sidebar.logic.test.ts`: `shows N older threads`, `adds the checkout's chats
   count to N more chats`, `keeps every workspace card`.
-- `CommandPalette.logic.test.ts`: `appends older matches`, `cancels an older
+- `CommandPalette.logic.test.ts`: `appends older matches`, `finds a left-out thread without a session`, `cancels an older
   search when the query changes`.
 - A component test for the older row's loading, error, offline and empty
   states.
@@ -628,8 +673,8 @@ A page copy or a resolved copy must not outlive its thread.
 ### Round 1 (`e724d358d`)
 
 1. **P1, capped snapshots trigger lifecycle cleanup.** The absence rule; the
-   `capped` marker; the reconciler deletes only on removal items or
-   `getThreadShells` `missing` (§1, §4, §9).
+   `capped` marker; the reconciler deletes only on `getThreadShells` `missing`
+   (§1, §4, §9; narrowed in round 2).
 2. **P2, live AI Terminals lose their hosts.** Kept set item 2, read from the
    terminal manager with re-reads on its changes (§1, §11), and the Agents
    rows resolve an off-shell host instead of dropping it (§9).
@@ -647,3 +692,22 @@ A page copy or a resolved copy must not outlive its thread.
    `checkout` scope use `workspaceCheckoutKey`'s grouping (§2, §3).
 8. **P2, cold resume resets freshness.** `unchanged` carries `activityAges`,
    pinned on receipt; a cold-resume test (§5, §9).
+
+### Round 2 (`38a523683`)
+
+1. **P1, a removal item for an archive drops saved tabs.** Removal items never
+   touch persisted state; the archived snapshot and `getThreadShells` decide,
+   so an archived workspace keeps its state and a closed panel drops it, as
+   today (§9, the absence rule).
+2. **P2, archive then unarchive in one window sends a false removal.** Lifecycle
+   events only nominate ids; removals come from their final state at the tick
+   (§8).
+3. **P2, a delayed reply resurrects a deleted row.** A generation fence that
+   removals, snapshots, `unchanged` and session changes bump; stale replies are
+   dropped (§9).
+4. **P2, archived-thread actions against old servers.** Unarchive and delete
+   keep today's direct dispatch; the resolver answers `Unknown`, never
+   `Missing`, for an uncapped shell, and resolves archived threads with
+   `archivedAt` (§9).
+5. **P2, search misses threads without sessions.** A `search` scope over every
+   unarchived thread of the environment, used by the palette (§3, §10).
