@@ -21,6 +21,8 @@ const h = vi.hoisted(() => ({
   selectCompareFile: vi.fn(),
   environments: [] as Array<{ environmentId: string }>,
   shells: {} as Record<string, { title: string; hostThreadId?: string }>,
+  // Threads the capped shell left out, which the resolver finds on the server (#223).
+  serverShells: {} as Record<string, { title: string; hostThreadId?: string }>,
 }));
 vi.mock("./ui/toast", () => ({
   stackedThreadToast: (options: unknown) => options,
@@ -34,6 +36,10 @@ vi.mock("./ui/toast", () => ({
 }));
 vi.mock("~/state/entities", () => ({
   readThreadShell: (ref: { threadId: string }) => h.shells[ref.threadId] ?? null,
+  resolveThreadShell: async (ref: { threadId: string }) => {
+    const thread = h.shells[ref.threadId] ?? h.serverShells[ref.threadId];
+    return thread === undefined ? { kind: "unknown" } : { kind: "resolved", thread };
+  },
 }));
 vi.mock("~/state/environments", () => ({
   useEnvironments: () => ({ environments: h.environments }),
@@ -180,6 +186,20 @@ describe("UiIntentNotifier", () => {
     expect(h.openChatPanel).toHaveBeenCalledWith(host, "panel");
     expect(h.rightPanel.open).toHaveBeenCalledWith(host, "diff");
     expect(h.selectCompareFile).toHaveBeenCalledWith(host, "a.ts");
+  });
+
+  it("routes a left-out panel to its host (#223)", async () => {
+    h.shells = {};
+    h.serverShells = { panel: { title: "Older review", hostThreadId: "host" } };
+    const registry = fakeRegistry();
+    await mount(registry);
+    await emit(registry, [intent({ threadId: ThreadId.make("panel"), surface: "thread" })]);
+    await act(async () => h.toasts[0]?.actionProps?.onClick());
+
+    const host = { environmentId, threadId: "host" };
+    expect(navigate).toHaveBeenCalledWith({ to: "/$environmentId/$threadId", params: host });
+    expect(h.openChatPanel).toHaveBeenCalledWith(host, "panel");
+    h.serverShells = {};
   });
 
   it("skips an expired intent and holds one for a hidden window until it is shown", async () => {

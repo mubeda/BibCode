@@ -3,7 +3,7 @@
 /* oxlint-disable react/no-unstable-nested-components */
 
 import { scopeProjectRef, scopeThreadRef } from "@bibcode/client-runtime/environment";
-import { type ProjectId } from "@bibcode/contracts";
+import { type OrchestrationOlderThreadsScope, type ProjectId } from "@bibcode/contracts";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import {
   ArrowDownIcon,
@@ -35,6 +35,9 @@ import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useClientSettings } from "../hooks/useSettings";
 import { useActiveEnvironmentId, useProjects, useThreadShells } from "../state/entities";
 import { useEnvironments } from "../state/environments";
+import { loadOlderThreads, useOffShellThreadShells } from "../state/offShell";
+import { cappedShellEnvironmentsAtom } from "../state/shell";
+import { mergeOffShellThreads } from "./sidebar/agentsSection.logic";
 import {
   startNewThreadInProjectFromContext,
   startNewThreadFromContext,
@@ -49,6 +52,7 @@ import {
   buildProjectActionItems,
   buildRootGroups,
   buildThreadActionItems,
+  createOlderThreadSearch,
   type CommandPaletteActionItem,
   type CommandPaletteSubmenuItem,
   type CommandPaletteView,
@@ -80,6 +84,8 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import { ComposerHandleContext, useComposerHandleContext } from "../composerHandleContext";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import { resolveAddProjectTargetLabel } from "./sidebar/environmentRail.logic";
+
+const OLDER_SEARCH_SCOPE: OrchestrationOlderThreadsScope = { kind: "search" };
 
 interface CommandPaletteOpenIntent {
   readonly kind: "add-project";
@@ -221,6 +227,8 @@ function OpenCommandPaletteDialog(props: {
     useHandleNewThread();
   const projects = useProjects();
   const threads = useThreadShells();
+  const offShellThreadShells = useOffShellThreadShells();
+  const cappedEnvironments = useAtomValue(cappedShellEnvironmentsAtom);
   const { environments } = useEnvironments();
   const activeEnvironmentId = useActiveEnvironmentId();
   const addProjectTargetLabel = resolveAddProjectTargetLabel({
@@ -340,6 +348,52 @@ function OpenCommandPaletteDialog(props: {
     [activeThreadId, clientSettings.sidebarThreadSortOrder, navigate, projectTitleById, threads],
   );
   const recentThreadItems = allThreadItems.slice(0, RECENT_THREAD_LIMIT);
+  // Matches the capped shells left out (#223), found by a server search, listed after the rest.
+  const olderThreadItems = useMemo(() => {
+    const older = mergeOffShellThreads(threads, offShellThreadShells).slice(threads.length);
+    return older.length === 0
+      ? []
+      : buildThreadActionItems({
+          threads: older,
+          projectTitleById,
+          sortOrder: clientSettings.sidebarThreadSortOrder,
+          icon: <MessageSquareIcon className={ITEM_ICON_CLASS} />,
+          runThread: async (thread) => {
+            await navigate({
+              to: "/$environmentId/$threadId",
+              params: buildThreadRouteParams(scopeThreadRef(thread.environmentId, thread.id)),
+            });
+          },
+        });
+  }, [
+    clientSettings.sidebarThreadSortOrder,
+    navigate,
+    offShellThreadShells,
+    projectTitleById,
+    threads,
+  ]);
+  // A newer query, or a change of capped environments, aborts the search in flight.
+  useEffect(() => {
+    const live = cappedEnvironments.filter((environment) => environment.live);
+    if (live.length === 0) return;
+    const search = createOlderThreadSearch(
+      (searchQuery, signal) => {
+        for (const { environmentId } of live) {
+          void loadOlderThreads(environmentId, OLDER_SEARCH_SCOPE, {
+            query: searchQuery,
+            append: false,
+            signal,
+          });
+        }
+      },
+      {
+        set: (callback, delayMs) => window.setTimeout(callback, delayMs),
+        clear: (handle) => window.clearTimeout(handle as number),
+      },
+    );
+    search.update(deferredQuery);
+    return () => search.dispose();
+  }, [cappedEnvironments, deferredQuery]);
 
   function pushPaletteView(view: CommandPaletteView): void {
     setViewStack((previousViews) => [
@@ -492,6 +546,7 @@ function OpenCommandPaletteDialog(props: {
     isInSubmenu: currentView !== null,
     projectSearchItems: projectSearchItems,
     threadSearchItems: allThreadItems,
+    olderThreadSearchItems: olderThreadItems,
   });
   const displayedGroups: CommandPaletteView["groups"] = filteredGroups;
   const inputPlaceholder = getCommandPaletteInputPlaceholder(paletteMode);

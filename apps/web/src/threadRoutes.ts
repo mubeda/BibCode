@@ -65,6 +65,10 @@ export interface MissingRouteThreadRedirectInput {
   readonly routeThreadExists: boolean;
   /** Server threads only — client-persisted drafts must not count. */
   readonly environmentHasServerThreads: boolean;
+  /** The live shell left finished threads out (#223), so its absence proves nothing. */
+  readonly shellCapped?: boolean;
+  /** The server reported the routed thread deleted or unknown (`getThreadShells`). */
+  readonly routeThreadMissing?: boolean;
 }
 
 /**
@@ -77,6 +81,12 @@ export interface MissingRouteThreadRedirectInput {
  * flaps, so they say nothing about the server's thread list.
  */
 export function shouldRedirectMissingRouteThread(input: MissingRouteThreadRedirectInput): boolean {
+  if (input.shellCapped === true) {
+    // Only the server's `missing` is evidence; a slow link never bounces a left-out thread.
+    return (
+      input.shellStatus === "live" && !input.routeThreadExists && input.routeThreadMissing === true
+    );
+  }
   return (
     input.shellStatus === "live" && !input.routeThreadExists && input.environmentHasServerThreads
   );

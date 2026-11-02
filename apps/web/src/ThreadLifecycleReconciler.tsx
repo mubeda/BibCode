@@ -20,6 +20,8 @@ import { useComposerDraftStore } from "./composerDraftStore";
 import { useArchivedThreadSnapshots } from "./lib/archivedThreadsState";
 import { useRightPanelStore } from "./rightPanelStore";
 import { useEnvironments } from "./state/environments";
+import { requestThreadShells } from "./state/offShell";
+import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
 import { environmentShell } from "./state/shell";
 import { terminalEnvironment } from "./state/terminal";
 
@@ -42,6 +44,43 @@ function collectPersistedThreadIds(environmentId: EnvironmentId): Set<ThreadId> 
     }
   }
   return threadIds;
+}
+
+/**
+ * The rule for a capped live shell (#223): absence from it proves nothing, so a thread with
+ * persisted state that neither shell lists is looked up, and its state is deleted only when the
+ * server reports it missing. An archived chat panel drops its state, as with an uncapped shell.
+ */
+export function reconcileCappedThreadPanelState(
+  environmentId: EnvironmentId,
+  retainedThreadIds: ReadonlySet<ThreadId>,
+  archivedThreadIds: ReadonlySet<ThreadId>,
+  lookup: (
+    environmentId: EnvironmentId,
+    threadIds: ReadonlyArray<ThreadId>,
+  ) => Promise<void> = requestThreadShells,
+): Promise<void> {
+  const candidates = [...collectPersistedThreadIds(environmentId)].filter(
+    (threadId) => !retainedThreadIds.has(threadId) && !archivedThreadIds.has(threadId),
+  );
+  const finish = () => {
+    const missing = offShellThreads.get(environmentId).missing;
+    const removed = new Set<ThreadId>();
+    for (const threadId of collectPersistedThreadIds(environmentId)) {
+      if (retainedThreadIds.has(threadId)) continue;
+      const archivedPanel = archivedThreadIds.has(threadId) && !retainedThreadIds.has(threadId);
+      if (archivedPanel || missing.has(threadId)) removed.add(threadId);
+    }
+    const retained = new Set(
+      [...collectPersistedThreadIds(environmentId)].filter((threadId) => !removed.has(threadId)),
+    );
+    reconcileThreadPanelState(environmentId, retained);
+  };
+  if (candidates.length === 0) {
+    finish();
+    return Promise.resolve();
+  }
+  return lookup(environmentId, candidates).then(finish);
 }
 
 export function reconcileThreadPanelState(
@@ -158,6 +197,14 @@ function EnvironmentThreadLifecycleReconciler({
         ),
         ...draftThreadIds,
       ]);
+      if (liveSnapshot.capped === true) {
+        reconcileCappedThreadPanelState(
+          environmentId,
+          retainedThreadIds,
+          new Set(archivedSnapshot.threads.map((thread) => thread.id)),
+        );
+        return;
+      }
       reconcileThreadPanelState(environmentId, retainedThreadIds);
       return;
     }
