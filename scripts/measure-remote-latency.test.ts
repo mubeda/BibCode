@@ -13,6 +13,7 @@ import {
   resolveLinks,
   runMeasureRemoteLatencyMain,
   summarizeWindow,
+  threadResyncedIn,
   traceRpcs,
 } from "./measure-remote-latency.ts";
 
@@ -161,6 +162,32 @@ describe("--link", () => {
     // A table of plain round trips keeps its columns.
     expect(formatTable([summarizeWindow("open", 250, frames, 0, 10, 20)])).toContain(
       "250 ms: RPCs",
+    );
+  });
+});
+
+describe("threadResyncedIn", () => {
+  const subscribe = (id: string, threadId: string) =>
+    text(0, "sent", {
+      _tag: "Request",
+      id,
+      tag: "orchestration.subscribeThread",
+      payload: { threadId },
+      headers: [],
+    });
+  const chunk = (requestId: string) =>
+    text(10, "received", { _tag: "Chunk", requestId, values: [{}] });
+
+  it("does not count a reply to another thread's subscription", () => {
+    const frames = [subscribe("1", "small"), subscribe("2", "big"), chunk("1")];
+    expect(threadResyncedIn(frames, new Set(), "big")).toBe(false);
+    expect(threadResyncedIn(frames, new Set())).toBe(true);
+    expect(threadResyncedIn([...frames, chunk("2")], new Set(), "big")).toBe(true);
+  });
+
+  it("ignores sockets that were open before the drop", () => {
+    expect(threadResyncedIn([subscribe("1", "big"), chunk("1")], new Set(["s1"]), "big")).toBe(
+      false,
     );
   });
 });
