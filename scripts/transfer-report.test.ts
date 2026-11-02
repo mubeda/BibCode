@@ -26,6 +26,21 @@ describe("formatTransferReport", () => {
     );
   });
 
+  it("shows the capped shell (#223), and n/a for a base measured before it", () => {
+    const capped = { cappedShell: { wireBytes: 900, decodedBytes: 3600 } };
+    const report = formatTransferReport(
+      sizes(1000, 5000, 200),
+      { ...sizes(1000, 5000, 200), ...capped },
+      {
+        ...sizes(2000, 6000, 300),
+        cappedShell: { wireBytes: 950, decodedBytes: 3700 },
+      },
+    );
+    expect(report).toContain(
+      "| Capped shell snapshot (`subscribeShell` with `cap`, first item) | after deflate | n/a | 900 B | n/a | 950 B |",
+    );
+  });
+
   it("marks a payload over its budget and a base that has no measurement", () => {
     const report = formatTransferReport(undefined, sizes(3000, 1, 1), sizes(2000, 1, 1));
     expect(report).toContain("| n/a | 3,000 B | n/a | 2,000 B **over budget** |");

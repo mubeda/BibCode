@@ -2,7 +2,8 @@
 //!
 //! It builds the deterministic large-store fixture (`support/load_fixture.rs`), serves it over a
 //! real `/ws` to a client that offers the compressed subprotocol, and records, for the shell
-//! snapshot, the big thread's first `subscribeThread` item and the answer to a resume, the bytes
+//! snapshot (whole, as an older client asks with `{}`, and capped, as the app asks since #223),
+//! the big thread's first `subscribeThread` item and the answer to a resume, the bytes
 //! of the WebSocket payloads (what the browser's DevTools count: after the transport's deflate,
 //! before TCP, TLS and WebSocket framing) and the bytes of the JSON they decode to. Each must stay
 //! under `transfer_budget.json`. A budget is raised only by editing that file in the same change.
@@ -148,6 +149,7 @@ async fn first_chunk(socket: &mut Socket, id: &str, tag: &str, payload: Value) -
 
 struct Measured {
     shell: Exchange,
+    capped_shell: Exchange,
     thread: Exchange,
     resume: Exchange,
 }
@@ -167,6 +169,13 @@ async fn measure() -> Measured {
     .expect("server starts");
     let mut socket = connect(handle.local_addr()).await;
     let shell = first_chunk(&mut socket, "1", "orchestration.subscribeShell", json!({})).await;
+    let capped_shell = first_chunk(
+        &mut socket,
+        "3",
+        "orchestration.subscribeShell",
+        json!({ "cap": {} }),
+    )
+    .await;
     let thread = first_chunk(
         &mut socket,
         "2",
@@ -197,6 +206,7 @@ async fn measure() -> Measured {
     engine.shutdown().await;
     Measured {
         shell,
+        capped_shell,
         thread,
         resume,
     }
@@ -207,6 +217,7 @@ async fn payloads_stay_within_the_transfer_budget() {
     let measured = measure().await;
     let rows = [
         ("shell", &measured.shell),
+        ("cappedShell", &measured.capped_shell),
         ("thread", &measured.thread),
         ("resume", &measured.resume),
     ];
@@ -285,6 +296,29 @@ async fn the_fixture_is_a_big_thread_in_a_big_shell() {
         load_fixture::PROJECT_COUNT
     );
     assert!(threads.iter().any(|thread| thread["kind"] == "panel"));
+    // One default thread per project; the rest are workspace threads without a worktree,
+    // which a capped shell may leave out.
+    let defaults = threads
+        .iter()
+        .filter(|thread| thread["kind"] == "default")
+        .count();
+    assert_eq!(defaults, load_fixture::PROJECT_COUNT);
+    assert!(
+        threads
+            .iter()
+            .any(|thread| thread["kind"] == "workspace" && thread["worktreePath"].is_null())
+    );
+    let capped = &measured.capped_shell.item["snapshot"];
+    assert_eq!(capped["capped"], true);
+    let kept = capped["threads"].as_array().unwrap().len();
+    assert!(kept < threads.len() / 2, "{kept} of {}", threads.len());
+    assert!(
+        capped["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|project| project["olderThreads"]["count"].as_u64() > Some(0))
+    );
     assert_eq!(measured.resume.item["kind"], "unchanged");
 }
 
@@ -293,6 +327,8 @@ async fn the_fixture_is_a_big_thread_in_a_big_shell() {
 async fn two_builds_give_identical_payloads() {
     // What a build legitimately varies in: the clock, and the temporary directory the workspaces are in.
     let strip_environment = |mut shell: Value| {
+        // A capped shell's revision hashes the workspace roots too.
+        shell.as_object_mut().unwrap().remove("revision");
         shell["snapshot"]
             .as_object_mut()
             .unwrap()
@@ -313,5 +349,9 @@ async fn two_builds_give_identical_payloads() {
     assert_eq!(
         strip_environment(first.shell.item),
         strip_environment(second.shell.item)
+    );
+    assert_eq!(
+        strip_environment(first.capped_shell.item),
+        strip_environment(second.capped_shell.item)
     );
 }
