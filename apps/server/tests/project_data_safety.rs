@@ -2701,6 +2701,33 @@ async fn compact_refuses_a_linked_database_before_touching_the_target() {
     assert_eq!(sqlite_bytes(&shared.paths.database), shared_bytes);
     assert!(backup_entries(&hard_linked.paths).is_empty());
 
+    // A separate store whose WAL is a hard link to the shared store's WAL.
+    let wal_linked = offline_store_with_free_pages();
+    std::fs::hard_link(
+        sqlite_sidecar(&shared.paths.database, "-wal"),
+        sqlite_sidecar(&wal_linked.paths.database, "-wal"),
+    )
+    .expect("hard-linked WAL");
+    let wal_linked_bytes = sqlite_bytes(&wal_linked.paths.database);
+    let error = compact(&wal_linked.config, false, refuse)
+        .await
+        .expect_err("a hard-linked WAL refuses");
+    assert!(
+        matches!(error, RecoveryError::NotCompactable { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("quit it normally"), "{error}");
+    let error = compact(&wal_linked.config, true, PLENTY)
+        .await
+        .expect_err("the dry run refuses too");
+    assert!(
+        matches!(error, RecoveryError::NotCompactable { .. }),
+        "{error:?}"
+    );
+    assert_eq!(sqlite_bytes(&shared.paths.database), shared_bytes);
+    assert_eq!(sqlite_bytes(&wal_linked.paths.database), wal_linked_bytes);
+    assert!(backup_entries(&wal_linked.paths).is_empty());
+
     // The state directory is a link (a junction on Windows).
     let root = TempDir::new().expect("linked root");
     let mut config = ServerConfig::new(root.path());

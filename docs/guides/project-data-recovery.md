@@ -162,7 +162,11 @@ The command:
 
 Compaction refuses a store whose state directory or `state.sqlite` is a
 symbolic link or junction, because SQLite keeps its recovery files beside the
-link target. If a cancelled or failed `VACUUM` had already switched an
+link target. It also refuses when `state.sqlite` or one
+of its sidecars has another name (a hard link): the other name may hold
+changes that are not written into the file yet. Open that store with BiBCode
+under its original name and quit it normally so its changes are written, then
+remove the extra name and retry. If a cancelled or failed `VACUUM` had already switched an
 `auto_vacuum = full` store to `incremental`, it switches it back. Every refusal
 before the backup leaves `state.sqlite` and its sidecars exactly as they were. Progress goes to stderr; stdout carries one JSON report with
 `before`, `plan`, `backupId`, `after` and `reclaimedBytes`. Press Ctrl-C to
