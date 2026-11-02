@@ -1,4 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - The packaged-upgrade harness owns host paths.
+// @effect-diagnostics globalDate:off - The harness tests wait on real host processes.
+// @effect-diagnostics globalTimers:off - The harness tests poll real host processes with bounded waits.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
