@@ -1359,18 +1359,28 @@ impl ToolCall<'_> {
         let thread_id = self.required("threadId")?.to_owned();
         self.thread(&thread_id).await?;
         let turn_count = match self.integer("turnCount")? {
-            // A turn not captured has no diff, as for revert: refused, typed, before any read.
+            // A turn not captured has no diff, as for revert, and neither has one captured
+            // without a trusted baseline (which is still a revert target): refused, typed,
+            // before any read.
             Some(count) if count >= 1 => {
-                if checkpoint_status(self.control.repositories(), &thread_id, count)
+                let checkpoint = self
+                    .control
+                    .repositories()
+                    .get_checkpoint(thread_id.clone(), count)
                     .await
                     .map_err(storage_failure)?
-                    .as_deref()
-                    != Some("ready")
-                {
-                    return Err(typed_tool_failure(
-                        "McpNoTurnDiffError",
-                        &crate::production::orchestration_effects::uncaptured_diff_detail(count),
-                    ));
+                    .filter(|checkpoint| checkpoint.status == "ready");
+                let refusal = match checkpoint {
+                    None => Some(
+                        crate::production::orchestration_effects::uncaptured_diff_detail(count),
+                    ),
+                    Some(checkpoint) if !checkpoint.diff_available => Some(
+                        crate::production::orchestration_effects::no_baseline_diff_detail(count),
+                    ),
+                    Some(_) => None,
+                };
+                if let Some(detail) = refusal {
+                    return Err(typed_tool_failure("McpNoTurnDiffError", &detail));
                 }
                 count
             }
@@ -1477,7 +1487,7 @@ fn upload_ids(command: &Value) -> impl Iterator<Item = &str> {
 }
 
 /// The highest turn count with a checkpoint on `thread_id`: any recorded one (what a revert
-/// counts from), or only a captured one when `captured` (what has a diff to read).
+/// counts from), or only one captured with its diff when `captured` (what has a diff to read).
 async fn latest_checkpoint(
     repositories: &Repositories,
     thread_id: &str,
@@ -1489,7 +1499,7 @@ async fn latest_checkpoint(
         .call(move |connection| {
             connection
                 .query_row(
-                    "SELECT MAX(checkpoint_turn_count) FROM projection_turns WHERE thread_id = ? AND (? = 0 OR checkpoint_status = 'ready')",
+                    "SELECT MAX(checkpoint_turn_count) FROM projection_turns WHERE thread_id = ? AND (? = 0 OR (checkpoint_status = 'ready' AND checkpoint_diff_available = 1))",
                     params![thread_id, captured],
                     |row| row.get::<_, Option<i64>>(0),
                 )

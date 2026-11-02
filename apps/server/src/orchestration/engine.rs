@@ -50,6 +50,15 @@ pub(crate) use compaction::{
     GUARD_WAITING_DETAIL, compaction_row_on, saved_conversation_on, unsettled_compaction_on,
 };
 
+fn diff_available_default() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes the field by reference.
+fn is_diff_available(diff_available: &bool) -> bool {
+    *diff_available
+}
+
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
 const DEFAULT_WORKTREE_DISCOVERY_JSON: &str =
     r#"{"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}"#;
@@ -800,6 +809,14 @@ pub enum OrchestrationCommand {
         checkpoint_ref: String,
         status: String,
         files: Value,
+        /// Whether the turn before's checkpoint is a trusted baseline, so `files` are this
+        /// turn's change. Omitted when true, so earlier commands keep their shape.
+        #[serde(
+            rename = "diffAvailable",
+            default = "diff_available_default",
+            skip_serializing_if = "is_diff_available"
+        )]
+        diff_available: bool,
         #[serde(rename = "assistantMessageId")]
         assistant_message_id: Option<String>,
         #[serde(rename = "completedAt")]
@@ -2833,10 +2850,36 @@ impl OrchestrationEngine {
         self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
     }
 
+    /// The worker is done with `turn_id`'s checkpoint: releases its hold unless the hold has
+    /// expired (the turn is stale), whose expiry task releases it after its one record attempt.
+    /// One decision under the hold lock, in `claim_checkpoint_completion`'s lock order, against
+    /// `expire_checkpoint_hold`: either the release comes first and the expiry finds no hold and
+    /// records nothing, or the expiry marks the turn first and keeps the hold.
+    pub(crate) fn release_checkpoint_hold_unless_stale(&self, thread_id: &str, turn_id: &str) {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let released = {
+            let mut holds = self
+                .checkpoint_holds
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale = self
+                .checkpoint_holds
+                .stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key);
+            !stale && holds.1.remove(&key).is_some()
+        };
+        if released {
+            self.wake_turn_delivery();
+        }
+    }
+
     /// Gives up hold `id` of `turn_id` before the worker captured the turn: marks the turn's
-    /// checkpoint stale and keeps the hold, which the caller releases once the stale checkpoint
-    /// is recorded. Returns `false`, changing nothing, when the hold is already gone (the worker
-    /// claimed the capture, or the thread was deleted).
+    /// checkpoint stale and keeps the hold, which the caller releases after its one attempt to
+    /// record the stale checkpoint. Returns `false`, changing nothing, when the hold is already
+    /// gone (the worker claimed the capture or released it, or the thread was deleted).
     pub(crate) fn expire_checkpoint_hold(&self, thread_id: &str, turn_id: &str, id: u64) -> bool {
         let key = (thread_id.to_owned(), turn_id.to_owned());
         let holds = self
@@ -5340,19 +5383,27 @@ async fn plan_command(
             checkpoint_ref,
             status,
             files,
+            diff_available,
             assistant_message_id,
             completed_at,
             created_at,
-        } => simple_thread_event(
-            model,
-            command,
-            "thread.turn-diff-completed",
-            command_id,
-            thread_id,
-            created_at,
-            metadata,
-            json!({"threadId":thread_id,"turnId":turn_id,"checkpointTurnCount":checkpoint_turn_count,"checkpointRef":checkpoint_ref,"status":status,"files":files,"assistantMessageId":assistant_message_id,"completedAt":completed_at}),
-        ),
+        } => {
+            let mut payload = json!({"threadId":thread_id,"turnId":turn_id,"checkpointTurnCount":checkpoint_turn_count,"checkpointRef":checkpoint_ref,"status":status,"files":files,"assistantMessageId":assistant_message_id,"completedAt":completed_at});
+            // Absent means true, so existing events and fixtures keep their shape.
+            if !diff_available {
+                payload["diffAvailable"] = json!(false);
+            }
+            simple_thread_event(
+                model,
+                command,
+                "thread.turn-diff-completed",
+                command_id,
+                thread_id,
+                created_at,
+                metadata,
+                payload,
+            )
+        }
         OrchestrationCommand::ThreadActivityAppend {
             command_id,
             thread_id,
@@ -8075,9 +8126,12 @@ fn apply_turns_projector_tx(
             } else {
                 json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?
             };
+            // Only a `ready` capture can lack its baseline; every other row keeps the default.
+            let diff_available = status != "ready"
+                || payload.get("diffAvailable").and_then(Value::as_bool) != Some(false);
             // A turn its session ended interrupted or failed keeps that state, and an event that
             // names no answer keeps the one the turn already has.
-            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
+            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ?, checkpoint_diff_available = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, diff_available, thread_id, turn_id])?;
             if updated == 0 {
                 transaction.execute(
                     TURN_UPSERT_SQL,
@@ -8097,6 +8151,10 @@ fn apply_turns_projector_tx(
                         Some(status),
                         files
                     ],
+                )?;
+                transaction.execute(
+                    "UPDATE projection_turns SET checkpoint_diff_available = ? WHERE thread_id = ? AND turn_id = ?",
+                    params![diff_available, thread_id, turn_id],
                 )?;
             }
         }
@@ -8775,6 +8833,7 @@ pub struct ProjectionCheckpointRow {
     pub checkpoint_ref: String,
     pub status: String,
     pub files: Value,
+    pub diff_available: bool,
     pub assistant_message_id: Option<String>,
     pub completed_at: String,
 }
@@ -9045,6 +9104,7 @@ impl From<crate::persistence::ProjectionCheckpoint> for ProjectionCheckpointRow 
             checkpoint_ref: checkpoint.checkpoint_ref,
             status: checkpoint.status,
             files: checkpoint.files,
+            diff_available: checkpoint.diff_available,
             assistant_message_id: checkpoint.assistant_message_id,
             completed_at: checkpoint.completed_at,
         }
@@ -14092,5 +14152,69 @@ mod tests {
                 .await,
             Err(OrchestrationError::Cancelled)
         ));
+    }
+
+    /// A capture's hold release and the hold's expiry decide once, in either order: the expiry
+    /// that marks the turn stale keeps the hold (its task releases it after its record), and an
+    /// expiry that finds the hold released marks nothing. Raced 1,000 times, the expiry returns
+    /// `true` exactly when the hold is still there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_release_and_its_expiry_decide_once_in_either_order() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        engine.set_checkpoint_hold_limit(Some(Duration::from_secs(60)));
+
+        // Order A: the release first. The expiry finds no hold and marks nothing.
+        let id = engine.hold_turns_for_checkpoint("t", "a").expect("hold");
+        engine.release_checkpoint_hold_unless_stale("t", "a");
+        assert!(!engine.turns_held_for_checkpoint("t"));
+        assert!(!engine.expire_checkpoint_hold("t", "a", id));
+        assert!(!engine.checkpoint_is_stale("t", "a"));
+
+        // Order B: the expiry first. The release leaves the hold to the expiry's task.
+        let id = engine.hold_turns_for_checkpoint("t", "b").expect("hold");
+        assert!(engine.expire_checkpoint_hold("t", "b", id));
+        engine.release_checkpoint_hold_unless_stale("t", "b");
+        assert!(engine.turns_held_for_checkpoint("t"));
+        engine.release_thread_checkpoint_holds("t");
+
+        for iteration in 0..1_000 {
+            let turn = format!("race-{iteration}");
+            let id = engine.hold_turns_for_checkpoint("t", &turn).expect("hold");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release = tokio::task::spawn_blocking({
+                let (engine, barrier, turn) = (engine.clone(), barrier.clone(), turn.clone());
+                move || {
+                    barrier.wait();
+                    engine.release_checkpoint_hold_unless_stale("t", &turn);
+                }
+            });
+            let expire = tokio::task::spawn_blocking({
+                let (engine, barrier, turn) = (engine.clone(), barrier.clone(), turn.clone());
+                move || {
+                    barrier.wait();
+                    engine.expire_checkpoint_hold("t", &turn, id)
+                }
+            });
+            release.await.expect("release");
+            let expired = expire.await.expect("expire");
+            assert_eq!(
+                expired,
+                engine.turns_held_for_checkpoint("t"),
+                "iteration {iteration}: the expiry returned {expired}"
+            );
+            engine.release_thread_checkpoint_holds("t");
+        }
+        engine.set_checkpoint_hold_limit(None);
+        engine.shutdown().await;
     }
 }
