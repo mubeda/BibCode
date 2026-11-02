@@ -32,6 +32,11 @@ import { Checkbox } from "~/components/ui/checkbox";
 import { useOpenInPreferredEditor } from "~/editorPreferences";
 import { readLocalApi } from "~/localApi";
 
+import {
+  discardRecoveryKey,
+  NO_DISCARD_RECOVERY_NOTICES,
+  useGitDiscardRecoveryStore,
+} from "../../../gitDiscardRecoveryStore";
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../../gitManagerStore";
 import { useProject, useServerConfigs } from "../../../state/entities";
 import { gitManagerEnvironment } from "../../../state/gitManager";
@@ -245,9 +250,14 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const [excludedPaths, setExcludedPaths] = useState<ReadonlySet<string>>(() => new Set());
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
-  // Where discarded files were kept. Held apart from `mutationError`, which every action
-  // clears, so it survives the permanent-discard confirmation that can follow.
-  const [recoveryNotices, setRecoveryNotices] = useState<ReadonlyArray<string>>([]);
+  // Where discarded files were kept. Held in a store, apart from `mutationError` (which every
+  // action clears), so it survives the permanent-discard confirmation and leaving the tab.
+  const recoveryKey = discardRecoveryKey(environmentId, cwd);
+  const recoveryNotices = useGitDiscardRecoveryStore(
+    (state) => state.noticesByCheckout[recoveryKey] ?? NO_DISCARD_RECOVERY_NOTICES,
+  );
+  const addRecoveryNotice = useGitDiscardRecoveryStore((state) => state.addNotice);
+  const dismissRecoveryNotices = useGitDiscardRecoveryStore((state) => state.dismissNotices);
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
   const project = useProject(stableProjectRef);
@@ -538,7 +548,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
       }
       if (result.value.keptInStaging.length > 0) {
         const notice = keptInStagingMessage(result.value.keptInStaging);
-        setRecoveryNotices((current) => [...current, notice]);
+        addRecoveryNotice(recoveryKey, notice);
       }
       if (requested.disposition === "trash" && result.value.trashUnavailable.length > 0) {
         setPendingDiscard({
@@ -551,7 +561,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(keptAfterPermanentDiscard(result.value.trashUnavailable));
       }
     });
-  }, [cwd, discard, environmentId, pendingDiscard]);
+  }, [addRecoveryNotice, cwd, discard, environmentId, pendingDiscard, recoveryKey]);
   const handleOpenExternal = useCallback(
     (path: string) => {
       if (availableEditors.length === 0) return;
@@ -812,7 +822,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
             size="icon-xs"
             title="Dismiss"
             variant="ghost"
-            onClick={() => setRecoveryNotices([])}
+            onClick={() => dismissRecoveryNotices(recoveryKey)}
           >
             <XIcon aria-hidden="true" className="size-3.5" />
           </Button>

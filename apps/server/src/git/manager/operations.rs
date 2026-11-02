@@ -2470,9 +2470,14 @@ pub async fn discard_paths(
         }
     }
 
-    let mut discarded_paths = outcome.trashed.clone();
+    // What was queued before an entry stranded may now name a file that took its place (the
+    // same file through another letter case, or a folder holding it): nothing deferred below
+    // unstages, restores or removes it. It is left in place, and the stranded entry reports it.
+    outcome.permanently_discarded =
+        without_stranded(&outcome.permanently_discarded, &outcome.kept_in_staging);
+    let mut discarded_paths = without_stranded(&outcome.trashed, &outcome.kept_in_staging);
     discarded_paths.extend(outcome.permanently_discarded.iter().cloned());
-    discarded_paths.extend(restore_only);
+    discarded_paths.extend(without_stranded(&restore_only, &outcome.kept_in_staging));
     if discarded_paths.is_empty() {
         return Ok(outcome);
     }
@@ -2530,6 +2535,15 @@ fn overlaps_stranded(path: &str, stranded: &[KeptInStaging]) -> bool {
         let kept = kept.path.to_lowercase();
         path_matches(&path, &kept) || path_matches(&kept, &path)
     })
+}
+
+/// `paths` without those that overlap an entry in `stranded` (see [`overlaps_stranded`]).
+fn without_stranded(paths: &[String], stranded: &[KeptInStaging]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !overlaps_stranded(path, stranded))
+        .cloned()
+        .collect()
 }
 
 /// The requested paths, each once and in order, without the ones a requested folder covers: a
@@ -4871,6 +4885,8 @@ mod tests {
     #[cfg(unix)]
     struct RefusingOnceTrash {
         recreate: PathBuf,
+        /// Which call (from 0) recreates the file.
+        recreate_on: usize,
         calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -4882,7 +4898,8 @@ mod tests {
             _cancellation: &'a CancellationToken,
         ) -> FileTrashFuture<'a> {
             Box::pin(async move {
-                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.recreate_on
+                {
                     std::fs::write(&self.recreate, "new\n").expect("a new file appears");
                 }
                 Err(TrashUnavailable)
@@ -4906,6 +4923,7 @@ mod tests {
             &GitRepository::default(),
             Arc::new(RefusingOnceTrash {
                 recreate: fixture.path().join("untracked.txt"),
+                recreate_on: 0,
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }),
             DiscardRequest {
@@ -4946,6 +4964,63 @@ mod tests {
         for apart in ["Dir/Other.txt", "Direct", "victim.txt"] {
             assert!(!overlaps_stranded(apart, &stranded), "{apart}");
         }
+    }
+
+    /// On a case-insensitive volume, `victim.txt` is queued for a permanent discard (the trash
+    /// refused it, and it went back); then `VICTIM.TXT` reaches the same file, which a writer
+    /// recreates while it is staged, so it strands. The deferred clean must not delete the
+    /// replacement. A case-sensitive volume cannot reach the file by the second name, so the
+    /// test has nothing to check there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_permanent_discard_queued_before_a_stranding_never_removes_the_replacement() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("victim.txt"), "old\n").expect("untracked file");
+        if !fixture.path().join("VICTIM.TXT").exists() {
+            return;
+        }
+
+        let outcome = discard_paths(
+            &GitRepository::default(),
+            Arc::new(RefusingOnceTrash {
+                recreate: fixture.path().join("victim.txt"),
+                recreate_on: 1,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            DiscardRequest {
+                cwd: fixture.path().to_path_buf(),
+                paths: vec!["victim.txt".into(), "VICTIM.TXT".into()],
+                permit_permanent: true,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the discard runs");
+
+        assert!(outcome.permanently_discarded.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.kept_in_staging.len(), 1, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("victim.txt")).unwrap(),
+            "new\n",
+            "the file that took the name survives"
+        );
+    }
+
+    /// What was queued before an entry stranded is dropped from the deferred work by the same
+    /// overlap rule.
+    #[test]
+    fn queued_paths_overlapping_a_stranded_entry_are_dropped_from_deferred_work() {
+        let stranded = [KeptInStaging {
+            path: "VICTIM.TXT".into(),
+            staged_at: "bibcode-discard/0f3a/VICTIM.TXT".into(),
+        }];
+        let queued = ["victim.txt".to_owned(), "other.txt".to_owned()];
+        assert_eq!(without_stranded(&queued, &stranded), ["other.txt"]);
+        assert_eq!(without_stranded(&queued, &[]), queued);
     }
 
     /// A path a requested folder covers, and one named twice, are discarded with the folder or
