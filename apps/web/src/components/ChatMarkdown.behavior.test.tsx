@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   openLink: vi.fn(),
   showFileOutsideWorkspaceNotice: vi.fn(),
   copyLink: vi.fn(),
+  showInternalBrowserFailedNotice: vi.fn(),
   browserLinkTarget: "app" as "app" | "system",
   previewSupported: true,
   localApiAvailable: true,
@@ -59,6 +60,7 @@ vi.mock("../browser/openLink", () => ({ openLink: mocks.openLink }));
 vi.mock("../browser/linkNotices", () => ({
   showFileOutsideWorkspaceNotice: mocks.showFileOutsideWorkspaceNotice,
   copyLink: mocks.copyLink,
+  showInternalBrowserFailedNotice: mocks.showInternalBrowserFailedNotice,
 }));
 vi.mock("../hooks/useSettings", () => ({
   getClientSettings: () => ({ wordWrap: false, browserLinkTarget: mocks.browserLinkTarget }),

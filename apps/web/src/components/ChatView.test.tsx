@@ -20,6 +20,7 @@ import {
   type ReactElement,
   type ReactNode,
   type RefObject,
+  use,
   useEffect,
   useLayoutEffect,
   useState,
@@ -507,29 +508,33 @@ vi.mock("./chat/threadFind/useThreadFind", () => ({
   },
 }));
 
-vi.mock("./chat/MessagesTimeline", () => ({
-  MessagesTimeline: (props: Record<string, unknown>) => {
-    h.captured["messagesTimeline"] = props;
-    // A new instance is a new find session: its query and selection start over.
-    useState(() => ++h.messagesTimelineInstanceCount);
-    if (h.timelineList !== null) {
-      (props["listRef"] as { current: unknown }).current = h.timelineList;
-    }
-    // The list reports that it mounted, as LegendList's ref does.
-    const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
-    useLayoutEffect(() => {
-      if (h.timelineList === null) return undefined;
-      onListMount?.(h.timelineList);
-      return () => onListMount?.(null);
-    }, [onListMount]);
-    return (
-      <div
-        data-mock="messages-timeline"
-        data-entry-count={String((props["timelineEntries"] as readonly unknown[]).length)}
-      />
-    );
-  },
-}));
+vi.mock("./chat/MessagesTimeline", async () => {
+  const { RightPanelThreadContext } = await import("./chat/rightPanelThread");
+  return {
+    MessagesTimeline: (props: Record<string, unknown>) => {
+      h.captured["messagesTimeline"] = props;
+      h.captured["rightPanelThread"] = use(RightPanelThreadContext);
+      // A new instance is a new find session: its query and selection start over.
+      useState(() => ++h.messagesTimelineInstanceCount);
+      if (h.timelineList !== null) {
+        (props["listRef"] as { current: unknown }).current = h.timelineList;
+      }
+      // The list reports that it mounted, as LegendList's ref does.
+      const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
+      useLayoutEffect(() => {
+        if (h.timelineList === null) return undefined;
+        onListMount?.(h.timelineList);
+        return () => onListMount?.(null);
+      }, [onListMount]);
+      return (
+        <div
+          data-mock="messages-timeline"
+          data-entry-count={String((props["timelineEntries"] as readonly unknown[]).length)}
+        />
+      );
+    },
+  };
+});
 
 vi.mock("./chat/ChatHeaderActions", () => ({
   ChatHeaderActions: (props: Record<string, unknown>) => {
@@ -4539,6 +4544,27 @@ describe("ChatView", () => {
       expect(composer["routeKind"]).toBe("server");
       expect(composer["isServerThread"]).toBe(true);
       expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
+    });
+
+    it("opens its chat's links and files in its host's right panel", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      const hostRef = scopeThreadRef(environmentId, ThreadId.make("thread-host"));
+
+      renderToStaticMarkup(
+        <ChatView
+          variant="panel"
+          panelThreadRef={threadRef}
+          activityPaneHostRef={hostRef}
+          workspaceUnavailable={null}
+        />,
+      );
+      expect(h.captured["rightPanelThread"]).toEqual(hostRef);
+
+      renderServerRoute();
+      expect(h.captured["rightPanelThread"]).toBeNull();
     });
 
     it("shows an opening state instead of the global empty state before its thread arrives", () => {
