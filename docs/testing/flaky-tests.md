@@ -129,6 +129,20 @@ log and retain the strict version/hash/no-installer predicate. Hermetic support
 tests cover exit-before-close, cleanup failure, transient samples, and an
 all-unavailable poll; actual installer qualification remains CI-only.
 
+A test that waits for a Git checkpoint ref, or for a queue to deliver after one, waits on
+`WAKE_WAIT` (`turn_delivery_queue_tests.rs`), not a few seconds: the capture spawns Git, which a
+loaded host leaves waiting for seconds, and a wait that ends when its condition holds costs nothing
+when it passes. Only a deadline the product owns stays short; the hold-limit test sets its own
+limit (15 s) long enough for the capture to finish first and waits it out, because the expiry
+timer cannot be observed. A test must not assert that a queued turn is still promotable while the
+delivery service runs: the service may already have promoted it. The Device tests'
+`wait_until` (`device/android/testing.rs`) polls for up to a minute for the same reason. Their
+cancelled-start test cancels once the adb log shows the server launch, which proves the forward
+exists, never after a fixed delay. A ChatView scroll-spy test waits until the send's own landing
+has scrolled and then stayed quiet for a number of frames, not a fixed few, and models the
+anchored turn the spec names (the sent row alone, ending inside the view). Host load alone did not
+reproduce that test; a 150 ms stall between clearing the spies and the assertions did.
+
 ## Unix recovery-test watchdog
 
 The private `turn_delivery_recovery` child helper uses an exactly selected,

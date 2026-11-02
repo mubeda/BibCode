@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const TIME: &str = "2026-08-01T00:00:00Z";
+/// How long a test waits for something to happen. It bounds only a failure: a wait ends the
+/// moment its condition holds, and the checkpoint tests spawn Git, which a loaded host can
+/// leave waiting for seconds. A deadline the product owns is never widened by this.
+const WAKE_WAIT: Duration = Duration::from_secs(30);
 fn command(value: Value) -> OrchestrationCommand {
     serde_json::from_value(value).unwrap()
 }
@@ -123,7 +127,7 @@ async fn quiet(routes: &mut mpsc::UnboundedReceiver<String>) {
 }
 async fn received(routes: &mut mpsc::UnboundedReceiver<String>, id: &str) {
     assert_eq!(
-        timeout(Duration::from_secs(3), routes.recv())
+        timeout(WAKE_WAIT, routes.recv())
             .await
             .expect("delivery wakes")
             .as_deref(),
@@ -738,7 +742,7 @@ async fn a_closed_chat_panel_never_promotes_its_queue_until_reopened() {
         ))
         .await
         .unwrap();
-    assert!(promotable("panel").await);
+    // The running service may already have promoted it, so only its delivery is certain.
     received(&mut routes, "queued-panel").await;
     service.shutdown().await;
     engine.shutdown().await;
@@ -1145,9 +1149,11 @@ impl RevertFixture {
             .then(|| String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"))
     }
 
-    /// Reports whether the effects worker reaches a second thread `b` within 5 seconds.
+    /// Reports whether the effects worker reaches a second thread `b` within [`WAKE_WAIT`]. The
+    /// callers hold thread `t`'s reopen or delivery behind a gate they release only afterwards,
+    /// so a worker that waits behind it never arrives.
     async fn worker_reaches_other_thread(&self) -> bool {
-        worker_reaches_other_thread(&self.engine, &self.rewind, "b", Duration::from_secs(5)).await
+        worker_reaches_other_thread(&self.engine, &self.rewind, "b", WAKE_WAIT).await
     }
 
     /// See [`worker_caught_up`].
@@ -2973,8 +2979,10 @@ async fn capture_failures(engine: &OrchestrationEngine, turn_id: &str) -> usize 
 /// refreshes the workspace) neither reports a failure nor marks it stale.
 #[tokio::test]
 async fn an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready() {
-    // Longer than the capture takes under load, so the worker takes it before the expiry.
-    const HOLD_LIMIT: Duration = Duration::from_secs(3);
+    // Longer than the capture takes under load (it spawns Git), so the worker takes it before
+    // the expiry. The expiry is a wall-clock timer from the turn's end that nothing can
+    // observe, so the test waits it out and the limit is what its duration is.
+    const HOLD_LIMIT: Duration = Duration::from_secs(15);
     use crate::production::orchestration_effects::{EffectsOptions, TurnEnd, record_turn_end};
     let fixture = RevertFixture::with_options(EffectsOptions {
         checkpoint_hold_limit: HOLD_LIMIT,
