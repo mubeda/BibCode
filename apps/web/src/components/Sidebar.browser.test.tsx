@@ -84,6 +84,7 @@ describe("SidebarThreadRow browser interactions", () => {
       modelLabel: "gpt-5-codex",
       moreChatsCount: 0,
       moreChatsStatus: null,
+      moreChatsOlderCount: 0,
       ...overrides,
     };
   }

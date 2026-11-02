@@ -50,26 +50,31 @@ function collectPersistedThreadIds(environmentId: EnvironmentId): Set<ThreadId> 
  * The rule for a capped live shell (#223): absence from it proves nothing, so a thread with
  * persisted state that neither shell lists is looked up, and its state is deleted only when the
  * server reports it missing. An archived chat panel drops its state, as with an uncapped shell.
+ * A thread already looked up is not asked for again until a removal item or snapshot drops it.
+ * The lookup's answer applies only while `isCurrent` holds: a newer shell or archived snapshot
+ * (a panel reopened meanwhile, say) makes these sets stale, and the newer run decides instead.
  */
 export function reconcileCappedThreadPanelState(
   environmentId: EnvironmentId,
   retainedThreadIds: ReadonlySet<ThreadId>,
   archivedThreadIds: ReadonlySet<ThreadId>,
-  lookup: (
-    environmentId: EnvironmentId,
-    threadIds: ReadonlyArray<ThreadId>,
-  ) => Promise<void> = requestThreadShells,
+  isCurrent: () => boolean = () => true,
 ): Promise<void> {
+  const known = offShellThreads.get(environmentId);
   const candidates = [...collectPersistedThreadIds(environmentId)].filter(
-    (threadId) => !retainedThreadIds.has(threadId) && !archivedThreadIds.has(threadId),
+    (threadId) =>
+      !retainedThreadIds.has(threadId) &&
+      !archivedThreadIds.has(threadId) &&
+      !known.threads.has(threadId) &&
+      !known.missing.has(threadId),
   );
   const finish = () => {
+    if (!isCurrent()) return;
     const missing = offShellThreads.get(environmentId).missing;
     const removed = new Set<ThreadId>();
     for (const threadId of collectPersistedThreadIds(environmentId)) {
       if (retainedThreadIds.has(threadId)) continue;
-      const archivedPanel = archivedThreadIds.has(threadId) && !retainedThreadIds.has(threadId);
-      if (archivedPanel || missing.has(threadId)) removed.add(threadId);
+      if (archivedThreadIds.has(threadId) || missing.has(threadId)) removed.add(threadId);
     }
     const retained = new Set(
       [...collectPersistedThreadIds(environmentId)].filter((threadId) => !removed.has(threadId)),
@@ -80,7 +85,7 @@ export function reconcileCappedThreadPanelState(
     finish();
     return Promise.resolve();
   }
-  return lookup(environmentId, candidates).then(finish);
+  return requestThreadShells(environmentId, candidates).then(finish);
 }
 
 export function reconcileThreadPanelState(
@@ -138,6 +143,9 @@ function EnvironmentThreadLifecycleReconciler({
     null,
   );
   const lastArchivedRefreshSequenceRef = useRef<number | null>(null);
+  // Bumped by every run below, so a capped cleanup still waiting on a lookup applies only if
+  // no newer shell or archived snapshot arrived meanwhile.
+  const cleanupRunRef = useRef(0);
   const [adoptionTracker] = useState(createCenterPanelAdoptionTracker);
   const terminalMetadataEventsAtom = useMemo(
     () => terminalEnvironment.metadataEvents({ environmentId, input: {} }),
@@ -156,7 +164,12 @@ function EnvironmentThreadLifecycleReconciler({
 
   useEffect(() => {
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) return;
-    applyPanelThreadAdoption(environmentId, adoptionTracker, shellState.snapshot.value.threads);
+    applyPanelThreadAdoption(
+      environmentId,
+      adoptionTracker,
+      shellState.snapshot.value.threads,
+      shellState.snapshot.value.capped === true,
+    );
   }, [adoptionTracker, environmentId, shellState]);
 
   // The archived snapshot is refetched only when a thread enters or leaves the live list
@@ -164,15 +177,19 @@ function EnvironmentThreadLifecycleReconciler({
   // advance of a running turn. A change elsewhere to an already archived thread waits for
   // the next such change; meanwhile its state is retained, never dropped.
   useEffect(() => {
+    const run = ++cleanupRunRef.current;
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) {
       liveMembershipRef.current = null;
       lastArchivedRefreshSequenceRef.current = null;
       return;
     }
     const liveSnapshot = shellState.snapshot.value;
+    // The engine's sequence, which the archived snapshot's is comparable with: a capped
+    // shell's own can run past it when an update has more items than events (#223).
+    const liveSequence = liveSnapshot.engineSequence ?? liveSnapshot.snapshotSequence;
     const membershipKey = liveThreadMembershipKey(liveSnapshot.threads);
     if (liveMembershipRef.current?.key !== membershipKey) {
-      liveMembershipRef.current = { key: membershipKey, sequence: liveSnapshot.snapshotSequence };
+      liveMembershipRef.current = { key: membershipKey, sequence: liveSequence };
     }
     // The archived atom runs one request at a time; never start another while it runs.
     if (archivedIsLoading) return;
@@ -186,7 +203,7 @@ function EnvironmentThreadLifecycleReconciler({
       archivedError === null &&
       archivedSnapshot !== undefined &&
       archivedSnapshot.snapshotSequence >= lifecycleSequence &&
-      archivedSnapshot.snapshotSequence <= liveSnapshot.snapshotSequence;
+      archivedSnapshot.snapshotSequence <= liveSequence;
     if (snapshotsAreAuthoritative) {
       lastArchivedRefreshSequenceRef.current = null;
       const retainedThreadIds = new Set<ThreadId>([
@@ -198,10 +215,11 @@ function EnvironmentThreadLifecycleReconciler({
         ...draftThreadIds,
       ]);
       if (liveSnapshot.capped === true) {
-        reconcileCappedThreadPanelState(
+        void reconcileCappedThreadPanelState(
           environmentId,
           retainedThreadIds,
           new Set(archivedSnapshot.threads.map((thread) => thread.id)),
+          () => cleanupRunRef.current === run,
         );
         return;
       }
@@ -209,10 +227,7 @@ function EnvironmentThreadLifecycleReconciler({
       return;
     }
 
-    if (
-      archivedSnapshot !== undefined &&
-      archivedSnapshot.snapshotSequence > liveSnapshot.snapshotSequence
-    ) {
+    if (archivedSnapshot !== undefined && archivedSnapshot.snapshotSequence > liveSequence) {
       return;
     }
     // One request per membership change, even when it fails.

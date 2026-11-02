@@ -6,6 +6,7 @@ import {
   buildThreadActionItems,
   createOlderThreadSearch,
   filterCommandPaletteGroups,
+  olderThreadSearchLines,
   OLDER_THREAD_SEARCH_DELAY_MS,
   filterBrowseEntries,
   type CommandPaletteGroup,
@@ -347,5 +348,50 @@ describe("older threads in search (#223)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("olderThreadSearchLines (#223)", () => {
+  const live = { label: "Local", live: true };
+  const offline = { label: "Build farm", live: false };
+
+  it("says it is searching until this query's search answers, then nothing", () => {
+    expect(olderThreadSearchLines({ query: "dep", environments: [live], search: null })).toEqual([
+      { kind: "searching" },
+    ]);
+    expect(
+      olderThreadSearchLines({
+        query: "dep",
+        environments: [live],
+        search: { query: "de", phase: "done" },
+      }),
+    ).toEqual([{ kind: "searching" }]);
+    expect(
+      olderThreadSearchLines({
+        query: " dep ",
+        environments: [live],
+        search: { query: "dep", phase: "done" },
+      }),
+    ).toEqual([]);
+  });
+
+  it("reports a failed search and every disconnected capped environment", () => {
+    expect(
+      olderThreadSearchLines({
+        query: "dep",
+        environments: [live, offline],
+        search: { query: "dep", phase: "failed" },
+      }),
+    ).toEqual([{ kind: "failed" }, { kind: "offline", label: "Build farm" }]);
+    expect(olderThreadSearchLines({ query: "dep", environments: [offline], search: null })).toEqual(
+      [{ kind: "offline", label: "Build farm" }],
+    );
+  });
+
+  it("shows nothing for a short query, an actions filter or an uncapped shell", () => {
+    for (const query of ["d", ">deploy"]) {
+      expect(olderThreadSearchLines({ query, environments: [live], search: null })).toEqual([]);
+    }
+    expect(olderThreadSearchLines({ query: "dep", environments: [], search: null })).toEqual([]);
   });
 });

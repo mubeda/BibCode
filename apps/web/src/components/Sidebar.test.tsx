@@ -4054,6 +4054,7 @@ staticDescribe("SidebarThreadRow direct rendering", () => {
       modelLabel: "gpt-5-codex",
       moreChatsCount: 0,
       moreChatsStatus: null,
+      moreChatsOlderCount: 0,
       ...overrides,
     };
   }

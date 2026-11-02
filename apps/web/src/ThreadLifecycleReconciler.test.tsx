@@ -13,6 +13,7 @@ interface TestSnapshot {
   readonly snapshotSequence: number;
   readonly threads: ReadonlyArray<TestThread>;
   readonly capped?: boolean;
+  readonly engineSequence?: number;
 }
 
 const h = vi.hoisted(() => ({
@@ -38,6 +39,8 @@ const h = vi.hoisted(() => ({
   // The server's answer to `getThreadShells`: ids it does not know are missing.
   known: new Set<string>(),
   lookups: [] as string[][],
+  // While set, a lookup waits for it before it answers.
+  holdLookups: null as Promise<void> | null,
 }));
 
 vi.mock("@effect/atom-react", () => ({
@@ -51,9 +54,12 @@ vi.mock("./state/offShell", () => ({
   requestThreadShells: async (environmentId: string, threadIds: ReadonlyArray<string>) => {
     h.lookups.push([...threadIds]);
     const { offShellThreads } = await import("@bibcode/client-runtime/state/off-shell-threads");
-    const store = offShellThreads.get(environmentId as never);
-    offShellThreads.applyLookup(environmentId as never, store.generation, {
-      threads: [],
+    const generation = offShellThreads.get(environmentId as never).generation;
+    if (h.holdLookups !== null) await h.holdLookups;
+    offShellThreads.applyLookup(environmentId as never, generation, {
+      threads: threadIds
+        .filter((threadId) => h.known.has(threadId))
+        .map((threadId) => ({ id: threadId, kind: "default", archivedAt: null })) as never,
       missing: threadIds.filter((threadId) => !h.known.has(threadId)) as never,
     });
   },
@@ -94,6 +100,8 @@ vi.mock("./lib/archivedThreadsState", () => ({
     return { ...h.archived, refresh: h.refresh };
   },
 }));
+
+import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
 
 import { ThreadLifecycleReconciler } from "./ThreadLifecycleReconciler";
 
@@ -175,6 +183,8 @@ beforeEach(() => {
   h.removeRightThread.mockReset();
   h.known = new Set();
   h.lookups = [];
+  h.holdLookups = null;
+  offShellThreads.reset("primary" as never);
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -317,5 +327,80 @@ describe("ThreadLifecycleReconciler with a capped shell (#223)", () => {
     h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:closed": { surfaces: [] } };
     await settleCapped([thread("a")], [thread("closed", "panel")]);
     expect(removedThreadIds()).toEqual(["closed"]);
+  });
+
+  it("does not look a resolved thread up again on every shell update", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:older": { surfaces: [] } };
+    h.known = new Set(["older"]);
+    await settleCapped([thread("a")], []);
+    expect(h.lookups).toEqual([["older"]]);
+    // A turn streams: the shell's sequence advances, its membership does not.
+    for (let sequence = 2; sequence < 6; sequence += 1) {
+      await act(async () => {
+        setLive(sequence, [thread("a")], true);
+        render();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(h.lookups).toEqual([["older"]]);
+    expect(removedThreadIds()).toEqual([]);
+  });
+
+  it("drops a delayed cleanup when a newer shell reopened a closed panel", async () => {
+    h.centerByThreadKey = {
+      "primary:a": { surfaces: [] },
+      "primary:older": { surfaces: [] },
+      "primary:closed": { surfaces: [] },
+    };
+    h.known = new Set(["older"]);
+    let release = () => {};
+    h.holdLookups = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // `older` is looked up while `closed` is still an archived panel.
+    await settleCapped([thread("a")], [thread("closed", "panel")]);
+    expect(h.lookups).toEqual([["older"]]);
+    // Reopened before the lookup answers: back in the live shell.
+    await act(async () => {
+      h.serverSequence = 2;
+      setLive(2, [thread("a"), thread("closed", "panel")], true);
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(removedThreadIds()).not.toContain("closed");
+  });
+
+  it("compares the archived snapshot with the engine's sequence, not one past it", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] } };
+    await settleCapped([thread("a")], []);
+    h.centerByThreadKey["primary:gone"] = { surfaces: [] };
+    // A terminal's agent started working: its host joins at sequence 2, past the engine's 1.
+    await act(async () => {
+      h.shell = {
+        status: "live",
+        snapshot: {
+          _tag: "Some",
+          value: {
+            snapshotSequence: 2,
+            engineSequence: 1,
+            threads: [thread("a"), thread("host")],
+            capped: true,
+          } satisfies TestSnapshot,
+        },
+      };
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    if (h.inFlight.length > 0) {
+      await act(async () => {
+        settleArchived([]);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(removedThreadIds()).toEqual(["gone"]);
   });
 });

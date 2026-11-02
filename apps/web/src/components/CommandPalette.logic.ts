@@ -411,3 +411,40 @@ export function createOlderThreadSearch(
     dispose: cancel,
   };
 }
+
+/** The last older-thread search the palette ran, and how it ended. */
+export interface OlderThreadSearchState {
+  readonly query: string;
+  readonly phase: "searching" | "done" | "failed";
+}
+
+export type OlderThreadSearchLine =
+  | { readonly kind: "searching" }
+  | { readonly kind: "failed" }
+  | { readonly kind: "offline"; readonly label: string };
+
+/**
+ * The status lines under the palette's results while it searches older threads (#223): one
+ * while the search for this query has not answered, the failure with its Retry, and one per
+ * capped environment that is not connected, whose older threads go unsearched.
+ */
+export function olderThreadSearchLines(input: {
+  readonly query: string;
+  readonly environments: ReadonlyArray<{ readonly label: string; readonly live: boolean }>;
+  readonly search: OlderThreadSearchState | null;
+}): OlderThreadSearchLine[] {
+  const query = input.query.trim();
+  if (query.length < 2 || query.startsWith(">") || input.environments.length === 0) return [];
+  const lines: OlderThreadSearchLine[] = [];
+  if (input.environments.some((environment) => environment.live)) {
+    if (input.search?.query !== query || input.search.phase === "searching") {
+      lines.push({ kind: "searching" });
+    } else if (input.search.phase === "failed") {
+      lines.push({ kind: "failed" });
+    }
+  }
+  for (const environment of input.environments) {
+    if (!environment.live) lines.push({ kind: "offline", label: environment.label });
+  }
+  return lines;
+}

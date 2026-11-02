@@ -95,6 +95,29 @@ describe("off-shell threads (#223)", () => {
     expect(state.missing.has(ThreadId.make("gone"))).toBe(true);
   });
 
+  it("a snapshot or a lookup that finds a missing thread clears its mark", () => {
+    const store = createOffShellThreads();
+    store.applyLookup(ENVIRONMENT, 0, {
+      threads: [],
+      missing: [ThreadId.make("restored"), ThreadId.make("found")],
+    });
+    store.onShellItem(ENVIRONMENT, {
+      kind: "snapshot",
+      snapshot: {
+        snapshotSequence: 1,
+        projects: [],
+        threads: [thread("restored")],
+        updatedAt: "2026-07-11T00:00:00.000Z",
+      },
+    });
+    expect([...store.get(ENVIRONMENT).missing]).toEqual(["found"]);
+    store.applyLookup(ENVIRONMENT, store.get(ENVIRONMENT).generation, {
+      threads: [thread("found")],
+      missing: [],
+    });
+    expect(store.get(ENVIRONMENT).missing.size).toBe(0);
+  });
+
   it("drops a page reply that completes after a removal", () => {
     const store = createOffShellThreads();
     const sentAt = store.get(ENVIRONMENT).generation;

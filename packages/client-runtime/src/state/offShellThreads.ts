@@ -59,9 +59,15 @@ export function offShellAfterItem(
   item: OrchestrationShellStreamItem,
 ): OffShellState {
   switch (item.kind) {
-    case "snapshot":
+    case "snapshot": {
+      // A removal may have been missed; what was deleted stays missing, unless it is listed.
+      const listed = new Set<ThreadId>(item.snapshot.threads.map((thread) => thread.id));
+      const missing = [...state.missing].some((threadId) => listed.has(threadId))
+        ? new Set([...state.missing].filter((threadId) => !listed.has(threadId)))
+        : state.missing;
+      return { ...EMPTY, generation: state.generation + 1, missing };
+    }
     case "unchanged":
-      // A removal may have been missed; what was deleted stays missing.
       return { ...EMPTY, generation: state.generation + 1, missing: state.missing };
     case "thread-removed": {
       const next = withoutThreads(state, (_, threadId) => threadId === item.threadId);
@@ -108,6 +114,7 @@ export function offShellWithLookup(
   const threads = new Map(state.threads);
   for (const thread of result.threads) threads.set(thread.id, thread);
   const missing = new Set(state.missing);
+  for (const thread of result.threads) missing.delete(thread.id);
   for (const threadId of result.missing) missing.add(threadId);
   return { ...state, threads, missing };
 }

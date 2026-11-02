@@ -470,6 +470,7 @@ vi.mock("../state/shell", () => ({
     adoptStorage: { label: "environment.adoptStorage" },
   },
   useEnvironmentShellSummary: () => h.state.shellSummary,
+  cappedShellEnvironmentsAtom: { id: "cappedShellEnvironments" },
 }));
 
 vi.mock("../state/threads", () => ({
@@ -1172,6 +1173,7 @@ beforeEach(() => {
       environment: { serverVersion: "0.1.0" },
     },
     primaryServerKeybindings: {},
+    cappedShellEnvironments: [],
   };
   h.state.vcsStatusByCwd = {};
   h.state.vcsQueries = [];
