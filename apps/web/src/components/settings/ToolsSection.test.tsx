@@ -57,6 +57,7 @@ describe("ToolsSection", () => {
     expect(outdated).toContain("CodeGraph");
     expect(outdated).toContain("Version 1.6.3 is available");
     expect(outdated).toContain(">Update<");
+    expect(outdated).toContain("Close agent sessions that use CodeGraph before updating");
 
     state.tools = [
       tool({
@@ -74,5 +75,6 @@ describe("ToolsSection", () => {
     const manual = renderToStaticMarkup(<ToolsSection />);
     expect(manual).toContain("will not update it");
     expect(manual).not.toContain(">Update<");
+    expect(manual).not.toContain("Close agent sessions");
   });
 });

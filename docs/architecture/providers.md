@@ -1112,7 +1112,10 @@ or sessions. The design and its reviewed trade-offs are in
   replacement can leave a half-swapped install. The task keeps the request's
   maintenance admission permit until it publishes its outcome, so a server
   self-update drain names it. Shutdown waits up to 30 seconds for it and never
-  asks it to stop earlier. Tool update state lives in its own map, so
+  asks it to stop earlier. A host that stops the server on a deadline of its own
+  extends it by `TOOL_UPDATE_SHUTDOWN_WAIT` while `ServerHandle::tool_updates_probe`
+  reports a running update; the desktop's in-process backend does (it would
+  otherwise cut the update short at its 5-second stop). Tool update state lives in its own map, so
   provider settings validation and full-refresh pruning cannot discard it.
 - **Agent configuration.** The command always carries
   `CODEGRAPH_NO_PROMPT_HOOK=1` and `CODEGRAPH_NO_INSTALL_REFRESH=1`, which stop

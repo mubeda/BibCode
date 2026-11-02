@@ -15,12 +15,20 @@ export interface ProviderVersionObservation {
   readonly driver: string;
   readonly displayName: string;
   readonly version: string | null;
-  /** BiBCode ran or is running an update for this instance, so its own toast reports it. */
-  readonly updatedByBiBCode: boolean;
+  /** An update BiBCode started is queued or running for this instance. */
+  readonly updateActive: boolean;
+  /** When the update state BiBCode retains for this instance last finished, if it did. */
+  readonly updateFinishedAt: string | null;
+}
+
+/** What is remembered about an instance between two snapshots. */
+export interface RememberedVersion {
+  readonly version: string;
+  readonly updateFinishedAt: string | null;
 }
 
 export interface ExternalUpdateNotice {
-  /** One per environment, instance and version: the toast never repeats. */
+  /** One per environment, instance and version: the notice never repeats. */
   readonly key: string;
   readonly title: string;
   readonly description: string;
@@ -30,8 +38,12 @@ function observationKey(observation: ProviderVersionObservation): string {
   return `${observation.environmentId}:${observation.instanceId}`;
 }
 
-function cleanVersion(version: string): string {
-  return version.replace(/^v/, "");
+/**
+ * The version number of a reported version string: Claude Code reports `2.1.100 (Claude Code)`,
+ * which must compare as 2.1.100 and read as 2.1.100.
+ */
+export function cleanVersion(version: string): string {
+  return (version.trim().split(/\s+/)[0] ?? "").replace(/^v/, "");
 }
 
 function advanced(previous: string, next: string): boolean {
@@ -43,18 +55,20 @@ function advanced(previous: string, next: string): boolean {
 }
 
 /**
- * The notices for versions that rose since `previous` without BiBCode updating them, and the
- * versions to remember next time. A first sight of an instance (a fresh connect, a reload)
- * has nothing to compare with and says nothing.
+ * The notices for versions that rose since `previous` without BiBCode updating them, and what to
+ * remember next time. A first sight of an instance (a fresh connect, a reload) has nothing to
+ * compare with and says nothing. A rise counts as BiBCode's own only when its retained update
+ * state finished in this same snapshot (or an update is running now), so one update BiBCode ran
+ * earlier never hides a later automatic one.
  */
 export function detectExternalUpdates(
-  previous: ReadonlyMap<string, string>,
+  previous: ReadonlyMap<string, RememberedVersion>,
   observations: ReadonlyArray<ProviderVersionObservation>,
   announced: ReadonlySet<string>,
   multipleEnvironments: boolean,
 ): {
   readonly notices: ReadonlyArray<ExternalUpdateNotice>;
-  readonly next: ReadonlyMap<string, string>;
+  readonly next: ReadonlyMap<string, RememberedVersion>;
 } {
   const next = new Map(previous);
   const notices: ExternalUpdateNotice[] = [];
@@ -64,13 +78,22 @@ export function detectExternalUpdates(
     }
     const key = observationKey(observation);
     const before = previous.get(key);
-    next.set(key, observation.version);
+    next.set(key, {
+      version: observation.version,
+      updateFinishedAt: observation.updateFinishedAt,
+    });
     if (
       before === undefined ||
       !EXTERNAL_UPDATE_NOTICE_DRIVERS.has(observation.driver) ||
-      observation.updatedByBiBCode ||
-      !advanced(before, observation.version)
+      !advanced(before.version, observation.version)
     ) {
+      continue;
+    }
+    const updatedByBiBCode =
+      observation.updateActive ||
+      (observation.updateFinishedAt !== null &&
+        observation.updateFinishedAt !== before.updateFinishedAt);
+    if (updatedByBiBCode) {
       continue;
     }
     const noticeKey = `external:${key}:${cleanVersion(observation.version)}`;
@@ -82,7 +105,7 @@ export function detectExternalUpdates(
       title: `${observation.displayName} updated to ${cleanVersion(observation.version)}`,
       description: `${
         multipleEnvironments ? `${observation.environmentLabel}: ` : ""
-      }It updated itself. New sessions use it; running sessions keep ${cleanVersion(before)} until they restart.`,
+      }It updated itself. New sessions use it; running sessions keep ${cleanVersion(before.version)} until they restart.`,
     });
   }
   return { notices, next };

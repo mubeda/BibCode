@@ -37,8 +37,11 @@ command to run yourself. Nothing is installed when it is missing. BiBCode runs
 the update with CodeGraph's agent-configuration side effects switched off, so
 it never rewrites your agents' instructions or MCP settings.
 
-The update keeps running if you close the window. If it was interrupted, or
-the server stopped before it finished, **Settings → Providers → Tools** says
+**Update** comes with a reminder to close agent sessions that use CodeGraph
+first, because an update replaces files a running CodeGraph may hold open. The
+update keeps running if you close the window, and quitting the desktop app waits
+for it (up to 30 seconds beyond the usual stop). If it was interrupted, or the
+server stopped before it finished, **Settings → Providers → Tools** says
 **CodeGraph may be damaged** and offers a reinstall, and it says **still being
 updated by an earlier BiBCode session** instead while that updater is running.
 Sessions that were already running keep the old version until they restart.

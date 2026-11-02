@@ -229,20 +229,30 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:update-provider",
       scheduler: configScheduler,
       concurrency: configConcurrency,
-      execute: (input: ServerProviderUpdateInput) =>
+      execute: (input: ServerProviderUpdateInput, { environmentId, registry }) =>
         isToolId(input.provider)
-          ? request(WS_METHODS.serverUpdateTool, { toolId: input.provider }).pipe(
-              Effect.map((result) => ({ providers: toolsAsProviders(result.tools) })),
-              // The same error as a provider's, so callers read one failure shape.
-              Effect.mapError((error) =>
-                error._tag === "ServerToolUpdateError"
-                  ? new ServerProviderUpdateError({
-                      provider: input.provider,
-                      reason: error.reason,
-                    })
-                  : error,
-              ),
-            )
+          ? // The call is made only to a server whose current config reports `tools`, even for an
+            // update confirmed before a reconnect to an older server.
+            registry.get(configValueAtom(environmentId))?.tools === undefined
+            ? Effect.fail(
+                new ServerProviderUpdateError({
+                  provider: input.provider,
+                  reason:
+                    "This server does not report tools, so it cannot update them. Update the server first.",
+                }),
+              )
+            : request(WS_METHODS.serverUpdateTool, { toolId: input.provider }).pipe(
+                Effect.map((result) => ({ providers: toolsAsProviders(result.tools) })),
+                // The same error as a provider's, so callers read one failure shape.
+                Effect.mapError((error) =>
+                  error._tag === "ServerToolUpdateError"
+                    ? new ServerProviderUpdateError({
+                        provider: input.provider,
+                        reason: error.reason,
+                      })
+                    : error,
+                ),
+              )
           : request(WS_METHODS.serverUpdateProvider, input),
     }),
     upsertKeybinding: createEnvironmentRpcCommand(runtime, {

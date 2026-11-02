@@ -1,7 +1,7 @@
 import type { ServerTool } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { toolRowView } from "./toolsSection.logic";
+import { TOOL_UPDATE_WARNING, toolRowView } from "./toolsSection.logic";
 
 const base: ServerTool = {
   toolId: "codegraph",
@@ -37,6 +37,8 @@ describe("toolRowView", () => {
     });
     expect(view.canUpdate).toBe(true);
     expect(view.description).toContain("Version 1.6.3 is available");
+    expect(view.warning).toBe(TOOL_UPDATE_WARNING);
+    expect(view.warning).toContain("Close agent sessions that use CodeGraph before updating");
   });
 
   it("explains a disabled update instead of leaving the button dead", () => {
@@ -45,6 +47,7 @@ describe("toolRowView", () => {
       versionAdvisory: advisory({ status: "behind_latest", latestVersion: "1.6.3" }),
     });
     expect(view.canUpdate).toBe(false);
+    expect(view.warning).toBeNull();
     expect(view.disabledReason).toContain("Update it with its own installer");
   });
 

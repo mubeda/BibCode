@@ -8,6 +8,8 @@ export interface ToolRowView {
   readonly tone: ToolRowTone;
   /** Present when the Update button is available. */
   readonly canUpdate: boolean;
+  /** Said next to an Update that can start, because the first cut does not guard against use. */
+  readonly warning: string | null;
   /** Why the Update button is off, when it is off and the description does not already say so. */
   readonly disabledReason: string | null;
   readonly updating: boolean;
@@ -22,7 +24,7 @@ function versionLabel(version: string | null): string {
  * person can do: an install BiBCode cannot update says how to update it by hand, a damaged one
  * says why it is flagged, and a running one says the button is busy.
  */
-export function toolRowView(tool: ServerTool): ToolRowView {
+function baseView(tool: ServerTool): Omit<ToolRowView, "warning"> {
   const advisory = tool.versionAdvisory;
   const state = tool.updateState;
   if (state?.status === "queued" || state?.status === "running") {
@@ -82,4 +84,16 @@ export function toolRowView(tool: ServerTool): ToolRowView {
     disabledReason: null,
     updating: false,
   };
+}
+
+/**
+ * An update replaces files a running CodeGraph (an MCP server, a sync) may hold open, and the
+ * first cut does not check for one, so the button comes with the instruction instead.
+ */
+export const TOOL_UPDATE_WARNING =
+  "Close agent sessions that use CodeGraph before updating. Sessions already running keep the old version until they restart.";
+
+export function toolRowView(tool: ServerTool): ToolRowView {
+  const view = baseView(tool);
+  return { ...view, warning: view.canUpdate ? TOOL_UPDATE_WARNING : null };
 }

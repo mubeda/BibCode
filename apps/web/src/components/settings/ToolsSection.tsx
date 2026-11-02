@@ -54,7 +54,12 @@ function ToolRow({ tool }: { readonly tool: ServerTool }) {
       title={tool.displayName}
       description={<span className={cn(TONE_CLASS[view.tone])}>{description}</span>}
       status={
-        requestError === null ? null : <span className="text-destructive">{requestError}</span>
+        requestError === null && view.warning === null ? null : (
+          <>
+            {view.warning === null ? null : <p>{view.warning}</p>}
+            {requestError === null ? null : <p className="text-destructive">{requestError}</p>}
+          </>
+        )
       }
       control={
         view.canUpdate || busy ? (
