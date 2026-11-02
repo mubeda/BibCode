@@ -669,6 +669,11 @@ Before merge, the implementation PR records a dated capture under
 `LARGE_STORE.per_gib` is kept at 240 s unless the slowest measured time per GiB
 for creation or restore, times three, exceeds it; then it is raised to that.
 
+Result (2026-11-02, [capture](../architecture/measurements/large-store-compaction-20261102.md)):
+on a 4.53 GiB store the pre-compact backup took 18.1 s on Windows and 21.9 s
+on Linux, and restore 13.0 s and 17.5 s, at most 4.84 s per GiB. Three times
+that is 14.5 s per GiB, well under 240 s, so the constant stays.
+
 ## Profiler, crash and trace coverage
 
 - **Events.** `storage.compact`'s end event gains `backupBudgetMs`. An outcome
