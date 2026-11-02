@@ -278,6 +278,8 @@ struct ProductionBootstrapEffects {
     repositories: crate::persistence::Repositories,
     repository: Arc<GitRepository>,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
+    #[cfg(test)]
+    test_hooks: crate::orchestration::engine::TestHooks,
 }
 
 impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
@@ -390,6 +392,31 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
             })
         })
     }
+
+    fn capture_first_turn_baseline<'a>(
+        &'a self,
+        thread_id: &'a str,
+        message_id: &'a str,
+        limit: Duration,
+        cancellation: &'a CancellationToken,
+    ) -> BoxBootstrapFuture<'a, Option<String>> {
+        Box::pin(async move {
+            #[cfg(test)]
+            let probe_gate = self.test_hooks.checkout_probe_gate();
+            #[cfg(not(test))]
+            let probe_gate = None;
+            ensure_first_turn_baseline(
+                &self.repositories,
+                self.callbacks.as_ref(),
+                thread_id,
+                message_id,
+                limit,
+                cancellation,
+                probe_gate,
+            )
+            .await
+        })
+    }
 }
 
 async fn fetch_origin_base(
@@ -485,6 +512,8 @@ impl OrchestrationEffects {
             repositories: engine.repositories(),
             repository: repository.clone(),
             callbacks: callbacks.clone(),
+            #[cfg(test)]
+            test_hooks: engine.test_hooks(),
         }));
 
         let identity_tasks = TaskTracker::new();
@@ -519,6 +548,18 @@ impl OrchestrationEffects {
             producer: tokio::sync::Mutex::new(Some(producer)),
             worker: tokio::sync::Mutex::new(Some(worker)),
         })
+    }
+
+    /// Captures a thread's first-turn baseline (ref 0) as turn delivery does before it first
+    /// claims that turn, for a caller that hands the turn to its provider itself.
+    pub async fn capture_first_turn_baseline(&self, thread_id: &str, message_id: &str) {
+        let _ = crate::production::turn_delivery::capture_first_turn_baseline(
+            &self.engine,
+            thread_id,
+            message_id,
+            &self.cancellation,
+        )
+        .await;
     }
 
     pub async fn shutdown(&self) {
@@ -1038,12 +1079,6 @@ async fn process_event(
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     match event.event.event_type.as_str() {
-        "thread.turn-start-requested" => {
-            ensure_baseline(engine, callbacks, event, Baseline::TurnStart, cancellation).await
-        }
-        "thread.message-sent" if needs_turn_baseline(event) => {
-            ensure_baseline(engine, callbacks, event, Baseline::Message, cancellation).await
-        }
         "thread.turn-diff-completed"
             if event.event.payload.get("status").and_then(Value::as_str) == Some("missing") =>
         {
@@ -1112,6 +1147,14 @@ async fn resolve_workspace(
     callbacks: &dyn OrchestrationEffectCallbacks,
     thread_id: &str,
 ) -> Result<Option<PathBuf>, OrchestrationEffectsError> {
+    resolve_thread_workspace(&engine.repositories(), callbacks, thread_id).await
+}
+
+async fn resolve_thread_workspace(
+    repositories: &crate::persistence::Repositories,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    thread_id: &str,
+) -> Result<Option<PathBuf>, OrchestrationEffectsError> {
     if let Some(cwd) = callbacks
         .workspace_for_thread(thread_id)
         .await
@@ -1119,7 +1162,6 @@ async fn resolve_workspace(
     {
         return Ok(Some(cwd));
     }
-    let repositories = engine.repositories();
     let Some(thread) = repositories.get_thread(thread_id.to_owned()).await? else {
         return Ok(None);
     };
@@ -1132,79 +1174,161 @@ async fn resolve_workspace(
         .map(|project| process_compatible_path(PathBuf::from(project.workspace_root))))
 }
 
-/// A user message that starts a turn needs the turn's checkpoint baseline. Imported CLI history
-/// starts no turn, so it must not capture one (or spawn Git once per historical prompt).
-fn needs_turn_baseline(event: &OrchestrationEvent) -> bool {
-    let payload = &event.event.payload;
-    payload.get("role").and_then(Value::as_str) == Some("user")
-        && payload.get("streaming").and_then(Value::as_bool) == Some(false)
-        && payload.get("turnId").is_none_or(Value::is_null)
-        && event
-            .event
-            .metadata
-            .get("historyImport")
-            .and_then(Value::as_bool)
-            != Some(true)
-}
-
-/// What asked for a turn's baseline.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Baseline {
-    /// The turn starts now.
-    TurnStart,
-    /// A user message was sent. A queued one is sent while another turn may still run.
-    Message,
-}
-
-async fn ensure_baseline(
-    engine: &OrchestrationEngine,
+/// Captures `thread_id`'s ref 0 before its first turn, the one `message_id` starts, is first
+/// claimed (#261). Turn delivery calls it and claims the turn only after it returns, so ref 0
+/// is the checkout before that turn: delivery is the only writer of ref 0, and every Git
+/// command whose output ref 0 holds has finished before the claim. Only `update-ref` can
+/// outlive a timeout (a stalled Windows spawn), and it publishes a commit fixed before the
+/// claim.
+///
+/// Every await is bounded by `limit`, then given up: `Ok(Some(reason))` for a failure or a
+/// timeout, which the caller reports; `Ok(None)` when it is captured or not needed; `Err` only
+/// when `cancellation` fires, leaving the turn to try again.
+pub(crate) async fn ensure_first_turn_baseline(
+    repositories: &crate::persistence::Repositories,
     callbacks: &dyn OrchestrationEffectCallbacks,
-    event: &OrchestrationEvent,
-    baseline: Baseline,
+    thread_id: &str,
+    message_id: &str,
+    limit: Duration,
     cancellation: &CancellationToken,
-) -> Result<(), OrchestrationEffectsError> {
-    let Some(thread_id) = event.event.payload.get("threadId").and_then(Value::as_str) else {
-        return Ok(());
+    probe_gate: Option<Arc<tokio::sync::Notify>>,
+) -> Result<Option<String>, String> {
+    let started = std::time::Instant::now();
+    let bounded = cancellation.child_token();
+    let steps = first_turn_baseline_steps(
+        repositories,
+        callbacks,
+        thread_id,
+        message_id,
+        &bounded,
+        probe_gate,
+    );
+    tokio::pin!(steps);
+    let mut timed_out = false;
+    let result = tokio::select! {
+        result = &mut steps => result,
+        () = tokio::time::sleep(limit) => {
+            timed_out = true;
+            bounded.cancel();
+            // The steps end promptly once cancelled: Git children are stopped and waited for.
+            steps.await
+        }
     };
-    let Some(cwd) = resolve_workspace(engine, callbacks, thread_id).await? else {
-        return Ok(());
-    };
-    if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
-        return Ok(());
+    if cancellation.is_cancelled() {
+        return Err("the first turn's checkpoint baseline was cancelled".to_owned());
     }
-    // One read of the thread's turns, so the number and the history it is judged by agree even
-    // when a turn's end is recorded meanwhile.
-    let turns = engine
-        .repositories()
-        .list_turns_by_thread(thread_id.to_owned())
-        .await?;
-    let starting_message = event.event.payload.get("messageId").and_then(Value::as_str);
-    // The baseline is the checkpoint of the turns before the starting one. That turn may already
-    // have ended and been numbered (it was fast, or the worker is behind); its number is not this
-    // baseline's.
-    let turn_count = turns
-        .iter()
-        .filter(|turn| {
-            starting_message.is_none() || turn.pending_message_id.as_deref() != starting_message
-        })
-        .filter_map(|turn| turn.checkpoint_turn_count)
-        .max()
-        .unwrap_or(0);
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(captured) => {
+            if captured {
+                tracing::debug!(
+                    thread_id,
+                    elapsed_ms,
+                    "first turn checkpoint baseline captured"
+                );
+            }
+            Ok(None)
+        }
+        Err(error) => {
+            let reason = if timed_out {
+                format!("timed out after {}", describe_limit(limit))
+            } else {
+                crate::diagnostics::redact_sensitive_text(&error.to_string())
+            };
+            tracing::warn!(
+                thread_id,
+                elapsed_ms,
+                error = %reason,
+                "a first turn's checkpoint baseline was not captured; the turn goes on without one"
+            );
+            Ok(Some(reason))
+        }
+    }
+}
+
+fn describe_limit(limit: Duration) -> String {
+    if limit >= Duration::from_secs(1) {
+        format!("{} seconds", limit.as_secs())
+    } else {
+        format!("{} ms", limit.as_millis())
+    }
+}
+
+/// Whether a turn of the thread other than the one `message_id` starts has a checkpoint number:
+/// the thread then has its checkpoints, and its first turn's baseline is long settled.
+pub(crate) fn an_earlier_turn_is_numbered(
+    turns: &[crate::persistence::ProjectionTurn],
+    message_id: &str,
+) -> bool {
+    turns.iter().any(|turn| {
+        turn.pending_message_id.as_deref() != Some(message_id)
+            && turn.checkpoint_turn_count.is_some_and(|count| count >= 1)
+    })
+}
+
+/// Resolves the token's cancellation as an effect error, for awaits that do not watch it.
+async fn until_cancelled<T>(
+    cancellation: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, OrchestrationEffectsError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(OrchestrationEffectsError::Effect(
+            "the first turn's checkpoint baseline was given up".to_owned(),
+        )),
+        value = future => Ok(value),
+    }
+}
+
+/// Returns whether ref 0 was captured.
+async fn first_turn_baseline_steps(
+    repositories: &crate::persistence::Repositories,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    thread_id: &str,
+    message_id: &str,
+    cancellation: &CancellationToken,
+    probe_gate: Option<Arc<tokio::sync::Notify>>,
+) -> Result<bool, OrchestrationEffectsError> {
+    let turns = until_cancelled(
+        cancellation,
+        repositories.list_turns_by_thread(thread_id.to_owned()),
+    )
+    .await??;
     // A baseline writes ref 0 only. Ref `n >= 1` is turn `n`'s end state, written only by that
-    // turn's own capture while its hold keeps later turns out. A baseline runs unordered with the
-    // delivery of the turn it is for, so the checkout may already hold that turn's edits: a
-    // numbered ref it wrote could stand in for a turn that was never captured.
-    if turn_count >= 1 {
-        return Ok(());
+    // turn's own capture while its hold keeps later turns out.
+    if an_earlier_turn_is_numbered(&turns, message_id) {
+        return Ok(false);
     }
-    let stale_first_baseline =
-        baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
+    let Some(cwd) = until_cancelled(
+        cancellation,
+        resolve_thread_workspace(repositories, callbacks, thread_id),
+    )
+    .await??
+    else {
+        return Ok(false);
+    };
+    // The walk cannot be interrupted, but it only reads: a cancelled one is left to finish.
+    let probe = async {
+        if let Some(gate) = probe_gate {
+            gate.notified().await;
+        }
+        in_git_checkout(Some(&cwd)).await
+    };
+    if !until_cancelled(cancellation, probe).await? {
+        return Ok(false);
+    }
+    if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
+        return Ok(false);
+    }
     let reference = checkpoint_ref(thread_id, 0);
-    if stale_first_baseline || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
+    if had_turns_before_checkpoints(&turns, Some(message_id))
+        || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await?
+    {
         capture_checkpoint_with_cancellation(&cwd, Path::new("git"), thread_id, 0, cancellation)
             .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Whether a thread with no recorded checkpoint already ran turns before the one
@@ -2489,48 +2613,6 @@ mod tests {
         engine.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn imported_history_captures_no_turn_baseline() {
-        const AT: &str = "2026-10-08T00:00:00Z";
-        let engine = empty_event_log().await;
-        for value in [
-            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
-            json!({"type":"thread.create","commandId":"thread","threadId":"t","projectId":"p","title":"T","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":AT}),
-            json!({"type":"thread.history.import","commandId":"history","threadId":"t","messages":[
-                {"messageId":"h-0","role":"user","text":"old prompt","createdAt":AT},
-                {"messageId":"h-1","role":"assistant","text":"old answer","createdAt":AT}
-            ]}),
-            json!({"type":"thread.turn.start","commandId":"turn","threadId":"t","message":{"messageId":"live","role":"user","text":"continue","attachments":[]},"createdAt":AT}),
-        ] {
-            engine
-                .dispatch(serde_json::from_value(value).unwrap())
-                .await
-                .expect("command");
-        }
-        let baselines = engine
-            .read_events(0)
-            .await
-            .expect("events")
-            .into_iter()
-            .filter(|event| event.event.event_type == "thread.message-sent")
-            .map(|event| {
-                (
-                    event.event.payload["messageId"].clone(),
-                    needs_turn_baseline(&event),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            baselines,
-            [
-                (json!("h-0"), false),
-                (json!("h-1"), false),
-                (json!("live"), true),
-            ]
-        );
-        engine.shutdown().await;
-    }
-
     /// Ref 0 is captured again only for a thread whose earlier turns predate checkpoints: never
     /// once an earlier turn has a number, never for a new thread's own first turn (it can end and
     /// be numbered before the worker handles its start), and never while another turn runs.
@@ -3186,6 +3268,7 @@ mod tests {
             .await
             .expect("setup project fixture");
         let bootstrap = ProductionBootstrapEffects {
+            test_hooks: crate::orchestration::engine::TestHooks::default(),
             repositories,
             repository: Arc::new(GitRepository::default()),
             callbacks: callbacks.clone(),
@@ -3391,6 +3474,7 @@ mod tests {
             launches: AtomicUsize::new(0),
         });
         let bootstrap = ProductionBootstrapEffects {
+            test_hooks: crate::orchestration::engine::TestHooks::default(),
             repositories,
             repository: Arc::new(GitRepository::default()),
             callbacks: callbacks.clone(),

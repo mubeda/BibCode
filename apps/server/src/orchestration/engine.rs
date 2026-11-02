@@ -324,6 +324,19 @@ pub trait ThreadTurnBootstrapEffects: Send + Sync {
         &'a self,
         input: BootstrapSetupInput,
     ) -> BoxBootstrapFuture<'a, BootstrapSetupResult>;
+
+    /// Captures `thread_id`'s checkpoint ref 0 before its first turn (`message_id`) is first
+    /// claimed, giving up after `limit`. `Ok(None)` when it is captured or not needed,
+    /// `Ok(Some(reason))` when it failed or timed out, and `Err` only when `cancellation` fired.
+    fn capture_first_turn_baseline<'a>(
+        &'a self,
+        _thread_id: &'a str,
+        _message_id: &'a str,
+        _limit: Duration,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxBootstrapFuture<'a, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 pub type BoxProjectCommandFuture<'a, T> =
@@ -918,6 +931,9 @@ pub struct TestHooks {
     pause_after_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
     fail_delivery_transitions: Arc<AtomicUsize>,
     delivery_transition_attempts: Arc<AtomicUsize>,
+    /// While set, a first turn's checkout probe waits for this gate before it walks the disk.
+    #[cfg(test)]
+    checkout_probe_gate: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -973,6 +989,25 @@ struct FailProjector {
 }
 
 impl TestHooks {
+    /// Holds every first-turn checkout probe until the returned gate is notified.
+    #[cfg(test)]
+    pub(crate) fn hold_checkout_probe(&self) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *self
+            .checkout_probe_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_probe_gate(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.checkout_probe_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn fail_next_projector(&self, projector: impl Into<String>, event_type: Option<&str>) {
         self.fail_next_projectors(projector, event_type, 1);
     }

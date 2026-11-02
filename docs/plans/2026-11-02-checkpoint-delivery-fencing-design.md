@@ -118,7 +118,7 @@ captured.
      the row for this fill (`continue`), the way a held thread is skipped (`:1038`). It does
      not count against `available`. A row whose stage cannot start yet is skipped too.
    - A finished stage puts its command id into `baselined`, except when it was `Cancelled`.
-     It then leaves `baselining` and wakes the loop. Only then can the row take a slot.
+     It then leaves `baselining`, and the loop, which waits on `baselines` as on its tasks, fills again. Only then can the row take a slot.
      `baselined` is pruned to active commands, like `retry_backoffs` (`:1017`).
    - A start with a `bootstrap` (it may prepare a worktree) needs its baseline taken after
      the bootstrap, in the checkout the bootstrap set up. `prepare_claim_and_deliver` runs
@@ -150,7 +150,7 @@ captured.
      `JoinHandle` is dropped, and the blocking thread ends whenever the filesystem answers.
    - The Git steps already honor the token (`capture_checkpoint_with_cancellation`,
      `:2048`).
-   - A test-only `EffectsOptions` field, `checkout_probe_gate: Option<Arc<Notify>>`
+   - A test-only engine hook, `TestHooks::hold_checkout_probe`
      (`#[cfg(test)]`), lets a test hold the walk.
 6. **The fence (R2).** Awaiting the stage is not enough on its own. After a stalled spawn,
    the runner returns `Timeout` while a detached task still waits for the child, and only
@@ -277,7 +277,7 @@ They gain a thread parameter. `GatedRewind` also gains:
    `n`'s lookup. Assert that the turn is received within the limit plus the usual slack,
    and that the activity says the capture timed out. Release the hold and sync with the worker. Assert that ref `n/0` never resolves.
 7. `a_hung_checkout_probe_is_given_up_at_the_limit` (R3, for `in_git_checkout`). Use a 200 ms
-   limit and set `checkout_probe_gate`. Assert the same as in test 6, then release the gate.
+   limit and hold the probe (`TestHooks::hold_checkout_probe`). Assert the same as in test 6, then release the gate.
 8. `a_live_ref_zero_writer_is_stopped_before_the_claim` (live-child cancellation). Install a
    `reference-transaction` hook in the fixture checkout (`core.hooksPath`) that waits for a
    marker file. Git runs it inside `update-ref` while holding the ref's lock. Use a 200 ms

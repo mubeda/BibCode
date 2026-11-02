@@ -130,6 +130,17 @@ async fn received(routes: &mut mpsc::UnboundedReceiver<String>, id: &str) {
         Some(id)
     );
 }
+/// Like `received`, for a first turn that is delivered only after its baseline capture, several
+/// Git processes that a loaded machine runs slowly.
+async fn received_after_baseline(routes: &mut mpsc::UnboundedReceiver<String>, id: &str) {
+    assert_eq!(
+        timeout(Duration::from_secs(30), routes.recv())
+            .await
+            .expect("delivery wakes")
+            .as_deref(),
+        Some(id)
+    );
+}
 async fn row(engine: &OrchestrationEngine, id: &str) -> ProviderTurnDelivery {
     engine
         .repositories()
@@ -793,9 +804,67 @@ struct GatedRewind {
     hold_refresh: std::sync::atomic::AtomicBool,
     refresh_entered: Notify,
     refresh_release: Notify,
+    /// Workspace lookups of these threads wait until `release_thread` drops them from the set,
+    /// each counted in `held_entered` and announced on `held_entered_notify`.
+    held_threads: std::sync::Mutex<HashSet<String>>,
+    held_entered: std::sync::atomic::AtomicUsize,
+    held_entered_notify: Notify,
+    held_release: Notify,
+    /// Threads whose deletion the effects worker has cleaned up.
+    cleaned: std::sync::Mutex<HashSet<String>>,
 }
 
 impl GatedRewind {
+    fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            entered: Notify::new(),
+            release: Notify::new(),
+            rewinds: std::sync::atomic::AtomicUsize::new(0),
+            suspended: std::sync::atomic::AtomicBool::new(false),
+            reopen_entered: Notify::new(),
+            reopen_release: Notify::new(),
+            hold_workspace: std::sync::atomic::AtomicBool::new(false),
+            workspace_release: Notify::new(),
+            hold_refresh: std::sync::atomic::AtomicBool::new(false),
+            refresh_entered: Notify::new(),
+            refresh_release: Notify::new(),
+            held_threads: std::sync::Mutex::new(HashSet::new()),
+            held_entered: std::sync::atomic::AtomicUsize::new(0),
+            held_entered_notify: Notify::new(),
+            held_release: Notify::new(),
+            cleaned: std::sync::Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Holds every workspace lookup of `thread` until `release_thread`.
+    fn hold_thread(&self, thread: &str) {
+        self.held_threads.lock().unwrap().insert(thread.to_owned());
+    }
+
+    fn release_thread(&self, thread: &str) {
+        self.held_threads.lock().unwrap().remove(thread);
+        self.held_release.notify_waiters();
+    }
+
+    /// Waits until `count` held lookups have started.
+    async fn held_lookups(&self, count: usize) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let entered = self.held_entered_notify.notified();
+                if self.held_entered.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                    return;
+                }
+                entered.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} held workspace lookups never start"));
+    }
+
+    fn held_lookups_started(&self) -> usize {
+        self.held_entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
     async fn reopen_if_suspended(&self) {
         if self
             .suspended
@@ -810,7 +879,7 @@ impl GatedRewind {
 impl crate::production::orchestration_effects::OrchestrationEffectCallbacks for GatedRewind {
     fn workspace_for_thread<'a>(
         &'a self,
-        _thread_id: &'a str,
+        thread_id: &'a str,
     ) -> crate::production::orchestration_effects::BoxEffectFuture<'a, Option<PathBuf>> {
         Box::pin(async move {
             if self
@@ -818,6 +887,18 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks for 
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 self.workspace_release.notified().await;
+            }
+            if self.held_threads.lock().unwrap().contains(thread_id) {
+                self.held_entered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.held_entered_notify.notify_waiters();
+                loop {
+                    let released = self.held_release.notified();
+                    if !self.held_threads.lock().unwrap().contains(thread_id) {
+                        break;
+                    }
+                    released.await;
+                }
             }
             Ok(Some(self.cwd.clone()))
         })
@@ -861,8 +942,9 @@ impl crate::production::orchestration_effects::OrchestrationEffectCallbacks for 
 
     fn close_terminals<'a>(
         &'a self,
-        _thread_id: &'a str,
+        thread_id: &'a str,
     ) -> crate::production::orchestration_effects::BoxEffectFuture<'a, ()> {
+        self.cleaned.lock().unwrap().insert(thread_id.to_owned());
         Box::pin(async { Ok(()) })
     }
 
@@ -928,19 +1010,18 @@ fn revert_checkout() -> tempfile::TempDir {
     repository
 }
 
-/// Admits a turn on a new thread `other` and reports whether its checkpoint baseline is
-/// captured within `deadline`: the serial effects worker has then handled every earlier event.
-async fn other_thread_gets_its_baseline(
+/// Creates and deletes a thread `other` and reports whether the effects worker cleans up that
+/// deletion within `deadline`: the serial worker has then handled every earlier event.
+async fn worker_reaches_other_thread(
     engine: &OrchestrationEngine,
-    cwd: &Path,
+    rewind: &GatedRewind,
     other: &str,
     deadline: Duration,
 ) -> bool {
     engine.dispatch(command(json!({"type":"thread.create", "commandId":format!("thread-{other}"), "threadId":other, "projectId":"p", "title":"Other", "runtimeMode":"full-access", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME}))).await.unwrap();
-    enqueue_for(engine, other, &format!("{other}-first"), false).await;
-    let baseline = crate::production::orchestration_effects::checkpoint_ref(other, 0);
+    engine.dispatch(command(json!({"type":"thread.delete", "commandId":format!("delete-{other}"), "threadId":other, "createdAt":TIME}))).await.unwrap();
     timeout(deadline, async {
-        while !git_resolves(cwd, &baseline) {
+        while !rewind.cleaned.lock().unwrap().contains(other) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -948,12 +1029,11 @@ async fn other_thread_gets_its_baseline(
     .is_ok()
 }
 
-/// Waits until the serial effects worker has handled every event before now, by admitting a
-/// turn on a new thread `other` and waiting for its baseline. Only a sync, so it allows for a
-/// loaded machine; a test that asserts the worker is not delayed uses
-/// `other_thread_gets_its_baseline` with its own deadline.
-async fn worker_caught_up(engine: &OrchestrationEngine, cwd: &Path, other: &str) -> bool {
-    other_thread_gets_its_baseline(engine, cwd, other, Duration::from_secs(60)).await
+/// Waits until the serial effects worker has handled every event before now, through a thread
+/// `other` it cleans up. Only a sync, so it allows for a loaded machine; a test that asserts the
+/// worker is not delayed uses `worker_reaches_other_thread` with its own deadline.
+async fn worker_caught_up(engine: &OrchestrationEngine, rewind: &GatedRewind, other: &str) -> bool {
+    worker_reaches_other_thread(engine, rewind, other, Duration::from_secs(60)).await
 }
 
 /// Whether `reference` resolves in the checkout `cwd`.
@@ -1006,20 +1086,7 @@ impl RevertFixture {
             }
         }
         session(&engine, "ready", "ready").await;
-        let rewind = Arc::new(GatedRewind {
-            cwd,
-            entered: Notify::new(),
-            release: Notify::new(),
-            rewinds: std::sync::atomic::AtomicUsize::new(0),
-            suspended: std::sync::atomic::AtomicBool::new(false),
-            reopen_entered: Notify::new(),
-            reopen_release: Notify::new(),
-            hold_workspace: std::sync::atomic::AtomicBool::new(false),
-            workspace_release: Notify::new(),
-            hold_refresh: std::sync::atomic::AtomicBool::new(false),
-            refresh_entered: Notify::new(),
-            refresh_release: Notify::new(),
-        });
+        let rewind = Arc::new(GatedRewind::new(cwd));
         let effects = OrchestrationEffects::start(
             engine.clone(),
             Arc::new(crate::git::GitRepository::default()),
@@ -1076,26 +1143,772 @@ impl RevertFixture {
             .then(|| String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"))
     }
 
-    /// Admits a turn on a second thread `b` and reports whether its checkpoint baseline is
-    /// captured within 5 seconds.
-    async fn other_thread_gets_its_baseline(&self) -> bool {
-        other_thread_gets_its_baseline(&self.engine, &self.rewind.cwd, "b", Duration::from_secs(5))
-            .await
+    /// Reports whether the effects worker reaches a second thread `b` within 5 seconds.
+    async fn worker_reaches_other_thread(&self) -> bool {
+        worker_reaches_other_thread(&self.engine, &self.rewind, "b", Duration::from_secs(5)).await
     }
 
     /// See [`worker_caught_up`].
     async fn worker_caught_up(&self, other: &str) -> bool {
-        worker_caught_up(&self.engine, &self.rewind.cwd, other).await
+        worker_caught_up(&self.engine, &self.rewind, other).await
     }
 
     async fn shutdown(self) {
         self.effects.shutdown().await;
         self.engine.shutdown().await;
     }
+
+    /// Restarts the engine and the effects worker on the file database at `database_path`, as a
+    /// server restart does: history before the restart is not replayed to the worker.
+    async fn restart(
+        self,
+        database_path: &Path,
+        options: crate::production::orchestration_effects::EffectsOptions,
+    ) -> Self {
+        let Self {
+            engine,
+            effects,
+            rewind,
+            _repository,
+            ..
+        } = self;
+        effects.shutdown().await;
+        let database = engine.repositories().database().clone();
+        engine.shutdown().await;
+        database.checkpoint_wal().await.unwrap();
+        drop(database);
+        let engine = OrchestrationEngine::start(
+            Database::open_existing(database_path).await.unwrap(),
+            EngineOptions::default(),
+        )
+        .await
+        .unwrap();
+        let effects = crate::production::orchestration_effects::OrchestrationEffects::start(
+            engine.clone(),
+            Arc::new(crate::git::GitRepository::default()),
+            rewind.clone(),
+            options,
+        )
+        .await
+        .unwrap();
+        let events = engine.subscribe_events();
+        Self {
+            engine,
+            effects,
+            rewind,
+            events,
+            _repository,
+        }
+    }
+}
+
+/// Creates thread `thread` in the fixture's project.
+async fn create_thread(engine: &OrchestrationEngine, thread: &str) {
+    engine.dispatch(command(json!({"type":"thread.create", "commandId":format!("thread-{thread}"), "threadId":thread, "projectId":"p", "title":"First turn", "runtimeMode":"full-access", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME}))).await.unwrap();
+}
+
+/// `cwd`'s `tracked.txt` as `reference` holds it, if `reference` resolves.
+fn tracked_at(cwd: &Path, reference: &str) -> Option<String> {
+    let config = IsolatedGitConfig::new();
+    let mut probe = std::process::Command::new("git");
+    config.apply_to_command(&mut probe);
+    let output = probe
+        .args(["show", &format!("{reference}:tracked.txt")])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"))
+}
+
+/// Ends `thread`'s first turn as the provider would, with its checkout as it is now, and
+/// returns its checkpoint once the worker has captured it.
+async fn end_first_turn(
+    engine: &OrchestrationEngine,
+    cwd: &Path,
+    thread: &str,
+) -> crate::persistence::ProjectionCheckpoint {
+    use crate::production::orchestration_effects::{TurnEnd, record_turn_end};
+    record_turn_end(
+        engine,
+        thread,
+        &format!("{thread}-turn-1"),
+        TIME,
+        TurnEnd::Live,
+        Some(cwd),
+    )
+    .await
+    .unwrap();
+    captured_in(engine, thread, 1).await
+}
+
+/// The issue's case (#261): after a restart, the effects worker is busy, and a thread's first
+/// turn is delivered and edits the checkout. Its baseline (ref 0) is still the checkout from
+/// before that turn, so the turn's diff holds its edit.
+#[tokio::test]
+async fn a_first_turn_delivered_while_the_effects_worker_lags_after_a_restart_diffs_its_edit() {
+    use crate::production::orchestration_effects::{EffectsOptions, checkpoint_ref};
+    let state = tempfile::tempdir().unwrap();
+    let database_path = state.path().join("lag.sqlite3");
+    let options = EffectsOptions::default();
+    let fixture = RevertFixture::on(Database::create_new(&database_path).await.unwrap(), options)
+        .await
+        .restart(&database_path, options)
+        .await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    // The worker is busy with thread `t`'s capture until the test lets it go.
+    fixture.rewind.hold_thread("t");
+    end_turn_unheld(&engine, 3).await;
+    fixture.rewind.held_lookups(1).await;
+
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    let baseline = tracked_at(&cwd, &checkpoint_ref("n", 0));
+    std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
+    assert_eq!(
+        baseline.as_deref(),
+        Some("two\n"),
+        "ref 0 is the checkout before the delivered turn"
+    );
+
+    fixture.rewind.release_thread("t");
+    let checkpoint = end_first_turn(&engine, &cwd, "n").await;
+    assert!(checkpoint.diff_available);
+    assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
+    assert_eq!(
+        tracked_at(&cwd, &checkpoint_ref("n", 1)).as_deref(),
+        Some(
+            "edited
+"
+        )
+    );
+    assert_eq!(
+        tracked_at(&cwd, &checkpoint_ref("n", 0)).as_deref(),
+        Some(
+            "two
+"
+        )
+    );
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A first turn admitted before a restart whose start event the worker never handled (history
+/// is not replayed) still gets its baseline before it is delivered after the restart.
+#[tokio::test]
+async fn a_first_turn_left_pending_across_a_restart_gets_its_baseline_before_delivery() {
+    use crate::production::orchestration_effects::{EffectsOptions, checkpoint_ref};
+    let state = tempfile::tempdir().unwrap();
+    let database_path = state.path().join("pending.sqlite3");
+    let options = EffectsOptions::default();
+    let fixture =
+        RevertFixture::on(Database::create_new(&database_path).await.unwrap(), options).await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    // The server stops before the worker handles the first turn's start.
+    fixture.effects.shutdown().await;
+    create_thread(&engine, "n").await;
+    enqueue_for(&engine, "n", "n-first", false).await;
+    let fixture = fixture.restart(&database_path, options).await;
+    let engine = fixture.engine.clone();
+
+    let (service, mut routes) = service(&engine);
+    received_after_baseline(&mut routes, "n-first").await;
+    let baseline = tracked_at(&cwd, &checkpoint_ref("n", 0));
+    std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
+    assert_eq!(baseline.as_deref(), Some("two\n"));
+    let checkpoint = end_first_turn(&engine, &cwd, "n").await;
+    assert!(checkpoint.diff_available);
+    assert_eq!(checkpoint.files[0]["path"], "tracked.txt");
+    assert_eq!(
+        tracked_at(&cwd, &checkpoint_ref("n", 1)).as_deref(),
+        Some(
+            "edited
+"
+        )
+    );
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A thread that already has its checkpoints is delivered with no workspace lookup and no Git
+/// for a baseline (#261: no added latency once the baseline exists).
+#[tokio::test]
+async fn a_turn_on_a_thread_with_checkpoints_is_delivered_without_git_or_wait() {
+    let fixture = RevertFixture::new().await;
+    fixture.rewind.hold_thread("t");
+    let (service, mut routes) = service(&fixture.engine);
+    enqueue(&fixture.engine, "t-next", false).await;
+    service.wake();
+    received(&mut routes, "t-next").await;
+    assert_eq!(
+        fixture.rewind.held_lookups_started(),
+        0,
+        "no workspace lookup, so no Git, before the turn"
+    );
+    fixture.rewind.release_thread("t");
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// The `checkpoint.capture.failed` activities that report `thread`'s first-turn baseline.
+async fn baseline_failures(engine: &OrchestrationEngine, thread: &str) -> Vec<String> {
+    crate::orchestration::load_snapshot(&engine.repositories())
+        .await
+        .unwrap()
+        .activities
+        .into_iter()
+        .filter(|activity| {
+            activity.thread_id == thread
+                && activity.kind == "checkpoint.capture.failed"
+                && activity.turn_id.is_none()
+                && activity.payload["turnCount"] == 0
+        })
+        .map(|activity| {
+            activity.payload["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A delivery service with the production slot count, whose router reports each command.
+fn production_service(
+    engine: &OrchestrationEngine,
+) -> (TurnDeliveryService, mpsc::UnboundedReceiver<String>) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let router: DeliveryRouter = Arc::new(move |command| {
+        sender.send(command.command_id().to_owned()).unwrap();
+        Box::pin(async { Ok(()) })
+    });
+    (
+        TurnDeliveryService::start_with_router_and_capacity(
+            engine.clone(),
+            MAX_CONCURRENT_THREADS,
+            MAX_CONCURRENT_THREADS,
+            router,
+        ),
+        receiver,
+    )
+}
+
+/// Admits the first turn `id` of a new thread `thread`, which a bootstrap creates when the turn is
+/// delivered.
+async fn enqueue_bootstrapped(engine: &OrchestrationEngine, thread: &str, id: &str) {
+    let command = command(json!({
+        "type":"thread.turn.start", "commandId":id, "threadId":thread,
+        "message":{"messageId":id, "role":"user", "text":id, "attachments":[]},
+        "modelSelection":{"instanceId":"codex", "model":"gpt-5"},
+        "bootstrap":{"createThread":{
+            "projectId":"p", "title":"Bootstrapped",
+            "modelSelection":{"instanceId":"codex", "model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "branch":null, "worktreePath":null, "createdAt":TIME
+        }},
+        "createdAt":TIME
+    }));
+    engine
+        .dispatch_with_admission(
+            command.clone(),
+            CommandAdmission {
+                payload_digest: canonical_command_digest(&command).unwrap(),
+                attachment_refs: Vec::new(),
+                provider_turn: Some(NewProviderTurnDelivery {
+                    command_id: id.into(),
+                    thread_id: thread.into(),
+                    message_id: id.into(),
+                    provider_instance_id: "codex".into(),
+                    provider_kind: "codex".into(),
+                    provider_session_id: None,
+                    delivery_key: id.into(),
+                    payload: serde_json::to_value(&command).unwrap(),
+                    state: TurnDeliveryState::Pending,
+                    mode: TurnDeliveryMode::Start,
+                    created_at: TIME.into(),
+                }),
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+}
+
+/// First-turn baselines hold no delivery slot: with every baseline stage hung, a thread that
+/// already has its baseline is still delivered at once, and each first turn goes only after
+/// its own ref 0.
+#[tokio::test]
+async fn first_turn_captures_never_hold_back_a_thread_that_has_its_baseline() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    let (service, mut routes) = production_service(&engine);
+    let threads = (1..=MAX_CONCURRENT_BASELINES + 1)
+        .map(|index| format!("n{index}"))
+        .collect::<Vec<_>>();
+    for thread in &threads {
+        create_thread(&engine, thread).await;
+        fixture.rewind.hold_thread(thread);
+        enqueue_for(&engine, thread, &format!("{thread}-first"), false).await;
+        service.wake();
+    }
+    fixture.rewind.held_lookups(MAX_CONCURRENT_BASELINES).await;
+
+    enqueue(&engine, "t-next", false).await;
+    service.wake();
+    received(&mut routes, "t-next").await;
+    assert_eq!(
+        fixture.rewind.held_lookups_started(),
+        MAX_CONCURRENT_BASELINES,
+        "one baseline waits for a stage"
+    );
+    for thread in &threads {
+        fixture.rewind.release_thread(thread);
+    }
+    let mut delivered = HashSet::new();
+    while delivered.len() < threads.len() {
+        let id = timeout(Duration::from_secs(10), routes.recv())
+            .await
+            .expect("every first turn is delivered")
+            .unwrap();
+        let thread = id.strip_suffix("-first").unwrap().to_owned();
+        assert!(
+            git_resolves(&cwd, &checkpoint_ref(&thread, 0)),
+            "{id} was delivered before its baseline"
+        );
+        delivered.insert(thread);
+    }
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A first turn with a bootstrap runs the bootstrap in its slot, then releases the slot while
+/// its baseline is captured in the checkout the bootstrap set up: four hung post-bootstrap
+/// captures still leave a thread that has its baseline delivered at once.
+#[tokio::test]
+async fn first_turn_captures_after_a_bootstrap_never_hold_back_a_thread_that_has_its_baseline() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    let (service, mut routes) = production_service(&engine);
+    let threads = (1..=MAX_CONCURRENT_THREADS)
+        .map(|index| format!("b{index}"))
+        .collect::<Vec<_>>();
+    for thread in &threads {
+        fixture.rewind.hold_thread(thread);
+        enqueue_bootstrapped(&engine, thread, &format!("{thread}-first")).await;
+        service.wake();
+    }
+    fixture.rewind.held_lookups(MAX_CONCURRENT_THREADS).await;
+
+    enqueue(&engine, "t-next", false).await;
+    service.wake();
+    received(&mut routes, "t-next").await;
+    for thread in &threads {
+        fixture.rewind.release_thread(thread);
+    }
+    let mut delivered = HashSet::new();
+    while delivered.len() < threads.len() {
+        let id = timeout(Duration::from_secs(10), routes.recv())
+            .await
+            .expect("every bootstrapped first turn is delivered")
+            .unwrap();
+        let thread = id.strip_suffix("-first").unwrap().to_owned();
+        assert!(
+            git_resolves(&cwd, &checkpoint_ref(&thread, 0)),
+            "{id} was delivered before its baseline"
+        );
+        delivered.insert(thread);
+    }
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A first turn whose baseline cannot be written is reported once and still delivered; its own
+/// capture is then `ready` without a diff.
+#[tokio::test]
+async fn a_first_turn_baseline_that_fails_is_reported_and_the_turn_still_goes() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    let lock = lock_ref(&cwd, &checkpoint_ref("n", 0));
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    assert_eq!(baseline_failures(&engine, "n").await.len(), 1);
+    assert!(!git_resolves(&cwd, &checkpoint_ref("n", 0)));
+    std::fs::remove_file(lock).unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
+    let checkpoint = end_first_turn(&engine, &cwd, "n").await;
+    assert!(!checkpoint.diff_available);
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// Waits for `thread`'s first-turn baseline to be reported as timed out.
+async fn baseline_timed_out(engine: &OrchestrationEngine, thread: &str) {
+    let failures = baseline_failures(engine, thread).await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("timed out"), "{failures:?}");
+}
+
+/// A workspace lookup that hangs is given up at the limit: the turn goes, the timeout is shown,
+/// and no ref 0 appears later.
+#[tokio::test]
+async fn a_hung_workspace_lookup_is_given_up_at_the_limit() {
+    use crate::production::orchestration_effects::{EffectsOptions, checkpoint_ref};
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: Duration::from_millis(200),
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    fixture.rewind.hold_thread("n");
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    baseline_timed_out(&engine, "n").await;
+    fixture.rewind.release_thread("n");
+    assert!(fixture.worker_caught_up("c").await);
+    assert!(!git_resolves(&fixture.rewind.cwd, &checkpoint_ref("n", 0)));
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// The checkout probe (a filesystem walk) is bounded too: one that hangs is given up at the
+/// limit.
+#[tokio::test]
+async fn a_hung_checkout_probe_is_given_up_at_the_limit() {
+    use crate::production::orchestration_effects::{EffectsOptions, checkpoint_ref};
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: Duration::from_millis(200),
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    let gate = engine.test_hooks().hold_checkout_probe();
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    baseline_timed_out(&engine, "n").await;
+    gate.notify_one();
+    assert!(fixture.worker_caught_up("c").await);
+    assert!(!git_resolves(&fixture.rewind.cwd, &checkpoint_ref("n", 0)));
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// Files of a `reference-transaction` hook that holds the update of a ref 0 in the checkout:
+/// Git runs it inside `update-ref`, after the commit is fixed, until `release` exists.
+struct HeldRefZeroUpdate {
+    entered: PathBuf,
+    recorded: PathBuf,
+    release: PathBuf,
+}
+
+impl HeldRefZeroUpdate {
+    fn install(cwd: &Path, scratch: &Path) -> Self {
+        let held = Self {
+            entered: scratch.join("entered"),
+            recorded: scratch.join("recorded"),
+            release: scratch.join("release"),
+        };
+        let slash = |path: &Path| path.display().to_string().replace('\\', "/");
+        let hook = cwd.join(".git").join("hooks").join("reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ninput=$(cat)\nif [ \"$1\" = prepared ]; then\n  case \"$input\" in\n    *turn/0*)\n      printf '%s\\n' \"$input\" > '{recorded}'\n      : > '{entered}'\n      while [ ! -f '{release}' ]; do sleep 0.1; done\n      ;;\n  esac\nfi\nexit 0\n",
+                recorded = slash(&held.recorded),
+                entered = slash(&held.entered),
+                release = slash(&held.release),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        held
+    }
+
+    async fn wait_entered(&self) {
+        timeout(LIVE_WRITER_LIMIT, async {
+            while !self.entered.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the ref 0 update reaches its hook");
+    }
+
+    /// The commit the held update was to publish.
+    fn commit(&self) -> String {
+        let recorded = std::fs::read_to_string(&self.recorded).unwrap();
+        recorded
+            .lines()
+            .find(|line| line.contains("turn/0"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap()
+            .to_owned()
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.release, "").unwrap();
+    }
+}
+
+/// Long enough for the capture's Git steps before `update-ref` under load, then given up.
+const LIVE_WRITER_LIMIT: Duration = Duration::from_secs(15);
+
+/// A ref 0 update still running at the limit is stopped before the turn is claimed: released
+/// afterwards, it never writes ref 0.
+#[tokio::test]
+async fn a_live_ref_zero_writer_is_stopped_before_the_claim() {
+    use crate::production::orchestration_effects::{EffectsOptions, checkpoint_ref};
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: LIVE_WRITER_LIMIT,
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    let held = HeldRefZeroUpdate::install(&cwd, scratch.path());
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    held.wait_entered().await;
+    quiet(&mut routes).await;
+    assert_eq!(
+        timeout(LIVE_WRITER_LIMIT + Duration::from_secs(10), routes.recv())
+            .await
+            .expect("the turn goes after the limit")
+            .as_deref(),
+        Some("n-first")
+    );
+    baseline_timed_out(&engine, "n").await;
+    held.release();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!git_resolves(&cwd, &checkpoint_ref("n", 0)));
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A ref 0 update that runs after the claim, as a child whose spawn stalled past the limit
+/// would, publishes only the checkout from before the turn: its commit was fixed before the
+/// claim. The turn's own capture keeps the `diffAvailable: false` it was recorded with.
+#[tokio::test]
+async fn a_late_ref_zero_write_after_the_claim_publishes_the_pre_turn_checkout() {
+    use crate::production::orchestration_effects::{EffectsOptions, checkpoint_ref};
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = RevertFixture::with_options(EffectsOptions {
+        checkpoint_hold_limit: LIVE_WRITER_LIMIT,
+        ..EffectsOptions::default()
+    })
+    .await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    let held = HeldRefZeroUpdate::install(&cwd, scratch.path());
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    held.wait_entered().await;
+    let commit = held.commit();
+    assert_eq!(
+        timeout(LIVE_WRITER_LIMIT + Duration::from_secs(10), routes.recv())
+            .await
+            .expect("the turn goes after the limit")
+            .as_deref(),
+        Some("n-first")
+    );
+    std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
+    let checkpoint = end_first_turn(&engine, &cwd, "n").await;
+    assert!(!checkpoint.diff_available);
+
+    // The late child: the killed one's lock is gone, and its update now runs.
+    held.release();
+    let reference = checkpoint_ref("n", 0);
+    let _ = std::fs::remove_file(cwd.join(".git").join(format!("{reference}.lock")));
+    git(
+        &IsolatedGitConfig::new(),
+        &cwd,
+        &["update-ref", &reference, &commit],
+    );
+    assert_eq!(tracked_at(&cwd, &reference).as_deref(), Some("two\n"));
+    assert!(
+        !checkpoint_in(&engine, "n", 1)
+            .await
+            .expect("turn 1")
+            .diff_available
+    );
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A shutdown during a first turn's baseline leaves the turn unclaimed and unreported; the next
+/// start captures the baseline, then delivers the turn.
+#[tokio::test]
+async fn a_shutdown_during_a_first_turn_baseline_leaves_the_turn_unclaimed() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    fixture.rewind.hold_thread("n");
+    create_thread(&engine, "n").await;
+    let (first, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    first.wake();
+    fixture.rewind.held_lookups(1).await;
+    timeout(Duration::from_secs(5), first.shutdown())
+        .await
+        .expect("the shutdown does not wait for the baseline");
+    let pending = row(&engine, "n-first").await;
+    assert_eq!(pending.state, TurnDeliveryState::Pending);
+    assert_eq!(pending.attempts, 0);
+    assert!(baseline_failures(&engine, "n").await.is_empty());
+    assert!(!git_resolves(&cwd, &checkpoint_ref("n", 0)));
+    assert!(routes.try_recv().is_err());
+
+    fixture.rewind.release_thread("n");
+    let (service, mut routes) = service(&engine);
+    received_after_baseline(&mut routes, "n-first").await;
+    assert!(git_resolves(&cwd, &checkpoint_ref("n", 0)));
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A first turn claimed before (it may have edited the checkout) never captures a baseline when
+/// it is delivered again.
+#[tokio::test]
+async fn a_redelivered_first_turn_never_captures_a_baseline() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    create_thread(&engine, "n").await;
+    enqueue_for(&engine, "n", "n-first", false).await;
+    engine
+        .repositories()
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE provider_turn_outbox SET attempts = 1 WHERE command_id = 'n-first'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (service, mut routes) = service(&engine);
+    received_after_baseline(&mut routes, "n-first").await;
+    assert!(!git_resolves(&fixture.rewind.cwd, &checkpoint_ref("n", 0)));
+    assert!(baseline_failures(&engine, "n").await.is_empty());
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A delivered first turn gets its baseline, and its capture (recorded `missing` when it ends)
+/// is replaced by the real checkpoint with the files the turn changed. Moved from
+/// `tests/production_orchestration_effects.rs`, where the effects worker wrote ref 0.
+#[tokio::test]
+async fn captures_baseline_and_replaces_missing_turn_checkpoint_with_real_diff() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    assert!(git_resolves(&cwd, &checkpoint_ref("n", 0)));
+
+    std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+    std::fs::write(cwd.join("new.txt"), "new\n").unwrap();
+    engine
+        .dispatch(command(json!({
+            "type":"thread.turn.diff.complete", "commandId":"placeholder", "threadId":"n",
+            "turnId":"n-turn-1", "checkpointTurnCount":1,
+            "checkpointRef":"missing", "status":"missing", "files":[],
+            "assistantMessageId":"assistant-1", "completedAt":TIME, "createdAt":TIME
+        })))
+        .await
+        .unwrap();
+    let checkpoint = captured_in(&engine, "n", 1).await;
+    assert_eq!(checkpoint.status, "ready");
+    assert_eq!(checkpoint.checkpoint_ref, checkpoint_ref("n", 1));
+    let files = checkpoint.files.as_array().unwrap();
+    assert!(files.iter().any(|file| file["path"] == "tracked.txt"));
+    assert!(files.iter().any(|file| file["path"] == "new.txt"));
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A thread whose turns predate turn checkpoints keeps the ref 0 of its very first turn. The
+/// first turn delivered afterwards captures ref 0 again, so that turn's diff, and a revert to 0,
+/// cover that turn alone rather than everything since the thread began. Moved from
+/// `tests/production_orchestration_effects.rs`, where the effects worker wrote ref 0.
+#[tokio::test]
+async fn a_thread_with_turns_before_checkpoints_starts_them_from_its_next_turn() {
+    use crate::production::orchestration_effects::{capture_checkpoint, checkpoint_ref};
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    create_thread(&engine, "n").await;
+    capture_checkpoint(&cwd, "n", 0).await.unwrap();
+    let session = |status: &str, active: Option<&str>| {
+        command(json!({
+            "type":"thread.session.set", "commandId":format!("session-{status}"), "threadId":"n",
+            "session":{
+                "threadId":"n", "status":status, "providerName":"codex",
+                "providerInstanceId":"codex", "runtimeMode":"full-access",
+                "activeTurnId":active, "lastError":null, "updatedAt":TIME
+            },
+            "createdAt":TIME
+        }))
+    };
+    // A turn that ran before this version: settled, with no checkpoint.
+    engine
+        .dispatch(session("running", Some("old-turn")))
+        .await
+        .unwrap();
+    engine.dispatch(session("ready", None)).await.unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "changed since\n").unwrap();
+
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    assert_eq!(
+        tracked_at(&cwd, &checkpoint_ref("n", 0)).as_deref(),
+        Some("changed since\n"),
+        "ref 0 is captured again when the next turn starts"
+    );
+    service.shutdown().await;
+    fixture.shutdown().await;
 }
 
 /// A revert that must first reopen a session suspended while idle does not hold the effects
-/// worker during that start: another thread's turn still gets its checkpoint baseline.
+/// worker during that start: it still handles another thread's events.
 #[tokio::test]
 async fn a_revert_reopening_a_suspended_session_does_not_delay_another_threads_checkpoint() {
     let mut fixture = RevertFixture::new().await;
@@ -1108,8 +1921,8 @@ async fn a_revert_reopening_a_suspended_session_does_not_delay_another_threads_c
     fixture.rewind.reopen_entered.notified().await;
 
     assert!(
-        fixture.other_thread_gets_its_baseline().await,
-        "thread b's checkpoint baseline waited behind thread t's provider reopen"
+        fixture.worker_reaches_other_thread().await,
+        "the effects worker's handling of thread b waited behind thread t's provider reopen"
     );
 
     fixture.rewind.reopen_release.notify_one();
@@ -1464,7 +2277,7 @@ async fn an_expired_hold_records_the_pending_checkpoint_stale_and_releases_the_t
 
     // The worker then gets past the capture: it records nothing for the stale turn.
     fixture.rewind.workspace_release.notify_one();
-    assert!(fixture.other_thread_gets_its_baseline().await);
+    assert!(fixture.worker_reaches_other_thread().await);
     let checkpoint = engine
         .repositories()
         .get_checkpoint("t".to_owned(), 3)
@@ -1734,7 +2547,7 @@ async fn a_restart_after_an_unwritten_stale_record_never_writes_that_turns_ref()
     // its baseline.
     std::fs::write(rewind.cwd.join("tracked.txt"), "four\n").unwrap();
     engine.dispatch(command(json!({"type":"thread.turn.start", "commandId":"turn-4", "threadId":"t", "message":{"messageId":"m-4", "role":"user", "text":"four", "attachments":[]}, "createdAt":TIME}))).await.unwrap();
-    assert!(worker_caught_up(&engine, &rewind.cwd, "b").await);
+    assert!(worker_caught_up(&engine, &rewind, "b").await);
     assert!(!git_resolves(&rewind.cwd, &checkpoint_ref("t", 3)));
 
     end_turn_unheld(&engine, 4).await;
@@ -1769,10 +2582,8 @@ async fn a_stale_captures_worker_leaves_the_hold_to_its_expiry() {
         .unwrap();
     assert!(fixture.worker_caught_up("b").await);
     assert!(engine.turns_held_for_checkpoint("t"));
-    // Thread b's own turn, which the sync admitted, is delivered first.
     enqueue(&engine, "queued", true).await;
     let (service, mut routes) = service(&engine);
-    received(&mut routes, "b-first").await;
     quiet(&mut routes).await;
 
     engine.release_checkpoint_hold("t", "turn-3");
@@ -1903,9 +2714,17 @@ async fn checkpoint_of(
     engine: &OrchestrationEngine,
     turn_count: i64,
 ) -> Option<crate::persistence::ProjectionCheckpoint> {
+    checkpoint_in(engine, "t", turn_count).await
+}
+
+async fn checkpoint_in(
+    engine: &OrchestrationEngine,
+    thread: &str,
+    turn_count: i64,
+) -> Option<crate::persistence::ProjectionCheckpoint> {
     engine
         .repositories()
-        .get_checkpoint("t".to_owned(), turn_count)
+        .get_checkpoint(thread.to_owned(), turn_count)
         .await
         .unwrap()
 }
@@ -1915,9 +2734,18 @@ async fn captured(
     engine: &OrchestrationEngine,
     turn_count: i64,
 ) -> crate::persistence::ProjectionCheckpoint {
+    captured_in(engine, "t", turn_count).await
+}
+
+/// Waits until `thread`'s turn `turn_count` is captured (`ready`), and returns it.
+async fn captured_in(
+    engine: &OrchestrationEngine,
+    thread: &str,
+    turn_count: i64,
+) -> crate::persistence::ProjectionCheckpoint {
     timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(checkpoint) = checkpoint_of(engine, turn_count)
+            if let Some(checkpoint) = checkpoint_in(engine, thread, turn_count)
                 .await
                 .filter(|checkpoint| checkpoint.status == "ready")
             {
@@ -1927,7 +2755,7 @@ async fn captured(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("turn {turn_count} is never captured"))
+    .unwrap_or_else(|_| panic!("{thread}'s turn {turn_count} is never captured"))
 }
 
 /// Waits for a `checkpoint.capture.failed` activity of `turn_id` on thread `t`.
@@ -2386,7 +3214,7 @@ async fn deliver_in_flight(
 }
 
 /// A revert waiting on thread `t`'s delivery does not hold the effects worker: another thread's
-/// turn still gets its checkpoint baseline meanwhile.
+/// events are still handled meanwhile.
 #[tokio::test]
 async fn a_revert_waiting_for_a_delivery_does_not_delay_another_threads_checkpoint() {
     let mut fixture = RevertFixture::new().await;
@@ -2394,8 +3222,8 @@ async fn a_revert_waiting_for_a_delivery_does_not_delay_another_threads_checkpoi
     fixture.revert().await;
 
     assert!(
-        fixture.other_thread_gets_its_baseline().await,
-        "thread b's checkpoint baseline waited behind thread t's revert"
+        fixture.worker_reaches_other_thread().await,
+        "the effects worker's handling of thread b waited behind thread t's revert"
     );
     assert_eq!(
         fixture
