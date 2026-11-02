@@ -1089,6 +1089,23 @@ impl Repositories {
             .await
     }
 
+    /// Whether the delivery was ever claimed, even if a manual retry reset its attempts since:
+    /// the provider may then have edited the checkout. A missing row counts as claimed.
+    pub async fn provider_turn_was_claimed(&self, command_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = ?",
+                        [command_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_none_or(|claimed| claimed != 0))
+            })
+            .await
+    }
+
     pub async fn claim_provider_turn(
         &self,
         command_id: String,
@@ -1100,7 +1117,7 @@ impl Repositories {
             .fetch_add(1, Ordering::SeqCst);
         // A closed (archived) chat panel starts nothing until it is reopened.
         let result = self.database.call(move |connection| connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, claimed_once = 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
             params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {

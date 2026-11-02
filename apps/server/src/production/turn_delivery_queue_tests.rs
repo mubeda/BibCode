@@ -1826,6 +1826,97 @@ async fn a_redelivered_first_turn_never_captures_a_baseline() {
     fixture.shutdown().await;
 }
 
+/// A manual retry resets `attempts`, but a first turn claimed before never captures a baseline:
+/// after an uncertain delivery whose provider may have edited the checkout, a restart and a
+/// retry, ref 0 stays unwritten rather than holding that attempt's edits.
+#[tokio::test]
+async fn a_retried_first_turn_after_an_uncertain_delivery_never_captures_a_baseline() {
+    use crate::production::orchestration_effects::checkpoint_ref;
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    // The first attempt's baseline cannot be written.
+    let lock = lock_ref(&cwd, &checkpoint_ref("n", 0));
+    create_thread(&engine, "n").await;
+    let uncertain = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (sender, mut routes) = mpsc::unbounded_channel();
+    let router: ProviderDeliveryRouter = {
+        let uncertain = uncertain.clone();
+        Arc::new(move |command, _delivery_key| {
+            sender.send(command.command_id().to_owned()).unwrap();
+            let outcome = if uncertain.load(std::sync::atomic::Ordering::SeqCst) {
+                ProviderDeliveryOutcome::Ambiguous {
+                    detail: "the provider stopped answering".to_owned(),
+                }
+            } else {
+                ProviderDeliveryOutcome::Accepted { turn_id: None }
+            };
+            Box::pin(async move { outcome })
+        })
+    };
+    let start = || {
+        TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            1,
+            router.clone(),
+            unavailable_reconciler(),
+        )
+    };
+    let first = start();
+    enqueue_for(&engine, "n", "n-first", false).await;
+    first.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    // The provider edited the checkout before the delivery became uncertain.
+    std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
+    timeout(Duration::from_secs(10), async {
+        while row(&engine, "n-first").await.state != TurnDeliveryState::Uncertain {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the delivery becomes uncertain");
+    first.shutdown().await;
+
+    std::fs::remove_file(lock).unwrap();
+    engine.dispatch(command(json!({"type":"thread.turn-delivery.resolve", "commandId":"retry", "threadId":"n", "messageId":"n-first", "action":"retry", "createdAt":TIME}))).await.unwrap();
+    let retried = row(&engine, "n-first").await;
+    assert_eq!(
+        (retried.state, retried.attempts),
+        (TurnDeliveryState::Pending, 0)
+    );
+    uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+    // A restarted delivery loop remembers nothing of the first attempt.
+    let second = start();
+    received_after_baseline(&mut routes, "n-first").await;
+    assert!(
+        !git_resolves(&cwd, &checkpoint_ref("n", 0)),
+        "ref 0 would hold the first attempt's edits"
+    );
+    second.shutdown().await;
+    fixture.shutdown().await;
+}
+
+/// A capture whose temporary-index removal stalls (a network filesystem) still ends: the removal
+/// is given up after its own bound, so the stage reports and the first turn is delivered with
+/// its baseline.
+#[tokio::test]
+async fn a_stalled_temporary_index_removal_never_holds_the_first_turn() {
+    use crate::production::orchestration_effects::{checkpoint_ref, hold_temporary_index_removal};
+    let fixture = RevertFixture::new().await;
+    let engine = fixture.engine.clone();
+    let cwd = fixture.rewind.cwd.clone();
+    let gate = hold_temporary_index_removal(&cwd.join(".git"));
+    create_thread(&engine, "n").await;
+    let (service, mut routes) = service(&engine);
+    enqueue_for(&engine, "n", "n-first", false).await;
+    service.wake();
+    received_after_baseline(&mut routes, "n-first").await;
+    assert!(git_resolves(&cwd, &checkpoint_ref("n", 0)));
+    gate.notify_waiters();
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
 /// A delivered first turn gets its baseline, and its capture (recorded `missing` when it ends)
 /// is replaced by the real checkpoint with the files the turn changed. Moved from
 /// `tests/production_orchestration_effects.rs`, where the effects worker wrote ref 0.

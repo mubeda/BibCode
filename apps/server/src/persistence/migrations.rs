@@ -702,6 +702,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(61, "Webhooks", migration_061),
     Migration::new(62, "McpOAuth", migration_062),
     Migration::new(63, "ProjectionTurnCheckpointDiffAvailable", migration_063),
+    Migration::new(64, "ProviderTurnOutboxClaimedOnce", migration_064),
 ];
 
 impl Migration {
@@ -2930,6 +2931,25 @@ fn migration_063(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_064(transaction: &Transaction<'_>) -> Result<()> {
+    // A first turn's checkpoint baseline (#261) is captured only before the turn is ever claimed:
+    // once claimed, the provider may have edited the checkout. `attempts` cannot tell, since a
+    // manual retry resets it, so a claim also sets `claimed_once`, which nothing clears. A row
+    // from before this column may have been claimed and retried, so every existing row counts as
+    // claimed: its first turn gets no late baseline, and so no diff, rather than a wrong one.
+    if !table_exists(transaction, "provider_turn_outbox")? {
+        return Ok(());
+    }
+    if !table_has_column(transaction, "provider_turn_outbox", "claimed_once")? {
+        transaction.execute_batch(
+            "ALTER TABLE provider_turn_outbox
+               ADD COLUMN claimed_once INTEGER NOT NULL DEFAULT 0;
+             UPDATE provider_turn_outbox SET claimed_once = 1;",
+        )?;
+    }
+    Ok(())
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3159,7 +3179,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63]
+            [59, 60, 61, 62, 63, 64]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3179,6 +3199,45 @@ mod tests {
     }
 
     #[test]
+    fn migration_064_counts_every_existing_delivery_as_claimed() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(63))?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, attempts, created_at, updated_at) VALUES ('retried', 't', 'm', 'codex', 'codex', 'k', '{}', 'pending', 0, '2026-11-02T00:00:00Z', '2026-11-02T00:00:00Z');",
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [64]
+        );
+        let claimed: i64 = connection.query_row(
+            "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(claimed, 1);
+        connection.execute(
+            "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, created_at, updated_at) VALUES ('new', 't', 'm2', 'codex', 'codex', 'k2', '{}', 'pending', '2026-11-02T00:00:00Z', '2026-11-02T00:00:00Z')",
+            [],
+        )?;
+        let claimed: i64 = connection.query_row(
+            "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'new'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(claimed, 0);
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_064(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_061_adds_the_webhook_tables() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(60))?;
@@ -3189,7 +3248,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63]
+            [61, 62, 63, 64]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3228,7 +3287,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63]
+            [62, 63, 64]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3283,7 +3342,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63]
+            [60, 61, 62, 63, 64]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3328,7 +3387,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59, 60, 61, 62, 63]
+            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3805,6 +3864,13 @@ mod tests {
                     0
                 ),
                 ("failure_reason".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                (
+                    "claimed_once".to_owned(),
+                    "INTEGER".to_owned(),
+                    1,
+                    Some("0".to_owned()),
+                    0
+                ),
             ]
         );
         assert_eq!(
@@ -3836,6 +3902,7 @@ mod tests {
                     "mode",
                     "held",
                     "failure_reason",
+                    "claimed_once",
                 ],
             ),
             (
@@ -4057,7 +4124,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=63).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=64).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4124,6 +4191,7 @@ mod tests {
                 (61, "Webhooks"),
                 (62, "McpOAuth"),
                 (63, "ProjectionTurnCheckpointDiffAvailable"),
+                (64, "ProviderTurnOutboxClaimedOnce"),
             ],
         );
         assert_eq!(
@@ -4274,7 +4342,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 47);
+        assert_eq!(second.len(), 48);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4394,7 +4462,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63
+                61, 62, 63, 64
             ]
         );
         let policy = connection.query_row(
@@ -4434,7 +4502,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63
+                62, 63, 64
             ]
         );
         let pin = connection.query_row(
@@ -4465,7 +4533,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63
+                63, 64
             ]
         );
         let pin = connection.query_row(
@@ -4607,7 +4675,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
             ]
         );
         assert_eq!(
@@ -4637,7 +4705,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 30);
+        assert_eq!(applied.len(), 31);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);

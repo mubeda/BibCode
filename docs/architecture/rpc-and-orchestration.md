@@ -868,12 +868,16 @@ is known to be the turn's end state.
    slot, so its baseline is taken in the checkout the bootstrap set up. A thread
    with a numbered turn costs one read and no Git, and a project outside Git
    costs a filesystem probe. Every step is bounded by the checkpoint hold limit.
+   Cancelled steps get 10 seconds to stop, and a capture waits at most 5
+   seconds to remove its temporary index. That removal is then left to finish
+   on its own and logged, so a stalled filesystem never holds the stage.
    A failure or timeout is logged and shown once as a
    `checkpoint.capture.failed` activity (`turnCount: 0`, no turn id). The turn
    still goes, and its capture is then `ready` without a diff. Shutdown cancels
    the stage, which leaves the row pending and unclaimed. A row claimed before
-   (attempt 1 or later) never captures, because the checkout may hold its
-   edits. Every Git command whose output ref 0 holds finishes before the claim.
+   never captures, because the checkout may hold its edits. A claim sets
+   `provider_turn_outbox.claimed_once` (migration 64), which a manual retry
+   does not clear, and every row from before the migration counts as claimed. Every Git command whose output ref 0 holds finishes before the claim.
    Only `update-ref` can outlive a timeout (a stalled Windows spawn), and it
    publishes a commit fixed before the claim. A turn start never writes a
    numbered ref. A thread with settled turns but no recorded checkpoint, whose

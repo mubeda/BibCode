@@ -1210,8 +1210,18 @@ pub(crate) async fn ensure_first_turn_baseline(
         () = tokio::time::sleep(limit) => {
             timed_out = true;
             bounded.cancel();
-            // The steps end promptly once cancelled: Git children are stopped and waited for.
-            steps.await
+            // Cancelled steps stop their Git children and wait for them, and their cleanup is
+            // bounded too; past this grace they are dropped, which still kills the children.
+            match tokio::time::timeout(CANCELLED_BASELINE_GRACE, steps).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        thread_id,
+                        "a first turn's cancelled checkpoint baseline did not stop in time; it is dropped"
+                    );
+                    Err(OrchestrationEffectsError::Effect("timed out".to_owned()))
+                }
+            }
         }
     };
     if cancellation.is_cancelled() {
@@ -1244,6 +1254,62 @@ pub(crate) async fn ensure_first_turn_baseline(
             Ok(Some(reason))
         }
     }
+}
+
+/// How long cancelled baseline steps may take to stop their Git children and clean up.
+const CANCELLED_BASELINE_GRACE: Duration = Duration::from_secs(10);
+/// How long a capture waits to remove its temporary index; past this, the removal is left to
+/// finish on its own (a stalled network filesystem) and logged, so no capture waits on it.
+const TEMPORARY_INDEX_REMOVAL_LIMIT: Duration = Duration::from_secs(5);
+
+/// Removes a capture's temporary index within `TEMPORARY_INDEX_REMOVAL_LIMIT`.
+async fn remove_temporary_index(path: PathBuf) {
+    #[cfg(test)]
+    let gate = temporary_index_removal_gate(&path);
+    let removal = async move {
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        tokio::fs::remove_file(path).await
+    };
+    if tokio::time::timeout(TEMPORARY_INDEX_REMOVAL_LIMIT, removal)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "a checkpoint's temporary index was not removed in time; it is left to finish on its own"
+        );
+    }
+}
+
+/// Test gates that hold the removal of temporary indexes under a Git directory.
+#[cfg(test)]
+static TEMPORARY_INDEX_REMOVAL_GATES: std::sync::Mutex<Vec<(PathBuf, Arc<tokio::sync::Notify>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds the removal of every temporary index under `git_dir` until the gate is notified.
+#[cfg(test)]
+pub(crate) fn hold_temporary_index_removal(git_dir: &Path) -> Arc<tokio::sync::Notify> {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    TEMPORARY_INDEX_REMOVAL_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((git_dir.to_path_buf(), gate.clone()));
+    gate
+}
+
+#[cfg(test)]
+fn temporary_index_removal_gate(path: &Path) -> Option<Arc<tokio::sync::Notify>> {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let parent = path.parent().map(canonical)?;
+    TEMPORARY_INDEX_REMOVAL_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(git_dir, _)| canonical(git_dir) == parent)
+        .map(|(_, gate)| gate.clone())
 }
 
 fn describe_limit(limit: Duration) -> String {
@@ -2252,7 +2318,7 @@ async fn capture_checkpoint_with_cancellation(
         Ok(())
     }
     .await;
-    let _ = tokio::fs::remove_file(temporary_index).await;
+    remove_temporary_index(temporary_index).await;
     result
 }
 
