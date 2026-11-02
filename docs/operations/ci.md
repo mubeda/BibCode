@@ -41,6 +41,10 @@ workflow as idle.
   test binaries use the default parallel harness threads. Exact subprocess
   tests may still select `--test-threads=1` inside an isolated child process
   that intentionally owns process-global state.
+  That suite includes the transfer byte budget (`apps/server/tests/transfer_budget.rs`): it
+  fails when the shell snapshot, the big thread's first `subscribeThread` item (whole, and as
+  the history window the app opens) or its resume answer grows past `apps/server/tests/transfer_budget.json`, in bytes after deflate or decoded.
+  It counts bytes, not time, so it is deterministic on any runner.
   The job then builds the guarded `bibcode` through
   `cargo test -p bibcode-server --test cli_smoke --no-run -j 2`
   and runs the ignored desktop SSH integration test
@@ -174,6 +178,12 @@ budgets above include a cold compile. Native desktop keeps its 120-minute and
   [symbol archives](./release.md#symbol-assets).
 - `.github/workflows/deploy-relay.yml` deploys the BiBCode Connect relay from
   `main` only when the required Cloudflare repository configuration exists.
+- `.github/workflows/transfer-report.yml` runs on pull requests that touch the server or its
+  contracts. It compiles the transfer byte-budget test on the pull request's head and, with the
+  head's test and fixture, on its base, and writes both measurements to the job summary and an
+  artifact (`scripts/transfer-report.ts`). It reports and never fails on a budget; the Test job
+  does. It has read-only repository permissions, no secrets and no comment step, so running the
+  pull request's own code is safe. A base that does not build with the head's test shows "n/a".
 - `.github/workflows/issue-labels.yml`, `pr-size.yml`, and `pr-vouch.yml` enforce
   repository-maintenance policy independently of the application quality
   gates.

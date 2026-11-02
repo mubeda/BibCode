@@ -12,6 +12,7 @@ use axum::{
         ConnectInfo, FromRef, Request, State, WebSocketUpgrade, connect_info::Connected,
         rejection::ExtensionRejection,
     },
+    handler::Handler,
     http::{
         HeaderMap, HeaderValue, Method, StatusCode, Uri,
         header::{
@@ -29,7 +30,10 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::fs::File;
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
-use tower_http::cors::{AllowCredentials, AllowOrigin, Any, CorsLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{AllowCredentials, AllowOrigin, Any, CorsLayer},
+};
 
 use crate::{
     auth,
@@ -474,7 +478,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(MAINTENANCE_UPDATE_STATUS_PATH, get(update_status))
         .route("/ws", get(websocket))
         .route(WS_E2EE_PATH, get(websocket_e2ee))
-        .fallback(static_or_dev)
+        // Gzip for the web build a remote browser loads (#227): only the static fallback, so
+        // `/ws`, the E2EE route, the JSON routes and preview traffic are never compressed here.
+        .fallback(static_or_dev.layer(CompressionLayer::new()))
         .layer(middleware::from_fn_with_state(
             state.admission_gate.clone(),
             request_admission,
@@ -1213,10 +1219,15 @@ async fn stream_file(
             StatusCode::OK
         })
         .header(CONTENT_TYPE, content_type.as_ref())
-        .header(CONTENT_LENGTH, metadata.len())
         .header(CACHE_CONTROL, cache_control)
+        // The static fallback gzips for clients that accept it (#227): every answer, a 304
+        // included, varies by encoding, and a 304 carries no length since the encoding sets it.
+        .header(VARY, "accept-encoding")
         .header("x-content-type-options", "nosniff")
         .header("content-security-policy", content_security_policy(headers));
+    if !not_modified {
+        response = response.header(CONTENT_LENGTH, metadata.len());
+    }
     if let Some(etag) = etag {
         response = response.header(ETAG, etag);
     }

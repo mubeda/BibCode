@@ -2007,9 +2007,11 @@ describe("connectionStorageLayer", () => {
       expect(Option.isSome(shell)).toBe(true);
 
       expect(Option.isNone(yield* cacheStore.loadThread(environmentId, threadId))).toBe(true);
-      yield* cacheStore.saveThread(environmentId, orchestrationThread());
+      const resumeFrom = { revision: "rev-1", snapshotSequence: 7 };
+      yield* cacheStore.saveThread(environmentId, { thread: orchestrationThread(), resumeFrom });
       const thread = yield* cacheStore.loadThread(environmentId, threadId);
-      expect(Option.isSome(thread)).toBe(true);
+      expect(Option.getOrThrow(thread).resumeFrom).toEqual(resumeFrom);
+      expect(Option.getOrThrow(thread).thread.id).toBe(threadId);
 
       // A thread cached under a different environment is not returned.
       expect(Option.isNone(yield* cacheStore.loadThread(otherEnvironmentId, threadId))).toBe(true);
@@ -2019,10 +2021,33 @@ describe("connectionStorageLayer", () => {
 
       // Repopulate, then clear the whole environment (shell + thread range).
       yield* cacheStore.saveShell(environmentId, shellSnapshot());
-      yield* cacheStore.saveThread(environmentId, orchestrationThread());
+      yield* cacheStore.saveThread(environmentId, {
+        thread: orchestrationThread(),
+        resumeFrom: null,
+      });
       yield* cacheStore.clear(environmentId);
       expect(Option.isNone(yield* cacheStore.loadShell(environmentId))).toBe(true);
       expect(Option.isNone(yield* cacheStore.loadThread(environmentId, threadId))).toBe(true);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  // The thread history window (#226): the cache holds the window, never loaded pages. `history`
+  // is optional, so a record from before it decodes, and one with it round-trips.
+  it.effect("decodes a cached thread with and without history", () => {
+    installFakeIndexedDb();
+    return Effect.gen(function* () {
+      const cacheStore = yield* EnvironmentCacheStore;
+      const history = {
+        floor: "eyJ2IjoxfQ",
+        hasOlder: true,
+        olderRows: 42,
+        carried: { activities: [], proposedPlans: [] },
+      };
+      for (const thread of [orchestrationThread(), { ...orchestrationThread(), history }]) {
+        yield* cacheStore.saveThread(environmentId, { thread, resumeFrom: null });
+        const cached = Option.getOrThrow(yield* cacheStore.loadThread(environmentId, threadId));
+        expect(cached.thread.history).toEqual(thread.history);
+      }
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
@@ -2076,12 +2101,35 @@ describe("connectionStorageLayer", () => {
         const shellError = yield* Effect.flip(cacheStore.saveShell(environmentId, shellSnapshot()));
         expect(shellError.operation).toBe("save-shell");
         const threadError = yield* Effect.flip(
-          cacheStore.saveThread(environmentId, orchestrationThread()),
+          cacheStore.saveThread(environmentId, { thread: orchestrationThread(), resumeFrom: null }),
         );
         expect(threadError.operation).toBe("save-thread");
       }).pipe(Effect.provide(connectionStorageLayer));
     },
   );
+
+  // A thread cached before #227 has no revision: it loads, and its first subscribe sends none.
+  it.effect("loads a thread cached before revisions were saved without one", () => {
+    const handle = installFakeIndexedDb();
+    const threadStore = new Map<IDBValidKey, unknown>();
+    handle.stores.set("thread", threadStore);
+    threadStore.set(
+      `${environmentId}:${threadId}`,
+      encodeUnknownJson({
+        schemaVersion: 1,
+        environmentId,
+        threadId,
+        thread: orchestrationThread(),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const cacheStore = yield* EnvironmentCacheStore;
+      const cached = Option.getOrThrow(yield* cacheStore.loadThread(environmentId, threadId));
+      expect(cached.thread.id).toBe(threadId);
+      expect(cached.resumeFrom).toBeNull();
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
 
   it.effect("rejects malformed cached snapshots and ignores snapshots scoped elsewhere", () => {
     const handle = installFakeIndexedDb();
@@ -2132,8 +2180,12 @@ describe("connectionStorageLayer", () => {
         (yield* Effect.flip(cacheStore.saveShell(environmentId, null as never))).operation,
       ).toBe("save-shell");
       expect(
-        (yield* Effect.flip(cacheStore.saveThread(environmentId, { id: threadId } as never)))
-          .operation,
+        (yield* Effect.flip(
+          cacheStore.saveThread(environmentId, {
+            thread: { id: threadId },
+            resumeFrom: null,
+          } as never),
+        )).operation,
       ).toBe("save-thread");
     }).pipe(Effect.provide(connectionStorageLayer));
   });

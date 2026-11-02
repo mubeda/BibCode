@@ -1,9 +1,40 @@
 // @vitest-environment happy-dom
+import {
+  EnvironmentId,
+  OrchestrationGetThreadHistoryPageError,
+  ThreadId,
+  type ScopedThreadRef,
+} from "@bibcode/contracts";
+import type { ThreadOlderHistory } from "@bibcode/client-runtime/state/threads";
+import * as Effect from "effect/Effect";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { describeThreadFindStatus, ThreadFindBar } from "./ThreadFindBar";
+import {
+  describeThreadFindStatus,
+  ThreadFindBar,
+  type ThreadFindOlderHistory,
+  useSearchAllOlder,
+} from "./ThreadFindBar";
 import type { ThreadFindStatus } from "./useThreadFind";
+
+const h = vi.hoisted(() => ({
+  olderHistory: null as ThreadOlderHistory | null,
+}));
+
+vi.mock("~/state/threads", () => ({
+  useThreadFindLoadState: () => ({ status: "live", error: null, hasData: true }),
+  useThreadOlderHistory: () => h.olderHistory,
+}));
+
+const THREAD_REF: ScopedThreadRef = {
+  environmentId: EnvironmentId.make("environment-1"),
+  threadId: ThreadId.make("thread-1"),
+};
+
+function olderHistoryWith(loadAllOlder: ThreadOlderHistory["loadAllOlder"]): ThreadOlderHistory {
+  return { status: "idle", loadOlder: Effect.void, loadAllOlder };
+}
 
 const roots: Array<{ root: Root; container: HTMLElement }> = [];
 
@@ -134,5 +165,130 @@ describe("ThreadFindBar", () => {
   ] as const)("shows the %o status", async (status, text) => {
     const container = await renderBar(controllerWith(status));
     expect(container.textContent).toContain(text);
+  });
+});
+
+// The thread history window (#226): find searches the loaded messages and says so.
+describe("ThreadFindBar with older history", () => {
+  async function renderWithOlder(
+    status: ThreadFindStatus,
+    olderHistory: ThreadFindOlderHistory,
+  ): Promise<HTMLElement> {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push({ root, container });
+    await act(async () =>
+      root.render(
+        <ThreadFindBar
+          query="needle"
+          status={status}
+          olderHistory={olderHistory}
+          attachInput={() => {}}
+          onQueryChange={() => {}}
+          onSubmit={() => {}}
+          onStep={() => {}}
+          onClose={() => {}}
+        />,
+      ),
+    );
+    return container;
+  }
+  const button = (container: HTMLElement, text: string) =>
+    [...container.querySelectorAll("button")].find((element) => element.textContent === text);
+
+  it("says it searched loaded messages while older history remains", async () => {
+    const onSearchAll = vi.fn();
+    const container = await renderWithOlder(MATCH, { state: "partial", onSearchAll });
+    expect(container.textContent).toContain("Searched loaded messages.");
+    await act(async () => button(container, "Search all")!.click());
+    expect(onSearchAll).toHaveBeenCalledTimes(1);
+    const none = await renderWithOlder(
+      { kind: "none", stale: false },
+      { state: "loading", onSearchAll },
+    );
+    expect(none.textContent).toContain("Loading earlier messages…");
+    expect(button(none, "Search all")).toBeUndefined();
+    // Before a scan there is nothing to qualify.
+    const idle = await renderWithOlder({ kind: "idle" }, { state: "partial", onSearchAll });
+    expect(idle.textContent).not.toContain("Searched loaded messages.");
+  });
+});
+
+describe("useSearchAllOlder", () => {
+  function Probe(props: { readonly isOpen: boolean }) {
+    const olderHistory = useSearchAllOlder(THREAD_REF, true, props.isOpen);
+    return (
+      <button type="button" data-state={olderHistory?.state} onClick={olderHistory?.onSearchAll}>
+        Search all
+      </button>
+    );
+  }
+  async function mountProbe() {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push({ root, container });
+    await act(async () => root.render(<Probe isOpen />));
+    const button = container.querySelector("button")!;
+    return {
+      state: () => container.querySelector("button")?.dataset.state,
+      searchAll: () => act(async () => button.click()),
+      close: () => act(async () => root.render(<Probe isOpen={false} />)),
+    };
+  }
+  const settle = () => act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
+  it("Search all loads every older page and rescans", async () => {
+    let release = () => {};
+    const pages = new Promise<void>((resolve) => (release = resolve));
+    let calls = 0;
+    h.olderHistory = olderHistoryWith(
+      Effect.suspend(() => {
+        calls += 1;
+        return Effect.promise(() => pages);
+      }),
+    );
+    const probe = await mountProbe();
+    await probe.searchAll();
+    expect(probe.state()).toBe("loading");
+    release();
+    await settle();
+    expect(calls).toBe(1);
+    // Every page loaded: the scan reruns over the new rows (the controller recounts on data).
+    expect(probe.state()).toBe("partial");
+  });
+
+  it("Search all reports a failed page and offers retry", async () => {
+    let fail = true;
+    h.olderHistory = olderHistoryWith(
+      Effect.suspend(() =>
+        fail
+          ? Effect.fail(new OrchestrationGetThreadHistoryPageError({ message: "offline" }))
+          : Effect.void,
+      ),
+    );
+    const probe = await mountProbe();
+    await probe.searchAll();
+    await settle();
+    expect(probe.state()).toBe("failed");
+    fail = false;
+    await probe.searchAll();
+    await settle();
+    expect(probe.state()).toBe("partial");
+  });
+
+  it("closing the bar interrupts Search all", async () => {
+    let interrupted = false;
+    h.olderHistory = olderHistoryWith(
+      Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => (interrupted = true)))),
+    );
+    const probe = await mountProbe();
+    await probe.searchAll();
+    await settle();
+    await probe.close();
+    await settle();
+    expect(interrupted).toBe(true);
+    expect(probe.state()).toBe("partial");
   });
 });

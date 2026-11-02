@@ -126,6 +126,25 @@ export class ConnectionCatalogHealthStore extends Context.Service<
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionCatalogHealthStore") {}
 
+/**
+ * The server's revision of a thread, as of the last stream item applied in full. A subscribe
+ * that names it lets the server answer `unchanged` instead of sending the whole thread.
+ */
+export interface ThreadResumePoint {
+  readonly revision: string;
+  readonly snapshotSequence: number;
+}
+
+/**
+ * A cached thread and the revision it was at, saved together so a cold start can resume. A
+ * record written before revisions were saved, or after a change no revision described, has
+ * `resumeFrom: null`.
+ */
+export interface CachedThread {
+  readonly thread: OrchestrationThread;
+  readonly resumeFrom: ThreadResumePoint | null;
+}
+
 export class EnvironmentCacheStore extends Context.Service<
   EnvironmentCacheStore,
   {
@@ -139,10 +158,10 @@ export class EnvironmentCacheStore extends Context.Service<
     readonly loadThread: (
       environmentId: EnvironmentId,
       threadId: ThreadId,
-    ) => Effect.Effect<Option.Option<OrchestrationThread>, ConnectionPersistenceError>;
+    ) => Effect.Effect<Option.Option<CachedThread>, ConnectionPersistenceError>;
     readonly saveThread: (
       environmentId: EnvironmentId,
-      thread: OrchestrationThread,
+      cached: CachedThread,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly removeThread: (
       environmentId: EnvironmentId,

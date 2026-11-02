@@ -876,7 +876,7 @@ is known to be the turn's end state.
    still goes, and its capture is then `ready` without a diff. Shutdown cancels
    the stage, which leaves the row pending and unclaimed. A row claimed before
    never captures, because the checkout may hold its edits. A claim sets
-   `provider_turn_outbox.claimed_once` (migration 64), which a manual retry
+   `provider_turn_outbox.claimed_once` (migration 65), which a manual retry
    does not clear, and every row from before the migration counts as claimed. Every Git command whose output ref 0 holds finishes before the claim.
    Only `update-ref` can outlive a timeout (a stalled Windows spawn), and it
    publishes a commit fixed before the claim. A turn start never writes a
@@ -2734,6 +2734,14 @@ client decodes only the changed fields with the thread's field
 schemas, and `packages/contracts/fixtures/thread-stream/lifecycle.json` pins
 that patches rebuild the server's snapshot exactly. Older clients omit
 `patches` and keep receiving whole snapshots; older servers ignore it.
+The thread stream sends at most the first 200 files of each checkpoint, in
+their stored (path) order so patches do not churn, and the checkpoint's
+`filesTotal` (#227): one formatter run or generated folder made every open of
+its thread carry thousands of entries. The chat's changed-files section shows
+the total and an "and N more files" row that opens the turn diff, which
+`getTurnDiff` computes from the checkpoint refs with every file. The HTTP read
+model keeps the full list and no total; an older server sends every file
+without `filesTotal`, and an older client ignores the field.
 
 A resubscribe resumes instead of resending the thread
 ([design](../superpowers/specs/2026-10-17-thread-resubscribe-resume-design.md)).
@@ -2744,7 +2752,9 @@ the last item it applied in full and sends it on each resubscribe as
 `resume: { revision, snapshotSequence }`. The server loads the thread as
 before, and answers `{ kind: "unchanged", snapshotSequence, revision }` only
 when the thread still has that revision and its sequence is at least the
-client's. It then patches against that thread. Anything else gets the whole
+client's. It then patches against that thread. The client caches the revision
+with the thread, so this also holds for its first subscribe after a reload or
+an app restart ([connection runtime](./connection-runtime.md)). Anything else gets the whole
 snapshot: a change the client missed, a revision from before a restart (new
 keys), one the server never produced, a sequence newer than the server's, or a
 client that does not apply patches. The client clears its revision whenever it
@@ -2754,6 +2764,67 @@ servers ignore it and send no `revision`, so either side alone keeps today's
 full snapshot. `packages/contracts/fixtures/thread-stream/resume.json` pins the
 items; revisions in it are placeholders, because they mean nothing to another
 process.
+
+A subscriber that sends `history: {}` opens a **history window** (#226,
+[design](../plans/2026-11-01-thread-history-window-design.md)): the first item
+holds recent history under a byte budget, and older rows load in pages. The
+four history arrays (messages, activities, reasoning, proposed plans) are cut by
+the key `K = (createdAt, kindRank, id)`, the timeline's order across kinds. A
+window has a fixed floor `{ K | ALL, openedAt, epoch }`, and a row is in it when
+`K >= floor.K`, when its `written_sequence` is greater than `openedAt` (it was
+written after the window opened), or when it is live: a streaming message or
+reasoning row, or a message whose delivery is `queued`, `pending`, `sending`,
+`uncertain` or `failed`. Every projector write to a history row sets
+`written_sequence` to the sequence of the event it projects, so it never
+repeats and a projection rebuild gives the same values; a rowid would do
+neither. A row stops being live only through a write, so rows only ever enter a
+window: index patches stay exact and nothing outside the window is sent as a
+removal. The server chooses a fresh floor by serializing the fixed parts first
+(the shell, live rows, carried rows and the turn index) and then walking the
+other rows newest first by `K` until 1 MiB of JSON, 500 rows or 10 user
+messages, always taking the newest row. The floor is the oldest whole turn
+reached, the oldest row taken inside one oversized turn, or `ALL` when the walk
+reaches the oldest row. The thread then has `history: { floor, hasOlder,
+olderRows, carried }`; `floor` is opaque base64url JSON of ids, timestamps and
+sequences.
+
+State a window may not hold travels in `history.carried`, selected by the same
+rules the web's readers use: every `*.requested` activity of a request still
+open (a pending approval in `projection_pending_approvals`, or a user-input
+request `open_user_input_requests_sql` lists, of any turn or none), the
+context-window and MCP status rows `deriveLatestContextWindowSnapshot` and
+`deriveMcpStatusSnapshot` would select (the newest valid one in canonical
+activity order, per provider instance for MCP), the newest proposed plan, the
+newest of the latest turn, and any plan a `running` turn names as its source.
+`packages/contracts/fixtures/thread-stream/carried-status.json` runs the Rust
+selector and the web readers on the same cases. Every checkpoint is sent, but
+one whose turn has no row in the window comes with `files: []` and its
+`filesTotal`: the turn index. A resubscribe echoes `history.floor`; the server
+keeps that floor when its epoch is the thread's and the whole value it admits
+is at most 4 MiB, and opens a fresh window otherwise. The revision covers the
+window value, so a resubscribe at the current revision with its floor still
+answers `unchanged`.
+
+`orchestration.getThreadHistoryPage { threadId, cursor }` (orchestration read
+scope; a local database read, so not in the profiler's `is_long_running`)
+returns the rows below the cursor that its window does not hold
+(`written_sequence <= openedAt` and not live), newest first, at most 75 rows or
+512 KiB but always one, the checkpoints of their turns with their files, the
+next `cursor` (`null` when nothing is older) and `olderRows`. The first cursor
+is the window's floor. A revert is the only deletion of settled rows: the
+`thread.reverted` projection sets `projection_threads.history_epoch` to its
+event sequence. Every re-read compares that epoch with the window's and
+re-windows with a snapshot when it moved, a revert lost to `Lagged` included;
+a resubscribe with an older floor gets a fresh window, and a page whose cursor
+carries an older epoch fails with `OrchestrationThreadHistoryStaleError`. A
+malformed cursor or an unreadable thread fails with
+`OrchestrationGetThreadHistoryPageError`, logged with the method, the thread id
+and the reason only. Without `history` the stream is byte-identical to a whole
+thread, and an older server ignores the field and sends one.
+`packages/contracts/fixtures/thread-stream/window.json` pins the windowed
+snapshot, a patch, every page, a stale page and the whole thread the client
+merges them back into.
+
 A thread stream ends with its first error, such as `Thread … was not found`
 for a missing or deleted thread, whose targeted load reads none of its rows.
 The client retries a failed `subscribeThread` or `subscribeActivity` with
