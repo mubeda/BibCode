@@ -219,7 +219,7 @@ impl Default for Options {
 /// commit served over dumb HTTP at `http://fixture.invalid:<port>/repo.git`.
 async fn fixture(options: Options) -> Fixture {
     let root = tempfile::tempdir().expect("root");
-    let base = root.path().canonicalize().expect("canonical root");
+    let base = super::canonical(root.path());
     let projects = base.join("projects");
     let alpha = projects.join(PROJECT);
     std::fs::create_dir_all(&alpha).expect("project folder");

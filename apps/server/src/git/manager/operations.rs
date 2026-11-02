@@ -4895,7 +4895,9 @@ mod tests {
         git(fixture.path(), &["add", "tracked.txt"]);
         git(fixture.path(), &["commit", "-q", "-m", "base"]);
         std::fs::write(fixture.path().join("untracked.txt"), "untracked\n").expect("untracked");
-        let root = fixture.path().canonicalize().expect("canonical checkout");
+        // Git refuses a `\\?\` path as a host name, which the linked worktree beside it carries.
+        let root =
+            without_verbatim_prefix(fixture.path().canonicalize().expect("canonical checkout"));
         (fixture, root)
     }
 
