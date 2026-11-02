@@ -3885,8 +3885,12 @@ them, and can move, swap or write anything there at any moment.
   there is no staging: the entry's folder is held and pinned for the whole trash call
   (`Dir::pin`: reopened through its own handle without `FILE_SHARE_DELETE`, refused unless
   the volume is NTFS or ReFS), so no folder on the path can be renamed or replaced, and the
-  trash moves a junction or symlink at the entry itself, never what it names. A volume that
-  cannot pin answers `trash_unavailable`.
+  trash moves a junction or symlink at the entry itself, never what it names. The pinned
+  handle must be the folder held (same file ID), and the folder's path, reopened without
+  following a link, must be that same folder at that very final path; a folder put at the
+  path before the pin is refused. The entry's name is checked through its handle and the
+  trash gets its full name, so an 8.3 short name (`GIT~1` for `.git`) is refused. A volume
+  that cannot pin answers `trash_unavailable`.
 - **Trash.** `projects.deleteEntry { toTrash }` uses the same `FileTrash` as Source
   Control's discard and fails `trash_unavailable` rather than deleting.
 - **Errors.** A workspace error's `failure` is kept on the tool failure, and the message is

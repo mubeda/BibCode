@@ -672,6 +672,50 @@ async fn no_files_tool_reads_or_changes_gits_own_metadata() {
     fixture.shutdown().await;
 }
 
+/// `.git` reached by its 8.3 short name (`GIT~1`) is never handed to the trash: the trash
+/// takes a path, so the name is checked through its handle first (#216 review).
+#[cfg(windows)]
+#[tokio::test]
+async fn a_trash_never_takes_gits_metadata_by_its_short_name() {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    let fixture = fixture().await;
+    let initialized = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&fixture.folder)
+        .status()
+        .expect("git runs");
+    assert!(initialized.success());
+    let git = fixture.folder.join(".git");
+    let wide: Vec<u16> = git.as_os_str().encode_wide().chain([0]).collect();
+    let mut buffer = vec![0_u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buffer` holds as many units as passed.
+    let length = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            buffer.as_mut_ptr(),
+            1024,
+        )
+    } as usize;
+    let short = (length > 0 && length < 1024)
+        .then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])))
+        .and_then(|short| {
+            short
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| name != ".git");
+    let Some(short) = short else {
+        eprintln!("this volume makes no 8.3 names; nothing to check");
+        fixture.shutdown().await;
+        return;
+    };
+    let refused = fixture.call("files_delete", json!({ "path": short })).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(fixture.trash.count.load(Ordering::SeqCst), 0);
+    assert!(git.join("config").exists());
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_delete_goes_to_the_trash_unless_permanent_and_never_falls_back() {
     let fixture = fixture().await;
