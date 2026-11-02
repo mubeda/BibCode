@@ -2685,7 +2685,9 @@ first of a burst of its events, and the shell stream re-reads the shell
 stream sends only what changed (#223). Per subscription it keeps a keyed
 64-bit fingerprint of each project and thread shell it last sent, never the
 shell itself, and leaves `lastActivityAgeMs` out of it: that age grows on every
-re-read, and the client ages the status from its own receipt of the value. Each
+re-read. The client pins each received age to its own clock on receipt
+(`lastActivityObservedAt`), since an unchanged thread is not sent again and its
+age would otherwise be as old as the item that carried it. Each
 re-read sends, in one chunk, `project-upserted` and `thread-upserted` for the
 entries that changed or appeared, then `thread-removed` and `project-removed`
 for those that left the live shell (deleted, archived, or in a deleted
@@ -2695,7 +2697,10 @@ client's reducer, which drops an item at or below the sequence it holds,
 applies each item once, drops a redelivered one, and ends at the sequence a new
 snapshot would carry. The stream sends a whole snapshot instead, which the
 client takes as is, when the items do not fit above the sequence the client
-holds, when its event receiver lagged, or after a failed re-read. Every
+holds or when its event receiver lagged. A failed re-read sends nothing and
+keeps the stream open, because the client resubscribes only when its session
+changes: the stream logs a warning, re-reads 2 s later whether or not events
+arrive, and sends a whole snapshot once a read succeeds. Every
 subscription, including each one after a reconnect, starts with a snapshot, so
 a client cannot miss a delta between streams. Every released client decodes and
 applies these items (the union and its reducer predate them), so no input flag
@@ -2789,8 +2794,9 @@ The shell carries what the left panel's agent status reads (#187):
   and it never moves backwards. Migration 057 seeds it from each thread's latest
   provider event.
 - **`lastActivityAgeMs`** is how old `lastActivityAt` was on the server's clock
-  when the snapshot was built. The client ages a Working status from its own
-  receipt of that value, so it never compares clocks with the server.
+  when the shell item carrying it was built. The client ages a Working status
+  from its own receipt of that value, recorded when the item arrives rather than
+  when a row first renders, so it never compares clocks with the server.
 
 Requests also settle without an answer:
 

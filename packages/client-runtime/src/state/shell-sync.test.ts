@@ -489,13 +489,20 @@ describe("environment shell synchronization", () => {
           },
           { kind: "thread-removed", sequence: 7, threadId: ThreadId.make("archived") },
         ];
+        yield* TestClock.setTime(10_000);
         yield* Queue.offerAll(events, deltas);
         yield* sequenceReaches(7);
         yield* TestClock.adjust("1 second");
         const afterDeltas = yield* SubscriptionRef.get(shellState);
         expect(afterDeltas.status).toBe("live");
+        // The age is pinned to the receipt: the thread is not sent again while unchanged.
         expect(Option.getOrThrow(afterDeltas.snapshot).threads).toEqual([
-          expect.objectContaining({ id: "streaming", title: "During", lastActivityAgeMs: 800 }),
+          expect.objectContaining({
+            id: "streaming",
+            title: "During",
+            lastActivityAgeMs: 800,
+            lastActivityObservedAt: 10_000 - 800,
+          }),
         ]);
         expect((yield* Ref.get(savedSequences)).at(-1)).toBe(7);
 

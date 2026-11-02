@@ -6,6 +6,7 @@ import {
   type ServerConfig,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -26,6 +27,7 @@ import {
 } from "../platform/persistence.ts";
 import { subscribeInSession } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import { observeThreadActivity } from "./models.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import type { EnvironmentCatalogState } from "./connections.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -214,9 +216,15 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       return;
     }
     const current = yield* SubscriptionRef.get(state);
+    const receivedAt = yield* Clock.currentTimeMillis;
     let nextSnapshot: OrchestrationShellSnapshot | null = null;
     if (item.kind === "snapshot") {
-      nextSnapshot = item.snapshot;
+      const threads = item.snapshot.threads.map((thread) =>
+        observeThreadActivity(thread, receivedAt),
+      );
+      nextSnapshot = threads.every((thread, index) => thread === item.snapshot.threads[index])
+        ? item.snapshot
+        : { ...item.snapshot, threads };
     } else {
       const currentAuthority = yield* Ref.get(authority);
       if (
@@ -228,7 +236,12 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       ) {
         return;
       }
-      nextSnapshot = applyShellStreamEvent(current.snapshot.value, item);
+      nextSnapshot = applyShellStreamEvent(
+        current.snapshot.value,
+        item.kind === "thread-upserted"
+          ? { ...item, thread: observeThreadActivity(item.thread, receivedAt) }
+          : item,
+      );
       if (nextSnapshot === current.snapshot.value) {
         return;
       }
