@@ -657,6 +657,115 @@ async fn an_undeliverable_start_waits_to_delivery_failed_and_exits_1() {
     server.join().await.expect("server joins");
 }
 
+/// A Codex app-server that refuses its configuration on `thread/start` and `thread/resume`, as
+/// Codex 0.166.0 does for a `bibcode` table holding both `command` and `url` (#273).
+const CONFIG_ERROR: &str =
+    "failed to load configuration: url is not supported for stdio in `mcp_servers.example`";
+
+/// [`CONFIG_ERROR`]'s Codex, as an executable in `root`.
+fn config_refusing_codex(root: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let codex = root.join("refusing-codex");
+        std::fs::write(
+            &codex,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"id":%s,"result":{{"userAgent":"fake"}}}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      printf '{{"id":%s,"error":{{"code":-32600,"message":"{CONFIG_ERROR}"}}}}\n' "$id" ;;
+    *'"method":'*) [ -n "$id" ] && printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        codex
+    }
+    #[cfg(windows)]
+    {
+        std::fs::write(
+            root.join("refusing-codex.js"),
+            format!(
+                r#"const readline = require("node:readline");
+readline.createInterface({{ input: process.stdin }}).on("line", (line) => {{
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  const reply = request.method === "thread/start" || request.method === "thread/resume"
+    ? {{ id: request.id, error: {{ code: -32600, message: {message} }} }}
+    : {{ id: request.id, result: request.method === "initialize" ? {{ userAgent: "fake" }} : {{}} }};
+  process.stdout.write(`${{JSON.stringify(reply)}}\n`);
+}});
+"#,
+                message = serde_json::to_string(CONFIG_ERROR).unwrap()
+            ),
+        )
+        .unwrap();
+        let codex = root.join("refusing-codex.cmd");
+        std::fs::write(
+            &codex,
+            "@echo off\r\nnode \"%~dp0refusing-codex.js\" %*\r\n",
+        )
+        .unwrap();
+        codex
+    }
+}
+
+/// #273: Codex refusing its configuration fails the first delivery once instead of retrying it
+/// forever, and an outside agent sees why: the wait's `error` and `read_thread`'s
+/// `failedDelivery` carry Codex's message on a fresh thread that never got a session.
+#[tokio::test]
+async fn a_codex_configuration_error_fails_the_start_and_reads_back_its_reason() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path(), &config_refusing_codex(root.path())).await;
+    let cwd = project(&server, root.path()).await;
+
+    // Before #273 the delivery retried forever and the wait never ended.
+    let started = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_in(
+            root.path(),
+            &cwd,
+            &["start", ".", "-", "--wait", "--json"],
+            "Say hello\n",
+        ),
+    )
+    .await
+    .expect("the delivery fails instead of retrying");
+    assert_eq!(started.code, 1, "{} {}", started.out, started.err);
+    let report = started.json();
+    assert_eq!(report["status"], "delivery_failed", "{report}");
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(error.contains(CONFIG_ERROR), "{report}");
+    assert!(error.contains("config.toml"), "{report}");
+    assert!(
+        !error.contains("MCP server"),
+        "no advice that cannot help: {report}"
+    );
+    let thread = report["threadId"].as_str().unwrap().to_owned();
+
+    let shown = run_in(root.path(), &cwd, &["show", &thread, "--json"], "").await;
+    assert_eq!(shown.code, 0, "{}", shown.err);
+    let read = shown.json();
+    assert_eq!(read["status"], "delivery_failed", "{read}");
+    assert!(read["session"].is_null(), "no session row: {read}");
+    assert_eq!(read["failedDelivery"]["messageId"], report["messageId"]);
+    assert!(
+        read["failedDelivery"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(CONFIG_ERROR)),
+        "{read}"
+    );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
 /// A Codex app-server that answers each turn with one reply, or, for a message that says
 /// `needs-approval`, asks to run a command and waits.
 #[cfg(unix)]
