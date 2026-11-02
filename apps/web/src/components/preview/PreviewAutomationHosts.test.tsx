@@ -1116,7 +1116,6 @@ describe("handleRequest: invalid input", () => {
       "exactly one",
     ],
     ["resize", { mode: "preset" }, "Preset mode requires a preset"],
-    ["open", { tabId: "tab-1", reuseExistingTab: false }, "reuseExistingTab"],
   ];
   for (const [operation, input, reason] of invalid) {
     it(`rejects ${operation} arguments the contract refuses, naming the problem`, async () => {
@@ -1133,6 +1132,86 @@ describe("handleRequest: invalid input", () => {
       expect(error.message).toContain(reason);
     });
   }
+
+  it("rejects an explicit tab with reuseExistingTab false, as the broker sends it", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+
+    // The server moves the agent's tabId out of the arguments into the request.
+    const error = await handle(
+      makeRequest({
+        operation: "open",
+        tabId: "tab-1",
+        tabIdExplicit: true,
+        input: { reuseExistingTab: false } as unknown,
+      }),
+    ).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationInvalidInputError);
+    expect(error.message).toContain("tabId");
+    expect(h.commandCalls.some((c) => c.label === "open")).toBe(false);
+  });
+
+  it("does not hold a server-assigned default tab against reuseExistingTab false", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+
+    await handle(
+      makeRequest({
+        operation: "open",
+        tabId: "tab-1",
+        tabIdExplicit: false,
+        input: { reuseExistingTab: false } as unknown,
+      }),
+    );
+
+    expect(h.commandCalls.some((c) => c.label === "open")).toBe(true);
+  });
+
+  it("still accepts addresses padded with whitespace, as normalization always did", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+    await handle(
+      makeRequest({
+        operation: "open",
+        input: { url: "  http://localhost:5173\n", show: false } as unknown,
+      }),
+    );
+    expect(h.resolveCalls).toEqual([{ kind: "url", url: "http://localhost:5173" }]);
+
+    h.resolveCalls.length = 0;
+    seedReadyTab("tab-1");
+    await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { url: "\texample.com \n" } as unknown,
+      }),
+    );
+    await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { target: { kind: "url", url: " http://localhost:3000\n" } } as unknown,
+      }),
+    );
+    expect(h.resolveCalls).toEqual([
+      { kind: "url", url: "example.com" },
+      { kind: "url", url: "http://localhost:3000" },
+    ]);
+  });
 
   it("rejects before looking for a ready tab", async () => {
     const handle = mountHost();

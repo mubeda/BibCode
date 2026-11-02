@@ -184,6 +184,12 @@ export class PreviewAutomationInvalidInputError extends Schema.TaggedError<Previ
   }
 }
 
+const trimString = (object: Record<string, unknown>, key: string): Record<string, unknown> => {
+  const value = object[key];
+  if (typeof value === "string") object[key] = value.trim();
+  return object;
+};
+
 /**
  * Decodes an agent's arguments with the operation's contract instead of
  * casting them; the decoded value drops unknown fields and trims locators.
@@ -194,7 +200,28 @@ export function decodePreviewAutomationInput<S extends Schema.Decoder<unknown>>(
   request: PreviewAutomationRequest,
 ): S["Type"] {
   try {
-    return Schema.decodeUnknownSync(schema)(request.input);
+    const { input } = request;
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return Schema.decodeUnknownSync(schema)(input);
+    }
+    // The server moves an explicit `tabId` out of the arguments; put it back so the contract's
+    // tab rules (open: tabId with reuseExistingTab false) see the whole call. A default tab
+    // the server assigned is not the agent's argument.
+    const candidate: Record<string, unknown> = { ...input };
+    if (request.tabIdExplicit && request.tabId !== undefined) candidate.tabId = request.tabId;
+    // Addresses were always trimmed before use; keep accepting padded ones.
+    trimString(candidate, "url");
+    const { target } = candidate;
+    if (typeof target === "object" && target !== null && !Array.isArray(target)) {
+      candidate.target = trimString({ ...target }, "url");
+    }
+    const decoded = Schema.decodeUnknownSync(schema)(candidate);
+    // The tab travels as `request.tabId`, as before; the bridge is not given it twice.
+    if (typeof decoded === "object" && decoded !== null && "tabId" in decoded) {
+      const { tabId: _tabId, ...rest } = decoded;
+      return rest;
+    }
+    return decoded;
   } catch (cause) {
     throw new PreviewAutomationInvalidInputError({
       requestId: request.requestId,
