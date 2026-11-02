@@ -22,6 +22,7 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as References from "effect/References";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
@@ -1059,6 +1060,33 @@ describe("EnvironmentThreads", () => {
           yield* Fiber.join(duplicate);
           expect(messageIds(yield* current(harness))).toEqual(["m0"]);
           expect(yield* Ref.get(harness.pageRequests)).toHaveLength(1);
+        }),
+      );
+
+      it.live("reserves one request for concurrent loads even when the scheduler yields", () =>
+        Effect.gen(function* () {
+          const answer = yield* Deferred.make<void>();
+          const harness = yield* makeHarness({
+            pages: (cursor) =>
+              Deferred.await(answer).pipe(Effect.andThen(pagesOf(TWO_PAGES)(cursor))),
+          });
+          yield* opened(harness);
+          const { loadOlder } = (yield* current(harness)).olderHistory!;
+          // A yield every few operations interleaves the loads between their steps: a load that
+          // checks for one in flight and yields before reserving its own sends a second request.
+          for (let budget = 3; budget <= 24; budget += 1) {
+            yield* Ref.set(harness.pageRequests, []);
+            const loads = yield* Effect.forkChild(
+              Effect.all([loadOlder, loadOlder, loadOlder], { concurrency: "unbounded" }).pipe(
+                Effect.provideService(References.MaxOpsBeforeYield, budget),
+              ),
+            );
+            yield* Effect.sleep("30 millis");
+            expect(yield* Ref.get(harness.pageRequests), `budget ${budget}`).toEqual([FLOOR]);
+            // Interrupting the loads releases the reservation for the next round.
+            yield* Fiber.interrupt(loads);
+          }
+          yield* Deferred.succeed(answer, undefined);
         }),
       );
 

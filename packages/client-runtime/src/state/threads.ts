@@ -319,40 +319,44 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     request(ORCHESTRATION_WS_METHODS.getThreadHistoryPage, { threadId, cursor }).pipe(
       Effect.provideContext(services),
     );
-  const loadOlder: Effect.Effect<void, ThreadHistoryPageFailure> = Effect.suspend(() => {
-    if (inFlight !== null) return Deferred.await(inFlight);
-    const cursor = nextCursor();
-    if (cursor === null) return Effect.void;
-    const requested = generation;
-    return Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const done = yield* Deferred.make<void, ThreadHistoryPageFailure>();
+  // Single-flight: the check for a load in flight and the reservation of a new one run in one
+  // synchronous step, inside the uninterruptible region, so no yield falls between them and an
+  // interruption can't leave a reservation nobody completes.
+  const loadOlder: Effect.Effect<void, ThreadHistoryPageFailure> = Effect.uninterruptibleMask(
+    (restore) =>
+      Effect.suspend(() => {
+        if (inFlight !== null) return restore(Deferred.await(inFlight));
+        const cursor = nextCursor();
+        if (cursor === null) return Effect.void;
+        const requested = generation;
+        const done = Deferred.makeUnsafe<void, ThreadHistoryPageFailure>();
         inFlight = done;
         olderStatus = "loading";
-        yield* publishOlder;
-        const exit = yield* Effect.exit(restore(fetchPage(cursor)));
-        inFlight = null;
-        if (Exit.isSuccess(exit)) {
-          // A page for a floor or cursor this state no longer holds is stale or a duplicate.
-          if (requested === generation && nextCursor() === cursor) {
-            older = appendHistoryPage(older, exit.value);
+        return Effect.gen(function* () {
+          yield* publishOlder;
+          const exit = yield* Effect.exit(restore(fetchPage(cursor)));
+          inFlight = null;
+          if (Exit.isSuccess(exit)) {
+            // A page for a floor or cursor this state no longer holds is stale or a duplicate.
+            if (requested === generation && nextCursor() === cursor) {
+              older = appendHistoryPage(older, exit.value);
+            }
+            olderStatus = "idle";
+          } else if (
+            Option.getOrUndefined(Cause.findErrorOption(exit.cause))?._tag ===
+            "OrchestrationThreadHistoryStaleError"
+          ) {
+            // A revert this state missed: the next re-read or resubscribe brings the new window.
+            resetOlder();
+          } else {
+            olderStatus = Cause.hasInterruptsOnly(exit.cause) ? "idle" : "error";
           }
-          olderStatus = "idle";
-        } else if (
-          Option.getOrUndefined(Cause.findErrorOption(exit.cause))?._tag ===
-          "OrchestrationThreadHistoryStaleError"
-        ) {
-          // A revert this state missed: the next re-read or resubscribe brings the new window.
-          resetOlder();
-        } else {
-          olderStatus = Cause.hasInterruptsOnly(exit.cause) ? "idle" : "error";
-        }
-        yield* publishOlder;
-        yield* Deferred.done(done, Exit.isSuccess(exit) ? Exit.void : exit);
-        return yield* exit;
+          yield* publishOlder;
+          yield* Deferred.done(done, Exit.isSuccess(exit) ? Exit.void : exit);
+          return yield* exit;
+        });
       }),
-    ).pipe(Effect.asVoid);
-  });
+  ).pipe(Effect.asVoid);
   const loadAllOlder: Effect.Effect<void, ThreadHistoryPageFailure> = Effect.gen(function* () {
     // Each round either moves the cursor or fails, so this can't spin. A page another caller
     // started and then dropped is only retried.
