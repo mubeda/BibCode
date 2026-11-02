@@ -25,6 +25,11 @@ export interface UseResizableWidthOptions {
    *   - "right" → panel grows rightward (left-anchored panels)
    */
   readonly edge: "left" | "right";
+  /**
+   * "y" resizes a height by vertical drags (default "x"). The size is still called `width`;
+   * `edge` "right" then means the bottom edge and "left" the top edge.
+   */
+  readonly axis?: "x" | "y";
 }
 
 export interface ResizableWidthHandlers {
@@ -58,7 +63,7 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
   /** Clamps `width` to the current bounds, persists it, and paints it. */
   readonly commitWidth: (width: number) => void;
 } {
-  const { storageKey, defaultWidth, minWidth, maxWidth, edge } = options;
+  const { storageKey, defaultWidth, minWidth, maxWidth, edge, axis = "x" } = options;
 
   const clamp = useCallback(
     (value: number): number => {
@@ -84,7 +89,7 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
 
   const dragStateRef = useRef<{
     pointerId: number;
-    startX: number;
+    startPointer: number;
     startWidth: number;
     pending: number;
     /** Whether the pointer has travelled past the press threshold. */
@@ -127,11 +132,11 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
       } catch {
         return;
       }
-      document.body.style.cursor = "col-resize";
+      document.body.style.cursor = axis === "y" ? "row-resize" : "col-resize";
       document.body.style.userSelect = "none";
       dragStateRef.current = {
         pointerId: event.pointerId,
-        startX: event.clientX,
+        startPointer: axis === "y" ? event.clientY : event.clientX,
         startWidth: paintedWidth,
         pending: paintedWidth,
         moved: false,
@@ -139,7 +144,7 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
         target,
       };
     },
-    [paintedWidth],
+    [axis, paintedWidth],
   );
 
   const onPointerMove = useCallback(
@@ -147,7 +152,7 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
       const state = dragStateRef.current;
       if (!state || state.pointerId !== event.pointerId) return;
       event.preventDefault();
-      const travel = event.clientX - state.startX;
+      const travel = (axis === "y" ? event.clientY : event.clientX) - state.startPointer;
       if (Math.abs(travel) > DRAG_THRESHOLD_PX) state.moved = true;
       state.pending = clamp(state.startWidth + (edge === "left" ? -travel : travel));
       if (state.rafId !== null) return;
@@ -158,7 +163,7 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
         setDragWidth(active.pending);
       });
     },
-    [clamp, edge],
+    [axis, clamp, edge],
   );
 
   const commitWidth = useCallback(

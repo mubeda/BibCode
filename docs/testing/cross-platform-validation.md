@@ -2438,6 +2438,12 @@ starts.
    deleting files. Exercise whole-file discard and **Discard All**; tracked
    content must restore, an untracked path must use OS trash when available, and
    a trash failure must require the separate permanent-discard confirmation.
+   While two or more files are changed, drag the handles above the diff and
+   above the commit form and move them with the arrow keys; confirm the sizes
+   return after reopening the tab and both handles take keyboard focus. Press **F7** and **Shift+F7** (and the **Next change** / **Previous
+   change** buttons): the diff must scroll block by block, then enter the next
+   or previous file at its first or last block, and the disabled button at the
+   end of the list must explain itself.
    Finish with a clean checkout.
 4. Open **History**, scroll until the loaded list crosses the 100-commit page
    boundary, and select commits on both sides of that boundary. Confirm the

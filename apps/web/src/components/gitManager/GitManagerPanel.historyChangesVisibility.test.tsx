@@ -346,14 +346,18 @@ it("returns from real History PNG selection to exactly one visible working-tree 
       'form[aria-label="Commit Changes"]',
     )!;
     expect(retainedImage).not.toBeNull();
-    expect(list.parentElement).toBe(changes);
-    expect(retainedImage.parentElement).toBe(changes);
-    expect(retainedCommit.parentElement).toBe(changes);
+    // The list and the diff share one split under the filters; the commit form sits in its own
+    // pane below it. Both panes resize, so the list is not a direct child of the section.
+    const split = list.parentElement!.parentElement!;
+    const diffSlot = retainedImage.parentElement!;
+    expect(split.parentElement).toBe(changes);
+    expect(diffSlot.parentElement).toBe(split);
+    expect(retainedCommit.parentElement!.parentElement).toBe(changes);
     expect(
       retainedCommit.querySelector<HTMLInputElement>('input[name="git-manager-summary"]')?.value,
     ).toBe("Owned layout draft");
     // Declared allocation contract only: Happy DOM does not resolve native flex heights.
-    for (const flexible of [list, retainedImage]) {
+    for (const flexible of [split, retainedImage]) {
       expect(flexible.classList.contains("flex-1")).toBe(true);
       expect(flexible.classList.contains("min-h-0")).toBe(true);
       expect(
@@ -365,6 +369,11 @@ it("returns from real History PNG selection to exactly one visible working-tree 
         ),
       ).toBe(false);
     }
+    // The diff takes what the list (a set height that yields first) and the form leave.
+    expect(diffSlot.classList.contains("flex-1")).toBe(true);
+    expect(
+      [...diffSlot.classList].some((token) => token === "shrink-0" || token.startsWith("h-")),
+    ).toBe(false);
     expect(
       retainedImage.querySelector('aside[aria-label="Partial staging selection gutter"]'),
     ).not.toBeNull();
