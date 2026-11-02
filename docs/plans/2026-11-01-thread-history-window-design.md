@@ -1,6 +1,6 @@
 # Thread History Window
 
-Status: Draft for approval, revision 2, 2026-11-01. Issue #226.
+Status: Draft for approval, revision 3, 2026-11-01. Issue #226.
 
 - Depends on #225, the 3G baseline and the byte-budget test.
 - Lands after #227, because it reuses #227's `filesTotal` checkpoint field.
@@ -8,9 +8,13 @@ Status: Draft for approval, revision 2, 2026-11-01. Issue #226.
 
 No code until this is approved.
 
-Revision 2 answers a Codex review of revision 1 (`9ec004e40`). The section
-[Review resolutions](#review-resolutions) at the end maps each finding to the
-change it caused.
+Revisions 2 and 3 answer two Codex reviews, of `9ec004e40` and `0ab5e0dc1`.
+The section [Review resolutions](#review-resolutions) at the end maps each
+finding to the change it caused.
+
+Revision 3 replaces several special cases with one rule. A row is in the
+window if it's recent by `K`, or it was written after the window opened, or
+it's still live. A row that's in the window always wins over any other copy.
 
 ## Problem
 
@@ -88,6 +92,17 @@ few turns.
     (`engine.rs:5791-5793`). A completed turn keeps its requests.
   - OpenCode asks recovered after a restart can have no turn id
     (`apps/server/src/provider/opencode/runtime.rs:3969`).
+- **Streaming rows keep their identity as they grow.** A delta appends to the
+  text and keeps `created_at` (`engine.rs:7570-7580` for messages,
+  `:7631-7636` for reasoning). Settlement is an `UPDATE … SET is_streaming = 0`
+  inside the projector transaction (`:7558`, `:7621`).
+- **Queue order is the admission sequence.** Queued messages sort by durable
+  admission sequence, not by timestamp (`repositories.rs:3391`).
+  `selectQueuedMessages` keeps array order (`apps/web/src/components/ChatView.logic.ts:645-648`),
+  and the head action requires `queuedMessages[0]` (`ChatView.tsx:5230-5237`).
+- **Status readers skip malformed rows.** They keep an older valid snapshot
+  instead (`apps/web/src/lib/contextWindow.ts:57-66`, tested at
+  `contextWindow.test.ts:145`; `McpStatusPopover.tsx:67-71`).
 - **Implementation turns name their source plan.** `projection_turns` records
   `source_proposed_plan_thread_id` and `source_proposed_plan_id`
   (`migrations.rs:1151-1152`).
@@ -166,114 +181,137 @@ provisional and are settled against #225 before implementation starts.
 
 | Kind | What | On the wire |
 | --- | --- | --- |
-| **History rows** | messages, activities, reasoning, proposed plans | windowed; older rows load in pages |
-| **Carried rows** | history rows below the window that current state needs (§4) | in `thread.history.carried`, whatever their age |
+| **History rows** | messages, activities, reasoning, proposed plans | windowed (§2); older rows load in pages |
+| **State rows** | immutable activities, and plans, that current state needs but the window may not hold (§4) | in `thread.history.carried`, used by state readers only |
 | **Turn index** | checkpoints | every checkpoint, but `files` only for turns in the window or a loaded page (§5) |
 
 Everything else on the thread is the fixed-size shell: title, session, latest
 turn, and so on.
 
-### 2. Order, the floor, and "written after"
+### 2. Order, the floor, and the window rule
 
 **The history key.** Every history row has
 `K = (createdAt, kindRank, id)`, with `kindRank` message=0, activity=1,
-reasoning=2, plan=3. `createdAt` is the order the timeline shows, so a window
+reasoning=2, plan=3. `createdAt` is the order the timeline shows, so a range
 cut by `K` is one contiguous slice of the timeline across all kinds.
 
-**Creation sequence.** A new column `created_sequence INTEGER NOT NULL
-DEFAULT 0` goes on the four history tables. The projector writes it on insert
-from the event being projected (`event.sequence`). The `ON CONFLICT … DO
-UPDATE` lists leave it out, so an in-place update keeps the original value.
+**Write sequence.** A new column `written_sequence INTEGER NOT NULL DEFAULT 0`
+goes on the four history tables. Every write sets it to the sequence of the
+event being projected (`event.sequence`). That covers the insert, every
+`ON CONFLICT … DO UPDATE`, a streaming delta, the settlement `UPDATE`s at
+`engine.rs:7558` and `:7621`, and delivery updates.
 
-This fixes three things a rowid can't:
+This fixes what a rowid can't:
 
 - It never repeats, because event sequences are `AUTOINCREMENT`
   (`migrations.rs:841`).
 - A rebuild replays the same sequences, so it's identical after a rebuild.
-- Existing rows get 0, which correctly means "older than any window".
+- Existing rows get 0, which correctly means "not written since any window
+  opened".
+
+A test asserts that every write path to these tables sets it.
 
 **History epoch.** A new column `history_epoch INTEGER NOT NULL DEFAULT 0`
 goes on `projection_threads`. The `thread.reverted` projection sets it to that
-event's `sequence`. It's also rebuild-stable. It changes exactly when the
-thread's rows were rewritten. A withdrawn queued message doesn't bump it: that
-message is always in the window or carried, so its removal is a normal patch.
+event's `sequence`, so it's also rebuild-stable. Reverts are the only deletions
+that can touch settled rows; a withdrawn message is always live (see below).
 
-**The window.** It's every history row at or above a floor, plus every row
-created after the window opened:
+**The window rule:**
 
 ```
-inWindow(row) = floor == ALL || K(row) >= floor.K || row.created_sequence > floor.openedAt
+inWindow(row) = floor == ALL
+             || K(row) >= floor.K                    // recent
+             || row.written_sequence > floor.openedAt // written since the window opened
+             || live(row)                             // can still change, or needs the user
 ```
+
+`live(row)` holds for:
+
+- a message or reasoning row with `is_streaming = 1`;
+- a message whose delivery is `queued`, `pending`, `sending`, `uncertain` or
+  `failed`.
 
 The floor is `{ K | ALL, openedAt, epoch }`:
 
-- `openedAt` is the snapshot's `snapshotSequence` when the window was chosen.
-- `epoch` is the thread's `history_epoch` at that moment.
-- `ALL` means the whole thread is in the window: an empty thread, or one that
-  fits the budget.
+- `openedAt` is the `snapshotSequence` when the window was chosen.
+- `epoch` is `history_epoch` at that moment.
+- `ALL` means the whole thread: an empty thread, or one that fits the budget.
 
-The floor is fixed for the life of a subscription, so rows only ever enter the
-window. Patches stay index-based, and nothing outside the window is sent as a
-removal. The `openedAt` term makes a row from a client whose clock is behind
-still join the window, even though its `createdAt` sorts below `floor.K`.
+**Rows only ever enter the window.** A row stops being live only through a
+write: a settlement, a delivery update, a dismissal or a withdrawal. That write
+sets `written_sequence > openedAt`, so the row stays in the window, unless the
+write deleted it, and then its removal is real. `K` and `openedAt` are fixed for
+the subscription. So patches stay index-based, nothing outside the window is
+sent as a removal, and:
+
+- **A message from a skewed client clock** joins the window through
+  `written_sequence`, though its `createdAt` sorts below `floor.K`.
+- **A streaming row that predates the floor** is in the window from the cold
+  open (`live`). Each delta keeps it there, and so does its settlement.
+- **A settled row that changes later** (a plan marked implemented, a dismissed
+  failure) moves into the window. The window's copy wins over any copy a page
+  loaded earlier, so loaded pages can't show a stale or deleted version.
 
 ### 3. Choosing the floor (server, at open)
 
-1. **Budget for rows.** Serialize the fixed parts first: the shell, the carried
-   rows (§4) and the turn index (§5), counting bytes with a counting
-   `io::Write`. The history-row budget is `HISTORY_OPEN_BYTES` minus that
-   total, floored at 0.
-2. **Walk newest first.** Walk the history rows newest first by `K`, counting
-   bytes and rows. At each **user message**, record a turn cut. Stop before the
-   next row would exceed the row-byte budget, `HISTORY_WINDOW_ROWS`, or
-   `HISTORY_WINDOW_TURNS` user messages.
+1. **Budget for rows.** Serialize the fixed parts first: the shell, live rows,
+   carried state rows (§4) and the turn index (§5), counting bytes with a
+   counting `io::Write`. The history-row budget is `HISTORY_OPEN_BYTES` minus
+   that total, floored at 0.
+2. **Walk newest first.** Walk the other history rows newest first by `K`,
+   counting bytes and rows. At each **user message**, record a turn cut. Stop
+   before the next row would exceed the row-byte budget,
+   `HISTORY_WINDOW_ROWS`, or `HISTORY_WINDOW_TURNS` user messages.
 3. **The newest row is always taken**, however large. This is the
    `ReplayBudget::Page` rule. A settled 3 MiB assistant message opens as a
    window of one row. Only a row over the transport's 64 MiB message limit
    fails, as it does today (`MAX_RECORDED_MESSAGE_BYTES`,
    `apps/server/src/rpc/transport.rs:58`).
 4. **Where the floor goes:**
-   - If the walk reaches the oldest row, or the thread has no history rows, the
+   - If the walk reaches the oldest row, or there are no history rows, the
      floor is `ALL` and `hasOlder` is false.
-   - Otherwise the floor is the oldest turn cut reached, so every turn is whole.
+   - Otherwise the floor is the oldest turn cut reached, so every turn is
+     whole.
    - If no turn cut was reached (one turn over budget, such as a 900-row tool
      run), the floor is the `K` of the oldest row taken. `latestTurn` timings
      keep that turn's duration right.
 5. **`olderRows`** is the number of history rows below the floor at open.
 
-The floor is never lowered for pinned rows. Rows the current state needs come
-through the carried set, so the budget holds.
+### 4. Carried state rows
 
-### 4. Carried rows
+Some current state comes from rows that never change and so never enter the
+window by the rule above. An open request is resolved by a *different*
+activity, and a status reader keeps an older valid row when the newer ones
+aren't valid.
 
-The carried rows are recomputed on every read from server state. A row is
-carried when it is **below the floor**, meaning not `inWindow`, **and** one of
-these holds:
+For these, the server sends **the rows the readers would select**, recomputed
+on every read and computed by the same selectors the readers use:
 
-- **Outstanding requests.** Every `*.requested` activity whose request is
-  still open:
+- **Open requests.** Every `*.requested` activity whose request is still open:
   - an approval whose `projection_pending_approvals` row is `pending`;
   - a user-input request in `open_user_input_requests_sql`.
 
   This covers any turn, a completed turn, and turnless recovered OpenCode
-  asks. It reuses the server's own open-request policy instead of copying the
-  client's matcher.
-- **Deliveries that need the user.** Messages whose delivery is `queued`,
-  `pending` or `sending`, plus the thread's newest `uncertain` or `failed`
-  message. That's the one `unresolved_delivery_state` names.
-- **Current status.** The newest `context-window.updated` activity, and the
-  newest MCP status activity (`mcp.status.updated`) per `providerInstanceId`.
-  Each is carried only when no newer row of the same key is in the window.
-  The kinds sit in one server list, `CARRIED_STATUS_KINDS`, and a parity test
-  pins it to the web readers.
-- **Plans.** The newest proposed plan, plus any plan named as
-  `source_proposed_plan_id` by a turn in state `running`. That's the
-  implementation-sidebar lookup.
+  asks. It's the server's own open-request policy.
+- **Effective status.**
+  - The row `deriveLatestContextWindowSnapshot` would return: the newest
+    `context-window.updated` with a valid `usedTokens`.
+  - Per `providerInstanceId`, the row `deriveMcpStatusSnapshot` would return:
+    the newest MCP status activity whose snapshot parses.
 
-Every rule is bounded, either by live work (open requests, in-flight
-deliveries, running implementation turns) or by one row per key. Carried rows
-sit in `thread.history.carried`, a small object that is replaced whole in a
-patch when it changes.
+  Rust ports of the two validity checks live next to the selector. One shared
+  fixture, `packages/contracts/fixtures/thread-stream/carried-status.json`,
+  lists valid and malformed payloads, including a malformed newest row over a
+  valid older one. The Rust test and the web reader tests both run against it,
+  so the two can't drift apart.
+- **Plans.** The newest proposed plan, plus any plan named as
+  `source_proposed_plan_id` by a turn in state `running`.
+
+A selected row is carried only when it isn't already in the window. Every rule
+is bounded: by open requests, by one row per status key, or by running
+implementation turns. `carried` holds `activities` and `proposedPlans` only.
+Messages and reasoning that matter to state are live, and so already in the
+window.
 
 ### 5. Turn index (checkpoints)
 
@@ -304,8 +342,7 @@ history: Schema.optional(Schema.Struct({
   floor: TrimmedNonEmptyString,   // opaque cursor: { v, k | null, openedAt, epoch }
   hasOlder: Schema.Boolean,
   olderRows: NonNegativeInt,      // rows below the floor at open
-  carried: Schema.Struct({
-    messages: Schema.Array(OrchestrationMessage),
+  carried: Schema.Struct({            // state rows selected as in §4; never shown in the timeline
     activities: Schema.Array(OrchestrationThreadActivity),
     proposedPlans: Schema.Array(OrchestrationProposedPlan),
   }),
@@ -330,13 +367,16 @@ output: {
 //   OrchestrationGetThreadHistoryPageError (malformed cursor, unknown thread, …)
 ```
 
-The page returns rows with `K < cursor.K` and `created_sequence <=
-cursor.openedAt`, newest first. It stops at `HISTORY_PAGE_ROWS` or
+The page returns rows with `K < cursor.K` that are not `inWindow` under the
+cursor's floor at the time of the page: `written_sequence <= cursor.openedAt`
+and not `live`. Rows come newest first. It stops at `HISTORY_PAGE_ROWS` or
 `HISTORY_PAGE_BYTES`, always keeping the first row. The next cursor is the `K`
 of the oldest row returned, with the same `openedAt` and `epoch`.
 
-Pages are disjoint from the window by construction. Carried rows can repeat,
-and the client dedupes them by id.
+So a page never holds a live row: no queued, in-flight or failed message, and
+no streaming row. A page row that is written later moves into the window, and
+the client lets the window's copy win (§8). A page can repeat a carried
+activity or plan; the client dedupes it by id.
 
 A page is served only if `cursor.epoch` equals the thread's `history_epoch`.
 That check is the durable fence for a revert the client missed.
@@ -384,17 +424,30 @@ the same either way.
   patches apply to by index.
 - **`older`** is session-only and never persisted:
   `{ rows, checkpointsByTurnId, cursor, olderRows, generation, inFlight: Deferred | null, status: idle | loading | error }`.
-- **Published `data`** is `window`, with three things added:
-  - history arrays = `dedupeById([...older.rows.X, ...window.history.carried.X, ...window.X])`;
-  - `checkpoints` = `window.checkpoints`, each replaced by
-    `older.checkpointsByTurnId[turnId]` when present;
-  - `history` = `{ ...window.history, hasOlder, loadedFrom }`, where
-    `loadedFrom` is the `K` of the oldest loaded row, or `ALL` once nothing is
-    older.
+- **Published `data`** is `window`, with these changes. Each history array is
+  keyed by id:
+  - **Precedence:** window, then carried, then older. A copy from a
+    lower-precedence source is dropped when a higher one holds the id. The
+    window's copy is the server's current version.
+  - **Order:** older rows in page order, oldest page first, then carried rows
+    the window doesn't hold, then the window array in **its server order**.
+
+    Every row whose order the server defines by something other than
+    `createdAt` is a live message: queued messages sort by admission sequence
+    (`repositories.rs:3391`). Live messages are always in the window, and
+    neither pages nor `carried` hold messages, so the queue's admission order
+    reaches `selectQueuedMessages` unchanged. The queue head stays the head.
+    Activities, reasoning and plans already carry their own order keys, and
+    their readers sort or scan from the newest.
+  - **Checkpoints:** `window.checkpoints`, each replaced by
+    `older.checkpointsByTurnId[turnId]` when present.
+  - **`history`:** `{ ...window.history, hasOlder, loadedFrom }`, where
+    `loadedFrom` is the `K` of the oldest page row, or the window floor's `K`
+    before any page loads, or `ALL` once nothing is older.
 
   So every state reader (approvals, user input, queue, MCP status, context
-  window, plans) reads one thread that includes the carried rows, with no
-  change. `shareUnchanged` keeps unchanged entries by identity.
+  window, plans) reads one thread with no change. `shareUnchanged` keeps
+  unchanged entries by identity.
 - **Persistence.** Only `window` is persisted.
 - **Resubscribe input.** `{ threadId, patches: true, history: { floor? }, resume? }`.
 - **`snapshot`.** Set `window`. If `history.floor` changed, or `history` is
@@ -421,12 +474,17 @@ the same either way.
 
 ### 9. Web
 
-- **Timeline lower bound.**
-  `deriveTimelineEntries(messages, plans, workEntries, loadedFrom)` drops
-  entries below `loadedFrom`, at `ChatView.tsx:2689`. Carried rows stay
-  available to state readers but appear in the timeline only once a page
-  reaches their place. Find in thread, the folds and the minimap read those
-  entries, so they agree.
+- **Carried rows stay out of the timeline.**
+  `deriveTimelineEntries(messages, plans, workEntries, loadedFrom)`, at
+  `ChatView.tsx:2689`, drops an entry below `loadedFrom` only when the window
+  doesn't hold it. That leaves out exactly the carried state rows until a page
+  reaches their place.
+
+  Window rows are always shown, including live or recently written rows whose
+  `createdAt` sorts below the floor. Such a row, a streaming reply or a
+  skewed-clock message, appears at the top of the loaded region, in
+  `createdAt` order, just under "Load earlier messages". Find in thread, the
+  folds and the minimap read these entries, so they agree.
 - **`MessagesTimeline`.**
   - When `hasOlder`, a first row `history-start` shows "Load earlier messages
     (N more)" as a button. While loading it reads "Loading earlier messages…".
@@ -467,8 +525,9 @@ big-thread sizes before code.
 something other than history length:
 
 - the newest row, when it's larger than the budget;
-- carried rows: live requests, in-flight deliveries, one status row per key,
-  the newest plan, and plans of running implementations;
+- live rows: streaming rows, plus in-flight and unresolved deliveries;
+- carried state rows: open requests, one status row per key, the newest plan,
+  and plans of running implementations;
 - the turn index, at about 200 bytes per turn. 1,000 turns is about 200 KiB.
 
 #225's byte-budget test gets a windowed thread-open entry on its large
@@ -481,7 +540,7 @@ fixture, and the PR lowers that budget.
 | old | old | today |
 | old (no `history`) | new | full thread, byte-identical to today |
 | new | old | server ignores `history`; full thread; no `history` field; the page RPC is never called |
-| new | new | window, carried rows and pages |
+| new | new | window, carried state rows and pages |
 
 - **Downgraded client.** An old client decodes a cached window as a thread,
   because `Struct` ignores the extra key. Its first snapshot is full and
@@ -495,13 +554,15 @@ fixture, and the PR lowers that budget.
 
 - **Server migration**, guarded like migration 044 for restored databases
   without projection tables:
-  - `created_sequence INTEGER NOT NULL DEFAULT 0` on
+  - `written_sequence INTEGER NOT NULL DEFAULT 0` on
     `projection_thread_messages`, `projection_thread_activities`,
     `projection_thread_reasoning` and `projection_thread_proposed_plans`;
   - `history_epoch INTEGER NOT NULL DEFAULT 0` on `projection_threads`.
 
   Page queries use the existing `(thread_id, created_at…)` indexes
-  (`migrations.rs:1038`, `:1134`, `:1927`, `:2609`).
+  (`migrations.rs:1038`, `:1134`, `:1927`, `:2609`). Live rows are found
+  through the existing streaming index (`:2612`) and the `delivery_state`
+  filter.
 - **Client.** The cache holds the window. Older pages are never written.
 
 ### 13. Profiler, crash and trace coverage
@@ -518,8 +579,8 @@ fixture, and the PR lowers that budget.
 ### 14. Living docs (same PR)
 
 - `docs/architecture/rpc-and-orchestration.md`, the snapshot section at about
-  `:2672-2700`: the window, `created_sequence`, `history_epoch`, carried rows,
-  the turn index and the page RPC.
+  `:2672-2700`: the window rule, `written_sequence`, `history_epoch`, carried
+  state rows, the turn index and the page RPC.
 - `docs/architecture/connection-runtime.md` (`:40-48`): a resumed client holds
   a window and sends its floor.
 - `docs/user/workspace-ui.md`, "Reading the timeline" (`:541`) and "Finding
@@ -544,23 +605,32 @@ fixture, and the PR lowers that budget.
 - `an_empty_thread_opens_with_the_all_floor_and_no_older_history`
 - `a_thread_under_budget_opens_whole_with_the_all_floor`
 
-**Carried rows:**
+**Live rows:**
+
+- `a_cold_open_includes_a_streaming_message_and_reasoning_row_that_predate_the_floor`
+- `a_streaming_row_below_the_floor_stays_in_the_window_through_deltas_and_settlement`
+- `live_rows_include_every_in_flight_and_unresolved_delivery`
+- `every_history_write_path_sets_written_sequence`
+
+**Carried state rows:**
 
 - `carried_rows_hold_every_open_request_below_the_floor`, including a
   completed turn's request and a turnless request.
 - `a_recovered_turnless_opencode_ask_below_the_floor_is_carried`: restart the
   engine, recover, and subscribe.
-- `carried_rows_hold_in_flight_and_unresolved_deliveries`
-- `carried_rows_hold_the_newest_mcp_status_per_instance_and_context_window`
+- `carried_status_is_the_newest_valid_row_when_a_newer_row_is_malformed`:
+  context window, and MCP status per instance.
+- `carried_status_selection_matches_the_shared_fixture`, against
+  `carried-status.json`.
 - `carried_rows_hold_the_newest_plan_and_the_source_plan_of_a_running_implementation`
-- `a_carried_row_leaves_the_carried_set_once_a_newer_row_is_in_the_window`
-- `carried_status_kinds_match_the_web_readers`: parity with a web fixture.
+- `a_carried_row_leaves_the_carried_set_once_the_window_holds_the_selected_row`
 
 **Pages:**
 
 - `history_pages_return_every_older_row_exactly_once_in_order`: the union of
   window and pages equals the full thread, and the last page ends with
   `cursor: null`.
+- `history_pages_never_return_a_live_row`
 - `history_page_respects_its_row_and_byte_caps`
 - `history_page_returns_full_checkpoints_for_its_turns`
 - `history_page_rejects_a_malformed_cursor`
@@ -572,7 +642,8 @@ fixture, and the PR lowers that budget.
 - `a_backdated_message_after_a_withdrawn_queued_message_joins_the_window`:
   withdraw the top-rowid queued message, then insert a backdated one. This is
   the case that broke rowids.
-- `created_sequence_survives_a_projection_rebuild`
+- `a_settled_row_below_the_floor_that_changes_moves_into_the_window`
+- `written_sequence_survives_a_projection_rebuild`
 - `windowed_resubscribe_at_the_current_revision_sends_unchanged`
 - `windowed_resubscribe_with_its_floor_keeps_the_floor_after_a_change`
 - `a_live_revert_rewindows_the_subscription`
@@ -602,8 +673,10 @@ fixture, and the PR lowers that budget.
 ### Contracts (`vp run check:contracts`)
 
 - New `fixtures/thread-stream/window.json`: subscribe with `history`, then a
-  windowed snapshot with carried rows, a patch, two pages, a stale-page
-  failure, and the merged result.
+  windowed snapshot with live and carried rows, a patch, two pages, a
+  stale-page failure, and the merged result.
+- New `fixtures/thread-stream/carried-status.json`: valid and malformed status
+  payloads, and the row each reader selects.
 - New `rpc-wire` contract shapes and a `manifest.json` entry for
   `orchestration.getThreadHistoryPage`, with both typed failures.
 - `rpcRustParity.test.ts` and `threadStreamParity.test.ts` pass. The latter
@@ -619,6 +692,13 @@ fixture, and the PR lowers that budget.
 - "loads two older pages in order before the window"
 - "applies a patch that arrives between two pages to the window only"
 - "sends exactly N-1 page requests to reach the start of an N-page thread"
+
+**Merge:**
+
+- "a window copy replaces the copy a page loaded"
+- "a withdrawn queued message disappears and no page resurrects it"
+- "keeps the admission order of queued messages when one is backdated below
+  the floor"
 
 **Stale and duplicate answers:**
 
@@ -652,10 +732,14 @@ when unchanged", `reconnectRetention.test.ts` and `threads-atoms.test.ts`.
   - "offers a retry when an older page fails"
 - `MessagesTimeline.logic.test.ts`: "labels the partial oldest turn Worked
   without a duration".
-- `session-logic.test.ts`: "deriveTimelineEntries leaves out rows below the
-  loaded history".
+- `session-logic.test.ts`:
+  - "deriveTimelineEntries leaves out carried rows below the loaded history"
+  - "deriveTimelineEntries keeps a window row that sorts below the floor"
 - `ChatView.logic.test.ts`: "a windowed thread with older history counts as
   having messages".
+- `lib/contextWindow.test.ts` and `McpStatusPopover` tests: run the readers on
+  `carried-status.json`. The existing "keeps the latest valid snapshot when a
+  newer usage activity is malformed" still passes.
 - `ChatComposer` tests: "shows the carried MCP status and context-window usage
   of a windowed thread".
 - `threadFind/useThreadFind.test.tsx`:
@@ -677,79 +761,102 @@ when unchanged", `reconnectRetention.test.ts` and `threads-atoms.test.ts`.
 
 ## Options considered
 
-1. **Recommended: a fixed-floor window with carried rows and a turn index, plus
-   a page RPC.** It reuses `patches`, `resume`, `HeldThread` and LegendList's
-   content-position upkeep. It adds two migration columns, one optional input
-   field, one optional thread field and one unary RPC.
+1. **Recommended: a fixed-floor window with the recent/written/live rule,
+   carried state rows and a turn index, plus a page RPC.** It reuses
+   `patches`, `resume`, `HeldThread` and LegendList's content-position upkeep.
+   It adds two migration columns, one optional input field, one optional
+   thread field and one unary RPC.
 2. **Lower the floor to include pinned rows** (revision 1). Rejected. The
    current MCP status or a completed turn's open request can be days old, so
-   the window would be unbounded. Carried rows bound it.
-3. **Rowid high-water marks** (revision 1). Rejected. Rowids are reused after a
-   delete and renumbered by a rebuild. `created_sequence` is neither.
-4. **Epoch alone, bumped on every delete, instead of `created_sequence`.**
-   Rejected. Withdrawing a queued message, a common action, would re-window and
-   drop the user's loaded pages. And an epoch derived from events can't detect
-   rowid renumbering.
-5. **A sliding window.** Rejected. It sends removals and invalidates index
+   the window would be unbounded.
+3. **Carry mutable rows such as messages, and reconcile their copies in pages**
+   (revision 2). Rejected. Deletes and updates of carried rows needed their own
+   reconciliation, and the merge could reverse queue order. Making those rows
+   live puts them in the window, whose copy and order are authoritative.
+4. **Sticky per-subscription id sets of carried rows.** Rejected. They're lost
+   on reconnect, and they're server memory per subscription.
+5. **Rowid high-water marks** (revision 1). Rejected. Rowids are reused after a
+   delete and renumbered by a rebuild.
+6. **Epoch alone, bumped on every delete.** Rejected. Withdrawing a queued
+   message would re-window and drop the user's loaded pages.
+7. **A sliding window.** Rejected. It sends removals and invalidates index
    patches and pages.
-6. **A window by `turn_id`.** Rejected. User messages are written with
+8. **A window by `turn_id`.** Rejected. User messages are written with
    `turnId: null` (`engine.rs:4897`), and boot activities have none either
    (`engine.rs:3059`).
-7. **Keep plans and checkpoints whole.** Rejected. 200 plans of 20 KiB, or
+9. **Keep plans and checkpoints whole.** Rejected. 200 plans of 20 KiB, or
    thousands of checkpoint file lists, would exceed the budget before any row.
-8. **Older history from `replayEvents`.** Rejected. Events are larger, and the
-   client would have to reduce them into rows.
-9. **Window only on the client.** Rejected. It saves no bytes.
-10. **Find searches the server.** Deferred. It needs a text index and an RPC.
-11. **Cache older pages.** Rejected. The cache would grow without bound, and
+10. **Older history from `replayEvents`, or a window only on the client.**
+    Rejected. Events are larger and need reducing, and a client-only window
+    saves no bytes.
+11. **Find searches the server.** Deferred. It needs a text index and an RPC.
+12. **Cache older pages.** Rejected. The cache would grow without bound, and
     reverts would invalidate it.
 
 ## Open questions for approval
 
 1. The budget numbers, once #225's baseline exists.
-2. Whether to do phase 2 (the floor pushed into SQL) in the same PR. Decide
-   from #225's server-time numbers.
+2. Whether to do phase 2 (the window rule pushed into SQL) in the same PR.
+   Decide from #225's server-time numbers.
 
 ## Residual risk
 
 - **A page landing during a key scroll.** A page that arrives while a key
   scroll's native scroll is pending (#207) can shift the view once.
-- **Stale rows in older pages.** A history row below the floor that changes in
-  place, other than carried rows, is stale in older pages until the floor
-  moves. Settled history is effectively append-only.
-- **A new state reader can drift.** A new web reader of "the newest activity of
-  kind X" must add X to `CARRIED_STATUS_KINDS`. The parity test catches the
-  known readers only.
+- **Rows can show out of place.** A live or recently written window row that
+  sorts below the floor shows at the top of the loaded region until pages
+  reach its place.
+- **A new state reader can drift.** A new web reader that selects "the newest
+  valid activity of kind X" needs a matching server selector and a fixture
+  case. The parity fixture covers the known readers only.
 
 ## Review resolutions
 
-1. **Rowid reuse after a withdrawn queued message, and rebuilds.** Accepted.
-   The rowid high-water marks are replaced by `created_sequence`, written from
-   the event sequence. It never repeats and a rebuild preserves it (§2). Tests:
-   `a_backdated_message_after_a_withdrawn_queued_message_joins_the_window` and
-   `created_sequence_survives_a_projection_rebuild`.
+### Round 1 (`9ec004e40`)
+
+1. **Rowid reuse and rebuilds.** Accepted. Rowid marks are replaced by a
+   sequence column written from the event sequence; revision 3 renames it
+   `written_sequence` and sets it on every write (§2). Tests: the backdated
+   message after a withdrawal, and survival across a rebuild.
 2. **Pin every outstanding request.** Accepted. The "requests expire with the
-   turn" premise was wrong (`engine.rs:5791-5793`). The carried set takes every
-   open request from server state, whatever its turn (§4). Tests: the two
+   turn" premise was wrong (`engine.rs:5791-5793`). Every open request is
+   carried from server state, whatever its turn (§4). Tests: the two
    carried-request tests, including OpenCode recovery.
-3. **A missed revert leaves deleted rows in pages.** Accepted. `history_epoch`,
-   set from the `thread.reverted` sequence, travels in the floor and in every
-   cursor. It's checked at open, on every re-read and by the page RPC. With the
-   client's `generation`, it fences responses in flight (§2, §6-§8). Tests: the
-   live, lag and disconnect revert tests, the stale-page test and the client
-   stale tests.
-4. **MCP status and context-window usage.** Accepted. Current-status rows are
-   carried, and state readers see them through the published thread (§4, §8).
-   Tests: the carried-status tests and the ChatComposer test.
-5. **Empty thread and an oversized first row.** Accepted. The `ALL` floor
-   covers an empty or fitting thread, and the newest row is always taken (§3).
-   Tests: the three window edge tests.
-6. **"Search all" can loop.** Accepted. `loadOlder` awaits the in-flight
-   request, `loadAllOlder` stops on failure, and an `ensuring` releases
-   `loading` (§8). Tests: the three `loadAllOlder` tests and the Find failure
-   test.
-7. **Plans and checkpoints are unbounded.** Accepted. Plans are windowed, with
-   the newest and running-source plans carried. Checkpoints become a turn
-   index with file lists only for the window and loaded pages. The budget now
-   covers the whole first payload (§1, §5, §10). Tests: the over-budget test
-   asserts the whole thread value, plus the page-checkpoint test.
+3. **A missed revert.** Accepted. `history_epoch` travels in the floor and
+   every cursor. It's checked at open, on every re-read and by the page RPC,
+   and fences pages in flight together with `generation` (§2, §6-§8). Tests:
+   the live, lag and disconnect revert tests and the stale-page tests.
+4. **MCP status and context-window usage.** Accepted, and completed in round
+   2, item 4.
+5. **Empty thread and an oversized first row.** Accepted. The `ALL` floor, and
+   the newest row is always taken (§3).
+6. **"Search all" can loop.** Accepted. `loadOlder` awaits the request in
+   flight, `loadAllOlder` stops on failure, and `ensuring` releases `loading`
+   (§8).
+7. **Plans and checkpoints unbounded.** Accepted. Plans are windowed,
+   checkpoints are a turn index, and the budget covers the whole first payload
+   (§1, §5, §10).
+
+### Round 2 (`0ab5e0dc1`)
+
+1. **Withdrawn or changed carried rows resurrected from pages.** Accepted.
+   Messages are no longer carried: queued, in-flight and failed deliveries are
+   `live`, so they sit in the window. Pages never return live rows, any write
+   moves a row into the window, and the window's copy wins (§2, §6, §8).
+   Tests: `history_pages_never_return_a_live_row`, "a withdrawn queued message
+   disappears and no page resurrects it", and "a window copy replaces the copy
+   a page loaded".
+2. **The merge could reverse queue order.** Accepted. Every row whose order
+   isn't `createdAt` is a live message, so it's in the window. The merge keeps
+   the window array in server order and never adds messages from carried rows
+   or pages ahead of it (§8). Test: "keeps the admission order of queued
+   messages when one is backdated below the floor".
+3. **Streaming rows that predate the window.** Accepted. Streaming messages
+   and reasoning are `live`. Deltas and settlement set `written_sequence`, so
+   they stay in the window, and the timeline always shows window rows (§2,
+   §9). Tests: the cold-open and through-settlement tests.
+4. **Carry the effective status.** Accepted. The server carries the row each
+   reader would select: the newest *valid* one. A shared
+   `carried-status.json` fixture runs against both the Rust selector and the
+   web readers (§4). Tests: the malformed-newest test, the fixture parity
+   tests, and the existing `contextWindow.test.ts` case.
