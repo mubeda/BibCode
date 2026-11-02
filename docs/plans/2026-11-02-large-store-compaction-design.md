@@ -1,13 +1,16 @@
 # Large-Store Compaction
 
-Status: Proposed 2026-11-02. Design for issue 262, verified against PR #248
-(`origin/v015/230-storage-compact` at `4923e9be2`) merged onto `main` at
-`fd98b4330`. It builds on the approved
+Status: Proposed 2026-11-02. Revised for Codex review round 2 (see "Review
+findings and resolutions" at the end). Design for issue 262, verified against
+PR #248 (`origin/v015/230-storage-compact` at `4923e9be2`) merged onto `main`
+at `fd98b4330`. It builds on the approved
 [storage compaction design](2026-11-01-storage-compaction-design.md) (called
 "the #230 design" below) and lifts its D5 scope-down. It changes what a backup
-inventory verifies, when a manifest's `created_at` is taken, the backup and
-restore deadlines, and the restore failure cleanup. No persisted shape
-changes.
+inventory verifies and what retention must verify before it deletes, when a
+manifest's `created_at` is taken, the backup and restore deadlines, the
+restore failure cleanup, how the recovery journal is published, and how an
+interrupted journaled restore is completed. The only persisted shape that
+changes is the transient recovery journal (O7).
 
 ## Problem
 
@@ -145,10 +148,10 @@ replaces it.
 
 Split `verify_generation` into two levels:
 
-| Level        | Checks                                                                                                                                                                                                                                                                                                        | Used by                                                                                                      |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `Structural` | Everything that does not grow with the file: boundary and identity, exact entries, single links, manifest decode, ID and location, canonical UTC `created_at` and its skew, checksum syntax, `database_size_bytes` equal to the file's metadata length, and the manifest's ledger version (a few pages read). | Inventory (`inspect`, the desktop's list, retention) and the two re-checks before deleting a generation.     |
-| `Content`    | `Structural`, plus the SHA-256 of the file and `quick_check`.                                                                                                                                                                                                                                                 | The reload verification right after publication, and restore's lookup of the selected generation (as today). |
+| Level        | Checks                                                                                                                                                                                                                                                                                                        | Used by                                                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Structural` | Everything that does not grow with the file: boundary and identity, exact entries, single links, manifest decode, ID and location, canonical UTC `created_at` and its skew, checksum syntax, `database_size_bytes` equal to the file's metadata length, and the manifest's ledger version (a few pages read). | Inventory (`inspect`, the desktop's list, the candidate list retention starts from) and the two identity re-checks immediately before a file is removed. |
+| `Content`    | `Structural`, plus the SHA-256 of the file and `quick_check`.                                                                                                                                                                                                                                                 | The reload verification right after publication, retention's replacements (below), and restore's lookup of the selected generation (as today).           |
 
 Restore keeps verifying the content of the generation it installs twice: the
 selected generation before the copy, and the staged copy against the manifest
@@ -158,17 +161,42 @@ after publication is therefore still never installed. What changes:
 - A generation whose bytes rot after publication, at the same length, is
   listed until it is selected. Its restore then fails before any live file is
   touched (`recovery_restore_rejects_a_tampered_manifest_without_mutating_the_live_store`
-  pins this), and the user picks an older one. Retention may count it among
-  the newest three. Tampering through the filesystem is still caught by the
-  identity, link and location checks, and replacement by the size, mtime and
-  ledger checks.
+  pins this), and the user picks an older one. Retention never counts it as a
+  replacement (below). Tampering through the filesystem is still caught by
+  the identity, link and location checks, and replacement by the size, mtime
+  and ledger checks.
 - Inventory cost no longer grows with backup size, so the 30 s inventory
   deadline stays and the desktop's WSL inspection keeps its 30 s timeout.
-- Creation reads about 5 `N` instead of 17 `N`. The pre-update and
-  pre-migration budgets do not change, but stores up to about three times
-  larger now fit in them.
-- Deleting an expired generation no longer reads it. The identity checks that
-  make deletion safe are unchanged.
+- Creation reads about 5 `N`, plus at most two more generations' content when
+  retention has something to delete, instead of 17 `N`. The pre-update and
+  pre-migration budgets do not change, but larger stores now fit in them.
+- An expired generation is not read before it is deleted: what justifies the
+  deletion is its replacements' content, not its own. The identity checks that
+  make the removal itself safe are unchanged.
+
+**Retention deletes only behind content-verified replacements.** A
+structurally listed generation is a deletion candidate, never a justification.
+`apply_retention` walks the structural list newest first (by publication
+time, as today) and `Content`-verifies each generation until it has
+`RETAINED_GENERATIONS` that pass. The generation just published counts without
+a second read: its reload verification in the same call was `Content`, and the
+walk re-checks its identity. A generation that fails `Content` verification is
+skipped, kept and logged as today's issues are. Only the generations older than
+the third passing one are deleted. #230 D6's rule is unchanged: a new
+`pre-compact` generation, `Content`-verified at its publication, replaces the
+older `pre-compact` ones.
+
+The walk runs under the creation's remaining deadline and token. If either
+ends before three replacements pass, retention deletes nothing in this call,
+logs `tracing::warn!`, and the creation still succeeds, because the new
+generation is already published and verified. So a pre-update backup with its
+`FIXED` 30 s beside a large pre-compact generation in the newest three keeps
+an extra generation instead of failing. That lasts until three newer
+generations exist; then the large one is no longer needed as a replacement,
+and is deleted without being read. Today's behavior is the same where it
+matters: content failures never justify a deletion, and the issue's example (a
+good A, then B and C corrupted at the same length, then D from an empty but
+valid store, the review's example) keeps A (test 18).
 
 Alternatives:
 
@@ -191,30 +219,39 @@ content is read. The lookup's directory scan and the lock wait keep
 work as a `Content`-verified creation (copy, `quick_check`, hash, reload hash
 and `quick_check`), so one budget function serves both (O5).
 
-A restore that fails before its journal is written now removes what it
+A restore that fails before its journal is published (O7) now removes what it
 created. It removes the staged `state.sqlite` and `environment-id` by name,
-after the same identity checks it used to create them, then the staging
-directory and its still-empty preserved directory, with `remove_dir` (never
-recursive). That covers a deadline, Ctrl-C, disk full and any I/O error. A
-crash or kill in the same window leaves the staging entry behind, so the next
-`restore` or `start-empty`, under both locks, clears a
-`.<uuid>.recovery-staging` entry when no recovery journal exists and the entry
-holds nothing but those two plain files. Any other content, or a journal, keeps
-today's `RecoveryInProgress` refusal. This is safe because the journal is
-written and synced before the first live file moves, and the staging entry is
-removed before the journal, so "staging without journal" always means the live
-store was never touched.
+after the same identity checks it used to create them, an owned temporary
+journal (O7), then the staging directory and its still-empty preserved
+directory, with `remove_dir` (never recursive). That covers a deadline,
+Ctrl-C, disk full and any I/O error. A crash or kill in the same window leaves
+the staging entry behind, so the next `restore` or `start-empty`, under both
+locks, clears a `.<uuid>.recovery-staging` entry and its temporary journal
+when no published recovery journal exists and the entry holds nothing but
+those two plain files. Any other content keeps today's `RecoveryInProgress`
+refusal; a published journal is completed by O7. This is safe because the
+journal is published (renamed into place and synced) before the first live
+file moves, and the staging entry is removed before the journal, so "staging
+without a published journal" always means the live store was never touched.
 
 The CLI gets Ctrl-C: `restore_backup` takes the caller's
 `CancellationToken`. The CLI cancels it from `termination_signal()`; the
 desktop passes a fresh token. Cancellation is honored until the journal is
-written (`backup.rs:1230`). After that, restore only renames and finishes.
+published. After that, the commit (renames and directory syncs) is neither
+cancellable nor bounded by the deadline, because stopping it half-way is
+worse than finishing it.
 
 For WSL, the desktop's restore timeout becomes
 `budget(sizeBytes) + RECOVERY_TIMEOUT + 30 s`, using the selected backup's
-`sizeBytes` from the validation inspection, so the server's own deadline and
-cleanup always run before the desktop kills the process. Inspection and
-start-empty keep 30 s.
+`sizeBytes` from the validation inspection. That makes the server's own
+deadline and cleanup fire first in the normal case, but it is a watchdog, not
+a guarantee: the commit's syncs are unbounded, so the desktop can still kill
+the process after the journal is published, and the server binary inside WSL
+may outlive `wsl.exe` or not. Both cases are recovered by O7: if the restore
+is still running, the next start waits on its locks and then finds no
+journal; if it was killed, the next start completes it. The desktop reports
+"WSL recovery timed out" and then shows the status the next inspection finds.
+Inspection and start-empty keep 30 s.
 
 **Adopted.**
 
@@ -291,23 +328,88 @@ the limit for a 7.0 GB store, so the database was not changed. Check that the
 disk is not busy or failing, then retry." Restore's equivalent ends "…so the
 current database was not changed."
 
+### O7. Atomic journal publication, and completing an interrupted commit
+
+**Publication.** Restore and start-empty create the journal at its final path,
+then write and sync it (`backup.rs:1243-1250`, `:1380`). Disk full or an I/O
+error in either step leaves a partial journal at that path. Startup then
+refuses with `RecoveryIncomplete`, restore and start-empty refuse with
+`RecoveryInProgress`, and O4 cannot clear it, because a journal means the
+commit may have started. The journal is instead published atomically:
+
+1. create `<journal>.<operation-id>.tmp` beside it with `private_create_new`;
+2. write it and `sync_all` it;
+3. confirm the journal path is absent (both locks are held, so nothing else
+   writes it) and `rename` the temporary file onto it;
+4. sync the data-root directory.
+
+Any error in steps 1 to 4 removes the owned temporary file (after an identity
+check) and runs O4's cleanup; the live store has not been touched. A crash in
+the same window leaves at most a temporary file beside a staging entry, which
+O4's rule clears. Startup never reads a temporary journal.
+
+**Completion.** After publication the commit renames the live files into the
+preserved directory, the staged files into place, and removes the staging
+entry and then the journal. A kill or crash anywhere in it, including the
+desktop's WSL watchdog, leaves the journal. Today nothing reads it, and the
+data root stays `RecoveryIncomplete` until a person intervenes. The journal now
+drives a roll-forward:
+
+- The journal gains `version: 2` and, for a restore, the file identities of
+  the staged `state.sqlite` and `environment-id`. The preserved and staging
+  directories are already named from its `operationId`.
+- `complete_interrupted_recovery(paths)` runs under the storage-operation lock
+  at startup (`store.rs:134` already takes it before the journal check), and
+  under both locks at the start of `restore` and `start-empty`. Every
+  started server and `bibcode` process either completes or refuses before it
+  opens SQLite, and a restore still running holds the exclusive runtime lock,
+  so it cannot be completed by someone else.
+- It preserves every live `state.sqlite`, `-wal`, `-shm` and `environment-id`
+  whose identity is not a staged one into the preserved directory (refusing if
+  that name is already taken there), moves any staged file still in staging
+  into place, syncs the state directory, removes the empty staging directory,
+  removes the journal and syncs the data root. Each step is a rename decided
+  from the files, so an interruption of the completion is completed the same
+  way next time. A start-empty journal only finishes preserving.
+- It refuses, leaving every file as it is and `RecoveryIncomplete` as today,
+  when the journal is not version 2, does not parse, names another state kind,
+  or the files match none of the states above: an unexpected entry in staging,
+  a live file that is neither old nor staged in an impossible combination, or
+  a staged file whose identity differs.
+
+Roll-forward rather than rollback: the staged copy was `Content`-verified and
+synced before the journal was published, so finishing is always possible, and
+it is what the user chose. A rollback would run the same renames in reverse
+and leave a long restore to be redone.
+
+`restore` and `start-empty` called while a journal exists first complete it,
+then run as asked; the completed result is preserved like any live store, so
+nothing is lost. The existing
+`restore_failure_after_preservation_keeps_the_journal_and_recoverable_live_files`
+keeps its assertions up to the failure; its last assertion, that startup then
+refuses, becomes "startup completes the restore" (test 21). That is the
+intended behavior change of this option.
+
+**Adopted.**
+
 ## Data safety on every path
 
 Compaction steps 1 to 7 and 9 to 12 are unchanged from #230 D9.
 
-| Path                                                 | State left                                                                                                                                                       | Reported                                                                                    |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Pre-compact backup fails or hits its deadline        | Live store as found (the copy only reads). Staging removed. No generation.                                                                                       | `CompactFailed { phase: "backup", backupId: null }` with the cause.                         |
-| Ctrl-C during the backup                             | Same. The token stops the copy, hash or `quick_check` within one step.                                                                                           | `Cancelled { backupId: null }`: "the database was not changed".                             |
-| Disk full during the backup                          | The online backup or a write fails; same as a failure. The free-space precheck (#230 D7) makes this rare.                                                        | The `SQLITE_FULL` or I/O error in the message.                                              |
-| Crash or kill during the backup                      | Live store intact: the maintenance connection has written nothing before the backup (#230 D3 step 4). A `.<id>.staging` entry stays and is ignored by inventory. | Next run works. The orphan is disk space only (Follow-ups).                                 |
-| Failure after publication (reload, retention)        | Unchanged from #230: the published generation is kept.                                                                                                           | As today.                                                                                   |
-| Restore fails, deadline or Ctrl-C before the journal | Live store untouched. Staging and empty preserved directory removed. The store starts as before.                                                                 | The cause, or `Cancelled`.                                                                  |
-| Disk full during the restore copy                    | Same as a failure before the journal. After the journal, restore only renames on one volume, so it needs no space.                                               | As above.                                                                                   |
-| Crash or kill before the restore journal             | Staging entry left. The next `restore` or `start-empty` clears it (O4).                                                                                          | Startup reports `RecoveryIncomplete` until then, which opens the desktop's recovery dialog. |
-| Crash or kill after the restore journal              | Unchanged: the journal blocks startup and the live files are preserved in `recovery/`.                                                                           | As today.                                                                                   |
-| Desktop kills a WSL restore                          | Prevented by the scaled timeout. An older desktop driving a newer WSL binary still kills at 30 s; that is the pre-journal crash row.                             | "WSL recovery timed out."                                                                   |
-| A listed backup rotted after publication             | Restore refuses it before touching the live store (O3).                                                                                                          | "The selected backup exists but failed verification."                                       |
+| Path                                                                       | State left                                                                                                                                                                                     | Reported                                                                                    |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Pre-compact backup fails or hits its deadline                              | Live store as found (the copy only reads). Staging removed. No generation.                                                                                                                     | `CompactFailed { phase: "backup", backupId: null }` with the cause.                         |
+| Ctrl-C during the backup                                                   | Same. The token stops the copy, hash or `quick_check` within one step.                                                                                                                         | `Cancelled { backupId: null }`: "the database was not changed".                             |
+| Disk full during the backup                                                | The online backup or a write fails; same as a failure. The free-space precheck (#230 D7) makes this rare.                                                                                      | The `SQLITE_FULL` or I/O error in the message.                                              |
+| Crash or kill during the backup                                            | Live store intact: the maintenance connection has written nothing before the backup (#230 D3 step 4). A `.<id>.staging` entry stays and is ignored by inventory.                               | Next run works. The orphan is disk space only (Follow-ups).                                 |
+| Failure after publication (reload)                                         | Unchanged from #230: the published generation is kept.                                                                                                                                         | As today.                                                                                   |
+| Retention runs out of time, is cancelled, or finds corrupt replacements    | Nothing is deleted in this call; the new generation stays published. A corrupt generation is never a replacement (O3).                                                                         | A `tracing::warn!`; the creation succeeds.                                                  |
+| Restore fails, deadline or Ctrl-C before the journal is published          | Live store untouched. Staging, temporary journal and empty preserved directory removed. The store starts as before.                                                                            | The cause, or `Cancelled`.                                                                  |
+| Disk full during the restore copy, or while writing or syncing the journal | Same as the row above (O7: the journal is published by rename only after its sync). After publication, restore only renames on one volume, so it needs no space.                               | As above.                                                                                   |
+| Crash or kill before the journal is published                              | Staging entry, and at most a temporary journal, left. The next `restore` or `start-empty` clears them (O4).                                                                                    | Startup reports `RecoveryIncomplete` until then, which opens the desktop's recovery dialog. |
+| Crash or kill during the commit, or an error in it                         | The journal stays. The next start, `restore` or `start-empty` completes the restore (O7); every old live file ends in `recovery/`.                                                             | Nothing if completion succeeds; `RecoveryIncomplete` if the files match no known state.     |
+| Desktop's WSL watchdog fires                                               | Usually the server's own deadline fires first. If the kill lands during the commit, it is the row above. If the process survives `wsl.exe`, it finishes and the next start waits on its locks. | "WSL recovery timed out", then the status the next inspection finds.                        |
+| A listed backup rotted after publication                                   | Restore refuses it before touching the live store (O3).                                                                                                                                        | "The selected backup exists but failed verification."                                       |
 
 ## Tests
 
@@ -364,9 +466,10 @@ Unit, `persistence/backup.rs`:
    fails with `RecoveryIncomplete`.
 9. `restore_clears_an_abandoned_staging_entry_without_a_journal`: three roots.
    A `.<uuid>.recovery-staging` with only `state.sqlite` and `environment-id`:
-   restore succeeds and the entry is gone. The same with an extra file:
-   `RecoveryInProgress` and the entry untouched. A staging entry with a recovery
-   journal: `RecoveryInProgress`, unchanged from today.
+   restore succeeds and the entry is gone. The same plus a temporary journal
+   (O7): both are cleared and restore succeeds. The same with an extra file:
+   `RecoveryInProgress` and the entry untouched. (A staging entry beside a
+   published journal is completed instead; tests 21 and 22.)
 10. `restore_cancelled_before_the_journal_changes_nothing`: the token is
     cancelled during `PauseAfterLookup`. `Cancelled`, and the assertions of
     test 8.
@@ -407,13 +510,81 @@ Desktop, `apps/desktop/src-tauri/src/data_safety.rs`:
 
 16. `wsl_restore_timeout_covers_the_server_restore_budget`: restore of a
     0-byte and an 8 GiB backup gets `LARGE_STORE.for_bytes(size) +
-    RECOVERY_TIMEOUT + 30 s`; inspect and start-empty keep 30 s.
+    RECOVERY_TIMEOUT + 30 s`; inspect and start-empty keep 30 s. This only
+    pins the arithmetic; what happens when the watchdog kills a restore is
+    tested by 21 and 24.
 
 CLI, `apps/server/src/lib.rs`:
 
 17. `long_operation_lines_name_the_size_and_limit`: the backup and elapsed
     lines and the compact and restore deadline messages, for 0 bytes, 7 GiB
     and a limit under one minute ("30 seconds").
+
+Retention (round 2, P1), `persistence_backup.rs` unless noted:
+
+18. `retention_keeps_the_last_good_generation_behind_corrupt_replacements`:
+    the review's scenario. A is a pre-update generation of a store with
+    projects. B and C are later generations of the same store, then corrupted
+    at the same length: B by overwriting bytes inside a table b-tree page with
+    its manifest left stale (hash mismatch), C the same with its manifest's
+    `sha256` refreshed (hash passes, `quick_check` fails). The live store's
+    projects are then deleted, and D is published from that empty but valid
+    store. After D: A, B, C and D all remain; `restore_backup` of A brings the
+    projects back. Control: with B and C healthy, D's publication deletes A,
+    as today. This passes today and fails under round 1's structural
+    retention; it guards O3.
+19. `retention_defers_instead_of_failing_beside_a_large_replacement`
+    (**Unix only**, `backup.rs`): three small generations, then a sparse large
+    pre-compact generation, then a pre-update backup with the `FIXED` budget.
+    The backup publishes and is returned, nothing is deleted, and a warning is
+    logged. After three more small backups the large generation and the older
+    small ones are deleted, and the large one's content is never read
+    (`set_len` leaves its stale hash, so a read would fail verification and
+    keep it). Before the change the creation fails with `DeadlineElapsed`.
+
+Journal publication and commit completion (round 2, P2s), `backup.rs` unless
+noted:
+
+20. `a_journal_write_or_sync_failure_leaves_no_journal_and_a_startable_store`:
+    `RecoveryFault::JournalWrite` and `RecoveryFault::JournalSync`, each
+    returning `io::ErrorKind::StorageFull` (ENOSPC) from inside the step, for
+    restore and for start-empty. Error; no journal, no temporary journal, no
+    staging entry; live database, marker and listing unchanged;
+    `prepare_store` succeeds. Before the change a partial journal stays and
+    startup fails with `RecoveryIncomplete`.
+21. `startup_completes_a_restore_interrupted_at_every_commit_step`: the live
+    store is the crash-left WAL fixture with `-shm` and different rows from the
+    backup. `RecoveryFault::CrashAt(step)` returns at once without any cleanup,
+    as a kill would, at each of: after publishing the journal, after preserving
+    the database, `-wal`, `-shm` and the marker in turn, after moving the
+    staged database, after moving the staged marker, and after removing the
+    staging directory. Then `prepare_store` succeeds; the database's SHA-256
+    equals the manifest's; the marker holds the backup's storage ID; no old
+    `-wal` or `-shm` sits beside it; the preserved directory holds every
+    original live file byte-identical; no journal or staging entry remains; and
+    the rows equal the backup's. A second crash injected during the completion
+    itself is completed by the next `prepare_store`. Runs again with
+    `bibcode storage restore` of another backup as the next command: it
+    completes the interrupted restore, preserves that result, and installs the
+    requested backup. This replaces the last assertion of
+    `restore_failure_after_preservation_keeps_the_journal_and_recoverable_live_files`.
+22. `startup_refuses_a_journal_it_cannot_complete`: a version-1 journal (as
+    written today), a journal for the other state kind, an extra entry in
+    staging, and a staged database whose identity differs from the journal's.
+    Each gives `RecoveryIncomplete` and leaves every file byte-identical and in
+    place.
+23. `startup_completes_an_interrupted_start_empty`: a crash after preserving
+    the database only. `prepare_store` finishes preserving the WAL, `-shm` and
+    marker, removes the journal, and starts a first-run store.
+24. `a_killed_restore_process_is_completed_by_the_next_start`
+    (**Unix only**, `apps/server/tests/cli_smoke.rs`): spawns the debug
+    `bibcode storage restore` with `BIBCODE_TEST_PAUSE_RECOVERY=<step>`, a hook
+    compiled only under `debug_assertions` that blocks at that commit step;
+    sends `SIGKILL` once a marker file says it is paused; then
+    `bibcode storage inspect` reports `recovery-incomplete`, and
+    `ServerRuntime::start` completes the restore with test 21's assertions.
+    Run for the journal-published and database-moved steps. This is the
+    watchdog kill with a real process instead of a returned error.
 
 Unchanged and must pass: every test the #230 design lists under item 25;
 `recovery_lookup_verifies_only_the_selected_generation`;
@@ -425,8 +596,10 @@ and the inventory trust tests in `persistence_backup.rs` (all structural, so
 still issues). The callers of `restore_backup` in tests and the desktop add the
 token argument; nothing else in them changes.
 
-Not tested: real `SIGINT` delivery (the token paths are tested by 5, 10 and 12) and a real full disk (a write error takes the same path as the injected
-faults in 4 and 8).
+Not tested: real `SIGINT` delivery (the token paths are tested by 5, 10 and
+12), a real full disk (an injected `StorageFull` error takes the same path, 4,
+8 and 20), power loss between a rename and its directory sync, and a real
+WSL watchdog kill on Windows (24 kills a real process on Unix).
 
 Gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --
 -D warnings`, `cargo test --workspace`, `vp check`, `vp run typecheck`.
@@ -452,9 +625,12 @@ for creation or restore, times three, exceeds it; then it is raised to that.
   backup was published. `docs/skills/bibcode-profiler/references/events.md`
   and the overview's Profiler section say both. Restore has no profiler event
   today and gets none here.
-- **Tracing.** `tracing::warn!` when staging cleanup leaves content behind;
-  `tracing::info!` when restore clears an abandoned staging entry. Both name
-  no path beyond the entry name, as `apply_retention` already logs.
+- **Tracing.** `tracing::warn!` when staging cleanup leaves content behind,
+  when retention defers, and when startup refuses a journal it cannot
+  complete; `tracing::info!` when restore clears an abandoned staging entry and
+  when startup completes an interrupted restore or start-empty. They name no
+  path beyond the entry or operation ID, as `apply_retention` already logs.
+  Startup completion runs inside the server, where the subscriber exists.
 - **Not applicable:** child processes, RPC methods and `is_long_running`,
   worktree removal, binaries and re-exec modes, shutdown ordering.
 
@@ -471,11 +647,18 @@ for creation or restore, times three, exceeds it; then it is raised to that.
 - `persistence/backup.rs`: `StoreIoBudget`; `created_at` in
   `finish_and_publish_backup`; remove the skew assertion; a verification level
   on `verify_generation` (`Structural` in `inventory_blocking` and
-  `delete_verified_generation_inner`; `Content` for reload and restore lookup);
-  `create_verified_backup_with`; staging cleanup on failure in creation and
-  restore; the abandoned-staging rule in `ensure_no_recovery_in_progress`
-  callers for restore and start-empty; restore's size-scaled deadline and
-  `CancellationToken` parameter; the test seams named in Tests.
+  `delete_verified_generation_inner`; `Content` for reload, retention's
+  replacements and restore lookup); the newest-first replacement walk and
+  deferral in `apply_retention`; `create_verified_backup_with`; staging
+  cleanup on failure in creation and restore; the abandoned-staging rule in
+  `ensure_no_recovery_in_progress` callers for restore and start-empty;
+  restore's size-scaled deadline and `CancellationToken` parameter; atomic
+  journal publication for restore and start-empty; the version-2 journal and
+  `complete_interrupted_recovery`; the test seams named in Tests.
+- `persistence/store.rs`: startup calls `complete_interrupted_recovery` under
+  its storage-operation guard before the journal check.
+- `main.rs` or `lib.rs`: the `debug_assertions`-only
+  `BIBCODE_TEST_PAUSE_RECOVERY` hook for test 24.
 - `persistence/compaction.rs`: `create_verified_backup_with` with the
   caller's token and `LARGE_STORE`; the new hooks; the deadline message;
   `backupBudgetMs`.
@@ -493,39 +676,57 @@ for creation or restore, times three, exceeds it; then it is raised to that.
   touches the current database.
 - `docs/architecture/overview.md`: the backup paragraph (`created_at` at
   publication, `Structural` listing and deletion, the size-scaled budgets,
-  staging cleanup) and the offline recovery paragraph (restore deadline,
-  Ctrl-C, abandoned staging).
+  staging cleanup, retention behind content-verified replacements) and the
+  offline recovery paragraph (restore deadline, Ctrl-C, abandoned staging,
+  atomic journal, roll-forward at startup; "A crash or cancellation after
+  preservation therefore leaves … an explicit incomplete operation" becomes
+  "…is completed by the next start").
+- `docs/guides/project-data-recovery.md` also says that an interrupted restore
+  finishes on the next start, and what `RecoveryIncomplete` means when it
+  cannot.
 - `docs/skills/bibcode-profiler/references/events.md`: `backupBudgetMs`.
 - `docs/testing/`: reviewed. No runbook covers storage CLI commands; they
   remain accurate unless the implementation adds a native validation step.
 
 ## Recommendation
 
-Implement O2, O3, O4, O5 and the phase-line form of O6 together, as one
+Implement O2, O3, O4, O5, O7 and the phase-line form of O6 together, as one
 change. O3 is the precondition: without it a large pre-compact generation
 breaks inspection, the desktop's list and every later pre-update and
-pre-migration backup. O2 removes the skew conflict without weakening the skew
-check. O4 and O5 give creation and restore one size-scaled deadline, with
-Ctrl-C and cleanup on every failure before the point of no return. Reject O1
-and percentage progress.
+pre-migration backup, and its retention rule keeps today's guarantee that
+only content-verified generations justify a deletion. O2 removes the skew
+conflict without weakening the skew check. O4 and O5 give creation and restore
+one size-scaled deadline, with Ctrl-C and cleanup on every failure before the
+journal. O7 makes the journal's publication atomic and its commit completable,
+which a long restore under a watchdog needs. Reject O1 and percentage
+progress.
 
 This meets the three acceptance criteria (tests 13, 14 and 15 with 6). It adds
-one struct, one verification level, one creation entry point and two cleanup
-rules, and changes no persisted shape, contract or server-path budget.
+one struct, one verification level, one creation entry point, two cleanup
+rules and journal completion. It changes only the transient journal's shape,
+no contract and no server-path budget.
 
 ## Risks
 
 - `per_gib` is a placeholder until the measurement. Too small refuses a slow
   disk (safely); too large only delays reporting a stuck one, which Ctrl-C
   ends.
-- Rot after publication is found at restore time and may take one of the
-  three retention slots (O3).
+- Rot after publication is found at restore time. It never justifies a
+  deletion, but it can keep an extra generation on disk (O3).
+- Retention beside a large replacement defers deletion, so up to two extra
+  generations can stay until three newer ones exist (O3, test 19).
+- Startup now renames files when it completes an interrupted restore (O7). It
+  does so only for a version-2 journal whose files match a known state, under
+  the storage-operation lock, and refuses otherwise as today.
+- An older binary that finds a version-2 journal refuses, as it does for any
+  journal today; a newer binary refuses a version-1 journal (test 22).
 - A cold disk cache at restore time is slower than creation's warm one; the
   shared budget has six passes of margin at 25.6 MiB/s.
 - A crash during a pre-compact backup leaves a `.staging` copy that only
   costs disk space.
 - An older desktop driving a newer WSL binary kills a long restore at 30 s;
-  the next restore clears the abandoned staging.
+  the next start or restore clears the abandoned staging or completes the
+  commit.
 - The 5 s startup validation still refuses stores whose `quick_check` exceeds
   it, before and after compaction or restore.
 
@@ -536,3 +737,13 @@ rules, and changes no persisted shape, contract or server-path budget.
   its locks.
 - A `storage.restore` profiler event.
 - Percentage progress, if the elapsed line proves insufficient.
+
+## Review findings and resolutions
+
+Round 2 (Codex, on `8a416944e`):
+
+| #     | Finding                                                                                                                                                                                                                                                 | Resolution                                                                                                                                                                                                                               |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| r2-P1 | Retention driven by a structural-only listing can delete the last usable generation: with A good, B and C corrupted at the same length and D from an empty valid store, it keeps B, C and D and deletes A. Today's retention excludes content failures. | Listing stays structural, but retention deletes only behind `RETAINED_GENERATIONS` replacements that pass `Content` verification now, walked newest first under the creation's deadline; otherwise it defers (O3). Tests 18, 19.         |
+| r2-P2 | The journal is created at its final path before it is written and synced, so ENOSPC leaves a partial journal that O4 then refuses to clear, blocking startup and recovery.                                                                              | Atomic publication: temporary file, write, `sync_all`, rename, directory sync; an owned temporary journal is removed on failure and cleared after a crash (O7, O4). Test 20, and 9 for the crash case.                                   |
+| r2-P2 | The WSL watchdog can kill a restore during its journaled commit, whose syncs ignore the deadline; round 1 claimed the server's deadline always fires first, and only tested the arithmetic.                                                             | The claim is withdrawn (O4). A version-2 journal records the staged identities, and startup, `restore` and `start-empty` roll the commit forward from the files, or refuse as today when they match no known state (O7). Tests 21 to 24. |
