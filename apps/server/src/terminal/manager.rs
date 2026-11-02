@@ -44,8 +44,11 @@ const DEFAULT_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// A childless terminal with no input or output is quiet after this many unchanged samples.
 const QUIET_AFTER_UNCHANGED_SAMPLES: u32 = 2;
 /// A quiet terminal is still sampled once per this many ticks, which bounds how late a child
-/// that starts and prints nothing is reported (#232).
-const QUIET_RESAMPLE_TICKS: u32 = 30;
+/// that starts and prints nothing is reported (#232; 10 s chosen by the user on 2026-11-01).
+const QUIET_RESAMPLE_TICKS: u32 = 10;
+/// How long the activity tick waits for one terminal's publication lock before retrying it on
+/// the next tick, so a terminal held by a slow close or restart cannot stall the others.
+const ACTIVITY_PUBLICATION_WAIT: Duration = Duration::from_millis(100);
 const OBSERVER_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// A hard stop for a preparer that asks to be waited for too long. It sits above every provider's
 /// own budget plus the supervisor's slack (a test holds it there), so it never cuts a provider
@@ -416,7 +419,11 @@ impl TerminalSessionIdentity {
             });
         }
         drop(session);
-        self.generation.writer.enqueue(&self.process, data, true)
+        let pending = self.generation.writer.enqueue(&self.process, data, true)?;
+        self.generation
+            .activity_wake
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(pending)
     }
 }
 
@@ -1642,6 +1649,16 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// What one terminal's sample did.
+enum ActivitySample {
+    /// The terminal is no longer the running process its poll was registered for.
+    Ended,
+    /// Its publication lock stayed busy; the terminal is sampled again next tick.
+    Busy,
+    Unchanged,
+    Changed,
+}
+
 /// The running terminals the shared activity tick samples, and whether that tick's task runs.
 #[derive(Default)]
 struct ActivityPolls {
@@ -1668,7 +1685,7 @@ impl ActivityPoll {
     }
 
     /// Whether this tick samples the terminal: always while a child runs or after input or
-    /// output, otherwise until it has been unchanged twice, then once every 30 ticks.
+    /// output, otherwise until it has been unchanged twice, then once every 10 ticks.
     fn take_due(&mut self) -> bool {
         if self
             .generation
@@ -2935,39 +2952,46 @@ impl TerminalManager {
             let inspection = inspections.get(&terminal.pid).cloned().unwrap_or_default();
             let has_child = inspection.has_running_subprocess;
             match Self::publish_activity(inner, terminal, inspection).await {
-                None => terminal.ended = true,
-                Some(changed) => {
+                ActivitySample::Ended => terminal.ended = true,
+                ActivitySample::Busy => terminal.unchanged = 0,
+                ActivitySample::Unchanged => {
                     terminal.has_child = has_child;
-                    terminal.unchanged = if changed {
-                        0
-                    } else {
-                        terminal.unchanged.saturating_add(1)
-                    };
+                    terminal.unchanged = terminal.unchanged.saturating_add(1);
+                }
+                ActivitySample::Changed => {
+                    terminal.has_child = has_child;
+                    terminal.unchanged = 0;
                 }
             }
         }
     }
 
-    /// Publishes `Activity` when the sample changed the terminal's subprocess state. `None`
-    /// means the terminal is no longer the running process this poll was registered for.
+    /// Publishes `Activity` when the sample changed the terminal's subprocess state.
     async fn publish_activity(
         inner: &Arc<Inner>,
         terminal: &ActivityPoll,
         inspection: SubprocessInspection,
-    ) -> Option<bool> {
-        let _publication = terminal.generation.publication.lock().await;
+    ) -> ActivitySample {
+        // Close holds this lock through process cleanup after cancelling the generation; one
+        // terminal's lock must not hold up every other terminal's sample.
+        let _publication = tokio::select! {
+            biased;
+            () = terminal.generation.cancellation.cancelled() => return ActivitySample::Ended,
+            guard = terminal.generation.publication.lock() => guard,
+            () = tokio::time::sleep(ACTIVITY_PUBLICATION_WAIT) => return ActivitySample::Busy,
+        };
         if terminal.generation.is_invalidated() {
-            return None;
+            return ActivitySample::Ended;
         }
         let (event, summary) = {
             let mut session = terminal.session.lock().await;
             if session.status != TerminalStatus::Running || session.pid != Some(terminal.pid) {
-                return None;
+                return ActivitySample::Ended;
             }
             if session.has_running_subprocess == inspection.has_running_subprocess
                 && session.child_command_label == inspection.child_command_label
             {
-                return Some(false);
+                return ActivitySample::Unchanged;
             }
             session.has_running_subprocess = inspection.has_running_subprocess;
             session.child_command_label = inspection.child_command_label;
@@ -2987,7 +3011,7 @@ impl TerminalManager {
         let _ = inner.metadata.send(TerminalMetadataEvent::Upsert {
             terminal: Box::new(summary),
         });
-        Some(true)
+        ActivitySample::Changed
     }
 
     /// Mirrors the generation observer's agent status into the terminal's metadata summary, so
@@ -7307,7 +7331,7 @@ mod tests {
 
         poll_ticks(2).await;
         assert_eq!(inspector.scan_count(), 2);
-        poll_ticks(29).await;
+        poll_ticks(9).await;
         assert_eq!(inspector.scan_count(), 2, "a quiet terminal kept sampling");
         assert!(drain_activity(&mut events).is_empty());
         manager.shutdown().await;
@@ -7327,6 +7351,117 @@ mod tests {
         poll_ticks(1).await;
         assert_eq!(inspector.scan_count(), 3, "input did not resume sampling");
         drop(write);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordered_input_resumes_sampling_on_next_tick() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        let connection = uuid::Uuid::new_v4();
+        let input_id = manager
+            .begin_input(
+                connection,
+                CancellationToken::new(),
+                "thread-poll",
+                "term-0",
+                0,
+                None,
+            )
+            .await
+            .unwrap()
+            .input_id;
+        poll_ticks(5).await;
+        assert_eq!(inspector.scan_count(), 2);
+
+        // `sleep 5` with echo off: the child starts and nothing is printed.
+        inspector.set_child(1, Some("sleep"));
+        let writer = manager.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .prepare_input_write(
+                    connection,
+                    "thread-poll",
+                    "term-0",
+                    &input_id,
+                    0,
+                    "sleep 5\r",
+                )?
+                .write()
+                .await
+        });
+        tokio::task::yield_now().await;
+        poll_ticks(1).await;
+        assert_eq!(
+            inspector.scan_count(),
+            3,
+            "ordered input did not resume sampling"
+        );
+        assert_eq!(drain_activity(&mut events), [true]);
+        drop(write);
+        manager.shutdown().await;
+    }
+
+    /// The `term-0` session's generation in a `polled_terminals` fixture.
+    async fn first_generation(manager: &TerminalManager) -> Arc<SessionGeneration> {
+        manager
+            .require_session("thread-poll", "term-0")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .generation
+            .clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closing_terminal_holding_its_publication_lock_does_not_stall_others() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        // Close holds the first terminal's publication lock through its process cleanup.
+        let closing = first_generation(&manager).await;
+        let publication = closing.publication.lock().await;
+        inspector.set_child(2, Some("sleep"));
+
+        poll_ticks(1).await;
+        closing.cancellation.cancel();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            drain_activity(&mut events),
+            [true],
+            "the other terminal waited on the closing terminal's lock"
+        );
+        poll_ticks(1).await;
+        assert_eq!(inspector.scans(), [vec![1, 2], vec![2]]);
+        drop(publication);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_terminal_publication_lock_does_not_stall_others() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        let busy = first_generation(&manager).await;
+        let publication = busy.publication.lock().await;
+        inspector.set_child(2, Some("sleep"));
+
+        poll_ticks(1).await;
+        tokio::time::sleep(DEFAULT_SUBPROCESS_POLL_INTERVAL / 2).await;
+        assert_eq!(
+            drain_activity(&mut events),
+            [true],
+            "the other terminal waited on a held lock"
+        );
+        // The busy terminal is sampled again once its lock is free.
+        drop(publication);
+        inspector.set_child(1, Some("sleep"));
+        poll_ticks(1).await;
+        assert_eq!(drain_activity(&mut events), [true]);
         manager.shutdown().await;
     }
 
@@ -7370,7 +7505,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quiet_terminal_resamples_every_30_ticks() {
+    async fn quiet_terminal_resamples_every_10_ticks() {
         let (_root, _backend, inspector, manager) =
             polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
         let mut events = manager.subscribe_events();
@@ -7378,7 +7513,7 @@ mod tests {
 
         // A child that starts and prints nothing.
         inspector.set_child(1, Some("sleep"));
-        poll_ticks(29).await;
+        poll_ticks(9).await;
         assert_eq!(inspector.scan_count(), 2);
         assert!(drain_activity(&mut events).is_empty());
         poll_ticks(1).await;
@@ -7427,7 +7562,7 @@ mod tests {
             polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
         poll_ticks(2).await;
         assert_eq!(inspector.scan_count(), 2);
-        poll_ticks(20).await;
+        poll_ticks(9).await;
         assert_eq!(
             inspector.scan_count(),
             2,
