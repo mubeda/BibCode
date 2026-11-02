@@ -77,7 +77,6 @@ struct Fixture {
     /// The thread's folder.
     folder: PathBuf,
     /// A folder outside it.
-    #[cfg_attr(not(unix), allow(dead_code))]
     outside: PathBuf,
     trash: Arc<TestTrash>,
     access: TransferAccess,
@@ -156,6 +155,28 @@ fn context() -> RouteContext {
         uri: axum::http::Uri::from_static("/api/transfers/token"),
         origin: crate::RequestOrigin::direct("http://127.0.0.1:43123"),
         cancellation: CancellationToken::new(),
+    }
+}
+
+/// A link to the folder `target` at `link`: a symlink on Unix, a junction on Windows, which
+/// needs no privilege.
+fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    junction::create(target, link).unwrap();
+}
+
+/// A symlink to the file `target` at `link`, when this host lets the server's user make one
+/// (Windows needs Developer Mode or a privilege).
+fn link_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
     }
 }
 
@@ -528,7 +549,6 @@ async fn create_rename_list_and_search_work_in_the_threads_folder() {
 /// end to end): writing `.git/config` or a hook makes Git run a command as the server's user.
 /// `.git` in any letter case, after `./`, and through a symlink is refused as an argument;
 /// `.gitignore` and `.github/` are ordinary files.
-#[cfg(unix)]
 #[tokio::test]
 async fn no_files_tool_reads_or_changes_gits_own_metadata() {
     let fixture = fixture().await;
@@ -538,7 +558,10 @@ async fn no_files_tool_reads_or_changes_gits_own_metadata() {
         .status()
         .expect("git runs");
     assert!(initialized.success());
-    std::os::unix::fs::symlink(".git", fixture.folder.join("gitlink")).unwrap();
+    link_dir(
+        &fixture.folder.join(".git"),
+        &fixture.folder.join("gitlink"),
+    );
     let config = fixture.read(".git/config").expect("a Git config");
     let refused = |result: &Value, what: &str| {
         assert_eq!(
@@ -649,6 +672,50 @@ async fn no_files_tool_reads_or_changes_gits_own_metadata() {
     fixture.shutdown().await;
 }
 
+/// `.git` reached by its 8.3 short name (`GIT~1`) is never handed to the trash: the trash
+/// takes a path, so the name is checked through its handle first (#216 review).
+#[cfg(windows)]
+#[tokio::test]
+async fn a_trash_never_takes_gits_metadata_by_its_short_name() {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    let fixture = fixture().await;
+    let initialized = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&fixture.folder)
+        .status()
+        .expect("git runs");
+    assert!(initialized.success());
+    let git = fixture.folder.join(".git");
+    let wide: Vec<u16> = git.as_os_str().encode_wide().chain([0]).collect();
+    let mut buffer = vec![0_u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buffer` holds as many units as passed.
+    let length = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            buffer.as_mut_ptr(),
+            1024,
+        )
+    } as usize;
+    let short = (length > 0 && length < 1024)
+        .then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])))
+        .and_then(|short| {
+            short
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| name != ".git");
+    let Some(short) = short else {
+        eprintln!("this volume makes no 8.3 names; nothing to check");
+        fixture.shutdown().await;
+        return;
+    };
+    let refused = fixture.call("files_delete", json!({ "path": short })).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(fixture.trash.count.load(Ordering::SeqCst), 0);
+    assert!(git.join("config").exists());
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_delete_goes_to_the_trash_unless_permanent_and_never_falls_back() {
     let fixture = fixture().await;
@@ -735,17 +802,15 @@ async fn a_delete_the_trash_refused_after_its_name_was_taken_says_where_the_file
     fixture.shutdown().await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_out_of_the_threads_folder_is_refused_by_every_tool() {
     let fixture = fixture().await;
     std::fs::write(fixture.outside.join("secret.txt"), "secret").unwrap();
-    std::os::unix::fs::symlink(&fixture.outside, fixture.folder.join("escape")).unwrap();
-    std::os::unix::fs::symlink(
-        fixture.outside.join("secret.txt"),
-        fixture.folder.join("leak.txt"),
-    )
-    .unwrap();
+    link_dir(&fixture.outside, &fixture.folder.join("escape"));
+    let file_links = link_file(
+        &fixture.outside.join("secret.txt"),
+        &fixture.folder.join("leak.txt"),
+    );
     // Through a symlinked folder: refused before any RPC.
     for (tool, arguments) in [
         ("files_read", json!({ "path": "escape/secret.txt" })),
@@ -798,6 +863,9 @@ async fn a_symlink_out_of_the_threads_folder_is_refused_by_every_tool() {
             json!({ "directory": "escape", "fileName": "new.txt" }),
         ),
     ] {
+        if !file_links && arguments["path"] == "leak.txt" {
+            continue;
+        }
         let refused = fixture.call(tool, arguments.clone()).await;
         let failure = &refused["structuredContent"]["error"]["failure"];
         assert!(
@@ -813,15 +881,17 @@ async fn a_symlink_out_of_the_threads_folder_is_refused_by_every_tool() {
         .await;
     assert_eq!(error_tag(&refused), "McpInvalidArgumentError");
     // A dangling symlink is never followed to create its target outside.
-    std::os::unix::fs::symlink(
-        fixture.outside.join("created.txt"),
-        fixture.folder.join("dangling.txt"),
-    )
-    .unwrap();
+    let dangling = link_file(
+        &fixture.outside.join("created.txt"),
+        &fixture.folder.join("dangling.txt"),
+    );
     for arguments in [
         json!({ "path": "dangling.txt", "content": "x", "createOnly": true }),
         json!({ "path": "dangling.txt", "content": "x", "expectedVersion": "0".repeat(64) }),
     ] {
+        if !dangling {
+            break;
+        }
         let refused = fixture.call("files_write", arguments).await;
         assert_eq!(refused["isError"], true, "{refused}");
     }
@@ -1132,7 +1202,6 @@ async fn an_unexpected_failure_names_the_agents_path_never_the_hosts() {
     fixture.shutdown().await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn an_agent_may_not_write_a_hard_linked_file_and_a_person_may() {
     let fixture = fixture().await;
