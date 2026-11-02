@@ -296,6 +296,14 @@ mod tests {
         assert_eq!(names, [".github/", ".github/ci.yml", "lib/", "lib/a.txt"]);
     }
 
+    /// A link to the folder `target` at `link`: a symlink on Unix, a junction on Windows.
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        junction::create(target, link).unwrap();
+    }
+
     #[tokio::test]
     async fn plans_and_streams_a_zip_skipping_symlinks() {
         let temp = crate::test_support::canonical_tempdir();
@@ -337,7 +345,6 @@ mod tests {
         assert_eq!(content, "hello");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_folder_swapped_for_an_outside_symlink_while_it_zips_is_never_followed() {
         let temp = crate::test_support::canonical_tempdir();
@@ -352,9 +359,9 @@ mod tests {
         // After the route opened the folder: the folder, and a folder inside it, each become
         // a symlink to somewhere outside.
         std::fs::rename(root.join("folder"), root.join("moved")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("folder")).unwrap();
+        link_dir(outside.path(), &root.join("folder"));
         std::fs::rename(root.join("moved/sub"), root.join("moved/sub.real")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("moved/sub")).unwrap();
+        link_dir(outside.path(), &root.join("moved/sub"));
 
         let body = archive_body_from(plan, folder, root.join("folder"), ArchiveLimits::default());
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
@@ -390,7 +397,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_plan_sizes_the_held_folder_never_a_swapped_link() {
         let temp = crate::test_support::canonical_tempdir();
@@ -403,9 +409,9 @@ mod tests {
         let folder = Dir::open(&validated, &root.join("folder"), false).unwrap();
         // After the route opened it, the folder and a folder inside it become outside links.
         std::fs::rename(root.join("folder"), root.join("moved")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("folder")).unwrap();
+        link_dir(outside.path(), &root.join("folder"));
         std::fs::rename(root.join("moved/sub"), root.join("moved/sub.real")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("moved/sub")).unwrap();
+        link_dir(outside.path(), &root.join("moved/sub"));
         let plan = plan_dir(&folder, ArchiveLimits::default()).unwrap();
         assert_eq!(
             plan,

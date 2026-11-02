@@ -171,11 +171,10 @@ fn validate_path(root: &Path, path: &str) -> Result<String, Value> {
             return Err(refused("a path may not leave the thread's folder"));
         }
     }
-    // The wire spelling is `/` everywhere; `\\` was refused above, so on Windows a backslash here
-    // is only the separator `PathBuf::push` added.
+    // `/` on every platform: the input holds no `\`, so any here is Windows' own separator.
     normal
         .to_str()
-        .map(|text| text.replace('\\', "/"))
+        .map(|path| path.replace('\\', "/"))
         .ok_or_else(|| refused("paths must be valid Unicode"))
 }
 

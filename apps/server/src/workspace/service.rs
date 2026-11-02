@@ -216,16 +216,10 @@ impl Place {
 
     /// The target opened for reading, refused unless it is a regular file.
     fn open_regular(&self) -> Result<std::fs::File, WorkspaceError> {
-        let file = match self.folder(false)?.open_file(&self.name, Open::Read) {
-            Ok(file) => file,
-            // Windows cannot open a folder as a file; Unix can, and the check below refuses it.
-            Err(_) if matches!(self.kind(), Ok(Kind::Directory)) => {
-                return Err(WorkspaceError::NotFile {
-                    path: self.target.clone(),
-                });
-            }
-            Err(error) => return Err(self.fault("open", error)),
-        };
+        let file = self
+            .folder(false)?
+            .open_file(&self.name, Open::Read)
+            .map_err(|error| self.fault("open", error))?;
         let metadata = file.metadata().map_err(|error| self.fault("stat", error))?;
         if !metadata.is_file() {
             return Err(WorkspaceError::NotFile {
@@ -334,19 +328,6 @@ fn hash_with(
             });
     }
     Ok((lowercase_hex(&hasher.finalize()), byte_length, binary, kept))
-}
-
-/// How many hard links a file has; one where the platform reports none.
-fn link_count(metadata: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::MetadataExt::nlink(metadata)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        1
-    }
 }
 
 async fn scan_file(place: Place) -> Result<ScannedFile, WorkspaceError> {
@@ -835,7 +816,10 @@ impl WorkspaceService {
                             path: place.target.clone(),
                         });
                     }
-                    if single_link_only && link_count(&metadata) > 1 {
+                    if single_link_only
+                        && beneath::link_count(&file).map_err(|error| place.fault("stat", error))?
+                            > 1
+                    {
                         return Err(WorkspaceError::HardLinked {
                             path: place.target.clone(),
                         });
@@ -1066,9 +1050,11 @@ impl WorkspaceService {
         }
     }
 
-    /// Without `*at` calls the trash takes the folder's path after a re-check (the outside
-    /// agents' tools that change files are refused on these platforms).
-    #[cfg(not(unix))]
+    /// The Windows trash takes a path: the entry's folder is held and pinned (`Dir::pin`) for
+    /// the whole call, so no folder on that path can be renamed or replaced meanwhile, and the
+    /// trash moves a junction or symlink at the entry itself, never what it names. A volume
+    /// that cannot pin (not NTFS or ReFS) leaves the entry in place: `trash_unavailable`.
+    #[cfg(windows)]
     async fn move_to_trash(
         &self,
         trash: &dyn crate::git::FileTrash,
@@ -1076,17 +1062,29 @@ impl WorkspaceService {
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<(), WorkspaceError> {
         let target = place.target.clone();
-        let checked = blocking(&target, move || {
-            place
-                .folder(false)?
-                .checked_path(&place.name)
-                .map_err(|error| place.fault("open", error))
+        let unavailable = target.clone();
+        let (held, checked) = blocking(&target, move || {
+            let dir = place.folder(false)?;
+            let pin = dir.pin().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::Unsupported {
+                    WorkspaceError::TrashUnavailable {
+                        path: place.target.clone(),
+                    }
+                } else {
+                    place.fault("open", error)
+                }
+            })?;
+            // The entry's own full name: a short name (`GIT~1`) is refused, never trashed.
+            let checked = dir
+                .long_name(&place.name)
+                .and_then(|name| dir.checked_path(&name))
+                .map_err(|error| place.fault("open", error))?;
+            Ok(((dir, pin), checked))
         })
         .await?;
-        trash
-            .trash(checked, cancellation)
-            .await
-            .map_err(|_| WorkspaceError::TrashUnavailable { path: target })
+        let trashed = trash.trash(checked, cancellation).await;
+        drop(held);
+        trashed.map_err(|_| WorkspaceError::TrashUnavailable { path: unavailable })
     }
 
     /// The folder that holds `bibcode-discard` for a workspace: its Git directory (a `.git`
