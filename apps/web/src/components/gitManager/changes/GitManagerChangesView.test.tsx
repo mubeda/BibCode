@@ -338,7 +338,12 @@ beforeEach(() => {
   );
   h.discard.mockReset();
   h.discard.mockResolvedValue(
-    AsyncResult.success({ trashed: [], permanentlyDiscarded: [], trashUnavailable: [] }),
+    AsyncResult.success({
+      trashed: [],
+      permanentlyDiscarded: [],
+      trashUnavailable: [],
+      keptInStaging: [],
+    }),
   );
   useGitManagerStore.setState({ byProjectKey: {} });
   useSourceControlPanelStore.setState({ byThreadKey: {}, byCwdKey: {} });
@@ -938,6 +943,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: [],
           trashUnavailable: ["src/unavailable-trash.ts"],
+          keptInStaging: [],
         }),
       )
       .mockResolvedValueOnce(
@@ -945,6 +951,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: ["src/unavailable-trash.ts"],
           trashUnavailable: [],
+          keptInStaging: [],
         }),
       );
     await renderView();
@@ -980,6 +987,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: [],
           trashUnavailable: ["logs/debug.log"],
+          keptInStaging: [],
         }),
       )
       .mockResolvedValueOnce(
@@ -987,6 +995,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: [],
           trashUnavailable: ["logs/debug.log"],
+          keptInStaging: [],
         }),
       );
     await renderView();
@@ -1005,6 +1014,34 @@ describe("GitManagerChangesView", () => {
         "Kept logs/debug.log: ignored files and files in linked folders can't be discarded here. Remove it in your file manager.",
       ),
     );
+  });
+
+  it("says where a stranded discard entry is kept and never offers to discard it permanently", async () => {
+    h.status = statusWith("src/stranded.ts");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard.mockResolvedValueOnce(
+      AsyncResult.success({
+        trashed: [],
+        permanentlyDiscarded: [],
+        trashUnavailable: [],
+        keptInStaging: [{ path: "src/stranded.ts", stagedAt: "bibcode-discard/0f3a/stranded.ts" }],
+      }),
+    );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+
+    await act(async () => listProps.onContextMenu("src/stranded.ts", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain(
+        "src/stranded.ts isn't in your working tree. The Trash refused it and something new took its name, so it's kept in the Git directory at bibcode-discard/0f3a/stranded.ts.",
+      ),
+    );
+    expect(document.body.textContent).not.toContain("The trash couldn't take these files");
+    expect(h.discard).toHaveBeenCalledTimes(1);
   });
 
   it("reveals a file through the environment-scoped file-manager command", async () => {

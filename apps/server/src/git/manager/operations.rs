@@ -69,6 +69,17 @@ pub struct DiscardOutcome {
     pub trashed: Vec<String>,
     pub permanently_discarded: Vec<String>,
     pub trash_unavailable: Vec<String>,
+    /// Entries the trash refused that could not go back because something else took their name:
+    /// they are in the Git directory's staging folder, not in the working tree.
+    pub kept_in_staging: Vec<KeptInStaging>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeptInStaging {
+    /// The path the discard was asked for.
+    pub path: String,
+    /// Where the entry is now, relative to the Git directory (`bibcode-discard/<id>/<name>`).
+    pub staged_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2397,8 +2408,9 @@ pub async fn discard_paths(
     let tracked = repository
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
+    let git_dir = roots.git_dir;
     #[cfg(unix)]
-    let (git_dir, worktree_root) = (roots.git_dir, roots.worktree_root);
+    let worktree_root = roots.worktree_root;
     #[cfg(unix)]
     {
         let (staging_dir, recovery_root) = (git_dir.clone(), worktree_root.clone());
@@ -2439,11 +2451,17 @@ pub async fn discard_paths(
             Moved::NotTaken if request.permit_permanent => {
                 outcome.permanently_discarded.push(path.clone());
             }
-            // A stranded entry is listed with those the trash did not take; it is in the
-            // staging folder, which the next discard's recovery empties.
-            Moved::NotTaken | Moved::Kept | Moved::Stranded(_) => {
-                outcome.trash_unavailable.push(path.clone());
-            }
+            // Never offered a permanent discard: its name now belongs to something else, which
+            // a clean would delete. The next discard's recovery moves it back once the name is free.
+            Moved::Stranded(staged) => outcome.kept_in_staging.push(KeptInStaging {
+                path: path.clone(),
+                staged_at: staged
+                    .strip_prefix(&git_dir)
+                    .unwrap_or(&staged)
+                    .to_string_lossy()
+                    .into_owned(),
+            }),
+            Moved::NotTaken | Moved::Kept => outcome.trash_unavailable.push(path.clone()),
         }
     }
 
@@ -5252,11 +5270,26 @@ mod tests {
         .await
         .expect("the discard runs");
 
-        assert_eq!(outcome.trash_unavailable, ["untracked.txt"]);
+        assert!(outcome.trash_unavailable.is_empty(), "{outcome:?}");
         assert!(outcome.permanently_discarded.is_empty());
         assert_eq!(
             std::fs::read_to_string(fixture.path().join("untracked.txt")).unwrap(),
             "new\n"
+        );
+        let [kept] = outcome.kept_in_staging.as_slice() else {
+            panic!("expected one stranded entry: {outcome:?}");
+        };
+        assert_eq!(kept.path, "untracked.txt");
+        assert!(
+            kept.staged_at.starts_with("bibcode-discard/")
+                && kept.staged_at.ends_with("/untracked.txt"),
+            "{}",
+            kept.staged_at
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join(".git").join(&kept.staged_at)).unwrap(),
+            "old\n",
+            "the entry is where the outcome says"
         );
     }
 
