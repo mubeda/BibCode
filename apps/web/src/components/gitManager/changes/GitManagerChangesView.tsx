@@ -6,6 +6,7 @@ import {
   GitManagerOperationError,
   type EditorId,
   type EnvironmentId,
+  type GitManagerKeptInStaging,
   type GitManagerUndoCommitResult,
   type ScopedProjectRef,
   type VcsStatusResult,
@@ -184,6 +185,21 @@ function keptAfterPermanentDiscard(paths: ReadonlyArray<string>): string {
     paths.length > MAX_KEPT_PATHS_NAMED ? ` and ${paths.length - MAX_KEPT_PATHS_NAMED} more` : "";
   const pronoun = paths.length === 1 ? "it" : "them";
   return `Kept ${named}${more}: ignored files and files in linked folders can't be discarded here. Remove ${pronoun} in your file manager.`;
+}
+
+/** Entries the Trash refused whose name was taken meanwhile: not in the working tree any more. */
+function keptInStagingMessage(kept: ReadonlyArray<GitManagerKeptInStaging>): string {
+  const [first] = kept;
+  if (kept.length === 1 && first !== undefined) {
+    return `${first.path} isn't in your working tree. The Trash refused it and something new took its name, so it's kept in the Git directory at ${first.stagedAt}. Once the name is free, any discard here moves it back, or move it back yourself.`;
+  }
+  const named = kept
+    .slice(0, MAX_KEPT_PATHS_NAMED)
+    .map((entry) => `${entry.path} at ${entry.stagedAt}`)
+    .join("; ");
+  const more =
+    kept.length > MAX_KEPT_PATHS_NAMED ? ` and ${kept.length - MAX_KEPT_PATHS_NAMED} more` : "";
+  return `${kept.length} files aren't in your working tree. The Trash refused them and something new took their names, so they're kept in the Git directory: ${named}${more}. Once the names are free, any discard here moves them back, or move them back yourself.`;
 }
 
 function gitManagerMutationErrorMessage(error: unknown): string {
@@ -517,7 +533,12 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(message);
         throw new Error(message);
       }
+      const notes: string[] = [];
+      if (result.value.keptInStaging.length > 0) {
+        notes.push(keptInStagingMessage(result.value.keptInStaging));
+      }
       if (requested.disposition === "trash" && result.value.trashUnavailable.length > 0) {
+        if (notes.length > 0) setMutationError(notes.join(" "));
         setPendingDiscard({
           paths: result.value.trashUnavailable,
           disposition: "permanent",
@@ -525,8 +546,9 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         return "keep-open";
       }
       if (result.value.trashUnavailable.length > 0) {
-        setMutationError(keptAfterPermanentDiscard(result.value.trashUnavailable));
+        notes.push(keptAfterPermanentDiscard(result.value.trashUnavailable));
       }
+      if (notes.length > 0) setMutationError(notes.join(" "));
     });
   }, [cwd, discard, environmentId, pendingDiscard]);
   const handleOpenExternal = useCallback(

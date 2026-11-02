@@ -54,11 +54,17 @@ struct TestTrash {
     folder: PathBuf,
     available: AtomicBool,
     count: AtomicUsize,
+    /// When set, a file is put at this path (the entry's own name) before the trash refuses.
+    take_name: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl FileTrash for TestTrash {
     fn trash<'a>(&'a self, path: PathBuf, _: &'a CancellationToken) -> FileTrashFuture<'a> {
         Box::pin(async move {
+            if let Some(name) = self.take_name.lock().unwrap().take() {
+                std::fs::write(name, "took the name").unwrap();
+                return Err(TrashUnavailable);
+            }
             if !self.available.load(Ordering::SeqCst) {
                 return Err(TrashUnavailable);
             }
@@ -150,6 +156,7 @@ pub(super) async fn fixture_with(register: impl FnOnce(&mut RpcRegistry)) -> Fix
         folder: folders[2].path().to_path_buf(),
         available: AtomicBool::new(true),
         count: AtomicUsize::new(0),
+        take_name: std::sync::Mutex::new(None),
     });
     let manager = GitManagerRpcServices::with_dependencies(
         repository.clone(),
@@ -465,6 +472,40 @@ async fn a_configured_remote_named_like_an_option_is_never_passed_to_git() {
             .expect_err("an option-like name is refused");
         assert_eq!(refused["code"], "invalid-request", "{payload} {refused}");
     }
+    fixture.harness.shutdown().await;
+}
+
+/// A file the trash refused whose name was taken meanwhile is in BiBCode's staging folder:
+/// `git_discard` says where, never lists it as kept in place, and `permanent` does not delete
+/// what took its name.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_discard_the_trash_refused_after_its_name_was_taken_says_where_the_file_is() {
+    let fixture = fixture().await;
+    fixture.write("stranded.txt", "old\n");
+    *fixture.trash.take_name.lock().unwrap() = Some(fixture.repo.join("stranded.txt"));
+
+    let discarded = fixture
+        .call(
+            "git_discard",
+            json!({ "paths": ["stranded.txt"], "permanent": true }),
+        )
+        .await;
+
+    let discarded = structured(&discarded);
+    assert_eq!(discarded["trashUnavailable"], json!([]));
+    assert_eq!(discarded["permanentlyDiscarded"], json!([]));
+    let kept = &discarded["keptInStaging"][0];
+    assert_eq!(kept["path"], "stranded.txt");
+    let staged_at = kept["stagedAt"].as_str().expect("stagedAt");
+    assert!(
+        staged_at.starts_with("bibcode-discard/") && staged_at.ends_with("/stranded.txt"),
+        "{staged_at}"
+    );
+    assert_eq!(
+        fixture.read("stranded.txt").as_deref(),
+        Some("took the name")
+    );
     fixture.harness.shutdown().await;
 }
 

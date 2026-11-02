@@ -2536,7 +2536,7 @@ Destructive: deletes a branch on a remote, leaving any local branch alone. It al
 
 #### `git_discard`
 
-Destructive: discards the changes of files or folders, restoring tracked files to HEAD and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in `trashUnavailable`, unless `permanent` is true. An ignored file that permanent deletion leaves in place is listed there too. Staged changes of the discarded paths are unstaged before the restore. On macOS 15 and later the system trash is reached through `/usr/bin/trash`, without Finder automation (older macOS asks Finder, which needs Automation consent); on macOS a trash that has not answered within 10 seconds counts as unavailable.
+Destructive: discards the changes of files or folders, restoring tracked files to HEAD and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in `trashUnavailable`, unless `permanent` is true. An ignored file that permanent deletion leaves in place is listed there too. A file the trash refused that could not be put back, because something else took its name, is listed in `keptInStaging` with where it is. Staged changes of the discarded paths are unstaged before the restore. On macOS 15 and later the system trash is reached through `/usr/bin/trash`, without Finder automation (older macOS asks Finder, which needs Automation consent); on macOS a trash that has not answered within 10 seconds counts as unavailable.
 
 - **Set / scope:** Source control · `orchestration:operate`
 - **Access:** operate (hidden at read-only)
@@ -2550,12 +2550,13 @@ Destructive: discards the changes of files or folders, restoring tracked files t
 | `permanent`       | boolean         | no       | `false`                                                    | Delete permanently what the trash cannot take.                |
 | `clientRequestId` | string          | no       | 1 to 256 characters                                        | Makes a retry replay.                                         |
 
-**Result** (`structuredContent`): `{ threadId, trashed, permanentlyDiscarded, trashUnavailable, status }`, each of the three a list of the normalized paths given:
+**Result** (`structuredContent`): `{ threadId, trashed, permanentlyDiscarded, trashUnavailable, keptInStaging, status }`, the first three each a list of the normalized paths given:
 
 - `trashed`: moved to the system trash.
 - `permanentlyDiscarded`: deleted for good (only when `permanent` was true and the trash could not take them).
 - `trashUnavailable`: left on disk because the trash could not take them and `permanent` was false, or an ignored file that permanent deletion did not remove.
   A tracked file already missing from disk is simply restored and appears in none of the lists.
+- `keptInStaging`: `[{ path, stagedAt }]`, files the trash refused that could not be put back because something else took their name. They are not in the folder: `stagedAt` is their path below the repository's Git directory (`bibcode-discard/<id>/<name>`). Nothing is deleted, not even with `permanent`; tell the person, and BiBCode moves them back on the next discard in that repository once the name is free. Never also in `trashUnavailable`.
 
 **Errors:**
 
