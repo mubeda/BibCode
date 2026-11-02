@@ -227,6 +227,20 @@ export function formatProviderList(providers: ReadonlyArray<Pick<ServerProvider,
   return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
 }
 
+/**
+ * An update replaces files a running CodeGraph (an MCP server, a sync) may hold open, and the
+ * first cut does not check for one, so every place a CodeGraph update can start says so.
+ */
+export const TOOL_UPDATE_WARNING =
+  "Close agent sessions that use CodeGraph before updating. Sessions already running keep the old version until they restart.";
+
+/** The warning to show beside an update that includes a tool, or `null` when it includes none. */
+export function toolUpdateWarning(
+  providers: ReadonlyArray<Pick<ServerProvider, "driver">>,
+): string | null {
+  return providers.some((provider) => isToolId(provider.driver)) ? TOOL_UPDATE_WARNING : null;
+}
+
 export function getProviderUpdateInitialToastView(input: {
   readonly updateProviders: ReadonlyArray<ProviderUpdateCandidate>;
   readonly oneClickProviders: ReadonlyArray<ProviderUpdateCandidate>;
@@ -237,7 +251,12 @@ export function getProviderUpdateInitialToastView(input: {
     title: getProviderUpdateInitialToastTitle(input.updateProviders),
     description:
       input.oneClickProviders.length > 0
-        ? "Install the update now or review provider settings."
+        ? [
+            "Install the update now or review provider settings.",
+            toolUpdateWarning(input.oneClickProviders),
+          ]
+            .filter((part) => part !== null)
+            .join(" ")
         : `${formatProviderList(input.updateProviders)} can be updated from provider settings.`,
   };
 }

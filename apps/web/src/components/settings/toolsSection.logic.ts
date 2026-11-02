@@ -1,5 +1,7 @@
 import type { ServerTool } from "@bibcode/contracts";
 
+import { TOOL_UPDATE_WARNING } from "../ProviderUpdateLaunchNotification.logic";
+
 export type ToolRowTone = "neutral" | "warning" | "success" | "error";
 
 export interface ToolRowView {
@@ -86,12 +88,7 @@ function baseView(tool: ServerTool): Omit<ToolRowView, "warning"> {
   };
 }
 
-/**
- * An update replaces files a running CodeGraph (an MCP server, a sync) may hold open, and the
- * first cut does not check for one, so the button comes with the instruction instead.
- */
-export const TOOL_UPDATE_WARNING =
-  "Close agent sessions that use CodeGraph before updating. Sessions already running keep the old version until they restart.";
+export { TOOL_UPDATE_WARNING };
 
 export function toolRowView(tool: ServerTool): ToolRowView {
   const view = baseView(tool);

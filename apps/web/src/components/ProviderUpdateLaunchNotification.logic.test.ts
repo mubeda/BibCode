@@ -39,6 +39,8 @@ import {
   type ProviderUpdateCandidate,
   type ProviderUpdateSidebarPillView,
   type ProviderUpdateToastView,
+  TOOL_UPDATE_WARNING,
+  toolUpdateWarning,
 } from "./ProviderUpdateLaunchNotification.logic";
 
 const checkedAt = "2026-04-23T10:00:00.000Z";
@@ -1597,5 +1599,15 @@ describe("provider update launch notification logic", () => {
         ).toBe(kind);
       }
     });
+  });
+});
+
+describe("toolUpdateWarning", () => {
+  it("names the CodeGraph warning only for an update that includes a tool", () => {
+    const codegraph = { driver: ProviderDriverKind.make("codegraph") };
+    const codex = { driver: ProviderDriverKind.make("codex") };
+    expect(toolUpdateWarning([codex])).toBeNull();
+    expect(toolUpdateWarning([codex, codegraph])).toBe(TOOL_UPDATE_WARNING);
+    expect(TOOL_UPDATE_WARNING).toContain("Close agent sessions that use CodeGraph");
   });
 });
