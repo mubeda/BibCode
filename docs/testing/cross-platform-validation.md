@@ -1724,8 +1724,10 @@ Do not run destructive worktree scenarios against a user repository.
 
 Run on each desktop (macOS, Windows, Linux) and on a server, against a disposable
 project. The focused gates are `cargo test -p bibcode-server --lib -- mcp::
-mcp_tools_tests connect_mcp auth::service::tests::the_mcp` (`mcp::` includes the
-`bibcode thread` tests in `mcp::thread_cli`) and
+mcp_tools_tests connect_mcp auth::service::tests::the_mcp git::clone_policy` (`mcp::`
+includes the `bibcode thread` tests in `mcp::thread_cli`; `git::clone_policy` runs the real
+`ssh -G` checks of an agent's SSH clone command, which skip with a note where no `ssh`
+runs) and
 `vp test run --project unit src/components/settings/AgentIntegrationsSection.test.tsx`
 from `apps/web`.
 
@@ -1813,6 +1815,38 @@ from `apps/web`.
        `codex mcp login bibcode --scopes orchestration:read,orchestration:operate,terminal:operate`;
        Claude Code: the server's `oauth.scopes`, then **Re-authenticate**), allow terminals
        when approving, and open a terminal.
+
+15. **An agent SSH clone** (#217). The hermetic tests fake ssh; this step needs a real sshd,
+    SSH agent and key. Run it on Windows twice (once with the OpenSSH Authentication Agent
+    service and `SSH_AUTH_SOCK` unset, once with an MSYS `ssh-agent` or `ssh-pageant` whose
+    `SSH_AUTH_SOCK` the server inherits), on Linux and on macOS, against one of your
+    `SourceControlTest` repositories, with its key loaded (`ssh-add`) and the host in
+    `~/.ssh/known_hosts`. Turn **Terminals** on at Full access and connect the agent with
+    terminals.
+    1. **The gate.** Ask an agent connected without terminals to clone
+       `ssh://git@github.com/<owner>/<repo>.git`: it is refused with `clone_ssh_not_allowed`
+       naming `https://github.com/<owner>/<repo>.git`. The terminal agent's clone of the same
+       URL finishes and registers the project. Turn **Terminals** off: its next SSH clone is
+       refused again.
+    2. **Unknown host.** Move the host's line out of `known_hosts` (keep a copy) and clone: the
+       error names the known_hosts file and prints `ssh -F none -p 22 -o HostKeyAlias=<host>
+       -T git@<host>`. Run it, compare the fingerprint with the one the host publishes, answer
+       yes, and retry: the clone succeeds, and `known_hosts` gained only that line. Repeat
+       against a Linux sshd on port 2222 (`ssh://git@<host>:2222/...`): the command carries
+       `-p 2222 -o 'HostKeyAlias=[<host>]:2222'` and the saved line is `[<host>]:2222 ...`.
+    3. **Host certificate** (Linux). An sshd for `git.example` with a host certificate is
+       accepted on port 22 with only `@cert-authority * <CA>` in `known_hosts`. On port 2222
+       with the same `known_hosts`, the clone is refused with the certificate message; the
+       printed command asks to trust the plain key, after `yes` `known_hosts` holds a plain
+       `[git.example]:2222` line (not merely the CA line), and the retried clone succeeds.
+    4. **`ssh-add -c`** (Linux). Start the agent with `SSH_ASKPASS_REQUIRE=never` and add the
+       key with `ssh-add -c`: the clone fails at once with the publickey message. Start it
+       again with `SSH_ASKPASS=<a script that sleeps>` and `SSH_ASKPASS_REQUIRE=force`: the
+       clone waits and returns `running` after 50 s; `cancel_clone` removes the folder and
+       leaves no Git or ssh process, while the sleeping helper remains the agent's child (the
+       documented limitation).
+    5. **No agent.** Stop the agent (on Windows, the service) and clone: the clone is
+       `clone_ssh_unavailable` with the platform's message.
 
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.
