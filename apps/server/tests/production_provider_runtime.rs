@@ -12073,10 +12073,11 @@ async fn a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_ca
     session.shutdown().await;
 }
 
-/// A turn whose baseline (ref 0) could not be captured is never recorded `ready`: its diff could
-/// not be read. Its own end state is still captured, so the next turn's diff is.
+/// A turn whose baseline (ref 0) could not be captured is recorded `ready` without a diff
+/// (#235): its own end state is captured, so it can be reverted to, and the next turn's diff
+/// is read from it.
 #[tokio::test]
-async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
+async fn a_turn_without_a_baseline_is_ready_without_a_diff_and_revertible() {
     let repository = initialize_repository();
     let session = CheckpointedSession::start(repository.path()).await;
     // Git cannot write ref 0 while its lock file exists.
@@ -12091,33 +12092,10 @@ async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
     let turn_id = session
         .finish_turn(repository.path(), 1, "one\n", "completed")
         .await;
-    timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
-        loop {
-            let failed = load_snapshot(&session.engine.repositories())
-                .await
-                .unwrap()
-                .activities
-                .iter()
-                .any(|activity| {
-                    activity.kind == "checkpoint.capture.failed"
-                        && activity.turn_id.as_deref() == Some(turn_id.as_str())
-                });
-            if failed {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the turn's checkpoint is reported unreadable");
-    let checkpoint = session
-        .engine
-        .repositories()
-        .get_checkpoint("t1".to_owned(), 1)
-        .await
-        .unwrap()
-        .expect("checkpoint 1");
-    assert_eq!(checkpoint.status, "missing");
+    let checkpoint = session.ready_checkpoint(1).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    assert!(!checkpoint.diff_available);
+    assert_eq!(checkpoint.files, json!([]));
     let reference = |turn_count| orchestration_effects::checkpoint_ref("t1", turn_count);
     assert!(!git_succeeds(
         repository.path(),
@@ -12134,6 +12112,29 @@ async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
         .await;
     let next = session.ready_checkpoint(2).await;
     assert_eq!(next.files[0]["path"], "tracked.txt");
+
+    let mut events = session.engine.subscribe_events();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert", "threadId":"t1",
+                "turnCount":1, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted"
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "one\n"
+    );
     session.shutdown().await;
 }
 
