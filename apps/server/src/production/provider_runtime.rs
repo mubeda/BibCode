@@ -13332,10 +13332,17 @@ impl CodexDriver {
                 );
             }
         }
-        let config_path = request.environment.get("CODEX_HOME").map_or_else(
-            || "~/.codex/config.toml".to_owned(),
-            |home| Path::new(home).join("config.toml").display().to_string(),
-        );
+        // Codex inherits BiBCode's own `CODEX_HOME` when the launch sets none.
+        let config_path = request
+            .environment
+            .get("CODEX_HOME")
+            .cloned()
+            .or_else(|| std::env::var("CODEX_HOME").ok())
+            .filter(|home| !home.trim().is_empty())
+            .map_or_else(
+                || "~/.codex/config.toml".to_owned(),
+                |home| Path::new(&home).join("config.toml").display().to_string(),
+            );
         let mut args = Vec::new();
         if let Some(mcp) = request.mcp.as_ref() {
             request.environment.insert(
