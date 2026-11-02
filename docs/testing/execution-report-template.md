@@ -314,7 +314,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 ## High-latency measurement
 
 - Server build profile, round trips and jitter measured:
-- Table printed by `scripts/measure-remote-latency.ts` at each round trip:
+- Table printed by `scripts/measure-remote-latency.ts` at each round trip (or with `--link 3g` for load changes), and the transfer byte budget result:
 - Actions that gained RPCs, sequential round trips or echo lag against the previous measurement, with the reason:
 
 ## SSH environment evidence
