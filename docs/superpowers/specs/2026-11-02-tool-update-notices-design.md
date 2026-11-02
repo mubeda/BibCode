@@ -1,9 +1,8 @@
 # Tool Update Notices Design (Claude Code and CodeGraph)
 
-Status: Revised for Codex review round 3. Option A, the Claude Code external
-update toast, and "no in-use guard in the first cut" are decided. Nothing in
-this document is implemented except the Claude Code regression tests named
-under "Claude Code today".
+Status: Approved 2026-11-02 (user decisions + Codex review, 3 rounds).
+Option A, the Claude Code external update toast, and "no in-use guard in the
+first cut" are decided.
 
 Issue: #212, "Update notifications for Claude Code and CodeGraph like Codex".
 
@@ -211,9 +210,17 @@ So `server.updateTool` does not run the command in its own handler:
     path still holds a runnable launcher; otherwise the row shows the
     installer's manual reinstall instructions. A successful reinstall clears
     the marker the same way as any verified finish.
-  - A marker whose process is alive (an update running in this server) is not
-    stale; a marker found at startup never is, because the server that wrote it
-    exited. BiBCode never deletes or repairs install files itself.
+  - The marker also stores the updater's **pid and process start time**, written
+    as soon as the child is spawned. A server killed outright (SIGKILL, OOM)
+    can leave its updater running (a Unix process group survives, kill-on-drop
+    is bypassed), so a restart must not offer a reinstall beside it. At startup
+    and on every probe, if a process with that pid and that start time is still
+    alive, the tool reports "CodeGraph is still being updated by an earlier
+    BiBCode session." with no action, and the reinstall is refused until the
+    process exits (re-checked on each probe). Only then, with the marker still
+    present, is the possibly-broken state and its reinstall offered. A reused pid
+    with a different start time does not count as the updater.
+  - BiBCode never deletes or repairs install files itself.
 - Tests: with an injected updater command that renames a marker file, sleeps,
   then restores it (a stand-in for the rollback journal), start
   `server.updateTool` and drop the request mid-sleep. Assert the child is still
@@ -226,7 +233,10 @@ So `server.updateTool` does not run the command in its own handler:
   instructions for b) because the marker is present, and must clear after a
   verified reinstall. A further test shows a clean verified update leaves no
   marker, and a shutdown during an update waits up to the stated budget without
-  killing earlier.
+  killing earlier. A server-only-crash test starts a slow updater, drops the
+  server without stopping the child, restarts it, and asserts the tool reports
+  "still being updated" with the reinstall refused, then offers the reinstall
+  once the child exits.
 
 ## Agent configuration
 
