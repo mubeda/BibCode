@@ -243,7 +243,8 @@ labelled `CLI · bibcode mcp` and revoke it on exit.
 - `-` reads the arguments from standard input; without them the call sends `{}`. Arguments
   that are not a JSON object are refused before anything connects.
 - Exit codes: 0 success; 1 a tool error (its message on standard error, the result still
-  printed), an unknown or refused tool, or a transport failure; 2 a result whose `status` is
+  printed), an unknown or refused tool, a transport failure, or a result that could not be
+  written to standard output; 2 a result whose `status` is
   `awaiting_approval` or `awaiting_input`.
 
 ### Remote HTTP with OAuth
