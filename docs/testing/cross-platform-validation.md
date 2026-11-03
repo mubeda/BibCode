@@ -1788,7 +1788,10 @@ from `apps/web`.
    stopped at an approval, `send <thread> <message> --wait` exits 2; `requests <thread>`
    lists the approval's request id, `approve <thread> <request>` exits 0 and the turn goes
    on (`decline` on another approval also exits 0), and `changes` prints a cursor that a
-   second `changes --cursor <c>` accepts. With **MCP server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
+   second `changes --cursor <c>` accepts. `bibcode mcp call list_projects_and_threads`
+   prints one JSON result and exits 0, `bibcode mcp tools` marks `files_download`
+   `oneShot: false`, and `bibcode mcp call files_upload` exits 1 without a row ever showing
+   in **Authorized clients**. With **MCP server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
    that the desktop executable's output reaches the terminal and a pipe.
 8. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
 9. **A destructive tool.** At Supervised, make a change in the disposable project and ask

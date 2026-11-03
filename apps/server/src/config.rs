@@ -798,6 +798,12 @@ pub enum McpSubcommand {
     /// Approve or deny a remote AI tool's request to connect over HTTPS, or list the
     /// requests waiting.
     Authorize(crate::mcp::authorize_cli::AuthorizeArgs),
+    /// Call one read-only tool and print its result as JSON: 0 on success, 1 on a failure,
+    /// 2 when the thread waits on a person.
+    Call(crate::mcp::call_cli::CallArgs),
+    /// Print the tools this command's credential sees as JSON, each with `oneShot`: whether
+    /// `call` takes it.
+    Tools,
 }
 
 #[derive(Debug, Args)]
@@ -978,6 +984,13 @@ pub enum CliAction {
         options: crate::mcp::relay::RelayOptions,
         args: crate::mcp::authorize_cli::AuthorizeArgs,
     },
+    /// Calls one read-only MCP tool on the data root's running server; never starts one.
+    McpCall {
+        options: crate::mcp::relay::RelayOptions,
+        args: crate::mcp::call_cli::CallArgs,
+    },
+    /// Lists the data root's running server's MCP tools; never starts one.
+    McpTools(crate::mcp::relay::RelayOptions),
     /// Calls the data root's running server's MCP thread tools; never starts one.
     Thread {
         options: crate::mcp::relay::RelayOptions,
@@ -1132,9 +1145,10 @@ impl Cli {
             CliAction::OpenUrl { .. } => Err(ConfigError::OpenUrlCommandIsNotServer),
             CliAction::Profiler { .. } => Err(ConfigError::ProfilerCommandIsNotServer),
             CliAction::Diagnostics { .. } => Err(ConfigError::DiagnosticsCommandIsNotServer),
-            CliAction::Mcp(_) | CliAction::McpAuthorize { .. } => {
-                Err(ConfigError::McpCommandIsNotServer)
-            }
+            CliAction::Mcp(_)
+            | CliAction::McpAuthorize { .. }
+            | CliAction::McpCall { .. }
+            | CliAction::McpTools(_) => Err(ConfigError::McpCommandIsNotServer),
             CliAction::Thread { .. } => Err(ConfigError::ThreadCommandIsNotServer),
         }
     }
@@ -1386,7 +1400,7 @@ pub(crate) fn profiler_state_dir(
 
 /// What `mcp` relays to, resolved as every command that reads a data root does: with no
 /// `--base-dir`, `BIBCODE_HOME` or `~/.bibcode`, which is also the desktop's root.
-/// `bibcode mcp`, or its `authorize` subcommand.
+/// `bibcode mcp`, or its `authorize`, `call` or `tools` subcommand.
 pub(crate) fn mcp_action(
     base_dir: Option<PathBuf>,
     dev_url: Option<Url>,
@@ -1396,6 +1410,8 @@ pub(crate) fn mcp_action(
     let options = relay_options(base_dir, dev_url, mcp)?;
     Ok(match command {
         Some(McpSubcommand::Authorize(args)) => CliAction::McpAuthorize { options, args },
+        Some(McpSubcommand::Call(args)) => CliAction::McpCall { options, args },
+        Some(McpSubcommand::Tools) => CliAction::McpTools(options),
         None => CliAction::Mcp(options),
     })
 }

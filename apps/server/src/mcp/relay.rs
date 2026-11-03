@@ -282,14 +282,26 @@ impl Connection {
         arguments: Value,
         label: &str,
     ) -> Result<Value, String> {
-        let message = json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments,
-                "_meta": { "io.modelcontextprotocol/protocolVersion": protocol::MODERN_VERSION },
-            },
-        });
+        let params = json!({ "name": name, "arguments": arguments });
+        self.request(id, "tools/call", params, label).await
+    }
+
+    /// The tool list this connection's credential sees, as `tools/list` returns it.
+    pub(crate) async fn list_tools(&self, id: u64, label: &str) -> Result<Value, String> {
+        self.request(id, "tools/list", json!({}), label).await
+    }
+
+    /// One request in the modern protocol era, and its `result`.
+    async fn request(
+        &self,
+        id: u64,
+        method: &str,
+        mut params: Value,
+        label: &str,
+    ) -> Result<Value, String> {
+        params["_meta"] =
+            json!({ "io.modelcontextprotocol/protocolVersion": protocol::MODERN_VERSION });
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let token = self.token(|| label.to_owned()).await?;
         let response = match self.send(&message, &token, None).await {
             Sent::Response(response) => response,

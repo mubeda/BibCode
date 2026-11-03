@@ -242,6 +242,12 @@ fn desktop_mcp_dispatch() -> i32 {
                 crate::config::CliAction::Mcp(options) => {
                     crate::mcp::relay::run_mcp_cli(options).await
                 }
+                crate::config::CliAction::McpCall { options, args } => {
+                    crate::mcp::call_cli::run_mcp_call(options, args).await
+                }
+                crate::config::CliAction::McpTools(options) => {
+                    crate::mcp::call_cli::run_mcp_tools(options).await
+                }
                 _ => 1,
             }
         }),
