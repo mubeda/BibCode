@@ -77,8 +77,8 @@ fn probe_environment(system: &Path, search_path: OsString) -> Vec<(OsString, OsS
     ]
 }
 
-/// `first`, then the inherited `PATH` without its relative entries, which would keep the
-/// policy at `NoSystem` (a shell can leave one, such as a `C` split off `C:\...`).
+/// `first`, then the inherited `PATH` without its relative entries, which keep the policy
+/// at `NoSystem` on Unix (a shell can leave one, such as a `C` split off `C:\...`).
 fn search_path(first: &[PathBuf]) -> OsString {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let inherited = std::env::split_paths(&inherited).filter(|entry| entry.is_absolute());
@@ -162,6 +162,12 @@ async fn assert_clean(clone: &Path) {
         .status(clone, &CancellationToken::new())
         .await
         .expect("BiBCode status");
+    // A configuration Git cannot read makes every command fail, which reads as no changes.
+    assert!(
+        status.local.is_repo && status.local.repository_unavailable_reason.is_none(),
+        "BiBCode's Git could not read the repository: {:?}",
+        status.local.repository_unavailable_reason
+    );
     assert!(
         !status.local.has_working_tree_changes && status.local.working_tree.files.is_empty(),
         "BiBCode's status and diff see the CRLF checkout as changed: {:?}",
@@ -512,17 +518,84 @@ async fn an_older_git_first_on_path_keeps_nosystem() {
     );
 }
 
+/// Windows searches a relative entry from the server's directory, not each child's, so
+/// every command still finds the same Git there.
 #[tokio::test]
-async fn a_relative_path_entry_keeps_nosystem() {
+async fn a_relative_path_entry_keeps_nosystem_on_unix() {
     let root = tempfile::tempdir().unwrap();
     let system = root.path().join("system.gitconfig");
     fs::write(&system, AUTOCRLF).unwrap();
     let state = root.path().join("state");
     let relative_first = search_path(&[PathBuf::from("relative-bin")]);
+    let policy = probe(&state, &probe_environment(&system, relative_first)).await;
     assert_eq!(
-        probe(&state, &probe_environment(&system, relative_first)).await,
+        matches!(policy, Policy::KeysOnly(_)),
+        cfg!(windows),
+        "{policy:?}"
+    );
+}
+
+/// Git resolves a relative `GIT_CONFIG_SYSTEM` inside each repository.
+#[tokio::test]
+async fn a_relative_state_dir_keeps_nosystem() {
+    let root = tempfile::tempdir().unwrap();
+    let system = root.path().join("system.gitconfig");
+    fs::write(&system, AUTOCRLF).unwrap();
+    // Relative to the package directory, inside the workspace's own `target`.
+    let state = Path::new("../../target/git-system-line-endings-relative-state");
+    let policy = probe(state, &probe_environment(&system, search_path(&[]))).await;
+    let _ = fs::remove_dir_all(state);
+    assert_eq!(policy, Policy::NoSystem);
+}
+
+/// The desktop's data root is canonicalized, a `\\?\` path on Windows, which Git ignores in
+/// `GIT_CONFIG_SYSTEM`.
+#[tokio::test]
+async fn a_canonical_state_dir_still_applies_the_system_autocrlf() {
+    let Some((phase, root)) = in_own_process(
+        "a_canonical_state_dir_still_applies_the_system_autocrlf",
+        |_| AUTOCRLF.to_owned(),
+    ) else {
+        return;
+    };
+    let clone = crlf_clone(&root);
+    let state = fs::canonicalize(&root).unwrap().join("state");
+    install_once(&state).await;
+    assert_clean(&clone).await;
+    phase.complete();
+}
+
+/// The state directory is the trust boundary: neither it nor the reused file may be
+/// writable by another user.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_group_or_other_writable_state_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let system = root.path().join("system.gitconfig");
+    fs::write(&system, AUTOCRLF).unwrap();
+    let environment = probe_environment(&system, search_path(&[]));
+    let Policy::KeysOnly(reference) = probe(&root.path().join("reference"), &environment).await
+    else {
+        panic!("the fixture system configuration was not probed");
+    };
+    let writable = |path: &Path| fs::set_permissions(path, fs::Permissions::from_mode(0o777));
+
+    let directory_state = root.path().join("writable-directory");
+    fs::create_dir_all(directory_state.join("git")).unwrap();
+    writable(&directory_state.join("git")).unwrap();
+    assert_eq!(
+        probe(&directory_state, &environment).await,
         Policy::NoSystem
     );
+
+    let file_state = root.path().join("writable-file");
+    fs::create_dir_all(file_state.join("git")).unwrap();
+    let file = file_state.join("git").join(reference.file_name().unwrap());
+    fs::copy(&reference, &file).unwrap();
+    writable(&file).unwrap();
+    assert_eq!(probe(&file_state, &environment).await, Policy::NoSystem);
 }
 
 #[tokio::test]

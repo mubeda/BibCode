@@ -203,6 +203,14 @@ impl ServerConfig {
         self
     }
 
+    /// Resolves the requested data root, as server startup does, and makes it `base_dir`.
+    pub fn resolve_data_root(&mut self) -> Result<ResolvedDataRoot, DataRootError> {
+        let resolved = crate::data_root::resolve_data_root(self.data_root_request.clone())?;
+        self.base_dir = resolved.effective.clone();
+        self.resolved_data_root = Some(resolved.clone());
+        Ok(resolved)
+    }
+
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
         self.base_dir.join(if self.dev_url.is_some() {
