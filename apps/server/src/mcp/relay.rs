@@ -222,9 +222,20 @@ pub(crate) struct Connection {
     http: reqwest::Client,
     access: McpAccess,
     endpoint: Mutex<Endpoint>,
-    /// Minted on the first request, so the relay's label can name the agent.
-    credential: Mutex<Option<Credential>>,
+    /// Minted on the first request, so the relay's label can name the agent; held by the
+    /// sign-in while it runs.
+    credential: Arc<Mutex<Option<Credential>>>,
+    /// A test holds the sign-in here, once the server has made the session.
+    #[cfg(test)]
+    hold_after_sign_in: std::sync::Mutex<Option<SignInHold>>,
 }
+
+/// Reached, then resumed: where a test holds a sign-in.
+#[cfg(test)]
+type SignInHold = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 struct Relay {
     connection: Connection,
@@ -269,7 +280,9 @@ impl Connection {
             http,
             access,
             endpoint: Mutex::new(endpoint),
-            credential: Mutex::new(None),
+            credential: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            hold_after_sign_in: std::sync::Mutex::new(None),
         })
     }
 
@@ -618,52 +631,69 @@ impl Connection {
     }
 
     /// The credential, minted on the first request: a 60 s link from the data root, exchanged
-    /// at once over loopback, labelled `label()`.
+    /// at once over loopback, labelled `label()`. The sign-in runs on a task of its own that
+    /// holds the credential slot, so a caller dropped once the server may have made the session
+    /// (Ctrl-C) still leaves it recorded, and [`Connection::revoke`] waits for it.
     async fn token(&self, label: impl FnOnce() -> String) -> Result<String, String> {
-        let mut credential = self.credential.lock().await;
-        if let Some(credential) = credential.as_ref() {
+        let mut slot = Arc::clone(&self.credential).lock_owned().await;
+        if let Some(credential) = slot.as_ref() {
             return Ok(credential.token.clone());
         }
-        let minted = mint(&self.options, &label(), self.access).await?;
+        let options = self.options.clone();
+        let http = self.http.clone();
+        let access = self.access;
+        let state_dir = self.state_dir.clone();
         let base = self.endpoint.lock().await.base.clone();
-        let exchanged = self
-            .http
-            .post(
-                base.join("oauth/token")
-                    .map_err(|error| error.to_string())?,
-            )
-            .form(&[
-                ("grant_type", crate::auth::TOKEN_GRANT_TYPE),
-                ("subject_token", minted.as_str()),
-                ("subject_token_type", crate::auth::BOOTSTRAP_TOKEN_TYPE),
-                ("requested_token_type", crate::auth::ACCESS_TOKEN_TYPE),
-                ("client_device_type", "desktop"),
-            ])
-            .send()
-            .await
-            .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
-        if !exchanged.status().is_success() {
-            return Err(format!(
-                "BiBCode refused this MCP server's sign-in ({}).",
-                exchanged.status()
-            ));
-        }
-        let exchanged: Value = exchanged
-            .json()
-            .await
-            .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
-        let token = exchanged["access_token"]
-            .as_str()
-            .ok_or("BiBCode returned no credential.")?
-            .to_owned();
-        let session_id =
-            session_id_of(&token).ok_or("BiBCode returned a credential this relay cannot read.")?;
-        record_client(&self.state_dir, &session_id);
-        *credential = Some(Credential {
-            token: token.clone(),
-            session_id,
-        });
-        Ok(token)
+        let label = label();
+        #[cfg(test)]
+        let hold = self.hold_after_sign_in.lock().unwrap().take();
+        tokio::spawn(async move {
+            let minted = mint(&options, &label, access).await?;
+            let exchanged = http
+                .post(
+                    base.join("oauth/token")
+                        .map_err(|error| error.to_string())?,
+                )
+                .form(&[
+                    ("grant_type", crate::auth::TOKEN_GRANT_TYPE),
+                    ("subject_token", minted.as_str()),
+                    ("subject_token_type", crate::auth::BOOTSTRAP_TOKEN_TYPE),
+                    ("requested_token_type", crate::auth::ACCESS_TOKEN_TYPE),
+                    ("client_device_type", "desktop"),
+                ])
+                .send()
+                .await
+                .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
+            if !exchanged.status().is_success() {
+                return Err(format!(
+                    "BiBCode refused this MCP server's sign-in ({}).",
+                    exchanged.status()
+                ));
+            }
+            #[cfg(test)]
+            if let Some((reached, resume)) = hold {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+            let exchanged: Value = exchanged
+                .json()
+                .await
+                .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
+            let token = exchanged["access_token"]
+                .as_str()
+                .ok_or("BiBCode returned no credential.")?
+                .to_owned();
+            let session_id = session_id_of(&token)
+                .ok_or("BiBCode returned a credential this relay cannot read.")?;
+            record_client(&state_dir, &session_id);
+            *slot = Some(Credential {
+                token: token.clone(),
+                session_id,
+            });
+            Ok(token)
+        })
+        .await
+        .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?
     }
 
     /// Revokes this connection's credential through the data root and removes its record.
