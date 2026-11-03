@@ -387,13 +387,17 @@ Implemented in `apps/server/src/git/system_line_endings.rs`, with the integratio
   before any write, and the policy is `NoSystem`: a directory, a symlink, or a file owned by
   another user. Under the design's write-then-rename, a foreign-owned file would have been
   replaced, so the design's expected `NoSystem` for that test case would not have held.
-- **Relative `PATH` entries.** On Windows, empty entries are skipped, as process creation
-  skips them. Every other relative entry gives `NoSystem` on every OS. A shell that splits
-  `C:\…` at the colon, as Git Bash did for one entry on this machine, leaves a relative `C`.
-  That entry alone keeps the policy at `NoSystem`, so the tests build their own `PATH`.
-- **Logging.** An older Git or a relative `PATH` entry logs at `debug`, because neither is
-  a failure. Timeouts, failures, invalid values and write failures go through the module's
-  one `tracing::warn!`. Its `reason` is fixed text with no path.
+- **Relative `PATH` entries (review fix P2-c).** The rule applies on Unix only. Rust's
+  Windows process creation searches a bare program from the server's own directory before
+  the child's directory applies, so every command finds the same Git there. On Unix, a
+  shell that splits `C:\…` at the colon would leave a relative `C` that keeps the policy at
+  `NoSystem`, so the tests build their own `PATH`.
+- **Logging (review fix P3-e).** An older Git or a relative `PATH` entry logs at `debug`,
+  because neither is a failure. Timeouts, failures, invalid values and write failures go
+  through the module's one `tracing::warn!`, whose `reason` is fixed text with no path.
+  `install_once` runs before either binary installs logging, so it keeps its warnings, and
+  `ServerRuntime` logs them right after `logging::initialize_owned`. There is no cheap test
+  seam for that ordering.
 - **Probe directory.** The probe runs in a fresh `bibcode-git-probe-<uuid>` directory under
   the temp directory, with `GIT_CEILING_DIRECTORIES` set to the temp directory, and removes
   it afterwards.
@@ -411,3 +415,22 @@ Implemented in `apps/server/src/git/system_line_endings.rs`, with the integratio
 - **Not done.** The native Windows run through the packaged app (status, diff, commit, a
   new worktree and a checkpoint restore) was not run. The integration tests cover status,
   diff, commit and worktrees through `GitRepository`, with a fixture system file.
+- **Review fixes, round 3 (Codex review of `10c019d90`).**
+  - P1-a: the desktop's data root is canonicalized, a `\\?\C:\…` path on Windows. Git
+    2.56 cannot read that form in `GIT_CONFIG_SYSTEM`. `git config --get` finds nothing,
+    and `git status` stops with "unknown error occurred while reading the configuration
+    files", so every BiBCode Git command on the desktop would have failed. The returned
+    path goes through `host_paths::process_compatible_path`. Test:
+    `a_canonical_state_dir_still_applies_the_system_autocrlf`. Its status helper now also
+    requires a readable repository, because a failed status read reports no changes and
+    first let the case pass without the fix.
+  - P1-b: `bibcode serve` probed `config.state_dir()` before startup resolved the data root,
+    so a relative or quoted `~` base directory gave a relative file path, which Git resolves
+    inside each repository. `run_server` now calls `ServerConfig::resolve_data_root`, the
+    helper startup also uses, and a non-absolute state directory gives `NoSystem`. Test:
+    `a_relative_state_dir_keeps_nosystem`. The `run_server` ordering itself has no cheap
+    test seam.
+  - P2-d (coordinator ruling): on Unix, an existing `<state>/git` or reused file that is
+    group- or other-writable gives `NoSystem`. Ancestors and Windows ACLs are not checked,
+    because the state directory, which holds the database, is the trust boundary. Test:
+    `a_group_or_other_writable_state_is_refused` (Unix, CI only).

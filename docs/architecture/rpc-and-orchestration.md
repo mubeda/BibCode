@@ -357,28 +357,36 @@ person's own Git, for example Git for Windows' system `core.autocrlf=true`:
   `git config --system --includes -z --get-regexp`, from an empty temporary directory. The
   two binaries call it, `bibcode serve` and the desktop's in-process backend, and
   `ServerRuntime::start` does not, so library and lifecycle tests keep
-  `GIT_CONFIG_NOSYSTEM=1`.
+  `GIT_CONFIG_NOSYSTEM=1`. `bibcode serve` first resolves its data root the way startup
+  does (`ServerConfig::resolve_data_root`), so the state directory is the absolute one the
+  server will use, never a relative `--base-dir`.
 - **Includes.** Unconditional `include.path` files are followed. `includeIf` cannot be
   resolved outside a repository and is not applied.
 - **Values.** The last value of each key wins. Booleans are canonicalized as Git reads them,
   and an invalid last value drops its key.
 - **The generated file.** The canonical values are written to
   `<state>/git/system-line-endings-<hash>.gitconfig` in the server's own state directory.
-  The write is atomic: a fresh `create_new` temporary name (`0600` on Unix) is renamed into
-  place, in a `0700` directory on Unix. The server uses the file only if `<state>/git` is a
-  real directory and the file is a regular file, both owned by the server on Unix, with
-  exactly the bytes written. Git then runs with `GIT_CONFIG_SYSTEM=<file>` and without
-  `GIT_CONFIG_NOSYSTEM`. These are system-scope values, so repository and global settings
+  The path loses a Windows `\\?\` verbatim prefix, which Git ignores in
+  `GIT_CONFIG_SYSTEM`, and must be absolute, because Git resolves a relative one inside
+  each repository. The write is atomic: a fresh `create_new` temporary name (`0600` on
+  Unix) is renamed into place, in a `0700` directory on Unix. The server uses the file only
+  if `<state>/git` is a real directory and the file is a regular file with exactly the bytes
+  written. On Unix both must also be owned by the server and writable by no group or other
+  user. The ancestors and Windows ACLs are not checked: the state directory already holds
+  the database, so it is the trust boundary. Git then runs with `GIT_CONFIG_SYSTEM=<file>`
+  and without `GIT_CONFIG_NOSYSTEM`. These are system-scope values, so repository and global settings
   still win. No credential helper, hook, filter, include or URL rule from the system
   configuration gets in.
 - **Fallback.** With no key set, the policy stays at `GIT_CONFIG_NOSYSTEM=1`, today's
   isolation. It also stays there when any of these hold:
-  - the child `PATH` has a relative entry, which could resolve another Git per directory;
+  - on Unix, the child `PATH` has a relative entry, which could resolve another Git per
+    directory (Windows searches it from the server's own directory, so it cannot);
   - the resolved Git is older than 2.32, which ignores `GIT_CONFIG_SYSTEM`;
   - the probe takes more than 2 s in total, and its children are killed;
   - the write or a check fails.
 
-  A failure logs one warning, with no path.
+  A failure, or an invalid value, logs one warning with no path. The probe runs before
+  logging starts, so the server logs the warnings right after it installs logging.
 
 - **Restart rule.** The result is fixed for the process. A desktop backend restart reuses
   it, and quitting and reopening the app, or restarting `bibcode serve`, reads the settings
