@@ -177,21 +177,28 @@ async fn a_sign_in_dropped_after_the_server_made_the_session_is_still_revoked() 
         }
     }
     // The call is dropped here, as Ctrl-C drops it; the server has made the session.
-    let live = |sessions: &[(String, Option<String>, Option<String>, Option<String>)]| {
-        sessions
-            .iter()
-            .filter(|session| session.3.is_none())
-            .count()
-    };
-    assert_eq!(live(&mcp_sessions(root.path()).await), 1);
+    assert_eq!(live_sessions(root.path()).await, 1);
     tokio::join!(connection.revoke(), async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = resume.send(());
     });
-    let sessions = mcp_sessions(root.path()).await;
-    assert_eq!(live(&sessions), 0, "{sessions:?}");
+    assert_eq!(
+        live_sessions(root.path()).await,
+        0,
+        "{:?}",
+        mcp_sessions(root.path()).await
+    );
     server.shutdown();
     server.join().await.expect("server joins");
+}
+
+/// The `mcp-client` sessions not revoked.
+async fn live_sessions(root: &Path) -> usize {
+    mcp_sessions(root)
+        .await
+        .iter()
+        .filter(|session| session.3.is_none())
+        .count()
 }
 
 async fn mcp_links(root: &Path) -> i64 {

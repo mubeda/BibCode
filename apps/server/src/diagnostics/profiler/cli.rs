@@ -795,11 +795,7 @@ mod tests {
     #[test]
     fn a_desktop_mcp_usage_error_exits_1_and_help_exits_0() {
         let code = |argv: &[&str]| {
-            usage_exit_code(
-                &DesktopMcpCli::try_parse_from(argv)
-                    .err()
-                    .expect("a parse error"),
-            )
+            usage_exit_code(&DesktopMcpCli::try_parse_from(argv).expect_err("a parse error"))
         };
         assert_eq!(code(&["mcp", "call"]), 1);
         assert_eq!(code(&["mcp", "--access", "everything"]), 1);
