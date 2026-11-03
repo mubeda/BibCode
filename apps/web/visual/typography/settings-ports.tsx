@@ -96,6 +96,21 @@ export const environmentSnapshotAtom: typeof ShellPorts.environmentSnapshotAtom 
     Atom.make<Atom.Type<ReturnType<typeof ShellPorts.environmentSnapshotAtom>>>(null),
 );
 
+/**
+ * An uncapped shell for every environment, so a thread no shell holds never looks threads up
+ * (#223). shortcut: capped shells are not modelled; add getThreadShells when a fixture needs one.
+ */
+export const environmentShell: Pick<typeof ShellPorts.environmentShell, "stateValueAtom"> = {
+  stateValueAtom: Atom.family(
+    (_environmentId: Parameters<typeof ShellPorts.environmentShell.stateValueAtom>[0]) =>
+      Atom.make<Atom.Type<ReturnType<typeof ShellPorts.environmentShell.stateValueAtom>>>({
+        snapshot: Option.none(),
+        status: "live",
+        error: Option.none(),
+      }),
+  ),
+};
+
 const traceQuery = Atom.make(AsyncResult.success(traceDiagnostics));
 const processesQuery = Atom.make(AsyncResult.success(resourceProcesses));
 const usageQuery = Atom.make(AsyncResult.success({ readAt, isFetching: false, providers: [] }));
