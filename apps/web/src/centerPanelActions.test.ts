@@ -33,6 +33,7 @@ const h = vi.hoisted(() => ({
   newCommandId: vi.fn(),
   startTurn: vi.fn(),
   pending: new Set<string>(),
+  creating: new Set<string>(),
   closed: [] as string[],
   drafts: new Map<string, { prompt: string; attachments: unknown[] }>(),
 }));
@@ -89,6 +90,11 @@ vi.mock("~/centerPanelStore", () => ({
       mergeGroup: h.mergeGroup,
       openChatPanel: h.openChatPanel,
       pendingChatPanelThreadKeys: h.pending,
+      creatingChatPanelThreadKeys: h.creating,
+      beginChatPanelCreation: (ref: { environmentId: string; threadId: string }) =>
+        h.creating.add(`${ref.environmentId}:${ref.threadId}`),
+      endChatPanelCreation: (ref: { environmentId: string; threadId: string }) =>
+        h.creating.delete(`${ref.environmentId}:${ref.threadId}`),
       closedBeforeCreated: h.closed,
       recordClosedBeforeCreated: (ref: { environmentId: string; threadId: string }) =>
         h.closed.push(`${ref.environmentId}:${ref.threadId}`),
@@ -173,6 +179,7 @@ beforeEach(() => {
     Promise.resolve({ _tag: "Failure", cause: new Error("no running turn") }),
   );
   h.pending.clear();
+  h.creating.clear();
   h.closed.length = 0;
   h.drafts.clear();
   h.reserveChatPanel.mockImplementation((_host: unknown, threadId: string) =>
@@ -826,6 +833,58 @@ describe("side chats", () => {
       input: { threadId: "new-panel-thread" },
     });
     expect(h.closed).toEqual([]);
+  });
+
+  it("sends nothing for a side chat closed after a snapshot released its reservation", async () => {
+    h.drafts.set(hostRef.threadId, { prompt: submittedText, attachments: [] });
+    const creation = deferred<unknown>();
+    h.createPanel.mockReturnValueOnce(creation.promise);
+    const actions = useCenterPanelActions({ onCloseTerminal });
+
+    const opening = actions.createSideChat(sideChat());
+    // The server committed the panel and a live snapshot listed it before `createPanel`
+    // answered: the lifecycle reconciler released the reservation.
+    h.pending.clear();
+    const tab = {
+      id: "chat:new-panel-thread",
+      kind: "chat",
+      threadId: "new-panel-thread",
+    } as const;
+    h.closeSurface.mockReturnValueOnce([tab]);
+    actions.closeSurface(hostRef, "group-root", tab as never);
+    expect(h.closed).toEqual([`${hostRef.environmentId}:new-panel-thread`]);
+
+    creation.resolve({ _tag: "Success", value: undefined });
+    await opening;
+
+    expect(h.startTurn).not.toHaveBeenCalled();
+    expect(h.drafts.get(hostRef.threadId)?.prompt).toBe(submittedText);
+    expect(h.archiveThread).toHaveBeenCalledOnce();
+    expect(h.closed).toEqual([]);
+    expect(h.creating.size).toBe(0);
+  });
+
+  it("leaves the close of an interrupted creation to adoption", async () => {
+    const creation = deferred<unknown>();
+    h.createPanel.mockReturnValueOnce(creation.promise);
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const opening = actions.createSideChat(sideChat());
+    const tab = {
+      id: "chat:new-panel-thread",
+      kind: "chat",
+      threadId: "new-panel-thread",
+    } as const;
+    h.closeSurface.mockReturnValueOnce([tab]);
+    actions.closeSurface(hostRef, "group-root", tab as never);
+
+    creation.resolve({ _tag: "Failure", interrupted: true, cause: null });
+    await opening;
+
+    expect(h.startTurn).not.toHaveBeenCalled();
+    expect(h.archiveThread).not.toHaveBeenCalled();
+    // Adoption archives it once the panel shows; the open no longer claims it.
+    expect(h.closed).toEqual([`${hostRef.environmentId}:new-panel-thread`]);
+    expect(h.creating.size).toBe(0);
   });
 
   it("archives a plain panel closed while it is created", async () => {

@@ -2132,9 +2132,13 @@ The client opens a side chat with `createPanel` (`sideChat: true`,
 `thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
 draft stays until the question was handed over. A tab closed while any panel
 is still being created records the close in the persisted
-`closedBeforeCreated` list (center panel store version 5, at most 20 keys), and
-the panel is archived once it exists, by the open itself or, after a reload, by
-adoption.
+`closedBeforeCreated` list (center panel store version 5, at most 20 keys). The
+open marks the panel as being created until `createPanel` answers, a mark a
+live snapshot never releases (it does release the reservation), so a close in
+that window is always recorded and a closed side chat never sends its question.
+The panel is archived once it exists: by the open itself, or by adoption after
+a reload or an open whose outcome was lost. Adoption skips a panel still being
+created and does not track a reserved one, so a later snapshot decides again.
 
 Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present

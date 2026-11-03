@@ -270,23 +270,16 @@ export function useCenterPanelActions({
     [archiveThread, interruptTurn],
   );
 
-  /**
-   * Reserves the tab, then creates the panel. `created` false: the outcome is unknown (the
-   * tab stays for adoption) or the tab closed meanwhile (the panel is archived once it exists).
-   */
-  const createPanelThread = useCallback(
+  /** Creates the reserved panel and settles a close made while it waited. */
+  const settlePanelCreation = useCallback(
     async (
       input: CreateChatPanelInput,
+      panelRef: ScopedThreadRef,
+      label: string,
       sideChat: boolean,
-      focusComposer = false,
     ): Promise<{ readonly threadId: ThreadId; readonly created: boolean } | null> => {
-      const { hostRef, modelSelection, providerLabel } = input;
-      const environmentId = hostRef.environmentId;
-      const threadId = newThreadId();
-      const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
-      const label = sideChat ? sideChatLabel(providerLabel) : providerLabel;
-      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
-      if (focusComposer) composerFocusRequests.add(scopedThreadKey(panelRef));
+      const { hostRef, modelSelection } = input;
+      const { environmentId, threadId } = panelRef;
       const result = await createPanel({
         environmentId,
         input: {
@@ -331,6 +324,31 @@ export function useCenterPanelActions({
       return { threadId, created: true };
     },
     [archivePanelThread, createPanel],
+  );
+
+  /**
+   * Reserves the tab, then creates the panel. `created` false: the outcome is unknown (the
+   * tab stays for adoption) or the tab closed meanwhile (the panel is archived once it exists).
+   */
+  const createPanelThread = useCallback(
+    async (
+      input: CreateChatPanelInput,
+      sideChat: boolean,
+      focusComposer = false,
+    ): Promise<{ readonly threadId: ThreadId; readonly created: boolean } | null> => {
+      const { hostRef, providerLabel } = input;
+      const environmentId = hostRef.environmentId;
+      const threadId = newThreadId();
+      const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
+      const label = sideChat ? sideChatLabel(providerLabel) : providerLabel;
+      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
+      useCenterPanelStore.getState().beginChatPanelCreation(panelRef);
+      if (focusComposer) composerFocusRequests.add(scopedThreadKey(panelRef));
+      return settlePanelCreation(input, panelRef, label, sideChat).finally(() =>
+        useCenterPanelStore.getState().endChatPanelCreation(panelRef),
+      );
+    },
+    [settlePanelCreation],
   );
 
   const createChatPanel = useCallback(
@@ -455,8 +473,13 @@ export function useCenterPanelActions({
           const panelRef = scopeThreadRef(hostRef.environmentId, surface.threadId);
           const store = useCenterPanelStore.getState();
           // The server may not have created it yet, so it cannot be archived now: its open
-          // archives it once it settles, and adoption does after a reload.
-          if (store.pendingChatPanelThreadKeys.has(scopedThreadKey(panelRef))) {
+          // archives it once it settles, and adoption does after a reload or an interrupted
+          // open. A snapshot may already have released the reservation; the creation mark stays.
+          const panelKey = scopedThreadKey(panelRef);
+          if (
+            store.creatingChatPanelThreadKeys.has(panelKey) ||
+            store.pendingChatPanelThreadKeys.has(panelKey)
+          ) {
             store.recordClosedBeforeCreated(panelRef);
             continue;
           }
