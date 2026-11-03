@@ -339,58 +339,61 @@ export function useCenterPanelActions({
     [createPanelThread],
   );
 
-  const createSideChat = useCallback(
+  const openSideChat = useCallback(
     async (input: CreateSideChatInput): Promise<ThreadId | null> => {
       const { hostRef, question, submittedText } = input;
-      const hostKey = scopedThreadKey(hostRef);
-      if (pendingSideChatHosts.has(hostKey)) return null;
-      pendingSideChatHosts.add(hostKey);
-      try {
-        // An empty side chat is opened to type in.
-        const panel = await createPanelThread(input, true, question.length === 0);
-        // Not created, or closed meanwhile: nothing is sent and the host draft keeps the text.
-        if (!panel?.created) return panel?.threadId ?? null;
-        const sideRef = scopeThreadRef(hostRef.environmentId, panel.threadId);
-        if (question.length > 0) {
-          // The side chat's own draft is never written on success: what the user types or
-          // attaches there meanwhile stays.
-          const result = await startTurn({
-            environmentId: hostRef.environmentId,
-            input: {
-              threadId: panel.threadId,
-              message: { messageId: newMessageId(), role: "user", text: question, attachments: [] },
-              modelSelection: input.modelSelection,
-              runtimeMode: "approval-required",
-              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            },
-          });
-          // The send may have landed: the `:btw` text stays in the host draft, nothing is lost.
-          if (result._tag === "Failure" && isAtomCommandInterrupted(result)) {
-            return panel.threadId;
-          }
-          if (result._tag === "Failure") {
-            const drafts = useComposerDraftStore.getState();
-            const current = drafts.getComposerDraft(sideRef)?.prompt ?? "";
-            drafts.setPrompt(
-              sideRef,
-              current === question ? current : [current, question].filter(Boolean).join("\n\n"),
-            );
-            toastManager.add(
-              stackedThreadToast({
-                type: "error",
-                title: SIDE_CHAT_SEND_FAILED_TITLE,
-                description: SIDE_CHAT_SEND_FAILED_DESCRIPTION,
-              }),
-            );
-          }
+      // An empty side chat is opened to type in.
+      const panel = await createPanelThread(input, true, question.length === 0);
+      // Not created, or closed meanwhile: nothing is sent and the host draft keeps the text.
+      if (!panel?.created) return panel?.threadId ?? null;
+      const sideRef = scopeThreadRef(hostRef.environmentId, panel.threadId);
+      if (question.length > 0) {
+        // The side chat's own draft is never written on success: what the user types or
+        // attaches there meanwhile stays.
+        const result = await startTurn({
+          environmentId: hostRef.environmentId,
+          input: {
+            threadId: panel.threadId,
+            message: { messageId: newMessageId(), role: "user", text: question, attachments: [] },
+            modelSelection: input.modelSelection,
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          },
+        });
+        // The send may have landed: the `:btw` text stays in the host draft, nothing is lost.
+        if (result._tag === "Failure" && isAtomCommandInterrupted(result)) {
+          return panel.threadId;
         }
-        if (submittedText !== undefined) clearSubmittedHostDraft(hostRef, submittedText);
-        return panel.threadId;
-      } finally {
-        pendingSideChatHosts.delete(hostKey);
+        if (result._tag === "Failure") {
+          const drafts = useComposerDraftStore.getState();
+          const current = drafts.getComposerDraft(sideRef)?.prompt ?? "";
+          drafts.setPrompt(
+            sideRef,
+            current === question ? current : [current, question].filter(Boolean).join("\n\n"),
+          );
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: SIDE_CHAT_SEND_FAILED_TITLE,
+              description: SIDE_CHAT_SEND_FAILED_DESCRIPTION,
+            }),
+          );
+        }
       }
+      if (submittedText !== undefined) clearSubmittedHostDraft(hostRef, submittedText);
+      return panel.threadId;
     },
     [createPanelThread, startTurn],
+  );
+
+  const createSideChat = useCallback(
+    async (input: CreateSideChatInput): Promise<ThreadId | null> => {
+      const hostKey = scopedThreadKey(input.hostRef);
+      if (pendingSideChatHosts.has(hostKey)) return null;
+      pendingSideChatHosts.add(hostKey);
+      return openSideChat(input).finally(() => pendingSideChatHosts.delete(hostKey));
+    },
+    [openSideChat],
   );
 
   const openSessionPanel = useCallback(
