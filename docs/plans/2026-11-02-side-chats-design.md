@@ -365,7 +365,9 @@ first-turn latency in the e2e run before changing it.
 - **Bring back.** A side chat action that writes a quoted summary of its last answer into the
   host composer as a draft. Never sent automatically. Disabled while the host runs, with
   "Available when the thread is idle." The summary is composed on the client from the side
-  chat's messages; no new RPC.
+  chat's messages; no new RPC. As built: it quotes the last finished answer under the question
+  before it, is appended after any text already in the host draft, and is also disabled
+  ("Available once the side chat answers.") before the first answer.
 - **Host file restore guard: deferred out of #265 to its own issue** (review finding 7). A
   check in `plan_revert` races: a revert reserves only its own thread's turns
   (`orchestration_effects.rs:934`), so a sibling can start a turn between the check and the
