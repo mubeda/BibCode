@@ -41,6 +41,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     previewTunnels: false,
     reviewDiffTools: false,
     webhookQuestionEvents: false,
+    webhookBearerToken: false,
     ...overrides,
   };
 }

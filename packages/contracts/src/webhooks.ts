@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -68,6 +69,11 @@ export const WebhookEndpoint = Schema.Struct({
   projectId: Schema.NullOr(Schema.String),
   /** The outside agent's session it is paired with: revoking that client disables it. */
   pairedClientId: Schema.NullOr(Schema.String),
+  /**
+   * Whether it sends `Authorization: Bearer <token>`. The token itself is never returned;
+   * an older server, which has none, leaves this out.
+   */
+  bearerTokenSet: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   consecutiveFailures: NonNegativeInt,
   disabledReason: Schema.NullOr(WebhookDisabledReason),
   pendingDeliveries: NonNegativeInt,
@@ -92,7 +98,8 @@ export const WebhookDelivery = Schema.Struct({
   lastStatus: Schema.NullOr(Schema.Int),
   /**
    * Why the last attempt failed: `status` (see `lastStatus`), `timeout`, `connect`,
-   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `redirect`, `cancelled`,
+   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `token_missing` (its
+   * bearer token could not be read, so nothing was sent), `redirect`, `cancelled`,
    * `queue_full` (dropped: the queue was full), `endpoint_changed` (dropped: the endpoint's
    * URL or filters changed while it waited) or `interrupted`.
    */
@@ -137,6 +144,13 @@ export const WebhooksUpsertInput = Schema.Struct({
   eventTypes: Schema.Array(Schema.String),
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
   pairedClientId: Schema.optional(Schema.NullOr(Schema.String)),
+  /**
+   * Absent keeps the endpoint's bearer token, `null` removes it and a string sets or
+   * replaces it (1 to 1,024 visible ASCII characters, without the word `Bearer`). Changing
+   * `url` while a token is set needs this field. Send it only to a server that advertises
+   * `webhookBearerToken`.
+   */
+  bearerToken: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type WebhooksUpsertInput = typeof WebhooksUpsertInput.Type;
 export const WebhooksUpsertResult = Schema.Struct({

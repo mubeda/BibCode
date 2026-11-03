@@ -1799,10 +1799,11 @@ from `apps/web`.
     its MCP server, press **Take over**: reads still work and its next change is refused as
     read-only. **Hand back** restores the level it had, and its next change works.
 13. **A webhook delivery.** In the **Webhooks** tab turn **Webhooks** on, add an endpoint at
-    a disposable public HTTPS receiver with `thread.status_changed`, copy the secret, and
-    **Send test event**: the receiver gets `webhook.test`, and its `X-BibCode-Signature`
-    verifies with the secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
-    shows. Start a thread: the receiver gets `thread.status_changed` events, and
+    a disposable public HTTPS receiver with `thread.status_changed` and a **Bearer token**,
+    copy the secret, and **Send test event**: the receiver gets `webhook.test` with
+    `Authorization: Bearer <that token>`, and its `X-BibCode-Signature` verifies with the
+    secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
+    shows. **Edit** shows "A token is set", never the token. Start a thread: the receiver gets `thread.status_changed` events, and
     `changes_since` from the first event's `cursor` returns the entries after it.
 14. **A remote OAuth connect**, once with Claude Code and once with Codex, on another
     computer, through BiBCode Connect's managed tunnel and through an HTTPS reverse proxy

@@ -11,9 +11,10 @@ Related pages: [Webhooks](../user/webhooks.md) (the person's guide to the Settin
 the [MCP reference](./mcp.md), whose `changes_since` and `profiler_findings` tools are how a
 receiver catches up on what it missed.
 
-A request carries ids, kinds, statuses and a cursor. It never carries a prompt, a message,
-a reply, terminal output, file contents, a diff, a path, an agent's label, a token or a
-secret.
+A request body carries ids, kinds, statuses and a cursor. It never carries a prompt, a
+message, a reply, terminal output, file contents, a diff, a path, an agent's label, a token
+or a secret. The only credential a request carries is the endpoint's own bearer token, in
+its `Authorization` header, when the person set one.
 
 ## Enabling
 
@@ -38,15 +39,15 @@ on the environment's WebSocket RPC (see
 [RPC and orchestration](../architecture/rpc-and-orchestration.md)); every refusal is
 `WebhookError` with a `reason`.
 
-| Method                    | Scope          | Input                                                                  | Result                                 |
-| ------------------------- | -------------- | ---------------------------------------------------------------------- | -------------------------------------- |
-| `webhooks.list`           | `access:read`  | `{}`                                                                   | `{ enabled, endpoints, maxEndpoints }` |
-| `webhooks.listDeliveries` | `access:read`  | `{ endpointId, limit? }` (50 unless set, at most 200)                  | `{ deliveries }`, newest first         |
-| `webhooks.upsert`         | `access:write` | `{ id?, name, url, enabled, eventTypes, projectId?, pairedClientId? }` | `{ endpoint, secret? }`                |
-| `webhooks.delete`         | `access:write` | `{ id }`                                                               | `{ deleted }`                          |
-| `webhooks.rotateSecret`   | `access:write` | `{ id }`                                                               | `{ secret }`                           |
-| `webhooks.sendTest`       | `access:write` | `{ id }`                                                               | `{ delivery }` after its first attempt |
-| `webhooks.redeliver`      | `access:write` | `{ deliveryId }`                                                       | `{ delivery }` after its first attempt |
+| Method                    | Scope          | Input                                                                                | Result                                 |
+| ------------------------- | -------------- | ------------------------------------------------------------------------------------ | -------------------------------------- |
+| `webhooks.list`           | `access:read`  | `{}`                                                                                 | `{ enabled, endpoints, maxEndpoints }` |
+| `webhooks.listDeliveries` | `access:read`  | `{ endpointId, limit? }` (50 unless set, at most 200)                                | `{ deliveries }`, newest first         |
+| `webhooks.upsert`         | `access:write` | `{ id?, name, url, enabled, eventTypes, projectId?, pairedClientId?, bearerToken? }` | `{ endpoint, secret? }`                |
+| `webhooks.delete`         | `access:write` | `{ id }`                                                                             | `{ deleted }`                          |
+| `webhooks.rotateSecret`   | `access:write` | `{ id }`                                                                             | `{ secret }`                           |
+| `webhooks.sendTest`       | `access:write` | `{ id }`                                                                             | `{ delivery }` after its first attempt |
+| `webhooks.redeliver`      | `access:write` | `{ deliveryId }`                                                                     | `{ delivery }` after its first attempt |
 
 `webhooks.upsert` without `id` adds an endpoint; with `id` it replaces that endpoint's
 editable fields. Its input rules:
@@ -63,12 +64,27 @@ editable fields. Its input rules:
   Revoking that client (or **Stop**) turns the endpoint off with `disabledReason:
   "client-revoked"`.
 - `enabled`: `false` keeps the endpoint but sends nothing to it.
+- `bearerToken`: sent as `Authorization: Bearer <token>` on every request (see
+  [Headers and signature](#headers-and-signature)). Left out, the endpoint keeps its
+  token, so an older client's save never clears it; `null` removes it; a string sets or
+  replaces it. The value is trimmed and must then be 1 to 1,024 visible ASCII characters
+  (`!` to `~`, no spaces); a value starting with `Bearer ` is refused with "Paste the
+  token without the word Bearer." Changing `url` while a token is set needs
+  `bearerToken` too (a new token, or `null`), else the upsert is refused (`invalid`,
+  "Enter the token for the new URL, or remove it."), so receiver A's token never goes to
+  receiver B. A server advertises the field with the `webhookBearerToken` capability; an
+  older one refuses it as `invalid`.
 - At most 20 endpoints per environment (`reason: "limit"`).
 
 **The secret** is `whsec_` followed by 64 hex characters (32 random bytes). It is returned
 once, as `secret` when the endpoint is created and by `webhooks.rotateSecret`, and never
 again. BiBCode keeps it in its secret store as `webhook-<endpoint id>`, readable only by the
 server's user. Rotating it makes the old secret stop verifying at once.
+
+**The bearer token** is write-only: no method returns it, and `webhooks.list` reports only
+`bearerTokenSet`. Each value is its own secret-store file,
+`webhook-bearer-<endpoint id>-<32 hex characters>`, and the endpoint's row names the current
+one, so the URL and the token always change together.
 
 `WebhookError.reason` values: `invalid`, `not_found`, `limit`, `webhooks_off`,
 `endpoint_disabled`, `queued` (a redelivery of a delivery still queued or being sent),
@@ -86,6 +102,7 @@ An endpoint as `webhooks.list` returns it:
   "eventTypes": ["thread.status_changed", "approval.requested"],
   "projectId": null,
   "pairedClientId": null,
+  "bearerTokenSet": false,
   "consecutiveFailures": 0,
   "disabledReason": null,
   "pendingDeliveries": 0,
@@ -218,6 +235,10 @@ drop batches it was not told about: a test event is sent the same way as any oth
 | `X-BibCode-Delivery`  | This delivery's id; a redelivery of the same event has a new one    |
 | `X-BibCode-Timestamp` | Unix seconds when this attempt was signed                           |
 | `X-BibCode-Signature` | `v1=` and the lowercase hex HMAC-SHA256 of `timestamp + "." + body` |
+| `Authorization`       | `Bearer <token>`, only when the endpoint has a bearer token         |
+
+Every request is signed, with or without a bearer token, and the signature does not cover
+`Authorization`. A receiver that checks only the token should still verify the signature.
 
 The HMAC key is the secret exactly as shown, `whsec_` prefix included, as UTF-8 bytes. The
 message is the decimal timestamp header, a `.`, then the raw body bytes. Each attempt,
@@ -287,8 +308,10 @@ export function verify(secret, headers, body /* Buffer */) {
 - A timeout, a connection or TLS error, a host that did not resolve, a `5xx` or a `429` is
   retried after 30 seconds, then 2, 5, 10 and 15 minutes: the first attempt and five
   retries over about 32 minutes. Then the delivery fails.
-- Any other answer fails at once: another `4xx`, a redirect, a refused address or URL, or a
-  missing secret (nothing is ever sent unsigned).
+- Any other answer fails at once: another `4xx` (a `401` or `403` from a wrong token
+  included), a redirect, a refused address or URL, a missing secret (nothing is ever sent
+  unsigned), or a bearer token whose file cannot be read (`token_missing`: nothing is ever
+  sent without the token; **Replace** sets a new one).
 - **Order.** One request at a time goes to each endpoint, always its oldest pending
   delivery, so a retrying delivery holds back that endpoint's later ones (order over
   throughput). At most eight endpoints have a request in flight at once. A test event or a
@@ -302,7 +325,7 @@ export function verify(secret, headers, body /* Buffer */) {
 Each delivery in `webhooks.listDeliveries` has `state` (`pending`, `sending`, `delivered`,
 `failed`, `abandoned`), `attempts`, `lastStatus`, `latencyMs`, `nextAttemptAt` and
 `lastError`, one of `status` (see `lastStatus`), `timeout`, `connect`, `unresolved`,
-`address_refused`, `url_refused`, `secret_missing`, `redirect`, `cancelled`, `queue_full`,
+`address_refused`, `url_refused`, `secret_missing`, `token_missing`, `redirect`, `cancelled`, `queue_full`,
 `endpoint_changed` or `interrupted` (a `sending` row a stop cut off, failed at the next start
 and never resent). Finished deliveries are kept 7 days, at most 1,000 per endpoint.
 
@@ -324,6 +347,11 @@ changed"), and a request in flight is cancelled. A delivery is stamped with the 
 was chosen under and is never sent under another one, so nothing queued for an old
 destination or filter reaches the new one, even across an edit and its undo. A test event or
 redelivery built before an edit is refused (`endpoint_changed`). Renaming keeps the queue.
+
+Changing only the bearer token is not a new revision: the queue is kept, and the next
+attempt sends the new token. A request already being sent finishes with the token it read,
+and the old token's file is removed only after it. Edits of one endpoint run one at a time,
+so two saves never mix one's URL with the other's token.
 
 ## Dropped deliveries
 
@@ -383,7 +411,9 @@ Catch up soon after a gap, especially after `dropped`, which means the gap was l
 
 ## Privacy and logs
 
-- The secret is a file in the secret store, never in settings, app state or logs.
+- The secret and the bearer token are files in the secret store, never in settings, app
+  state, logs, the delivery log, diagnostic bundles or profiler records. `webhooks.list`
+  says only whether a token is set.
 - A failed delivery is logged with the endpoint's id and the failure tag, never its URL,
   which may carry a token.
 - Payloads hold ids, kinds, statuses, cursors and counts only (see [Payload](#payload)).

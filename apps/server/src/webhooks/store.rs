@@ -1,4 +1,4 @@
-//! The webhook tables (migration 61): endpoints, the durable delivery queue and log, and the
+//! The webhook tables (migrations 61 and 66): endpoints, the durable delivery queue and log, and the
 //! dispatcher's positions. Every write that changes more than one row runs in one SQLite
 //! transaction, so a restart finds the queue and the positions agreeing.
 
@@ -51,6 +51,9 @@ pub(crate) struct Endpoint {
     /// Bumped by every edit that changes where its deliveries go or which events it gets,
     /// and by turning it off or on; each queued delivery is stamped with it.
     pub(crate) revision: i64,
+    /// The secret-store name of the file holding its bearer token, if it has one. Only this
+    /// name is ever in the row or in memory outside a send; never the token.
+    pub(crate) bearer_secret: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,7 +127,8 @@ fn now_iso() -> String {
 }
 
 const ENDPOINT_COLUMNS: &str = "endpoint_id, name, url, enabled, event_types_json, project_id, \
-    paired_session_id, consecutive_failures, disabled_reason, created_at, updated_at, revision";
+    paired_session_id, consecutive_failures, disabled_reason, created_at, updated_at, revision, \
+    bearer_secret";
 const DELIVERY_COLUMNS: &str = "sequence, delivery_id, endpoint_id, event_id, event_type, body, \
     state, attempts, next_attempt_ms, last_status, last_error, latency_ms, created_at, updated_at, \
     endpoint_revision";
@@ -144,6 +148,7 @@ fn decode_endpoint(row: &Row<'_>) -> rusqlite::Result<Endpoint> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         revision: row.get(11)?,
+        bearer_secret: row.get(12)?,
     })
 }
 
@@ -228,7 +233,7 @@ impl Store {
                     return Ok(Err(StoreError::Limit));
                 }
                 transaction.execute(
-                    &format!("INSERT INTO webhook_endpoints ({ENDPOINT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+                    &format!("INSERT INTO webhook_endpoints ({ENDPOINT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
                     params![
                         endpoint.id,
                         endpoint.name,
@@ -242,6 +247,7 @@ impl Store {
                         endpoint.created_at,
                         endpoint.updated_at,
                         endpoint.revision,
+                        endpoint.bearer_secret,
                     ],
                 )?;
                 transaction.commit()?;
@@ -251,10 +257,13 @@ impl Store {
     }
 
     /// Replaces an endpoint's editable fields. Turning it off abandons what it has queued;
-    /// turning it on clears its failure count and reason.
+    /// turning it on clears its failure count and reason. `bearer_secret` is written only
+    /// when `set_bearer` (the upsert carried `bearerToken`), in the same commit as the URL,
+    /// so an edit never writes back a name it read before another edit replaced it.
     pub(crate) async fn update_endpoint(
         &self,
         endpoint: Endpoint,
+        set_bearer: bool,
     ) -> std::result::Result<(), StoreError> {
         self.database
             .call(move |connection| {
@@ -286,6 +295,7 @@ impl Store {
                      consecutive_failures = CASE WHEN ?8 THEN 0 ELSE consecutive_failures END, \
                      disabled_reason = CASE WHEN ?4 THEN NULL ELSE disabled_reason END, \
                      revision = revision + CASE WHEN ?10 THEN 1 ELSE 0 END, \
+                     bearer_secret = CASE WHEN ?11 THEN ?12 ELSE bearer_secret END, \
                      updated_at = ?9 WHERE endpoint_id = ?1",
                     params![
                         endpoint.id,
@@ -298,6 +308,8 @@ impl Store {
                         turned_on,
                         now_iso(),
                         new_revision,
+                        set_bearer,
+                        endpoint.bearer_secret,
                     ],
                 )?;
                 if readdressed {

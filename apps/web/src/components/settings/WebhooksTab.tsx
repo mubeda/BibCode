@@ -1,6 +1,7 @@
 import {
   WEBHOOK_EVENT_CATEGORIES,
   type EnvironmentId,
+  type ExecutionEnvironmentCapabilities,
   type WebhookDelivery,
   type WebhookEndpoint,
   type WebhookEventType,
@@ -77,6 +78,15 @@ const HTTPS_URL = /^https:\/\/[^\s/@]+/i;
 
 const selectWebhooksEnabled = (settings: UnifiedSettings) => settings.enableWebhooks;
 
+/** What the environment's server offers beyond the first webhooks release. */
+export type WebhookCapabilities = Pick<
+  ExecutionEnvironmentCapabilities,
+  "webhookQuestionEvents" | "webhookBearerToken"
+>;
+
+/** How an edit treats the endpoint's bearer token. */
+type TokenChoice = "keep" | "replace" | "remove";
+
 /** The message of a failed command, or `null` when it succeeded or was interrupted. */
 function commandFailure(result: AtomCommandResult<unknown, unknown>, what: string): string | null {
   if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return null;
@@ -143,6 +153,7 @@ const ERROR_LABELS: Readonly<Record<string, string>> = {
   address_refused: "the host is a private address",
   url_refused: "not an https URL",
   secret_missing: "its secret is missing: rotate it",
+  token_missing: "its bearer token is missing: replace it",
   redirect: "redirects are not followed",
   cancelled: "cancelled",
   queue_full: "the queue was full",
@@ -154,14 +165,13 @@ export function WebhooksTab({
   environmentId,
   isPrimary,
   supported,
-  questionEvents,
+  capabilities,
 }: {
   readonly environmentId: EnvironmentId;
   readonly isPrimary: boolean;
   /** The server reports its settings (it is connected and new enough). */
   readonly supported: boolean;
-  /** The server offers the Questions events (`webhookQuestionEvents`). */
-  readonly questionEvents: boolean;
+  readonly capabilities: WebhookCapabilities;
 }) {
   const enabled = useEnvironmentSettings(environmentId, selectWebhooksEnabled);
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
@@ -195,7 +205,7 @@ export function WebhooksTab({
         environmentId={environmentId}
         enabled={enabled}
         isPrimary={isPrimary}
-        questionEvents={questionEvents}
+        capabilities={capabilities}
       />
     </>
   );
@@ -205,12 +215,12 @@ function EndpointsRow({
   environmentId,
   enabled,
   isPrimary,
-  questionEvents,
+  capabilities,
 }: {
   readonly environmentId: EnvironmentId;
   readonly enabled: boolean;
   readonly isPrimary: boolean;
-  readonly questionEvents: boolean;
+  readonly capabilities: WebhookCapabilities;
 }) {
   const access = usePrimaryAgentAccess();
   // The primary environment's session says whether it may read webhooks; elsewhere the
@@ -260,7 +270,7 @@ function EndpointsRow({
           <EndpointForm
             environmentId={environmentId}
             isPrimary={isPrimary}
-            questionEvents={questionEvents}
+            capabilities={capabilities}
             endpoint={null}
             onDone={(created) => {
               setAdding(false);
@@ -281,7 +291,7 @@ function EndpointsRow({
                 endpoint={endpoint}
                 webhooksOn={enabled}
                 isPrimary={isPrimary}
-                questionEvents={questionEvents}
+                capabilities={capabilities}
                 onChanged={list.refresh}
                 onSecret={(value) => setSecret({ name: endpoint.name, value })}
               />
@@ -335,7 +345,7 @@ function EndpointItem({
   endpoint,
   webhooksOn,
   isPrimary,
-  questionEvents,
+  capabilities,
   onChanged,
   onSecret,
 }: {
@@ -343,7 +353,7 @@ function EndpointItem({
   readonly endpoint: WebhookEndpoint;
   readonly webhooksOn: boolean;
   readonly isPrimary: boolean;
-  readonly questionEvents: boolean;
+  readonly capabilities: WebhookCapabilities;
   readonly onChanged: () => void;
   readonly onSecret: (secret: string) => void;
 }) {
@@ -401,7 +411,7 @@ function EndpointItem({
         <EndpointForm
           environmentId={environmentId}
           isPrimary={isPrimary}
-          questionEvents={questionEvents}
+          capabilities={capabilities}
           endpoint={endpoint}
           onDone={() => {
             setEditing(false);
@@ -650,13 +660,13 @@ function DeliveriesList({
 function EndpointForm({
   environmentId,
   isPrimary,
-  questionEvents,
+  capabilities,
   endpoint,
   onDone,
 }: {
   readonly environmentId: EnvironmentId;
   readonly isPrimary: boolean;
-  readonly questionEvents: boolean;
+  readonly capabilities: WebhookCapabilities;
   readonly endpoint: WebhookEndpoint | null;
   readonly onDone: (created: { readonly name: string; readonly value: string } | null) => void;
 }) {
@@ -669,7 +679,7 @@ function EndpointForm({
   const [name, setName] = useState(endpoint?.name ?? "");
   const [url, setUrl] = useState(endpoint?.url ?? "");
   // An older server refuses the Questions events, so they are neither shown nor chosen there.
-  const categories = questionEvents
+  const categories = capabilities.webhookQuestionEvents
     ? WEBHOOK_EVENT_CATEGORIES
     : WEBHOOK_EVENT_CATEGORIES.filter((category) => category.key !== "questions");
   const [events, setEvents] = useState<ReadonlySet<string>>(
@@ -683,12 +693,29 @@ function EndpointForm({
   const [pairedClientId, setPairedClientId] = useState<string | null>(
     endpoint?.pairedClientId ?? null,
   );
+  const [tokenChoice, setTokenChoice] = useState<TokenChoice>("keep");
+  const [token, setToken] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameId = useId();
   const urlId = useId();
+  const tokenId = useId();
   const urlValid = HTTPS_URL.test(url.trim());
-  const canSave = name.trim().length > 0 && urlValid && events.size > 0 && !saving;
+  const hasToken = endpoint?.bearerTokenSet === true;
+  const urlChanged = endpoint !== null && url.trim() !== endpoint.url;
+  // A new URL must not get the old receiver's token: the field opens and asks for one.
+  const tokenOpen =
+    capabilities.webhookBearerToken &&
+    (!hasToken || tokenChoice === "replace" || (urlChanged && tokenChoice === "keep"));
+  const tokenText = token.trim();
+  const tokenReason =
+    hasToken && tokenOpen && tokenText.length === 0
+      ? urlChanged
+        ? "Enter the token for the new URL, or remove it."
+        : "Enter the new token, or keep the current one."
+      : null;
+  const canSave =
+    name.trim().length > 0 && urlValid && events.size > 0 && tokenReason === null && !saving;
 
   const toggle = (event: WebhookEventType, checked: boolean) =>
     setEvents((current) => {
@@ -715,6 +742,12 @@ function EndpointForm({
         ],
         projectId,
         pairedClientId,
+        // Left out keeps the stored token; an older server is never sent the field.
+        ...(tokenChoice === "remove"
+          ? { bearerToken: null }
+          : tokenOpen && tokenText.length > 0
+            ? { bearerToken: tokenText }
+            : {}),
       },
     });
     setSaving(false);
@@ -761,6 +794,87 @@ function EndpointForm({
       {url.trim().length > 0 && !urlValid ? (
         <ReasonLine text="Use an https:// URL. Private network addresses are refused when sending." />
       ) : null}
+      {capabilities.webhookBearerToken ? (
+        <div className="space-y-1.5">
+          {tokenOpen ? (
+            <label className="block space-y-1" htmlFor={tokenId}>
+              <span className="text-xs font-medium text-foreground">Bearer token</span>
+              <Input
+                id={tokenId}
+                type="password"
+                autoComplete="off"
+                value={token}
+                placeholder={hasToken ? "New token" : "Optional"}
+                onChange={(event) => setToken(event.currentTarget.value)}
+              />
+            </label>
+          ) : (
+            <div className="text-xs font-medium text-foreground">Bearer token</div>
+          )}
+          {hasToken ? (
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span>
+                {tokenChoice === "remove"
+                  ? "The token is removed when you save."
+                  : "A token is set."}
+              </span>
+              {tokenChoice === "keep" && !urlChanged ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  type="button"
+                  onClick={() => setTokenChoice("replace")}
+                >
+                  Replace
+                </Button>
+              ) : null}
+              {tokenChoice === "remove" ? null : (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  type="button"
+                  onClick={() => {
+                    setTokenChoice("remove");
+                    setToken("");
+                  }}
+                >
+                  Remove
+                </Button>
+              )}
+              {tokenChoice === "remove" && urlChanged ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  type="button"
+                  onClick={() => setTokenChoice("replace")}
+                >
+                  Enter a token
+                </Button>
+              ) : null}
+              {tokenChoice === "keep" || urlChanged ? null : (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  type="button"
+                  onClick={() => {
+                    setTokenChoice("keep");
+                    setToken("");
+                  }}
+                >
+                  Keep current token
+                </Button>
+              )}
+            </div>
+          ) : null}
+          {tokenReason === null ? null : <ReasonLine text={tokenReason} />}
+          <p className="text-xs text-muted-foreground">
+            Sent as Authorization: Bearer with every request, for receivers that require it. It is
+            never shown again.
+          </p>
+        </div>
+      ) : (
+        <ReasonLine text="Update BiBCode on this environment to send a bearer token." />
+      )}
       <fieldset className="space-y-2">
         <legend className="text-xs font-medium text-foreground">Send these events</legend>
         <div className="grid gap-x-4 gap-y-3 sm:grid-cols-2">
@@ -781,7 +895,7 @@ function EndpointForm({
             </div>
           ))}
         </div>
-        {questionEvents ? null : (
+        {capabilities.webhookQuestionEvents ? null : (
           <ReasonLine text="Update BiBCode on this environment to send question events." />
         )}
         {events.size === 0 ? <ReasonLine text="Choose at least one event." /> : null}
