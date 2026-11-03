@@ -273,8 +273,7 @@ pub(crate) async fn run(
             report
         }
     };
-    print(&report, args.json, out, err);
-    report.code
+    print(&report, args.json, out, err)
 }
 
 async fn connect_and_execute(
@@ -315,18 +314,28 @@ async fn until_stopped(
     }
 }
 
-fn print(report: &Report, json: bool, out: &mut impl Write, err: &mut impl Write) {
-    if json {
-        let _ = writeln!(out, "{}", report.json);
+/// Prints `report` and returns its exit code; 1 when its result could not be written, since a
+/// script reading standard output would lose the thread and the id to retry with.
+fn print(report: &Report, json: bool, out: &mut impl Write, err: &mut impl Write) -> i32 {
+    let written = if json {
+        writeln!(out, "{}", report.json)
     } else {
-        for line in &report.text {
-            let _ = writeln!(out, "{line}");
-        }
+        report
+            .text
+            .iter()
+            .try_for_each(|line| writeln!(out, "{line}"))
     }
+    .and_then(|()| out.flush());
     for line in report.note.iter().flat_map(|note| note.lines()) {
         let _ = writeln!(err, "bibcode: {line}");
     }
-    let _ = out.flush();
+    match written {
+        Ok(()) => report.code,
+        Err(error) => {
+            let _ = writeln!(err, "bibcode: could not write the result: {error}");
+            1
+        }
+    }
 }
 
 /// The message a `start` or `send` names, or the answers of an `answer`: its argument, or
