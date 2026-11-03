@@ -158,6 +158,42 @@ async fn mcp_sessions(
     rows
 }
 
+/// Ctrl-C, or a dropped call, after the server made the session but before the caller heard
+/// back: `revoke` waits for that sign-in to finish and revokes its credential, so none is
+/// left live and untracked.
+#[tokio::test]
+async fn a_sign_in_dropped_after_the_server_made_the_session_is_still_revoked() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    *connection.hold_after_sign_in.lock().unwrap() = Some((reached_tx, resume_rx));
+    tokio::select! {
+        biased;
+        _ = reached => {}
+        called = connection.call_tool(1, "server_capabilities", json!({}), "MCP · test") => {
+            panic!("the sign-in was not held: {called:?}");
+        }
+    }
+    // The call is dropped here, as Ctrl-C drops it; the server has made the session.
+    let live = |sessions: &[(String, Option<String>, Option<String>, Option<String>)]| {
+        sessions
+            .iter()
+            .filter(|session| session.3.is_none())
+            .count()
+    };
+    assert_eq!(live(&mcp_sessions(root.path()).await), 1);
+    tokio::join!(connection.revoke(), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = resume.send(());
+    });
+    let sessions = mcp_sessions(root.path()).await;
+    assert_eq!(live(&sessions), 0, "{sessions:?}");
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
 async fn mcp_links(root: &Path) -> i64 {
     let (repositories, database) = repositories(root).await;
     let count = repositories
@@ -843,10 +879,11 @@ async fn a_legacy_clients_version_is_sent_on_every_later_request() {
             endpoint: Mutex::new(Endpoint {
                 base: format!("http://127.0.0.1:{port}/").parse().unwrap(),
             }),
-            credential: Mutex::new(Some(Credential {
+            credential: Arc::new(Mutex::new(Some(Credential {
                 token: "test-bearer".into(),
                 session_id: "test-session".into(),
-            })),
+            }))),
+            hold_after_sign_in: std::sync::Mutex::new(None),
         },
         legacy_version: std::sync::Mutex::new(None),
     };
