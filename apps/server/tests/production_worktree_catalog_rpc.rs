@@ -4678,8 +4678,9 @@ impl CatalogRpcFixture {
         let external = root.path().join("external");
         fs::create_dir(&main).expect("primary directory");
         git(&main, &["init", "--initial-branch", "main"], None);
-        // Production Git ignores the system config, so a host `core.autocrlf=true` would make
-        // the checkout look dirty to it (docs/testing/windows-desktop.md).
+        // Test servers never install the system line-ending policy, so their Git ignores a
+        // host `core.autocrlf=true` that the fixture's Git reads; the checkout would look
+        // dirty to them (docs/testing/windows-desktop.md).
         git(&main, &["config", "core.autocrlf", "false"], None);
         git(
             &main,

@@ -181,6 +181,7 @@ pub async fn run_cli() -> Result<(), RunError> {
 
 async fn run_server(config: ServerConfig) -> Result<(), RunError> {
     let open_browser = !config.no_browser;
+    git::system_line_endings::install_once(&config.state_dir()).await;
     let handle = ServerRuntime::start_standalone(config).await?;
     let http_base_url = format!("http://{}", handle.local_addr());
     let browser_target = handle
