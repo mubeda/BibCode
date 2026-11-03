@@ -1430,7 +1430,9 @@ async fn a_sweep_racing_a_record_being_written_leaves_the_live_relay_signed_in()
         let first = Arc::clone(&first);
         async move { first.list_tools(1, "MCP · first").await }
     });
-    reached.await.expect("publication held");
+    reached
+        .await
+        .expect("the record file is created, still empty");
     let second = Connection::open(options(root.path())).await.expect("opens");
     resume.send(()).unwrap();
     let listed = call.await.unwrap();

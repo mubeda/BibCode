@@ -256,7 +256,7 @@ struct SignInPlan {
     lose_token_response: bool,
     /// The task ends right after the server answered, as a process death would.
     die_after_send: bool,
-    /// Held once the first record's temporary file is written.
+    /// Held once the first record's file is created, before its contents are written.
     hold_publication: Option<SignInHold>,
 }
 
@@ -871,24 +871,25 @@ async fn publish_record(state_dir: &Path, name: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let path = record_path(state_dir, name);
     let temporary = record_path(state_dir, &format!("{name}.tmp-{}", std::process::id()));
-    let written = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| {
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(
-                json!({
-                    "pid": std::process::id(),
-                    "processStartedAt": process_started_at(std::process::id()),
-                })
-                .to_string()
-                .as_bytes(),
-            )?;
-            file.sync_all()
-        });
-    #[cfg(test)]
-    reach(&HOLD_PUBLICATION).await;
-    let published = written.and_then(|()| std::fs::rename(&temporary, &path));
+    let published = async {
+        path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+        let mut file = std::fs::File::create(&temporary)?;
+        // A test holds here, with the file created and still empty.
+        #[cfg(test)]
+        reach(&HOLD_PUBLICATION).await;
+        file.write_all(
+            json!({
+                "pid": std::process::id(),
+                "processStartedAt": process_started_at(std::process::id()),
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)
+    }
+    .await;
     if published.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
