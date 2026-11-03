@@ -80,6 +80,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "webhookBearerToken": true,
             "webhookStatusKinds": true,
             "sideChats": true,
+            "threadDeleteOnlyIfUnused": true,
         },
     })
 }
@@ -1305,6 +1306,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
         assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
+        assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // A client asks for `server.downloadDiagnosticLogs` only when this is set (#194).

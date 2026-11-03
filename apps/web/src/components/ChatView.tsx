@@ -114,6 +114,8 @@ import {
   parseStandaloneComposerBiBCodeAction,
 } from "../composer-logic";
 import { resolveSideChatAvailability } from "../sideChatAvailability";
+import { composeSideChatBringBack } from "../sideChatBringBack";
+import { SideChatBringBack } from "./chat/SideChatBringBack";
 import { buildPanelMenuModel, PROVIDER_NOT_READY_REASON } from "./chat/ChatHeaderPanelMenu.logic";
 import {
   derivePendingApprovals,
@@ -205,6 +207,7 @@ import {
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
 import { takeComposerFocusRequest, useCenterPanelActions } from "../centerPanelActions";
+import { markChatPanelSent } from "../centerPanelClose";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -1092,7 +1095,17 @@ function ChatViewContent(props: ChatViewProps) {
   const setThreadInteractionMode = useAtomCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
-  const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const startThreadTurnCommand = useAtomCommand(threadEnvironment.startTurn, {
+    reportFailure: false,
+  });
+  // Every send is noted first, so closing an unused side chat while it goes out archives it.
+  const startThreadTurn = useCallback<typeof startThreadTurnCommand>(
+    (value, runOptions) => {
+      markChatPanelSent(scopeThreadRef(value.environmentId, value.input.threadId));
+      return startThreadTurnCommand(value, runOptions);
+    },
+    [startThreadTurnCommand],
+  );
   const stageAttachments = useAtomCommand(threadEnvironment.stageAttachments, {
     reportFailure: false,
   });
@@ -2745,6 +2758,19 @@ function ChatViewContent(props: ChatViewProps) {
     return byMessageId;
   }, [turnDiffSummaries]);
   const isSideChat = activeThread?.sideChat === true;
+  const sideChatHostThreadId = isSideChat ? (activeThread?.hostThreadId ?? null) : null;
+  const sideChatEnvironmentId = activeThread?.environmentId ?? null;
+  const sideChatHostRef = useMemo(
+    () =>
+      sideChatEnvironmentId !== null && sideChatHostThreadId !== null
+        ? scopeThreadRef(sideChatEnvironmentId, sideChatHostThreadId)
+        : null,
+    [sideChatEnvironmentId, sideChatHostThreadId],
+  );
+  const bringBackSummary = useMemo(
+    () => (isSideChat ? composeSideChatBringBack(activeThread?.messages ?? []) : null),
+    [activeThread?.messages, isSideChat],
+  );
   const revertTurnCountByUserMessageId = useMemo(() => {
     const byUserMessageId = new Map<MessageId, number>();
     // A side chat shares its host's checkout and cannot restore files (the server refuses).
@@ -7345,6 +7371,9 @@ function ChatViewContent(props: ChatViewProps) {
                               onLayoutChange={reportComposerOverlayLayout}
                             />
                           </div>
+                        ) : null}
+                        {sideChatHostRef !== null ? (
+                          <SideChatBringBack hostRef={sideChatHostRef} summary={bringBackSummary} />
                         ) : null}
                         <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
                         <div className="relative z-10">

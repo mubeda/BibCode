@@ -1477,6 +1477,22 @@ impl Repositories {
             })
             .await
     }
+    /// Whether `thread_id` has any message (queued ones included) or turn (pending ones
+    /// included): what `thread.delete` with `onlyIfUnused` refuses.
+    pub async fn thread_has_messages_or_turns(&self, thread_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM projection_thread_messages WHERE thread_id = ?1) \
+                         OR EXISTS(SELECT 1 FROM projection_turns WHERE thread_id = ?1)",
+                        [thread_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+    }
     pub async fn delete_activities_by_thread(&self, thread_id: String) -> Result<()> {
         self.delete(
             "DELETE FROM projection_thread_activities WHERE thread_id = ?",

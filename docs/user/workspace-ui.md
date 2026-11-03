@@ -508,14 +508,25 @@ the main thread.
 Side chats follow the chat panel rules: hidden from the left panel and Settings
 → Archived, an Inbox row opens the thread with the side chat active, closing
 archives it, **Reopen closed chat** lists it, and deleting the thread deletes
-it. **Side chat** and `:btw` are unavailable inside a chat panel or side chat
-("Side chats start from the main chat. Use :btw there."), on a server too old to
-support them ("This server doesn't support side chats. Update it to use
-them."), before the thread has started, and while the thread's provider is not
-ready. The menu item stays visible with its reason; a refused `:btw` keeps your
-text and shows the reason under the composer. A `:btw` with attachments or
-contexts is refused too, so nothing is split between two chats. If the question
-can't be sent, it waits in the side chat's composer.
+it. One exception: closing a side chat nobody ever sent a message to deletes it,
+so **Reopen closed chat** does not fill with empty ones. If someone sent it a
+message meanwhile, on any client, it is archived as usual. A server too old to
+refuse deleting a used side chat always archives it. **Side chat** and `:btw`
+are unavailable inside a chat panel or side chat ("Side chats start from the
+main chat. Use :btw there."), on a server too old to support them ("This server
+doesn't support side chats. Update it to use them."), before the thread has
+started, and while the thread's provider is not ready. The menu item stays
+visible with its reason; a refused `:btw` keeps your text and shows the reason
+under the composer. A `:btw` with attachments or contexts is refused too, so
+nothing is split between two chats. If the question can't be sent, it waits in
+the side chat's composer.
+
+**Bring back**, above the side chat's composer, puts the side chat's last answer,
+quoted under "From the side chat:", into the thread's composer as a draft and
+shows the thread. Anything already typed there stays, with the answer after it.
+Nothing is sent: read, edit and send it yourself. It is unavailable while the
+thread is working ("Available when the thread is idle.") and before the side
+chat has answered.
 
 The composer's **History** button (left of **Attach files**) brings back
 earlier work for the thread, in a chat panel's composer too, where it acts for

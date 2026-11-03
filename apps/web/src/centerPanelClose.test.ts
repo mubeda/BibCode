@@ -7,6 +7,9 @@
  * arrive late, out of order or never, against a reopen here and a reopen by another client.
  * An archive whose outcome is uncertain is never retried, so this page never closes a panel
  * someone else reopened; such a row says so: the panel comes back as a tab instead.
+ * Every row runs again against a server that deletes an unused side chat: a side chat closed
+ * before anything was sent to it ends deleted instead of archived, and everything else ends as
+ * the row says. More rows race the delete against a send, here and on another client.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@bibcode/contracts";
@@ -22,7 +25,18 @@ const h = vi.hoisted(() => {
   };
   return {
     deferred,
-    server: new Map<string, { archived: boolean }>(),
+    server: new Map<
+      string,
+      { archived: boolean; deleted?: boolean; used?: boolean; sideChat?: boolean }
+    >(),
+    /** The server advertises `threadDeleteOnlyIfUnused`. */
+    deletesUnused: false,
+    /** `thread.delete` requests this page sent. */
+    deletes: 0,
+    nextDeleteReply: "normal" as "normal" | "lose-reply" | "drop",
+    /** The next send waits for the test before the server takes it. */
+    holdNextSend: false,
+    heldSend: null as null | { resolve: () => void },
     archivedTimes: new Map<string, number>(),
     sent: [] as string[],
     drafts: new Map<string, string>(),
@@ -44,7 +58,7 @@ function serverArchive(
 ): Promise<{ _tag: string; cause?: unknown; interrupted?: boolean; value?: unknown }> {
   const apply = () => {
     const thread = h.server.get(threadId);
-    if (!thread || thread.archived) {
+    if (!thread || thread.archived || thread.deleted) {
       return { _tag: "Failure", cause: new Error(`Thread '${threadId}' cannot be archived.`) };
     }
     thread.archived = true;
@@ -74,7 +88,51 @@ function serverArchive(
   return held.promise.then(apply);
 }
 
+/** The server's answer to `thread.delete` with `onlyIfUnused`. */
+function serverDelete(
+  threadId: string,
+): Promise<{ _tag: string; cause?: unknown; interrupted?: boolean; value?: unknown }> {
+  h.deletes += 1;
+  const reply = h.nextDeleteReply;
+  h.nextDeleteReply = "normal";
+  if (reply === "drop") return Promise.resolve({ _tag: "Failure", interrupted: true, cause: null });
+  const thread = h.server.get(threadId);
+  let result: { _tag: string; cause?: unknown; value?: unknown };
+  if (!thread || thread.deleted) {
+    result = { _tag: "Failure", cause: new Error(`Thread '${threadId}' does not exist.`) };
+  } else if (thread.used) {
+    result = {
+      _tag: "Failure",
+      cause: { _tag: "OrchestrationThreadInUseError", message: "Used.", threadId },
+    };
+  } else {
+    thread.deleted = true;
+    h.sequence += 1;
+    result = { _tag: "Success", value: { sequence: h.sequence } };
+  }
+  if (reply === "lose-reply") {
+    return Promise.resolve({ _tag: "Failure", interrupted: true, cause: null });
+  }
+  return Promise.resolve(result);
+}
+
+/** The server takes a send: the thread is used from then on. */
+function serverSend(threadId: string): { _tag: string; cause?: unknown } {
+  const thread = h.server.get(threadId);
+  if (!thread || thread.deleted) {
+    return { _tag: "Failure", cause: new Error(`Thread '${threadId}' is deleted.`) };
+  }
+  thread.used = true;
+  h.sequence += 1;
+  return { _tag: "Success" };
+}
+
 vi.mock("react", () => ({ useCallback: (callback: unknown) => callback }));
+vi.mock("~/state/session", () => ({
+  readPreparedConnection: () => ({
+    descriptor: { capabilities: { threadDeleteOnlyIfUnused: h.deletesUnused } },
+  }),
+}));
 vi.mock("@bibcode/client-runtime/state/runtime", () => ({
   isAtomCommandInterrupted: (result: { interrupted?: boolean }) => result.interrupted === true,
   squashAtomCommandFailure: (result: { cause?: unknown }) => result.cause,
@@ -113,6 +171,7 @@ vi.mock("~/state/worktrees", () => ({ worktreeEnvironment: { createPanel: "creat
 vi.mock("~/state/threads", () => ({
   threadEnvironment: {
     archive: "archive",
+    delete: "delete",
     unarchive: "unarchive",
     interruptTurn: "interrupt",
     startTurn: "start-turn",
@@ -121,8 +180,12 @@ vi.mock("~/state/threads", () => ({
 vi.mock("~/state/entities", () => ({
   readThreadShell: (ref: { threadId: string }) => {
     const thread = h.server.get(ref.threadId);
-    return thread
-      ? { archivedAt: thread.archived ? "2026-11-03T00:00:00Z" : null, session: null }
+    return thread && !thread.deleted
+      ? {
+          archivedAt: thread.archived ? "2026-11-03T00:00:00Z" : null,
+          session: null,
+          ...(thread.sideChat ? { sideChat: true } : {}),
+        }
       : null;
   },
 }));
@@ -135,6 +198,10 @@ vi.mock("~/state/use-atom-command", () => ({
         return reply.promise;
       },
       archive: ({ input }: { input: { threadId: string } }) => serverArchive(input.threadId),
+      delete: ({ input }: { input: { threadId: string; onlyIfUnused?: boolean } }) => {
+        expect(input.onlyIfUnused).toBe(true);
+        return serverDelete(input.threadId);
+      },
       unarchive: ({ input }: { input: { threadId: string } }) => {
         const thread = h.server.get(input.threadId);
         if (thread?.archived) {
@@ -145,9 +212,13 @@ vi.mock("~/state/use-atom-command", () => ({
       },
       interrupt: () => Promise.resolve({ _tag: "Success" }),
       open: () => Promise.resolve({ _tag: "Success" }),
-      "start-turn": ({ input }: { input: { message: { text: string } } }) => {
+      "start-turn": ({ input }: { input: { threadId: string; message: { text: string } } }) => {
         h.sent.push(input.message.text);
-        return Promise.resolve({ _tag: "Success" });
+        if (!h.holdNextSend) return Promise.resolve(serverSend(input.threadId));
+        h.holdNextSend = false;
+        const held = h.deferred<void>();
+        h.heldSend = { resolve: () => held.resolve() };
+        return held.promise.then(() => serverSend(input.threadId));
       },
     })[command],
 }));
@@ -165,6 +236,11 @@ const SUBMITTED = `:btw ${QUESTION}`;
 
 type Outcome = "success" | "failure" | "interrupted";
 type Step =
+  | "hold-send"
+  | "release-send"
+  | "remote-send"
+  | "lose-delete-reply"
+  | "drop-delete"
   | "reopen-here"
   | "remote-reopen"
   | "remote-archive"
@@ -402,7 +478,8 @@ const flush = async () => {
 };
 
 async function play(row: Row, sideChat: boolean) {
-  const hostId = ThreadId.make(`host-${row.name}`);
+  // Unique per play: a creation an earlier play left waiting keeps its host busy.
+  const hostId = ThreadId.make(`host-${h.nextThread + 1}-${row.name}`);
   const hostRef = scopeThreadRef(ENV, hostId);
   const panelId = ThreadId.make(`panel-${h.nextThread + 1}`);
   const panelRef = scopeThreadRef(ENV, panelId);
@@ -440,7 +517,7 @@ async function play(row: Row, sideChat: boolean) {
       id === hostId
         ? [{ id: hostId, kind: "workspace" as const, title: "Host", archivedAt: null }]
         : // The live shell leaves archived threads out.
-          id === panelId && !thread.archived
+          id === panelId && !thread.archived && !thread.deleted
           ? [
               {
                 id: panelId,
@@ -484,7 +561,7 @@ async function play(row: Row, sideChat: boolean) {
   for (const step of row.steps) {
     switch (step) {
       case "commit":
-        h.server.set(panelId, { archived: false });
+        h.server.set(panelId, { archived: false, ...(sideChat ? { sideChat: true } : {}) });
         h.sequence += 1;
         break;
       case "snapshot":
@@ -559,6 +636,24 @@ async function play(row: Row, sideChat: boolean) {
       case "release-archive":
         h.heldArchive?.resolve();
         break;
+      case "hold-send":
+        h.holdNextSend = true;
+        break;
+      case "release-send":
+        h.heldSend?.resolve();
+        break;
+      case "remote-send": {
+        // Another client's first send lands.
+        const thread = h.server.get(panelId);
+        if (thread) thread.used = true;
+        break;
+      }
+      case "lose-delete-reply":
+        h.nextDeleteReply = "lose-reply";
+        break;
+      case "drop-delete":
+        h.nextDeleteReply = "drop";
+        break;
       case "interleaved-deltas":
         // Another thread changed after the archive, in the same publication; the shell
         // streams per-thread deltas, and that thread's comes first. Between the two items the
@@ -589,8 +684,12 @@ async function play(row: Row, sideChat: boolean) {
     await flush();
     if (closed && tabIds().includes(`chat:${panelId}`)) tabReturned = true;
   }
+  const isArchived = () => {
+    const thread = h.server.get(panelId);
+    return thread?.archived === true && thread.deleted !== true;
+  };
   const judgedNow = {
-    archived: h.server.get(panelId)?.archived ?? false,
+    archived: isArchived(),
     shown: tabIds().includes(`chat:${panelId}`),
   };
   // Later snapshots, as the shell keeps streaming.
@@ -611,10 +710,11 @@ async function play(row: Row, sideChat: boolean) {
   const ended = row.withoutMoreSnapshots
     ? judgedNow
     : {
-        archived: h.server.get(panelId)?.archived ?? false,
+        archived: isArchived(),
         shown: tabIds().includes(`chat:${panelId}`),
       };
   return {
+    deleted: h.server.get(panelId)?.deleted === true,
     outcome: {
       archived: ended.archived,
       archives: h.archivedTimes.get(panelId) ?? 0,
@@ -645,6 +745,49 @@ function expectSettled(row: Row, result: Awaited<ReturnType<typeof play>>, sideC
   expect(result.leaked).toEqual({});
 }
 
+/** Where a side chat closed before anything was sent to it ends on a deleting server. */
+const DELETED: Expected = { archived: false, archives: 0, shown: false, neverReturned: true };
+
+/** Closes racing a delete's reply or a send, on a server that deletes unused side chats. */
+function deleteRows(): Array<Row & { readonly deleted: boolean }> {
+  return [
+    {
+      // An uncertain delete is not retried: the tab comes back from the held shell until a
+      // newer shell drops the deleted panel.
+      name: "lost delete reply",
+      outcome: "success",
+      steps: ["commit", "snapshot", "lose-delete-reply", "close", "respond", "snapshot"],
+      expected: { ...DELETED, neverReturned: false },
+      deleted: true,
+    },
+    {
+      name: "a delete that never reached the server",
+      outcome: "success",
+      steps: ["commit", "snapshot", "drop-delete", "close", "respond", "snapshot"],
+      expected: RETURNS(0),
+      deleted: false,
+    },
+    {
+      // This page's first send is still on its way when the tab closes: archived, not deleted,
+      // and the question was handed over.
+      name: "closed while this page's first send is on its way",
+      outcome: "success",
+      steps: ["commit", "snapshot", "hold-send", "respond", "close", "release-send", "snapshot"],
+      expected: CLOSED,
+      deleted: false,
+    },
+    {
+      // Another client's first send landed before this page's close: the delete is refused and
+      // the side chat is archived.
+      name: "another client's first send lands before the close",
+      outcome: "success",
+      steps: ["commit", "snapshot", "remote-send", "close", "respond", "snapshot"],
+      expected: CLOSED,
+      deleted: false,
+    },
+  ];
+}
+
 describe("closing a chat panel in every ordering", () => {
   const all = [...rows(), ...replyRows(), ...creationRows(), ...delayedShellRows()].map(
     (row) => [row.name, row] as const,
@@ -652,11 +795,53 @@ describe("closing a chat panel in every ordering", () => {
 
   it.each(all)("side chat: %s", async (_name, row) => {
     h.sent.length = 0;
-    expectSettled(row, await play(row, true), true);
+    h.deletesUnused = false;
+    h.deletes = 0;
+    const result = await play(row, true);
+    expectSettled(row, result, true);
+    // An older server is never asked to delete.
+    expect({ deletes: h.deletes, deleted: result.deleted }).toEqual({ deletes: 0, deleted: false });
   });
 
   it.each(all)("plain panel: %s", async (_name, row) => {
     h.sent.length = 0;
+    h.deletesUnused = false;
     expectSettled(row, await play(row, false), false);
   });
+
+  it.each(all)("side chat on a server that deletes unused ones: %s", async (_name, row) => {
+    h.sent.length = 0;
+    h.deletesUnused = true;
+    const result = await play(row, true);
+    // Closed before anything was sent to it: deleted where the row archives it.
+    const deleted = row.expected.archived && !result.sentBeforeClose;
+    expectSettled(
+      deleted
+        ? { ...row, expected: { ...DELETED, neverReturned: row.expected.neverReturned } }
+        : row,
+      result,
+      true,
+    );
+    expect(result.deleted).toBe(deleted);
+  });
+
+  it.each(all)("plain panel on a server that deletes unused ones: %s", async (_name, row) => {
+    h.sent.length = 0;
+    h.deletesUnused = true;
+    h.deletes = 0;
+    const result = await play(row, false);
+    expectSettled(row, result, false);
+    expect({ deletes: h.deletes, deleted: result.deleted }).toEqual({ deletes: 0, deleted: false });
+  });
+
+  it.each(deleteRows().map((row) => [row.name, row] as const))(
+    "side chat delete race: %s",
+    async (_name, row) => {
+      h.sent.length = 0;
+      h.deletesUnused = true;
+      const result = await play(row, true);
+      expectSettled(row, result, true);
+      expect(result.deleted).toBe(row.deleted);
+    },
+  );
 });

@@ -358,11 +358,17 @@ first-turn latency in the e2e run before changing it.
 
 - **Unused close deletes.** `thread.delete` gains `onlyIfUnused`, which the engine refuses
   when the thread has any message or turn, so a close racing a first send on another client
-  archives instead. The client sends it only for a side chat.
+  archives instead. The client sends it only for a side chat. As built: the refusal is its
+  own error, `OrchestrationThreadInUseError`, and the client sends the field only to a server
+  that advertises `capabilities.threadDeleteOnlyIfUnused`, because an older server's command
+  decoder ignores unknown fields and would delete a used side chat.
 - **Bring back.** A side chat action that writes a quoted summary of its last answer into the
   host composer as a draft. Never sent automatically. Disabled while the host runs, with
   "Available when the thread is idle." The summary is composed on the client from the side
-  chat's messages; no new RPC.
+  chat's messages; no new RPC. As built: it writes "From the side chat:" and the last finished
+  answer as a Markdown quote, with no question (the client cannot pair an answer with the
+  message that started its turn reliably), is appended after any text already in the host draft, and is also disabled
+  ("Available once the side chat answers.") before the first answer.
 - **Host file restore guard: deferred out of #265 to its own issue** (review finding 7). A
   check in `plan_revert` races: a revert reserves only its own thread's turns
   (`orchestration_effects.rs:934`), so a sibling can start a turn between the check and the
