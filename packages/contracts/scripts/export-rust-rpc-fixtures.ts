@@ -782,11 +782,13 @@ dynamicFixtures.set(
     headers: [],
   } satisfies RpcMessage.RequestEncoded),
 );
-// `webhooks.upsert` with its bearer token absent (kept), `null` (removed) and set.
-for (const [name, bearerToken] of [
-  ["token-absent", undefined],
-  ["token-null", null],
-  ["token-set", "fixture-token"],
+// `webhooks.upsert` with its bearer token absent (kept), `null` (removed) and set, and with
+// a status-kind filter.
+for (const [name, bearerToken, statusKinds] of [
+  ["token-absent", undefined, undefined],
+  ["token-null", null, undefined],
+  ["token-set", "fixture-token", undefined],
+  ["status-kinds", undefined, ["turn.completed", "turn.failed"]],
 ] as const) {
   dynamicFixtures.set(
     `contract-shapes/webhooks__upsert-${name}-request.json`,
@@ -801,6 +803,7 @@ for (const [name, bearerToken] of [
         enabled: true,
         eventTypes: ["thread.status_changed"],
         ...(bearerToken === undefined ? {} : { bearerToken }),
+        ...(statusKinds === undefined ? {} : { statusKinds }),
       }),
       headers: [],
     } satisfies RpcMessage.RequestEncoded),

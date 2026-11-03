@@ -24,6 +24,19 @@ export const WEBHOOK_EVENT_CATEGORIES = [
   { key: "diagnostics", events: ["profiler.finding"] },
 ] as const;
 
+/**
+ * The change-feed kinds a `thread.status_changed` event carries as its `kind`. An endpoint
+ * may choose among them (`statusKinds`).
+ */
+export const WEBHOOK_STATUS_KINDS = [
+  "turn.started",
+  "turn.completed",
+  "turn.interrupted",
+  "turn.failed",
+  "session.status",
+] as const;
+export type WebhookStatusKind = (typeof WEBHOOK_STATUS_KINDS)[number];
+
 export const WebhookEventType = Schema.Literals([
   "thread.status_changed",
   "worktree.created",
@@ -74,6 +87,13 @@ export const WebhookEndpoint = Schema.Struct({
    * an older server, which has none, leaves this out.
    */
   bearerTokenSet: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * The `thread.status_changed` kinds it is sent, or `null` for all of them. Strings, like
+   * `eventTypes`; an older server, which has no filter, leaves this out.
+   */
+  statusKinds: Schema.NullOr(Schema.Array(Schema.String)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   consecutiveFailures: NonNegativeInt,
   disabledReason: Schema.NullOr(WebhookDisabledReason),
   pendingDeliveries: NonNegativeInt,
@@ -151,6 +171,12 @@ export const WebhooksUpsertInput = Schema.Struct({
    * `webhookBearerToken`.
    */
   bearerToken: Schema.optional(Schema.NullOr(Schema.String)),
+  /**
+   * Absent keeps the endpoint's `thread.status_changed` filter, `null` sends every kind and a
+   * list only those (`WEBHOOK_STATUS_KINDS`, at least one). Send it only to a server that
+   * advertises `webhookStatusKinds`.
+   */
+  statusKinds: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
 });
 export type WebhooksUpsertInput = typeof WebhooksUpsertInput.Type;
 export const WebhooksUpsertResult = Schema.Struct({

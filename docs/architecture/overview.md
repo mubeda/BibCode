@@ -2869,9 +2869,11 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md),
   the checked addresses only (reqwest's resolve override, every other name refused),
   ignores proxies, follows no redirects, and gives up after 10 seconds without
   reading the body.
-- **Content.** Payloads carry ids, kinds, statuses and the feed cursor (or a
-  finding's `{ id, count, lastSeen }`); an agent is its kind and opaque client id,
-  never its label. Each body is HMAC-SHA256 signed over its timestamp with
+- **Content.** Payloads carry ids (the thread's and its project's), kinds, statuses and
+  the feed cursor (or a finding's `{ id, count, lastSeen }`); an agent is its kind and
+  opaque client id, never its label. An endpoint may limit `thread.status_changed` to
+  some feed kinds (`status_kinds_json`, migration 68; NULL sends all), which `address`
+  applies and a change of which is a new revision. Each body is HMAC-SHA256 signed over its timestamp with
   the endpoint's secret, kept in the secret store as `webhook-<id>`.
 - **Bearer token (#271).** An endpoint may also send `Authorization: Bearer`. Each
   token value is its own secret-store file, `webhook-bearer-<id>-<32 hex>`, and the

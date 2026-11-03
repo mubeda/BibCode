@@ -30,6 +30,16 @@ describe("webhook contracts across versions", () => {
     const list = decodeList({ enabled: true, endpoints: [olderEndpoint], maxEndpoints: 20 });
     expect(list.endpoints[0]!.eventTypes).toEqual(["thread.status_changed"]);
     expect(list.endpoints[0]!.bearerTokenSet).toBe(false);
+    expect(list.endpoints[0]!.statusKinds).toBeNull();
+  });
+
+  it("keeps a status kind a newer server added", () => {
+    const list = decodeList({
+      enabled: true,
+      endpoints: [{ ...olderEndpoint, statusKinds: ["turn.completed", "future.kind"] }],
+      maxEndpoints: 20,
+    });
+    expect(list.endpoints[0]!.statusKinds).toEqual(["turn.completed", "future.kind"]);
   });
 
   it("keeps an event type a newer server added", () => {
@@ -45,5 +55,6 @@ describe("webhook contracts across versions", () => {
     const capabilities = decodeCapabilities({});
     expect(capabilities.webhookQuestionEvents).toBe(false);
     expect(capabilities.webhookBearerToken).toBe(false);
+    expect(capabilities.webhookStatusKinds).toBe(false);
   });
 });

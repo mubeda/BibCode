@@ -943,6 +943,14 @@ impl Webhooks {
                         .project_id
                         .as_ref()
                         .is_none_or(|project| event.project_id.as_ref() == Some(project))
+                    && (event.event_type != events::THREAD_STATUS_CHANGED
+                        || endpoint.status_kinds.as_ref().is_none_or(|kinds| {
+                            event
+                                .fields
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| kinds.iter().any(|chosen| chosen == kind))
+                        }))
             }) {
                 deliveries.push(NewDelivery {
                     delivery_id: uuid::Uuid::new_v4().to_string(),

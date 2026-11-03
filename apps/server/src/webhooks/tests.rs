@@ -2544,3 +2544,86 @@ async fn a_rename_racing_a_url_and_token_change_never_pairs_the_old_url_with_the
     assert_eq!(received[0].header("Authorization"), bearer(TOKEN_B));
     harness.webhooks.shutdown().await;
 }
+
+/// An endpoint whose status filter leaves out `turn.started` gets only the turn's completion;
+/// one with no filter gets both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_that_skips_turn_started_gets_no_such_delivery() {
+    let harness = Harness::new().await;
+    let created = harness
+        .call(
+            "upsert",
+            json!({ "name": "Done only", "url": harness.receiver.url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED], "statusKinds": ["turn.completed"] }),
+        )
+        .await
+        .expect("an endpoint");
+    assert_eq!(
+        created["endpoint"]["statusKinds"],
+        json!(["turn.completed"])
+    );
+    let filtered = created["endpoint"]["id"].as_str().unwrap().to_owned();
+    let (every, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    harness.turn("thread-1", "turn-1").await;
+    let received = wait_for_requests(&harness.receiver, 3).await;
+    let mut kinds: Vec<String> = received
+        .iter()
+        .map(|request| request.json()["kind"].as_str().unwrap().to_owned())
+        .collect();
+    kinds.sort();
+    assert_eq!(kinds, ["turn.completed", "turn.completed", "turn.started"]);
+    assert_eq!(harness.deliveries(&filtered).await.len(), 1);
+    assert_eq!(harness.deliveries(&every).await.len(), 2);
+    harness.webhooks.shutdown().await;
+}
+
+/// `statusKinds` absent keeps the stored filter (an older client's save), `null` sends every
+/// kind, and a change is a new revision; unknown and empty lists are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upsert_without_status_kinds_keeps_them_and_null_clears_them() {
+    let harness = Harness::new().await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let listed = harness.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["endpoints"][0]["statusKinds"], Value::Null);
+    let set = harness
+        .edit(
+            &id,
+            json!({ "statusKinds": ["turn.failed", "turn.completed", "turn.failed"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        set["endpoint"]["statusKinds"],
+        json!(["turn.completed", "turn.failed"]),
+        "known kinds, once each, in the catalog's order"
+    );
+    let store = harness.webhooks.store();
+    let revision = store.endpoint(&id).await.unwrap().unwrap().revision;
+    // The v0.14 shape: no `statusKinds`.
+    let renamed = harness
+        .edit(&id, json!({ "name": "Renamed" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed["endpoint"]["statusKinds"],
+        json!(["turn.completed", "turn.failed"])
+    );
+    assert_eq!(
+        store.endpoint(&id).await.unwrap().unwrap().revision,
+        revision
+    );
+    for refused in [json!(["turn.started", "turn.exploded"]), json!([])] {
+        let refusal = harness
+            .edit(&id, json!({ "statusKinds": refused }))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal["reason"], "invalid", "{refused}");
+    }
+    let cleared = harness
+        .edit(&id, json!({ "statusKinds": null }))
+        .await
+        .unwrap();
+    assert_eq!(cleared["endpoint"]["statusKinds"], Value::Null);
+    assert!(store.endpoint(&id).await.unwrap().unwrap().revision > revision);
+    harness.webhooks.shutdown().await;
+}

@@ -134,7 +134,11 @@ import { WebhooksTab } from "./WebhooksTab";
 
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
-async function render({ questionEvents = true, bearerToken = true } = {}): Promise<HTMLDivElement> {
+async function render({
+  questionEvents = true,
+  bearerToken = true,
+  statusKinds = true,
+} = {}): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -148,6 +152,7 @@ async function render({ questionEvents = true, bearerToken = true } = {}): Promi
         capabilities={{
           webhookQuestionEvents: questionEvents,
           webhookBearerToken: bearerToken,
+          webhookStatusKinds: statusKinds,
         }}
       />,
     );
@@ -169,6 +174,7 @@ function endpoint(overrides: Record<string, unknown> = {}): Record<string, unkno
     projectId: null,
     pairedClientId: null,
     bearerTokenSet: false,
+    statusKinds: null,
     consecutiveFailures: 0,
     disabledReason: null,
     pendingDeliveries: 0,
@@ -386,6 +392,69 @@ describe("WebhooksTab", () => {
     });
     await act(async () => submitButton(container).click());
     expect("bearerToken" in h.calls[0]!.request.input).toBe(false);
+  });
+
+  it("sends only the status changes chosen, and every one by default", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint()];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    const group = container.querySelector('[role="group"][aria-label="Status changes sent"]')!;
+    const kinds = [...group.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    expect(group.textContent).toContain("Turn started");
+    expect(kinds.every((kind) => kind.checked)).toBe(true);
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.statusKinds).toBeNull();
+
+    await act(async () => button(container, "Edit").click());
+    const again = [
+      ...container
+        .querySelector('[role="group"][aria-label="Status changes sent"]')!
+        .querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+    ];
+    // Leave out "Turn started".
+    await act(async () => again[0]!.click());
+    await act(async () => submitButton(container).click());
+    expect(h.calls[1]!.request.input.statusKinds).toEqual([
+      "turn.completed",
+      "turn.interrupted",
+      "turn.failed",
+      "session.status",
+    ]);
+  });
+
+  it("asks for at least one status change and keeps kinds it does not know", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ statusKinds: ["turn.failed", "future.kind"] })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    const kinds = () => [
+      ...container
+        .querySelector('[role="group"][aria-label="Status changes sent"]')!
+        .querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+    ];
+    expect(kinds().map((kind) => kind.checked)).toEqual([false, false, false, true, false]);
+    await act(async () => kinds()[3]!.click());
+    expect(submitButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "Choose at least one status change, or stop sending Thread status changed.",
+    );
+    await act(async () => kinds()[1]!.click());
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.statusKinds).toEqual(["turn.completed", "future.kind"]);
+  });
+
+  it("hides the status choices on an older server and never sends them", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint()];
+    const container = await render({ statusKinds: false });
+    await act(async () => button(container, "Edit").click());
+    expect(container.querySelector('[aria-label="Status changes sent"]')).toBeNull();
+    expect(container.textContent).toContain(
+      "Update BiBCode on this environment to choose which status changes are sent.",
+    );
+    await act(async () => submitButton(container).click());
+    expect("statusKinds" in h.calls[0]!.request.input).toBe(false);
   });
 
   it("refuses to submit a URL that is not https", async () => {
