@@ -20,7 +20,7 @@ import {
   createCenterPanelAdoptionTracker,
 } from "./centerPanelAdoption";
 
-import type { PanelArchiveOutcome } from "./centerPanelClose";
+import type { PanelArchiveResult } from "./centerPanelClose";
 import { useCenterPanelStore } from "./centerPanelStore";
 import { useComposerDraftStore } from "./composerDraftStore";
 import { useArchivedThreadSnapshots } from "./lib/archivedThreadsState";
@@ -179,22 +179,25 @@ function EnvironmentThreadLifecycleReconciler({
   const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
   // Archives a panel this client closed once a snapshot shows it live (see `centerPanelClose`).
   const archiveClosedPanel = useCallback(
-    async ({ threadId }: ScopedThreadRef): Promise<PanelArchiveOutcome> => {
+    async ({ threadId }: ScopedThreadRef): Promise<PanelArchiveResult> => {
       const result = await archiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Success") return "archived";
-      return isAtomCommandInterrupted(result) ? "interrupted" : "refused";
+      if (result._tag === "Success") return { kind: "archived", sequence: result.value.sequence };
+      return { kind: isAtomCommandInterrupted(result) ? "interrupted" : "refused" };
     },
     [archiveThread, environmentId],
   );
 
   useEffect(() => {
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) return;
+    const snapshot = shellState.snapshot.value;
     applyPanelThreadAdoption(
       environmentId,
       adoptionTracker,
-      shellState.snapshot.value.threads,
-      shellState.snapshot.value.capped === true,
+      snapshot.threads,
+      snapshot.capped === true,
       archiveClosedPanel,
+      // The engine's sequence, which an archive's reply sequence is comparable with (#223).
+      snapshot.engineSequence ?? snapshot.snapshotSequence,
     );
   }, [adoptionTracker, archiveClosedPanel, environmentId, shellState]);
 
