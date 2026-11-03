@@ -4281,7 +4281,17 @@ function ChatViewContent(props: ChatViewProps) {
 
   // Auto-open the plan sidebar when plan/todo steps arrive for the current turn.
   // Don't auto-open for plans carried over from a previous turn (the user can open manually).
+  // Leaving the panel for any other surface dismisses it for the turn, as closing it does, so
+  // View diff or a file link is not taken straight back to the tasks (#275).
+  const planSidebarShownForThreadKeyRef = useRef<string | null>(null);
   useEffect(() => {
+    const leftPlanSidebar =
+      !planSidebarOpen && planSidebarShownForThreadKeyRef.current === activeThreadKey;
+    planSidebarShownForThreadKeyRef.current = planSidebarOpen ? activeThreadKey : null;
+    if (leftPlanSidebar) {
+      dismissPlanSidebarForCurrentTurn();
+      return;
+    }
     if (!autoOpenPlanSidebar) return;
     if (!activePlan) return;
     if (planSidebarOpen) return;
@@ -4295,8 +4305,10 @@ function ChatViewContent(props: ChatViewProps) {
   }, [
     activePlan,
     activeLatestTurn?.turnId,
+    activeThreadKey,
     activeThreadRef,
     autoOpenPlanSidebar,
+    dismissPlanSidebarForCurrentTurn,
     planSidebarOpen,
     sidebarProposedPlan?.turnId,
   ]);

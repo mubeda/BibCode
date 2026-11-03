@@ -1483,7 +1483,10 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Diff** reviews the working tree, branch changes, or a turn's changes (see
   [Diff](#diff)).
 - **Activity** shows structured provider activity when available.
-- **Plan** displays the active agent plan when available.
+- **Plan** displays the active agent plan when available. With **Auto-open task
+  panel** on, it opens when a turn's steps appear. Closing it, or switching to
+  another surface such as a turn's **View diff**, keeps it closed until the next
+  turn's steps.
 - **Device** shows an Android emulator or, on a macOS server, an iOS simulator
   running on the environment's server (see [Device previews](#device-previews)).
   It is in the `+` menu only while device previews are on.
