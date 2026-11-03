@@ -104,6 +104,14 @@ interface CenterPanelStoreState {
    * archived instead of adopted.
    */
   readonly closedBeforeCreated: readonly string[];
+  /**
+   * Scoped keys of chat panels whose `createPanel` request this client is still waiting on.
+   * Unlike the reservation, a live snapshot never releases it, so a close in that window is
+   * always left to the open, which settles it.
+   */
+  readonly creatingChatPanelThreadKeys: ReadonlySet<string>;
+  beginChatPanelCreation: (ref: ScopedThreadRef) => void;
+  endChatPanelCreation: (ref: ScopedThreadRef) => void;
   recordClosedBeforeCreated: (ref: ScopedThreadRef) => void;
   clearClosedBeforeCreated: (ref: ScopedThreadRef) => void;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
@@ -513,6 +521,21 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
         activityPanes: {},
         pendingChatPanelThreadKeys: new Set<string>(),
         closedBeforeCreated: [],
+        creatingChatPanelThreadKeys: new Set<string>(),
+        beginChatPanelCreation: (ref) =>
+          set((state) => ({
+            creatingChatPanelThreadKeys: new Set(state.creatingChatPanelThreadKeys).add(
+              scopedThreadKey(ref),
+            ),
+          })),
+        endChatPanelCreation: (ref) =>
+          set((state) => {
+            const key = scopedThreadKey(ref);
+            if (!state.creatingChatPanelThreadKeys.has(key)) return state;
+            const creatingChatPanelThreadKeys = new Set(state.creatingChatPanelThreadKeys);
+            creatingChatPanelThreadKeys.delete(key);
+            return { creatingChatPanelThreadKeys };
+          }),
         recordClosedBeforeCreated: (ref) =>
           set((state) => {
             const key = scopedThreadKey(ref);

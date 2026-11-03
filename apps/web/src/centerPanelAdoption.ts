@@ -128,21 +128,26 @@ export function applyPanelThreadAdoption(
     if (tracker.panelThreadIds.has(thread.id) || !liveThreadIds.has(hostThreadId)) continue;
     const panelRef = scopeThreadRef(environmentId, thread.id);
     const panelKey = scopedThreadKey(panelRef);
-    // The open still in flight settles its own close.
-    if (store.pendingChatPanelThreadKeys.has(panelKey)) {
-      tracker.panelThreadIds.add(thread.id);
-      continue;
-    }
+    // An open still waiting on `createPanel` owns the panel and settles its own close. Neither
+    // it nor a reserved panel is tracked yet, so a later snapshot decides again.
+    if (store.creatingChatPanelThreadKeys.has(panelKey)) continue;
+    // Closed before creation (also an open whose outcome was lost): archive it, then let go of
+    // the close and of a reservation nothing will settle now.
     if (store.closedBeforeCreated.includes(panelKey)) {
       if (archiveClosedPanel && !tracker.closingPanelThreadIds.has(thread.id)) {
         tracker.closingPanelThreadIds.add(thread.id);
         void archiveClosedPanel(thread.id).then((settled) => {
           tracker.closingPanelThreadIds.delete(thread.id);
-          if (settled) useCenterPanelStore.getState().clearClosedBeforeCreated(panelRef);
+          if (!settled) return;
+          const current = useCenterPanelStore.getState();
+          current.clearClosedBeforeCreated(panelRef);
+          current.releaseChatPanelReservation(panelRef);
         });
       }
       continue;
     }
+    // The local open already shows this panel's tab; adoption takes it over once released.
+    if (store.pendingChatPanelThreadKeys.has(panelKey)) continue;
     tracker.panelThreadIds.add(thread.id);
     store.adoptChatPanel(
       scopeThreadRef(environmentId, hostThreadId),
