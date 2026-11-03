@@ -168,6 +168,7 @@ type Step =
   | "reopen-here"
   | "remote-reopen"
   | "remote-archive"
+  | "interleaved-deltas"
   | "hold-reply"
   | "lose-reply"
   | "drop-archive"
@@ -361,6 +362,19 @@ function delayedShellRows(): Row[] {
       expected: CLOSED,
     },
     {
+      name: "per-thread deltas, another thread's first",
+      outcome: "success",
+      steps: ["commit", "respond", "snapshot", "close", "interleaved-deltas"],
+      expected: CLOSED,
+    },
+    {
+      // A reopen after the archive shows once the publication is complete.
+      name: "per-thread deltas, another thread's first, then a reopen",
+      outcome: "success",
+      steps: ["commit", "respond", "snapshot", "close", "remote-reopen", "interleaved-deltas"],
+      expected: RETURNS(1, true),
+    },
+    {
       // The shell that reflects the archive shows it live again: someone reopened it.
       name: "delayed shell that shows a reopen after the archive",
       outcome: "success",
@@ -400,7 +414,9 @@ async function play(row: Row, sideChat: boolean) {
    * The shell this page holds. The server publishes it late (it batches for 500 ms), so a
    * reply can arrive before the shell that reflects it; the reconciler replays what it holds.
    */
-  let held: { threads: ShellRow[]; capped: boolean; sequence: number } | null = null;
+  /** `complete`: the shell ends a publication (a snapshot, or a delta chunk's last item). */
+  let held: { threads: ShellRow[]; capped: boolean; sequence: number; complete: boolean } | null =
+    null;
   const adopt = () => {
     if (!held) return;
     (applyPanelThreadAdoption as (...args: unknown[]) => void)(
@@ -410,6 +426,8 @@ async function play(row: Row, sideChat: boolean) {
       held.capped,
       undefined,
       held.sequence,
+      undefined,
+      held.complete,
     );
     // The lifecycle reconciler releases the reservation of every live thread it sees.
     for (const thread of held.threads) {
@@ -434,7 +452,7 @@ async function play(row: Row, sideChat: boolean) {
             ]
           : [],
     );
-    held = { threads, capped, sequence: h.sequence };
+    held = { threads, capped, sequence: h.sequence, complete: true };
     adopt();
   };
   // The reconciler also runs adoption again, on the shell it holds, when a close changes.
@@ -540,6 +558,32 @@ async function play(row: Row, sideChat: boolean) {
       }
       case "release-archive":
         h.heldArchive?.resolve();
+        break;
+      case "interleaved-deltas":
+        // Another thread changed after the archive, in the same publication; the shell
+        // streams per-thread deltas, and that thread's comes first. Between the two items the
+        // shell is past the archive but still lists the panel as it was.
+        h.sequence += 1;
+        if (held) {
+          held = {
+            threads: [
+              ...held.threads,
+              {
+                id: ThreadId.make(`other-${row.name}`),
+                kind: "workspace",
+                title: "Other",
+                archivedAt: null,
+              },
+            ],
+            capped: held.capped,
+            sequence: h.sequence,
+            complete: false,
+          };
+          adopt();
+          await flush();
+          if (closed && tabIds().includes(`chat:${panelId}`)) tabReturned = true;
+        }
+        snapshot(false);
         break;
     }
     await flush();

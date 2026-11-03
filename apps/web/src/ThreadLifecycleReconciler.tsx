@@ -183,6 +183,8 @@ function EnvironmentThreadLifecycleReconciler({
       // The engine's sequence, which an archive's reply sequence is comparable with (#223).
       snapshot.engineSequence ?? snapshot.snapshotSequence,
       closingChatPanels,
+      // The server puts the shell's revision on a publication's last item only.
+      snapshot.revision !== undefined,
     );
   }, [adoptionTracker, closingChatPanels, environmentId, reshowChatPanels, shellState]);
 

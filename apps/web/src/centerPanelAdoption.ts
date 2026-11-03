@@ -116,19 +116,26 @@ export function applyPanelThreadAdoption(
   /** Panels this page is closing (the store's, by default). */
   closingChatPanels: ReadonlyMap<string, number | null> = useCenterPanelStore.getState()
     .closingChatPanels,
+  /**
+   * The shell ends a publication: a whole snapshot, or the last item of a delta chunk (the one
+   * that carries the shell's revision). Between per-thread deltas it may show a row as it was.
+   */
+  complete = true,
 ): void {
   const liveThreadIds = new Set<string>(
     threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
   );
-  // An archived panel stays hidden until this shell reaches its archive; listed live then, it
-  // was reopened, so it is shown again. A capped shell may leave a live one out.
+  // An archived panel stays hidden until this shell reaches its archive, decided by the
+  // panel's own row (a row carries no sequence of its own): gone, it was archived; still live
+  // in a shell that ends a publication, it was reopened, so it is shown again. A capped shell
+  // may leave a live one out.
   for (const [key, archivedAt] of closingChatPanels) {
     const ref = parseScopedThreadKey(key);
     if (archivedAt === null || ref?.environmentId !== environmentId) continue;
     if (sequence === undefined || sequence < archivedAt) continue;
-    useCenterPanelStore
-      .getState()
-      .releaseClosingChatPanel(ref, capped || liveThreadIds.has(ref.threadId));
+    const live = liveThreadIds.has(ref.threadId);
+    if (live && !complete) continue;
+    useCenterPanelStore.getState().releaseClosingChatPanel(ref, capped || live);
   }
   const store = useCenterPanelStore.getState();
   const reshown = new Set<string>();
