@@ -203,9 +203,9 @@ and signs in as `bibcode mcp` does, with its own credential labelled
 - Exit codes: 0 success; 1 failure, or a turn that ended interrupted, failed or undelivered;
   2 the thread waits on a person (an approval or a question).
 
-Each run mints a new credential, so `clientRequestId` rows (kept per credential) and the
-"thread this agent opened or last drove" rule of `send_panel_message` do not carry over
-between runs.
+Each run mints a new credential, but every `bibcode thread` run shares one `clientRequestId`
+scope, so the `--request-id` retry above works across runs. Only the "thread this agent
+opened or last drove" rule of `send_panel_message` does not carry over between runs.
 
 ### Remote HTTP with OAuth
 

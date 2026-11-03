@@ -46,6 +46,7 @@ const DELIVERIES_SHOWN = 20;
 const CATEGORY_LABELS: Readonly<Record<string, string>> = {
   threads: "Threads",
   approvals: "Approvals",
+  questions: "Questions",
   operations: "Agent operations",
   diagnostics: "Diagnostics",
 };
@@ -56,6 +57,8 @@ const EVENT_LABELS: Readonly<Record<WebhookEventType, string>> = {
   "panel.created": "Chat panel created",
   "approval.requested": "Approval requested",
   "approval.resolved": "Approval answered",
+  "input.requested": "Question asked",
+  "input.resolved": "Question answered",
   "clone.completed": "Clone finished",
   "scm.operation_completed": "Git or pull request change",
   "transfer.completed": "File transfer finished",
@@ -66,6 +69,7 @@ const EVENT_LABELS: Readonly<Record<WebhookEventType, string>> = {
 const ALL_EVENTS: ReadonlyArray<WebhookEventType> = WEBHOOK_EVENT_CATEGORIES.flatMap(
   (category) => category.events,
 );
+const KNOWN_EVENTS: ReadonlySet<string> = new Set(ALL_EVENTS);
 
 const NO_PROJECT = "__none__";
 /** A quick shape check; the server checks the URL fully, and its addresses when sending. */
@@ -150,11 +154,14 @@ export function WebhooksTab({
   environmentId,
   isPrimary,
   supported,
+  questionEvents,
 }: {
   readonly environmentId: EnvironmentId;
   readonly isPrimary: boolean;
   /** The server reports its settings (it is connected and new enough). */
   readonly supported: boolean;
+  /** The server offers the Questions events (`webhookQuestionEvents`). */
+  readonly questionEvents: boolean;
 }) {
   const enabled = useEnvironmentSettings(environmentId, selectWebhooksEnabled);
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
@@ -184,7 +191,12 @@ export function WebhooksTab({
           />
         }
       />
-      <EndpointsRow environmentId={environmentId} enabled={enabled} isPrimary={isPrimary} />
+      <EndpointsRow
+        environmentId={environmentId}
+        enabled={enabled}
+        isPrimary={isPrimary}
+        questionEvents={questionEvents}
+      />
     </>
   );
 }
@@ -193,10 +205,12 @@ function EndpointsRow({
   environmentId,
   enabled,
   isPrimary,
+  questionEvents,
 }: {
   readonly environmentId: EnvironmentId;
   readonly enabled: boolean;
   readonly isPrimary: boolean;
+  readonly questionEvents: boolean;
 }) {
   const access = usePrimaryAgentAccess();
   // The primary environment's session says whether it may read webhooks; elsewhere the
@@ -246,6 +260,7 @@ function EndpointsRow({
           <EndpointForm
             environmentId={environmentId}
             isPrimary={isPrimary}
+            questionEvents={questionEvents}
             endpoint={null}
             onDone={(created) => {
               setAdding(false);
@@ -266,6 +281,7 @@ function EndpointsRow({
                 endpoint={endpoint}
                 webhooksOn={enabled}
                 isPrimary={isPrimary}
+                questionEvents={questionEvents}
                 onChanged={list.refresh}
                 onSecret={(value) => setSecret({ name: endpoint.name, value })}
               />
@@ -319,6 +335,7 @@ function EndpointItem({
   endpoint,
   webhooksOn,
   isPrimary,
+  questionEvents,
   onChanged,
   onSecret,
 }: {
@@ -326,6 +343,7 @@ function EndpointItem({
   readonly endpoint: WebhookEndpoint;
   readonly webhooksOn: boolean;
   readonly isPrimary: boolean;
+  readonly questionEvents: boolean;
   readonly onChanged: () => void;
   readonly onSecret: (secret: string) => void;
 }) {
@@ -383,6 +401,7 @@ function EndpointItem({
         <EndpointForm
           environmentId={environmentId}
           isPrimary={isPrimary}
+          questionEvents={questionEvents}
           endpoint={endpoint}
           onDone={() => {
             setEditing(false);
@@ -631,11 +650,13 @@ function DeliveriesList({
 function EndpointForm({
   environmentId,
   isPrimary,
+  questionEvents,
   endpoint,
   onDone,
 }: {
   readonly environmentId: EnvironmentId;
   readonly isPrimary: boolean;
+  readonly questionEvents: boolean;
   readonly endpoint: WebhookEndpoint | null;
   readonly onDone: (created: { readonly name: string; readonly value: string } | null) => void;
 }) {
@@ -647,8 +668,16 @@ function EndpointForm({
   );
   const [name, setName] = useState(endpoint?.name ?? "");
   const [url, setUrl] = useState(endpoint?.url ?? "");
-  const [events, setEvents] = useState<ReadonlySet<WebhookEventType>>(
-    () => new Set(endpoint?.eventTypes ?? ALL_EVENTS),
+  // An older server refuses the Questions events, so they are neither shown nor chosen there.
+  const categories = questionEvents
+    ? WEBHOOK_EVENT_CATEGORIES
+    : WEBHOOK_EVENT_CATEGORIES.filter((category) => category.key !== "questions");
+  const [events, setEvents] = useState<ReadonlySet<string>>(
+    () =>
+      new Set(
+        endpoint?.eventTypes ??
+          categories.flatMap((category): readonly string[] => category.events),
+      ),
   );
   const [projectId, setProjectId] = useState<string | null>(endpoint?.projectId ?? null);
   const [pairedClientId, setPairedClientId] = useState<string | null>(
@@ -679,7 +708,11 @@ function EndpointForm({
         name: name.trim(),
         url: url.trim(),
         enabled: endpoint?.enabled ?? true,
-        eventTypes: ALL_EVENTS.filter((event) => events.has(event)),
+        // Names a newer server added, which this form does not show, are kept as they were.
+        eventTypes: [
+          ...ALL_EVENTS.filter((event) => events.has(event)),
+          ...(endpoint?.eventTypes ?? []).filter((event) => !KNOWN_EVENTS.has(event)),
+        ],
         projectId,
         pairedClientId,
       },
@@ -731,7 +764,7 @@ function EndpointForm({
       <fieldset className="space-y-2">
         <legend className="text-xs font-medium text-foreground">Send these events</legend>
         <div className="grid gap-x-4 gap-y-3 sm:grid-cols-2">
-          {WEBHOOK_EVENT_CATEGORIES.map((category) => (
+          {categories.map((category) => (
             <div key={category.key} className="space-y-1.5">
               <div className="text-xs text-muted-foreground">
                 {CATEGORY_LABELS[category.key] ?? category.key}
@@ -748,6 +781,9 @@ function EndpointForm({
             </div>
           ))}
         </div>
+        {questionEvents ? null : (
+          <ReasonLine text="Update BiBCode on this environment to send question events." />
+        )}
         {events.size === 0 ? <ReasonLine text="Choose at least one event." /> : null}
         {events.has("profiler.finding") ? (
           <p className="text-xs text-muted-foreground">

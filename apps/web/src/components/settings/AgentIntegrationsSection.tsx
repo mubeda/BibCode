@@ -188,6 +188,9 @@ export function AgentIntegrationsSection() {
             environmentId={environment.environmentId}
             isPrimary={isPrimary}
             supported={supported}
+            questionEvents={
+              environment.serverConfig?.environment.capabilities.webhookQuestionEvents === true
+            }
           />
         </TabsPanel>
       </Tabs>

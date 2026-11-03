@@ -15,6 +15,7 @@ export const WEBHOOK_EVENT_CATEGORIES = [
     events: ["thread.status_changed", "worktree.created", "panel.created"],
   },
   { key: "approvals", events: ["approval.requested", "approval.resolved"] },
+  { key: "questions", events: ["input.requested", "input.resolved"] },
   {
     key: "operations",
     events: ["clone.completed", "scm.operation_completed", "transfer.completed", "transfer.failed"],
@@ -28,6 +29,8 @@ export const WebhookEventType = Schema.Literals([
   "panel.created",
   "approval.requested",
   "approval.resolved",
+  "input.requested",
+  "input.resolved",
   "clone.completed",
   "scm.operation_completed",
   "transfer.completed",
@@ -57,7 +60,11 @@ export const WebhookEndpoint = Schema.Struct({
   name: Schema.String,
   url: Schema.String,
   enabled: Schema.Boolean,
-  eventTypes: Schema.Array(WebhookEventType),
+  /**
+   * Strings, not `WebhookEventType`: an event a newer server added never breaks the list,
+   * and the form saves it back unchanged.
+   */
+  eventTypes: Schema.Array(Schema.String),
   projectId: Schema.NullOr(Schema.String),
   /** The outside agent's session it is paired with: revoking that client disables it. */
   pairedClientId: Schema.NullOr(Schema.String),
@@ -126,7 +133,8 @@ export const WebhooksUpsertInput = Schema.Struct({
   /** `https://` with a public host and no user name or password. */
   url: TrimmedNonEmptyString,
   enabled: Schema.Boolean,
-  eventTypes: Schema.Array(WebhookEventType),
+  /** Event names this client does not know are sent back as they were listed. */
+  eventTypes: Schema.Array(Schema.String),
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
   pairedClientId: Schema.optional(Schema.NullOr(Schema.String)),
 });

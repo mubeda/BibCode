@@ -134,15 +134,26 @@ import { WebhooksTab } from "./WebhooksTab";
 
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
-async function render(): Promise<HTMLDivElement> {
+async function render({ questionEvents = true } = {}): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   mounted.push({ root, container });
   await act(async () => {
-    root.render(<WebhooksTab environmentId={"local" as never} isPrimary={true} supported={true} />);
+    root.render(
+      <WebhooksTab
+        environmentId={"local" as never}
+        isPrimary={true}
+        supported={true}
+        questionEvents={questionEvents}
+      />,
+    );
   });
   return container;
+}
+
+function submitButton(container: HTMLElement): HTMLButtonElement {
+  return container.querySelector<HTMLButtonElement>('form button[type="submit"]')!;
 }
 
 function endpoint(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -243,7 +254,7 @@ describe("WebhooksTab", () => {
       projectId: null,
       pairedClientId: null,
     });
-    expect(h.calls[0]!.request.input.eventTypes).toHaveLength(10);
+    expect(h.calls[0]!.request.input.eventTypes).toHaveLength(12);
     expect(container.querySelector('[aria-label="Signing secret"]')?.textContent).toBe(
       "whsec_0123",
     );
@@ -252,6 +263,41 @@ describe("WebhooksTab", () => {
     expect(h.copied).toEqual(["whsec_0123"]);
     await act(async () => button(container, "Done").click());
     expect(container.querySelector('[aria-label="Signing secret"]')).toBeNull();
+  });
+
+  it("offers the Questions events and leaves them out for an older server", async () => {
+    h.settings = { enableWebhooks: true };
+    const container = await render();
+    await act(async () => button(container, "Add endpoint").click());
+    expect(container.textContent).toContain("Questions");
+    expect(container.textContent).toContain("Question asked");
+    expect(container.textContent).toContain("Question answered");
+    expect(container.textContent).not.toContain("Update BiBCode on this environment");
+
+    const older = await render({ questionEvents: false });
+    await act(async () => button(older, "Add endpoint").click());
+    expect(older.textContent).not.toContain("Question asked");
+    expect(older.textContent).toContain(
+      "Update BiBCode on this environment to send question events.",
+    );
+    const inputs = older.querySelectorAll<HTMLInputElement>("form input:not([type])");
+    await act(async () => {
+      setInput(inputs[0]!, "CI");
+      setInput(inputs[1]!, "https://hooks.example.com/bibcode");
+    });
+    await act(async () => submitButton(older).click());
+    const sent = h.calls[0]!.request.input.eventTypes as string[];
+    expect(sent).toHaveLength(10);
+    expect(sent).not.toContain("input.requested");
+  });
+
+  it("saves back event types it does not know", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ eventTypes: ["thread.status_changed", "future.event"] })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.eventTypes).toEqual(["thread.status_changed", "future.event"]);
   });
 
   it("refuses to submit a URL that is not https", async () => {

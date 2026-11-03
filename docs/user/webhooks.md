@@ -1,7 +1,7 @@
 # Webhooks
 
 BiBCode can tell another service when something happens in an environment: a thread's
-turn starts or ends, an approval is asked for or answered, an outside agent commits or
+turn starts or ends, an approval or a question is asked for or answered, an outside agent commits or
 clones, or the profiler records a finding. It sends a signed HTTPS `POST` to each endpoint
 you register. A request carries ids, kinds, statuses and a cursor, never a prompt, a
 message, a reply, terminal output, file contents, a diff or a token.
@@ -54,6 +54,8 @@ delivery log and secret go with it.
 | `panel.created`           | A chat panel is created                                                                               | Threads          |
 | `approval.requested`      | A thread asks for an approval (`requestId` when the provider's id is a plain id)                      | Approvals        |
 | `approval.resolved`       | An approval is answered (`status: resolved`) or expires (`status: expired`)                           | Approvals        |
+| `input.requested`         | A thread asks you a question (`requestId`; never the question's text)                                 | Questions        |
+| `input.resolved`          | A question is answered (`status: resolved`) or expires (`status: expired`); never the answers         | Questions        |
 | `clone.completed`         | An outside agent's `clone_repository` call answered (`status` is its outcome; see below)              | Agent operations |
 | `scm.operation_completed` | An outside agent's Git or pull request tool changed something (`tool`, `status`, `target`)            | Agent operations |
 | `transfer.completed`      | An outside agent's file download or upload finished                                                   | Agent operations |
@@ -63,6 +65,10 @@ delivery log and secret go with it.
 
 `profiler.finding` is sent only while MCP is on and **What agents can use → Diagnostics** is
 on, because a receiver catches up on findings through the MCP `profiler_findings` tool.
+
+An endpoint added before the **Questions** events existed keeps the events it had: edit it
+and tick them to get them. The form hides them, and says so, for an
+environment that runs an older BiBCode.
 
 `clone.completed` follows the call, not the clone: a clone still running when the call
 returned is reported with `status: success` and its `target.cloneId`; `clone_status` says

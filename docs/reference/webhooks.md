@@ -109,6 +109,8 @@ count.
 | `panel.created`           | `threads`     | A `panel.created` entry (a chat panel was opened)                                                           | `kind`                             |
 | `approval.requested`      | `approvals`   | An `approval.requested` entry                                                                               | `kind`, `requestId`                |
 | `approval.resolved`       | `approvals`   | An `approval.resolved` entry; `status` is `resolved` or `expired`                                           | `kind`, `status`, `requestId`      |
+| `input.requested`         | `questions`   | An `input.requested` entry (a provider asked the person a question)                                         | `kind`, `requestId`                |
+| `input.resolved`          | `questions`   | An `input.resolved` entry; `status` is `resolved` or `expired`                                              | `kind`, `status`, `requestId`      |
 | `clone.completed`         | `operations`  | An `agent.call` entry of `clone_repository`                                                                 | `kind`, `status`, `tool`, `target` |
 | `scm.operation_completed` | `operations`  | An `agent.call` entry of any tool in the Source control set (Git and pull request tools)                    | `kind`, `status`, `tool`, `target` |
 | `transfer.completed`      | `operations`  | An `agent.call` entry of a transfer the `files_download` or `files_upload` URL served, `status: success`    | `kind`, `status`, `tool`, `target` |
@@ -121,8 +123,12 @@ Notes on the sources:
 - Every event but `profiler.finding` and `webhook.test` is made from one entry of the MCP
   change feed, the same entries `changes_since` returns (see the
   [MCP reference](./mcp.md#change-feed-and-capabilities)). The feed's other entries
-  (`thread.created` without a worktree, `thread.archived`, `turn.requested`,
-  `input.requested`, `input.resolved`) have no event.
+  (`thread.created` without a worktree, `thread.archived`, `turn.requested`) have no
+  event.
+- `input.requested` and `input.resolved` carry the question's id and outcome only, never
+  its text or the answers. Endpoints made before these events existed keep their own event
+  list, so they get them only once a person adds them. A server advertises them with the
+  `webhookQuestionEvents` capability.
 - `worktree.created` is sent for any thread created with a worktree, by a person or an
   agent.
 - `clone.completed` follows the `clone_repository` call, not the clone: a clone still
@@ -138,22 +144,22 @@ Notes on the sources:
 
 The body is one JSON object, `Content-Type: application/json`:
 
-| Field           | Type   | Present                                    | Meaning                                                                                                                   |
-| --------------- | ------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| `id`            | string | always                                     | The event's id: `ev_` and 24 hex characters, the same on every delivery and redelivery of this event. Drop repeats by it. |
-| `type`          | string | always                                     | The event type.                                                                                                           |
-| `occurredAt`    | string | always                                     | ISO 8601 time of the change (for a finding, its `lastSeen`).                                                              |
-| `environmentId` | string | always                                     | The environment that sent it.                                                                                             |
-| `threadId`      | string | when the entry names a thread              | The thread.                                                                                                               |
-| `cursor`        | string | every feed event                           | The `changes_since` cursor just after this event (`v1.<sequence>.<activityId>`; treat it as opaque).                      |
-| `kind`          | string | every feed event                           | The change-feed entry kind (`turn.completed`, `approval.requested`, `agent.call`, ...).                                   |
-| `status`        | string | when the entry has one                     | The session status, approval status (`resolved`, `expired`), or an agent call's outcome (`success` or its error tag).     |
-| `requestId`     | string | approvals, when the provider's id is plain | The approval's id (letters, digits, `_`, `.`, `:`, `-`, at most 128); else left out.                                      |
-| `tool`          | string | operation events                           | The MCP tool that ran.                                                                                                    |
-| `target`        | object | operation events, when known               | Ids and counts only: `sha`, `revertedSha`, `pullRequest`, `worktreeKey`, `fileCount`, `cloneId`, `transferId`.            |
-| `actor`         | object | when an outside agent caused the change    | `{ kind: "mcp-client", clientId }`; never the agent's label. Left out when either value is not an id.                     |
-| `finding`       | object | `profiler.finding`                         | `{ id, count, lastSeen }`.                                                                                                |
-| `dropped`       | object | after deliveries were dropped              | `{ count, fromCursor?, toCursor?, sinceLastSeen? }`; see [Dropped deliveries](#dropped-deliveries).                       |
+| Field           | Type   | Present                                 | Meaning                                                                                                                   |
+| --------------- | ------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `id`            | string | always                                  | The event's id: `ev_` and 24 hex characters, the same on every delivery and redelivery of this event. Drop repeats by it. |
+| `type`          | string | always                                  | The event type.                                                                                                           |
+| `occurredAt`    | string | always                                  | ISO 8601 time of the change (for a finding, its `lastSeen`).                                                              |
+| `environmentId` | string | always                                  | The environment that sent it.                                                                                             |
+| `threadId`      | string | when the entry names a thread           | The thread.                                                                                                               |
+| `cursor`        | string | every feed event                        | The `changes_since` cursor just after this event (`v1.<sequence>.<activityId>`; treat it as opaque).                      |
+| `kind`          | string | every feed event                        | The change-feed entry kind (`turn.completed`, `approval.requested`, `agent.call`, ...).                                   |
+| `status`        | string | when the entry has one                  | The session status, approval status (`resolved`, `expired`), or an agent call's outcome (`success` or its error tag).     |
+| `requestId`     | string | approvals and questions, when plain     | The approval's or question's id (letters, digits, `_`, `.`, `:`, `-`, at most 128); else left out.                        |
+| `tool`          | string | operation events                        | The MCP tool that ran.                                                                                                    |
+| `target`        | object | operation events, when known            | Ids and counts only: `sha`, `revertedSha`, `pullRequest`, `worktreeKey`, `fileCount`, `cloneId`, `transferId`.            |
+| `actor`         | object | when an outside agent caused the change | `{ kind: "mcp-client", clientId }`; never the agent's label. Left out when either value is not an id.                     |
+| `finding`       | object | `profiler.finding`                      | `{ id, count, lastSeen }`.                                                                                                |
+| `dropped`       | object | after deliveries were dropped           | `{ count, fromCursor?, toCursor?, sinceLastSeen? }`; see [Dropped deliveries](#dropped-deliveries).                       |
 
 Examples:
 
