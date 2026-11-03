@@ -528,6 +528,11 @@ async fn dispatch_prepared_command(
     }
     .map_err(|error| match error {
         OrchestrationError::ProjectPreparation { detail } => invalid_request(&request_tag, detail),
+        OrchestrationError::ThreadInUse { ref thread_id } => json!({
+            "_tag": "OrchestrationThreadInUseError",
+            "message": error.to_string(),
+            "threadId": thread_id,
+        }),
         error => orchestration_error("OrchestrationDispatchCommandError", error),
     })?;
     let should_route = match (&command, &result.project_id) {
@@ -5427,6 +5432,60 @@ mod tests {
                 .payload_digest,
             None,
             "legacy replay must not rewrite the historical receipt"
+        );
+        engine.shutdown().await;
+    }
+
+    /// The contract's own `thread.delete` with `onlyIfUnused` decodes, and a used thread is
+    /// refused with its own error type, so the client can archive instead (#265).
+    #[tokio::test]
+    async fn unused_delete_of_a_used_thread_is_refused_with_its_own_type() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../packages/contracts/fixtures/rpc-wire/contract-shapes/orchestration__thread__delete-only-if-unused-request.json",
+        );
+        let request: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(matches!(
+            decode_command(request["payload"].clone()),
+            OrchestrationCommand::ThreadDelete {
+                only_if_unused: true,
+                ..
+            }
+        ));
+
+        let engine = migrated_engine().await;
+        for command in [
+            json!({"type":"project.create","commandId":"project","projectId":"project-1",
+                "title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"create","threadId":"thread-1",
+                "projectId":"project-1","title":"Thread",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access","createdAt":CREATED_AT}),
+            json!({"type":"thread.turn.start","commandId":"send","threadId":"thread-1",
+                "message":{"messageId":"m-1","role":"user","text":"hello","attachments":[]},
+                "createdAt":CREATED_AT}),
+        ] {
+            engine
+                .dispatch(decode_command(command))
+                .await
+                .expect("setup");
+        }
+        let refusal = dispatch_prepared_for_test(
+            &engine,
+            None,
+            decode_command(json!({"type":"thread.delete","commandId":"close",
+                "threadId":"thread-1","onlyIfUnused":true})),
+        )
+        .await
+        .expect_err("a used thread is not deleted");
+        assert_eq!(refusal["_tag"], "OrchestrationThreadInUseError");
+        assert_eq!(refusal["threadId"], "thread-1");
+        assert!(
+            engine
+                .repositories()
+                .get_thread("thread-1".to_owned())
+                .await
+                .expect("thread read")
+                .is_some_and(|thread| thread.deleted_at.is_none())
         );
         engine.shutdown().await;
     }

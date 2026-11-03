@@ -44,6 +44,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     webhookBearerToken: false,
     webhookStatusKinds: false,
     sideChats: false,
+    threadDeleteOnlyIfUnused: false,
     ...overrides,
   };
 }

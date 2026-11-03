@@ -1,0 +1,12 @@
+{
+  "_tag": "Request",
+  "id": "900719925474099312345",
+  "tag": "orchestration.dispatchCommand",
+  "payload": {
+    "type": "thread.delete",
+    "commandId": "queue-command-1",
+    "threadId": "thread-1",
+    "onlyIfUnused": true
+  },
+  "headers": []
+}

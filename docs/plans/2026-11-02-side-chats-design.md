@@ -358,7 +358,10 @@ first-turn latency in the e2e run before changing it.
 
 - **Unused close deletes.** `thread.delete` gains `onlyIfUnused`, which the engine refuses
   when the thread has any message or turn, so a close racing a first send on another client
-  archives instead. The client sends it only for a side chat.
+  archives instead. The client sends it only for a side chat. As built: the refusal is its
+  own error, `OrchestrationThreadInUseError`, and the client sends the field only to a server
+  that advertises `capabilities.threadDeleteOnlyIfUnused`, because an older server's command
+  decoder ignores unknown fields and would delete a used side chat.
 - **Bring back.** A side chat action that writes a quoted summary of its last answer into the
   host composer as a draft. Never sent automatically. Disabled while the host runs, with
   "Available when the thread is idle." The summary is composed on the client from the side

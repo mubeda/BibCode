@@ -508,7 +508,10 @@ the main thread.
 Side chats follow the chat panel rules: hidden from the left panel and Settings
 → Archived, an Inbox row opens the thread with the side chat active, closing
 archives it, **Reopen closed chat** lists it, and deleting the thread deletes
-it. **Side chat** and `:btw` are unavailable inside a chat panel or side chat
+it. One exception: closing a side chat nobody ever sent a message to deletes it,
+so **Reopen closed chat** does not fill with empty ones. If someone sent it a
+message meanwhile, on any client, it is archived as usual. A server too old to
+refuse deleting a used side chat always archives it. **Side chat** and `:btw` are unavailable inside a chat panel or side chat
 ("Side chats start from the main chat. Use :btw there."), on a server too old to
 support them ("This server doesn't support side chats. Update it to use
 them."), before the thread has started, and while the thread's provider is not

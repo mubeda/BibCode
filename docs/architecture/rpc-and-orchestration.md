@@ -2159,6 +2159,27 @@ Nothing about a close is persisted: after a reload, a panel created late, or
 whose archive did not land, is adopted as a tab. A definite archive failure
 shows **Failed to close chat panel**.
 
+Closing a side chat nobody sent to deletes it instead (#265, P1).
+`thread.delete` takes `onlyIfUnused`; the engine then refuses with
+`OrchestrationThreadInUseError` (`threadId`: the used thread) when any thread
+the command would delete, its cascaded panels included, has a message (queued
+ones too) or a turn (pending ones too) in the projection. The check runs in
+`plan_command`, in the engine's command order, so a first send that commits
+first makes the delete refused, and one that commits after finds the thread
+deleted. A refusal is stored as a rejected receipt, so a duplicate of the same
+command replays as rejected and never deletes. The Rust field is omitted when
+`false`, so a plain delete digests as before. The serde command enum accepts
+unknown fields, so an older server would ignore `onlyIfUnused` and delete a
+used side chat: the client sends it only to a server that advertises
+`capabilities.threadDeleteOnlyIfUnused`, and only for a side chat whose shell
+shows no turn or user message and that this page has not sent to (every
+`thread.turn.start` from `ChatView` and the `:btw` send note it first). A
+refusal archives the side chat through the normal close (interrupt, then
+`thread.archive`); an interrupted delete is uncertain, as an interrupted
+archive is. A delete settles the close as an archive does: the shell that
+reaches its sequence no longer lists the panel, and it never reaches **Reopen
+closed chat**, which lists archived panels only.
+
 Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the

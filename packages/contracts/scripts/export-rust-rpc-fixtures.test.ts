@@ -105,13 +105,16 @@ describe("RPC wire fixture exporter", () => {
     expect(manifest.expectedTopLevelStreamShapes).toBe(94);
     expect(manifest.expectedOrchestrationEventShapes).toBe(27);
     expect(manifest.streamShapeFixtures).toHaveLength(94);
-    expect(manifest.typedFailureFixtures).toHaveLength(403);
+    expect(manifest.typedFailureFixtures).toHaveLength(404);
     expect(manifest.staleMethodIdentifiers).toEqual([
       "projects.add",
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(537);
+    expect(manifest.fixtures).toHaveLength(539);
+    expect(manifest.fixtures).toContain(
+      "contract-shapes/orchestration__thread__delete-only-if-unused-request.json",
+    );
     expect(manifest.fixtures).toContain("contract-shapes/webhooks__upsert-token-null-request.json");
     expect(manifest.fixtures).toContain(
       "contract-shapes/webhooks__upsert-status-kinds-request.json",
@@ -125,7 +128,7 @@ describe("RPC wire fixture exporter", () => {
       ]),
     );
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(497);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(498);
 
     for (const relativePath of manifest.fixtures) {
       const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));

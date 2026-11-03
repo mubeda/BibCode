@@ -1670,6 +1670,7 @@ pub async fn route_orchestration_command(
     if let OrchestrationCommand::ThreadDelete {
         command_id,
         thread_id,
+        ..
     } = &command
     {
         let stop = OrchestrationCommand::ThreadSessionStop {
@@ -13081,6 +13082,7 @@ mod removal_suspension_tests {
             .dispatch(OrchestrationCommand::ThreadDelete {
                 command_id: "delete".into(),
                 thread_id: "t1".into(),
+                only_if_unused: false,
             })
             .await
             .unwrap();
