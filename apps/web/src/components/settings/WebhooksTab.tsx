@@ -731,10 +731,9 @@ function EndpointForm({
         : "Enter the new token, or keep the current one."
       : null;
   const chooseKinds = capabilities.webhookStatusKinds && events.has(STATUS_CHANGED);
+  // Kinds a newer server added count too: they are saved back as they were.
   const kindsReason =
-    chooseKinds &&
-    statusKinds !== null &&
-    !WEBHOOK_STATUS_KINDS.some((kind) => statusKinds.has(kind))
+    chooseKinds && statusKinds !== null && statusKinds.size === 0
       ? "Choose at least one status change, or stop sending Thread status changed."
       : null;
   const canSave =
@@ -788,8 +787,9 @@ function EndpointForm({
           : tokenOpen && tokenText.length > 0
             ? { bearerToken: tokenText }
             : {}),
-        // Left out keeps the stored filter; an older server is never sent the field.
-        ...(capabilities.webhookStatusKinds
+        // Left out keeps the stored filter; an older server is never sent the field, and nor
+        // is an empty one, which the server refuses (Save allows it only with the event off).
+        ...(capabilities.webhookStatusKinds && statusKinds?.size !== 0
           ? {
               statusKinds:
                 statusKinds === null
