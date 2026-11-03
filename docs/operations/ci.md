@@ -158,17 +158,22 @@ budgets above include a cold compile. Native desktop keeps its 120-minute and
   and scopes Linux process cleanup to its exact data root. The harness rejects
   local invocation; unit/syntax checks do not constitute real upgrade evidence.
   The two seeded macOS rows have a 360-minute complete-job allowance for three
-  cold, isolated 90-minute packaging children, three 10-minute frozen installs,
+  sequential 90-minute packaging children that share one run-owned Cargo target
+  (only the first is cold; each bundle is staged into its own artifact root),
+  three 10-minute frozen installs,
   and 60 minutes for setup, runtime verification, evidence, and cleanup: Intel
   needs it, and the capacity-constrained Apple silicon runners have taken 43
   minutes for one package. The other four rows and the separate WSL job keep
-  240 minutes; their packaging children keep 45 minutes. If owned-child cleanup does not observe `close`
+  240 minutes; their packaging children keep 60 minutes on Windows and 45 on Linux. If owned-child cleanup does not observe `close`
   within five seconds, the harness releases that child and exits nonzero so the
   job cannot stay open for the rest of the 240-minute budget.
-  The smoke builds override the release profile with 16 codegen units and LTO off, because they prove upgrade behaviour, not optimised code; a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package.
+  The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release and CI packaging outside this harness keep the full release profile.
   The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs.
   `remote-install` reuses the protected package.
-  Repository `target` caching cannot warm the run root's three Cargo outputs.
+  Repository `target` caching cannot warm the run root's shared Cargo target.
+  Outside WSL, each lane also requires the embedded server's `serverVersion` to be the
+  baseline version before the update and the candidate version after it, so a stale
+  binary from another build in the shared target fails the lane.
   These packaging allowances are separate from the native desktop CI job above
   and preserve all existing product, WebDriver, and restart deadlines.
   Windows lanes wait for the exact candidate's installed PE version before

@@ -62,6 +62,8 @@ interface SeededUpgradeLaneLayout {
 export interface SeededUpgradeRunLayout {
   readonly candidateBuildRoot: string;
   readonly candidateCheckout: string;
+  /** One Cargo target shared by every packaging build; bundles are staged out of it. */
+  readonly cargoTargetRoot: string;
   readonly previousStable: SeededUpgradeLaneLayout;
   readonly protectedBaseline: SeededUpgradeLaneLayout;
   readonly remoteInstall: SeededUpgradeLaneLayout;
@@ -73,6 +75,7 @@ export interface SeededUpgradeObservationBefore {
   readonly effectiveRoot: string;
   readonly projectId: string;
   readonly projectIds: ReadonlyArray<string>;
+  readonly serverVersion: string | null;
   readonly storageInstanceId: string | null;
 }
 
@@ -80,6 +83,7 @@ export interface SeededUpgradeObservationAfter {
   readonly appVersion: string | null;
   readonly effectiveRoot: string;
   readonly projectIds: ReadonlyArray<string>;
+  readonly serverVersion: string | null;
   readonly storageInstanceId: string | null;
   readonly preUpdateBackups: ReadonlyArray<{
     readonly storageInstanceId: string;
@@ -338,6 +342,7 @@ export function createSeededUpgradeRunLayout(
   return {
     candidateBuildRoot: NodePath.join(runRoot, "candidate-build"),
     candidateCheckout: NodePath.join(runRoot, "candidate-checkout"),
+    cargoTargetRoot: NodePath.join(runRoot, "cargo-target"),
     previousStable: laneLayout(runRoot, "previous"),
     protectedBaseline: laneLayout(runRoot, "protected"),
     remoteInstall: laneLayout(runRoot, "remote"),
@@ -639,6 +644,8 @@ async function observe(seed) {
       effectiveRoot,
       projectId: parameters.projectId,
       projectIds,
+      serverVersion:
+        typeof descriptor?.serverVersion === "string" ? descriptor.serverVersion : null,
       storageInstanceId:
         typeof descriptor?.storageInstanceId === "string" ? descriptor.storageInstanceId : null,
       preUpdateBackups,
@@ -1022,6 +1029,29 @@ export function verifySeededUpgradeOutcome(
       primary === undefined
         ? "The protected update did not retain a verified pre-update backup."
         : `The protected update did not retain a verified pre-update backup (primary ${primary.status}, issue: ${primary.issue ?? "none"}, ${primary.backupCount} listed for storage ${primary.storageInstanceId ?? "unknown"}; rejected generations, if any, are in ${lane}-backup-inventory.log).`,
+    );
+  }
+}
+
+/** Proves each lane ran the server its own build compiled, not another build's stale binary. */
+export function verifySeededUpgradeServerVersions(input: {
+  readonly after: Pick<SeededUpgradeObservationAfter, "serverVersion">;
+  readonly baselineVersion: string;
+  readonly before: Pick<SeededUpgradeObservationBefore, "serverVersion">;
+  readonly candidateVersion: string;
+  readonly wsl: boolean;
+}): void {
+  // WSL's primary server is built separately and does not carry the desktop version.
+  if (input.wsl) return;
+  for (const [role, phase, observed, expected] of [
+    ["baseline", "before", input.before.serverVersion, input.baselineVersion],
+    ["candidate", "after", input.after.serverVersion, input.candidateVersion],
+  ] as const) {
+    if (observed === expected) continue;
+    throw new SeededDesktopUpgradeSmokeError(
+      observed === null
+        ? `The ${role} server reported no version ${phase} update.`
+        : `The ${role} server reported ${observed} ${phase} update, not ${expected}.`,
     );
   }
 }
@@ -2142,15 +2172,24 @@ const buildPackagedApplication = async (input: {
   readonly bundle: SeededDesktopUpgradeSmokeInput["bundle"];
   /** Evidence name: candidate, previous-stable, or protected-baseline. */
   readonly build: string;
+  /** This build's own artifact root; its bundle is staged here from the shared target. */
+  readonly buildRoot: string;
+  readonly cargoTargetDirectory: string;
   readonly checkout: string;
   readonly overlayPath: string;
   readonly platform: SeededUpgradePlatform;
   readonly repositoryRoot: string;
   readonly signingEnvironment: NodeJS.ProcessEnv;
-  readonly targetDirectory: string;
   readonly version: string;
 }): Promise<void> => {
   await prepareSeededUpgradeBuild(input);
+  const sharedBundle = seededUpgradeBundleRoot(
+    input.cargoTargetDirectory,
+    input.platform,
+    input.arch,
+  );
+  // Tauri adds to an existing bundle directory, so clear only it; Cargo's state stays reusable.
+  await NodeFS.promises.rm(sharedBundle, { recursive: true, force: true });
   await runTimedBuildCommand({
     artifactDirectory: input.artifactDirectory,
     command: seededUpgradeVitePlusExecutable,
@@ -2182,21 +2221,51 @@ const buildPackagedApplication = async (input: {
       seededUpgradeRustTarget(input.platform, input.arch),
     ],
     cwd: input.checkout,
-    // The smoke proves upgrade behaviour, not optimised codegen. The release profile's single
-    // thin-LTO codegen unit kept Intel runners on one core for 27-65 minutes per package.
+    // The smoke proves upgrade behaviour, not optimised code. The release profile's single
+    // thin-LTO codegen unit kept Intel runners on one core for 27-65 minutes per package, and
+    // once the builds share registry dependencies, optimising the workspace crates dominates
+    // what sharing cannot remove. Every build in the run uses this same override.
     env: {
       ...input.signingEnvironment,
-      CARGO_TARGET_DIR: input.targetDirectory,
+      CARGO_TARGET_DIR: input.cargoTargetDirectory,
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16",
       CARGO_PROFILE_RELEASE_LTO: "off",
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1",
     },
     inherit: true,
     label: `${input.build} vp run build`,
-    // Each seeded package has its own cold Cargo output. Intel needs more than 45 minutes, and
-    // the capacity-constrained Apple silicon runners have taken 43 minutes for one build.
+    // The builds share one run-owned Cargo target, but the first is cold and changed package
+    // versions rebuild the workspace crates. Intel needs more than 45 minutes, and the
+    // capacity-constrained Apple silicon runners have taken 43 minutes for one build.
     // Windows x64 took 43 minutes to compile one release build, then ran out of time bundling.
     timeoutMs: (input.platform === "mac" ? 90 : input.platform === "win" ? 60 : 45) * 60_000,
   });
+  // Stage the whole bundle before the next build overwrites the shared one. A fresh
+  // destination keeps rename from replacing or merging into an earlier package.
+  const destination = seededUpgradeBundleRoot(input.buildRoot, input.platform, input.arch);
+  if (NodeFS.existsSync(destination)) {
+    throw new SeededDesktopUpgradeSmokeError(
+      `The ${input.build} bundle destination already exists.`,
+    );
+  }
+  await NodeFS.promises.mkdir(NodePath.dirname(destination), { recursive: true });
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await NodeFS.promises.rename(sharedBundle, destination);
+      return;
+    } catch (cause) {
+      // A Windows scanner can briefly hold a fresh installer open; retry like the
+      // dependency-tree removal. A missing bundle (ENOENT) fails at once.
+      const code = (cause as NodeJS.ErrnoException).code;
+      if (attempt < 20 && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
+      throw new SeededDesktopUpgradeSmokeError(`Could not stage the ${input.build} bundle.`, {
+        cause,
+      });
+    }
+  }
 };
 
 export const seededUpgradeBundleRoot = (
@@ -2635,6 +2704,7 @@ const stopRemoteLaneApplication = async (
 const runUpgradeLane = async (input: {
   readonly appBinaryPath: string;
   readonly backendPort: number;
+  readonly baselineVersion: string;
   readonly candidateVersion: string;
   readonly layout: SeededUpgradeLaneLayout;
   readonly lane: SeededUpgradeLane;
@@ -2709,6 +2779,13 @@ const runUpgradeLane = async (input: {
   const before = await readObservation<SeededUpgradeObservationBefore>(beforePath);
   const after = await readObservation<SeededUpgradeObservationAfter>(afterPath);
   verifySeededUpgradeOutcome(input.lane, before, after, input.candidateVersion);
+  verifySeededUpgradeServerVersions({
+    after,
+    baselineVersion: input.baselineVersion,
+    before,
+    candidateVersion: input.candidateVersion,
+    wsl: input.wsl,
+  });
   if (input.lane === "remote-install") {
     const remote = await readObservation<Omit<RemoteInstallEvidence, "preUpdateBackups">>(
       NodePath.join(input.layout.evidenceDirectory, "remote-host.json"),
@@ -2732,6 +2809,7 @@ const runUpgradeLane = async (input: {
       lane: input.lane,
       candidateVersion: input.candidateVersion,
       observedAppVersion: after.appVersion,
+      observedServerVersions: { before: before.serverVersion, after: after.serverVersion },
       projectRetained: true,
       storageIdentityRetained:
         before.storageInstanceId === null || before.storageInstanceId === after.storageInstanceId,
@@ -2831,7 +2909,7 @@ const copyBoundedEvidence = async (input: {
   }
 };
 
-export { copyBoundedEvidence, runTimedBuildCommand };
+export { baselinePackage, copyBoundedEvidence, publishCandidateUpdater, runTimedBuildCommand };
 
 export async function runSeededDesktopUpgradeSmoke(
   input: SeededDesktopUpgradeSmokeInput,
@@ -3020,12 +3098,13 @@ export async function runSeededDesktopUpgradeSmoke(
       artifactDirectory: input.artifactDirectory,
       bundle: input.bundle,
       build: "candidate",
+      buildRoot: layout.candidateBuildRoot,
+      cargoTargetDirectory: layout.cargoTargetRoot,
       checkout: layout.candidateCheckout,
       overlayPath: candidateOverlay,
       platform: input.platform,
       repositoryRoot: input.repositoryRoot,
       signingEnvironment,
-      targetDirectory: layout.candidateBuildRoot,
       version: input.candidateVersion,
     });
     if (!input.wsl) {
@@ -3034,12 +3113,13 @@ export async function runSeededDesktopUpgradeSmoke(
         artifactDirectory: input.artifactDirectory,
         bundle: input.bundle,
         build: "previous-stable",
+        buildRoot: layout.previousStable.buildRoot,
+        cargoTargetDirectory: layout.cargoTargetRoot,
         checkout: layout.previousStable.checkout,
         overlayPath: previousOverlay,
         platform: input.platform,
         repositoryRoot: input.repositoryRoot,
         signingEnvironment,
-        targetDirectory: layout.previousStable.buildRoot,
         version: input.previousVersion,
       });
     }
@@ -3048,12 +3128,13 @@ export async function runSeededDesktopUpgradeSmoke(
       artifactDirectory: input.artifactDirectory,
       bundle: input.bundle,
       build: "protected-baseline",
+      buildRoot: layout.protectedBaseline.buildRoot,
+      cargoTargetDirectory: layout.cargoTargetRoot,
       checkout: layout.protectedBaseline.checkout,
       overlayPath: protectedOverlay,
       platform: input.platform,
       repositoryRoot: input.repositoryRoot,
       signingEnvironment,
-      targetDirectory: layout.protectedBaseline.buildRoot,
       version: input.previousVersion,
     });
     await publishCandidateUpdater({
@@ -3087,6 +3168,7 @@ export async function runSeededDesktopUpgradeSmoke(
       await runUpgradeLane({
         appBinaryPath: previousApp,
         backendPort: input.updaterPort + 1,
+        baselineVersion: input.previousVersion,
         candidateVersion: input.candidateVersion,
         lane: "previous-stable",
         layout: layout.previousStable,
@@ -3112,6 +3194,7 @@ export async function runSeededDesktopUpgradeSmoke(
     await runUpgradeLane({
       appBinaryPath: protectedApp,
       backendPort: input.updaterPort + 2,
+      baselineVersion: input.previousVersion,
       candidateVersion: input.candidateVersion,
       lane: "protected-baseline",
       layout: layout.protectedBaseline,
@@ -3149,6 +3232,7 @@ export async function runSeededDesktopUpgradeSmoke(
       await runUpgradeLane({
         appBinaryPath: remoteApp,
         backendPort: assertRemoteInstallPort(input.updaterPort + 3),
+        baselineVersion: input.previousVersion,
         candidateVersion: input.candidateVersion,
         lane: "remote-install",
         layout: layout.remoteInstall,

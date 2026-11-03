@@ -1918,14 +1918,20 @@ isolated data root; legacy cleanup can terminate another desktop app.
 
 For seeded CI qualification, distinguish a packaging-child timeout from a
 runtime-upgrade failure. The candidate, previous stable, and protected baseline
-are three sequential builds with separate cold Cargo outputs outside the
-workflow's cached repository `target`; `remote-install` reuses the protected
-package. Only macOS (x64 and arm64) gives each packaging child 90 minutes and
+are three sequential builds into one run-owned Cargo target under the isolated
+run root, outside every checkout and the workflow's cached repository `target`.
+The first build is cold; the later two reuse its registry dependencies and
+rebuild only the workspace crates whose versions or sources changed. Before each
+build the harness removes only the shared `<triple>/release/bundle` directory,
+and after it succeeds renames that whole directory into the build's own
+artifact root, so a later build cannot overwrite or contaminate an earlier
+package; a missing bundle or occupied destination stops the run before any
+publish or install. `remote-install` reuses the protected package. Only macOS (x64 and arm64) gives each packaging child 90 minutes and
 the complete job 360 minutes. Windows gives each packaging child 60 minutes and
 Linux 45, both within 240-minute jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
 10 minutes per checkout. Each macOS job reserves 60 additional minutes after the
 three packaging and install bounds for setup, all lanes, evidence, and cleanup.
-Product, WebDriver, and restart deadlines remain unchanged. The smoke builds override the release profile with 16 codegen units and LTO off, because they prove upgrade behaviour, not optimised code; a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs. Read `build-timings.txt` first when a lane stops during packaging. Record a command
+Product, WebDriver, and restart deadlines remain unchanged. The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release and CI packaging outside this harness keep the full release profile. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs. Read `build-timings.txt` first when a lane stops during packaging. Record a command
 timeout and the last completed phase as unavailable native evidence; passing
 tooling tests cannot substitute for completed upgrade observations.
 
