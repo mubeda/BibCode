@@ -92,6 +92,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   previewTunnels: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `review.listDiffTools` and `review.openDiffTool`: the Diff panel's **Open with**. */
   reviewDiffTools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Webhooks offer `input.requested` and `input.resolved` (the Questions events). */
+  webhookQuestionEvents: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

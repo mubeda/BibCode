@@ -20,6 +20,8 @@ pub(crate) const WORKTREE_CREATED: &str = "worktree.created";
 pub(crate) const PANEL_CREATED: &str = "panel.created";
 pub(crate) const APPROVAL_REQUESTED: &str = "approval.requested";
 pub(crate) const APPROVAL_RESOLVED: &str = "approval.resolved";
+pub(crate) const INPUT_REQUESTED: &str = "input.requested";
+pub(crate) const INPUT_RESOLVED: &str = "input.resolved";
 pub(crate) const CLONE_COMPLETED: &str = "clone.completed";
 pub(crate) const SCM_OPERATION_COMPLETED: &str = "scm.operation_completed";
 pub(crate) const TRANSFER_COMPLETED: &str = "transfer.completed";
@@ -35,6 +37,8 @@ pub(crate) const EVENT_TYPES: &[(&str, &str)] = &[
     (PANEL_CREATED, "threads"),
     (APPROVAL_REQUESTED, "approvals"),
     (APPROVAL_RESOLVED, "approvals"),
+    (INPUT_REQUESTED, "questions"),
+    (INPUT_RESOLVED, "questions"),
     (CLONE_COMPLETED, "operations"),
     (SCM_OPERATION_COMPLETED, "operations"),
     (TRANSFER_COMPLETED, "operations"),
@@ -105,6 +109,8 @@ pub(crate) fn from_feed_entry(entry: &Value, route: ThreadRoute) -> Option<Event
         "panel.created" => PANEL_CREATED,
         "approval.requested" => APPROVAL_REQUESTED,
         "approval.resolved" => APPROVAL_RESOLVED,
+        "input.requested" => INPUT_REQUESTED,
+        "input.resolved" => INPUT_RESOLVED,
         "agent.call" => agent_call_event(entry)?,
         _ => return None,
     };
@@ -200,6 +206,8 @@ pub(crate) fn test_event(occurred_at: String) -> Event {
 mod tests {
     use super::*;
 
+    const MARKER: &str = "QUESTION-TEXT-never-in-a-payload";
+
     fn entry(kind: &str) -> Value {
         json!({ "at": "2026-10-31T00:00:00Z", "kind": kind, "threadId": "t1", "cursor": "v1.7.2" })
     }
@@ -216,10 +224,11 @@ mod tests {
             ("panel.created", Some(PANEL_CREATED)),
             ("approval.requested", Some(APPROVAL_REQUESTED)),
             ("approval.resolved", Some(APPROVAL_RESOLVED)),
+            ("input.requested", Some(INPUT_REQUESTED)),
+            ("input.resolved", Some(INPUT_RESOLVED)),
             ("thread.created", None),
             ("thread.archived", None),
             ("turn.requested", None),
-            ("input.requested", None),
         ] {
             let event = from_feed_entry(&entry(kind), route.clone());
             assert_eq!(event.map(|event| event.event_type), expected, "{kind}");
@@ -305,6 +314,17 @@ mod tests {
             .unwrap()
             .id
         );
+        // A question carries its id and how it was resolved, never its text or answers.
+        let answered = from_feed_entry(
+            &json!({ "kind": "input.resolved", "cursor": "v1.9.2", "threadId": "t1", "requestId": "q-1", "status": "expired", "questions": MARKER, "answers": MARKER }),
+            None,
+        )
+        .expect("an input event");
+        let body: Value = serde_json::from_str(&answered.body("env-1")).unwrap();
+        assert_eq!(body["type"], INPUT_RESOLVED);
+        assert_eq!(body["requestId"], "q-1");
+        assert_eq!(body["status"], "expired");
+        assert!(!body.to_string().contains(MARKER), "{body}");
         let finding = from_finding("f1", 3, "2026-10-31T00:00:01Z");
         let body: Value = serde_json::from_str(&finding.body("env-1")).unwrap();
         assert_eq!(
