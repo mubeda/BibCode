@@ -2924,6 +2924,7 @@ async fn removal_command_reservation_allows_only_one_cross_repository_git_mutati
     let second_external = fixture.root.path().join("second-external");
     fs::create_dir(&second_main).expect("second primary directory");
     git(&second_main, &["init", "--initial-branch", "main"], None);
+    git(&second_main, &["config", "core.autocrlf", "false"], None);
     git(
         &second_main,
         &["config", "user.email", "rpc@example.invalid"],
@@ -4677,6 +4678,9 @@ impl CatalogRpcFixture {
         let external = root.path().join("external");
         fs::create_dir(&main).expect("primary directory");
         git(&main, &["init", "--initial-branch", "main"], None);
+        // Production Git ignores the system config, so a host `core.autocrlf=true` would make
+        // the checkout look dirty to it (docs/testing/windows-desktop.md).
+        git(&main, &["config", "core.autocrlf", "false"], None);
         git(
             &main,
             &["config", "user.email", "rpc@example.invalid"],

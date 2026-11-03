@@ -11506,8 +11506,9 @@ mod turn_diff_tests {
             json!([{"path": "lines.txt", "kind": "modified", "additions": 1, "deletions": 1}]),
         )
         .await;
-        // Back to the ledger a v0.14 server wrote (migration 62), then upgraded. Migration 64
-        // (#226) is idempotent, so its columns can stay.
+        // Back to the ledger a v0.14 server wrote (migration 62), then upgraded. Every later
+        // migration is guarded, so the columns they added can stay; only the ledger must end at
+        // 62, since pending migrations are the ones above its highest id.
         engine
             .repositories()
             .database()
@@ -11521,8 +11522,7 @@ mod turn_diff_tests {
                 if has_column {
                     connection.execute_batch(
                         "ALTER TABLE projection_turns DROP COLUMN checkpoint_diff_available;
-                         DELETE FROM effect_sql_migrations
-                           WHERE name IN ('ProjectionTurnCheckpointDiffAvailable', 'ThreadHistoryWindow');",
+                         DELETE FROM effect_sql_migrations WHERE migration_id > 62;",
                     )?;
                 }
                 run_migrations(connection, None)?;
