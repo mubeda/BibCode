@@ -213,7 +213,8 @@ async function play(row: Row, sideChat: boolean) {
       result._tag === "Success" ? "archived" : "refused",
     );
   const snapshot = () => {
-    const threads = [...h.server].flatMap(([id, thread]) =>
+    type ShellRow = Parameters<typeof applyPanelThreadAdoption>[2][number];
+    const threads = [...h.server].flatMap(([id, thread]): ShellRow[] =>
       id === hostId
         ? [{ id: hostId, kind: "workspace" as const, title: "Host", archivedAt: null }]
         : // The live shell leaves archived threads out.
@@ -224,7 +225,7 @@ async function play(row: Row, sideChat: boolean) {
                 kind: "panel" as const,
                 hostThreadId: hostId,
                 title: sideChat ? "Panel: Side chat · Codex" : "Panel: Codex",
-                archivedAt: thread.archived ? "2026-11-03T00:00:00Z" : null,
+                archivedAt: null,
               },
             ]
           : [],
