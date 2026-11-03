@@ -2180,14 +2180,13 @@ archive is. A delete settles the close as an archive does: the shell that
 reaches its sequence no longer lists the panel, and it never reaches **Reopen
 closed chat**, which lists archived panels only.
 
-**Bring back** in a side chat composes, on the client, the last finished
-assistant answer quoted under the user message that started its turn: the newest
-delivered user message without a turn id (a steer carries one) created by the
-time the answer was, since a queued message keeps its queued state until it is
-promoted and re-timed (`apps/web/src/sideChatBringBack.ts`). It appends that to
-the host's composer
-draft. It sends nothing and calls no RPC; it is disabled while the host's
-session is running.
+**Bring back** in a side chat composes, on the client, "From the side chat:" and
+the last finished assistant answer as a Markdown quote
+(`apps/web/src/sideChatBringBack.ts`), and appends it to the host's composer
+draft. It names no question: the thread detail carries no link from a turn to
+the user message that started it, so a question queued or retried meanwhile
+could be named wrongly. It sends nothing and calls no RPC; it is disabled while
+the host's session is running.
 
 Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present

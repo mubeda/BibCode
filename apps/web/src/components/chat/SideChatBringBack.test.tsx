@@ -48,7 +48,7 @@ import { BRING_BACK_HOST_RUNNING_REASON, BRING_BACK_NO_ANSWER_REASON } from "~/s
 import { BRING_BACK_DESCRIPTION, SideChatBringBack } from "./SideChatBringBack";
 
 const HOST = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("host"));
-const SUMMARY = "From the side chat (asked: why?):\n\n> Because.";
+const SUMMARY = "From the side chat:\n\n> Because.";
 
 let root: Root | null = null;
 
