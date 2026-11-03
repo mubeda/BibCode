@@ -4227,6 +4227,8 @@ pub struct TransitionRow {
     pub request_id: Option<String>,
     /// The event's `metadata.actor` as JSON (slice X1), when an outside agent planned it.
     pub actor_json: Option<String>,
+    /// `thread.created`: why the outside agent that created it did (#271), as it gave it.
+    pub purpose: Option<String>,
 }
 
 /// One `mcp_activity` row (slice X1): ids, an outcome tag and a target of ids and counts.
@@ -4274,7 +4276,8 @@ const TRANSITION_COLUMNS: &str = "e.sequence, e.event_type, e.stream_id, e.occur
     CASE WHEN e.event_type = 'thread.session-set' THEN (SELECT json_array(json_extract(p.payload_json, '$.session.status'), json_extract(p.payload_json, '$.session.activeTurnId')) FROM orchestration_events AS p WHERE p.aggregate_kind = 'thread' AND p.stream_id = e.stream_id AND p.sequence < e.sequence AND p.event_type = 'thread.session-set' ORDER BY p.sequence DESC LIMIT 1) END, \
     CASE WHEN e.event_type = 'thread.activity-appended' THEN json_extract(e.payload_json, '$.activity.kind') END, \
     CASE WHEN e.event_type = 'thread.activity-appended' THEN COALESCE(json_extract(e.payload_json, '$.activity.payload.requestId'), json_extract(e.metadata_json, '$.requestId')) END, \
-    json_extract(e.metadata_json, '$.actor')";
+    json_extract(e.metadata_json, '$.actor'), \
+    CASE WHEN e.event_type = 'thread.created' THEN json_extract(e.payload_json, '$.purpose') END";
 
 /// The bytes of payload the transition read may parse for event `o`: a transition type's whole
 /// payload (an approval's kind is inside it), plus, for a session update, the payload of the
@@ -4428,6 +4431,7 @@ fn decode_transition(row: &Row<'_>) -> rusqlite::Result<TransitionRow> {
         activity_kind: text_column(row, 8)?,
         request_id: text_column(row, 9)?,
         actor_json: text_column(row, 10)?,
+        purpose: text_column(row, 11)?,
     })
 }
 

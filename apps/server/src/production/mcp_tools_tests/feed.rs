@@ -275,14 +275,11 @@ async fn transitions_hold_no_text_and_their_cursors_increase_strictly() {
 
     let page = feed(&harness, &agent, json!({ "cursor": cursor })).await;
     let text = page.to_string();
-    for marker in [
-        PROMPT_MARKER,
-        REPLY_MARKER,
-        "SUMMARY-MARKER-x3",
-        "PURPOSE-MARKER-x3",
-    ] {
+    for marker in [PROMPT_MARKER, REPLY_MARKER, "SUMMARY-MARKER-x3"] {
         assert!(!text.contains(marker), "{marker} leaked: {text}");
     }
+    // The agent's purpose is on the entry of the thread it created, and nowhere else.
+    assert_eq!(text.matches("PURPOSE-MARKER-x3").count(), 1, "{text}");
     assert_eq!(
         kinds(&page),
         [
@@ -307,6 +304,7 @@ async fn transitions_hold_no_text_and_their_cursors_increase_strictly() {
         "actor",
         "tool",
         "target",
+        "purpose",
     ];
     for entry in entries {
         for key in entry.as_object().unwrap().keys() {
@@ -315,6 +313,7 @@ async fn transitions_hold_no_text_and_their_cursors_increase_strictly() {
         assert_eq!(entry["threadId"], thread_id.as_str(), "{entry}");
     }
     // The agent's own work names it; the provider's does not.
+    assert_eq!(entries[0]["purpose"], "PURPOSE-MARKER-x3");
     let actor = &entries[0]["actor"];
     assert_eq!(actor["kind"], "mcp-client");
     assert_eq!(actor["clientId"], agent.principal.session_id.as_str());

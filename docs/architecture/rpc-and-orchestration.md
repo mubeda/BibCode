@@ -3938,7 +3938,9 @@ instead of failing the call.
   charged), of which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
   `thread.session-set` and the approval and input `thread.activity-appended` events come
   back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`
-  (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`);
+  (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`), and a
+  `thread.created` with its `purpose` (the agent's own reason, at most 200 characters,
+  #271), which webhook payloads never copy;
   and the `mcp_activity` rows after the cursor's activity id. A session update reads the
   status and turn of the thread's previous session update (both that lookup and its cost
   seek the partial index `idx_orch_events_thread_session_updates`, migration 60), so it maps
@@ -4207,7 +4209,8 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   `projection_threads.requester_json` `{ actor, purpose }` for a thread an agent created
   (a `thread.create` or `bootstrap.createThread` `purpose`, at most 200 characters, an
   engine invariant). The thread stream's messages carry `actor` and `sourceThreadId`, the
-  shell's threads carry `requester`, and `read_thread` returns both.
+  shell's threads carry `requester`, and `read_thread` and every thread summary
+  (`list_projects_and_threads`, `list_chat_panels`) return it.
 - **Activity rows.** `McpControl::call_in` records one `mcp_activity` row per call of a
   non-read-only tool that reached its handler: time, session, label, tool, thread, outcome
   (`success` or the error tag) and a target of ids and counts only (`sha`, `revertedSha`,

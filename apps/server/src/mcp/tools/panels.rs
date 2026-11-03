@@ -249,11 +249,7 @@ impl ToolCall<'_> {
             .into_iter()
             .flatten()
             .filter(|thread| thread["kind"] == "panel" && thread["hostThreadId"] == host_thread_id)
-            .map(|thread| {
-                let mut summary = super::threads::thread_summary(thread);
-                summary["requester"] = thread.get("requester").cloned().unwrap_or(Value::Null);
-                summary
-            })
+            .map(super::threads::thread_summary)
             .collect();
         let mut content = json!({ "hostThreadId": host_thread_id, "panels": panels });
         fit_list(&mut content, "/panels", Cut::Back, 1);
