@@ -135,6 +135,10 @@ const DELIVERY_COLUMNS: &str = "sequence, delivery_id, endpoint_id, event_id, ev
     state, attempts, next_attempt_ms, last_status, last_error, latency_ms, created_at, updated_at, \
     endpoint_revision";
 
+/// What an endpoint's deliveries are addressed by: `enabled`, `url`, `project_id`,
+/// `event_types_json` and `status_kinds_json`.
+type Addressing = (i64, String, Option<String>, String, Option<String>);
+
 fn status_kinds_json(kinds: Option<&[String]>) -> Option<String> {
     kinds.map(|kinds| serde_json::to_string(kinds).unwrap_or_else(|_| "[]".to_owned()))
 }
@@ -278,7 +282,7 @@ impl Store {
         self.database
             .call(move |connection| {
                 let transaction = connection.transaction()?;
-                let before: Option<(i64, String, Option<String>, String, Option<String>)> =
+                let before: Option<Addressing> =
                     transaction
                         .query_row(
                             "SELECT enabled, url, project_id, event_types_json, status_kinds_json FROM webhook_endpoints WHERE endpoint_id = ?1",
