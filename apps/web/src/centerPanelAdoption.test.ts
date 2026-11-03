@@ -63,7 +63,7 @@ describe("center panel adoption", () => {
     useCenterPanelStore.setState({
       byThreadKey: {},
       pendingChatPanelThreadKeys: new Set(),
-      closingChatPanels: new Set(),
+      closingChatPanels: new Map(),
       reshowChatPanels: new Set(),
     });
     release.mockClear();
