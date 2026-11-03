@@ -590,6 +590,17 @@ The scenario releases it only after reload assertions. Support tests cover
 steer/start log discrimination, turn identity, release, timeout, and interrupt
 cleanup without requiring provider accounts or listeners.
 
+The default suite also includes `chat-side-chat.e2e.ts` (isolate it with
+`BIBCODE_E2E_SPEC=./specs/chat-side-chat.e2e.ts`). It starts a `[[slow]]` host
+turn, types `:btw <question>` into the running thread, and checks that a
+**Side chat · Codex** tab opens active, that the side chat's first provider
+input carries the host's messages in `<bibcode_thread_context>` with side-chat
+framing, that the side chat shows the fixture reply, and that the host's
+provider input, transcript and queue are unchanged. The host's `[[slow]]`
+marker is part of the seed, so the side chat's turn is slow too; the scenario
+releases both turns one after the other through the release file. It saves
+`side-chat-reply.png` and `side-chat-host-untouched.png`.
+
 The native composer fixture must advertise each user-invocable Claude skill in
 both the `initialize.commands` catalog and `reload_skills.skills`. The server
 filters out reload-only model skills, so adding a fixture skill only to the

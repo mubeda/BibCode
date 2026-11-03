@@ -896,7 +896,9 @@ is known to be the turn's end state.
    projection before the session settles. Only a thread with a recorded
    checkpoint, or a turn whose working directory lies in a Git work tree (a
    `.git` in it or above), is numbered, so numbering never waits for the
-   effects worker and a project outside Git gets no checkpoints. It also takes
+   effects worker and a project outside Git gets no checkpoints. A side chat's
+   turns are never numbered, and turn start writes no ref 0 for it, so a side
+   chat captures no checkpoints in the checkout it shares with its host. It also takes
    a checkpoint hold for the turn: turn delivery holds every turn of the
    thread (direct starts, Send now, promoted follow-ups, steers, MCP sends)
    while any of its ended turns is held, so no turn edits the checkout before
@@ -2104,8 +2106,37 @@ every client can open the panel under its host; public `thread.create` rejects a
 client-supplied `hostThreadId`. A generic `thread.delete` emits `thread.deleted`
 for every non-deleted panel whose `hostThreadId` is the deleted thread, live or
 archived, in id order before the thread's own event and in the same command, so
-the existing deletion effects clean up their sessions and terminals. Similarly,
-`worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
+the existing deletion effects clean up their sessions and terminals.
+
+A **side chat** (#265) is a panel with `sideChat: true`. Only
+`worktree.createPanel` sets it, and only on a server that advertises
+`capabilities.sideChats`; an older server's `deny_unknown_fields` input would
+refuse the field, so the client never sends it there. The Rust input omits a
+`false` marker when it hashes the command (`skip_serializing_if`), so a plain
+panel request digests as it did before side chats and replays its stored
+receipt. The engine requires a side chat to be a `panel` with a host, copies
+the marker into `thread.created` only when true, and the projector stores it in
+`projection_threads.side_chat` (migration 67); replaying older events yields
+`false`. Thread shells, details and MCP thread summaries carry `sideChat: true`
+only for a side chat. A side chat is a panel, so nesting, the delete cascade,
+visibility and the MCP credential scope are the panel rules. The engine drops
+`title` from `thread.meta.update` on a side chat (the first-message rename any
+client sends), so its `Panel: Side chat · <provider>` title, which every client
+labels its tab from, stays; the other fields apply. It refuses
+`thread.checkpoint.revert` for a side chat ("Side chats can't restore files.
+Restore from the main thread."): with no checkpoints of its own, a revert would
+fall back to `HEAD` and clean the host's uncommitted work.
+
+The client opens a side chat with `createPanel` (`sideChat: true`,
+`approval-required`, the host's model) and then sends its question with
+`thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
+draft stays until the question was handed over. A tab closed while any panel
+is still being created records the close in the persisted
+`closedBeforeCreated` list (center panel store version 5, at most 20 keys), and
+the panel is archived once it exists, by the open itself or, after a reload, by
+adoption.
+
+Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the
 resolved metadata change. Neither operation accepts generic path or kind
