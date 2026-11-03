@@ -73,7 +73,7 @@ jobs:
               jobTimeoutMinutes: 360,
               harnessTimeoutMinutes: 345,
             }
-          # Three cold 90-minute builds + three 10-minute installs + setup and all upgrade lanes.
+          # Three 90-minute builds sharing one Cargo target + three 10-minute installs + setup and lanes.
           - {
               label: macOS x64,
               runner: macos-26-intel,

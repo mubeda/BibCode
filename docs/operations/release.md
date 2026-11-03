@@ -346,14 +346,16 @@ version. The harness verifies the package manifests, both Rust manifests,
 their Cargo lock entries, and the Tauri overlay agree, so native app and embedded
 server versions describe the same build. The calling checkout is not rewritten.
 
-The three packages compile sequentially into separate Cargo output directories
-under the isolated run root; the workflow's cached repository `target` does not
-warm them. The macOS packaging children have a 90-minute bound, Windows
+The three packages compile sequentially into one shared Cargo target under the
+isolated run root; the workflow's cached repository `target` does not warm it.
+The later builds reuse the first build's registry dependencies, and after each
+build the harness renames its whole bundle directory into that build's own
+artifact root, so packages never mix. The macOS packaging children have a 90-minute bound, Windows
 children 60 minutes, and Linux children 45 minutes. Each checkout's frozen dependency install retains
 10 minutes. The complete macOS jobs allow 360 minutes: 270 for packaging, 30
 for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
 The other four native rows and the separate WSL job retain 240 minutes.
-The smoke builds override the release profile with 16 codegen units and LTO off, because they prove upgrade behaviour, not optimised code; a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs.
+The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release and CI packaging outside this harness keep the full release profile. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs.
 The `remote-install` lane reuses the protected package rather than building a
 fourth package. These are build/job limits, not expected durations or changes
 to product, WebDriver, or restart deadlines.

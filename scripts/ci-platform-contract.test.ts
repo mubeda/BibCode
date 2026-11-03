@@ -834,7 +834,7 @@ describe("seeded packaged desktop upgrade contract", () => {
     const intel = smoke.strategy?.matrix?.include?.find(
       (row) => row.platform === "mac" && row.arch === "x64",
     );
-    // Three separate Cargo outputs, three bounded frozen installs, plus an hour
+    // Three bounded builds into one shared Cargo target, three bounded frozen installs, plus an hour
     // for setup, runtime verification, evidence retention, and cleanup.
     expect(intel?.jobTimeoutMinutes).toBe(3 * 90 + 3 * 10 + 60);
     // The harness step ends 15 minutes before the job so setup overruns still leave the
