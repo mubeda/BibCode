@@ -75,6 +75,11 @@ describe("buildComposerCommandItems", () => {
       { type: "bibcode-action", group: "bibcode", action: "model", replacement: null },
       { type: "bibcode-action", group: "bibcode", action: "plan", replacement: null },
       { type: "bibcode-action", group: "bibcode", action: "default", replacement: null },
+      { type: "bibcode-action", group: "bibcode", action: "btw", replacement: null },
+      { type: "bibcode-action", group: "bibcode", action: "side", replacement: null },
+    ]);
+    expect(buildComposerCommandItems(inputFor(":bt")).items).toMatchObject([
+      { action: "btw", description: "Side chat: ask without adding to this thread" },
     ]);
   });
 

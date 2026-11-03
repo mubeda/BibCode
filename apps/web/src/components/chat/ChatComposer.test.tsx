@@ -2203,6 +2203,18 @@ describe("ChatComposer menu selection", () => {
     expect(second.spies.onSend).not.toHaveBeenCalled();
   });
 
+  it("types :btw and :side for their question instead of running them", () => {
+    const first = renderCommandMenu(":bt");
+    first.onSelect(first.items.find((item) => item["id"] === "bibcode-action:btw")!);
+    expect(draftOf(threadRef)?.prompt).toBe(":btw ");
+    expect(first.spies.onSend).not.toHaveBeenCalled();
+    expect(first.spies.handleInteractionModeChange).not.toHaveBeenCalled();
+
+    const second = renderCommandMenu(":si");
+    second.onSelect(second.items.find((item) => item["id"] === "bibcode-action:side")!);
+    expect(draftOf(threadRef)?.prompt).toBe(":side ");
+  });
+
   it("inserts provider slash commands with a trailing space", () => {
     const { onSelect, items } = renderCommandMenu("/rev");
 

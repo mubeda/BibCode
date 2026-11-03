@@ -4410,14 +4410,15 @@ function ChatViewContent(props: ChatViewProps) {
   );
   // A side chat runs on the host's provider and model; the composer's `:btw` and the menu's
   // **Side chat** share one availability, so both say the same thing when they can't.
+  const hostInstanceId = activeThread?.modelSelection.instanceId ?? null;
   const hostProviderItem = useMemo(
     () =>
-      activeThread
-        ? buildPanelMenuModel(providerInstanceEntries).find(
-            (item) => item.entry.instanceId === activeThread.modelSelection.instanceId,
-          )
-        : undefined,
-    [activeThread, providerInstanceEntries],
+      hostInstanceId === null
+        ? undefined
+        : buildPanelMenuModel(providerInstanceEntries).find(
+            (item) => item.entry.instanceId === hostInstanceId,
+          ),
+    [hostInstanceId, providerInstanceEntries],
   );
   const sideChatUnavailableReason = resolveSideChatAvailability({
     capabilities: serverConfig?.environment.capabilities ?? null,
@@ -4428,31 +4429,22 @@ function ChatViewContent(props: ChatViewProps) {
       ? (hostProviderItem.disabledReason ?? null)
       : PROVIDER_NOT_READY_REASON,
   });
-  const createCenterSideChat = centerPanelActions.createSideChat;
-  const handleOpenSideChat = useCallback(
-    (question: string, submittedText?: string) => {
-      if (!activeThread || !activeThreadRef || !hostProviderItem) return;
-      if (sideChatUnavailableReason !== null) return;
-      void createCenterSideChat({
-        hostRef: activeThreadRef,
-        projectId: activeThread.projectId,
-        worktreePath: centerPanelLaunchContext?.worktreePath ?? null,
-        branch: activeThread.branch ?? null,
-        modelSelection: activeThread.modelSelection,
-        providerLabel: hostProviderItem.entry.displayName,
-        question,
-        ...(submittedText === undefined ? {} : { submittedText }),
-      });
-    },
-    [
-      activeThread,
-      activeThreadRef,
-      centerPanelLaunchContext?.worktreePath,
-      createCenterSideChat,
-      hostProviderItem,
-      sideChatUnavailableReason,
-    ],
-  );
+  // A latest handler: the thread changes on every streamed update, the composer and menu
+  // keep one callback.
+  const handleOpenSideChat = useLatestHandler((question: string, submittedText?: string) => {
+    if (!activeThread || !activeThreadRef || !hostProviderItem) return;
+    if (sideChatUnavailableReason !== null) return;
+    void centerPanelActions.createSideChat({
+      hostRef: activeThreadRef,
+      projectId: activeThread.projectId,
+      worktreePath: centerPanelLaunchContext?.worktreePath ?? null,
+      branch: activeThread.branch ?? null,
+      modelSelection: activeThread.modelSelection,
+      providerLabel: hostProviderItem.entry.displayName,
+      question,
+      ...(submittedText === undefined ? {} : { submittedText }),
+    });
+  });
   const handleCreateSideChatFromMenu = useCallback(
     () => handleOpenSideChat(""),
     [handleOpenSideChat],
