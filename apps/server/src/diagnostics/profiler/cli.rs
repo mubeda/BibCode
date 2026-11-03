@@ -220,7 +220,7 @@ fn desktop_mcp_dispatch() -> i32 {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
-            return error.exit_code();
+            return usage_exit_code(&error);
         }
     };
     let action = match crate::config::mcp_action(cli.base_dir, cli.dev_url, cli.args) {
@@ -274,6 +274,12 @@ struct DesktopMcpCli {
     args: crate::config::McpArgs,
 }
 
+/// A parse failure's exit code: 0 for `--help` and `--version`, else 1, never clap's 2, which
+/// means a person must answer in BiBCode.
+fn usage_exit_code(error: &clap::Error) -> i32 {
+    i32::from(error.exit_code() != 0)
+}
+
 /// `<desktop exe> thread …` (#139): `bibcode thread` against this desktop's own running
 /// server. A usage error exits 1, not clap's 2, which means a person must answer in BiBCode.
 fn desktop_thread_dispatch() -> i32 {
@@ -281,7 +287,7 @@ fn desktop_thread_dispatch() -> i32 {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
-            return i32::from(error.exit_code() != 0);
+            return usage_exit_code(&error);
         }
     };
     let options = match crate::config::relay_options(
@@ -782,6 +788,23 @@ mod tests {
             Some(crate::mcp::control::McpAccess::ReadOnly)
         );
         assert!(DesktopMcpCli::try_parse_from(["mcp", "--access", "everything"]).is_err());
+    }
+
+    /// A usage error exits 1, never clap's 2, which `call` uses for a thread waiting on a
+    /// person; `--help` still exits 0.
+    #[test]
+    fn a_desktop_mcp_usage_error_exits_1_and_help_exits_0() {
+        let code = |argv: &[&str]| {
+            usage_exit_code(
+                &DesktopMcpCli::try_parse_from(argv)
+                    .err()
+                    .expect("a parse error"),
+            )
+        };
+        assert_eq!(code(&["mcp", "call"]), 1);
+        assert_eq!(code(&["mcp", "--access", "everything"]), 1);
+        assert_eq!(code(&["mcp", "--help"]), 0);
+        assert_eq!(code(&["mcp", "call", "--help"]), 0);
     }
 
     #[test]
