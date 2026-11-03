@@ -33,7 +33,7 @@ const h = vi.hoisted(() => ({
   newCommandId: vi.fn(),
   startTurn: vi.fn(),
   pending: new Set<string>(),
-  closing: new Set<string>(),
+  closing: new Map<string, number | null>(),
   reshow: new Set<string>(),
   drafts: new Map<string, { prompt: string; attachments: unknown[] }>(),
 }));
@@ -93,8 +93,15 @@ vi.mock("~/centerPanelStore", () => ({
       closingChatPanels: h.closing,
       reshowChatPanels: h.reshow,
       hideClosingChatPanel: (ref: { environmentId: string; threadId: string }) => {
-        h.closing.add(`${ref.environmentId}:${ref.threadId}`);
+        h.closing.set(`${ref.environmentId}:${ref.threadId}`, null);
         h.pending.delete(`${ref.environmentId}:${ref.threadId}`);
+      },
+      awaitClosingChatPanelShell: (
+        ref: { environmentId: string; threadId: string },
+        sequence: number,
+      ) => {
+        const key = `${ref.environmentId}:${ref.threadId}`;
+        if (h.closing.has(key)) h.closing.set(key, sequence);
       },
       releaseClosingChatPanel: (
         ref: { environmentId: string; threadId: string },

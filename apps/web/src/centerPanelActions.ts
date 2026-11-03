@@ -251,8 +251,9 @@ export function useCenterPanelActions({
   });
   const { reopenChatPanel, openPanelThread } = usePanelThreadOpener();
 
+  /** Resolves the archive's event sequence once the server archived it, else `null`. */
   const archivePanelThread = useCallback(
-    async ({ environmentId, threadId }: ScopedThreadRef) => {
+    async ({ environmentId, threadId }: ScopedThreadRef): Promise<number | null> => {
       const session = readThreadShell(scopeThreadRef(environmentId, threadId))?.session;
       if (session?.status === "running") {
         // Best effort: an interrupt that fails must not keep the closed panel live.
@@ -265,7 +266,8 @@ export function useCenterPanelActions({
         });
       }
       const result = await archiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      if (result._tag === "Success") return result.value.sequence;
+      if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         toastManager.add(
           stackedThreadToast({
@@ -275,6 +277,7 @@ export function useCenterPanelActions({
           }),
         );
       }
+      return null;
     },
     [archiveThread, interruptTurn],
   );

@@ -99,14 +99,17 @@ interface CenterPanelStoreState {
   navigateActivityPane: (ref: ScopedThreadRef, surfaceId: string, route: ActivityPaneRoute) => void;
   readonly pendingChatPanelThreadKeys: ReadonlySet<string>;
   /**
-   * Chat panels whose tab this page closed while its own request about them (their archive,
-   * or the creation it waits on) is in flight; adoption leaves them alone (see
-   * `centerPanelClose`). In memory only: a reload forgets them.
+   * Chat panels whose tab this page closed and adoption leaves alone (see `centerPanelClose`):
+   * `null` while this page's own request about them (their archive, or the creation it waits
+   * on) is in flight, or the sequence of their archive while the shell has not reached it yet.
+   * In memory only: a reload forgets them.
    */
-  readonly closingChatPanels: ReadonlySet<string>;
+  readonly closingChatPanels: ReadonlyMap<string, number | null>;
   /** Chat panels whose close ended; adoption shows them again if they are still live. */
   readonly reshowChatPanels: ReadonlySet<string>;
   hideClosingChatPanel: (ref: ScopedThreadRef) => void;
+  /** Keeps `ref` hidden until a shell at or after `sequence`, its archive's. */
+  awaitClosingChatPanelShell: (ref: ScopedThreadRef, sequence: number) => void;
   /** Ends `ref`'s close; `reshow` asks adoption to show it again while it is live. */
   releaseClosingChatPanel: (ref: ScopedThreadRef, reshow: boolean) => void;
   clearReshowChatPanels: (keys: ReadonlySet<string>) => void;
@@ -503,7 +506,7 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
         byThreadKey: {},
         activityPanes: {},
         pendingChatPanelThreadKeys: new Set<string>(),
-        closingChatPanels: new Set<string>(),
+        closingChatPanels: new Map<string, number | null>(),
         reshowChatPanels: new Set<string>(),
         hideClosingChatPanel: (ref) =>
           set((state) => {
@@ -513,16 +516,22 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
             const reshowChatPanels = new Set(state.reshowChatPanels);
             reshowChatPanels.delete(key);
             return {
-              closingChatPanels: new Set(state.closingChatPanels).add(key),
+              closingChatPanels: new Map(state.closingChatPanels).set(key, null),
               reshowChatPanels,
               pendingChatPanelThreadKeys,
             };
+          }),
+        awaitClosingChatPanelShell: (ref, sequence) =>
+          set((state) => {
+            const key = scopedThreadKey(ref);
+            if (!state.closingChatPanels.has(key)) return state;
+            return { closingChatPanels: new Map(state.closingChatPanels).set(key, sequence) };
           }),
         releaseClosingChatPanel: (ref, reshow) =>
           set((state) => {
             const key = scopedThreadKey(ref);
             if (!state.closingChatPanels.has(key)) return state;
-            const closingChatPanels = new Set(state.closingChatPanels);
+            const closingChatPanels = new Map(state.closingChatPanels);
             closingChatPanels.delete(key);
             return reshow
               ? { closingChatPanels, reshowChatPanels: new Set(state.reshowChatPanels).add(key) }

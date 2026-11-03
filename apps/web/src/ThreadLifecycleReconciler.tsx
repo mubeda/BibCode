@@ -168,18 +168,23 @@ function EnvironmentThreadLifecycleReconciler({
   );
   useAtomSubscribe(terminalMetadataEventsAtom, handleTerminalMetadataEvent, { immediate: true });
 
-  // Also when a close ends: a panel to show again uses the snapshot already held.
+  // Also when a close changes: it is decided against the shell already held.
+  const closingChatPanels = useCenterPanelStore((state) => state.closingChatPanels);
   const reshowChatPanels = useCenterPanelStore((state) => state.reshowChatPanels);
   useEffect(() => {
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) return;
+    const snapshot = shellState.snapshot.value;
     applyPanelThreadAdoption(
       environmentId,
       adoptionTracker,
-      shellState.snapshot.value.threads,
-      shellState.snapshot.value.capped === true,
+      snapshot.threads,
+      snapshot.capped === true,
       reshowChatPanels,
+      // The engine's sequence, which an archive's reply sequence is comparable with (#223).
+      snapshot.engineSequence ?? snapshot.snapshotSequence,
+      closingChatPanels,
     );
-  }, [adoptionTracker, environmentId, reshowChatPanels, shellState]);
+  }, [adoptionTracker, closingChatPanels, environmentId, reshowChatPanels, shellState]);
 
   // The archived snapshot is refetched only when a thread enters or leaves the live list
   // (create, archive, unarchive, delete, panel close), never on every live sequence

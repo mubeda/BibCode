@@ -33,6 +33,8 @@ const h = vi.hoisted(() => {
     nextArchiveReply: "normal" as "normal" | "hold-reply" | "lose-reply" | "drop",
     heldReply: null as null | { resolve: () => void },
     nextThread: 0,
+    /** The server's event sequence; every create, archive, unarchive advances it. */
+    sequence: 1,
   };
 });
 
@@ -46,8 +48,10 @@ function serverArchive(
       return { _tag: "Failure", cause: new Error(`Thread '${threadId}' cannot be archived.`) };
     }
     thread.archived = true;
+    h.sequence += 1;
     h.archivedTimes.set(threadId, (h.archivedTimes.get(threadId) ?? 0) + 1);
-    return { _tag: "Success", value: undefined };
+    // A dispatch answers with its event's sequence.
+    return { _tag: "Success", value: { sequence: h.sequence } };
   };
   const reply = h.nextArchiveReply;
   h.nextArchiveReply = "normal";
@@ -135,6 +139,7 @@ vi.mock("~/state/use-atom-command", () => ({
         const thread = h.server.get(input.threadId);
         if (thread?.archived) {
           thread.archived = false;
+          h.sequence += 1;
         }
         return Promise.resolve({ _tag: "Success", value: undefined });
       },
@@ -198,6 +203,11 @@ interface Row {
 }
 
 const CLOSED: Expected = { archived: true, archives: 1, shown: false, neverReturned: true };
+/**
+ * An archive that landed but whose reply was lost is uncertain: the tab comes back from the
+ * shell this page holds until a newer shell drops it.
+ */
+const CLOSED_AFTER_UNCERTAIN: Expected = { ...CLOSED, neverReturned: false };
 /**
  * The close stands down: the panel is live, so its tab comes back and nothing archives it.
  * `reopenedElsewhere`: it comes back because another client reopened it, not while this page
@@ -303,11 +313,11 @@ function replyRows(): Row[] {
       RETURNS(1, true),
     );
     const lostReply: Step[] = [...opened, "lose-reply", "close", "snapshot", ...tail];
-    add(`lost archive reply, archived snapshot${suffix}`, lostReply, CLOSED);
+    add(`lost archive reply, archived snapshot${suffix}`, lostReply, CLOSED_AFTER_UNCERTAIN);
     add(
       `lost archive reply, archived snapshot, reopened elsewhere${suffix}`,
       [...lostReply, "remote-reopen"],
-      RETURNS(1, true),
+      RETURNS(1),
     );
   }
   // A: the reply comes after the reopen's snapshot, and nothing streams after it.
@@ -330,9 +340,34 @@ function replyRows(): Row[] {
       "remote-reopen",
       "capped-snapshot",
     ],
-    RETURNS(1, true),
+    RETURNS(1),
   );
   return result;
+}
+
+/** The shell reflects a successful archive only after its reply: the tab must not come back. */
+function delayedShellRows(): Row[] {
+  return [
+    {
+      name: "delayed shell after a normal close",
+      outcome: "success",
+      steps: ["commit", "respond", "snapshot", "close", "snapshot"],
+      expected: CLOSED,
+    },
+    {
+      name: "delayed shell after a close during creation",
+      outcome: "success",
+      steps: ["commit", "snapshot", "close", "respond", "snapshot"],
+      expected: CLOSED,
+    },
+    {
+      // The shell that reflects the archive shows it live again: someone reopened it.
+      name: "delayed shell that shows a reopen after the archive",
+      outcome: "success",
+      steps: ["commit", "respond", "snapshot", "close", "remote-reopen", "snapshot"],
+      expected: RETURNS(1, true),
+    },
+  ];
 }
 
 /** C: closed while created, archived elsewhere and settled by a snapshot before the answer. */
@@ -360,8 +395,29 @@ async function play(row: Row, sideChat: boolean) {
   h.server.set(hostId, { archived: false });
   h.drafts.set(hostId, SUBMITTED);
   let tracker = createCenterPanelAdoptionTracker();
+  type ShellRow = Parameters<typeof applyPanelThreadAdoption>[2][number];
+  /**
+   * The shell this page holds. The server publishes it late (it batches for 500 ms), so a
+   * reply can arrive before the shell that reflects it; the reconciler replays what it holds.
+   */
+  let held: { threads: ShellRow[]; capped: boolean; sequence: number } | null = null;
+  const adopt = () => {
+    if (!held) return;
+    (applyPanelThreadAdoption as (...args: unknown[]) => void)(
+      ENV,
+      tracker,
+      held.threads,
+      held.capped,
+      undefined,
+      held.sequence,
+    );
+    // The lifecycle reconciler releases the reservation of every live thread it sees.
+    for (const thread of held.threads) {
+      useCenterPanelStore.getState().releaseChatPanelReservation(scopeThreadRef(ENV, thread.id));
+    }
+  };
+  /** The shell publishes the server's state as of now. */
   const snapshot = (capped: boolean) => {
-    type ShellRow = Parameters<typeof applyPanelThreadAdoption>[2][number];
     const threads = [...h.server].flatMap(([id, thread]): ShellRow[] =>
       id === hostId
         ? [{ id: hostId, kind: "workspace" as const, title: "Host", archivedAt: null }]
@@ -378,17 +434,15 @@ async function play(row: Row, sideChat: boolean) {
             ]
           : [],
     );
-    applyPanelThreadAdoption(ENV, tracker, threads, capped);
-    // The lifecycle reconciler releases the reservation of every live thread it sees.
-    for (const thread of threads) {
-      useCenterPanelStore.getState().releaseChatPanelReservation(scopeThreadRef(ENV, thread.id));
-    }
+    held = { threads, capped, sequence: h.sequence };
+    adopt();
   };
-  // The reconciler runs adoption again, on the snapshot it holds, when a panel is to be shown
-  // again.
-  let lastCapped = false;
+  // The reconciler also runs adoption again, on the shell it holds, when a close changes.
   const unsubscribe = useCenterPanelStore.subscribe((state, previous) => {
-    if (state.reshowChatPanels !== previous.reshowChatPanels) snapshot(lastCapped);
+    const changed = (["closingChatPanels", "reshowChatPanels"] as const).some(
+      (field) => state[field] !== previous[field],
+    );
+    if (changed) adopt();
   });
   const tabIds = () =>
     selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, hostRef).surfaces.map(
@@ -413,11 +467,11 @@ async function play(row: Row, sideChat: boolean) {
     switch (step) {
       case "commit":
         h.server.set(panelId, { archived: false });
+        h.sequence += 1;
         break;
       case "snapshot":
       case "capped-snapshot":
-        lastCapped = step === "capped-snapshot";
-        snapshot(lastCapped);
+        snapshot(step === "capped-snapshot");
         break;
       case "close": {
         if (!closedAtLeastOnce) sentBeforeClose = h.sent.length > 0;
@@ -445,13 +499,15 @@ async function play(row: Row, sideChat: boolean) {
         );
         break;
       case "reload":
-        // The page's memory goes, and the open that was waiting never resumes.
+        // The page's memory goes (the shell it held with it), and the open that was waiting
+        // never resumes.
+        held = null;
+        tracker = createCenterPanelAdoptionTracker();
         useCenterPanelStore.setState({
           pendingChatPanelThreadKeys: new Set(),
-          closingChatPanels: new Set(),
+          closingChatPanels: new Map(),
           reshowChatPanels: new Set(),
         });
-        tracker = createCenterPanelAdoptionTracker();
         break;
       case "hold-archive":
         h.holdNextArchive = true;
@@ -477,6 +533,7 @@ async function play(row: Row, sideChat: boolean) {
         const archived = step === "remote-archive";
         if (thread && thread.archived !== archived) {
           thread.archived = archived;
+          h.sequence += 1;
         }
         if (!archived) closed = false;
         break;
@@ -494,7 +551,6 @@ async function play(row: Row, sideChat: boolean) {
   };
   // Later snapshots, as the shell keeps streaming.
   for (let index = 0; index < 3; index += 1) {
-    lastCapped = false;
     snapshot(false);
     await flush();
     if (closed && tabIds().includes(`chat:${panelId}`)) tabReturned = true;
@@ -546,7 +602,9 @@ function expectSettled(row: Row, result: Awaited<ReturnType<typeof play>>, sideC
 }
 
 describe("closing a chat panel in every ordering", () => {
-  const all = [...rows(), ...replyRows(), ...creationRows()].map((row) => [row.name, row] as const);
+  const all = [...rows(), ...replyRows(), ...creationRows(), ...delayedShellRows()].map(
+    (row) => [row.name, row] as const,
+  );
 
   it.each(all)("side chat: %s", async (_name, row) => {
     h.sent.length = 0;
