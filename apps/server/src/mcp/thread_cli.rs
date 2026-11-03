@@ -89,6 +89,71 @@ pub enum ThreadCommand {
         /// A thread id, as `list` prints it.
         thread: String,
     },
+    /// List a thread's open questions and pending approvals, with their request ids.
+    Requests {
+        /// A thread id, as `list` prints it.
+        thread: String,
+    },
+    /// Answer a thread's open question.
+    Answer {
+        /// A thread id, as `list` prints it.
+        thread: String,
+        /// The question's request id, as `requests` prints it.
+        request: String,
+        /// A JSON object from each question id to an option label, a list of labels or text,
+        /// or `-` to read it from standard input.
+        answers: String,
+        /// An id for this answer, 1 to 256 characters; one is made up unless set. After an
+        /// interrupted run, the same command with the id it printed does not answer twice.
+        #[arg(long, value_name = "ID", value_parser = request_id)]
+        request_id: Option<String>,
+    },
+    /// Approve a thread's pending approval, once or for the rest of its session.
+    Approve {
+        /// A thread id, as `list` prints it.
+        thread: String,
+        /// The approval's request id, as `requests` prints it.
+        request: String,
+        /// Approve it for the rest of the provider's session.
+        #[arg(long)]
+        for_session: bool,
+        /// An id for this decision, 1 to 256 characters; one is made up unless set.
+        #[arg(long, value_name = "ID", value_parser = request_id)]
+        request_id: Option<String>,
+    },
+    /// Decline a thread's pending approval; the turn goes on.
+    Decline {
+        /// A thread id, as `list` prints it.
+        thread: String,
+        /// The approval's request id, as `requests` prints it.
+        request: String,
+        /// Cancel instead: for providers that tell the two apart, the turn stops too.
+        #[arg(long)]
+        cancel: bool,
+        /// An id for this decision, 1 to 256 characters; one is made up unless set.
+        #[arg(long, value_name = "ID", value_parser = request_id)]
+        request_id: Option<String>,
+    },
+    /// Stop a thread's running turn.
+    Interrupt {
+        /// A thread id, as `list` prints it.
+        thread: String,
+        /// Only this turn; the thread's latest turn while it runs, unless set.
+        #[arg(long, value_name = "ID")]
+        turn: Option<String>,
+    },
+    /// What changed since a cursor, as ids and states only.
+    Changes {
+        /// A cursor a previous `changes` printed; from now, unless set.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Only this thread's changes.
+        #[arg(long, value_name = "ID")]
+        thread: Option<String>,
+        /// Entries to read, 1 to 500; 100 unless set.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
 }
 
 /// The most characters of a `clientRequestId`, as the server takes it.
@@ -105,17 +170,30 @@ fn request_id(text: &str) -> Result<String, String> {
 }
 
 impl ThreadCommand {
-    /// The id this `start` or `send` carries as its `clientRequestId`, once it has one.
+    /// The id this command carries as its `clientRequestId`, once it has one.
     fn request_id(&self) -> Option<&str> {
         match self {
-            Self::Start { request_id, .. } | Self::Send { request_id, .. } => request_id.as_deref(),
-            Self::List | Self::Show { .. } => None,
+            Self::Start { request_id, .. }
+            | Self::Send { request_id, .. }
+            | Self::Answer { request_id, .. }
+            | Self::Approve { request_id, .. }
+            | Self::Decline { request_id, .. } => request_id.as_deref(),
+            Self::List
+            | Self::Show { .. }
+            | Self::Requests { .. }
+            | Self::Interrupt { .. }
+            | Self::Changes { .. } => None,
         }
     }
 
     /// This command with a request id of its own made up, unless it has one.
     fn with_request_id(mut self) -> Self {
-        if let Self::Start { request_id, .. } | Self::Send { request_id, .. } = &mut self {
+        if let Self::Start { request_id, .. }
+        | Self::Send { request_id, .. }
+        | Self::Answer { request_id, .. }
+        | Self::Approve { request_id, .. }
+        | Self::Decline { request_id, .. } = &mut self
+        {
             request_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
         }
         self
@@ -251,26 +329,30 @@ fn print(report: &Report, json: bool, out: &mut impl Write, err: &mut impl Write
     let _ = out.flush();
 }
 
-/// The message a `start` or `send` names: its argument, or standard input for `-`.
+/// The message a `start` or `send` names, or the answers of an `answer`: its argument, or
+/// standard input for `-`.
 pub(crate) fn message_of(
     command: &ThreadCommand,
     mut stdin: impl Read,
 ) -> Result<Option<String>, String> {
-    let (ThreadCommand::Start { message, .. } | ThreadCommand::Send { message, .. }) = command
-    else {
-        return Ok(None);
+    let (message, what, empty) = match command {
+        ThreadCommand::Start { message, .. } | ThreadCommand::Send { message, .. } => {
+            (message, "message", "The message is empty.")
+        }
+        ThreadCommand::Answer { answers, .. } => (answers, "answers", "The answers are empty."),
+        _ => return Ok(None),
     };
     let text = if message == "-" {
         let mut text = String::new();
         stdin
             .read_to_string(&mut text)
-            .map_err(|error| format!("Could not read the message from standard input: {error}"))?;
+            .map_err(|error| format!("Could not read the {what} from standard input: {error}"))?;
         text.trim_end_matches(['\n', '\r']).to_owned()
     } else {
         message.clone()
     };
     if text.trim().is_empty() {
-        return Err("The message is empty.".to_owned());
+        return Err(empty.to_owned());
     }
     Ok(Some(text))
 }
@@ -317,7 +399,16 @@ fn failure(command: &ThreadCommand, error: String) -> Report {
             &command.request_id().into(),
             Some(&error),
         ),
-        ThreadCommand::List | ThreadCommand::Show { .. } => json!({ "error": error }),
+        ThreadCommand::Answer { .. }
+        | ThreadCommand::Approve { .. }
+        | ThreadCommand::Decline { .. } => {
+            json!({ "error": error, "clientRequestId": command.request_id() })
+        }
+        ThreadCommand::List
+        | ThreadCommand::Show { .. }
+        | ThreadCommand::Requests { .. }
+        | ThreadCommand::Interrupt { .. }
+        | ThreadCommand::Changes { .. } => json!({ "error": error }),
     };
     Report {
         code: 1,
@@ -389,6 +480,60 @@ pub(crate) async fn execute(
     let outcome = match command {
         ThreadCommand::List => list(tools).await,
         ThreadCommand::Show { thread } => show(tools, thread).await,
+        ThreadCommand::Requests { thread } => requests(tools, thread).await,
+        ThreadCommand::Interrupt { thread, turn } => {
+            interrupt(tools, thread, turn.as_deref()).await
+        }
+        ThreadCommand::Changes {
+            cursor,
+            thread,
+            limit,
+        } => changes(tools, cursor.as_deref(), thread.as_deref(), *limit).await,
+        ThreadCommand::Answer {
+            thread, request, ..
+        } => {
+            // The refusal names no part of the answers.
+            let Ok(answers @ Value::Object(_)) =
+                serde_json::from_str::<Value>(&message.unwrap_or_default())
+            else {
+                return failure(
+                    command,
+                    "The answers must be a JSON object, such as {\"color\": \"Red\"}.".to_owned(),
+                );
+            };
+            let arguments = json!({ "threadId": thread, "requestId": request, "answers": answers });
+            return answered(command, tools, "answer_question", arguments, "Answered").await;
+        }
+        ThreadCommand::Approve {
+            thread,
+            request,
+            for_session,
+            ..
+        } => {
+            let decision = if *for_session {
+                "acceptForSession"
+            } else {
+                "accept"
+            };
+            let arguments =
+                json!({ "threadId": thread, "requestId": request, "decision": decision });
+            return answered(command, tools, "answer_approval", arguments, "Approved").await;
+        }
+        ThreadCommand::Decline {
+            thread,
+            request,
+            cancel,
+            ..
+        } => {
+            let (decision, done) = if *cancel {
+                ("cancel", "Cancelled")
+            } else {
+                ("decline", "Declined")
+            };
+            let arguments =
+                json!({ "threadId": thread, "requestId": request, "decision": decision });
+            return answered(command, tools, "answer_approval", arguments, done).await;
+        }
         ThreadCommand::Start {
             project,
             title,
@@ -597,6 +742,144 @@ async fn list_all(tools: &impl Tools, threads: bool) -> Result<Value, String> {
     Err(format!(
         "BiBCode lists more than {MOST_PAGES} pages of projects and threads; name a project by its id."
     ))
+}
+
+async fn requests(tools: &impl Tools, thread: &str) -> Result<Report, String> {
+    let pending = tool(
+        tools,
+        "list_pending_requests",
+        json!({ "threadId": thread }),
+    )
+    .await?;
+    let mut text = Vec::new();
+    for question in pending["questions"].as_array().into_iter().flatten() {
+        let asked = question["summary"]
+            .as_str()
+            .or_else(|| question["questions"][0]["question"].as_str());
+        text.push(format!(
+            "{}  question  {}",
+            field(&question["requestId"]),
+            asked.unwrap_or("-")
+        ));
+    }
+    for approval in pending["approvals"].as_array().into_iter().flatten() {
+        text.push(format!(
+            "{}  approval  {}  {}",
+            field(&approval["requestId"]),
+            field(&approval["kind"]),
+            field(&approval["summary"])
+        ));
+    }
+    if text.is_empty() {
+        text.push(format!("Thread {thread} waits on no question or approval."));
+    }
+    Ok(Report {
+        code: 0,
+        json: pending,
+        text,
+        note: None,
+    })
+}
+
+/// An `answer`, `approve` or `decline`: `name` with `arguments` and the command's
+/// `clientRequestId`. Its `--json` document is the tool's result with that id.
+async fn answered(
+    command: &ThreadCommand,
+    tools: &impl Tools,
+    name: &str,
+    mut arguments: Value,
+    done: &str,
+) -> Report {
+    let request_id = command.request_id().unwrap_or_default();
+    arguments["clientRequestId"] = request_id.into();
+    let line = format!(
+        "{done} request {} on thread {}.",
+        field(&arguments["requestId"]),
+        field(&arguments["threadId"])
+    );
+    match mutate(tools, name, arguments).await {
+        Err(Failed {
+            error,
+            unknown: true,
+        }) => unknown_outcome(command, error),
+        Err(Failed { error, .. }) => failure(command, error),
+        Ok(mut result) => {
+            result["clientRequestId"] = request_id.into();
+            Report {
+                code: 0,
+                json: result,
+                text: vec![line],
+                note: None,
+            }
+        }
+    }
+}
+
+async fn interrupt(tools: &impl Tools, thread: &str, turn: Option<&str>) -> Result<Report, String> {
+    let mut arguments = json!({ "threadId": thread });
+    if let Some(turn) = turn {
+        arguments["turnId"] = turn.into();
+    }
+    let result = tool(tools, "interrupt_turn", arguments).await?;
+    let text = if result["interruptRequested"] == true {
+        format!(
+            "Asked turn {} of thread {thread} to stop.",
+            field(&result["turnId"])
+        )
+    } else {
+        format!("No turn was running on thread {thread}; nothing was sent.")
+    };
+    Ok(Report {
+        code: 0,
+        json: result,
+        text: vec![text],
+        note: None,
+    })
+}
+
+async fn changes(
+    tools: &impl Tools,
+    cursor: Option<&str>,
+    thread: Option<&str>,
+    limit: Option<u32>,
+) -> Result<Report, String> {
+    let mut arguments = json!({});
+    if let Some(cursor) = cursor {
+        arguments["cursor"] = cursor.into();
+    }
+    if let Some(thread) = thread {
+        arguments["threadId"] = thread.into();
+    }
+    if let Some(limit) = limit {
+        arguments["limit"] = limit.into();
+    }
+    let feed = tool(tools, "changes_since", arguments).await?;
+    let mut text: Vec<String> = feed["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            format!(
+                "{}  {}  {}  {}",
+                field(&entry["at"]),
+                field(&entry["kind"]),
+                field(&entry["threadId"]),
+                field(&entry["status"])
+            )
+        })
+        .collect();
+    let next = field(&feed["cursor"]);
+    text.push(if feed["more"] == true {
+        format!("More to read: run again with --cursor {next}")
+    } else {
+        format!("Caught up; next time, run with --cursor {next}")
+    });
+    Ok(Report {
+        code: 0,
+        json: feed,
+        text,
+        note: None,
+    })
 }
 
 fn field(value: &Value) -> &str {

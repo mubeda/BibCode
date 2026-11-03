@@ -53,9 +53,13 @@ transfer URLs then name the public host. The flow is in
 Without the MCP server, a shell can call the same tools with `bibcode thread list`,
 `start <project|.> <message|->`, `send <thread> <message|->` and `show <thread>`; `--wait`
 waits for the turn and `--json` prints `{ threadId, messageId, status, reply, requestId, error }`.
-It exits 0 on success, 1 on failure and 2 when the thread waits on a person. If a `start` or
-`send` is interrupted, run the same command with `--request-id <id>` (it prints the id) to
-finish it without repeating it.
+`requests <thread>` lists open questions and approvals with their request ids;
+`answer <thread> <request> <answers-json|->`, `approve <thread> <request> [--for-session]`
+and `decline <thread> <request> [--cancel]` answer them (no `--wait`: check with `show`);
+`interrupt <thread> [--turn <id>]` stops a turn; `changes [--cursor <c>]` reads the change
+feed. It exits 0 on success, 1 on failure and 2 when the thread waits on a person. If a
+`start`, `send`, `answer`, `approve` or `decline` is interrupted, run the same command with
+`--request-id <id>` (it prints the id) to finish it without repeating it.
 
 ## Hand off work and wait
 
