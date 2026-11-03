@@ -77,6 +77,8 @@ vi.mock("./state/offShell", () => ({
 vi.mock("./state/terminal", () => ({
   terminalEnvironment: { metadataEvents: () => "terminal-metadata-atom" },
 }));
+vi.mock("./state/threads", () => ({ threadEnvironment: { archive: "archive" } }));
+vi.mock("./state/use-atom-command", () => ({ useAtomCommand: () => () => undefined }));
 vi.mock("./state/environments", () => ({
   useEnvironments: () => ({ environments: [{ environmentId: "primary" }] }),
 }));

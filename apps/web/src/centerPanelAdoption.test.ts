@@ -60,8 +60,53 @@ const activeSurfaceId = () => hostState().groups[0]?.activeSurfaceId;
 
 describe("center panel adoption", () => {
   beforeEach(() => {
-    useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() });
+    useCenterPanelStore.setState({
+      byThreadKey: {},
+      pendingChatPanelThreadKeys: new Set(),
+      closedBeforeCreated: [],
+    });
     release.mockClear();
+  });
+
+  it("archives a panel closed before creation when it appears after a reload", async () => {
+    const lateRef = scopeThreadRef(ENV, ThreadId.make("panel-late"));
+    // The tab closed while the server was creating the panel; then the page reloaded, so
+    // only the persisted list remains (no reservation, a new tracker).
+    useCenterPanelStore.getState().recordClosedBeforeCreated(lateRef);
+    const tracker = createCenterPanelAdoptionTracker();
+    let settle!: (settled: boolean) => void;
+    const archive = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          settle = resolve;
+        }),
+    );
+
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+
+    expect(archive).toHaveBeenCalledTimes(1);
+    expect(archive).toHaveBeenCalledWith("panel-late");
+    expect(surfaceIds()).not.toContain("chat:panel-late");
+    // Kept until the archive settles, so an interrupted one is asked for again.
+    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([scopedThreadKey(lateRef)]);
+    settle(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([]);
+  });
+
+  it("asks again for an archive that did not settle", async () => {
+    const lateRef = scopeThreadRef(ENV, ThreadId.make("panel-late"));
+    useCenterPanelStore.getState().recordClosedBeforeCreated(lateRef);
+    const tracker = createCenterPanelAdoptionTracker();
+    const archive = vi.fn(() => Promise.resolve(false));
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    await Promise.resolve();
+    await Promise.resolve();
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    expect(archive).toHaveBeenCalledTimes(2);
+    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([scopedThreadKey(lateRef)]);
   });
 
   it("adopts a center terminal another client opened as an inactive tab with its command", () => {

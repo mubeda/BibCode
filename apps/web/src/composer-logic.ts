@@ -1,5 +1,6 @@
 import {
   detectComposerTrigger as detectSharedComposerTrigger,
+  parseComposerSideChatCommand,
   parseStandaloneComposerBiBCodeAction,
   replaceTextRange,
 } from "@bibcode/shared/composerTrigger";
@@ -8,7 +9,34 @@ import type { ComposerTrigger, ComposerTriggerProfile } from "@bibcode/shared/co
 import { splitPromptIntoComposerSegments } from "./composer-editor-mentions";
 import { INLINE_TERMINAL_CONTEXT_PLACEHOLDER } from "./lib/terminalContext";
 
-export { parseStandaloneComposerBiBCodeAction, replaceTextRange };
+export { parseComposerSideChatCommand, parseStandaloneComposerBiBCodeAction, replaceTextRange };
+
+/** Why a `:btw` with attachments or contexts is not opened: nothing is split between two chats. */
+export const SIDE_CHAT_TEXT_ONLY_REASON =
+  "Side chats take text only. Remove the attachments, or add them in the side chat.";
+
+export type ComposerSideChatSubmit =
+  | { readonly kind: "none" }
+  | { readonly kind: "refused"; readonly reason: string }
+  | { readonly kind: "open"; readonly question: string };
+
+/**
+ * What a submit of `prompt` does about a side chat: nothing (not a `:btw` or `:side`), refuse
+ * with a reason (the composer keeps the text and sends nothing), or open one with the question.
+ */
+export function resolveComposerSideChatSubmit(input: {
+  readonly prompt: string;
+  /** Why side chats are unavailable here (`resolveSideChatAvailability`), or null. */
+  readonly unavailableReason: string | null;
+  /** Attachments, terminal contexts or element contexts in the draft. */
+  readonly hasNonTextContent: boolean;
+}): ComposerSideChatSubmit {
+  const question = parseComposerSideChatCommand(input.prompt);
+  if (question === null) return { kind: "none" };
+  if (input.unavailableReason !== null) return { kind: "refused", reason: input.unavailableReason };
+  if (input.hasNonTextContent) return { kind: "refused", reason: SIDE_CHAT_TEXT_ONLY_REASON };
+  return { kind: "open", question };
+}
 export type {
   ComposerBiBCodeAction,
   ComposerTrigger,

@@ -20,6 +20,9 @@ import {
   type ProviderInstanceEntry,
 } from "~/providerInstances";
 
+/** Why panel actions wait: a panel copies its host, which exists once the thread has started. */
+export const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
+
 /** The most closed chats Reopen closed chat and History list. */
 export const MAX_CLOSED_CHATS = 10;
 

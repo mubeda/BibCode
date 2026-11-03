@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { CENTER_PANEL_ROOT_GROUP_ID } from "./centerPanelLayout";
 import {
   HOST_SURFACE_ID,
+  MAX_CLOSED_BEFORE_CREATED,
   migratePersistedCenterPanelState,
   selectActivityPaneState,
   selectActiveCenterSurface,
@@ -33,7 +34,11 @@ const rootGroup = () => stateOf().groups.find((group) => group.id === CENTER_PAN
 
 describe("centerPanelStore", () => {
   beforeEach(() =>
-    useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() }),
+    useCenterPanelStore.setState({
+      byThreadKey: {},
+      pendingChatPanelThreadKeys: new Set(),
+      closedBeforeCreated: [],
+    }),
   );
   afterEach(() => vi.restoreAllMocks());
 
@@ -540,6 +545,51 @@ describe("centerPanelStore", () => {
       });
       expect(migrated.byThreadKey.implicit).toBeUndefined();
       expect(migrated.byThreadKey.explicit).toBeDefined();
+    });
+  });
+
+  describe("side chats", () => {
+    const SIDE = ThreadId.make("side-chat");
+
+    it("opens, closes and reopens a side chat as a chat surface with its label", () => {
+      store().reserveChatPanel(HOST, SIDE, "Side chat · Codex");
+      expect(stateOf().surfaces.at(-1)).toEqual({
+        id: `chat:${SIDE}`,
+        kind: "chat",
+        threadId: SIDE,
+        providerLabel: "Side chat · Codex",
+      });
+      expect(selectActiveCenterSurface(store().byThreadKey, HOST)?.id).toBe(`chat:${SIDE}`);
+      const removed = store().closeSurface(HOST, CENTER_PANEL_ROOT_GROUP_ID, `chat:${SIDE}`);
+      expect(removed.map((surface) => surface.id)).toEqual([`chat:${SIDE}`]);
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID]);
+      store().reserveChatPanel(HOST, SIDE, "Side chat · Codex");
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${SIDE}`]);
+    });
+
+    it("remembers panels closed before creation, oldest dropped past the cap", () => {
+      const ref = (index: number) =>
+        scopeThreadRef(HOST.environmentId, ThreadId.make(`closed-${index}`));
+      for (let index = 0; index <= MAX_CLOSED_BEFORE_CREATED; index += 1) {
+        store().recordClosedBeforeCreated(ref(index));
+      }
+      store().recordClosedBeforeCreated(ref(5));
+      expect(store().closedBeforeCreated).toHaveLength(MAX_CLOSED_BEFORE_CREATED);
+      expect(store().closedBeforeCreated[0]).toBe(scopedThreadKey(ref(1)));
+      store().clearClosedBeforeCreated(ref(5));
+      expect(store().closedBeforeCreated).not.toContain(scopedThreadKey(ref(5)));
+    });
+
+    it("migrates version 4 to an empty closed-before-created list", () => {
+      expect(
+        migratePersistedCenterPanelState({ byThreadKey: {}, activityPanes: {} })
+          .closedBeforeCreated,
+      ).toEqual([]);
+      const keys = Array.from({ length: 25 }, (_, index) => `environment-1:closed-${index}`);
+      expect(
+        migratePersistedCenterPanelState({ byThreadKey: {}, closedBeforeCreated: [...keys, 7] })
+          .closedBeforeCreated,
+      ).toEqual(keys.slice(-MAX_CLOSED_BEFORE_CREATED));
     });
   });
 
