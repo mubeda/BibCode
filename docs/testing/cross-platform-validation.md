@@ -1816,8 +1816,10 @@ from `apps/web`.
     copy the secret, and **Send test event**: the receiver gets `webhook.test` with
     `Authorization: Bearer <that token>`, and its `X-BibCode-Signature` verifies with the
     secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
-    shows. **Edit** shows "A token is set", never the token. Start a thread: the receiver gets `thread.status_changed` events, and
-    `changes_since` from the first event's `cursor` returns the entries after it.
+    shows. **Edit** shows "A token is set", never the token. Start a thread: the receiver gets `thread.status_changed` events, each with the
+    thread's `projectId`, and `changes_since` from the first event's `cursor` returns the
+    entries after it. Untick **Turn started** under **Thread status changed** and start
+    another turn: only its `turn.completed` arrives.
 14. **A remote OAuth connect**, once with Claude Code and once with Codex, on another
     computer, through BiBCode Connect's managed tunnel and through an HTTPS reverse proxy
     that follows the [Remote access](../user/remote-access.md#remote-ai-tools-over-https)

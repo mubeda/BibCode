@@ -70,6 +70,12 @@ delivery log and secret go with it.
 `profiler.finding` is sent only while MCP is on and **What agents can use → Diagnostics** is
 on, because a receiver catches up on findings through the MCP `profiler_findings` tool.
 
+Under **Thread status changed** you can choose which changes are sent: **Turn started**,
+**Turn finished**, **Turn interrupted**, **Turn failed** and **Other status changes**. All of
+them are sent until you untick one. Every request names the thread's project (`projectId`)
+next to its thread. An environment that runs an older BiBCode sends every status change and
+the form says so.
+
 An endpoint added before the **Questions** events existed keeps the events it had: edit it
 and tick them to get them. The form hides them, and says so, for an
 environment that runs an older BiBCode.
@@ -156,7 +162,7 @@ signature is `v1=35495024f4ef3f94e5a93e22221544c4b75e9a42300cd965ab81cb85cd994e9
 - One request at a time goes to each endpoint, oldest first, so events arrive in order. A
   test event or a redelivery waits for the endpoint's request in flight. **Redeliver** works
   on a finished delivery only, never one still queued or being sent.
-- Changing an endpoint's URL, project or events drops what was waiting for it (the log shows
+- Changing an endpoint's URL, project, events or status changes drops what was waiting for it (the log shows
   "Not sent: the endpoint's URL or events changed"): nothing queued for the old destination
   or filters goes to the new one. Renaming it keeps the queue. A test event or redelivery
   waiting to be sent when the endpoint is edited, or turned off or on, is not sent: it says

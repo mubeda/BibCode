@@ -1,10 +1,12 @@
 import {
   WEBHOOK_EVENT_CATEGORIES,
+  WEBHOOK_STATUS_KINDS,
   type EnvironmentId,
   type ExecutionEnvironmentCapabilities,
   type WebhookDelivery,
   type WebhookEndpoint,
   type WebhookEventType,
+  type WebhookStatusKind,
 } from "@bibcode/contracts";
 import type { UnifiedSettings } from "@bibcode/contracts/settings";
 import {
@@ -67,6 +69,16 @@ const EVENT_LABELS: Readonly<Record<WebhookEventType, string>> = {
   "profiler.finding": "Profiler finding",
 };
 
+const STATUS_KIND_LABELS: Readonly<Record<WebhookStatusKind, string>> = {
+  "turn.started": "Turn started",
+  "turn.completed": "Turn finished",
+  "turn.interrupted": "Turn interrupted",
+  "turn.failed": "Turn failed",
+  "session.status": "Other status changes",
+};
+const STATUS_CHANGED: WebhookEventType = "thread.status_changed";
+const KNOWN_STATUS_KINDS: ReadonlySet<string> = new Set(WEBHOOK_STATUS_KINDS);
+
 const ALL_EVENTS: ReadonlyArray<WebhookEventType> = WEBHOOK_EVENT_CATEGORIES.flatMap(
   (category) => category.events,
 );
@@ -81,7 +93,7 @@ const selectWebhooksEnabled = (settings: UnifiedSettings) => settings.enableWebh
 /** What the environment's server offers beyond the first webhooks release. */
 export type WebhookCapabilities = Pick<
   ExecutionEnvironmentCapabilities,
-  "webhookQuestionEvents" | "webhookBearerToken"
+  "webhookQuestionEvents" | "webhookBearerToken" | "webhookStatusKinds"
 >;
 
 /** How an edit treats the endpoint's bearer token. */
@@ -689,6 +701,10 @@ function EndpointForm({
           categories.flatMap((category): readonly string[] => category.events),
       ),
   );
+  // `null` sends every status change, as an endpoint without a filter does.
+  const [statusKinds, setStatusKinds] = useState<ReadonlySet<string> | null>(() =>
+    endpoint?.statusKinds == null ? null : new Set(endpoint.statusKinds),
+  );
   const [projectId, setProjectId] = useState<string | null>(endpoint?.projectId ?? null);
   const [pairedClientId, setPairedClientId] = useState<string | null>(
     endpoint?.pairedClientId ?? null,
@@ -714,8 +730,20 @@ function EndpointForm({
         ? "Enter the token for the new URL, or remove it."
         : "Enter the new token, or keep the current one."
       : null;
+  const chooseKinds = capabilities.webhookStatusKinds && events.has(STATUS_CHANGED);
+  const kindsReason =
+    chooseKinds &&
+    statusKinds !== null &&
+    !WEBHOOK_STATUS_KINDS.some((kind) => statusKinds.has(kind))
+      ? "Choose at least one status change, or stop sending Thread status changed."
+      : null;
   const canSave =
-    name.trim().length > 0 && urlValid && events.size > 0 && tokenReason === null && !saving;
+    name.trim().length > 0 &&
+    urlValid &&
+    events.size > 0 &&
+    tokenReason === null &&
+    kindsReason === null &&
+    !saving;
 
   const toggle = (event: WebhookEventType, checked: boolean) =>
     setEvents((current) => {
@@ -723,6 +751,18 @@ function EndpointForm({
       if (checked) next.add(event);
       else next.delete(event);
       return next;
+    });
+
+  const toggleKind = (kind: WebhookStatusKind, checked: boolean) =>
+    setStatusKinds((current) => {
+      const next = new Set<string>(current ?? WEBHOOK_STATUS_KINDS);
+      if (checked) next.add(kind);
+      else next.delete(kind);
+      // Every kind chosen is no filter, so a kind a later server adds is sent too.
+      return next.size === WEBHOOK_STATUS_KINDS.length &&
+        WEBHOOK_STATUS_KINDS.every((known) => next.has(known))
+        ? null
+        : next;
     });
 
   const submit = async () => {
@@ -748,6 +788,19 @@ function EndpointForm({
           : tokenOpen && tokenText.length > 0
             ? { bearerToken: tokenText }
             : {}),
+        // Left out keeps the stored filter; an older server is never sent the field.
+        ...(capabilities.webhookStatusKinds
+          ? {
+              statusKinds:
+                statusKinds === null
+                  ? null
+                  : [
+                      ...WEBHOOK_STATUS_KINDS.filter((kind) => statusKinds.has(kind)),
+                      // Kinds a newer server added, which this form does not show.
+                      ...[...statusKinds].filter((kind) => !KNOWN_STATUS_KINDS.has(kind)),
+                    ],
+            }
+          : {}),
       },
     });
     setSaving(false);
@@ -884,13 +937,38 @@ function EndpointForm({
                 {CATEGORY_LABELS[category.key] ?? category.key}
               </div>
               {category.events.map((event) => (
-                <label key={event} className="flex items-center gap-2 text-xs text-foreground">
-                  <Checkbox
-                    checked={events.has(event)}
-                    onCheckedChange={(checked) => toggle(event, checked === true)}
-                  />
-                  {EVENT_LABELS[event]}
-                </label>
+                <div key={event} className="space-y-1.5">
+                  <label className="flex items-center gap-2 text-xs text-foreground">
+                    <Checkbox
+                      checked={events.has(event)}
+                      onCheckedChange={(checked) => toggle(event, checked === true)}
+                    />
+                    {EVENT_LABELS[event]}
+                  </label>
+                  {event === STATUS_CHANGED && chooseKinds ? (
+                    <div role="group" aria-label="Status changes sent" className="space-y-1.5 ps-6">
+                      {WEBHOOK_STATUS_KINDS.map((kind) => (
+                        <label
+                          key={kind}
+                          className="flex items-center gap-2 text-xs text-foreground"
+                        >
+                          <Checkbox
+                            checked={statusKinds === null || statusKinds.has(kind)}
+                            onCheckedChange={(checked) => toggleKind(kind, checked === true)}
+                          />
+                          {STATUS_KIND_LABELS[kind]}
+                        </label>
+                      ))}
+                    </div>
+                  ) : null}
+                  {event === STATUS_CHANGED &&
+                  events.has(STATUS_CHANGED) &&
+                  !capabilities.webhookStatusKinds ? (
+                    <div className="ps-6">
+                      <ReasonLine text="Update BiBCode on this environment to choose which status changes are sent." />
+                    </div>
+                  ) : null}
+                </div>
               ))}
             </div>
           ))}
@@ -899,6 +977,7 @@ function EndpointForm({
           <ReasonLine text="Update BiBCode on this environment to send question events." />
         )}
         {events.size === 0 ? <ReasonLine text="Choose at least one event." /> : null}
+        {kindsReason === null ? null : <ReasonLine text={kindsReason} />}
         {events.has("profiler.finding") ? (
           <p className="text-xs text-muted-foreground">
             Profiler findings are sent only while MCP agents may use Diagnostics.

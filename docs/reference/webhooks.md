@@ -39,15 +39,15 @@ on the environment's WebSocket RPC (see
 [RPC and orchestration](../architecture/rpc-and-orchestration.md)); every refusal is
 `WebhookError` with a `reason`.
 
-| Method                    | Scope          | Input                                                                                | Result                                 |
-| ------------------------- | -------------- | ------------------------------------------------------------------------------------ | -------------------------------------- |
-| `webhooks.list`           | `access:read`  | `{}`                                                                                 | `{ enabled, endpoints, maxEndpoints }` |
-| `webhooks.listDeliveries` | `access:read`  | `{ endpointId, limit? }` (50 unless set, at most 200)                                | `{ deliveries }`, newest first         |
-| `webhooks.upsert`         | `access:write` | `{ id?, name, url, enabled, eventTypes, projectId?, pairedClientId?, bearerToken? }` | `{ endpoint, secret? }`                |
-| `webhooks.delete`         | `access:write` | `{ id }`                                                                             | `{ deleted }`                          |
-| `webhooks.rotateSecret`   | `access:write` | `{ id }`                                                                             | `{ secret }`                           |
-| `webhooks.sendTest`       | `access:write` | `{ id }`                                                                             | `{ delivery }` after its first attempt |
-| `webhooks.redeliver`      | `access:write` | `{ deliveryId }`                                                                     | `{ delivery }` after its first attempt |
+| Method                    | Scope          | Input                                                                                              | Result                                 |
+| ------------------------- | -------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `webhooks.list`           | `access:read`  | `{}`                                                                                               | `{ enabled, endpoints, maxEndpoints }` |
+| `webhooks.listDeliveries` | `access:read`  | `{ endpointId, limit? }` (50 unless set, at most 200)                                              | `{ deliveries }`, newest first         |
+| `webhooks.upsert`         | `access:write` | `{ id?, name, url, enabled, eventTypes, projectId?, pairedClientId?, bearerToken?, statusKinds? }` | `{ endpoint, secret? }`                |
+| `webhooks.delete`         | `access:write` | `{ id }`                                                                                           | `{ deleted }`                          |
+| `webhooks.rotateSecret`   | `access:write` | `{ id }`                                                                                           | `{ secret }`                           |
+| `webhooks.sendTest`       | `access:write` | `{ id }`                                                                                           | `{ delivery }` after its first attempt |
+| `webhooks.redeliver`      | `access:write` | `{ deliveryId }`                                                                                   | `{ delivery }` after its first attempt |
 
 `webhooks.upsert` without `id` adds an endpoint; with `id` it replaces that endpoint's
 editable fields. Its input rules:
@@ -74,6 +74,13 @@ editable fields. Its input rules:
   "Enter the token for the new URL, or remove it."), so receiver A's token never goes to
   receiver B. A server advertises the field with the `webhookBearerToken` capability; an
   older one refuses it as `invalid`.
+- `statusKinds`: which `thread.status_changed` events are sent, by their `kind`: a list of
+  at least one of `turn.started`, `turn.completed`, `turn.interrupted`, `turn.failed` and
+  `session.status` (duplicates dropped, stored in that order), or `null` for all of them.
+  Left out, the endpoint keeps its filter, so an older client's save never resets it; a new
+  endpoint without it gets every kind. Other events are not filtered by it. A server
+  advertises the field with the `webhookStatusKinds` capability; an older one refuses it as
+  `invalid`, and lists no `statusKinds` (read it as `null`).
 - At most 20 endpoints per environment (`reason: "limit"`).
 
 **The secret** is `whsec_` followed by 64 hex characters (32 random bytes). It is returned
@@ -103,6 +110,7 @@ An endpoint as `webhooks.list` returns it:
   "projectId": null,
   "pairedClientId": null,
   "bearerTokenSet": false,
+  "statusKinds": ["turn.completed", "turn.failed"],
   "consecutiveFailures": 0,
   "disabledReason": null,
   "pendingDeliveries": 0,
@@ -168,6 +176,7 @@ The body is one JSON object, `Content-Type: application/json`:
 | `occurredAt`    | string | always                                  | ISO 8601 time of the change (for a finding, its `lastSeen`).                                                              |
 | `environmentId` | string | always                                  | The environment that sent it.                                                                                             |
 | `threadId`      | string | when the entry names a thread           | The thread.                                                                                                               |
+| `projectId`     | string | when the entry's thread has a project   | The thread's project, as opaque an id as `threadId`.                                                                      |
 | `cursor`        | string | every feed event                        | The `changes_since` cursor just after this event (`v1.<sequence>.<activityId>`; treat it as opaque).                      |
 | `kind`          | string | every feed event                        | The change-feed entry kind (`turn.completed`, `approval.requested`, `agent.call`, ...).                                   |
 | `status`        | string | when the entry has one                  | The session status, approval status (`resolved`, `expired`), or an agent call's outcome (`success` or its error tag).     |
@@ -187,6 +196,7 @@ Examples:
   "occurredAt": "2026-10-31T10:00:00.123Z",
   "environmentId": "env_8c2f",
   "threadId": "b2f7a3c4-91de-4f1b-8a55-2c0d6e1f9a30",
+  "projectId": "5e0c2a91-3b7d-4c8e-9f10-a2b3c4d5e6f7",
   "cursor": "v1.4821.37",
   "kind": "turn.completed",
   "status": "ready",
@@ -340,8 +350,8 @@ and never resent). Finished deliveries are kept 7 days, at most 1,000 per endpoi
 
 ## Edits and revisions
 
-Each endpoint has a revision that moves when its URL, project or event list changes, and
-when it is turned off or on. In the same transaction BiBCode abandons every delivery queued
+Each endpoint has a revision that moves when its URL, project, event list or status-kind
+filter changes, and when it is turned off or on. In the same transaction BiBCode abandons every delivery queued
 for it (`lastError: "endpoint_changed"`, shown as "Not sent: the endpoint's URL or events
 changed"), and a request in flight is cancelled. A delivery is stamped with the revision it
 was chosen under and is never sent under another one, so nothing queued for an old

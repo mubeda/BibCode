@@ -111,8 +111,11 @@ describe("RPC wire fixture exporter", () => {
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(536);
+    expect(manifest.fixtures).toHaveLength(537);
     expect(manifest.fixtures).toContain("contract-shapes/webhooks__upsert-token-null-request.json");
+    expect(manifest.fixtures).toContain(
+      "contract-shapes/webhooks__upsert-status-kinds-request.json",
+    );
     expect(manifest.fixtures).toContain("exit-response-too-large.json");
     expect(manifest.typedFailureFixtures).toContain("typed-failures/vcs__clone-04.json");
     expect(manifest.typedFailureFixtures).toEqual(

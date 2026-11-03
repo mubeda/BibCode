@@ -97,6 +97,7 @@ fn endpoint_view(
         "projectId": endpoint.project_id,
         "pairedClientId": endpoint.paired_session_id,
         "bearerTokenSet": endpoint.bearer_secret.is_some(),
+        "statusKinds": endpoint.status_kinds,
         "consecutiveFailures": endpoint.consecutive_failures,
         "disabledReason": endpoint.disabled_reason,
         "pendingDeliveries": pending,
@@ -152,6 +153,42 @@ struct UpsertInput {
     /// No `Debug`: it holds the token.
     #[serde(default, deserialize_with = "present")]
     bearer_token: Option<Option<String>>,
+    /// Absent keeps the endpoint's `thread.status_changed` filter, so an older client's save
+    /// never resets it; `null` sends every kind and a list only those.
+    #[serde(default, deserialize_with = "present_kinds")]
+    status_kinds: Option<Option<Vec<String>>>,
+}
+
+/// [`present`] for `statusKinds`.
+fn present_kinds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<Vec<String>>>, D::Error> {
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
+}
+
+/// A `statusKinds` list as it is stored: known kinds, once each, in the catalog's order.
+fn status_kinds(kinds: Vec<String>) -> Result<Vec<String>, Value> {
+    if let Some(unknown) = kinds
+        .iter()
+        .find(|kind| !events::STATUS_KINDS.contains(&kind.as_str()))
+    {
+        return Err(refusal(
+            "invalid",
+            &format!("{unknown} is not a thread.status_changed kind."),
+        ));
+    }
+    let kinds: Vec<String> = events::STATUS_KINDS
+        .iter()
+        .filter(|known| kinds.iter().any(|kind| kind == *known))
+        .map(|kind| (*kind).to_owned())
+        .collect();
+    if kinds.is_empty() {
+        return Err(refusal(
+            "invalid",
+            "Choose at least one status change, or stop sending Thread status changed.",
+        ));
+    }
+    Ok(kinds)
 }
 
 /// A field that is present, as `Some`, so `null` and absent differ. A value of the wrong
@@ -192,7 +229,7 @@ fn decode_upsert(payload: Value) -> Result<UpsertInput, Value> {
     serde_json::from_value(payload).map_err(|_| {
         refusal(
             "invalid",
-            "Invalid request: an endpoint needs name, url, enabled and eventTypes, and bearerToken must be a string or null.",
+            "Invalid request: an endpoint needs name, url, enabled and eventTypes, bearerToken must be a string or null, and statusKinds a list of strings or null.",
         )
     })
 }
@@ -305,6 +342,10 @@ impl Webhooks {
             Some(Some(token)) => Some(Some(bearer_token(&token)?)),
             other => other,
         };
+        let kinds = match input.status_kinds {
+            Some(Some(kinds)) => Some(Some(status_kinds(kinds)?)),
+            other => other,
+        };
         let now = crate::mcp::control::now_iso();
         let (endpoint, secret) = match optional_id(input.id, "id")? {
             Some(id) => {
@@ -331,9 +372,11 @@ impl Webhooks {
                 self.after_token_write().await;
                 // Where its deliveries go, which events it gets, or on/off: a new revision.
                 // A token change alone is not: the next attempt reads the new token.
+                let status_kinds = kinds.unwrap_or_else(|| existing.status_kinds.clone());
                 let new_revision = existing.url != url
                     || existing.project_id != project_id
                     || existing.event_types != event_types
+                    || existing.status_kinds != status_kinds
                     || existing.enabled != input.enabled;
                 let bearer_secret = match &bearer {
                     None => existing.bearer_secret.clone(),
@@ -347,6 +390,7 @@ impl Webhooks {
                     project_id,
                     paired_session_id: paired,
                     bearer_secret,
+                    status_kinds,
                     ..existing
                 };
                 let update = self
@@ -390,6 +434,7 @@ impl Webhooks {
                     updated_at: now,
                     revision: 0,
                     bearer_secret: None,
+                    status_kinds: kinds.flatten(),
                 };
                 let secret = signing::generate_secret().map_err(storage)?;
                 self.inner
@@ -652,8 +697,9 @@ mod tests {
         }
     }
 
-    /// The contract's own encodings of an upsert: absent keeps the token, `null` clears it
-    /// and a string sets it. An upsert in the v0.14 shape is the absent case.
+    /// The contract's own encodings of an upsert: absent keeps the token and the status
+    /// filter, `null` clears the token and a string sets it, and a list sets the filter. An
+    /// upsert in the v0.14 shape is the absent case.
     #[test]
     fn upsert_fixtures_decode_to_keep_clear_and_set() {
         let fixture = |name: &str| -> UpsertInput {
@@ -665,6 +711,15 @@ mod tests {
             serde_json::from_value(request["payload"].clone()).unwrap()
         };
         assert!(fixture("token-absent").bearer_token.is_none());
+        assert!(fixture("token-absent").status_kinds.is_none());
+        assert_eq!(
+            fixture("status-kinds").status_kinds,
+            Some(Some(vec![
+                "turn.completed".to_owned(),
+                "turn.failed".to_owned()
+            ]))
+        );
+        assert!(fixture("status-kinds").bearer_token.is_none());
         assert_eq!(fixture("token-null").bearer_token, Some(None));
         assert_eq!(
             fixture("token-set").bearer_token,

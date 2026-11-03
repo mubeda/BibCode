@@ -121,6 +121,7 @@ type IntegrationsTab = "mcp" | "webhooks";
 const NO_CAPABILITIES: WebhookCapabilities = {
   webhookQuestionEvents: false,
   webhookBearerToken: false,
+  webhookStatusKinds: false,
 };
 
 /**
