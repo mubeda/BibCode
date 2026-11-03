@@ -1,5 +1,5 @@
 import type { EnvironmentId, ServerProvider, ServerSettings, ThreadId } from "@bibcode/contracts";
-import { HistoryIcon, PlusIcon, TerminalSquare } from "lucide-react";
+import { HistoryIcon, MessagesSquareIcon, PlusIcon, TerminalSquare } from "lucide-react";
 import { memo, useMemo, type ReactElement } from "react";
 
 import { panelProviderLabel } from "~/centerPanelAdoption";
@@ -18,7 +18,7 @@ import {
   MenuTrigger,
 } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { selectClosedChatPanels } from "./ChatHeaderPanelMenu.logic";
+import { PANEL_UNAVAILABLE_REASON, selectClosedChatPanels } from "./ChatHeaderPanelMenu.logic";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { buildProviderAgentActions } from "./providerAgentActions";
 import type { ProviderTerminalAction } from "./providerTerminalActions";
@@ -34,6 +34,10 @@ interface ChatHeaderPanelMenuProps {
   readonly environmentId: EnvironmentId;
   readonly hostThreadId: ThreadId;
   readonly onCreateChatPanel: (entry: ProviderInstanceEntry) => void;
+  /** Opens an empty side chat of the host on its provider and model. */
+  readonly onCreateSideChat: () => void;
+  /** Why **Side chat** is unavailable (`resolveSideChatAvailability`), or null. */
+  readonly sideChatUnavailableReason: string | null;
   readonly onReopenChatPanel: (threadId: ThreadId, providerLabel: string) => void;
   readonly onOpenTerminalPanel: () => void;
   readonly onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
@@ -41,7 +45,7 @@ interface ChatHeaderPanelMenuProps {
   readonly unavailableReason?: string | null;
 }
 
-export const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
+export { PANEL_UNAVAILABLE_REASON };
 
 function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement }) {
   return (
@@ -156,6 +160,8 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
   environmentId,
   hostThreadId,
   onCreateChatPanel,
+  onCreateSideChat,
+  sideChatUnavailableReason,
   onReopenChatPanel,
   onOpenTerminalPanel,
   onOpenProviderTerminalPanel,
@@ -172,6 +178,23 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
         <PlusIcon className="size-4" />
       </MenuTrigger>
       <MenuPopup align="end" className="min-w-52">
+        {sideChatUnavailableReason === null ? (
+          <MenuItem onClick={onCreateSideChat}>
+            <MessagesSquareIcon className="size-4" />
+            Side chat
+          </MenuItem>
+        ) : (
+          // Shown disabled, not hidden, so an older server's users still find it.
+          <DisabledReasonTooltip
+            reason={sideChatUnavailableReason}
+            trigger={
+              <MenuItem className="data-disabled:pointer-events-auto" disabled>
+                <MessagesSquareIcon className="size-4" />
+                Side chat
+              </MenuItem>
+            }
+          />
+        )}
         {chatActions.map((action) => {
           const disabled = action.disabled || !canCreatePanel;
           const reason = canCreatePanel

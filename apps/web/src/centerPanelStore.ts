@@ -98,6 +98,14 @@ interface CenterPanelStoreState {
   ) => void;
   navigateActivityPane: (ref: ScopedThreadRef, surfaceId: string, route: ActivityPaneRoute) => void;
   readonly pendingChatPanelThreadKeys: ReadonlySet<string>;
+  /**
+   * Scoped keys of chat panels whose tab closed while the server was still creating them,
+   * oldest first. Persisted, unlike the reservation, so a panel created after a reload is
+   * archived instead of adopted.
+   */
+  readonly closedBeforeCreated: readonly string[];
+  recordClosedBeforeCreated: (ref: ScopedThreadRef) => void;
+  clearClosedBeforeCreated: (ref: ScopedThreadRef) => void;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
   reserveChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
   releaseChatPanelReservation: (ref: ScopedThreadRef) => void;
@@ -156,7 +164,15 @@ interface CenterPanelStoreState {
 
 const HOST_SURFACE: CenterSurface = { id: HOST_SURFACE_ID, kind: "chat-host" };
 const CENTER_PANEL_STORAGE_KEY = "bibcode:center-panel-state:v1";
-const CENTER_PANEL_STORAGE_VERSION = 4;
+const CENTER_PANEL_STORAGE_VERSION = 5;
+/** The most panels closed before creation that the store remembers; the oldest go first. */
+export const MAX_CLOSED_BEFORE_CREATED = 20;
+
+function sanitizeClosedBeforeCreated(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const keys = value.filter((key): key is string => typeof key === "string");
+  return [...new Set(keys)].slice(-MAX_CLOSED_BEFORE_CREATED);
+}
 
 const EMPTY_THREAD_STATE: ThreadCenterPanelState = {
   surfaces: [HOST_SURFACE],
@@ -432,9 +448,10 @@ function sanitizeSurface(surface: unknown): CenterSurface[] {
 export function migratePersistedCenterPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadCenterPanelState>;
   activityPanes: ActivityPanesByThreadKey;
+  closedBeforeCreated: string[];
 } {
   if (!persistedState || typeof persistedState !== "object") {
-    return { byThreadKey: {}, activityPanes: {} };
+    return { byThreadKey: {}, activityPanes: {}, closedBeforeCreated: [] };
   }
   const raw =
     "byThreadKey" in persistedState &&
@@ -476,7 +493,11 @@ export function migratePersistedCenterPanelState(persistedState: unknown): {
     "activityPanes" in persistedState ? persistedState.activityPanes : undefined,
     byThreadKey,
   );
-  return { byThreadKey, activityPanes };
+  // Version 4 and older had no list.
+  const closedBeforeCreated = sanitizeClosedBeforeCreated(
+    "closedBeforeCreated" in persistedState ? persistedState.closedBeforeCreated : undefined,
+  );
+  return { byThreadKey, activityPanes, closedBeforeCreated };
 }
 
 export const useCenterPanelStore = create<CenterPanelStoreState>()(
@@ -491,6 +512,25 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
         byThreadKey: {},
         activityPanes: {},
         pendingChatPanelThreadKeys: new Set<string>(),
+        closedBeforeCreated: [],
+        recordClosedBeforeCreated: (ref) =>
+          set((state) => {
+            const key = scopedThreadKey(ref);
+            if (state.closedBeforeCreated.includes(key)) return state;
+            return {
+              closedBeforeCreated: [...state.closedBeforeCreated, key].slice(
+                -MAX_CLOSED_BEFORE_CREATED,
+              ),
+            };
+          }),
+        clearClosedBeforeCreated: (ref) =>
+          set((state) => {
+            const key = scopedThreadKey(ref);
+            if (!state.closedBeforeCreated.includes(key)) return state;
+            return {
+              closedBeforeCreated: state.closedBeforeCreated.filter((entry) => entry !== key),
+            };
+          }),
         setActivityPaneExpanded: (ref, surfaceId, expanded, section) =>
           set((state) => {
             const threadKey = scopedThreadKey(ref);
@@ -872,6 +912,7 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
       partialize: (state) => ({
         byThreadKey: state.byThreadKey,
         activityPanes: state.activityPanes,
+        closedBeforeCreated: state.closedBeforeCreated,
       }),
       migrate: migratePersistedCenterPanelState,
       // Same-version layout is trusted, but pane Activity state is always
@@ -888,6 +929,7 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
             persisted.activityPanes,
             merged.byThreadKey,
           ),
+          closedBeforeCreated: sanitizeClosedBeforeCreated(persisted.closedBeforeCreated),
         };
       },
     },

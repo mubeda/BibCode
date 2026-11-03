@@ -47,6 +47,8 @@ interface ChatHeaderActionsProps {
   settings: Pick<ServerSettings, "providerInstances" | "providers" | "providerSessionDefaults">;
   canCreatePanel: boolean;
   onCreateChatPanel: (entry: ProviderInstanceEntry) => void;
+  onCreateSideChat: () => void;
+  sideChatUnavailableReason: string | null;
   onReopenChatPanel: (threadId: ThreadId, providerLabel: string) => void;
   onOpenTerminalPanel: () => void;
   onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
@@ -89,6 +91,8 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
   settings,
   canCreatePanel,
   onCreateChatPanel,
+  onCreateSideChat,
+  sideChatUnavailableReason,
   onReopenChatPanel,
   onOpenTerminalPanel,
   onOpenProviderTerminalPanel,
@@ -148,6 +152,8 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
         environmentId={activeThreadEnvironmentId}
         hostThreadId={activeThreadId}
         onCreateChatPanel={onCreateChatPanel}
+        onCreateSideChat={onCreateSideChat}
+        sideChatUnavailableReason={sideChatUnavailableReason}
         onReopenChatPanel={onReopenChatPanel}
         onOpenTerminalPanel={onOpenTerminalPanel}
         onOpenProviderTerminalPanel={onOpenProviderTerminalPanel}

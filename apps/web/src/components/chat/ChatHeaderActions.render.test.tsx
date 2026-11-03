@@ -246,6 +246,8 @@ function props(
     },
     canCreatePanel: false,
     onCreateChatPanel: vi.fn(),
+    onCreateSideChat: vi.fn(),
+    sideChatUnavailableReason: null,
     onReopenChatPanel: vi.fn(),
     onOpenTerminalPanel: vi.fn(),
     onOpenProviderTerminalPanel: vi.fn(),

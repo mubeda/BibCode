@@ -109,7 +109,12 @@ import { AsyncResult } from "effect/reactivity";
 import { isDesktopHost } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
-import { parseStandaloneComposerBiBCodeAction } from "../composer-logic";
+import {
+  parseComposerSideChatCommand,
+  parseStandaloneComposerBiBCodeAction,
+} from "../composer-logic";
+import { resolveSideChatAvailability } from "../sideChatAvailability";
+import { buildPanelMenuModel, PROVIDER_NOT_READY_REASON } from "./chat/ChatHeaderPanelMenu.logic";
 import {
   derivePendingApprovals,
   derivePendingUserInputs,
@@ -199,7 +204,7 @@ import {
   type CenterPanelDropRequest,
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
-import { useCenterPanelActions } from "../centerPanelActions";
+import { takeComposerFocusRequest, useCenterPanelActions } from "../centerPanelActions";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -2739,8 +2744,11 @@ function ChatViewContent(props: ChatViewProps) {
     }
     return byMessageId;
   }, [turnDiffSummaries]);
+  const isSideChat = activeThread?.sideChat === true;
   const revertTurnCountByUserMessageId = useMemo(() => {
     const byUserMessageId = new Map<MessageId, number>();
+    // A side chat shares its host's checkout and cannot restore files (the server refuses).
+    if (isSideChat) return byUserMessageId;
     for (let index = 0; index < timelineEntries.length; index += 1) {
       const entry = timelineEntries[index];
       if (!entry || entry.kind !== "message" || entry.message.role !== "user") {
@@ -2770,7 +2778,12 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     return byUserMessageId;
-  }, [inferredCheckpointTurnCountByTurnId, timelineEntries, turnDiffSummaryByAssistantMessageId]);
+  }, [
+    inferredCheckpointTurnCountByTurnId,
+    isSideChat,
+    timelineEntries,
+    turnDiffSummaryByAssistantMessageId,
+  ]);
 
   const gitCwd = activeProject
     ? projectScriptCwd({
@@ -2905,6 +2918,11 @@ function ChatViewContent(props: ChatViewProps) {
       focusComposer();
     });
   }, [focusComposer]);
+  // An empty side chat opened from `:btw` or the menu is ready to type in once it shows.
+  const panelThreadShown = isPanel && activeThread !== undefined;
+  useEffect(() => {
+    if (panelThreadShown && takeComposerFocusRequest(routeThreadRef)) scheduleComposerFocus();
+  }, [panelThreadShown, routeThreadRef, scheduleComposerFocus]);
   const addTerminalContextToDraft = useCallback(
     (selection: TerminalContextSelection) => {
       readComposerHandle(composerRef)?.addTerminalContext(selection);
@@ -4390,6 +4408,55 @@ function ChatViewContent(props: ChatViewProps) {
       workspaceUnavailable,
     ],
   );
+  // A side chat runs on the host's provider and model; the composer's `:btw` and the menu's
+  // **Side chat** share one availability, so both say the same thing when they can't.
+  const hostProviderItem = useMemo(
+    () =>
+      activeThread
+        ? buildPanelMenuModel(providerInstanceEntries).find(
+            (item) => item.entry.instanceId === activeThread.modelSelection.instanceId,
+          )
+        : undefined,
+    [activeThread, providerInstanceEntries],
+  );
+  const sideChatUnavailableReason = resolveSideChatAvailability({
+    capabilities: serverConfig?.environment.capabilities ?? null,
+    isPanel,
+    canCreatePanel: centerPanelLaunchContext !== null,
+    workspaceUnavailableReason: workspaceUnavailable,
+    hostProviderReason: hostProviderItem
+      ? (hostProviderItem.disabledReason ?? null)
+      : PROVIDER_NOT_READY_REASON,
+  });
+  const createCenterSideChat = centerPanelActions.createSideChat;
+  const handleOpenSideChat = useCallback(
+    (question: string, submittedText?: string) => {
+      if (!activeThread || !activeThreadRef || !hostProviderItem) return;
+      if (sideChatUnavailableReason !== null) return;
+      void createCenterSideChat({
+        hostRef: activeThreadRef,
+        projectId: activeThread.projectId,
+        worktreePath: centerPanelLaunchContext?.worktreePath ?? null,
+        branch: activeThread.branch ?? null,
+        modelSelection: activeThread.modelSelection,
+        providerLabel: hostProviderItem.entry.displayName,
+        question,
+        ...(submittedText === undefined ? {} : { submittedText }),
+      });
+    },
+    [
+      activeThread,
+      activeThreadRef,
+      centerPanelLaunchContext?.worktreePath,
+      createCenterSideChat,
+      hostProviderItem,
+      sideChatUnavailableReason,
+    ],
+  );
+  const handleCreateSideChatFromMenu = useCallback(
+    () => handleOpenSideChat(""),
+    [handleOpenSideChat],
+  );
   const reopenCenterChatPanel = centerPanelActions.reopenChatPanel;
   const handleReopenChatPanel = useCallback(
     (threadId: ThreadId, providerLabel: string) => {
@@ -5334,6 +5401,8 @@ function ChatViewContent(props: ChatViewProps) {
     const sendContext = composerRef.current?.getSendContext();
     const prompt = promptRef.current;
     if (parseStandaloneComposerBiBCodeAction(prompt.trim())) return false;
+    // A side chat question opens a side chat (the composer routes it); it is never sent here.
+    if (parseComposerSideChatCommand(prompt) !== null) return false;
     return deriveComposerSendState({
       prompt,
       imageCount: sendContext?.attachments.length ?? composerAttachmentsRef.current.length,
@@ -5528,6 +5597,8 @@ function ChatViewContent(props: ChatViewProps) {
           composerPreviewAnnotations.length +
           composerReviewComments.length,
       });
+      // `:btw` and `:side` open a side chat through the composer; nothing reaches this thread.
+      if (parseComposerSideChatCommand(trimmed) !== null) return;
       const standaloneColonAction = parseStandaloneComposerBiBCodeAction(trimmed);
       if (standaloneColonAction === "plan" || standaloneColonAction === "default") {
         handleInteractionModeChange(standaloneColonAction);
@@ -7346,6 +7417,8 @@ function ChatViewContent(props: ChatViewProps) {
                             composerTerminalContextsRef={composerTerminalContextsRef}
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
+                            onOpenSideChat={handleOpenSideChat}
+                            sideChatUnavailableReason={sideChatUnavailableReason}
                             onInterrupt={onInterrupt}
                             onSteerQueuedMessage={onSteerHeadQueuedMessage}
                             onImplementPlanInNewThread={onImplementPlanInNewThread}
@@ -7432,6 +7505,8 @@ function ChatViewContent(props: ChatViewProps) {
                   settings={settings}
                   canCreatePanel={centerPanelLaunchContext !== null}
                   onCreateChatPanel={handleCreateChatPanel}
+                  onCreateSideChat={handleCreateSideChatFromMenu}
+                  sideChatUnavailableReason={sideChatUnavailableReason}
                   onReopenChatPanel={handleReopenChatPanel}
                   onOpenTerminalPanel={handleOpenTerminalPanel}
                   onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}

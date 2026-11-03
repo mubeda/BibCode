@@ -24,6 +24,9 @@ import { requestThreadShells } from "./state/offShell";
 import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
 import { environmentShell } from "./state/shell";
 import { terminalEnvironment } from "./state/terminal";
+import { threadEnvironment } from "./state/threads";
+import { useAtomCommand } from "./state/use-atom-command";
+import { isAtomCommandInterrupted } from "@bibcode/client-runtime/state/runtime";
 
 function collectPersistedThreadIds(environmentId: EnvironmentId): Set<ThreadId> {
   const threadIds = new Set<ThreadId>();
@@ -167,6 +170,15 @@ function EnvironmentThreadLifecycleReconciler({
     [adoptionTracker, environmentId],
   );
   useAtomSubscribe(terminalMetadataEventsAtom, handleTerminalMetadataEvent, { immediate: true });
+  const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
+  // A panel closed before the server created it: archived once created, even after a reload.
+  const archiveClosedPanel = useCallback(
+    async (threadId: ThreadId) => {
+      const result = await archiveThread({ environmentId, input: { threadId } });
+      return result._tag === "Success" || !isAtomCommandInterrupted(result);
+    },
+    [archiveThread, environmentId],
+  );
 
   useEffect(() => {
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) return;
@@ -175,8 +187,9 @@ function EnvironmentThreadLifecycleReconciler({
       adoptionTracker,
       shellState.snapshot.value.threads,
       shellState.snapshot.value.capped === true,
+      archiveClosedPanel,
     );
-  }, [adoptionTracker, environmentId, shellState]);
+  }, [adoptionTracker, archiveClosedPanel, environmentId, shellState]);
 
   // The archived snapshot is refetched only when a thread enters or leaves the live list
   // (create, archive, unarchive, delete, panel close), never on every live sequence

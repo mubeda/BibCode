@@ -9,7 +9,8 @@
  * deleted elsewhere) loses its tab, and is adopted again if it is reopened. A
  * capped list (#223) leaves finished panels out, so leaving it proves nothing:
  * the panel keeps its tab, and the lifecycle reconciler drops it once the server
- * reports it archived or missing.
+ * reports it archived or missing. A panel this client closed while it was still being
+ * created (`closedBeforeCreated`) is archived instead of adopted, also after a reload.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -27,11 +28,20 @@ import { isTerminalIdReserved } from "./terminalIdReservations";
 export interface CenterPanelAdoptionTracker {
   readonly terminalKeys: Set<string>;
   readonly panelThreadIds: Set<string>;
+  /** Panels closed before creation whose archive is in flight, so it is asked for once. */
+  readonly closingPanelThreadIds: Set<string>;
 }
 
 export function createCenterPanelAdoptionTracker(): CenterPanelAdoptionTracker {
-  return { terminalKeys: new Set(), panelThreadIds: new Set() };
+  return { terminalKeys: new Set(), panelThreadIds: new Set(), closingPanelThreadIds: new Set() };
 }
+
+/**
+ * Archives a panel this client closed before the server created it. Resolves whether the
+ * close is settled (archived, or refused by the server); an interrupted request is retried at
+ * the next snapshot.
+ */
+export type ArchiveClosedPanel = (threadId: ThreadId) => Promise<boolean>;
 
 // Panels titled before the colon form used an em dash; adoption still accepts both.
 const PANEL_TITLE_PREFIX = /^Panel(?: \u2014|:) /u;
@@ -104,6 +114,7 @@ export function applyPanelThreadAdoption(
     Pick<OrchestrationThreadShell, "id" | "kind" | "hostThreadId" | "title" | "archivedAt">
   >,
   capped = false,
+  archiveClosedPanel?: ArchiveClosedPanel,
 ): void {
   const liveThreadIds = new Set<string>(
     threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
@@ -115,9 +126,24 @@ export function applyPanelThreadAdoption(
       continue;
     }
     if (tracker.panelThreadIds.has(thread.id) || !liveThreadIds.has(hostThreadId)) continue;
+    const panelRef = scopeThreadRef(environmentId, thread.id);
+    const panelKey = scopedThreadKey(panelRef);
+    // The open still in flight settles its own close.
+    if (store.pendingChatPanelThreadKeys.has(panelKey)) {
+      tracker.panelThreadIds.add(thread.id);
+      continue;
+    }
+    if (store.closedBeforeCreated.includes(panelKey)) {
+      if (archiveClosedPanel && !tracker.closingPanelThreadIds.has(thread.id)) {
+        tracker.closingPanelThreadIds.add(thread.id);
+        void archiveClosedPanel(thread.id).then((settled) => {
+          tracker.closingPanelThreadIds.delete(thread.id);
+          if (settled) useCenterPanelStore.getState().clearClosedBeforeCreated(panelRef);
+        });
+      }
+      continue;
+    }
     tracker.panelThreadIds.add(thread.id);
-    const panelKey = scopedThreadKey(scopeThreadRef(environmentId, thread.id));
-    if (store.pendingChatPanelThreadKeys.has(panelKey)) continue;
     store.adoptChatPanel(
       scopeThreadRef(environmentId, hostThreadId),
       thread.id,

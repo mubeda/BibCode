@@ -390,6 +390,7 @@ const STATE = {
   modelPickerOpen: 7,
   focused: 8,
   dismissedTrigger: 9,
+  sideChatRefusal: 10,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -856,6 +857,8 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     composerElementContextsRef: { current: [] },
     composerRef,
     onSend: spies.onSend,
+    onOpenSideChat: vi.fn(),
+    sideChatUnavailableReason: null,
     onInterrupt: spies.onInterrupt,
     onImplementPlanInNewThread: spies.onImplementPlanInNewThread,
     onRespondToApproval: spies.onRespondToApproval,
@@ -1933,7 +1936,13 @@ describe("ChatComposer command menu", () => {
 
     const menu = findCapture("ComposerCommandMenu");
     const items = menu["items"] as Array<Record<string, unknown>>;
-    expect(items.map((item) => item["label"])).toEqual([":model", ":plan", ":default"]);
+    expect(items.map((item) => item["label"])).toEqual([
+      ":model",
+      ":plan",
+      ":default",
+      ":btw",
+      ":side",
+    ]);
     expect(items.every((item) => item["type"] === "bibcode-action")).toBe(true);
     expect(menu["emptyStateText"]).toBe("No matching BiBCode action.");
   });
@@ -2875,6 +2884,81 @@ describe("ChatComposer paste and drag", () => {
     h.stateSeeds.set(STATE.dragOver, true);
     const { markup } = renderComposer();
     expect(markup).toContain("border-primary/70");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Side chats
+// ---------------------------------------------------------------------------
+
+describe("ChatComposer side chats", () => {
+  const question = "why did you pick that file?";
+  const submitted = `:btw ${question}`;
+  const submit = () => {
+    const form = findHost((element) => element.type === "form");
+    const event = { preventDefault: vi.fn() };
+    (form.props["onSubmit"] as (event: unknown) => void)(event);
+    return event;
+  };
+
+  it("opens a side chat for :btw <q> and never sends it", () => {
+    seedPrompt(submitted);
+    const onOpenSideChat = vi.fn();
+    const { spies } = renderComposer({ onOpenSideChat, promptRef: { current: submitted } });
+
+    const event = submit();
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(onOpenSideChat).toHaveBeenCalledWith(question, submitted);
+    expect(spies.onSend).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.prompt).toBe(submitted);
+  });
+
+  it.each([
+    ["in a panel", "Side chats start from the main chat. Use :btw there."],
+    ["without the capability", "This server doesn't support side chats. Update it to use them."],
+  ])("refuses :btw %s, keeping the text and showing why", (_case, reason) => {
+    seedPrompt(submitted);
+    const onOpenSideChat = vi.fn();
+    const { spies } = renderComposer({
+      onOpenSideChat,
+      sideChatUnavailableReason: reason,
+      promptRef: { current: submitted },
+    });
+
+    submit();
+
+    expect(onOpenSideChat).not.toHaveBeenCalled();
+    expect(spies.onSend).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.prompt).toBe(submitted);
+    expect(setStateValues(STATE.sideChatRefusal)).toContainEqual({ prompt: submitted, reason });
+    h.stateSeeds.set(STATE.sideChatRefusal, { prompt: submitted, reason });
+    expect(renderComposer({ sideChatUnavailableReason: reason }).markup).toContain(
+      reason.replace("'", "&#x27;"),
+    );
+  });
+
+  it("refuses :btw with attachments, keeping the draft", () => {
+    seedPrompt(submitted);
+    draftStore().addAttachments(threadRef, [makeFile()]);
+    const onOpenSideChat = vi.fn();
+    const { spies } = renderComposer({ onOpenSideChat, promptRef: { current: submitted } });
+
+    submit();
+
+    expect(onOpenSideChat).not.toHaveBeenCalled();
+    expect(spies.onSend).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.attachments).toHaveLength(1);
+    expect(setStateValues(STATE.sideChatRefusal)).toContainEqual({
+      prompt: submitted,
+      reason: "Side chats take text only. Remove the attachments, or add them in the side chat.",
+    });
+  });
+
+  it("hides the reason once the text changes", () => {
+    seedPrompt("something else");
+    h.stateSeeds.set(STATE.sideChatRefusal, { prompt: submitted, reason: "Hidden reason" });
+    expect(renderComposer().markup).not.toContain("Hidden reason");
   });
 });
 
