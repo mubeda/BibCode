@@ -1,6 +1,6 @@
 # Git: Honouring the System Line-Ending Settings
 
-Status: Proposed, revision 2. Issue #282. Verified at `30622da46436` (`v015/batch`) on
+Status: Approved by Mauro 2026-11-03 (revision 2). Issue #282. Verified at `30622da46436` (`v015/batch`) on
 Windows 11 with Git `2.56.0.windows.4`. Line references are to that commit. No product code
 is written until this design is approved.
 
