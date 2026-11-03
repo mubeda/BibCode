@@ -13,11 +13,34 @@ export const BRING_BACK_NO_ANSWER_REASON = "Available once the side chat answers
 
 const QUESTION_MAX_CHARS = 120;
 
-type Message = Pick<OrchestrationMessage, "role" | "text" | "streaming">;
+type Message = Pick<OrchestrationMessage, "role" | "text" | "streaming" | "turnId" | "createdAt"> &
+  Partial<Pick<OrchestrationMessage, "delivery">>;
 
 /**
- * The quoted summary of the last finished answer and the question before it, or `null` before
- * the side chat has answered.
+ * The first line of the user message that started `answer`'s turn. That message carries no
+ * turn id (only a steer does) and is re-timed to the turn's start, while one queued behind the
+ * turn is still `queued`, or re-timed past the answer once promoted. So it is the newest
+ * delivered user message of no other turn created by the time the answer was.
+ */
+function questionOf(messages: ReadonlyArray<Message>, answer: Message): string | undefined {
+  let question: Message | undefined;
+  for (const message of messages) {
+    if (
+      message.role === "user" &&
+      message.turnId === null &&
+      (message.delivery === undefined || message.delivery.state === "delivered") &&
+      message.createdAt <= answer.createdAt &&
+      (question === undefined || message.createdAt >= question.createdAt)
+    ) {
+      question = message;
+    }
+  }
+  return question?.text.trim().split("\n", 1)[0]?.trim();
+}
+
+/**
+ * The quoted summary of the last finished answer and the question that started its turn, or
+ * `null` before the side chat has answered.
  */
 export function composeSideChatBringBack(messages: ReadonlyArray<Message>): string | null {
   let answerIndex = messages.length - 1;
@@ -30,11 +53,7 @@ export function composeSideChatBringBack(messages: ReadonlyArray<Message>): stri
   }
   if (answerIndex < 0) return null;
   const answer = messages[answerIndex]!.text.trim();
-  let question: string | undefined;
-  for (let index = answerIndex - 1; index >= 0 && question === undefined; index -= 1) {
-    const message = messages[index]!;
-    if (message.role === "user") question = message.text.trim().split("\n", 1)[0]?.trim();
-  }
+  const question = questionOf(messages, messages[answerIndex]!);
   const asked =
     question === undefined || question.length === 0
       ? ""

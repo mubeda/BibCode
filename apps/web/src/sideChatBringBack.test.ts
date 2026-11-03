@@ -1,5 +1,15 @@
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import { EnvironmentId, ThreadId } from "@bibcode/contracts";
+import { applyThreadDetailEvent } from "@bibcode/client-runtime/state/thread-reducer";
+import {
+  EnvironmentId,
+  EventId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  TurnId,
+  type OrchestrationThread,
+} from "@bibcode/contracts";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
@@ -34,11 +44,22 @@ import {
   resolveBringBackUnavailableReason,
 } from "./sideChatBringBack";
 
-const user = (text: string) => ({ role: "user" as const, text, streaming: false });
+// Each message is created after the one before it, as a conversation is.
+let clock = 0;
+const createdAt = () => `2026-11-03T00:00:${String((clock += 1) % 60).padStart(2, "0")}.000Z`;
+const user = (text: string) => ({
+  role: "user" as const,
+  text,
+  streaming: false,
+  turnId: null,
+  createdAt: createdAt(),
+});
 const assistant = (text: string, streaming = false) => ({
   role: "assistant" as const,
   text,
   streaming,
+  turnId: TurnId.make(`turn-${clock}`),
+  createdAt: createdAt(),
 });
 const HOST = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("host"));
 
@@ -63,6 +84,96 @@ describe("composeSideChatBringBack", () => {
     expect(
       composeSideChatBringBack([user("q1"), assistant("done"), user("q2"), assistant("hal", true)]),
     ).toBe("From the side chat (asked: q1):\n\n> done");
+  });
+
+  it("names the question that started the answer's turn, not one queued meanwhile", () => {
+    // The real reducer: A is sent and starts turn 1, B is queued behind it, then A's answer
+    // streams in. The list reads [A, B, answer-A].
+    const at = (minute: number) => `2026-11-03T00:${String(minute).padStart(2, "0")}:00.000Z`;
+    let sequence = 0;
+    let thread: OrchestrationThread = {
+      id: ThreadId.make("side"),
+      projectId: ProjectId.make("project"),
+      title: "Panel: Side chat · Codex",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: at(0),
+      updatedAt: at(0),
+      archivedAt: null,
+      deletedAt: null,
+      messages: [],
+      reasoning: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
+      session: null,
+    };
+    const apply = (type: string, payload: Record<string, unknown>, minute: number) => {
+      sequence += 1;
+      const result = applyThreadDetailEvent(thread, {
+        sequence,
+        eventId: EventId.make(`event-${sequence}`),
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        occurredAt: at(minute),
+        aggregateKind: "thread",
+        aggregateId: thread.id,
+        type,
+        payload: { threadId: thread.id, ...payload },
+      } as never);
+      if (result.kind === "updated") thread = result.thread;
+    };
+    const sent = (id: string, role: string, text: string, turnId: string | null, minute: number) =>
+      apply(
+        "thread.message-sent",
+        {
+          messageId: MessageId.make(id),
+          role,
+          text,
+          turnId: turnId === null ? null : TurnId.make(turnId),
+          streaming: false,
+          createdAt: at(minute),
+          updatedAt: at(minute),
+        },
+        minute,
+      );
+    const delivery = (id: string, state: string, minute: number) =>
+      apply(
+        "thread.turn-delivery-updated",
+        {
+          messageId: MessageId.make(id),
+          delivery: { state, provider: "codex", mode: "start" },
+          mode: "start",
+          updatedAt: at(minute),
+        },
+        minute,
+      );
+    sent("a", "user", "question A", null, 1);
+    apply(
+      "thread.turn-start-requested",
+      {
+        messageId: MessageId.make("a"),
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        createdAt: at(1),
+      },
+      1,
+    );
+    delivery("a", "delivered", 2);
+    sent("b", "user", "question B", null, 3);
+    delivery("b", "queued", 3);
+    sent("answer-a", "assistant", "answer to A", "turn-1", 4);
+    expect(thread.messages.map((message) => message.id)).toEqual(["a", "b", "answer-a"]);
+
+    expect(composeSideChatBringBack(thread.messages)).toBe(
+      "From the side chat (asked: question A):\n\n> answer to A",
+    );
   });
 
   it("shortens a long question", () => {
