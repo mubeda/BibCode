@@ -3,7 +3,7 @@
 BiBCode can tell another service when something happens in an environment: a thread's
 turn starts or ends, an approval or a question is asked for or answered, an outside agent commits or
 clones, or the profiler records a finding. It sends a signed HTTPS `POST` to each endpoint
-you register. A request carries ids, kinds, statuses and a cursor, never a prompt, a
+you register. A request body carries ids, kinds, statuses and a cursor, never a prompt, a
 message, a reply, terminal output, file contents, a diff or a token.
 
 The [webhooks reference](../reference/webhooks.md) is the complete contract for a
@@ -17,9 +17,13 @@ receiver: every event's payload, signature verification, retries and catch-up.
 3. Click **Add endpoint**, give it a name and an `https://` URL, and choose the events to
    send. You can limit it to one project, and pair it with an MCP client so that revoking
    that client turns the endpoint off.
-4. Copy the **signing secret** shown once. BiBCode keeps it in its secret store and never
+4. If your receiver wants a key, enter it as the **Bearer token**: every request then
+   carries `Authorization: Bearer <token>`. It is never shown again. Editing the endpoint
+   shows only "A token is set", with **Replace** and **Remove**; changing the URL asks you
+   to enter the new receiver's token or remove it.
+5. Copy the **signing secret** shown once. BiBCode keeps it in its secret store and never
    shows it again; **Rotate secret** makes a new one, and the old one stops working at once.
-5. Click **Send test event** to check that your receiver answers.
+6. Click **Send test event** to check that your receiver answers.
 
 The section header sums up the environment: whether MCP is on, how many agents are
 connected, and how many endpoints are active and failing. Each endpoint lists its recent

@@ -134,7 +134,7 @@ import { WebhooksTab } from "./WebhooksTab";
 
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
-async function render({ questionEvents = true } = {}): Promise<HTMLDivElement> {
+async function render({ questionEvents = true, bearerToken = true } = {}): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -145,7 +145,10 @@ async function render({ questionEvents = true } = {}): Promise<HTMLDivElement> {
         environmentId={"local" as never}
         isPrimary={true}
         supported={true}
-        questionEvents={questionEvents}
+        capabilities={{
+          webhookQuestionEvents: questionEvents,
+          webhookBearerToken: bearerToken,
+        }}
       />,
     );
   });
@@ -165,6 +168,7 @@ function endpoint(overrides: Record<string, unknown> = {}): Record<string, unkno
     eventTypes: ["thread.status_changed"],
     projectId: null,
     pairedClientId: null,
+    bearerTokenSet: false,
     consecutiveFailures: 0,
     disabledReason: null,
     pendingDeliveries: 0,
@@ -298,6 +302,90 @@ describe("WebhooksTab", () => {
     await act(async () => button(container, "Edit").click());
     await act(async () => submitButton(container).click());
     expect(h.calls[0]!.request.input.eventTypes).toEqual(["thread.status_changed", "future.event"]);
+  });
+
+  it("adds an endpoint with a masked bearer token that is gone from the page once saved", async () => {
+    h.settings = { enableWebhooks: true };
+    const container = await render();
+    await act(async () => button(container, "Add endpoint").click());
+    const inputs = container.querySelectorAll<HTMLInputElement>("form input:not([type])");
+    const token = container.querySelector<HTMLInputElement>('form input[type="password"]')!;
+    expect(token.getAttribute("autocomplete")).toBe("off");
+    expect(container.textContent).toContain("Sent as Authorization: Bearer");
+    await act(async () => {
+      setInput(inputs[0]!, "CI");
+      setInput(inputs[1]!, "https://hooks.example.com/bibcode");
+      setInput(token, "  tok-secret-1  ");
+    });
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.bearerToken).toBe("tok-secret-1");
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.innerHTML).not.toContain("tok-secret-1");
+  });
+
+  it("keeps, replaces and removes an endpoint's token", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ bearerTokenSet: true })];
+    const container = await render();
+    // Untouched, the token is kept: the field is left out.
+    await act(async () => button(container, "Edit").click());
+    expect(container.textContent).toContain("A token is set.");
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    await act(async () => submitButton(container).click());
+    expect("bearerToken" in h.calls[0]!.request.input).toBe(false);
+
+    await act(async () => button(container, "Edit").click());
+    await act(async () => button(container, "Replace").click());
+    expect(submitButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("Enter the new token, or keep the current one.");
+    await act(async () =>
+      setInput(container.querySelector<HTMLInputElement>('input[type="password"]')!, "tok-2"),
+    );
+    await act(async () => submitButton(container).click());
+    expect(h.calls[1]!.request.input.bearerToken).toBe("tok-2");
+    expect(container.innerHTML).not.toContain("tok-2");
+
+    await act(async () => button(container, "Edit").click());
+    await act(async () => button(container, "Remove").click());
+    expect(container.textContent).toContain("The token is removed when you save.");
+    await act(async () => submitButton(container).click());
+    expect(h.calls[2]!.request.input.bearerToken).toBeNull();
+  });
+
+  it("asks for the token again when the URL changes", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ bearerTokenSet: true })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    const url = container.querySelectorAll<HTMLInputElement>("form input:not([type])")[1]!;
+    await act(async () => setInput(url, "https://other.example.com/hook"));
+    expect(container.querySelector('input[type="password"]')).not.toBeNull();
+    expect(submitButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("Enter the token for the new URL, or remove it.");
+    await act(async () => button(container, "Remove").click());
+    expect(submitButton(container).disabled).toBe(false);
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input).toMatchObject({
+      url: "https://other.example.com/hook",
+      bearerToken: null,
+    });
+  });
+
+  it("hides the token field on an older server and never sends it", async () => {
+    h.settings = { enableWebhooks: true };
+    const container = await render({ bearerToken: false });
+    await act(async () => button(container, "Add endpoint").click());
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    expect(container.textContent).toContain(
+      "Update BiBCode on this environment to send a bearer token.",
+    );
+    const inputs = container.querySelectorAll<HTMLInputElement>("form input:not([type])");
+    await act(async () => {
+      setInput(inputs[0]!, "CI");
+      setInput(inputs[1]!, "https://hooks.example.com/bibcode");
+    });
+    await act(async () => submitButton(container).click());
+    expect("bearerToken" in h.calls[0]!.request.input).toBe(false);
   });
 
   it("refuses to submit a URL that is not https", async () => {

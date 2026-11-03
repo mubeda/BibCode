@@ -390,7 +390,8 @@ Terminal's preparation runs its provider's probe, a mise shim's `which` and `env
 and `codesign` for a new Claude build), MCP tool calls that wait
 (`mcp.wait_for_thread`, `mcp.preview_*`, `mcp.device_*`, and any `mcp.*` tool
 whose RPC method is long-running), a webhook test event or redelivery
-(`webhooks.sendTest`, `webhooks.redeliver`, which wait on a person's endpoint), and
+(`webhooks.sendTest`, `webhooks.redeliver`, which wait on a person's endpoint, and
+`webhooks.upsert`, which waits for the request in flight when a bearer token changes), and
 similar external or filesystem work) never
 raise `rpc.slow`; their hang budget is 300 s. Builds
 through v0.9.2 raised it for `server.getProviderCapabilities` (#107).

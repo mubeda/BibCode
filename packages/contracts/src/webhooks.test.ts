@@ -29,6 +29,7 @@ describe("webhook contracts across versions", () => {
   it("decodes an older server's list", () => {
     const list = decodeList({ enabled: true, endpoints: [olderEndpoint], maxEndpoints: 20 });
     expect(list.endpoints[0]!.eventTypes).toEqual(["thread.status_changed"]);
+    expect(list.endpoints[0]!.bearerTokenSet).toBe(false);
   });
 
   it("keeps an event type a newer server added", () => {
@@ -43,5 +44,6 @@ describe("webhook contracts across versions", () => {
   it("reads the webhook capabilities as off when an older server leaves them out", () => {
     const capabilities = decodeCapabilities({});
     expect(capabilities.webhookQuestionEvents).toBe(false);
+    expect(capabilities.webhookBearerToken).toBe(false);
   });
 });

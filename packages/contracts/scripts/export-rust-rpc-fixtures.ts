@@ -33,6 +33,7 @@ import {
 } from "../src/server.ts";
 import { DEFAULT_SERVER_SETTINGS } from "../src/settings.ts";
 import { TerminalBeginInput, TerminalOpenInput } from "../src/terminal.ts";
+import { WebhooksUpsertInput } from "../src/webhooks.ts";
 
 const StreamSchemaTypeId = "~effect/rpc/RpcSchema/StreamSchema";
 const requestId = "900719925474099312345";
@@ -781,6 +782,30 @@ dynamicFixtures.set(
     headers: [],
   } satisfies RpcMessage.RequestEncoded),
 );
+// `webhooks.upsert` with its bearer token absent (kept), `null` (removed) and set.
+for (const [name, bearerToken] of [
+  ["token-absent", undefined],
+  ["token-null", null],
+  ["token-set", "fixture-token"],
+] as const) {
+  dynamicFixtures.set(
+    `contract-shapes/webhooks__upsert-${name}-request.json`,
+    serializeWireFixture({
+      _tag: "Request",
+      id: requestId,
+      tag: "webhooks.upsert",
+      payload: compileUnknownEncoder(WebhooksUpsertInput)({
+        id: "endpoint-1",
+        name: "CI",
+        url: "https://hooks.example.com/bibcode",
+        enabled: true,
+        eventTypes: ["thread.status_changed"],
+        ...(bearerToken === undefined ? {} : { bearerToken }),
+      }),
+      headers: [],
+    } satisfies RpcMessage.RequestEncoded),
+  );
+}
 const queueCommandFields = {
   commandId: "queue-command-1",
   threadId: "thread-1",

@@ -199,6 +199,9 @@ pub fn is_long_running(method: &str) -> bool {
             // (#139 slice X8).
             | "webhooks.sendTest"
             | "webhooks.redeliver"
+            // Replacing or removing a bearer token waits for the endpoint's request in flight
+            // before it removes the old token's file (#271).
+            | "webhooks.upsert"
             // Run Claude Code's or Codex's own `mcp` command; `claude mcp get` health-checks
             // the entry, which starts `bibcode mcp` and connects it back (up to 45 s).
             | "mcpClients.getRegistrations"
@@ -1240,14 +1243,15 @@ mod tests {
         // Preparing an AI Terminal runs its provider's probe, a shim's manager and codesign.
         assert!(is_long_running("terminal.open"));
         assert!(!is_long_running("terminal.writeInput"));
-        // A test event or a redelivery waits on the person's endpoint (up to 10 s); the rest
-        // of the webhook methods read and write the store only.
+        // A test event or a redelivery waits on the person's endpoint (up to 10 s), and a
+        // token change waits for the request in flight; the rest of the webhook methods read
+        // and write the store only.
         assert!(is_long_running("webhooks.sendTest"));
         assert!(is_long_running("webhooks.redeliver"));
+        assert!(is_long_running("webhooks.upsert"));
         for method in [
             "webhooks.list",
             "webhooks.listDeliveries",
-            "webhooks.upsert",
             "webhooks.delete",
             "webhooks.rotateSecret",
         ] {

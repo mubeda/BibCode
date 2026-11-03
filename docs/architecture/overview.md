@@ -2175,8 +2175,9 @@ bounded memory, and works while the server is stopped.
   ending every wait in flight and interrupting owned mutations (recorded `unknown`),
   before the orchestration engine shuts down.
 - **Webhook dispatcher.** Outbound HTTP is not a child process. `webhooks.sendTest`
-  and `webhooks.redeliver` wait on a person's endpoint and are long-running; the
-  other `webhooks.*` methods are timed as usual. A failed delivery logs a
+  and `webhooks.redeliver` wait on a person's endpoint, and `webhooks.upsert` waits for
+  the endpoint's request in flight before it removes a replaced bearer token's file, so
+  all three are long-running; the other `webhooks.*` methods are timed as usual. A failed delivery logs a
   `tracing::warn!` with the endpoint id, status and error tag, never the URL. The
   dispatcher stops right after the MCP service in the quiesce sequence, before the
   profiler's teardown (see [Outbound webhooks](#outbound-webhooks)).
@@ -2872,6 +2873,19 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md),
   finding's `{ id, count, lastSeen }`); an agent is its kind and opaque client id,
   never its label. Each body is HMAC-SHA256 signed over its timestamp with
   the endpoint's secret, kept in the secret store as `webhook-<id>`.
+- **Bearer token (#271).** An endpoint may also send `Authorization: Bearer`. Each
+  token value is its own secret-store file, `webhook-bearer-<id>-<32 hex>`, and the
+  row's `bearer_secret` (migration 66) names the current one, so the URL and the token
+  change in one commit and a destination is never paired with another one's token.
+  Every upsert and delete of an endpoint holds its edit lock from its read of the row
+  through cleanup; a file is written before the commit and removed only after the
+  commit stops naming it, under the endpoint's send lock (waited for, never cancelling
+  the request in flight), so a sender never reads a name whose file is gone. Each edit
+  also removes that endpoint's files the row does not name, which a crash between write
+  and commit leaves; there is no startup sweep, which would race a save. A URL change
+  must restate or remove the token. A row naming a file that cannot be read fails the
+  delivery as `token_missing`, never sent without it. The token is never listed
+  (`bearerTokenSet` only), logged or put in a profiler record.
 - **Controls.** `enableWebhooks` (default off) is a live setting: off cancels every
   request in flight, abandons the queue and resets the positions to the heads.
   Disabling an endpoint does the same for it; revoking its paired MCP client

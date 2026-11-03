@@ -664,6 +664,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(63, "ProjectionTurnCheckpointDiffAvailable", migration_063),
     Migration::new(64, "ThreadHistoryWindow", migration_064),
     Migration::new(65, "ProviderTurnOutboxClaimedOnce", migration_065),
+    Migration::new(66, "WebhookBearerSecret", migration_066),
 ];
 
 impl Migration {
@@ -2942,6 +2943,19 @@ fn migration_065(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_066(transaction: &Transaction<'_>) -> Result<()> {
+    // A webhook endpoint's bearer token (#271): the secret-store name of the file that holds
+    // the current token, or NULL. The URL and the token are named in one row, so one commit
+    // changes both and a destination is never paired with another destination's token.
+    if table_exists(transaction, "webhook_endpoints")?
+        && !table_has_column(transaction, "webhook_endpoints", "bearer_secret")?
+    {
+        transaction
+            .execute_batch("ALTER TABLE webhook_endpoints ADD COLUMN bearer_secret TEXT;")?;
+    }
+    Ok(())
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3171,7 +3185,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63, 64, 65]
+            [59, 60, 61, 62, 63, 64, 65, 66]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3204,7 +3218,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65]
+            [65, 66]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3240,7 +3254,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65]
+            [61, 62, 63, 64, 65, 66]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3269,6 +3283,34 @@ mod tests {
     }
 
     #[test]
+    fn migration_066_adds_a_null_bearer_secret_to_existing_endpoints() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(65))?;
+        connection.execute(
+            "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [66]
+        );
+        let bearer: Option<String> = connection.query_row(
+            "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(bearer, None);
+        let transaction = connection.transaction()?;
+        super::migration_066(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn migration_062_adds_the_oauth_tables_and_the_session_resource() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(61))?;
@@ -3279,7 +3321,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65]
+            [62, 63, 64, 65, 66]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3334,7 +3376,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65]
+            [60, 61, 62, 63, 64, 65, 66]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3379,7 +3421,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65]
+            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3421,7 +3463,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(65));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(66));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4153,7 +4195,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=65).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=66).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4223,6 +4265,7 @@ mod tests {
                 (63, "ProjectionTurnCheckpointDiffAvailable"),
                 (64, "ThreadHistoryWindow"),
                 (65, "ProviderTurnOutboxClaimedOnce"),
+                (66, "WebhookBearerSecret"),
             ],
         );
         assert_eq!(
@@ -4373,7 +4416,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 49);
+        assert_eq!(second.len(), 50);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4493,7 +4536,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63, 64, 65
+                61, 62, 63, 64, 65, 66
             ]
         );
         let policy = connection.query_row(
@@ -4533,7 +4576,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63, 64, 65
+                62, 63, 64, 65, 66
             ]
         );
         let pin = connection.query_row(
@@ -4564,7 +4607,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63, 64, 65
+                63, 64, 65, 66
             ]
         );
         let pin = connection.query_row(
@@ -4706,7 +4749,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
+                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66
             ]
         );
         assert_eq!(
@@ -4736,7 +4779,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 32);
+        assert_eq!(applied.len(), 33);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);

@@ -94,6 +94,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   reviewDiffTools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Webhooks offer `input.requested` and `input.resolved` (the Questions events). */
   webhookQuestionEvents: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `webhooks.upsert` takes `bearerToken`, and `webhooks.list` reports `bearerTokenSet`. */
+  webhookBearerToken: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 
