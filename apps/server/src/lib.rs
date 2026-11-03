@@ -144,6 +144,16 @@ pub async fn run_cli() -> Result<(), RunError> {
                 code => std::process::exit(code),
             }
         }
+        CliAction::McpCall { options, args } => {
+            match mcp::call_cli::run_mcp_call(options, args).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        CliAction::McpTools(options) => match mcp::call_cli::run_mcp_tools(options).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        },
         CliAction::Thread { options, args } => {
             match mcp::thread_cli::run_thread_cli(options, args).await {
                 0 => Ok(()),

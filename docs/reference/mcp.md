@@ -224,6 +224,28 @@ Each run mints a new credential, but every `bibcode thread` run shares one `clie
 scope, so the `--request-id` retry above works across runs. Only the "thread this agent
 opened or last drove" rule of `send_panel_message` does not carry over between runs.
 
+### One tool from a shell: `bibcode mcp call` and `bibcode mcp tools`
+
+`bibcode mcp call <tool> [<arguments-json>|-]` calls one tool and prints its MCP `result`
+(`content`, `structuredContent`, `isError`) as one JSON document. `bibcode mcp tools` prints
+`{ "tools": [...] }`, the `tools/list` entries this command's credential sees, each with
+`oneShot`: whether `call` takes it. Both find the server and sign in as `bibcode mcp` does,
+take `--access`, `--url` and `--base-dir` before the subcommand
+(`bibcode mcp --access read-only call read_thread '{"threadId":"..."}'`), mint a credential
+labelled `CLI · bibcode mcp` and revoke it on exit.
+
+- **Read-only tools only, and not `files_download`.** Revoking the credential ends what a
+  call handed back: a transfer URL is bound to the session that minted it, and owned work
+  such as a clone stops. Read-only tools finish within the call; `files_download` is the
+  one that hands back a URL. Any other tool, and an unknown one, is refused before a
+  credential is minted: "`<tool>` needs a connection that stays open. Use it from
+  `bibcode mcp` in your agent, or `bibcode thread` for messages, answers and approvals."
+- `-` reads the arguments from standard input; without them the call sends `{}`. Arguments
+  that are not a JSON object are refused before anything connects.
+- Exit codes: 0 success; 1 a tool error (its message on standard error, the result still
+  printed), an unknown or refused tool, or a transport failure; 2 a result whose `status` is
+  `awaiting_approval` or `awaiting_input`.
+
 ### Remote HTTP with OAuth
 
 An environment reachable over HTTPS also serves MCP as Streamable HTTP at

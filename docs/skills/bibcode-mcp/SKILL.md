@@ -60,6 +60,9 @@ and `decline <thread> <request> [--cancel]` answer them (no `--wait`: check with
 feed. It exits 0 on success, 1 on failure and 2 when the thread waits on a person. If a
 `start`, `send`, `answer`, `approve` or `decline` is interrupted, run the same command with
 `--request-id <id>` (it prints the id) to finish it without repeating it.
+`bibcode mcp call <tool> [<arguments-json>|-]` calls one read-only tool (not
+`files_download`) and prints its result as JSON; `bibcode mcp tools` lists the tools with
+`oneShot`. Anything else needs `bibcode mcp` or `bibcode thread`.
 
 ## Hand off work and wait
 

@@ -619,6 +619,14 @@ bibcode thread requests <thread id>
 bibcode thread approve <thread id> <request id>
 ```
 
+## One tool from a shell: `bibcode mcp call`
+
+`bibcode mcp call <tool> [<arguments>]` calls one tool and prints its result as JSON, for a
+script that only needs to read: `bibcode mcp call list_projects_and_threads`, or
+`bibcode mcp call read_thread '{"threadId":"<id>"}'`. It takes read-only tools only, other
+than `files_download`; `bibcode mcp tools` lists every tool with `oneShot: true` for those
+it takes. It exits 0 on success, 1 on a failure and 2 when the thread waits on a person.
+
 ## What it can and cannot do
 
 - **Access.** A thread an agent starts never runs above **Agents may**, and an agent cannot
