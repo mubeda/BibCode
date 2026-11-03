@@ -920,7 +920,10 @@ open, that project's header row stays highlighted in the left panel, and the
 toolbar leads with the project's name (its checkout path on hover) and the
 environment it is connected to. The selected
 environment owns every path and Git process, so a remote project's checkout
-path remains opaque to the browser.
+path remains opaque to the browser. Git Manager handles line endings the way
+your own Git does on that host, including Git for Windows' system
+`core.autocrlf`. If an earlier version committed files with CRLF line endings,
+they stay that way. To normalize them, run `git add --renormalize .` yourself.
 
 The toolbar has three segments:
 
