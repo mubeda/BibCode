@@ -682,6 +682,7 @@ it takes. It exits 0 on success, 1 on a failure and 2 when the thread waits on a
 | "This BiBCode server does not listen on this computer's loopback address." | The server binds only to another interface                  | Bind it to a loopback or wildcard address                   |
 | "The program listening on … is not this BiBCode server."                   | Another program took the recorded port, or BiBCode crashed  | Start BiBCode again                                         |
 | "BiBCode ended this MCP connection's access."                              | The agent's row was revoked                                 | Restart the MCP server in the agent                         |
+| "Could not record this MCP connection in …"                                | BiBCode's state folder cannot be written                    | Free disk space or fix the folder's permissions, then retry |
 | `--access … is above this environment's limit`                             | Asked for more than Agents may                              | Raise Agents may, or ask for less                           |
 
 When two BiBCode servers run on the same data root, such as the desktop app and a
