@@ -572,6 +572,7 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
           }),
         recordChatPanelClose: (ref, liveAt) => {
           const key = scopedThreadKey(ref);
+          // @effect-diagnostics-next-line cryptoRandomUUID:off -- Close ids are generated at the impure Zustand store boundary.
           const closeId = crypto.randomUUID();
           set((state) => ({
             closingChatPanels: [
