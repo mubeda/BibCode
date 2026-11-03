@@ -9,13 +9,14 @@ import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 // @effect-diagnostics-next-line nodeBuiltinImport:off - Hashes build inputs outside an Effect Crypto service.
 import * as NodeCrypto from "node:crypto";
+// @effect-diagnostics-next-line nodeBuiltinImport:off - Effect's stat loses inodes above 2^53.
+import * as NodeFSP from "node:fs/promises";
 import * as NodeUtil from "node:util";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
@@ -1405,19 +1406,30 @@ export const copyTauriBundleArtifacts = Effect.fn("copyTauriBundleArtifacts")(fu
 });
 
 interface BinaryFingerprint {
-  readonly inode: number | undefined;
-  readonly links: number | undefined;
+  readonly inode: bigint;
+  readonly links: bigint;
   readonly sha256: string;
   readonly bytes: Uint8Array;
 }
 
+/**
+ * The file's inode and link count, exact. Effect's `stat` drops an inode above 2^53, and NTFS file
+ * IDs carry a sequence number in their top bits, so most Windows inodes would read as unknown.
+ */
+const fileIdentity = (file: string) =>
+  Effect.tryPromise({
+    try: () => NodeFSP.stat(file, { bigint: true }),
+    catch: (cause) =>
+      new TauriDesktopBuildConfigurationError(`Could not stat ${file}: ${String(cause)}`),
+  }).pipe(Effect.map((info) => ({ inode: info.ino, links: info.nlink })));
+
 const fingerprintBinary = Effect.fn("fingerprintTauriBinary")(function* (file: string) {
   const fs = yield* FileSystem.FileSystem;
-  const info = yield* fs.stat(file);
+  const { inode, links } = yield* fileIdentity(file);
   const bytes = yield* fs.readFile(file);
   return {
-    inode: Option.getOrUndefined(info.ino),
-    links: Option.getOrUndefined(info.nlink),
+    inode,
+    links,
     sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
     bytes,
   } satisfies BinaryFingerprint;
@@ -1437,10 +1449,8 @@ const restoreStrippedBinary = (
   stripped: BinaryFingerprint,
 ) =>
   Effect.gen(function* () {
-    const info = yield* fs.stat(binary);
-    const inode = Option.getOrUndefined(info.ino);
-    const links = Option.getOrUndefined(info.nlink);
-    if (inode === undefined || inode !== stripped.inode || links !== stripped.links) {
+    const { inode, links } = yield* fileIdentity(binary);
+    if (inode !== stripped.inode || links !== stripped.links) {
       return yield* Effect.fail(
         new TauriDesktopBuildConfigurationError(
           `${binary} was changed or replaced during tauri bundle, so it cannot be restored to the stripped binary.`,
@@ -1549,8 +1559,7 @@ const verifyBundledBinary = Effect.fn("verifyBundledTauriBinary")(function* (
   env: NodeJS.ProcessEnv,
 ) {
   const after = yield* fingerprintBinary(binary);
-  const sameFile =
-    (after.inode !== undefined && after.inode === stripped.inode) || after.links === 1;
+  const sameFile = after.inode === stripped.inode || after.links === 1n;
   if (!sameFile || after.sha256 !== stripped.sha256) {
     return yield* Effect.fail(
       new TauriDesktopBuildConfigurationError(

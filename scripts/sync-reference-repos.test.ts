@@ -115,6 +115,8 @@ const initializeRepository = Effect.fn("syncReferenceReposTest.initializeReposit
   yield* runGit(root, ["init", "--quiet"]);
   yield* runGit(root, ["config", "user.name", "Reference Sync Test"]);
   yield* runGit(root, ["config", "user.email", "reference-sync-test@invalid.local"]);
+  // Git for Windows' system autocrlf=true would check fixture files out as CRLF.
+  yield* runGit(root, ["config", "core.autocrlf", "false"]);
 });
 
 const getReferenceRepoSyncLockPath = Effect.fn(
