@@ -1216,6 +1216,38 @@ async fn an_interrupted_start_names_the_request_id() {
     assert!(note.contains("--request-id req-1"), "{note}");
 }
 
+/// Standard output that is full or closed.
+struct Full;
+
+impl std::io::Write for Full {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("no space left on device"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("no space left on device"))
+    }
+}
+
+/// A started thread whose result cannot be written exits 1, so a script never takes the
+/// silence for success: `start ... > /dev/full` would lose the thread and its retry id.
+#[test]
+fn a_result_that_cannot_be_written_exits_1() {
+    let report = Report {
+        code: 0,
+        json: json!({ "threadId": "thread-1", "requestId": "req-1" }),
+        text: vec!["Started thread thread-1 (message message-1).".to_owned()],
+        note: None,
+    };
+    for json in [false, true] {
+        let mut err = Vec::new();
+        assert_eq!(print(&report, json, &mut Full, &mut err), 1, "json: {json}");
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("could not write the result"), "{err}");
+        assert_eq!(print(&report, json, &mut Vec::new(), &mut Vec::new()), 0);
+    }
+}
+
 #[test]
 fn a_request_id_is_one_to_256_characters() {
     for bad in [String::new(), "x".repeat(257)] {
