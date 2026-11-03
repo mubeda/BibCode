@@ -118,6 +118,7 @@ vi.mock("./state/terminal", () => ({
   terminalEnvironment: { metadataEvents: () => ({}) },
 }));
 
+vi.mock("./state/threads", () => ({ threadEnvironment: { archive: "archive" } }));
 vi.mock("./state/use-atom-command", () => ({
   useAtomCommand: () => vi.fn(async () => undefined),
 }));
