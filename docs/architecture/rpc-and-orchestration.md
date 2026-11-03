@@ -2139,8 +2139,12 @@ once and never retried. A successful archive keeps the panel hidden until a
 shell at or after the archive's own sequence (`DispatchResult.sequence`,
 compared with `engineSequence ?? snapshotSequence`): the shell is published up
 to 500 ms after the reply, and the shell held meanwhile still lists the panel.
-If the shell that reaches the archive lists it live, someone reopened it, and it
-comes back as a tab. Any other outcome (a refusal, an interruption, a lost
+A shell row carries no sequence of its own, so the release is decided by the
+panel's row in such a shell: gone, it was archived; still live, it was reopened
+by someone, but only in a shell that ends a publication (a whole snapshot, or
+the last item of a delta chunk, which alone carries the shell's revision),
+because between per-thread deltas the shell can be past the archive and still
+show the panel's old row. A reopened panel comes back as a tab. Any other outcome (a refusal, an interruption, a lost
 reply) is uncertain: the panel stops being hidden at once, adoption runs again
 on the shell it holds, and a panel still listed live comes back as a tab, so the
 user can close it again. A closed tab coming back is the accepted cost of never
