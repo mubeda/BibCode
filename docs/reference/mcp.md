@@ -182,23 +182,40 @@ server runs (the desktop executable takes it as `<desktop exe> thread`), finds t
 and signs in as `bibcode mcp` does, with its own credential labelled
 `CLI · bibcode thread`, and revokes that credential when it exits.
 
-| Command                                    | Tools it calls                                                              |
-| ------------------------------------------ | --------------------------------------------------------------------------- |
-| `bibcode thread list`                      | `list_projects_and_threads` (every page, at most 50)                        |
-| `bibcode thread start <project> <message>` | `start_thread`; `.` is the project whose folder holds the current directory |
-| `bibcode thread send <thread> <message>`   | `send_message` (queued behind a running turn, never interrupting)           |
-| `bibcode thread show <thread>`             | `read_thread`                                                               |
+| Command                                                  | Tools it calls                                                              |
+| -------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `bibcode thread list`                                    | `list_projects_and_threads` (every page, at most 50)                        |
+| `bibcode thread start <project> <message>`               | `start_thread`; `.` is the project whose folder holds the current directory |
+| `bibcode thread send <thread> <message>`                 | `send_message` (queued behind a running turn, never interrupting)           |
+| `bibcode thread show <thread>`                           | `read_thread`                                                               |
+| `bibcode thread requests <thread>`                       | `list_pending_requests`: the open questions and approvals, with request ids |
+| `bibcode thread answer <thread> <request> <answers>`     | `answer_question`; `<answers>` is a JSON object, or `-` for standard input  |
+| `bibcode thread approve <thread> <request>`              | `answer_approval` with `accept`, or `acceptForSession` with `--for-session` |
+| `bibcode thread decline <thread> <request>`              | `answer_approval` with `decline`, or `cancel` with `--cancel`               |
+| `bibcode thread interrupt <thread>`                      | `interrupt_turn`; `--turn <id>` stops only that turn                        |
+| `bibcode thread changes [--cursor] [--thread] [--limit]` | `changes_since`, one page; it prints the cursor to pass next time           |
 
 - `-` as the message reads it from standard input.
 - `start` takes `--title`, `--provider <instance>` and `--model`.
 - `--wait` (on `start` and `send`) calls `wait_for_thread` in 30-second calls until the turn
-  settles or needs a person, and prints the reply. Ctrl-C stops only the waiting.
+  settles or needs a person, and prints the reply. Ctrl-C stops only the waiting. `answer`,
+  `approve` and `decline` take no `--wait`: right after an answer, a wait could still report
+  the request just answered. Follow the thread with `show`, `changes`, or the
+  `input.resolved` and `approval.resolved` webhooks.
+- `answer` and `approve` are refused (`McpAccessCeilingError`) when the thread's mode is
+  above **Agents may**; `decline` and `interrupt` never are. The CLI takes no `--access`.
 - `--json` prints one JSON document. For `start` and `send` it is
   `{ "threadId", "messageId", "status", "reply", "requestId", "error" }`, also on failure.
-- `--request-id <id>` (1 to 256 characters) is the `clientRequestId`. Without it one is made
-  up and printed as `requestId`. After an interrupted run, run the same command with
-  `--request-id <id>`: it returns the original thread and message instead of repeating them
+  For `answer`, `approve` and `decline` it is the tool's result with `clientRequestId`
+  added, or `{ "error", "clientRequestId" }`; for the other commands, the tool's result or
+  `{ "error" }`.
+- `--request-id <id>` (1 to 256 characters, on `start`, `send`, `answer`, `approve` and
+  `decline`) is the `clientRequestId`. Without it one is made up and printed (as `requestId`
+  for `start` and `send`, else `clientRequestId`). After an interrupted run, run the same
+  command with `--request-id <id>`: it returns the original result instead of repeating it
   (for 24 hours); the same id with anything else changed is `idempotency_conflict`.
+  `interrupt` takes none, as `interrupt_turn` takes none. Answers, like messages, are never
+  echoed or logged.
 - `--base-dir <root>` picks another data root.
 - Exit codes: 0 success; 1 failure, or a turn that ended interrupted, failed or undelivered;
   2 the thread waits on a person (an approval or a question).

@@ -3752,7 +3752,8 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   that is off hides its tools and refuses them with `McpCapabilityDisabledError`,
   live.
 - **Clients.** `bibcode mcp` relays an agent's messages unchanged. `bibcode thread`
-  (`mcp::thread_cli`) calls the same tools itself in the modern era, over the
+  (`mcp::thread_cli`) calls the same tools itself in the modern era (`requests`,
+  `answer`, `approve`, `decline`, `interrupt` and `changes` are one tool call each), over the
   relay's `Connection` (setting check, endpoint proof, credential minted on first
   call and revoked on exit, orphan sweep). It resolves `start .` from
   `list_projects_and_threads`'s `workspaceRoot` over every project page, sends a

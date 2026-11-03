@@ -168,6 +168,80 @@ fn every_subcommand_and_flag_parses() {
     assert!(!args.json && matches!(args.command, ThreadCommand::List));
     let (_, args) = parse(&["bibcode", "thread", "show", "thread-1"]);
     assert!(matches!(args.command, ThreadCommand::Show { ref thread } if thread == "thread-1"));
+    let (_, args) = parse(&["bibcode", "thread", "requests", "thread-1", "--json"]);
+    assert!(args.json);
+    assert!(matches!(args.command, ThreadCommand::Requests { ref thread } if thread == "thread-1"));
+    let (_, args) = parse(&[
+        "bibcode",
+        "thread",
+        "answer",
+        "thread-1",
+        "q1",
+        "-",
+        "--request-id",
+        "req-2",
+    ]);
+    assert!(matches!(
+        args.command,
+        ThreadCommand::Answer { ref thread, ref request, ref answers, ref request_id }
+            if thread == "thread-1" && request == "q1" && answers == "-" && request_id.as_deref() == Some("req-2")
+    ));
+    let (_, args) = parse(&[
+        "bibcode",
+        "thread",
+        "approve",
+        "thread-1",
+        "a1",
+        "--for-session",
+    ]);
+    assert!(matches!(
+        args.command,
+        ThreadCommand::Approve { ref request, for_session: true, request_id: None, .. } if request == "a1"
+    ));
+    let (_, args) = parse(&[
+        "bibcode",
+        "thread",
+        "decline",
+        "thread-1",
+        "a1",
+        "--cancel",
+        "--request-id",
+        "req-3",
+    ]);
+    assert!(matches!(
+        args.command,
+        ThreadCommand::Decline { cancel: true, ref request_id, .. } if request_id.as_deref() == Some("req-3")
+    ));
+    let (_, args) = parse(&[
+        "bibcode",
+        "thread",
+        "interrupt",
+        "thread-1",
+        "--turn",
+        "turn-1",
+    ]);
+    assert!(matches!(
+        args.command,
+        ThreadCommand::Interrupt { ref thread, ref turn } if thread == "thread-1" && turn.as_deref() == Some("turn-1")
+    ));
+    let (_, args) = parse(&[
+        "bibcode", "thread", "changes", "--cursor", "v1.2.3", "--thread", "thread-1", "--limit",
+        "50",
+    ]);
+    assert!(matches!(
+        args.command,
+        ThreadCommand::Changes { ref cursor, ref thread, limit: Some(50) }
+            if cursor.as_deref() == Some("v1.2.3") && thread.as_deref() == Some("thread-1")
+    ));
+    let (_, args) = parse(&["bibcode", "thread", "changes"]);
+    assert!(matches!(
+        args.command,
+        ThreadCommand::Changes {
+            cursor: None,
+            thread: None,
+            limit: None
+        }
+    ));
 
     for missing in [
         &["bibcode", "thread"][..],
@@ -177,6 +251,26 @@ fn every_subcommand_and_flag_parses() {
         &[
             "bibcode", "thread", "send", "thread-1", "hi", "--title", "x",
         ],
+        &["bibcode", "thread", "requests"],
+        &["bibcode", "thread", "answer", "thread-1", "q1"],
+        &["bibcode", "thread", "approve", "thread-1"],
+        &["bibcode", "thread", "decline", "thread-1"],
+        &["bibcode", "thread", "interrupt"],
+        // No `--wait` on an answer or a decision, and no `--request-id` on an interrupt.
+        &[
+            "bibcode", "thread", "answer", "thread-1", "q1", "{}", "--wait",
+        ],
+        &["bibcode", "thread", "approve", "thread-1", "a1", "--wait"],
+        &["bibcode", "thread", "decline", "thread-1", "a1", "--wait"],
+        &[
+            "bibcode",
+            "thread",
+            "interrupt",
+            "thread-1",
+            "--request-id",
+            "x",
+        ],
+        &["bibcode", "thread", "changes", "--limit", "many"],
     ] {
         assert!(crate::Cli::try_parse_from(missing).is_err(), "{missing:?}");
     }
@@ -542,6 +636,11 @@ async fn the_setting_off_exits_1_naming_it_before_any_credential() {
 
 /// A server on `root` whose only provider is Codex at `codex`; every other one is off.
 async fn start_server(root: &Path, codex: &Path) -> ServerHandle {
+    start_server_with(root, codex, json!({})).await
+}
+
+/// [`start_server`] with `settings` laid over its server settings.
+async fn start_server_with(root: &Path, codex: &Path, mut settings: Value) -> ServerHandle {
     let mut providers = crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS
         .iter()
         .map(|driver| ((*driver).to_owned(), json!({ "enabled": false })))
@@ -550,9 +649,10 @@ async fn start_server(root: &Path, codex: &Path) -> ServerHandle {
         "codex".into(),
         json!({ "enabled": true, "binaryPath": codex }),
     );
+    settings["providers"] = providers.into();
     crate::test_support::hermetic_providers::write_hermetic_settings(
         &ServerConfig::new(root).state_dir(),
-        json!({ "providers": providers }),
+        settings,
     );
     ServerRuntime::start(ServerConfig::new(root).with_bind("127.0.0.1", 0))
         .await
@@ -1240,6 +1340,335 @@ async fn a_start_run_again_with_its_request_id_does_not_start_a_second_thread() 
         .filter(|message| message["text"] == "again")
         .count();
     assert_eq!(sends, 1, "{shown}");
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// `requests`, `answer`, `approve`, `decline`, `interrupt` and `changes` each call their one
+/// tool, print its result with `--json` and exit 0; a refusal exits 1.
+#[tokio::test]
+async fn each_request_and_feed_subcommand_calls_its_tool_and_prints_its_result() {
+    let pending = json!({
+        "threadId": "thread-1", "truncated": false,
+        "questions": [{ "requestId": "q1", "summary": null, "questions": [{ "id": "color", "question": "Which color?" }], "answerWith": "answer_question" }],
+        "approvals": [{ "requestId": "a1", "kind": "command", "summary": "Run tests", "answerWith": "answer_approval" }],
+    });
+    let tools = Scripted::new(vec![("list_pending_requests", ok(pending.clone()))]);
+    let report = execute_now(
+        &ThreadCommand::Requests {
+            thread: "thread-1".into(),
+        },
+        &tools,
+    )
+    .await;
+    assert_eq!((report.code, &report.json), (0, &pending));
+    assert_eq!(
+        report.text,
+        [
+            "q1  question  Which color?",
+            "a1  approval  command  Run tests"
+        ]
+    );
+    assert_eq!(tools.calls()[0].1, json!({ "threadId": "thread-1" }));
+
+    let answer = ThreadCommand::Answer {
+        thread: "thread-1".into(),
+        request: "q1".into(),
+        answers: r#"{"color":"Red"}"#.into(),
+        request_id: Some("req-1".into()),
+    };
+    let tools = Scripted::new(vec![(
+        "answer_question",
+        ok(json!({ "threadId": "thread-1", "requestId": "q1", "answered": true })),
+    )]);
+    let report = execute_now(&answer, &tools).await;
+    assert_eq!(report.code, 0, "{report:?}");
+    assert_eq!(
+        report.json,
+        json!({ "threadId": "thread-1", "requestId": "q1", "answered": true, "clientRequestId": "req-1" })
+    );
+    assert_eq!(
+        tools.calls()[0].1,
+        json!({ "threadId": "thread-1", "requestId": "q1", "answers": { "color": "Red" }, "clientRequestId": "req-1" })
+    );
+    assert!(
+        !report.text.concat().contains("Red"),
+        "never echoes the answers"
+    );
+
+    for (command, decision) in [
+        (
+            ThreadCommand::Approve {
+                thread: "thread-1".into(),
+                request: "a1".into(),
+                for_session: false,
+                request_id: Some("req-1".into()),
+            },
+            "accept",
+        ),
+        (
+            ThreadCommand::Approve {
+                thread: "thread-1".into(),
+                request: "a1".into(),
+                for_session: true,
+                request_id: Some("req-1".into()),
+            },
+            "acceptForSession",
+        ),
+        (
+            ThreadCommand::Decline {
+                thread: "thread-1".into(),
+                request: "a1".into(),
+                cancel: false,
+                request_id: Some("req-1".into()),
+            },
+            "decline",
+        ),
+        (
+            ThreadCommand::Decline {
+                thread: "thread-1".into(),
+                request: "a1".into(),
+                cancel: true,
+                request_id: Some("req-1".into()),
+            },
+            "cancel",
+        ),
+    ] {
+        let tools = Scripted::new(vec![(
+            "answer_approval",
+            ok(
+                json!({ "threadId": "thread-1", "requestId": "a1", "decision": decision, "answered": true }),
+            ),
+        )]);
+        let report = execute_now(&command, &tools).await;
+        assert_eq!(report.code, 0, "{decision}: {report:?}");
+        assert_eq!(report.json["decision"], decision);
+        assert_eq!(report.json["clientRequestId"], "req-1");
+        assert_eq!(
+            tools.calls()[0].1,
+            json!({ "threadId": "thread-1", "requestId": "a1", "decision": decision, "clientRequestId": "req-1" })
+        );
+
+        let tools = Scripted::new(vec![(
+            "answer_approval",
+            tool_error("McpInvalidArgumentError", "No pending approval."),
+        )]);
+        let report = execute_now(&command, &tools).await;
+        assert_eq!(report.code, 1, "{decision}");
+        assert_eq!(
+            report.json,
+            json!({ "error": "No pending approval.", "clientRequestId": "req-1" })
+        );
+
+        let tools = Scripted::new(vec![("answer_approval", Err("Gone.".into()))]);
+        let report = execute_now(&command, &tools).await;
+        assert_eq!(report.code, 1, "{decision}");
+        assert!(
+            report.note.unwrap().contains("--request-id req-1"),
+            "an unknown outcome names the id to finish it with"
+        );
+    }
+
+    let tools = Scripted::new(vec![(
+        "interrupt_turn",
+        ok(
+            json!({ "threadId": "thread-1", "turnId": "turn-1", "interruptRequested": true, "turnRunning": true }),
+        ),
+    )]);
+    let interrupt = ThreadCommand::Interrupt {
+        thread: "thread-1".into(),
+        turn: Some("turn-1".into()),
+    };
+    let report = execute_now(&interrupt, &tools).await;
+    assert_eq!(report.code, 0);
+    assert_eq!(report.json["interruptRequested"], true);
+    assert_eq!(
+        tools.calls()[0].1,
+        json!({ "threadId": "thread-1", "turnId": "turn-1" }),
+        "no clientRequestId: the tool refuses one"
+    );
+
+    let feed = json!({
+        "cursor": "v1.9.0", "more": false, "activityDropped": false,
+        "entries": [{ "cursor": "v1.9.0", "at": "2026-11-02T00:00:00Z", "kind": "turn.started", "threadId": "thread-1", "status": "running" }],
+    });
+    let tools = Scripted::new(vec![("changes_since", ok(feed.clone()))]);
+    let changes = ThreadCommand::Changes {
+        cursor: Some("v1.1.0".into()),
+        thread: Some("thread-1".into()),
+        limit: Some(10),
+    };
+    let report = execute_now(&changes, &tools).await;
+    assert_eq!((report.code, &report.json), (0, &feed));
+    assert_eq!(
+        tools.calls()[0].1,
+        json!({ "cursor": "v1.1.0", "threadId": "thread-1", "limit": 10 })
+    );
+    assert_eq!(
+        report.text,
+        [
+            "2026-11-02T00:00:00Z  turn.started  thread-1  running",
+            "Caught up; next time, run with --cursor v1.9.0"
+        ]
+    );
+    let tools = Scripted::new(vec![(
+        "changes_since",
+        tool_error("McpInvalidArgumentError", "Bad cursor."),
+    )]);
+    let report = execute_now(&changes, &tools).await;
+    assert_eq!(
+        (report.code, report.json),
+        (1, json!({ "error": "Bad cursor." }))
+    );
+}
+
+/// Answers that are not a JSON object are refused before any call, naming none of them.
+#[tokio::test]
+async fn answers_that_are_not_a_json_object_are_refused_unsent() {
+    for answers in ["Mauve", "[\"Mauve\"]", "{\"Mauve\":"] {
+        let command = ThreadCommand::Answer {
+            thread: "thread-1".into(),
+            request: "q1".into(),
+            answers: answers.into(),
+            request_id: Some("req-1".into()),
+        };
+        let tools = Scripted::new(Vec::new());
+        let report = execute_now(&command, &tools).await;
+        assert_eq!(report.code, 1, "{answers}");
+        assert!(tools.calls().is_empty(), "{answers}");
+        assert!(
+            !report.note.unwrap().contains("Mauve"),
+            "the refusal never echoes the answers"
+        );
+    }
+    let command = ThreadCommand::Answer {
+        thread: "thread-1".into(),
+        request: "q1".into(),
+        answers: "-".into(),
+        request_id: None,
+    };
+    assert_eq!(
+        message_of(&command, std::io::Cursor::new("{\"color\":\"Red\"}\n")).unwrap(),
+        Some("{\"color\":\"Red\"}".into())
+    );
+    assert_eq!(
+        message_of(&command, std::io::empty()).unwrap_err(),
+        "The answers are empty."
+    );
+}
+
+/// A thread `t1` on a real server, in `runtime_mode`, that waits on question `q1` and
+/// approval `a1`.
+async fn waiting_thread(server: &ServerHandle, runtime_mode: &str) {
+    let engine = server.orchestration_for_test().expect("engine");
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type": "thread.create", "commandId": "thread", "threadId": "t1", "projectId": "p1",
+                "title": "T", "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "runtimeMode": runtime_mode, "interactionMode": "default", "branch": null,
+                "worktreePath": null, "createdAt": "2026-10-30T00:00:00.000Z",
+            }))
+            .expect("command"),
+        )
+        .await
+        .expect("thread");
+    for (id, kind, payload) in [
+        (
+            "ask",
+            "user-input.requested",
+            json!({ "requestId": "q1", "questions": [{ "id": "color", "header": "Color", "question": "Which?", "options": [{ "label": "Red", "description": "" }] }] }),
+        ),
+        (
+            "approve",
+            "approval.requested",
+            json!({ "requestId": "a1", "requestKind": "command" }),
+        ),
+    ] {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.activity.append", "commandId": id, "threadId": "t1",
+                    "activity": { "id": id, "tone": "approval", "kind": kind, "summary": "Needs you", "payload": payload, "turnId": null, "createdAt": "2026-10-30T00:00:01.000Z" },
+                    "createdAt": "2026-10-30T00:00:01.000Z",
+                }))
+                .expect("command"),
+            )
+            .await
+            .expect("activity");
+    }
+}
+
+/// Against a real server whose **Agents may** is below the thread's mode, `requests` lists both
+/// requests, `answer` and `approve` are refused at the ceiling, and `decline` is not
+/// ceiling-checked. Every run's credential is revoked.
+#[tokio::test]
+async fn answer_and_approve_meet_the_ceiling_and_decline_does_not() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server_with(
+        root.path(),
+        &root.path().join("no-such-codex"),
+        json!({ "mcpServerAccess": "approval-required" }),
+    )
+    .await;
+    let cwd = project(&server, root.path()).await;
+    waiting_thread(&server, "full-access").await;
+
+    let listed = run_in(root.path(), &cwd, &["requests", "t1", "--json"], "").await;
+    assert_eq!(listed.code, 0, "{}", listed.err);
+    let pending = listed.json();
+    assert_eq!(pending["questions"][0]["requestId"], "q1", "{pending}");
+    assert_eq!(pending["approvals"][0]["requestId"], "a1", "{pending}");
+    let human = run_in(root.path(), &cwd, &["requests", "t1"], "").await;
+    assert!(human.out.contains("a1  approval  command"), "{}", human.out);
+
+    let ceiling = "above this MCP connection's limit";
+    for args in [
+        &["answer", "t1", "q1", "-", "--json"][..],
+        &["approve", "t1", "a1", "--json"],
+        &["approve", "t1", "a1", "--for-session", "--json"],
+    ] {
+        let ran = run_in(root.path(), &cwd, args, r#"{"color":"Red"}"#).await;
+        assert_eq!(ran.code, 1, "{args:?}: {} {}", ran.out, ran.err);
+        let error = ran.json()["error"].as_str().unwrap().to_owned();
+        assert!(error.contains(ceiling), "{args:?}: {error}");
+        assert!(!ran.err.contains("Red"), "never echoes the answers");
+    }
+    let declined = run_in(root.path(), &cwd, &["decline", "t1", "a1", "--json"], "").await;
+    let report = declined.json();
+    assert!(
+        !report.to_string().contains(ceiling),
+        "a decline is not ceiling-checked: {report}"
+    );
+    assert!(report["clientRequestId"].is_string(), "{report}");
+
+    let interrupted = run_in(root.path(), &cwd, &["interrupt", "t1", "--json"], "").await;
+    assert_eq!(
+        interrupted.code, 0,
+        "{} {}",
+        interrupted.out, interrupted.err
+    );
+    assert_eq!(interrupted.json()["turnRunning"], false);
+
+    let changes = run_in(root.path(), &cwd, &["changes", "--json"], "").await;
+    assert_eq!(changes.code, 0, "{}", changes.err);
+    let cursor = changes.json()["cursor"].as_str().unwrap().to_owned();
+    let later = run_in(
+        root.path(),
+        &cwd,
+        &["changes", "--cursor", &cursor, "--thread", "t1", "--json"],
+        "",
+    )
+    .await;
+    assert_eq!(later.code, 0, "{}", later.err);
+    assert!(later.json()["entries"].is_array());
+
+    assert!(
+        credentials(root.path())
+            .await
+            .iter()
+            .all(|(label, revoked)| label == LABEL && *revoked)
+    );
     server.shutdown();
     server.join().await.expect("server joins");
 }

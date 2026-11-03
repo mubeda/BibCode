@@ -572,12 +572,18 @@ the server runs (the desktop app's executable takes it as `<desktop exe> thread`
 when it exits. While it runs it shows as one **CLI · bibcode thread** row in **Authorized
 clients**.
 
-| Command                                    | What it does                                                                 |
-| ------------------------------------------ | ---------------------------------------------------------------------------- |
-| `bibcode thread list`                      | Projects with their folders, and their threads with each status              |
-| `bibcode thread start <project> <message>` | Starts a thread; `.` is the project whose folder holds the current directory |
-| `bibcode thread send <thread> <message>`   | Sends a message; it queues behind a running turn and never interrupts it     |
-| `bibcode thread show <thread>`             | The thread's status and its latest messages                                  |
+| Command                                              | What it does                                                                       |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `bibcode thread list`                                | Projects with their folders, and their threads with each status                    |
+| `bibcode thread start <project> <message>`           | Starts a thread; `.` is the project whose folder holds the current directory       |
+| `bibcode thread send <thread> <message>`             | Sends a message; it queues behind a running turn and never interrupts it           |
+| `bibcode thread show <thread>`                       | The thread's status and its latest messages                                        |
+| `bibcode thread requests <thread>`                   | The thread's open questions and approvals, each with its request id                |
+| `bibcode thread answer <thread> <request> <answers>` | Answers a question; `<answers>` is a JSON object such as `{"color":"Red"}`, or `-` |
+| `bibcode thread approve <thread> <request>`          | Approves once, or for the rest of the session with `--for-session`                 |
+| `bibcode thread decline <thread> <request>`          | Declines, and the turn goes on; `--cancel` stops the turn where the provider can   |
+| `bibcode thread interrupt <thread>`                  | Stops the running turn (`--turn <id>`: only that turn)                             |
+| `bibcode thread changes`                             | What changed, as ids and states; pass the cursor it prints with `--cursor`         |
 
 - Pass `-` as the message to read it from standard input.
 - `start` takes `--title`, `--provider <instance>` and `--model`. Without them it uses the
@@ -587,8 +593,12 @@ clients**.
   only the waiting: the turn goes on.
 - `--json` prints one JSON document. For `start` and `send` it is
   `{ "threadId", "messageId", "status", "reply", "requestId", "error" }`, also on failure.
-- `start` and `send` take `--request-id <id>` (1 to 256 characters); without it one is made
-  up and printed as `requestId`. If a run is interrupted, or loses BiBCode before it hears
+- `answer` and `approve` are refused when the thread runs above **Agents may**; `decline`
+  and `interrupt` always work. They take no `--wait`: check the thread with `show` or
+  `changes` afterwards.
+- `start`, `send`, `answer`, `approve` and `decline` take `--request-id <id>` (1 to 256
+  characters); without it one is made up and printed (as `requestId` for `start` and
+  `send`, else `clientRequestId`). If a run is interrupted, or loses BiBCode before it hears
   back, it may already have started the thread or sent the message. It prints the id and
   the hint "Run the same command with --request-id <id> to finish it without repeating it."
   Run that exact command, with the same message and options: BiBCode returns the original
@@ -605,6 +615,8 @@ in BiBCode. With **MCP server** off it exits 1 with the same message as `bibcode
 ```sh
 bibcode thread start . "Summarize the README" --wait
 echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
+bibcode thread requests <thread id>
+bibcode thread approve <thread id> <request id>
 ```
 
 ## What it can and cannot do
