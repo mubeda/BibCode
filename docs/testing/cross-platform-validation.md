@@ -1828,7 +1828,7 @@ from `apps/web`.
     that follows the [Remote access](../user/remote-access.md#remote-ai-tools-over-https)
     recipe (see the [MCP reference](../reference/mcp.md#remote-http-with-oauth) for the
     flow):
-    1. **Connect.** Copy the command from **MCP → Remote agents**
+    1. **Connect.** **Copy URL** copies `https://<host>/mcp` alone. Copy the command from **MCP → Remote agents**
        (`claude mcp add --transport http bibcode https://<host>/mcp`, or
        `codex mcp add bibcode --url https://<host>/mcp`) and run it. The tool opens a sign-in
        page showing a code.

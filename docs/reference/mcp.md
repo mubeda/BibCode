@@ -253,7 +253,8 @@ An environment reachable over HTTPS also serves MCP as Streamable HTTP at
 registration, rotating refresh tokens). A person approves each sign-in in BiBCode.
 
 **Setup commands.** **Settings → Agents → Agent integrations → MCP → Remote agents** shows
-the URL with **Copy for Claude Code** and **Copy for Codex**:
+the URL with **Copy URL** (for any other MCP client, including one hosted on the web that
+registers an `https` callback) and **Copy for Claude Code** and **Copy for Codex**:
 
 ```sh
 claude mcp add --transport http bibcode https://<host>/mcp
@@ -361,7 +362,9 @@ Cache-Control: no-store
 
 - Public clients only: `token_endpoint_auth_method` is `none` or absent.
 - 1 to 5 `redirect_uris`, each `http://localhost`, `http://127.0.0.1` or `http://[::1]`
-  (any port, any path) or an `https://` URI, without a fragment, at most 2,048 bytes.
+  (any port, any path) or an `https://` URI, without a fragment, at most 2,048 bytes. A
+  client hosted on the web registers its `https` callback; an authorization request must
+  then name exactly that URI, or it is refused with 400 and no redirect.
 - `client_name` is optional, at most 100 characters, `MCP client` unless set. The person
   sees it on the request, and the grant's row in **Authorized clients** is
   `MCP · <client_name> (remote)`.

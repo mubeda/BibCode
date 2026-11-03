@@ -130,6 +130,7 @@ function RemoteAgentsRow({
           {url}
         </code>
         <div className="flex flex-wrap gap-2">
+          <CopyButton label="Copy URL" text={url} />
           <CopyButton
             label="Copy for Claude Code"
             text={`claude mcp add --transport http bibcode ${url}`}

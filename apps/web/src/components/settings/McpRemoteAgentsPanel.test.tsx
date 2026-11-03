@@ -223,6 +223,13 @@ describe("McpRemoteAgentsPanel", () => {
     expect(container.textContent).not.toContain("Turn on MCP server first.");
   });
 
+  it("copies the bare URL for an MCP client that takes one", async () => {
+    h.baseUrl = "https://env-1.connect.example/";
+    const container = await render();
+    await act(async () => button(container, "Copy URL").click());
+    expect(h.copied).toEqual(["https://env-1.connect.example/mcp"]);
+  });
+
   it("says to turn the MCP server on first while it is off", async () => {
     h.baseUrl = "https://env-1.connect.example";
     h.settings = { ...h.settings, enableMcpServer: false };
