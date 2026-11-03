@@ -1395,6 +1395,11 @@ async fn each_request_and_feed_subcommand_calls_its_tool_and_prints_its_result()
         !report.text.concat().contains("Red"),
         "never echoes the answers"
     );
+    assert!(
+        report.text.concat().contains("clientRequestId req-1"),
+        "the id to retry with is printed: {:?}",
+        report.text
+    );
 
     for (command, decision) in [
         (

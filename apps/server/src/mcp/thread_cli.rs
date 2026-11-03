@@ -793,7 +793,7 @@ async fn answered(
     let request_id = command.request_id().unwrap_or_default();
     arguments["clientRequestId"] = request_id.into();
     let line = format!(
-        "{done} request {} on thread {}.",
+        "{done} request {} on thread {} (clientRequestId {request_id}).",
         field(&arguments["requestId"]),
         field(&arguments["threadId"])
     );
