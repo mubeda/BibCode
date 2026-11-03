@@ -2344,6 +2344,60 @@ impl Repositories {
             })
             .await
     }
+    /// Inserts an `mcp-client` session unless its pairing link `link_id` was revoked since its
+    /// consume; `false` when the fence wrote nothing (#281).
+    pub async fn create_fenced_mcp_auth_session(
+        &self,
+        row: NewAuthSession,
+        link_id: String,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let fenced: bool = transaction.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM auth_pairing_links \
+                     WHERE id = ? AND revoked_at IS NOT NULL)",
+                    [&link_id],
+                    |row| row.get(0),
+                )?;
+                if fenced {
+                    return Ok(false);
+                }
+                insert_auth_session_on(&transaction, &row, None)?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(true)
+            })
+            .await
+    }
+    /// Revokes an MCP relay's credential `id` in one transaction: its pairing link, consumed
+    /// or not, so no later exchange or fenced insert succeeds, and the `mcp-client` session of
+    /// that id if it is live. `true` when either changed (#281).
+    pub async fn revoke_mcp_credential(&self, id: String, revoked_at: Timestamp) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let link = transaction.execute(
+                    "UPDATE auth_pairing_links SET revoked_at = ? \
+                     WHERE id = ? AND subject = 'mcp-client' AND revoked_at IS NULL",
+                    params![revoked_at, id],
+                )?;
+                let session = transaction.execute(
+                    "UPDATE auth_sessions SET revoked_at = ? \
+                     WHERE session_id = ? AND subject = 'mcp-client' AND revoked_at IS NULL",
+                    params![revoked_at, id],
+                )?;
+                let changed = link + session > 0;
+                if changed {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(changed)
+            })
+            .await
+    }
     pub async fn get_auth_session(&self, session_id: String) -> Result<Option<AuthSession>> {
         self.database
             .call(move |connection| {

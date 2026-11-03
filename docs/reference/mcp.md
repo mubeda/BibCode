@@ -114,9 +114,12 @@ What the relay does, in order:
    the typed tool error `McpServerUnreachableError`; a sign-in failure is
    `McpSignInError`; a revoked credential is `McpCredentialRefusedError`. Other requests
    get a JSON-RPC error.
-6. **Revokes its credential** when it exits. A relay that crashed is cleaned up by the next
-   relay on that data root (it records each live credential's session in
-   `<state>/mcp-clients/`).
+6. **Revokes its credential** when it exits. It records each credential in
+   `<state>/mcp-clients/` before it signs in, so a sign-in whose answer was lost is revoked
+   too. A relay that crashed is cleaned up by the next relay on that data root; a crash in the
+   middle of a sign-in is cleaned up only by a relay from v0.15 or later. When
+   `<state>/mcp-clients/` cannot be written, the sign-in fails ("Could not record this MCP
+   connection in …") and no credential is sent.
 
 Limits: one stdio line is at most 4 MiB (a longer line is skipped and answered with a
 JSON-RPC parse error); connecting times out after 5 s and one request after 120 s (longer
