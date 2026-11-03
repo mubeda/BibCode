@@ -522,7 +522,7 @@ nothing is split between two chats. If the question can't be sent, it waits in
 the side chat's composer.
 
 **Bring back**, above the side chat's composer, puts the side chat's last answer,
-quoted under the question it answered, into the thread's composer as a draft and
+quoted under "From the side chat:", into the thread's composer as a draft and
 shows the thread. Anything already typed there stays, with the answer after it.
 Nothing is sent: read, edit and send it yourself. It is unavailable while the
 thread is working ("Available when the thread is idle.") and before the side

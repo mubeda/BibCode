@@ -183,10 +183,6 @@
       "types": "./src/state/threads.ts",
       "default": "./src/state/threads.ts"
     },
-    "./state/thread-reducer": {
-      "types": "./src/state/threadReducer.ts",
-      "default": "./src/state/threadReducer.ts"
-    },
     "./state/thread-history": {
       "types": "./src/state/threadHistory.ts",
       "default": "./src/state/threadHistory.ts"
