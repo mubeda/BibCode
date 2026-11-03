@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { CENTER_PANEL_ROOT_GROUP_ID } from "./centerPanelLayout";
 import {
   HOST_SURFACE_ID,
-  MAX_CLOSED_BEFORE_CREATED,
+  MAX_CLOSING_CHAT_PANELS,
   migratePersistedCenterPanelState,
   selectActivityPaneState,
   selectActiveCenterSurface,
@@ -37,7 +37,7 @@ describe("centerPanelStore", () => {
     useCenterPanelStore.setState({
       byThreadKey: {},
       pendingChatPanelThreadKeys: new Set(),
-      closedBeforeCreated: [],
+      closingChatPanels: [],
     }),
   );
   afterEach(() => vi.restoreAllMocks());
@@ -567,29 +567,28 @@ describe("centerPanelStore", () => {
       expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${SIDE}`]);
     });
 
-    it("remembers panels closed before creation, oldest dropped past the cap", () => {
+    it("remembers unsettled panel closes, oldest dropped past the cap", () => {
       const ref = (index: number) =>
         scopeThreadRef(HOST.environmentId, ThreadId.make(`closed-${index}`));
-      for (let index = 0; index <= MAX_CLOSED_BEFORE_CREATED; index += 1) {
-        store().recordClosedBeforeCreated(ref(index));
+      for (let index = 0; index <= MAX_CLOSING_CHAT_PANELS; index += 1) {
+        store().recordChatPanelClose(ref(index));
       }
-      store().recordClosedBeforeCreated(ref(5));
-      expect(store().closedBeforeCreated).toHaveLength(MAX_CLOSED_BEFORE_CREATED);
-      expect(store().closedBeforeCreated[0]).toBe(scopedThreadKey(ref(1)));
-      store().clearClosedBeforeCreated(ref(5));
-      expect(store().closedBeforeCreated).not.toContain(scopedThreadKey(ref(5)));
+      store().recordChatPanelClose(ref(5));
+      expect(store().closingChatPanels).toHaveLength(MAX_CLOSING_CHAT_PANELS);
+      expect(store().closingChatPanels[0]).toBe(scopedThreadKey(ref(1)));
+      store().clearChatPanelClose(ref(5));
+      expect(store().closingChatPanels).not.toContain(scopedThreadKey(ref(5)));
     });
 
-    it("migrates version 4 to an empty closed-before-created list", () => {
+    it("migrates version 4 to an empty close intent list", () => {
       expect(
-        migratePersistedCenterPanelState({ byThreadKey: {}, activityPanes: {} })
-          .closedBeforeCreated,
+        migratePersistedCenterPanelState({ byThreadKey: {}, activityPanes: {} }).closingChatPanels,
       ).toEqual([]);
-      const keys = Array.from({ length: 25 }, (_, index) => `environment-1:closed-${index}`);
+      const keys = Array.from({ length: 55 }, (_, index) => `environment-1:closed-${index}`);
       expect(
-        migratePersistedCenterPanelState({ byThreadKey: {}, closedBeforeCreated: [...keys, 7] })
-          .closedBeforeCreated,
-      ).toEqual(keys.slice(-MAX_CLOSED_BEFORE_CREATED));
+        migratePersistedCenterPanelState({ byThreadKey: {}, closingChatPanels: [...keys, 7] })
+          .closingChatPanels,
+      ).toEqual(keys.slice(-MAX_CLOSING_CHAT_PANELS));
     });
   });
 

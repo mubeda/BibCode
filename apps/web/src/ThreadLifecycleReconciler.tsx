@@ -4,7 +4,12 @@ import {
   scopedThreadKey,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
-import type { EnvironmentId, TerminalMetadataStreamEvent, ThreadId } from "@bibcode/contracts";
+import type {
+  EnvironmentId,
+  ScopedThreadRef,
+  TerminalMetadataStreamEvent,
+  ThreadId,
+} from "@bibcode/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -15,6 +20,7 @@ import {
   createCenterPanelAdoptionTracker,
 } from "./centerPanelAdoption";
 
+import type { PanelArchiveOutcome } from "./centerPanelClose";
 import { useCenterPanelStore } from "./centerPanelStore";
 import { useComposerDraftStore } from "./composerDraftStore";
 import { useArchivedThreadSnapshots } from "./lib/archivedThreadsState";
@@ -171,11 +177,12 @@ function EnvironmentThreadLifecycleReconciler({
   );
   useAtomSubscribe(terminalMetadataEventsAtom, handleTerminalMetadataEvent, { immediate: true });
   const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
-  // A panel closed before the server created it: archived once created, even after a reload.
+  // Archives a panel this client closed once a snapshot shows it live (see `centerPanelClose`).
   const archiveClosedPanel = useCallback(
-    async (threadId: ThreadId) => {
+    async ({ threadId }: ScopedThreadRef): Promise<PanelArchiveOutcome> => {
       const result = await archiveThread({ environmentId, input: { threadId } });
-      return result._tag === "Success" || !isAtomCommandInterrupted(result);
+      if (result._tag === "Success") return "archived";
+      return isAtomCommandInterrupted(result) ? "interrupted" : "refused";
     },
     [archiveThread, environmentId],
   );

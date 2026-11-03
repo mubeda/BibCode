@@ -35,6 +35,7 @@ const h = vi.hoisted(() => ({
   pending: new Set<string>(),
   creating: new Set<string>(),
   closed: [] as string[],
+  progress: new Map<string, string>(),
   drafts: new Map<string, { prompt: string; attachments: unknown[] }>(),
 }));
 
@@ -95,12 +96,25 @@ vi.mock("~/centerPanelStore", () => ({
         h.creating.add(`${ref.environmentId}:${ref.threadId}`),
       endChatPanelCreation: (ref: { environmentId: string; threadId: string }) =>
         h.creating.delete(`${ref.environmentId}:${ref.threadId}`),
-      closedBeforeCreated: h.closed,
-      recordClosedBeforeCreated: (ref: { environmentId: string; threadId: string }) =>
-        h.closed.push(`${ref.environmentId}:${ref.threadId}`),
-      clearClosedBeforeCreated: (ref: { environmentId: string; threadId: string }) => {
-        const index = h.closed.indexOf(`${ref.environmentId}:${ref.threadId}`);
+      closingChatPanels: h.closed,
+      chatPanelCloseProgress: h.progress,
+      recordChatPanelClose: (ref: { environmentId: string; threadId: string }) => {
+        const key = `${ref.environmentId}:${ref.threadId}`;
+        if (!h.closed.includes(key)) h.closed.push(key);
+      },
+      clearChatPanelClose: (ref: { environmentId: string; threadId: string }) => {
+        const key = `${ref.environmentId}:${ref.threadId}`;
+        const index = h.closed.indexOf(key);
         if (index >= 0) h.closed.splice(index, 1);
+        h.progress.delete(key);
+      },
+      setChatPanelCloseProgress: (
+        ref: { environmentId: string; threadId: string },
+        progress: string | null,
+      ) => {
+        const key = `${ref.environmentId}:${ref.threadId}`;
+        if (progress === null) h.progress.delete(key);
+        else h.progress.set(key, progress);
       },
     }),
   },
@@ -110,6 +124,10 @@ vi.mock("@bibcode/client-runtime/environment", () => ({
   scopeThreadRef: (environmentId: string, threadId: string) => ({ environmentId, threadId }),
   scopedThreadKey: (ref: { environmentId: string; threadId: string }) =>
     `${ref.environmentId}:${ref.threadId}`,
+  parseScopedThreadKey: (key: string) => {
+    const [environmentId, threadId] = key.split(":");
+    return environmentId && threadId ? { environmentId, threadId } : null;
+  },
 }));
 
 vi.mock("~/state/projects", () => ({
@@ -181,6 +199,7 @@ beforeEach(() => {
   h.pending.clear();
   h.creating.clear();
   h.closed.length = 0;
+  h.progress.clear();
   h.drafts.clear();
   h.reserveChatPanel.mockImplementation((_host: unknown, threadId: string) =>
     h.pending.add(`${hostRef.environmentId}:${threadId}`),
@@ -371,7 +390,7 @@ describe("center panel actions", () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
 
     actions.closeOtherSurfaces(hostRef, "group-right", chatSurface);
-    await Promise.resolve();
+    await flush();
     expect(h.archiveThread).toHaveBeenCalledWith({
       environmentId: hostRef.environmentId,
       input: { threadId: removedChat.threadId },
@@ -382,7 +401,7 @@ describe("center panel actions", () => {
     h.archiveThread.mockClear();
     h.closeSurfacesToRight.mockReturnValueOnce([removedChat]);
     actions.closeSurfacesToRight(hostRef, "group-right", chatSurface);
-    await Promise.resolve();
+    await flush();
     expect(h.archiveThread).toHaveBeenCalledOnce();
 
     h.archiveThread.mockClear();
@@ -392,7 +411,7 @@ describe("center panel actions", () => {
 
     h.closeAllSurfaces.mockReturnValueOnce([chatSurface, removedChat]);
     actions.closeAllSurfaces(hostRef, "group-right");
-    await Promise.resolve();
+    await flush();
     expect(h.archiveThread).toHaveBeenCalledTimes(2);
   });
 
@@ -419,16 +438,14 @@ describe("center panel actions", () => {
       { _tag: "Failure", cause: "unknown" },
     ];
     const actions = useCenterPanelActions({ onCloseTerminal });
-    const surface = {
-      id: "chat:panel-1",
-      kind: "chat",
-      threadId: ThreadId.make("panel-1"),
-    } as never;
-
-    h.closeSurface.mockReturnValue([surface]);
-    actions.closeSurface(hostRef, "group-left", surface);
-    actions.closeSurface(hostRef, "group-left", surface);
-    actions.closeSurface(hostRef, "group-left", surface);
+    for (const index of [1, 2, 3]) {
+      const threadId = ThreadId.make(`panel-${index}`);
+      // A panel this page knows to be live; a not yet created one is archived when it shows.
+      h.shells.set(threadId, { archivedAt: null, session: null });
+      const surface = { id: `chat:${threadId}`, kind: "chat", threadId } as never;
+      h.closeSurface.mockReturnValueOnce([surface]);
+      actions.closeSurface(hostRef, "group-left", surface);
+    }
     await flush();
 
     expect(h.addToast).toHaveBeenCalledTimes(2);
@@ -474,6 +491,15 @@ describe("center panel actions", () => {
       ]!;
     expect(h.interruptTurn.mock.invocationCallOrder[0]).toBeLessThan(archiveRunOrder);
     expect(h.addToast).not.toHaveBeenCalled();
+  });
+
+  it("forgets a close when the panel is reopened, so nothing archives it again", async () => {
+    h.closed.push(`${hostRef.environmentId}:panel-1`);
+    h.progress.set(`${hostRef.environmentId}:panel-1`, "archived");
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    await actions.reopenChatPanel(hostRef, ThreadId.make("panel-1"), "Codex");
+    expect(h.closed).toEqual([]);
+    expect(h.progress.size).toBe(0);
   });
 
   it("reopens a closed chat panel as the active tab and rolls back explicit failures", async () => {
@@ -803,133 +829,6 @@ describe("side chats", () => {
     await opening;
 
     expect(h.drafts.get("new-panel-thread")).toEqual(typed);
-  });
-
-  it("sends nothing, keeps the host draft and archives a side chat closed while it is created", async () => {
-    h.drafts.set(hostRef.threadId, { prompt: submittedText, attachments: [] });
-    const creation = deferred<unknown>();
-    h.createPanel.mockReturnValueOnce(creation.promise);
-    const actions = useCenterPanelActions({ onCloseTerminal });
-
-    const opening = actions.createSideChat(sideChat());
-    const tab = {
-      id: "chat:new-panel-thread",
-      kind: "chat",
-      threadId: "new-panel-thread",
-    } as const;
-    h.closeSurface.mockReturnValueOnce([tab]);
-    actions.closeSurface(hostRef, "group-root", tab as never);
-    // The thread may not exist yet, so nothing is archived now.
-    expect(h.archiveThread).not.toHaveBeenCalled();
-    expect(h.closed).toEqual([`${hostRef.environmentId}:new-panel-thread`]);
-
-    creation.resolve({ _tag: "Success", value: undefined });
-    await opening;
-
-    expect(h.startTurn).not.toHaveBeenCalled();
-    expect(h.drafts.get(hostRef.threadId)?.prompt).toBe(submittedText);
-    expect(h.archiveThread).toHaveBeenCalledWith({
-      environmentId: hostRef.environmentId,
-      input: { threadId: "new-panel-thread" },
-    });
-    expect(h.closed).toEqual([]);
-  });
-
-  it("sends nothing for a side chat closed after a snapshot released its reservation", async () => {
-    h.drafts.set(hostRef.threadId, { prompt: submittedText, attachments: [] });
-    const creation = deferred<unknown>();
-    h.createPanel.mockReturnValueOnce(creation.promise);
-    const actions = useCenterPanelActions({ onCloseTerminal });
-
-    const opening = actions.createSideChat(sideChat());
-    // The server committed the panel and a live snapshot listed it before `createPanel`
-    // answered: the lifecycle reconciler released the reservation.
-    h.pending.clear();
-    const tab = {
-      id: "chat:new-panel-thread",
-      kind: "chat",
-      threadId: "new-panel-thread",
-    } as const;
-    h.closeSurface.mockReturnValueOnce([tab]);
-    actions.closeSurface(hostRef, "group-root", tab as never);
-    expect(h.closed).toEqual([`${hostRef.environmentId}:new-panel-thread`]);
-
-    creation.resolve({ _tag: "Success", value: undefined });
-    await opening;
-
-    expect(h.startTurn).not.toHaveBeenCalled();
-    expect(h.drafts.get(hostRef.threadId)?.prompt).toBe(submittedText);
-    expect(h.archiveThread).toHaveBeenCalledOnce();
-    expect(h.closed).toEqual([]);
-    expect(h.creating.size).toBe(0);
-  });
-
-  it("leaves the close of an interrupted creation to adoption", async () => {
-    const creation = deferred<unknown>();
-    h.createPanel.mockReturnValueOnce(creation.promise);
-    const actions = useCenterPanelActions({ onCloseTerminal });
-    const opening = actions.createSideChat(sideChat());
-    const tab = {
-      id: "chat:new-panel-thread",
-      kind: "chat",
-      threadId: "new-panel-thread",
-    } as const;
-    h.closeSurface.mockReturnValueOnce([tab]);
-    actions.closeSurface(hostRef, "group-root", tab as never);
-
-    creation.resolve({ _tag: "Failure", interrupted: true, cause: null });
-    await opening;
-
-    expect(h.startTurn).not.toHaveBeenCalled();
-    expect(h.archiveThread).not.toHaveBeenCalled();
-    // Adoption archives it once the panel shows; the open no longer claims it.
-    expect(h.closed).toEqual([`${hostRef.environmentId}:new-panel-thread`]);
-    expect(h.creating.size).toBe(0);
-  });
-
-  it("archives a plain panel closed while it is created", async () => {
-    const creation = deferred<unknown>();
-    h.createPanel.mockReturnValueOnce(creation.promise);
-    const actions = useCenterPanelActions({ onCloseTerminal });
-
-    const opening = actions.createChatPanel({
-      hostRef,
-      projectId: ProjectId.make("project-1"),
-      modelSelection: codex,
-      providerLabel: "Codex",
-    });
-    const tab = {
-      id: "chat:new-panel-thread",
-      kind: "chat",
-      threadId: "new-panel-thread",
-    } as const;
-    h.closeAllSurfaces.mockReturnValueOnce([tab]);
-    actions.closeAllSurfaces(hostRef, "group-root");
-    expect(h.archiveThread).not.toHaveBeenCalled();
-
-    creation.resolve({ _tag: "Success", value: undefined });
-    await opening;
-    expect(h.archiveThread).toHaveBeenCalledOnce();
-    expect(h.closed).toEqual([]);
-  });
-
-  it("drops the close intent when a closed panel's creation fails", async () => {
-    const creation = deferred<unknown>();
-    h.createPanel.mockReturnValueOnce(creation.promise);
-    const actions = useCenterPanelActions({ onCloseTerminal });
-    const opening = actions.createSideChat(sideChat());
-    const tab = {
-      id: "chat:new-panel-thread",
-      kind: "chat",
-      threadId: "new-panel-thread",
-    } as const;
-    h.closeSurface.mockReturnValueOnce([tab]);
-    actions.closeSurface(hostRef, "group-root", tab as never);
-
-    creation.resolve({ _tag: "Failure", cause: new Error("refused") });
-    await opening;
-    expect(h.closed).toEqual([]);
-    expect(h.archiveThread).not.toHaveBeenCalled();
   });
 
   it("focuses an empty side chat's composer once, and not one opened with a question", async () => {
