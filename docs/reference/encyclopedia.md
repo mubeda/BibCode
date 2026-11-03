@@ -111,7 +111,8 @@ with `sideChat: true`, opened with `:btw <question>`, `:side <question>` or
 **Side chat** in the chat header **+** menu. Its first turn carries the host's
 delivered messages; nothing in it reaches the host's messages, queue or turn.
 It starts in `approval-required`, its tab reads **Side chat · <provider>**, and
-it follows the panel thread rules. See
+it follows the panel thread rules, except that closing one nobody sent to deletes
+it (`thread.delete` with `onlyIfUnused`). See
 [Side chats](../user/workspace-ui.md#side-chats).
 
 ### Right Panel

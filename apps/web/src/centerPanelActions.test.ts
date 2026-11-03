@@ -14,6 +14,9 @@ const h = vi.hoisted(() => ({
   shells: new Map<string, unknown>(),
   createPanel: vi.fn(),
   archiveThread: vi.fn(),
+  deleteThread: vi.fn(),
+  deleteResults: [] as unknown[],
+  deletesUnused: false,
   unarchiveThread: vi.fn(),
   interruptTurn: vi.fn(),
   addToast: vi.fn(),
@@ -134,6 +137,7 @@ vi.mock("~/lib/utils", () => ({
 vi.mock("~/state/threads", () => ({
   threadEnvironment: {
     archive: "archive",
+    delete: "delete",
     unarchive: "unarchive",
     interruptTurn: "interrupt",
     startTurn: "start-turn",
@@ -142,6 +146,13 @@ vi.mock("~/state/threads", () => ({
 
 vi.mock("~/state/entities", () => ({
   readThreadShell: (ref: { threadId: string }) => h.shells.get(ref.threadId) ?? null,
+}));
+
+// Unless a test says otherwise, a server that does not delete unused side chats.
+vi.mock("~/state/session", () => ({
+  readPreparedConnection: () => ({
+    descriptor: { capabilities: { threadDeleteOnlyIfUnused: h.deletesUnused } },
+  }),
 }));
 
 vi.mock("~/state/worktrees", () => ({
@@ -153,6 +164,7 @@ vi.mock("~/state/use-atom-command", () => ({
     ({
       "create-panel": h.createPanel,
       archive: h.archiveThread,
+      delete: h.deleteThread,
       unarchive: h.unarchiveThread,
       interrupt: h.interruptTurn,
       "open-in-panel": h.openInPanel,
@@ -174,6 +186,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   h.createResult = { _tag: "Success", value: undefined };
   h.archiveResults = [];
+  h.deleteResults = [];
+  h.deletesUnused = false;
+  h.deleteThread.mockImplementation(() =>
+    Promise.resolve(h.deleteResults.shift() ?? { _tag: "Success", value: { sequence: 2 } }),
+  );
   h.unarchiveResult = { _tag: "Success", value: undefined };
   h.shells.clear();
   h.createPanel.mockImplementation(() => Promise.resolve(h.createResult));
@@ -810,6 +827,75 @@ describe("side chats", () => {
     await opening;
 
     expect(h.drafts.get("new-panel-thread")).toEqual(typed);
+  });
+
+  it("deletes a side chat nobody sent to on close, and archives a used one", async () => {
+    h.deletesUnused = true;
+    const unused = { archivedAt: null, session: null, sideChat: true, latestTurn: null };
+    const shells = {
+      "side-unused": { ...unused, latestUserMessageAt: null },
+      // Sent to on another client after this page last heard: the server refuses.
+      "side-used-elsewhere": { ...unused, latestUserMessageAt: null },
+      "side-answered": { ...unused, latestUserMessageAt: "2026-11-03T00:00:00Z" },
+      "plain-panel": { archivedAt: null, session: null, latestTurn: null },
+    };
+    h.deleteResults = [
+      { _tag: "Success", value: { sequence: 7 } },
+      {
+        _tag: "Failure",
+        cause: { _tag: "OrchestrationThreadInUseError", message: "Used.", threadId: "x" },
+      },
+    ];
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    for (const [threadId, shell] of Object.entries(shells)) {
+      h.shells.set(threadId, shell);
+      const surface = { id: `chat:${threadId}`, kind: "chat", threadId } as never;
+      h.closeSurface.mockReturnValueOnce([surface]);
+      actions.closeSurface(hostRef, "group-left", surface);
+    }
+    await flush();
+
+    expect(h.deleteThread.mock.calls.map(([call]) => call)).toEqual(
+      ["side-unused", "side-used-elsewhere"].map((threadId) => ({
+        environmentId: hostRef.environmentId,
+        input: { threadId, onlyIfUnused: true },
+      })),
+    );
+    expect(h.archiveThread.mock.calls.map(([call]) => call.input.threadId).toSorted()).toEqual([
+      "plain-panel",
+      "side-answered",
+      "side-used-elsewhere",
+    ]);
+    // The delete's own sequence settles the close, as an archive's does.
+    expect(h.closing.get(`${hostRef.environmentId}:side-unused`)).toBe(7);
+    expect(h.addToast).not.toHaveBeenCalled();
+  });
+
+  it("archives a side chat closed while its first send is on its way", async () => {
+    h.deletesUnused = true;
+    const send = deferred<unknown>();
+    h.startTurn.mockReturnValueOnce(send.promise);
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    void actions.createSideChat(sideChat());
+    await flush();
+    h.shells.set("new-panel-thread", {
+      archivedAt: null,
+      session: null,
+      sideChat: true,
+      latestTurn: null,
+      latestUserMessageAt: null,
+    });
+    const surface = { id: "chat:new-panel-thread", kind: "chat", threadId: panelRef.threadId };
+    h.closeSurface.mockReturnValueOnce([surface]);
+    actions.closeSurface(hostRef, "group-left", surface as never);
+    send.resolve({ _tag: "Success", value: undefined });
+    await flush();
+
+    expect(h.deleteThread).not.toHaveBeenCalled();
+    expect(h.archiveThread).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: "new-panel-thread" },
+    });
   });
 
   it("focuses an empty side chat's composer once, and not one opened with a question", async () => {

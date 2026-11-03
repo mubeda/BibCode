@@ -205,6 +205,7 @@ import {
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
 import { takeComposerFocusRequest, useCenterPanelActions } from "../centerPanelActions";
+import { markChatPanelSent } from "../centerPanelClose";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -1092,7 +1093,17 @@ function ChatViewContent(props: ChatViewProps) {
   const setThreadInteractionMode = useAtomCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
-  const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const startThreadTurnCommand = useAtomCommand(threadEnvironment.startTurn, {
+    reportFailure: false,
+  });
+  // Every send is noted first, so closing an unused side chat while it goes out archives it.
+  const startThreadTurn = useCallback<typeof startThreadTurnCommand>(
+    (value, runOptions) => {
+      markChatPanelSent(scopeThreadRef(value.environmentId, value.input.threadId));
+      return startThreadTurnCommand(value, runOptions);
+    },
+    [startThreadTurnCommand],
+  );
   const stageAttachments = useAtomCommand(threadEnvironment.stageAttachments, {
     reportFailure: false,
   });

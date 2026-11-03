@@ -16,6 +16,8 @@
  * the creation it waits on is in flight (`centerPanelClose`); a creation closed
  * meanwhile never sends its first question. A side chat (#265) is a panel the
  * server seeds with the host's messages; `:btw` sends its question once it exists.
+ * Closing a side chat nobody sent to deletes it instead of archiving it, where the server
+ * can refuse a used one; a refusal archives it.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -37,7 +39,9 @@ import { useCallback } from "react";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import {
   archiveClosingChatPanel,
+  closesByUnusedDelete,
   hideClosingChatPanel,
+  markChatPanelSent,
   releaseUncreatedChatPanel,
 } from "~/centerPanelClose";
 import { useCenterPanelStore, type CenterSurface } from "~/centerPanelStore";
@@ -111,6 +115,12 @@ export interface OpenSessionPanelInput {
  * making another copy. A success or the server's own refusal settles the open.
  */
 const unsettledSessionOpens = new Map<string, CommandId>();
+
+/** `thread.delete` with `onlyIfUnused` refused: the thread was used. */
+const isThreadInUse = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  (error as { readonly _tag?: unknown })._tag === "OrchestrationThreadInUseError";
 
 /** A failure the server decided, as opposed to a request that may not have reached it. */
 const isServerRefusal = (error: unknown): boolean =>
@@ -244,6 +254,7 @@ export function useCenterPanelActions({
 }: CenterPanelActionsOptions): CenterPanelActions {
   const createPanel = useAtomCommand(worktreeEnvironment.createPanel, { reportFailure: false });
   const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
+  const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
   const startTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const interruptTurn = useAtomCommand(threadEnvironment.interruptTurn, { reportFailure: false });
   const openInPanel = useAtomCommand(projectEnvironment.openAgentSessionInPanel, {
@@ -280,6 +291,37 @@ export function useCenterPanelActions({
       return null;
     },
     [archiveThread, interruptTurn],
+  );
+
+  /**
+   * Ends a closed panel: deletes a side chat nobody sent to, else archives it. Resolves the
+   * event sequence of whichever the server did, or `null` for any other outcome.
+   */
+  const closePanelThread = useCallback(
+    async (ref: ScopedThreadRef, sideChat: boolean): Promise<number | null> => {
+      if (sideChat && closesByUnusedDelete(ref)) {
+        const result = await deleteThread({
+          environmentId: ref.environmentId,
+          input: { threadId: ref.threadId, onlyIfUnused: true },
+        });
+        if (result._tag === "Success") return result.value.sequence;
+        if (isAtomCommandInterrupted(result)) return null;
+        const error = squashAtomCommandFailure(result);
+        // Anything else is reported as a failed archive would be; a used one is archived.
+        if (!isThreadInUse(error)) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Failed to close chat panel",
+              description: error instanceof Error ? error.message : "An error occurred.",
+            }),
+          );
+          return null;
+        }
+      }
+      return archivePanelThread(ref);
+    },
+    [archivePanelThread, deleteThread],
   );
 
   /** Creates the reserved panel and settles a close made while it waited. */
@@ -327,10 +369,12 @@ export function useCenterPanelActions({
       }
       // Closed meanwhile (success, or an outcome that may have created it): archive it now,
       // just this once. Nobody else can have reopened a panel that was never archived.
-      if (closed) void archiveClosingChatPanel(panelRef, archivePanelThread);
+      if (closed) {
+        void archiveClosingChatPanel(panelRef, (ref) => closePanelThread(ref, sideChat));
+      }
       return { threadId, created: result._tag === "Success" && !closed };
     },
-    [archivePanelThread, createPanel],
+    [closePanelThread, createPanel],
   );
 
   /**
@@ -376,6 +420,7 @@ export function useCenterPanelActions({
       if (question.length > 0) {
         // The side chat's own draft is never written on success: what the user types or
         // attaches there meanwhile stays.
+        markChatPanelSent(sideRef);
         const result = await startTurn({
           environmentId: hostRef.environmentId,
           input: {
@@ -483,13 +528,16 @@ export function useCenterPanelActions({
           const creation = creations.get(scopedThreadKey(panelRef));
           // A panel still being created is archived when its creation answers.
           if (creation) creation.closed = true;
-          else void archiveClosingChatPanel(panelRef, archivePanelThread);
+          else {
+            const sideChat = readThreadShell(panelRef)?.sideChat === true;
+            void archiveClosingChatPanel(panelRef, (ref) => closePanelThread(ref, sideChat));
+          }
         } else if (surface.kind === "terminal") {
           onCloseTerminal(hostRef, surface);
         }
       }
     },
-    [archivePanelThread, onCloseTerminal],
+    [closePanelThread, onCloseTerminal],
   );
 
   const activateSurface = useCallback(
