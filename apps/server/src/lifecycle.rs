@@ -13,7 +13,7 @@ use crate::{
         },
     },
     config::{ServerConfig, ServerMode},
-    data_root::{DataRootError, ResolvedDataRoot, resolve_data_root},
+    data_root::{DataRootError, ResolvedDataRoot},
     diagnostics::{
         DesktopUiProcessObserver, NotApplicableUiProcessObserver,
         UnavailableDesktopUiProcessObserver,
@@ -218,9 +218,7 @@ impl ServerRuntime {
         process_tree_cleanup: ProcessTreeCleanup,
         update_delegate: Option<Arc<dyn RemoteUpdateDelegate>>,
     ) -> Result<ServerHandle, ServerError> {
-        let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
-        config.base_dir = resolved_data_root.effective.clone();
-        config.resolved_data_root = Some(resolved_data_root.clone());
+        let resolved_data_root = config.resolve_data_root()?;
         tokio::fs::create_dir_all(&config.base_dir)
             .await
             .map_err(ServerError::CreateBaseDirectory)?;
@@ -233,6 +231,7 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
+        crate::git::system_line_endings::log_install_warnings();
         if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
             tracing::info!(
                 static_dir = %static_dir.display(),

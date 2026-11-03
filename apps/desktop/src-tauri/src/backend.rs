@@ -2127,6 +2127,10 @@ async fn start_managed_backend(
             if let Some(window) = listener_bind_retry {
                 server_config = server_config.with_listener_bind_retry(window);
             }
+            // Once per process: a backend restart keeps the first result. Tests keep NOSYSTEM.
+            #[cfg(not(test))]
+            bibcode_server::git::system_line_endings::install_once(&server_config.state_dir())
+                .await;
             let handle = match remote_update_delegate {
                 Some(delegate) => {
                     ServerRuntime::start_with_desktop_integration(

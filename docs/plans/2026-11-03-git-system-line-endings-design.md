@@ -367,3 +367,70 @@ deferred. One new finding was confirmed.
 | #    | Finding                                                                                                                                                                              | Checked                                                             | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | R2.1 | P1: on a shared `/tmp`, another user can pre-create `bibcode-git` and replace the hash-named file with config that sets `core.hooksPath`, so a later BiBCode commit runs their hook. | Confirmed against revision 1's Write step (`<temp>/bibcode-git/…`). | **Fixed (ruling).** The file is written under `<state>/git/` in the server's own data root. The directory must be a real one, owned by the server on Unix, `0700`. The file is written with `create_new` to a unique temporary name, `0600`, and renamed. After the rename it must be a regular file the server owns with the expected bytes, or the policy is `NoSystem`. Applies the same way to the desktop, `bibcode serve`, WSL and SSH. Test: `a_planted_or_foreign_generated_file_is_refused`. |
+
+## As built
+
+Implemented in `apps/server/src/git/system_line_endings.rs`, with the integration tests in
+`apps/server/tests/git_system_line_endings.rs`. It differs from the design in these ways:
+
+- **Test isolation.** Each case that installs the policy runs in a process of its own,
+  through `tests/support/reexec.rs`, instead of one `#[test]` that runs every case in
+  order. The parent process sets the fixture `GIT_CONFIG_SYSTEM`, an isolated
+  `GIT_CONFIG_GLOBAL` and a `PATH` without relative entries, and removes inherited `GIT_*`
+  variables. Cases that need no installed policy call the public `probe(state_dir,
+  environment)`, which installs nothing. `install_once` is that probe plus the lock.
+- **Deadline.** One 2 s deadline is shared by both probe commands as their
+  `ProcessRequest` timeouts, so the supervised runner kills a stalled child. There is no
+  separate cancellation token.
+- **An existing final name.** A regular file the server owns, holding exactly the
+  expected bytes, is reused without a rewrite. Anything else at the final name is refused
+  before any write, and the policy is `NoSystem`: a directory, a symlink, or a file owned by
+  another user. Under the design's write-then-rename, a foreign-owned file would have been
+  replaced, so the design's expected `NoSystem` for that test case would not have held.
+- **Relative `PATH` entries (review fix P2-c).** The rule applies on Unix only. Rust's
+  Windows process creation searches a bare program from the server's own directory before
+  the child's directory applies, so every command finds the same Git there. On Unix, a
+  shell that splits `C:\…` at the colon would leave a relative `C` that keeps the policy at
+  `NoSystem`, so the tests build their own `PATH`.
+- **Logging (review fix P3-e).** An older Git or a relative `PATH` entry logs at `debug`,
+  because neither is a failure. Timeouts, failures, invalid values and write failures go
+  through the module's one `tracing::warn!`, whose `reason` is fixed text with no path.
+  `install_once` runs before either binary installs logging, so it keeps its warnings, and
+  `ServerRuntime` logs them right after `logging::initialize_owned`. There is no cheap test
+  seam for that ordering.
+- **Probe directory.** The probe runs in a fresh `bibcode-git-probe-<uuid>` directory under
+  the temp directory, with `GIT_CEILING_DIRECTORIES` set to the temp directory, and removes
+  it afterwards.
+- **Desktop tests.** The desktop backend's `install_once` call is `#[cfg(not(test))]`, so
+  desktop unit tests keep `GIT_CONFIG_NOSYSTEM=1`, like the server's lifecycle tests.
+- **Symlink case on Windows.** Creating a symlink needs a privilege that this machine
+  lacks. The test then uses a directory junction, which `symlink_metadata` also reports as
+  a link.
+- **Booleans.** The canonicalizer uses `git_boolean` in `git/repository.rs`, the same
+  parser behind the existing `git_boolean_is_true`.
+- **Verified on this machine.** `git config --show-scope --get-all core.autocrlf` gives only
+  `system` (`C:/Program Files/Git/etc/gitconfig`). The note in
+  `docs/testing/windows-desktop.md` that Git for Windows also sets the key globally was
+  corrected.
+- **Not done.** The native Windows run through the packaged app (status, diff, commit, a
+  new worktree and a checkpoint restore) was not run. The integration tests cover status,
+  diff, commit and worktrees through `GitRepository`, with a fixture system file.
+- **Review fixes, round 3 (Codex review of `10c019d90`).**
+  - P1-a: the desktop's data root is canonicalized, a `\\?\C:\…` path on Windows. Git
+    2.56 cannot read that form in `GIT_CONFIG_SYSTEM`. `git config --get` finds nothing,
+    and `git status` stops with "unknown error occurred while reading the configuration
+    files", so every BiBCode Git command on the desktop would have failed. The returned
+    path goes through `host_paths::process_compatible_path`. Test:
+    `a_canonical_state_dir_still_applies_the_system_autocrlf`. Its status helper now also
+    requires a readable repository, because a failed status read reports no changes and
+    first let the case pass without the fix.
+  - P1-b: `bibcode serve` probed `config.state_dir()` before startup resolved the data root,
+    so a relative or quoted `~` base directory gave a relative file path, which Git resolves
+    inside each repository. `run_server` now calls `ServerConfig::resolve_data_root`, the
+    helper startup also uses, and a non-absolute state directory gives `NoSystem`. Test:
+    `a_relative_state_dir_keeps_nosystem`. The `run_server` ordering itself has no cheap
+    test seam.
+  - P2-d (coordinator ruling): on Unix, an existing `<state>/git` or reused file that is
+    group- or other-writable gives `NoSystem`. Ancestors and Windows ACLs are not checked,
+    because the state directory, which holds the database, is the trust boundary. Test:
+    `a_group_or_other_writable_state_is_refused` (Unix, CI only).

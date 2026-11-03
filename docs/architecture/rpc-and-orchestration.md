@@ -340,6 +340,73 @@ authorization mapping is
 [`required_scope`](../../apps/server/src/auth/scope.rs); adding a live method
 without exactly one declared scope fails a server test.
 
+## Git process environment
+
+Status, diff, the Git Manager, worktrees, refs, the watcher and the other commands built on
+`git_environment()` (`apps/server/src/git/repository.rs`) run Git noninteractively:
+`GCM_INTERACTIVE=never`, empty `GIT_ASKPASS` and `SSH_ASKPASS`,
+`SSH_ASKPASS_REQUIRE=never`, `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`. Reads add
+`GIT_OPTIONAL_LOCKS=0`.
+
+They read only the line-ending keys of the system configuration (#282,
+[design](../plans/2026-11-03-git-system-line-endings-design.md)), so line endings match the
+person's own Git, for example Git for Windows' system `core.autocrlf=true`:
+
+- **Probe.** Before the server starts, `git::system_line_endings::install_once` reads
+  `core.autocrlf`, `core.eol` and `core.safecrlf` with
+  `git config --system --includes -z --get-regexp`, from an empty temporary directory. The
+  two binaries call it, `bibcode serve` and the desktop's in-process backend, and
+  `ServerRuntime::start` does not, so library and lifecycle tests keep
+  `GIT_CONFIG_NOSYSTEM=1`. `bibcode serve` first resolves its data root the way startup
+  does (`ServerConfig::resolve_data_root`), so the state directory is the absolute one the
+  server will use, never a relative `--base-dir`.
+- **Includes.** Unconditional `include.path` files are followed. `includeIf` cannot be
+  resolved outside a repository and is not applied.
+- **Values.** The last value of each key wins. Booleans are canonicalized as Git reads them,
+  and an invalid last value drops its key.
+- **The generated file.** The canonical values are written to
+  `<state>/git/system-line-endings-<hash>.gitconfig` in the server's own state directory.
+  The path loses a Windows `\\?\` verbatim prefix, which Git ignores in
+  `GIT_CONFIG_SYSTEM`, and must be absolute, because Git resolves a relative one inside
+  each repository. The write is atomic: a fresh `create_new` temporary name (`0600` on
+  Unix) is renamed into place, in a `0700` directory on Unix. The server uses the file only
+  if `<state>/git` is a real directory and the file is a regular file with exactly the bytes
+  written. On Unix both must also be owned by the server and writable by no group or other
+  user. The ancestors and Windows ACLs are not checked: the state directory already holds
+  the database, so it is the trust boundary. Git then runs with `GIT_CONFIG_SYSTEM=<file>`
+  and without `GIT_CONFIG_NOSYSTEM`. These are system-scope values, so repository and global settings
+  still win. No credential helper, hook, filter, include or URL rule from the system
+  configuration gets in.
+- **Fallback.** With no key set, the policy stays at `GIT_CONFIG_NOSYSTEM=1`, today's
+  isolation. It also stays there when any of these hold:
+  - on Unix, the child `PATH` has a relative entry, which could resolve another Git per
+    directory (Windows searches it from the server's own directory, so it cannot);
+  - the resolved Git is older than 2.32, which ignores `GIT_CONFIG_SYSTEM`;
+  - the probe takes more than 2 s in total, and its children are killed;
+  - the write or a check fails.
+
+  A failure, or an invalid value, logs one warning with no path. The probe runs before
+  logging starts, so the server logs the warnings right after it installs logging.
+
+- **Restart rule.** The result is fixed for the process. A desktop backend restart reuses
+  it, and quitting and reopening the app, or restarting `bibcode serve`, reads the settings
+  again.
+- **Known limits.** A Git downgraded below 2.32 while BiBCode runs reads the full system
+  file until restart. A generated file that goes missing is ignored by Git, which is the
+  same as `GIT_CONFIG_NOSYSTEM=1`.
+
+These spawns keep their own configuration:
+
+- The clone tools' fully isolated configuration ([Clone tools](#clone-tools)). A clone's
+  LF checkout is clean for both Gits under `autocrlf=true`.
+- Turn checkpoints and the bootstrap fetch, which inherit the full system configuration,
+  so they already agree on line endings.
+- The streamed review diff, workspace search's `git ls-files` and the pull-request
+  discovery default.
+- The external difftool, whose tool definitions can live in the system configuration.
+
+Isolating checkpoints is a follow-up (#283).
+
 ## VCS status and mutation coordination
 
 `subscribeVcsStatus` and `vcs.refreshStatus` add the optional
@@ -1726,7 +1793,8 @@ missing remotes, unsupported/unconfigured hosts, missing or outdated CLIs,
 authentication, and repository access. Process failures remain typed errors.
 
 `HostCommandRunner` is the module's single process boundary and delegates all
-Git/provider work to `ProcessRunner`. It supplies noninteractive Git settings,
+Git/provider work to `ProcessRunner`. It supplies noninteractive Git settings
+([Git process environment](#git-process-environment)),
 host environment variables, repository operands, cancellation, output caps,
 and deadlines. One overall deadline covers context/vocabulary (30 seconds),
 lists, detail/tab reads and ordinary mutations (60 seconds), including their
@@ -4039,7 +4107,8 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   `http.<url>.*` settings, hooks, fsmonitor or filter drivers apply; the commands inherit
   nothing from the server (`env_clear`) but an allowlist (`PATH`, `TMPDIR`, `TEMP`, `TMP`,
   `LANG`, `LC_*`, `TZ`, and the Windows system variables), with `HOME` the null device, and
-  the clone gets `--template=` so no hooks are copied;
+  the clone gets `--template=` so no hooks are copied, and it does not get the system
+  line-ending keys of the [Git process environment](#git-process-environment);
 - `git ls-remote --get-url -- <url>` gives the URL after any `insteadOf` left (the clone
   folder's enclosing repository, which `git ls-remote` reads and `git clone` does not, so
   Git clones the URL as written): an HTTPS expansion must pass the same checks and may not

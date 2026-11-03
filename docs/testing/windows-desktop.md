@@ -379,15 +379,22 @@ or `LNK1140: limit exceeded for program database` rather than a disk error.
 Delete only the checkout's own `target\debug` to recover; never the retained
 validation tree.
 
-Git for Windows installs with `core.autocrlf=true` in the system and global
-configuration. Test fixtures that assert on checked-out file bytes pin
-`core.autocrlf=false` on the repository they create right after `git init`;
-a `"base\r\n"` versus `"base\n"` assertion failure means a fixture is missing
-that pin, not that the product rewrote line endings. Do not change the host
-Git configuration to make a suite pass. A fixture whose repository production
-Git reads (a revert, a checkpoint, a worktree removal) pins `core.autocrlf=false`
-in the repository's own configuration, because the test's `IsolatedGitConfig`
-reaches only the commands the fixture runs itself.
+Git for Windows installs with `core.autocrlf=true` in the system configuration
+(`<Git>\etc\gitconfig`); the installer does not set it globally. Test fixtures
+that assert on checked-out file bytes pin `core.autocrlf=false` on the
+repository they create right after `git init`; a `"base\r\n"` versus `"base\n"`
+assertion failure means a fixture is missing that pin, not that the product
+rewrote line endings. Do not change the host Git configuration to make a suite
+pass. A fixture whose repository production Git reads (a revert, a checkpoint,
+a worktree removal) pins `core.autocrlf=false` in the repository's own
+configuration, because the test's `IsolatedGitConfig` reaches only the commands
+the fixture runs itself. The pin is still required: the packaged app's Git reads
+the system line-ending keys
+([Git process environment](../architecture/rpc-and-orchestration.md#git-process-environment)),
+but test servers never install that policy and keep `GIT_CONFIG_NOSYSTEM=1`,
+while checkpoints read the full system configuration. The repository pin beats
+both. `apps/server/tests/git_system_line_endings.rs` covers the policy with a
+fixture `GIT_CONFIG_SYSTEM` file, never the host's.
 
 `bibcode-server` library tests run on a Windows development machine, and these
 Windows behaviors decide how a fixture is written:
