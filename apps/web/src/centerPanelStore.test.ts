@@ -567,28 +567,51 @@ describe("centerPanelStore", () => {
       expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${SIDE}`]);
     });
 
-    it("remembers unsettled panel closes, oldest dropped past the cap", () => {
+    it("remembers unsettled panel closes, a new close replacing the old, oldest dropped", () => {
       const ref = (index: number) =>
         scopeThreadRef(HOST.environmentId, ThreadId.make(`closed-${index}`));
       for (let index = 0; index <= MAX_CLOSING_CHAT_PANELS; index += 1) {
-        store().recordChatPanelClose(ref(index));
+        store().recordChatPanelClose(ref(index), undefined);
       }
-      store().recordChatPanelClose(ref(5));
-      expect(store().closingChatPanels).toHaveLength(MAX_CLOSING_CHAT_PANELS);
-      expect(store().closingChatPanels[0]).toBe(scopedThreadKey(ref(1)));
+      const keys = () => store().closingChatPanels.map((intent) => intent.key);
+      expect(keys()).toHaveLength(MAX_CLOSING_CHAT_PANELS);
+      expect(keys()[0]).toBe(scopedThreadKey(ref(1)));
+      const first = store().closingChatPanels.find(
+        (intent) => intent.key === scopedThreadKey(ref(5)),
+      )!;
+      const second = store().recordChatPanelClose(ref(5), 9);
+      expect(second).not.toBe(first.closeId);
+      expect(keys().at(-1)).toBe(scopedThreadKey(ref(5)));
+      // A reply to the first close changes nothing; one to the second applies.
+      store().updateChatPanelClose(ref(5), first.closeId, { archivedAt: 3 });
+      expect(store().closingChatPanels.at(-1)).toEqual({
+        key: scopedThreadKey(ref(5)),
+        closeId: second,
+        liveAt: 9,
+      });
+      store().updateChatPanelClose(ref(5), second, { archivedAt: 10 });
+      expect(store().closingChatPanels.at(-1)?.archivedAt).toBe(10);
+      store().clearChatPanelClose(ref(5), first.closeId);
+      expect(keys()).toContain(scopedThreadKey(ref(5)));
       store().clearChatPanelClose(ref(5));
-      expect(store().closingChatPanels).not.toContain(scopedThreadKey(ref(5)));
+      expect(keys()).not.toContain(scopedThreadKey(ref(5)));
     });
 
-    it("migrates version 4 to an empty close intent list", () => {
+    it("migrates version 4 to an empty close intent list and drops malformed intents", () => {
       expect(
         migratePersistedCenterPanelState({ byThreadKey: {}, activityPanes: {} }).closingChatPanels,
       ).toEqual([]);
-      const keys = Array.from({ length: 55 }, (_, index) => `environment-1:closed-${index}`);
+      const intents = Array.from({ length: 55 }, (_, index) => ({
+        key: `environment-1:closed-${index}`,
+        closeId: `close-${index}`,
+        liveAt: index,
+      }));
       expect(
-        migratePersistedCenterPanelState({ byThreadKey: {}, closingChatPanels: [...keys, 7] })
-          .closingChatPanels,
-      ).toEqual(keys.slice(-MAX_CLOSING_CHAT_PANELS));
+        migratePersistedCenterPanelState({
+          byThreadKey: {},
+          closingChatPanels: [...intents, 7, { key: "x" }, { key: "y", closeId: "c", liveAt: -1 }],
+        }).closingChatPanels,
+      ).toEqual([...intents.slice(-(MAX_CLOSING_CHAT_PANELS - 1)), { key: "y", closeId: "c" }]);
     });
   });
 

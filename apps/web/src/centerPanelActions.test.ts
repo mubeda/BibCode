@@ -34,8 +34,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(),
   pending: new Set<string>(),
   creating: new Set<string>(),
-  closed: [] as string[],
-  progress: new Map<string, string>(),
+  closed: [] as Array<{ key: string; closeId: string; liveAt?: number; archivedAt?: number }>,
   drafts: new Map<string, { prompt: string; attachments: unknown[] }>(),
 }));
 
@@ -97,24 +96,31 @@ vi.mock("~/centerPanelStore", () => ({
       endChatPanelCreation: (ref: { environmentId: string; threadId: string }) =>
         h.creating.delete(`${ref.environmentId}:${ref.threadId}`),
       closingChatPanels: h.closed,
-      chatPanelCloseProgress: h.progress,
       recordChatPanelClose: (ref: { environmentId: string; threadId: string }) => {
         const key = `${ref.environmentId}:${ref.threadId}`;
-        if (!h.closed.includes(key)) h.closed.push(key);
+        const index = h.closed.findIndex((intent) => intent.key === key);
+        if (index >= 0) h.closed.splice(index, 1);
+        const closeId = `close-${h.closed.length + 1}`;
+        h.closed.push({ key, closeId });
+        return closeId;
+      },
+      updateChatPanelClose: (
+        ref: { environmentId: string; threadId: string },
+        closeId: string,
+        patch: object,
+      ) => {
+        const intent = h.closed.find(
+          (candidate) =>
+            candidate.key === `${ref.environmentId}:${ref.threadId}` &&
+            candidate.closeId === closeId,
+        );
+        if (intent) Object.assign(intent, patch);
       },
       clearChatPanelClose: (ref: { environmentId: string; threadId: string }) => {
-        const key = `${ref.environmentId}:${ref.threadId}`;
-        const index = h.closed.indexOf(key);
+        const index = h.closed.findIndex(
+          (intent) => intent.key === `${ref.environmentId}:${ref.threadId}`,
+        );
         if (index >= 0) h.closed.splice(index, 1);
-        h.progress.delete(key);
-      },
-      setChatPanelCloseProgress: (
-        ref: { environmentId: string; threadId: string },
-        progress: string | null,
-      ) => {
-        const key = `${ref.environmentId}:${ref.threadId}`;
-        if (progress === null) h.progress.delete(key);
-        else h.progress.set(key, progress);
       },
     }),
   },
@@ -187,7 +193,7 @@ beforeEach(() => {
   h.shells.clear();
   h.createPanel.mockImplementation(() => Promise.resolve(h.createResult));
   h.archiveThread.mockImplementation(() =>
-    Promise.resolve(h.archiveResults.shift() ?? { _tag: "Success", value: undefined }),
+    Promise.resolve(h.archiveResults.shift() ?? { _tag: "Success", value: { sequence: 1 } }),
   );
   h.unarchiveThread.mockImplementation(() => Promise.resolve(h.unarchiveResult));
   h.openInPanelResult = { _tag: "Success", value: undefined };
@@ -199,7 +205,6 @@ beforeEach(() => {
   h.pending.clear();
   h.creating.clear();
   h.closed.length = 0;
-  h.progress.clear();
   h.drafts.clear();
   h.reserveChatPanel.mockImplementation((_host: unknown, threadId: string) =>
     h.pending.add(`${hostRef.environmentId}:${threadId}`),
@@ -494,12 +499,10 @@ describe("center panel actions", () => {
   });
 
   it("forgets a close when the panel is reopened, so nothing archives it again", async () => {
-    h.closed.push(`${hostRef.environmentId}:panel-1`);
-    h.progress.set(`${hostRef.environmentId}:panel-1`, "archived");
+    h.closed.push({ key: `${hostRef.environmentId}:panel-1`, closeId: "close-1", archivedAt: 3 });
     const actions = useCenterPanelActions({ onCloseTerminal });
     await actions.reopenChatPanel(hostRef, ThreadId.make("panel-1"), "Codex");
     expect(h.closed).toEqual([]);
-    expect(h.progress.size).toBe(0);
   });
 
   it("reopens a closed chat panel as the active tab and rolls back explicit failures", async () => {

@@ -64,7 +64,6 @@ describe("center panel adoption", () => {
       byThreadKey: {},
       pendingChatPanelThreadKeys: new Set(),
       creatingChatPanelThreadKeys: new Set(),
-      chatPanelCloseProgress: new Map(),
       closingChatPanels: [],
     });
     release.mockClear();
@@ -77,53 +76,69 @@ describe("center panel adoption", () => {
     useCenterPanelStore.setState({
       pendingChatPanelThreadKeys: new Set([scopedThreadKey(lateRef)]),
     });
-    useCenterPanelStore.getState().recordChatPanelClose(lateRef);
+    useCenterPanelStore.getState().recordChatPanelClose(lateRef, undefined);
     const tracker = createCenterPanelAdoptionTracker();
-    let settle!: (outcome: "archived") => void;
+    let settle!: (result: { kind: "archived"; sequence: number }) => void;
     const archive = vi.fn(
       () =>
-        new Promise<"archived">((resolve) => {
+        new Promise<{ kind: "archived"; sequence: number }>((resolve) => {
           settle = resolve;
         }),
     );
+    const live = [hostThread, panelThread("panel-late")];
 
-    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
-    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    applyPanelThreadAdoption(ENV, tracker, live, false, archive, 10);
+    applyPanelThreadAdoption(ENV, tracker, live, false, archive, 10);
     expect(archive).toHaveBeenCalledTimes(1);
     expect(archive).toHaveBeenCalledWith(lateRef);
     expect(surfaceIds()).not.toContain("chat:panel-late");
 
-    settle("archived");
+    settle({ kind: "archived", sequence: 11 });
     await Promise.resolve();
     await Promise.resolve();
-    // Settled: the intent goes; an older snapshot that still lists it shows nothing.
-    expect(useCenterPanelStore.getState().closingChatPanels).toEqual([]);
-    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    // An older snapshot that still lists it neither shows it nor archives it again.
+    applyPanelThreadAdoption(ENV, tracker, live, false, archive, 10);
     expect(surfaceIds()).not.toContain("chat:panel-late");
     expect(archive).toHaveBeenCalledTimes(1);
-    // Once a snapshot drops it, no mark is left.
-    applyPanelThreadAdoption(ENV, tracker, [hostThread], false, archive);
-    expect(useCenterPanelStore.getState().chatPanelCloseProgress.size).toBe(0);
+    // The snapshot at the archive settles the close.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread], false, archive, 11);
+    expect(useCenterPanelStore.getState().closingChatPanels).toEqual([]);
+  });
+
+  it("shows a closed panel again once a newer snapshot lists it live after its archive", async () => {
+    const ref = scopeThreadRef(ENV, ThreadId.make("panel-a"));
+    useCenterPanelStore.getState().recordChatPanelClose(ref, 5);
+    const archive = vi.fn(() => Promise.resolve({ kind: "archived", sequence: 6 } as const));
+    const tracker = createCenterPanelAdoptionTracker();
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], false, archive, 5);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Another client reopened it at 7; this page never saw it archived.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], false, archive, 7);
+    expect(archive).toHaveBeenCalledTimes(1);
+    expect(useCenterPanelStore.getState().closingChatPanels).toEqual([]);
+    expect(surfaceIds()).toContain("chat:panel-a");
   });
 
   it("asks again for an archive that was interrupted or refused", async () => {
     const lateRef = scopeThreadRef(ENV, ThreadId.make("panel-late"));
-    useCenterPanelStore.getState().recordChatPanelClose(lateRef);
+    useCenterPanelStore.getState().recordChatPanelClose(lateRef, undefined);
     const tracker = createCenterPanelAdoptionTracker();
-    const archive = vi.fn(() => Promise.resolve("interrupted" as const));
-    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    const archive = vi.fn(() => Promise.resolve({ kind: "interrupted" } as const));
+    const live = [hostThread, panelThread("panel-late")];
+    applyPanelThreadAdoption(ENV, tracker, live, false, archive, 4);
     await Promise.resolve();
     await Promise.resolve();
-    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    applyPanelThreadAdoption(ENV, tracker, live, false, archive, 4);
     expect(archive).toHaveBeenCalledTimes(2);
-    expect(useCenterPanelStore.getState().closingChatPanels).toEqual([scopedThreadKey(lateRef)]);
+    expect(useCenterPanelStore.getState().closingChatPanels).toHaveLength(1);
   });
 
   it("leaves a closing panel this page is still creating to its open", () => {
     const creatingRef = scopeThreadRef(ENV, ThreadId.make("panel-creating"));
     useCenterPanelStore.getState().beginChatPanelCreation(creatingRef);
-    useCenterPanelStore.getState().recordChatPanelClose(creatingRef);
-    const archive = vi.fn(() => Promise.resolve("archived" as const));
+    useCenterPanelStore.getState().recordChatPanelClose(creatingRef, undefined);
+    const archive = vi.fn(() => Promise.resolve({ kind: "archived", sequence: 1 } as const));
     applyPanelThreadAdoption(
       ENV,
       createCenterPanelAdoptionTracker(),

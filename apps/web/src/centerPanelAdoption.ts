@@ -111,12 +111,22 @@ export function applyPanelThreadAdoption(
   >,
   capped = false,
   archiveClosedPanel?: ArchivePanelThread,
+  /** The server's engine sequence this snapshot reflects; it orders closes (`centerPanelClose`). */
+  sequence?: number,
 ): void {
   const liveThreadIds = new Set<string>(
     threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
   );
   // Close intents first: a closed panel this snapshot shows live is archived, never adopted.
-  reconcileChatPanelCloses(environmentId, liveThreadIds, archiveClosedPanel);
+  const reopened = reconcileChatPanelCloses(
+    environmentId,
+    liveThreadIds,
+    sequence,
+    capped,
+    archiveClosedPanel,
+  );
+  // Reopened elsewhere after this page closed it: shown again, as on first sight.
+  for (const threadId of reopened) tracker.panelThreadIds.delete(threadId);
   const store = useCenterPanelStore.getState();
   for (const thread of threads) {
     const hostThreadId = thread.hostThreadId;

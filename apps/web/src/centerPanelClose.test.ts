@@ -3,7 +3,10 @@
  * arrives, when the tab closes, how `createPanel` ends, and whether the page reloads. However
  * they interleave, a closed panel ends archived exactly once (or is never created), a side chat
  * closed before its first send sends nothing and leaves its question in the host draft, the
- * tab never comes back, and no mark is left behind.
+ * tab never comes back, and no mark is left behind. Further rows play archive replies that
+ * arrive late, out of order or never, against a reopen here and a reopen by another client:
+ * the server's ordered state decides, so a close is honoured and another client's reopen is
+ * never closed again.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@bibcode/contracts";
@@ -26,21 +29,43 @@ const h = vi.hoisted(() => {
     pendingCreate: null as null | { resolve: (value: unknown) => void },
     heldArchive: null as null | { resolve: () => void },
     holdNextArchive: false,
+    /** How the next archive reply behaves, once. */
+    nextArchiveReply: "normal" as "normal" | "hold-reply" | "lose-reply" | "drop",
+    heldReply: null as null | { resolve: () => void },
+    /** The server's event sequence; every create, archive and unarchive advances it. */
+    sequence: 1,
     nextThread: 0,
   };
 });
 
 /** The server's answer to `thread.archive`, optionally held until the test releases it. */
-function serverArchive(threadId: string): Promise<{ _tag: string; cause?: unknown }> {
+function serverArchive(
+  threadId: string,
+): Promise<{ _tag: string; cause?: unknown; interrupted?: boolean; value?: unknown }> {
   const apply = () => {
     const thread = h.server.get(threadId);
     if (!thread || thread.archived) {
       return { _tag: "Failure", cause: new Error(`Thread '${threadId}' cannot be archived.`) };
     }
     thread.archived = true;
+    h.sequence += 1;
     h.archivedTimes.set(threadId, (h.archivedTimes.get(threadId) ?? 0) + 1);
-    return { _tag: "Success" };
+    return { _tag: "Success", value: { sequence: h.sequence } };
   };
+  const reply = h.nextArchiveReply;
+  h.nextArchiveReply = "normal";
+  // The request never reached the server.
+  if (reply === "drop") return Promise.resolve({ _tag: "Failure", interrupted: true, cause: null });
+  if (reply === "lose-reply") {
+    apply();
+    return Promise.resolve({ _tag: "Failure", interrupted: true, cause: null });
+  }
+  if (reply === "hold-reply") {
+    const applied = apply();
+    const held = h.deferred<void>();
+    h.heldReply = { resolve: () => held.resolve() };
+    return held.promise.then(() => applied);
+  }
   if (!h.holdNextArchive) return Promise.resolve(apply());
   h.holdNextArchive = false;
   const held = h.deferred<void>();
@@ -109,7 +134,14 @@ vi.mock("~/state/use-atom-command", () => ({
         return reply.promise;
       },
       archive: ({ input }: { input: { threadId: string } }) => serverArchive(input.threadId),
-      unarchive: () => Promise.resolve({ _tag: "Success" }),
+      unarchive: ({ input }: { input: { threadId: string } }) => {
+        const thread = h.server.get(input.threadId);
+        if (thread?.archived) {
+          thread.archived = false;
+          h.sequence += 1;
+        }
+        return Promise.resolve({ _tag: "Success", value: { sequence: h.sequence } });
+      },
       interrupt: () => Promise.resolve({ _tag: "Success" }),
       open: () => Promise.resolve({ _tag: "Success" }),
       "start-turn": ({ input }: { input: { message: { text: string } } }) => {
@@ -123,6 +155,7 @@ vi.mock("./components/ThreadTerminalPanel", () => ({
 }));
 
 import { useCenterPanelActions } from "./centerPanelActions";
+import * as closeMemory from "./centerPanelClose";
 import { applyPanelThreadAdoption, createCenterPanelAdoptionTracker } from "./centerPanelAdoption";
 import { selectThreadCenterPanelState, useCenterPanelStore } from "./centerPanelStore";
 
@@ -134,6 +167,12 @@ type Outcome = "success" | "failure" | "interrupted";
 type Close = "during" | "during-after-snapshot" | "after" | "during-archive";
 type Reload = "none" | "before-respond" | "after-respond";
 type Step =
+  | "reopen-here"
+  | "remote-reopen"
+  | "hold-reply"
+  | "lose-reply"
+  | "drop-archive"
+  | "release-reply"
   | "close"
   | "commit"
   | "snapshot"
@@ -148,6 +187,79 @@ interface Row {
   readonly close: Close;
   readonly reload: Reload;
   readonly steps: readonly Step[];
+  /** Rows where the panel ends reopened by another client, with its archives counted. */
+  readonly reopenedElsewhere?: { readonly archives: number };
+  /** The archives a row that ends closed expects (one unless it was closed twice). */
+  readonly archives?: number;
+}
+
+/** Replies that arrive late, out of order or never, against reopens here and elsewhere. */
+function replyRows(): Row[] {
+  const base = { outcome: "success", close: "after", reload: "none" } as const;
+  const opened: Step[] = ["commit", "respond", "snapshot"];
+  const result: Row[] = [];
+  for (const reload of [false, true]) {
+    const tail: Step[] = reload ? ["reload", "snapshot"] : [];
+    const suffix = reload ? ", then a reload" : "";
+    // Finding 1: the first close's late reply must not settle the second close.
+    const outOfOrder: Step[] = [
+      ...opened,
+      "hold-reply",
+      "close",
+      "reopen-here",
+      "snapshot",
+      "drop-archive",
+      "close",
+      "release-reply",
+      ...tail,
+    ];
+    result.push({
+      ...base,
+      name: `close, reopen, close, first reply last${suffix}`,
+      steps: outOfOrder,
+      archives: 2,
+    });
+    result.push({
+      ...base,
+      name: `close, reopen, close, first reply last, reopened elsewhere${suffix}`,
+      steps: [...outOfOrder, "snapshot", "remote-reopen"],
+      reopenedElsewhere: { archives: 2 },
+    });
+    // Finding 2: the snapshot that drops the panel comes before the archive's reply.
+    const snapshotFirst: Step[] = [
+      ...opened,
+      "hold-reply",
+      "close",
+      "snapshot",
+      "release-reply",
+      ...tail,
+    ];
+    result.push({
+      ...base,
+      name: `snapshot before the archive reply${suffix}`,
+      steps: snapshotFirst,
+    });
+    result.push({
+      ...base,
+      name: `snapshot before the archive reply, reopened elsewhere${suffix}`,
+      steps: [...snapshotFirst, "remote-reopen"],
+      reopenedElsewhere: { archives: 1 },
+    });
+    // Finding 3: the archive committed, its reply was lost, and a snapshot shows it archived.
+    const lostReply: Step[] = [...opened, "lose-reply", "close", "snapshot", ...tail];
+    result.push({
+      ...base,
+      name: `lost archive reply, archived snapshot${suffix}`,
+      steps: lostReply,
+    });
+    result.push({
+      ...base,
+      name: `lost archive reply, archived snapshot, reopened elsewhere${suffix}`,
+      steps: [...lostReply, "remote-reopen"],
+      reopenedElsewhere: { archives: 1 },
+    });
+  }
+  return result;
 }
 
 function rows(): Row[] {
@@ -210,7 +322,9 @@ async function play(row: Row, sideChat: boolean) {
   // Takes a ref; e4cab9463's adoption passed the thread id, so the red run accepts both.
   const adoptionArchive = (target: string | { threadId: string }) =>
     serverArchive(typeof target === "string" ? target : target.threadId).then((result) =>
-      result._tag === "Success" ? "archived" : "refused",
+      result._tag === "Success"
+        ? { kind: "archived", sequence: (result.value as { sequence: number }).sequence }
+        : { kind: result.interrupted === true ? "interrupted" : "refused" },
     );
   const snapshot = () => {
     type ShellRow = Parameters<typeof applyPanelThreadAdoption>[2][number];
@@ -230,7 +344,14 @@ async function play(row: Row, sideChat: boolean) {
             ]
           : [],
     );
-    applyPanelThreadAdoption(ENV, tracker, threads, false, adoptionArchive as never);
+    (applyPanelThreadAdoption as (...args: unknown[]) => void)(
+      ENV,
+      tracker,
+      threads,
+      false,
+      adoptionArchive,
+      h.sequence,
+    );
     // The lifecycle reconciler releases the reservation of every live thread it sees.
     for (const thread of threads) {
       if (thread.archivedAt === null) {
@@ -260,6 +381,7 @@ async function play(row: Row, sideChat: boolean) {
     switch (step) {
       case "commit":
         h.server.set(panelId, { archived: false });
+        h.sequence += 1;
         break;
       case "snapshot":
         snapshot();
@@ -297,10 +419,35 @@ async function play(row: Row, sideChat: boolean) {
           chatPanelCloseProgress: new Map(),
         } as never);
         tracker = createCenterPanelAdoptionTracker();
+        (closeMemory as { resetChatPanelCloseMemory?: () => void }).resetChatPanelCloseMemory?.();
         break;
       case "hold-archive":
         h.holdNextArchive = true;
         break;
+      case "hold-reply":
+      case "lose-reply":
+        h.nextArchiveReply = step;
+        break;
+      case "drop-archive":
+        h.nextArchiveReply = "drop";
+        break;
+      case "release-reply":
+        h.heldReply?.resolve();
+        break;
+      case "reopen-here":
+        closed = false;
+        await actions.reopenChatPanel(hostRef, panelId, sideChat ? "Side chat · Codex" : "Codex");
+        break;
+      case "remote-reopen": {
+        // Another client reopens it through the server.
+        const thread = h.server.get(panelId);
+        if (thread?.archived) {
+          thread.archived = false;
+          h.sequence += 1;
+        }
+        closed = false;
+        break;
+      }
       case "release-archive":
         h.heldArchive?.resolve();
         break;
@@ -308,13 +455,14 @@ async function play(row: Row, sideChat: boolean) {
     await flush();
     if (closed && tabIds().includes(`chat:${panelId}`)) tabReturned = true;
   }
+  const reopenedElsewhere = row.steps.at(-1) === "remote-reopen";
   // What ended the creation settled the close itself, without waiting for another snapshot.
   const archivedWithoutMoreSnapshots = h.server.get(panelId)?.archived ?? false;
   // Later snapshots, as the shell keeps streaming.
   for (let index = 0; index < 3; index += 1) {
     snapshot();
     await flush();
-    if (tabIds().includes(`chat:${panelId}`)) tabReturned = true;
+    if (!reopenedElsewhere && tabIds().includes(`chat:${panelId}`)) tabReturned = true;
   }
 
   const panel = h.server.get(panelId);
@@ -333,11 +481,20 @@ async function play(row: Row, sideChat: boolean) {
         | readonly string[]
         | undefined;
       if (value === undefined) return [];
-      const keys = Array.isArray(value) ? value : [...(value as ReadonlySet<string>).keys()];
+      const keys = Array.isArray(value)
+        ? value.map((entry: string | { key: string }) =>
+            typeof entry === "string" ? entry : entry.key,
+          )
+        : [...(value as ReadonlySet<string>).keys()];
       return keys.includes(scopedThreadKey(panelRef)) ? [[field, true]] : [];
     }),
   );
+  const archiving = (
+    closeMemory as { archivingChatPanels?: () => ReadonlySet<string> }
+  ).archivingChatPanels?.();
+  if (archiving?.has(scopedThreadKey(panelRef))) leaked["archiving"] = true;
   return {
+    tabShown: tabIds().includes(`chat:${panelId}`),
     created: panel !== undefined,
     archived: panel?.archived ?? false,
     archivedTimes: h.archivedTimes.get(panelId) ?? 0,
@@ -351,6 +508,29 @@ async function play(row: Row, sideChat: boolean) {
 }
 
 function expectSettled(row: Row, result: Awaited<ReturnType<typeof play>>, sideChat: boolean) {
+  if (row.reopenedElsewhere) {
+    // Another client's reopen stands: it is shown here and never closed again.
+    expect({
+      archived: result.archived,
+      times: result.archivedTimes,
+      shown: result.tabShown,
+      leaked: result.leaked,
+    }).toEqual({ archived: false, times: row.reopenedElsewhere.archives, shown: true, leaked: {} });
+    return;
+  }
+  if (row.archives !== undefined) {
+    expect({
+      archived: result.archived,
+      times: result.archivedTimes,
+      back: result.tabBack,
+    }).toEqual({
+      archived: true,
+      times: row.archives,
+      back: false,
+    });
+    expect(result.leaked).toEqual({});
+    return;
+  }
   if (result.created) {
     expect({
       archived: result.archived,
@@ -385,13 +565,19 @@ function expectSettled(row: Row, result: Awaited<ReturnType<typeof play>>, sideC
 }
 
 describe("closing a chat panel in every ordering", () => {
-  it.each(rows().map((row) => [row.name, row] as const))("side chat: %s", async (_name, row) => {
-    h.sent.length = 0;
-    expectSettled(row, await play(row, true), true);
-  });
+  it.each([...rows(), ...replyRows()].map((row) => [row.name, row] as const))(
+    "side chat: %s",
+    async (_name, row) => {
+      h.sent.length = 0;
+      expectSettled(row, await play(row, true), true);
+    },
+  );
 
-  it.each(rows().map((row) => [row.name, row] as const))("plain panel: %s", async (_name, row) => {
-    h.sent.length = 0;
-    expectSettled(row, await play(row, false), false);
-  });
+  it.each([...rows(), ...replyRows()].map((row) => [row.name, row] as const))(
+    "plain panel: %s",
+    async (_name, row) => {
+      h.sent.length = 0;
+      expectSettled(row, await play(row, false), false);
+    },
+  );
 });

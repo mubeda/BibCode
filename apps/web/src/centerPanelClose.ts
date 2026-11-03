@@ -1,74 +1,99 @@
 /**
  * The one rule for closing a chat panel (#265). A user's close is a durable close intent
- * (`closingChatPanels`, persisted): the open, adoption and the lifecycle reconciler check it
- * first, so a panel with one is never shown again and never sent its first question. It is
- * cleared only once the archive is settled: the server archived the panel, or it was never
- * created. Until a live snapshot stops listing an archived panel, an in-memory `archived`
- * mark keeps an older snapshot from showing it again. Whatever ends a creation
- * (success, failure, interruption) settles a pending close itself, without waiting for a
- * snapshot; adoption settles one the page learns about only from a snapshot (after a reload,
- * or an open whose outcome was lost).
+ * (`closingChatPanels`, persisted) that the open, adoption and the lifecycle reconciler check
+ * first, so a closing panel is never adopted, shown or sent its first question.
+ *
+ * Replies are not authoritative; the server's ordered state is. Each close has its own id, and
+ * an archive reply applies only to the close that sent it (it records the archive's event
+ * sequence). A close is settled by a live snapshot, through the snapshot's engine sequence:
+ *
+ * - The snapshot leaves the panel out at or after this close's own archive, or after the newest
+ *   snapshot that listed it live during this close: the server archived or deleted it. The
+ *   intent is dropped.
+ * - The snapshot lists it live after this close's own archive: someone reopened it. The intent
+ *   is dropped and the panel is never archived again.
+ * - It lists it live otherwise: this close is not done yet, so it is archived (one request at a
+ *   time; a refused or lost one is tried again at the next live sighting).
+ *
+ * A snapshot without a sequence, or a capped one that may leave the panel out, settles nothing.
+ * Whatever ends a creation (success, failure, interruption) settles a pending close itself: a
+ * failure drops it (never created), anything else archives the panel without waiting for a
+ * snapshot. Adoption handles the rest, also after a reload.
  */
 import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type { EnvironmentId, ScopedThreadRef } from "@bibcode/contracts";
 
-import { useCenterPanelStore } from "./centerPanelStore";
+import { type ChatPanelCloseIntent, useCenterPanelStore } from "./centerPanelStore";
 
 /** `refused`: the server answered no (the thread is missing, or already archived). */
-export type PanelArchiveOutcome = "archived" | "refused" | "interrupted";
+export type PanelArchiveResult =
+  | { readonly kind: "archived"; readonly sequence: number }
+  | { readonly kind: "refused" }
+  | { readonly kind: "interrupted" };
 
-export type ArchivePanelThread = (ref: ScopedThreadRef) => Promise<PanelArchiveOutcome>;
+export type ArchivePanelThread = (ref: ScopedThreadRef) => Promise<PanelArchiveResult>;
 
-/** Whether the user closed `ref`'s tab: it must not be shown, adopted or sent anything. */
-export function isChatPanelClosed(ref: ScopedThreadRef): boolean {
-  const key = scopedThreadKey(ref);
-  const store = useCenterPanelStore.getState();
-  return store.closingChatPanels.includes(key) || store.chatPanelCloseProgress.has(key);
+/** This page's memory: the close each panel's archive request is in flight for. */
+const archiving = new Map<string, string>();
+/** This page's memory: the newest snapshot sequence that listed each panel live. */
+const liveSequences = new Map<string, number>();
+
+/** For a page that starts over (a reload): only the persisted intents remain. */
+export function resetChatPanelCloseMemory(): void {
+  archiving.clear();
+  liveSequences.clear();
 }
 
-/** Records the user's close of `ref` and archives it now, unless its creation is in flight. */
+/** The panels whose archive request is in flight. */
+export function archivingChatPanels(): ReadonlySet<string> {
+  return new Set(archiving.keys());
+}
+
+function closeIntent(key: string): ChatPanelCloseIntent | undefined {
+  return useCenterPanelStore.getState().closingChatPanels.find((intent) => intent.key === key);
+}
+
+/** Whether the user closed `ref`'s tab and the close is not settled. */
+export function isChatPanelClosed(ref: ScopedThreadRef): boolean {
+  return closeIntent(scopedThreadKey(ref)) !== undefined;
+}
+
+/** Records a new close of `ref` and archives it now, unless its creation is in flight. */
 export function closeChatPanel(ref: ScopedThreadRef, archive: ArchivePanelThread): void {
   const store = useCenterPanelStore.getState();
-  // A new close is a new intent, also for a panel archived here before and reopened elsewhere.
-  if (store.chatPanelCloseProgress.get(scopedThreadKey(ref)) === "archived") {
-    store.setChatPanelCloseProgress(ref, null);
-  }
-  store.recordChatPanelClose(ref);
-  // The tab is gone; the close intent, not the reservation, now keeps the panel from showing.
+  store.recordChatPanelClose(ref, liveSequences.get(scopedThreadKey(ref)));
+  // The tab is gone; the close intent, not the reservation, keeps the panel from showing.
   store.releaseChatPanelReservation(ref);
   settleChatPanelClose(ref, archive);
 }
 
 /**
- * Archives a closing panel once at a time. Skipped while this page still waits on its
- * `createPanel`, whose end settles it, and once the server archived it.
+ * Archives a closing panel, one request at a time. Skipped while this page still waits on its
+ * `createPanel`, whose end settles it, and once its close has its own archive.
  */
 export function settleChatPanelClose(ref: ScopedThreadRef, archive: ArchivePanelThread): void {
   const key = scopedThreadKey(ref);
-  const store = useCenterPanelStore.getState();
+  const intent = closeIntent(key);
   if (
-    !store.closingChatPanels.includes(key) ||
-    store.creatingChatPanelThreadKeys.has(key) ||
-    store.chatPanelCloseProgress.has(key)
+    !intent ||
+    intent.archivedAt !== undefined ||
+    archiving.has(key) ||
+    useCenterPanelStore.getState().creatingChatPanelThreadKeys.has(key)
   ) {
     return;
   }
-  store.setChatPanelCloseProgress(ref, "archiving");
-  void archive(ref).then((outcome) => {
-    const current = useCenterPanelStore.getState();
-    // Reopened meanwhile: the user wants it back.
-    if (!current.closingChatPanels.includes(key)) {
-      current.setChatPanelCloseProgress(ref, null);
-      return;
+  const { closeId } = intent;
+  archiving.set(key, closeId);
+  void archive(ref).then((result) => {
+    if (archiving.get(key) === closeId) archiving.delete(key);
+    // Applies to this close only; a newer close or a reopen is left alone.
+    if (result.kind === "archived") {
+      useCenterPanelStore
+        .getState()
+        .updateChatPanelClose(ref, closeId, { archivedAt: result.sequence });
     }
-    if (outcome === "archived") {
-      // Settled: the intent goes, and the mark holds until a snapshot stops listing it.
-      current.clearChatPanelClose(ref);
-      useCenterPanelStore.getState().setChatPanelCloseProgress(ref, "archived");
-      return;
-    }
-    // A refusal or a lost answer is tried again when a snapshot shows the panel live.
-    current.setChatPanelCloseProgress(ref, null);
+    // A newer close of the same panel waited on this request; it gets its own archive now.
+    if (closeIntent(key)?.closeId !== closeId) settleChatPanelClose(ref, archive);
   });
 }
 
@@ -77,25 +102,61 @@ export function forgetChatPanelClose(ref: ScopedThreadRef): void {
   useCenterPanelStore.getState().clearChatPanelClose(ref);
 }
 
+/** Drops the close of a panel whose creation the server refused: it never existed. */
+export function dropChatPanelCloseOfUncreated(ref: ScopedThreadRef): void {
+  useCenterPanelStore.getState().clearChatPanelClose(ref);
+}
+
 /**
- * Applies a live snapshot of `environmentId`: archives a closing panel the snapshot shows
- * live, and drops the `archived` mark of one it no longer lists. A live sighting of an
- * archived panel is an older snapshot, so it is left alone.
+ * Applies a live snapshot of `environmentId` taken at the server's `sequence` (see the module
+ * comment). `capped`: the snapshot may leave live panels out. Returns the panels someone
+ * reopened after this page closed them, which adoption shows again.
  */
 export function reconcileChatPanelCloses(
   environmentId: EnvironmentId,
   liveThreadIds: ReadonlySet<string>,
+  sequence: number | undefined,
+  capped: boolean,
   archive: ArchivePanelThread | undefined,
-): void {
+): ReadonlySet<string> {
+  const reopened = new Set<string>();
+  if (sequence !== undefined) {
+    for (const threadId of liveThreadIds) {
+      const key = scopedThreadKey({ environmentId, threadId } as ScopedThreadRef);
+      if ((liveSequences.get(key) ?? -1) < sequence) liveSequences.set(key, sequence);
+    }
+  }
   const store = useCenterPanelStore.getState();
-  for (const key of store.closingChatPanels) {
-    const ref = parseScopedThreadKey(key);
+  for (const intent of store.closingChatPanels) {
+    const ref = parseScopedThreadKey(intent.key);
     if (!ref || ref.environmentId !== environmentId) continue;
-    if (archive && liveThreadIds.has(ref.threadId)) settleChatPanelClose(ref, archive);
+    const live = liveThreadIds.has(ref.threadId);
+    if (sequence === undefined) {
+      // No ordering: nothing settles, but a live closing panel is still archived once.
+      if (live && archive && intent.archivedAt === undefined) settleChatPanelClose(ref, archive);
+      continue;
+    }
+    if (live) {
+      if (intent.archivedAt !== undefined) {
+        // After this close's archive, it is live again: someone reopened it.
+        if (sequence > intent.archivedAt) {
+          store.clearChatPanelClose(ref, intent.closeId);
+          reopened.add(ref.threadId);
+        }
+        continue;
+      }
+      if ((intent.liveAt ?? -1) < sequence) {
+        store.updateChatPanelClose(ref, intent.closeId, { liveAt: sequence });
+      }
+      if (archive) settleChatPanelClose(ref, archive);
+      continue;
+    }
+    if (capped) continue;
+    const goneAfterOwnArchive = intent.archivedAt !== undefined && sequence >= intent.archivedAt;
+    const goneAfterLastSighting = intent.liveAt !== undefined && sequence > intent.liveAt;
+    if (goneAfterOwnArchive || goneAfterLastSighting) {
+      store.clearChatPanelClose(ref, intent.closeId);
+    }
   }
-  for (const [key, progress] of store.chatPanelCloseProgress) {
-    const ref = parseScopedThreadKey(key);
-    if (progress !== "archived" || !ref || ref.environmentId !== environmentId) continue;
-    if (!liveThreadIds.has(ref.threadId)) store.setChatPanelCloseProgress(ref, null);
-  }
+  return reopened;
 }

@@ -41,7 +41,8 @@ import {
   forgetChatPanelClose,
   isChatPanelClosed,
   settleChatPanelClose,
-  type PanelArchiveOutcome,
+  dropChatPanelCloseOfUncreated,
+  type PanelArchiveResult,
 } from "~/centerPanelClose";
 import { useCenterPanelStore, type CenterSurface } from "~/centerPanelStore";
 import { useComposerDraftStore } from "~/composerDraftStore";
@@ -252,7 +253,7 @@ export function useCenterPanelActions({
   const { reopenChatPanel, openPanelThread } = usePanelThreadOpener();
 
   const archivePanelThread = useCallback(
-    async ({ environmentId, threadId }: ScopedThreadRef): Promise<PanelArchiveOutcome> => {
+    async ({ environmentId, threadId }: ScopedThreadRef): Promise<PanelArchiveResult> => {
       const session = readThreadShell(scopeThreadRef(environmentId, threadId))?.session;
       if (session?.status === "running") {
         // Best effort: an interrupt that fails must not keep the closed panel live.
@@ -265,8 +266,8 @@ export function useCenterPanelActions({
         });
       }
       const result = await archiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Success") return "archived";
-      if (isAtomCommandInterrupted(result)) return "interrupted";
+      if (result._tag === "Success") return { kind: "archived", sequence: result.value.sequence };
+      if (isAtomCommandInterrupted(result)) return { kind: "interrupted" };
       // Only a panel this page knows to exist failed to close; a not yet created one is
       // archived once it shows up.
       if (readThreadShell(scopeThreadRef(environmentId, threadId))?.archivedAt === null) {
@@ -279,7 +280,7 @@ export function useCenterPanelActions({
           }),
         );
       }
-      return "refused";
+      return { kind: "refused" };
     },
     [archiveThread, interruptTurn],
   );
@@ -315,7 +316,7 @@ export function useCenterPanelActions({
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         composerFocusRequests.delete(scopedThreadKey(panelRef));
         // Never created: a close made meanwhile is settled with it.
-        if (closed) forgetChatPanelClose(panelRef);
+        if (closed) dropChatPanelCloseOfUncreated(panelRef);
         store.removeThread(panelRef);
         const error = squashAtomCommandFailure(result);
         toastManager.add(
