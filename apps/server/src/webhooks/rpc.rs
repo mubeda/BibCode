@@ -154,11 +154,14 @@ struct UpsertInput {
     bearer_token: Option<Option<String>>,
 }
 
-/// A field that is present, as `Some`, so `null` and absent differ.
+/// A field that is present, as `Some`, so `null` and absent differ. A value of the wrong
+/// type gets fixed text, because serde's own error quotes it and it may be the token.
 fn present<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(deserializer).map(Some)
+    Option::<String>::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("bearerToken must be a string or null"))
 }
 
 /// A bearer token as it is stored: trimmed, 1 to 1,024 bytes of visible ASCII, so it is
@@ -656,5 +659,27 @@ mod tests {
             fixture("token-set").bearer_token,
             Some(Some("fixture-token".to_owned()))
         );
+    }
+
+    /// A token of the wrong JSON type is refused without echoing it, so neither the
+    /// reply nor the RPC trace that records the reply holds it.
+    #[test]
+    fn a_bearer_token_of_the_wrong_type_is_refused_without_its_value() {
+        for token in [
+            json!(123_456_789_012_345_u64),
+            json!(["SECRET9x"]),
+            json!({ "SECRET9x": 1 }),
+        ] {
+            let refusal = decode::<UpsertInput>(json!({
+                "name": "n", "url": "https://example.test/h", "enabled": true,
+                "eventTypes": [], "bearerToken": token,
+            }))
+            .err()
+            .unwrap();
+            assert_eq!(refusal["reason"], "invalid");
+            let shown = refusal.to_string();
+            assert!(!shown.contains("123456789012345"), "{shown}");
+            assert!(!shown.contains("SECRET9x"), "{shown}");
+        }
     }
 }
