@@ -342,6 +342,13 @@ mod tests {
         assert_eq!(body["requestId"], "q-1");
         assert_eq!(body["status"], "expired");
         assert!(!body.to_string().contains(MARKER), "{body}");
+        // An agent's purpose is text it chose: the feed entry has it, the payload never.
+        let panel = from_feed_entry(
+            &json!({ "kind": "panel.created", "cursor": "v1.9.3", "threadId": "t2", "purpose": MARKER }),
+            None,
+        )
+        .expect("a panel event");
+        assert!(!panel.body("env-1").contains(MARKER));
         let finding = from_finding("f1", 3, "2026-10-31T00:00:01Z");
         let body: Value = serde_json::from_str(&finding.body("env-1")).unwrap();
         assert_eq!(

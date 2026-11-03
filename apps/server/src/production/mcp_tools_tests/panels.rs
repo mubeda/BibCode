@@ -66,6 +66,8 @@ async fn a_panel_created_over_mcp_is_shown_to_every_client_and_a_keyed_retry_ret
     let harness = &fixture.harness;
     let (agent, _) = harness.agent(McpAccess::FullAccess).await;
     let host = host(harness, &agent, "feature-panel").await;
+    let from = harness.call(&agent, "changes_since", json!({})).await;
+    let from = structured(&from)["cursor"].clone();
     let arguments = json!({
         "hostThreadId": host, "title": "Review", "purpose": "Review the diff", "clientRequestId": "panel-1",
     });
@@ -91,6 +93,19 @@ async fn a_panel_created_over_mcp_is_shown_to_every_client_and_a_keyed_retry_ret
     assert_eq!(shown[0]["kind"], "panel");
     assert_eq!(shown[0]["hostThreadId"], host.as_str());
     assert_eq!(shown[0]["requester"]["purpose"], "Review the diff");
+    // The change feed's entry for it carries the purpose too.
+    let changes = harness
+        .call(&agent, "changes_since", json!({ "cursor": from }))
+        .await;
+    let created = structured(&changes)["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "panel.created")
+        .cloned()
+        .unwrap_or_else(|| panic!("a panel.created entry: {changes}"));
+    assert_eq!(created["threadId"], panel_id.as_str());
+    assert_eq!(created["purpose"], "Review the diff");
     assert_eq!(
         shown[0]["requester"]["actor"]["clientId"],
         agent.principal.session_id.as_str()

@@ -1629,6 +1629,8 @@ pub(crate) fn thread_summary(thread: &Value) -> Value {
         "interactionMode": thread["interactionMode"],
         "branch": thread["branch"],
         "hostThreadId": thread.get("hostThreadId"),
+        // The agent that created it and why; null for a person's thread.
+        "requester": thread.get("requester").cloned().unwrap_or(Value::Null),
         "archived": !thread["archivedAt"].is_null(),
         "updatedAt": thread["updatedAt"],
     });

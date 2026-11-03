@@ -360,7 +360,7 @@ These two belong to no set: they are always listed and work at read-only.
 - **Following changes.** Call `changes_since` once without a cursor: it returns where the
   logs are now and no entries. Pass each call's `cursor` to the next, and call again at once
   while `more` is true. An entry is `{ cursor, at, kind, threadId, status, requestId,
-  actor }`, never text:
+  actor, purpose }`, never text but the `purpose` an agent gave what it created:
   - `thread.created`, `panel.created`, `thread.archived`;
   - `turn.requested`, `turn.started`, `turn.completed`, `turn.interrupted`, `turn.failed`,
     and `session.status` for any other change of the session's status;

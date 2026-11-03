@@ -2823,8 +2823,9 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   events; each mutating call writes a content-free `mcp_activity` row
   (`mcp/activity.rs`); Stop, Take over and Hand back act on the session.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
-  the activity log by a monotonic cursor without reading payload text; the
-  webhook dispatcher follows the same pages.
+  the activity log by a monotonic cursor without reading payload text other than
+  an agent's `purpose` on `thread.created`; the webhook dispatcher follows the same
+  pages and copies no `purpose`.
 - **Drift test.** `mcp::reference_docs` fails when a registered client tool,
   a `feed::ERRORS` tag or a webhook event type is missing from
   `docs/reference/`.
