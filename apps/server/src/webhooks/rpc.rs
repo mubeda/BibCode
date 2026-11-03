@@ -186,6 +186,17 @@ fn bearer_token(value: &str) -> Result<String, Value> {
     Ok(token.to_owned())
 }
 
+/// An upsert can hold a token, and serde's errors quote values and unknown keys, so a
+/// malformed one gets fixed text that never reaches the reply or the RPC trace.
+fn decode_upsert(payload: Value) -> Result<UpsertInput, Value> {
+    serde_json::from_value(payload).map_err(|_| {
+        refusal(
+            "invalid",
+            "Invalid request: an endpoint needs name, url, enabled and eventTypes, and bearerToken must be a string or null.",
+        )
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RedeliverInput {
@@ -246,7 +257,7 @@ impl Webhooks {
     }
 
     pub(super) async fn upsert(&self, payload: Value) -> Result<Value, Value> {
-        let input: UpsertInput = decode(payload)?;
+        let input = decode_upsert(payload)?;
         let name = input.name.trim().to_owned();
         if name.is_empty()
             || name.chars().count() > MAX_NAME_CHARS
@@ -661,21 +672,25 @@ mod tests {
         );
     }
 
-    /// A token of the wrong JSON type is refused without echoing it, so neither the
-    /// reply nor the RPC trace that records the reply holds it.
+    /// A malformed upsert is refused without echoing a token, so neither the reply nor
+    /// the RPC trace that records the reply holds it.
     #[test]
     fn a_bearer_token_of_the_wrong_type_is_refused_without_its_value() {
-        for token in [
-            json!(123_456_789_012_345_u64),
-            json!(["SECRET9x"]),
-            json!({ "SECRET9x": 1 }),
-        ] {
-            let refusal = decode::<UpsertInput>(json!({
+        let endpoint = |token: Value| {
+            json!({
                 "name": "n", "url": "https://example.test/h", "enabled": true,
                 "eventTypes": [], "bearerToken": token,
-            }))
-            .err()
-            .unwrap();
+            })
+        };
+        for payload in [
+            endpoint(json!(123_456_789_012_345_u64)),
+            endpoint(json!(["SECRET9x"])),
+            endpoint(json!({ "SECRET9x": 1 })),
+            // A token pasted as the whole payload or as a key.
+            json!("SECRET9x"),
+            json!({ "SECRET9x": null }),
+        ] {
+            let refusal = decode_upsert(payload).err().unwrap();
             assert_eq!(refusal["reason"], "invalid");
             let shown = refusal.to_string();
             assert!(!shown.contains("123456789012345"), "{shown}");
