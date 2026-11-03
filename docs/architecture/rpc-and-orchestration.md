@@ -2180,6 +2180,12 @@ archive is. A delete settles the close as an archive does: the shell that
 reaches its sequence no longer lists the panel, and it never reaches **Reopen
 closed chat**, which lists archived panels only.
 
+**Bring back** in a side chat composes, on the client, the last finished
+assistant answer quoted under the user question before it
+(`apps/web/src/sideChatBringBack.ts`) and appends it to the host's composer
+draft. It sends nothing and calls no RPC; it is disabled while the host's
+session is running.
+
 Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the
