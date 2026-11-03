@@ -5317,8 +5317,23 @@ mod tests {
                     };
                     let staged = staging.join(name);
                     let bytes = fs::read(&staged).expect("staged bytes");
-                    fs::remove_file(&staged).expect("remove staged");
-                    fs::write(&staged, bytes).expect("same bytes, new identity");
+                    // Create the copy while the original still holds its inode, then rename it
+                    // over: remove-then-write lets Linux hand the freed inode number back.
+                    let replacement = staging.join("replacement.tmp");
+                    fs::write(&replacement, bytes).expect("same bytes");
+                    #[cfg(unix)]
+                    let original = {
+                        use std::os::unix::fs::MetadataExt;
+                        fs::metadata(&staged).expect("staged metadata").ino()
+                    };
+                    fs::rename(&replacement, &staged).expect("same bytes, new identity");
+                    assert!(!replacement.exists(), "{case}: no stray staging entry");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        let replaced = fs::metadata(&staged).expect("replaced metadata").ino();
+                        assert_ne!(replaced, original, "{case}: the staged file has a new inode");
+                    }
                 }
                 missing => {
                     if missing != "staged-marker-missing" {
@@ -5333,9 +5348,10 @@ mod tests {
             let staging_before = entries(&staging);
             let journal_before = fs::read(&journal_path).expect("journal bytes");
 
-            let error = resume_recovery(&fixture.resolved)
-                .await
-                .expect_err("resume refuses");
+            let error = match resume_recovery(&fixture.resolved).await {
+                Ok(resumed) => panic!("{case}: resume refuses, but it resumed: {resumed:?}"),
+                Err(error) => error,
+            };
 
             assert!(
                 matches!(error, RecoveryError::ResumeRefused { .. }),
