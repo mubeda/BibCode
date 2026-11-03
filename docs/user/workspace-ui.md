@@ -456,6 +456,7 @@ moved between split panes, or closed from the center layout without deleting the
 thread. While present, it remains mounted throughout layout and tab changes. The
 chat header `+` menu contains:
 
+- Side chat, which opens an empty [side chat](#side-chats) of this thread
 - enabled AI providers, which create new chat panels
 - Reopen closed chat, which lists this thread's ten most recently closed chat
   panels, newest first; it is disabled with **No closed chats** when there are
@@ -477,6 +478,42 @@ behind a stopped turn then offer **Send now**), and a
 the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
+Closing a tab whose panel is still being created opens nothing: the panel is
+closed as soon as the server creates it, also after a reload.
+
+### Side chats
+
+A side chat is a chat panel that starts with what its thread knows. Use it to
+ask about the thread while it keeps working, without adding to its messages,
+queue or context. Type `:btw <question>` or `:side <question>` as the whole
+message in a thread's composer, or choose **Side chat** in the `+` menu. The
+side chat opens as the active tab, runs on the thread's provider and model, and
+sends your question there; the thread's composer is cleared once it did. A bare
+`:btw` (or the menu) opens an empty side chat with focus in its composer. The
+`:` menu lists `:btw` and `:side` with the other composer actions (`:model`,
+`:plan`, `:default`); `/btw` still goes to the provider as its own command.
+
+Its first answer is based on the thread's delivered messages, up to the last 40
+and 24,000 characters, sent with that first question; the work log shows
+**Started with the thread's last N messages**. Later questions use the side
+chat's own history. It sees message text only, not tool output or attachments,
+and reads files from the same checkout, which the thread may still be changing.
+A side chat starts in **Supervised** mode, so it asks before it edits files or
+runs commands; its runtime mode picker can change that. Its tab reads **Side chat
+· <provider>**. It keeps no checkpoints and offers no restore: restore files from
+the main thread.
+
+Side chats follow the chat panel rules: hidden from the left panel and Settings
+→ Archived, an Inbox row opens the thread with the side chat active, closing
+archives it, **Reopen closed chat** lists it, and deleting the thread deletes
+it. **Side chat** and `:btw` are unavailable inside a chat panel or side chat
+("Side chats start from the main chat. Use :btw there."), on a server too old to
+support them ("This server doesn't support side chats. Update it to use
+them."), before the thread has started, and while the thread's provider is not
+ready. The menu item stays visible with its reason; a refused `:btw` keeps your
+text and shows the reason under the composer. A `:btw` with attachments or
+contexts is refused too, so nothing is split between two chats. If the question
+can't be sent, it waits in the side chat's composer.
 
 The composer's **History** button (left of **Attach files**) brings back
 earlier work for the thread, in a chat panel's composer too, where it acts for

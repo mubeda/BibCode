@@ -44,6 +44,7 @@ const desktopUiSpecFiles =
         "./specs/terminal-font.e2e.ts",
         "./specs/composer-native-triggers.e2e.ts",
         "./specs/composer-message-queue.e2e.ts",
+        "./specs/chat-side-chat.e2e.ts",
         "./specs/chat-activity-panel.e2e.ts",
         "./specs/chat-reasoning-rows.e2e.ts",
         "./specs/chat-huge-thread-scroll.e2e.ts",

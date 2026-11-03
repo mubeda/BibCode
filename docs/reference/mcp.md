@@ -1270,7 +1270,7 @@ Lists BiBCode projects (with their folders) and their threads, newest first, wit
 **Result** (`structuredContent`):
 
 - `projects`: array of `{ projectId, title, workspaceRoot, defaultModelSelection }` (`defaultModelSelection` is `{ instanceId, model }` or null). Not limited by `limit`; only the result-size fit can shorten it.
-- `threads`: array of thread summaries, sorted by `updatedAt` descending then `threadId`: `{ threadId, projectId, title, status, hasPendingApprovals, hasPendingUserInput, latestTurn, providerInstanceId, model, runtimeMode, interactionMode, branch, hostThreadId, archived, updatedAt }`. `latestTurn` is `{ turnId, state, completedAt }` or null. `hostThreadId` is set on a chat panel (its host thread). `branch` is null for a thread in the project's folder.
+- `threads`: array of thread summaries, sorted by `updatedAt` descending then `threadId`: `{ threadId, projectId, title, status, hasPendingApprovals, hasPendingUserInput, latestTurn, providerInstanceId, model, runtimeMode, interactionMode, branch, hostThreadId, archived, updatedAt }`. `latestTurn` is `{ turnId, state, completedAt }` or null. `hostThreadId` is set on a chat panel (its host thread). A side chat (a chat panel that started with its host's messages) also has `sideChat: true`; other threads leave the field out. `branch` is null for a thread in the project's folder.
 - `threadCount`, `projectCount`: totals after the `projectId` and `includeArchived` filters, not the page sizes.
 - `nextCursor`: string or null (`t:<n>`); null when no more threads. Treat as opaque.
 - `nextProjectCursor`: string or null (`p:<n>`); null when no more projects. Treat as opaque.
@@ -1950,7 +1950,7 @@ Lists the open chat panels of a host thread, with each one's status, model and m
 **Result** (`structuredContent`):
 
 - `hostThreadId`: string.
-- `panels`: array of thread summaries (the same fields as in `list_projects_and_threads`: `threadId`, `projectId`, `title`, `status`, `hasPendingApprovals`, `hasPendingUserInput`, `latestTurn`, `providerInstanceId`, `model`, `runtimeMode`, `interactionMode`, `branch`, `hostThreadId`, `archived`, `updatedAt`) plus `requester` (null, or `{ actor, purpose }` for a panel an outside agent opened). Only non-archived panels of this host are listed.
+- `panels`: array of thread summaries (the same fields as in `list_projects_and_threads`: `threadId`, `projectId`, `title`, `status`, `hasPendingApprovals`, `hasPendingUserInput`, `latestTurn`, `providerInstanceId`, `model`, `runtimeMode`, `interactionMode`, `branch`, `hostThreadId`, `archived`, `updatedAt`, and `sideChat: true` on a side chat) plus `requester` (null, or `{ actor, purpose }` for a panel an outside agent opened). Only non-archived panels of this host are listed.
 - `truncated`: true when panels were dropped from the end to fit the size cap (at least one is kept).
 
 **Errors:** `McpNotAHostThreadError`, `McpThreadNotFoundError`.

@@ -104,6 +104,16 @@ selected workspace thread. Extra chat surfaces use panel threads; closing one
 deletes that panel thread. Closing a split pane instead merges its surfaces into
 an adjacent group without closing them.
 
+### Side Chat
+
+A chat panel that starts with what its host thread knows (#265): a panel thread
+with `sideChat: true`, opened with `:btw <question>`, `:side <question>` or
+**Side chat** in the chat header **+** menu. Its first turn carries the host's
+delivered messages; nothing in it reaches the host's messages, queue or turn.
+It starts in `approval-required`, its tab reads **Side chat · <provider>**, and
+it follows the panel thread rules. See
+[Side chats](../user/workspace-ui.md#side-chats).
+
 ### Right Panel
 
 The tool surface area for the active thread. Its supported surface kinds are
@@ -223,7 +233,9 @@ actor and thread or terminal scope.
 
 ### Checkpoint
 
-A saved snapshot of workspace state at a particular turn.
+A saved snapshot of workspace state at a particular turn. A side chat captures
+none and cannot revert: it shares its host's checkout, so files are restored
+from the main thread.
 
 ### Checkpoint Baseline
 

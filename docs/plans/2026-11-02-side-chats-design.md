@@ -99,9 +99,9 @@ messages, which do not include the host. The activity follows the precedent of
 - `projection_threads.side_chat INTEGER NOT NULL DEFAULT 0`, added by a guarded `ALTER TABLE`
   like `migration_054` (the table may be absent in a trusted-ledger restore). Name:
   `ProjectionThreadSideChat`.
-- **Migration id: 66.** Main is at 62 and #247, #259 and #269 claim 63, 64 and 65. If any of
-  them has not merged when this lands, the id is renumbered at merge time to the next free
-  one; the list is append-only and the id carries no other meaning.
+- **Migration id: 67.** Ids 63 to 66 were taken on the batch branch when this landed (66 is
+  `WebhookBearerSecret`), so the side chat column is 67. The list is append-only and the id
+  carries no other meaning.
 - `ProjectionThread.side_chat: bool` with `#[serde(default)]`; `THREAD_SELECT` and the upsert
   gain the column.
 - The projector reads `sideChat` from `thread.created` (beside `hostThreadId`,
@@ -413,7 +413,7 @@ Each test fails before its change. Rust runs through `node scripts/run-msvc.mjs 
   `side_chat_marker_requires_a_panel_with_a_host`,
   `host_delete_cascades_to_open_and_archived_side_chats`,
   `side_chat_marker_round_trips_through_projection_threads`.
-- `persistence/migrations.rs`: `migration_066_adds_the_side_chat_column_defaulting_false`.
+- `persistence/migrations.rs`: `migration_067_adds_the_side_chat_column_defaulting_false`.
 - `production/worktree_catalog_rpc.rs`:
   `create_panel_with_side_chat_records_the_marker_and_replays`,
   `create_panel_replays_a_receipt_stored_before_side_chats` (an old-format digest still
