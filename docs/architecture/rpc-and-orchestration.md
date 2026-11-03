@@ -2130,15 +2130,22 @@ fall back to `HEAD` and clean the host's uncommitted work.
 The client opens a side chat with `createPanel` (`sideChat: true`,
 `approval-required`, the host's model) and then sends its question with
 `thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
-draft stays until the question was handed over. A tab closed while any panel
-is still being created records the close in the persisted
-`closedBeforeCreated` list (center panel store version 5, at most 20 keys). The
-open marks the panel as being created until `createPanel` answers, a mark a
-live snapshot never releases (it does release the reservation), so a close in
-that window is always recorded and a closed side chat never sends its question.
-The panel is archived once it exists: by the open itself, or by adoption after
-a reload or an open whose outcome was lost. Adoption skips a panel still being
-created and does not track a reserved one, so a later snapshot decides again.
+draft stays until the question was handed over.
+
+Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): the
+user's close is a durable close intent (`closingChatPanels`, persisted in the
+center panel store, version 5, at most 50 keys), which the open, adoption and
+the lifecycle reconciler check before anything else, so a closing panel is
+never adopted, shown again or sent its first question. The intent is cleared
+only once the close is settled: the server archived the panel, or it was never
+created. An in-memory `archived` mark then keeps an older live snapshot from
+showing it until a snapshot stops listing it. Whatever ends a creation
+(success, failure or interruption) settles a pending close itself: it archives
+the panel, or drops the intent when the server refused the creation. A panel
+this page learns about only from a snapshot (after a reload, or an open whose
+answer was lost) is archived by adoption when a snapshot shows it live. Archives
+run one at a time per panel, a reopen forgets the close, and a refused or lost
+archive is tried again at the next live sighting.
 
 Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present

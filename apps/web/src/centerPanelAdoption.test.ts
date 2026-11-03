@@ -64,101 +64,75 @@ describe("center panel adoption", () => {
       byThreadKey: {},
       pendingChatPanelThreadKeys: new Set(),
       creatingChatPanelThreadKeys: new Set(),
-      closedBeforeCreated: [],
+      chatPanelCloseProgress: new Map(),
+      closingChatPanels: [],
     });
     release.mockClear();
   });
 
-  it("archives a closed panel whose interrupted creation kept its reservation", async () => {
+  it("archives a closed panel a snapshot shows live and never adopts it", async () => {
     const lateRef = scopeThreadRef(ENV, ThreadId.make("panel-late"));
-    // Closed during creation; the request was then interrupted, so the reservation stays.
+    // Closed while it was being created, then the page reloaded: only the intent remains,
+    // with a reservation an interrupted open could have kept.
     useCenterPanelStore.setState({
       pendingChatPanelThreadKeys: new Set([scopedThreadKey(lateRef)]),
     });
-    useCenterPanelStore.getState().recordClosedBeforeCreated(lateRef);
+    useCenterPanelStore.getState().recordChatPanelClose(lateRef);
     const tracker = createCenterPanelAdoptionTracker();
-    const archive = vi.fn(() => Promise.resolve(true));
-
-    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(archive).toHaveBeenCalledWith("panel-late");
-    expect(surfaceIds()).not.toContain("chat:panel-late");
-    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([]);
-    expect(useCenterPanelStore.getState().pendingChatPanelThreadKeys.size).toBe(0);
-  });
-
-  it("leaves a panel still being created to its open, then adopts it once", () => {
-    const creatingRef = scopeThreadRef(ENV, ThreadId.make("panel-creating"));
-    useCenterPanelStore.getState().beginChatPanelCreation(creatingRef);
-    useCenterPanelStore.getState().recordClosedBeforeCreated(creatingRef);
-    const tracker = createCenterPanelAdoptionTracker();
-    const archive = vi.fn(() => Promise.resolve(true));
-
-    applyPanelThreadAdoption(
-      ENV,
-      tracker,
-      [hostThread, panelThread("panel-creating")],
-      false,
-      archive,
-    );
-    // The open archives it itself when `createPanel` settles.
-    expect(archive).not.toHaveBeenCalled();
-    expect(surfaceIds()).not.toContain("chat:panel-creating");
-
-    useCenterPanelStore.getState().endChatPanelCreation(creatingRef);
-    useCenterPanelStore.getState().clearClosedBeforeCreated(creatingRef);
-    applyPanelThreadAdoption(
-      ENV,
-      tracker,
-      [hostThread, panelThread("panel-creating")],
-      false,
-      archive,
-    );
-    expect(archive).not.toHaveBeenCalled();
-    expect(surfaceIds()).toContain("chat:panel-creating");
-  });
-
-  it("archives a panel closed before creation when it appears after a reload", async () => {
-    const lateRef = scopeThreadRef(ENV, ThreadId.make("panel-late"));
-    // The tab closed while the server was creating the panel; then the page reloaded, so
-    // only the persisted list remains (no reservation, a new tracker).
-    useCenterPanelStore.getState().recordClosedBeforeCreated(lateRef);
-    const tracker = createCenterPanelAdoptionTracker();
-    let settle!: (settled: boolean) => void;
+    let settle!: (outcome: "archived") => void;
     const archive = vi.fn(
       () =>
-        new Promise<boolean>((resolve) => {
+        new Promise<"archived">((resolve) => {
           settle = resolve;
         }),
     );
 
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
-
     expect(archive).toHaveBeenCalledTimes(1);
-    expect(archive).toHaveBeenCalledWith("panel-late");
+    expect(archive).toHaveBeenCalledWith(lateRef);
     expect(surfaceIds()).not.toContain("chat:panel-late");
-    // Kept until the archive settles, so an interrupted one is asked for again.
-    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([scopedThreadKey(lateRef)]);
-    settle(true);
+
+    settle("archived");
     await Promise.resolve();
     await Promise.resolve();
-    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([]);
+    // Settled: the intent goes; an older snapshot that still lists it shows nothing.
+    expect(useCenterPanelStore.getState().closingChatPanels).toEqual([]);
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
+    expect(surfaceIds()).not.toContain("chat:panel-late");
+    expect(archive).toHaveBeenCalledTimes(1);
+    // Once a snapshot drops it, no mark is left.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread], false, archive);
+    expect(useCenterPanelStore.getState().chatPanelCloseProgress.size).toBe(0);
   });
 
-  it("asks again for an archive that did not settle", async () => {
+  it("asks again for an archive that was interrupted or refused", async () => {
     const lateRef = scopeThreadRef(ENV, ThreadId.make("panel-late"));
-    useCenterPanelStore.getState().recordClosedBeforeCreated(lateRef);
+    useCenterPanelStore.getState().recordChatPanelClose(lateRef);
     const tracker = createCenterPanelAdoptionTracker();
-    const archive = vi.fn(() => Promise.resolve(false));
+    const archive = vi.fn(() => Promise.resolve("interrupted" as const));
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
     await Promise.resolve();
     await Promise.resolve();
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-late")], false, archive);
     expect(archive).toHaveBeenCalledTimes(2);
-    expect(useCenterPanelStore.getState().closedBeforeCreated).toEqual([scopedThreadKey(lateRef)]);
+    expect(useCenterPanelStore.getState().closingChatPanels).toEqual([scopedThreadKey(lateRef)]);
+  });
+
+  it("leaves a closing panel this page is still creating to its open", () => {
+    const creatingRef = scopeThreadRef(ENV, ThreadId.make("panel-creating"));
+    useCenterPanelStore.getState().beginChatPanelCreation(creatingRef);
+    useCenterPanelStore.getState().recordChatPanelClose(creatingRef);
+    const archive = vi.fn(() => Promise.resolve("archived" as const));
+    applyPanelThreadAdoption(
+      ENV,
+      createCenterPanelAdoptionTracker(),
+      [hostThread, panelThread("panel-creating")],
+      false,
+      archive,
+    );
+    expect(archive).not.toHaveBeenCalled();
+    expect(surfaceIds()).not.toContain("chat:panel-creating");
   });
 
   it("adopts a center terminal another client opened as an inactive tab with its command", () => {

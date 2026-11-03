@@ -9,8 +9,8 @@
  * deleted elsewhere) loses its tab, and is adopted again if it is reopened. A
  * capped list (#223) leaves finished panels out, so leaving it proves nothing:
  * the panel keeps its tab, and the lifecycle reconciler drops it once the server
- * reports it archived or missing. A panel this client closed while it was still being
- * created (`closedBeforeCreated`) is archived instead of adopted, also after a reload.
+ * reports it archived or missing. A panel this client closed is never adopted: its close
+ * intent is checked first, and a live sighting archives it (see `centerPanelClose`).
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -21,6 +21,11 @@ import {
   type TerminalSummary,
 } from "@bibcode/contracts";
 
+import {
+  type ArchivePanelThread,
+  isChatPanelClosed,
+  reconcileChatPanelCloses,
+} from "./centerPanelClose";
 import { useCenterPanelStore } from "./centerPanelStore";
 import { useRightPanelStore } from "./rightPanelStore";
 import { isTerminalIdReserved } from "./terminalIdReservations";
@@ -28,20 +33,11 @@ import { isTerminalIdReserved } from "./terminalIdReservations";
 export interface CenterPanelAdoptionTracker {
   readonly terminalKeys: Set<string>;
   readonly panelThreadIds: Set<string>;
-  /** Panels closed before creation whose archive is in flight, so it is asked for once. */
-  readonly closingPanelThreadIds: Set<string>;
 }
 
 export function createCenterPanelAdoptionTracker(): CenterPanelAdoptionTracker {
-  return { terminalKeys: new Set(), panelThreadIds: new Set(), closingPanelThreadIds: new Set() };
+  return { terminalKeys: new Set(), panelThreadIds: new Set() };
 }
-
-/**
- * Archives a panel this client closed before the server created it. Resolves whether the
- * close is settled (archived, or refused by the server); an interrupted request is retried at
- * the next snapshot.
- */
-export type ArchiveClosedPanel = (threadId: ThreadId) => Promise<boolean>;
 
 // Panels titled before the colon form used an em dash; adoption still accepts both.
 const PANEL_TITLE_PREFIX = /^Panel(?: \u2014|:) /u;
@@ -114,11 +110,13 @@ export function applyPanelThreadAdoption(
     Pick<OrchestrationThreadShell, "id" | "kind" | "hostThreadId" | "title" | "archivedAt">
   >,
   capped = false,
-  archiveClosedPanel?: ArchiveClosedPanel,
+  archiveClosedPanel?: ArchivePanelThread,
 ): void {
   const liveThreadIds = new Set<string>(
     threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
   );
+  // Close intents first: a closed panel this snapshot shows live is archived, never adopted.
+  reconcileChatPanelCloses(environmentId, liveThreadIds, archiveClosedPanel);
   const store = useCenterPanelStore.getState();
   for (const thread of threads) {
     const hostThreadId = thread.hostThreadId;
@@ -127,28 +125,10 @@ export function applyPanelThreadAdoption(
     }
     if (tracker.panelThreadIds.has(thread.id) || !liveThreadIds.has(hostThreadId)) continue;
     const panelRef = scopeThreadRef(environmentId, thread.id);
-    const panelKey = scopedThreadKey(panelRef);
-    // An open still waiting on `createPanel` owns the panel and settles its own close. Neither
-    // it nor a reserved panel is tracked yet, so a later snapshot decides again.
-    if (store.creatingChatPanelThreadKeys.has(panelKey)) continue;
-    // Closed before creation (also an open whose outcome was lost): archive it, then let go of
-    // the close and of a reservation nothing will settle now.
-    if (store.closedBeforeCreated.includes(panelKey)) {
-      if (archiveClosedPanel && !tracker.closingPanelThreadIds.has(thread.id)) {
-        tracker.closingPanelThreadIds.add(thread.id);
-        void archiveClosedPanel(thread.id).then((settled) => {
-          tracker.closingPanelThreadIds.delete(thread.id);
-          if (!settled) return;
-          const current = useCenterPanelStore.getState();
-          current.clearClosedBeforeCreated(panelRef);
-          current.releaseChatPanelReservation(panelRef);
-        });
-      }
-      continue;
-    }
-    // The local open already shows this panel's tab; adoption takes it over once released.
-    if (store.pendingChatPanelThreadKeys.has(panelKey)) continue;
+    if (isChatPanelClosed(panelRef)) continue;
     tracker.panelThreadIds.add(thread.id);
+    // The local open already shows its tab.
+    if (store.pendingChatPanelThreadKeys.has(scopedThreadKey(panelRef))) continue;
     store.adoptChatPanel(
       scopeThreadRef(environmentId, hostThreadId),
       thread.id,

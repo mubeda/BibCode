@@ -99,21 +99,23 @@ interface CenterPanelStoreState {
   navigateActivityPane: (ref: ScopedThreadRef, surfaceId: string, route: ActivityPaneRoute) => void;
   readonly pendingChatPanelThreadKeys: ReadonlySet<string>;
   /**
-   * Scoped keys of chat panels whose tab closed while the server was still creating them,
-   * oldest first. Persisted, unlike the reservation, so a panel created after a reload is
-   * archived instead of adopted.
+   * Close intents: scoped keys of chat panels whose tab the user closed and whose archive is
+   * not yet confirmed, oldest first. Persisted, so it outlives a reload. Every path checks it
+   * first (see `centerPanelClose`): such a panel is never adopted and ends archived.
    */
-  readonly closedBeforeCreated: readonly string[];
-  /**
-   * Scoped keys of chat panels whose `createPanel` request this client is still waiting on.
-   * Unlike the reservation, a live snapshot never releases it, so a close in that window is
-   * always left to the open, which settles it.
-   */
+  readonly closingChatPanels: readonly string[];
+  /** Scoped keys of chat panels whose `createPanel` request this page is still waiting on. */
   readonly creatingChatPanelThreadKeys: ReadonlySet<string>;
+  /** In-memory progress of each close intent's archive. */
+  readonly chatPanelCloseProgress: ReadonlyMap<string, ChatPanelCloseProgress>;
   beginChatPanelCreation: (ref: ScopedThreadRef) => void;
   endChatPanelCreation: (ref: ScopedThreadRef) => void;
-  recordClosedBeforeCreated: (ref: ScopedThreadRef) => void;
-  clearClosedBeforeCreated: (ref: ScopedThreadRef) => void;
+  recordChatPanelClose: (ref: ScopedThreadRef) => void;
+  clearChatPanelClose: (ref: ScopedThreadRef) => void;
+  setChatPanelCloseProgress: (
+    ref: ScopedThreadRef,
+    progress: ChatPanelCloseProgress | null,
+  ) => void;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
   reserveChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
   releaseChatPanelReservation: (ref: ScopedThreadRef) => void;
@@ -173,13 +175,16 @@ interface CenterPanelStoreState {
 const HOST_SURFACE: CenterSurface = { id: HOST_SURFACE_ID, kind: "chat-host" };
 const CENTER_PANEL_STORAGE_KEY = "bibcode:center-panel-state:v1";
 const CENTER_PANEL_STORAGE_VERSION = 5;
-/** The most panels closed before creation that the store remembers; the oldest go first. */
-export const MAX_CLOSED_BEFORE_CREATED = 20;
+/** The most unconfirmed panel closes the store remembers; the oldest go first. */
+export const MAX_CLOSING_CHAT_PANELS = 50;
 
-function sanitizeClosedBeforeCreated(value: unknown): string[] {
+/** `archiving`: its archive request is in flight. `archived`: the server archived it. */
+export type ChatPanelCloseProgress = "archiving" | "archived";
+
+function sanitizeClosingChatPanels(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const keys = value.filter((key): key is string => typeof key === "string");
-  return [...new Set(keys)].slice(-MAX_CLOSED_BEFORE_CREATED);
+  return [...new Set(keys)].slice(-MAX_CLOSING_CHAT_PANELS);
 }
 
 const EMPTY_THREAD_STATE: ThreadCenterPanelState = {
@@ -456,10 +461,10 @@ function sanitizeSurface(surface: unknown): CenterSurface[] {
 export function migratePersistedCenterPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadCenterPanelState>;
   activityPanes: ActivityPanesByThreadKey;
-  closedBeforeCreated: string[];
+  closingChatPanels: string[];
 } {
   if (!persistedState || typeof persistedState !== "object") {
-    return { byThreadKey: {}, activityPanes: {}, closedBeforeCreated: [] };
+    return { byThreadKey: {}, activityPanes: {}, closingChatPanels: [] };
   }
   const raw =
     "byThreadKey" in persistedState &&
@@ -502,10 +507,10 @@ export function migratePersistedCenterPanelState(persistedState: unknown): {
     byThreadKey,
   );
   // Version 4 and older had no list.
-  const closedBeforeCreated = sanitizeClosedBeforeCreated(
-    "closedBeforeCreated" in persistedState ? persistedState.closedBeforeCreated : undefined,
+  const closingChatPanels = sanitizeClosingChatPanels(
+    "closingChatPanels" in persistedState ? persistedState.closingChatPanels : undefined,
   );
-  return { byThreadKey, activityPanes, closedBeforeCreated };
+  return { byThreadKey, activityPanes, closingChatPanels };
 }
 
 export const useCenterPanelStore = create<CenterPanelStoreState>()(
@@ -520,8 +525,9 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
         byThreadKey: {},
         activityPanes: {},
         pendingChatPanelThreadKeys: new Set<string>(),
-        closedBeforeCreated: [],
+        closingChatPanels: [],
         creatingChatPanelThreadKeys: new Set<string>(),
+        chatPanelCloseProgress: new Map<string, ChatPanelCloseProgress>(),
         beginChatPanelCreation: (ref) =>
           set((state) => ({
             creatingChatPanelThreadKeys: new Set(state.creatingChatPanelThreadKeys).add(
@@ -536,23 +542,35 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
             creatingChatPanelThreadKeys.delete(key);
             return { creatingChatPanelThreadKeys };
           }),
-        recordClosedBeforeCreated: (ref) =>
+        recordChatPanelClose: (ref) =>
           set((state) => {
             const key = scopedThreadKey(ref);
-            if (state.closedBeforeCreated.includes(key)) return state;
+            if (state.closingChatPanels.includes(key)) return state;
             return {
-              closedBeforeCreated: [...state.closedBeforeCreated, key].slice(
-                -MAX_CLOSED_BEFORE_CREATED,
-              ),
+              closingChatPanels: [...state.closingChatPanels, key].slice(-MAX_CLOSING_CHAT_PANELS),
             };
           }),
-        clearClosedBeforeCreated: (ref) =>
+        clearChatPanelClose: (ref) =>
           set((state) => {
             const key = scopedThreadKey(ref);
-            if (!state.closedBeforeCreated.includes(key)) return state;
+            if (!state.closingChatPanels.includes(key) && !state.chatPanelCloseProgress.has(key)) {
+              return state;
+            }
+            const chatPanelCloseProgress = new Map(state.chatPanelCloseProgress);
+            chatPanelCloseProgress.delete(key);
             return {
-              closedBeforeCreated: state.closedBeforeCreated.filter((entry) => entry !== key),
+              closingChatPanels: state.closingChatPanels.filter((entry) => entry !== key),
+              chatPanelCloseProgress,
             };
+          }),
+        setChatPanelCloseProgress: (ref, progress) =>
+          set((state) => {
+            const key = scopedThreadKey(ref);
+            if ((state.chatPanelCloseProgress.get(key) ?? null) === progress) return state;
+            const chatPanelCloseProgress = new Map(state.chatPanelCloseProgress);
+            if (progress === null) chatPanelCloseProgress.delete(key);
+            else chatPanelCloseProgress.set(key, progress);
+            return { chatPanelCloseProgress };
           }),
         setActivityPaneExpanded: (ref, surfaceId, expanded, section) =>
           set((state) => {
@@ -935,7 +953,7 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
       partialize: (state) => ({
         byThreadKey: state.byThreadKey,
         activityPanes: state.activityPanes,
-        closedBeforeCreated: state.closedBeforeCreated,
+        closingChatPanels: state.closingChatPanels,
       }),
       migrate: migratePersistedCenterPanelState,
       // Same-version layout is trusted, but pane Activity state is always
@@ -952,7 +970,7 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
             persisted.activityPanes,
             merged.byThreadKey,
           ),
-          closedBeforeCreated: sanitizeClosedBeforeCreated(persisted.closedBeforeCreated),
+          closingChatPanels: sanitizeClosingChatPanels(persisted.closingChatPanels),
         };
       },
     },
