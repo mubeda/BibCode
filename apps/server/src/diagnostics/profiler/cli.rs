@@ -152,7 +152,7 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
         if authorize || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
             attach_console();
         }
-        return Some(desktop_mcp_dispatch());
+        return Some(desktop_mcp_dispatch(std::env::args_os().skip(1)));
     }
     if command.as_deref() == Some(OsStr::new("diagnostics")) {
         attach_console();
@@ -160,7 +160,7 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
     }
     if command.as_deref() == Some(OsStr::new("thread")) {
         attach_console();
-        return Some(desktop_thread_dispatch());
+        return Some(desktop_thread_dispatch(std::env::args_os().skip(1)));
     }
     if command.as_deref() != Some(OsStr::new("profiler")) {
         return None;
@@ -215,8 +215,8 @@ fn desktop_diagnostics_dispatch() -> i32 {
 
 /// `<desktop exe> mcp …` (#139): the relay to this desktop's own running server, which it
 /// finds through the endpoint record in the desktop's data root.
-fn desktop_mcp_dispatch() -> i32 {
-    let cli = match DesktopMcpCli::try_parse_from(std::env::args_os().skip(1)) {
+fn desktop_mcp_dispatch(args: impl IntoIterator<Item = std::ffi::OsString>) -> i32 {
+    let cli = match DesktopMcpCli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
@@ -282,8 +282,8 @@ fn usage_exit_code(error: &clap::Error) -> i32 {
 
 /// `<desktop exe> thread …` (#139): `bibcode thread` against this desktop's own running
 /// server. A usage error exits 1, not clap's 2, which means a person must answer in BiBCode.
-fn desktop_thread_dispatch() -> i32 {
-    let cli = match DesktopThreadCli::try_parse_from(std::env::args_os().skip(1)) {
+fn desktop_thread_dispatch(args: impl IntoIterator<Item = std::ffi::OsString>) -> i32 {
+    let cli = match DesktopThreadCli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
@@ -801,6 +801,21 @@ mod tests {
         assert_eq!(code(&["mcp", "--access", "everything"]), 1);
         assert_eq!(code(&["mcp", "--help"]), 0);
         assert_eq!(code(&["mcp", "call", "--help"]), 0);
+    }
+
+    /// Through the dispatchers themselves: a usage error exits 1 and `--help` exits 0, before
+    /// anything connects.
+    #[test]
+    fn the_desktop_mcp_and_thread_entries_exit_1_on_a_usage_error() {
+        let args = |argv: &[&str]| {
+            argv.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(desktop_mcp_dispatch(args(&["mcp", "call"])), 1);
+        assert_eq!(desktop_mcp_dispatch(args(&["mcp", "call", "--help"])), 0);
+        assert_eq!(desktop_thread_dispatch(args(&["thread", "send"])), 1);
+        assert_eq!(desktop_thread_dispatch(args(&["thread", "--help"])), 0);
     }
 
     #[test]
