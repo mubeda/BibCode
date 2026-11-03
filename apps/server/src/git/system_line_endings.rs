@@ -13,7 +13,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::Write as _,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -45,6 +45,9 @@ pub enum Policy {
 }
 
 static POLICY: OnceLock<Policy> = OnceLock::new();
+/// Warnings from [`install_once`], which runs before the server installs logging; the
+/// server logs them once logging starts ([`log_install_warnings`]).
+static INSTALL_WARNINGS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
 /// Probes the system configuration and fixes the policy for the rest of the process. Only
 /// the two binaries call it, before the server starts. Later calls, an in-process desktop
@@ -54,8 +57,22 @@ pub async fn install_once(state_dir: &Path) -> &'static Policy {
     if let Some(policy) = POLICY.get() {
         return policy;
     }
-    let policy = probe(state_dir, &[]).await;
+    let (policy, warnings) = probe_with_warnings(state_dir, &[]).await;
+    INSTALL_WARNINGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .extend(warnings);
     POLICY.get_or_init(|| policy)
+}
+
+/// Logs what [`install_once`] could not, once: the server calls it right after logging starts.
+pub(crate) fn log_install_warnings() {
+    let warnings = std::mem::take(
+        &mut *INSTALL_WARNINGS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    warnings.into_iter().for_each(warn);
 }
 
 /// The variable [`super::git_environment`] passes; `GIT_CONFIG_NOSYSTEM=1` until installed.
@@ -73,26 +90,36 @@ fn config_variable(policy: Option<&Policy>) -> (OsString, OsString) {
 /// What [`install_once`] would install, without installing it. `environment` is added to
 /// the inherited one, as production Git's is; the probe honours its `GIT_CONFIG_SYSTEM`.
 pub async fn probe(state_dir: &Path, environment: &[(OsString, OsString)]) -> Policy {
-    match probe_policy(state_dir, environment).await {
+    let (policy, warnings) = probe_with_warnings(state_dir, environment).await;
+    warnings.into_iter().for_each(warn);
+    policy
+}
+
+/// The policy, and the warnings to log: a fallback reason or an ignored invalid value.
+async fn probe_with_warnings(
+    state_dir: &Path,
+    environment: &[(OsString, OsString)],
+) -> (Policy, Vec<&'static str>) {
+    let mut warnings = Vec::new();
+    let policy = match probe_policy(state_dir, environment, &mut warnings).await {
         Ok(policy) => policy,
         Err(reason) => {
-            warn(reason);
+            warnings.push(reason);
             Policy::NoSystem
         }
-    }
+    };
+    (policy, warnings)
 }
 
 /// The module's one warning. Reasons are fixed text: no path, value or command output.
 fn warn(reason: &'static str) {
-    tracing::warn!(
-        reason,
-        "Git system line-ending settings: falling back to no system configuration"
-    );
+    tracing::warn!(reason, "Git system line-ending settings not fully applied");
 }
 
 async fn probe_policy(
     state_dir: &Path,
     environment: &[(OsString, OsString)],
+    warnings: &mut Vec<&'static str>,
 ) -> Result<Policy, &'static str> {
     let deadline = Instant::now() + PROBE_BUDGET;
     let mut environment_with_guards = prompt_guard_environment();
@@ -132,7 +159,7 @@ async fn probe_policy(
     )
     .await?;
     let keys = match output.exit_code {
-        0 => canonical_keys(&output.stdout),
+        0 => canonical_keys(&output.stdout, warnings),
         // No key matched.
         1 => Vec::new(),
         _ => return Err("git config --system failed"),
@@ -162,13 +189,15 @@ fn child_search_path(environment: &[(OsString, OsString)]) -> Option<OsString> {
     }
 }
 
-/// Whether a bare `git` names the same executable from every working directory: no
-/// relative `PATH` entry. Windows skips empty entries; on Unix they mean the directory.
+/// Whether a bare `git` names the same executable from every working directory. On Unix a
+/// relative `PATH` entry, the empty one included, is searched from the child's directory.
+/// Windows process creation searches from the server's own directory before the child's
+/// is applied, so every command finds the same Git there.
 fn resolves_one_git(search_path: Option<&OsStr>) -> bool {
-    search_path.is_none_or(|search_path| {
-        std::env::split_paths(search_path)
-            .all(|entry| entry.is_absolute() || (cfg!(windows) && entry.as_os_str().is_empty()))
-    })
+    cfg!(windows)
+        || search_path.is_none_or(|search_path| {
+            std::env::split_paths(search_path).all(|entry| entry.is_absolute())
+        })
 }
 
 struct ProbeDirectory(PathBuf);
@@ -225,7 +254,10 @@ async fn run_git(
 
 /// The last value of each key, canonicalized as Git reads it. An invalid last value drops
 /// the key, as the person's own Git refuses it.
-fn canonical_keys(output: &str) -> Vec<(&'static str, &'static str)> {
+fn canonical_keys(
+    output: &str,
+    warnings: &mut Vec<&'static str>,
+) -> Vec<(&'static str, &'static str)> {
     let mut last: [Option<Option<&str>>; 3] = [None; 3];
     for record in output.split('\0').filter(|record| !record.is_empty()) {
         // `-z` prints `key\nvalue`, or a bare key for a valueless boolean.
@@ -242,7 +274,7 @@ fn canonical_keys(output: &str) -> Vec<(&'static str, &'static str)> {
         .filter_map(|(key, value)| {
             let canonical = canonical_value(key, value?);
             if canonical.is_none() {
-                warn("an invalid system line-ending value was ignored");
+                warnings.push("an invalid system line-ending value was ignored");
             }
             Some((key, canonical?))
         })
@@ -281,9 +313,15 @@ fn file_contents(keys: &[(&str, &str)]) -> String {
 }
 
 /// Writes `<state>/git/system-line-endings-<hash>.gitconfig` atomically and returns it only
-/// when it is a regular file the server owns holding exactly `contents`: another local user
+/// when it is a private regular file of the server holding exactly `contents`: another user
 /// must not plant or replace the configuration BiBCode's Git reads.
 fn write_keys_file(state_dir: &Path, contents: &str) -> Result<PathBuf, &'static str> {
+    // Git ignores a `\\?\` verbatim path in `GIT_CONFIG_SYSTEM`, and resolves a relative one
+    // inside each repository, where whoever can write there could plant a configuration.
+    let state_dir = crate::production::host_paths::process_compatible_path(state_dir.into());
+    if !state_dir.is_absolute() {
+        return Err("the state directory is not an absolute path");
+    }
     let directory = state_dir.join("git");
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -293,9 +331,9 @@ fn write_keys_file(state_dir: &Path, contents: &str) -> Result<PathBuf, &'static
         .create(&directory)
         .map_err(|_| "could not create the Git state directory")?;
     if !std::fs::symlink_metadata(&directory)
-        .is_ok_and(|metadata| metadata.is_dir() && owned(&metadata))
+        .is_ok_and(|metadata| metadata.is_dir() && private(&metadata))
     {
-        return Err("the Git state directory is not a directory the server owns");
+        return Err("the Git state directory is not a private directory of the server");
     }
     let digest = Sha256::digest(contents.as_bytes());
     let hash: String = digest[..8]
@@ -306,8 +344,8 @@ fn write_keys_file(state_dir: &Path, contents: &str) -> Result<PathBuf, &'static
     let path = directory.join(&name);
     // A name taken by anything but the server's own regular file means tampering.
     match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if !(metadata.is_file() && owned(&metadata)) => {
-            return Err("the generated Git configuration is not a file the server owns");
+        Ok(metadata) if !(metadata.is_file() && private(&metadata)) => {
+            return Err("the generated Git configuration is not a private file of the server");
         }
         Ok(_) if holds(&path, contents) => return Ok(path),
         _ => {}
@@ -335,25 +373,27 @@ fn write_keys_file(state_dir: &Path, contents: &str) -> Result<PathBuf, &'static
     if holds(&path, contents) {
         Ok(path)
     } else {
-        Err("the generated Git configuration is not a file the server owns")
+        Err("the generated Git configuration is not a private file of the server")
     }
 }
 
 fn holds(path: &Path, contents: &str) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file() && owned(&metadata))
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file() && private(&metadata))
         && std::fs::read(path).is_ok_and(|bytes| bytes == contents.as_bytes())
 }
 
+/// Owned by the server and writable by no one else. The state directory is the trust
+/// boundary, as it already holds the database, so its ancestors are not checked.
 #[cfg(unix)]
-fn owned(metadata: &std::fs::Metadata) -> bool {
+fn private(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     // SAFETY: `geteuid` has no preconditions.
-    metadata.uid() == unsafe { libc::geteuid() }
+    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0
 }
 
-/// Windows has no owner check: the per-user data root's ACL keeps other users out.
+/// Windows has no owner or mode check: the per-user data root's ACL keeps other users out.
 #[cfg(not(unix))]
-fn owned(_metadata: &std::fs::Metadata) -> bool {
+fn private(_metadata: &std::fs::Metadata) -> bool {
     true
 }
 
@@ -364,7 +404,7 @@ mod tests {
     use super::{Policy, canonical_keys, config_variable, file_contents, resolves_one_git};
 
     fn keys(output: &str) -> Vec<(&'static str, &'static str)> {
-        canonical_keys(output)
+        canonical_keys(output, &mut Vec::new())
     }
 
     #[test]
@@ -430,17 +470,17 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_path_entry_means_more_than_one_git() {
+    fn a_relative_path_entry_means_more_than_one_git_only_on_unix() {
         let absolute = std::env::temp_dir();
         let joined = |entries: &[PathBuf]| std::env::join_paths(entries).unwrap();
         assert!(resolves_one_git(None));
         assert!(resolves_one_git(Some(&joined(std::slice::from_ref(
             &absolute
         )))));
-        assert!(!resolves_one_git(Some(&joined(&[
-            absolute.clone(),
-            PathBuf::from("bin")
-        ]))));
+        assert_eq!(
+            resolves_one_git(Some(&joined(&[absolute.clone(), PathBuf::from("bin")]))),
+            cfg!(windows)
+        );
         assert_eq!(
             resolves_one_git(Some(&joined(&[absolute, PathBuf::new()]))),
             cfg!(windows)
