@@ -463,6 +463,8 @@ export const WorktreeCreatePanelInput = Schema.Struct({
   purpose: Schema.optional(
     Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
   ),
+  /** Opens a side chat of the host (#265). Only for a server that advertises `sideChats`. */
+  sideChat: Schema.optional(Schema.Boolean),
 });
 export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
 

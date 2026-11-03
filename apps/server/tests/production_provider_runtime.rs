@@ -858,6 +858,7 @@ fn launch() -> ProviderLaunchRequest {
         )),
         open_url: None,
         host_thread_id: None,
+        side_chat_host_thread_id: None,
     }
 }
 

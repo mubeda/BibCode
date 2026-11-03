@@ -96,6 +96,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   webhookQuestionEvents: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `webhooks.upsert` takes `bearerToken`, and `webhooks.list` reports `bearerTokenSet`. */
   webhookBearerToken: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `worktree.createPanel` takes `sideChat`: a panel seeded with its host's messages (#265). */
+  sideChats: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

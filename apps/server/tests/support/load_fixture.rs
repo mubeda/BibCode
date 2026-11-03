@@ -181,6 +181,7 @@ fn thread_row(
         compaction: None,
         last_activity_at: Some(LONG_AGO.to_owned()),
         requester: None,
+        side_chat: false,
     }
 }
 

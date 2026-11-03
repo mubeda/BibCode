@@ -665,6 +665,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(64, "ThreadHistoryWindow", migration_064),
     Migration::new(65, "ProviderTurnOutboxClaimedOnce", migration_065),
     Migration::new(66, "WebhookBearerSecret", migration_066),
+    Migration::new(67, "ProjectionThreadSideChat", migration_067),
 ];
 
 impl Migration {
@@ -2956,6 +2957,19 @@ fn migration_066(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_067(transaction: &Transaction<'_>) -> Result<()> {
+    // A side chat is a chat panel that starts with its host's messages (#265). Guarded like
+    // 054: a trusted-ledger restore may not carry this rebuildable projection table.
+    if table_exists(transaction, "projection_threads")?
+        && !table_has_column(transaction, "projection_threads", "side_chat")?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_threads ADD COLUMN side_chat INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3185,7 +3199,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63, 64, 65, 66]
+            [59, 60, 61, 62, 63, 64, 65, 66, 67]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3218,7 +3232,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66]
+            [65, 66, 67]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3254,7 +3268,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65, 66]
+            [61, 62, 63, 64, 65, 66, 67]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3296,7 +3310,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66]
+            [66, 67]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3306,6 +3320,35 @@ mod tests {
         assert_eq!(bearer, None);
         let transaction = connection.transaction()?;
         super::migration_066(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_067_adds_the_side_chat_column_defaulting_false() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(66))?;
+        connection.execute(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-11-02T00:00:00Z', '2026-11-02T00:00:00Z', NULL, NULL)",
+            [],
+        )?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [67]
+        );
+        let side_chat: i64 = connection.query_row(
+            "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(side_chat, 0);
+        // Running it again changes nothing.
+        let transaction = connection.transaction()?;
+        super::migration_067(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3321,7 +3364,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66]
+            [62, 63, 64, 65, 66, 67]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3376,7 +3419,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65, 66]
+            [60, 61, 62, 63, 64, 65, 66, 67]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3421,7 +3464,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
+            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3463,7 +3506,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(66));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(67));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4195,7 +4238,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=66).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=67).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4266,6 +4309,7 @@ mod tests {
                 (64, "ThreadHistoryWindow"),
                 (65, "ProviderTurnOutboxClaimedOnce"),
                 (66, "WebhookBearerSecret"),
+                (67, "ProjectionThreadSideChat"),
             ],
         );
         assert_eq!(

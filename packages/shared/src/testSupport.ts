@@ -42,6 +42,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     reviewDiffTools: false,
     webhookQuestionEvents: false,
     webhookBearerToken: false,
+    sideChats: false,
     ...overrides,
   };
 }

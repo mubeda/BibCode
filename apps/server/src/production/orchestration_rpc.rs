@@ -2946,6 +2946,9 @@ fn thread_shell_with_records(
     if let Some(host_thread_id) = &thread.host_thread_id {
         shell["hostThreadId"] = json!(host_thread_id);
     }
+    if thread.side_chat {
+        shell["sideChat"] = json!(true);
+    }
     if let Some(requester) = &thread.requester {
         shell["requester"] = requester.clone();
     }
@@ -3242,6 +3245,7 @@ mod tests {
                 pending_user_input_count: 0,
                 last_activity_at: None,
                 requester: None,
+                side_chat: false,
                 has_actionable_proposed_plan: 0,
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,
@@ -3484,6 +3488,22 @@ mod tests {
         );
         let without = thread_shell(thread, &snapshot, None);
         assert!(without.get("conversationPreview").is_none());
+    }
+
+    #[test]
+    fn thread_shell_marks_only_a_side_chat() {
+        let snapshot = preview_snapshot_fixture("running");
+        let mut thread = snapshot.threads[0].clone();
+        assert!(
+            thread_shell(&thread, &snapshot, None)
+                .get("sideChat")
+                .is_none()
+        );
+        thread.side_chat = true;
+        assert_eq!(
+            thread_shell(&thread, &snapshot, None)["sideChat"],
+            serde_json::json!(true)
+        );
     }
 
     fn store_thread(
@@ -5943,6 +5963,7 @@ mod tests {
                     codex_home: None,
                     open_url: None,
                     host_thread_id: None,
+                    side_chat_host_thread_id: None,
                 })
                 .await
                 .expect("provider launches");
@@ -6068,6 +6089,7 @@ mod tests {
                 codex_home: None,
                 open_url: None,
                 host_thread_id: None,
+                side_chat_host_thread_id: None,
             })
             .await
             .expect("provider launches");

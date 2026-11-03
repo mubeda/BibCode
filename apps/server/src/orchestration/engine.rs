@@ -500,6 +500,14 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         host_thread_id: Option<String>,
+        /// A side chat of its host (#265); only `worktree.createPanel` sets it, and only on a
+        /// panel. Omitted when false so a plain command keeps its digest.
+        #[serde(
+            rename = "sideChat",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        side_chat: bool,
         /// Why an outside agent created the thread (untrusted text, at most 200 characters);
         /// shown with the agent's label, never logged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1257,6 +1265,7 @@ struct ThreadState {
     project_id: String,
     kind: String,
     host_thread_id: Option<String>,
+    side_chat: bool,
     runtime_mode: String,
     interaction_mode: String,
     branch: Option<String>,
@@ -4606,6 +4615,7 @@ async fn plan_command(
             title,
             kind,
             host_thread_id,
+            side_chat,
             purpose,
             model_selection,
             runtime_mode,
@@ -4615,6 +4625,12 @@ async fn plan_command(
             created_at,
         } => {
             require_project(model, command, project_id)?;
+            if *side_chat && (kind.as_deref() != Some("panel") || host_thread_id.is_none()) {
+                return invariant(
+                    command,
+                    "A side chat must be a chat panel with a host thread.".to_owned(),
+                );
+            }
             if purpose
                 .as_deref()
                 .is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS)
@@ -4667,6 +4683,7 @@ async fn plan_command(
                 host_thread_id.as_ref().map(|v| json!(v)),
             );
             insert_optional(&mut payload, "purpose", purpose.as_ref().map(|v| json!(v)));
+            insert_optional(&mut payload, "sideChat", side_chat.then(|| json!(true)));
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -4793,7 +4810,10 @@ async fn plan_command(
                 }
             }
             let mut payload = json!({"threadId":thread_id,"updatedAt":occurred_at});
-            insert_optional(&mut payload, "title", title.as_ref().map(|v| json!(v)));
+            // A side chat keeps its `Panel: Side chat · <provider>` title, which every client
+            // labels its tab from; the first-message rename any client sends is dropped.
+            let title = title.as_ref().filter(|_| !thread.side_chat);
+            insert_optional(&mut payload, "title", title.map(|v| json!(v)));
             insert_optional(&mut payload, "modelSelection", model_selection.clone());
             insert_optional(
                 &mut payload,
@@ -4927,6 +4947,7 @@ async fn plan_command(
                             project_id: create.project_id.clone(),
                             kind: "workspace".to_owned(),
                             host_thread_id: None,
+                            side_chat: false,
                             runtime_mode: create.runtime_mode.clone(),
                             interaction_mode: create.interaction_mode.clone(),
                             branch: create.branch.clone(),
@@ -5233,6 +5254,19 @@ async fn plan_command(
                 json!({"requestId":request_id}),
                 json!({"threadId":thread_id,"requestId":request_id,"answers":answers,"createdAt":created_at}),
             )])
+        }
+        OrchestrationCommand::ThreadCheckpointRevert { thread_id, .. }
+            if model
+                .threads
+                .get(thread_id)
+                .is_some_and(|thread| thread.side_chat) =>
+        {
+            // A side chat shares its host's checkout and has no checkpoints of its own, so a
+            // revert would fall back to `HEAD` and clean the host's uncommitted work.
+            invariant(
+                command,
+                "Side chats can't restore files. Restore from the main thread.".to_owned(),
+            )
         }
         OrchestrationCommand::ThreadCheckpointRevert {
             command_id,
@@ -6886,6 +6920,8 @@ fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent
                                 .get("hostThreadId")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
+                            side_chat: payload.get("sideChat").and_then(Value::as_bool)
+                                == Some(true),
                             runtime_mode: payload
                                 .get("runtimeMode")
                                 .and_then(Value::as_str)
@@ -7076,6 +7112,7 @@ async fn load_command_model(
                     project_id: thread.project_id.clone(),
                     kind: thread.kind.clone(),
                     host_thread_id: thread.host_thread_id.clone(),
+                    side_chat: thread.side_chat,
                     runtime_mode: thread.runtime_mode.clone(),
                     interaction_mode: thread.interaction_mode.clone(),
                     branch: thread.branch.clone(),
@@ -7227,10 +7264,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json, side_chat) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, side_chat = excluded.side_chat, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -7263,6 +7300,7 @@ fn apply_threads_projector_tx(
                         &json!({ "actor": actor, "purpose": payload.get("purpose") }),
                     ))
                     .transpose()?,
+                payload.get("sideChat").and_then(Value::as_bool) == Some(true),
             ],
         )?;
     } else {
@@ -9330,6 +9368,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    side_chat: false,
                     purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
@@ -9592,6 +9631,7 @@ mod tests {
                         title: id.to_owned(),
                         kind: Some(kind.to_owned()),
                         host_thread_id: host.map(str::to_owned),
+                        side_chat: false,
                         purpose: None,
                         model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                         runtime_mode: "full-access".to_owned(),
@@ -9934,6 +9974,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    side_chat: false,
                     purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
@@ -10800,6 +10841,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host_id.clone()),
+                side_chat: false,
                 purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
@@ -10885,6 +10927,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host.to_owned()),
+                side_chat: false,
                 purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
@@ -10957,6 +11000,281 @@ mod tests {
                 "a refused panel is not created"
             );
         }
+    }
+
+    fn side_chat_create(
+        command_id: &str,
+        thread_id: &str,
+        kind: Option<&str>,
+        host: Option<&str>,
+    ) -> OrchestrationCommand {
+        OrchestrationCommand::ThreadCreate {
+            command_id: command_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            project_id: "delivery-project".to_owned(),
+            title: "Panel: Side chat · Codex".to_owned(),
+            kind: kind.map(str::to_owned),
+            host_thread_id: host.map(str::to_owned),
+            side_chat: true,
+            purpose: None,
+            model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+            runtime_mode: "approval-required".to_owned(),
+            interaction_mode: "default".to_owned(),
+            branch: None,
+            worktree_path: None,
+            created_at: "2026-11-02T00:00:01Z".to_owned(),
+        }
+    }
+
+    fn plain_panel_create(command_id: &str, thread_id: &str, host: &str) -> OrchestrationCommand {
+        let mut command = side_chat_create(command_id, thread_id, Some("panel"), Some(host));
+        if let OrchestrationCommand::ThreadCreate { side_chat, .. } = &mut command {
+            *side_chat = false;
+        }
+        command
+    }
+
+    fn invariant_detail<T: std::fmt::Debug>(result: Result<T, OrchestrationError>) -> String {
+        match result {
+            Err(OrchestrationError::Invariant { detail, .. }) => detail,
+            other => panic!("expected an invariant refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn side_chat_marker_requires_a_panel_with_a_host() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for command in [
+            side_chat_create("no-kind", "no-kind", None, Some(&host_id)),
+            side_chat_create("workspace", "workspace", Some("workspace"), Some(&host_id)),
+            side_chat_create("no-host", "no-host", Some("panel"), None),
+        ] {
+            let thread_id = command.aggregate_ref().1.to_owned();
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "A side chat must be a chat panel with a host thread."
+            );
+            assert!(
+                engine
+                    .repositories()
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn side_chat_cannot_host_a_panel_or_side_chat() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        for command in [
+            plain_panel_create("nested-panel", "nested-panel", "side-chat"),
+            side_chat_create(
+                "nested-side",
+                "nested-side",
+                Some("panel"),
+                Some("side-chat"),
+            ),
+        ] {
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "Host thread 'side-chat' is a chat panel itself."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_delete_cascades_to_open_and_archived_side_chats() {
+        let (engine, _) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"create-host","threadId":"host",
+                    "projectId":"delivery-project","title":"Host",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","createdAt":"2026-11-02T00:00:00Z"
+                }))
+                .expect("host command"),
+            )
+            .await
+            .expect("host");
+        for (command_id, thread_id) in [("open", "open-side"), ("closed", "closed-side")] {
+            engine
+                .dispatch(side_chat_create(
+                    command_id,
+                    thread_id,
+                    Some("panel"),
+                    Some("host"),
+                ))
+                .await
+                .expect("side chat");
+        }
+        engine
+            .dispatch(OrchestrationCommand::ThreadArchive {
+                command_id: "archive-closed".to_owned(),
+                thread_id: "closed-side".to_owned(),
+            })
+            .await
+            .expect("archive");
+        engine
+            .dispatch(OrchestrationCommand::ThreadDelete {
+                command_id: "delete-host".to_owned(),
+                thread_id: "host".to_owned(),
+            })
+            .await
+            .expect("delete host");
+        for thread_id in ["open-side", "closed-side", "host"] {
+            assert!(
+                engine
+                    .repositories()
+                    .get_thread(thread_id.to_owned())
+                    .await
+                    .expect("thread read")
+                    .is_none_or(|thread| thread.deleted_at.is_some()),
+                "{thread_id} is deleted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn side_chat_marker_round_trips_through_projection_threads() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        let side_chat_of = |thread_id: String| {
+            let repositories = engine.repositories();
+            async move {
+                repositories
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .expect("thread exists")
+                    .side_chat
+            }
+        };
+        assert!(side_chat_of("side-chat".to_owned()).await);
+        assert!(!side_chat_of(host_id.clone()).await);
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE projection_threads SET side_chat = 0", [])?;
+                connection.execute(
+                    "DELETE FROM projection_state WHERE projector = 'projection.threads'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("reset thread projection");
+        bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+            .await
+            .expect("replay threads");
+        assert!(side_chat_of("side-chat".to_owned()).await);
+        assert!(!side_chat_of(host_id).await);
+    }
+
+    #[tokio::test]
+    async fn side_chat_checkpoint_revert_is_refused() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        let revert = |command_id: &str, thread_id: &str| {
+            serde_json::from_value::<OrchestrationCommand>(json!({
+                "type":"thread.checkpoint.revert","commandId":command_id,"threadId":thread_id,
+                "turnCount":0,"createdAt":"2026-11-02T00:00:02Z"
+            }))
+            .expect("revert command")
+        };
+        assert_eq!(
+            invariant_detail(engine.dispatch(revert("revert-side", "side-chat")).await),
+            "Side chats can't restore files. Restore from the main thread."
+        );
+        engine
+            .dispatch(revert("revert-host", &host_id))
+            .await
+            .expect("the host can still request a revert");
+    }
+
+    async fn rename(engine: &OrchestrationEngine, command_id: &str, thread_id: &str) {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update","commandId":command_id,"threadId":thread_id,
+                    "title":"why did you pick that file?",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+                }))
+                .expect("meta update command"),
+            )
+            .await
+            .expect("meta update applies");
+    }
+
+    #[tokio::test]
+    async fn side_chat_title_survives_a_meta_update() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        rename(&engine, "rename-side", "side-chat").await;
+        let thread = engine
+            .repositories()
+            .get_thread("side-chat".to_owned())
+            .await
+            .expect("thread read")
+            .expect("thread exists");
+        assert_eq!(thread.title, "Panel: Side chat · Codex");
+        assert_eq!(thread.model_selection["model"], "gpt-5.1");
+    }
+
+    #[tokio::test]
+    async fn plain_panel_meta_update_still_renames() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(plain_panel_create("panel", "plain-panel", &host_id))
+            .await
+            .expect("panel");
+        rename(&engine, "rename-panel", "plain-panel").await;
+        assert_eq!(
+            engine
+                .repositories()
+                .get_thread("plain-panel".to_owned())
+                .await
+                .expect("thread read")
+                .expect("thread exists")
+                .title,
+            "why did you pick that file?"
+        );
     }
 
     fn delivery_turn_for_message(
