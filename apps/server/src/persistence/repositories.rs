@@ -4013,7 +4013,7 @@ pub enum OlderThreadsScope {
 
 /// The newest-first key of a capped shell and of older pages: the last user message, or the
 /// last update of a thread that has none.
-pub fn shell_recency_key(thread: &ProjectionThread) -> &str {
+pub(crate) fn shell_recency_key(thread: &ProjectionThread) -> &str {
     thread
         .latest_user_message_at
         .as_deref()
@@ -4065,7 +4065,7 @@ fn shell_live_thread_ids(connection: &Connection) -> Result<HashSet<String>> {
 /// `workspace` with a worktree), `forced` ones, then of the rest the newest
 /// [`SHELL_RECENT_FINISHED`] plus the newest [`SHELL_RECENT_PER_PROJECT`] non-panel threads of
 /// each project.
-pub fn shell_kept_ids(
+fn shell_kept_ids(
     threads: &[ProjectionThread],
     live: &HashSet<String>,
     forced: &HashSet<String>,

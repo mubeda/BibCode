@@ -456,6 +456,15 @@ fn public_repository_api_inventory_is_explicit() {
         "exchange_mcp_oauth_code",
         "revoke_replayed_mcp_oauth_code",
         "rotate_mcp_oauth_refresh_token",
+        "create_fenced_mcp_auth_session",
+        "revoke_mcp_credential",
+        "live_shell_thread_ids_among",
+        "list_older_thread_rows",
+        "load_capped_shell_snapshot_rows",
+        "load_thread_shell_rows",
+        "provider_turn_was_claimed",
+        "thread_has_activity_kind",
+        "thread_has_messages_or_turns",
     ]
     .into_iter()
     .map(str::to_owned)
