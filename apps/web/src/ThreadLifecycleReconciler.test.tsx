@@ -77,8 +77,6 @@ vi.mock("./state/offShell", () => ({
 vi.mock("./state/terminal", () => ({
   terminalEnvironment: { metadataEvents: () => "terminal-metadata-atom" },
 }));
-vi.mock("./state/threads", () => ({ threadEnvironment: { archive: "archive" } }));
-vi.mock("./state/use-atom-command", () => ({ useAtomCommand: () => () => undefined }));
 vi.mock("./state/environments", () => ({
   useEnvironments: () => ({ environments: [{ environmentId: "primary" }] }),
 }));
@@ -87,16 +85,22 @@ vi.mock("./centerPanelAdoption", () => ({
   applyTerminalMetadataAdoption: () => undefined,
   createCenterPanelAdoptionTracker: () => ({}),
 }));
-vi.mock("./centerPanelStore", () => ({
-  useCenterPanelStore: {
-    getState: () => ({
-      byThreadKey: h.centerByThreadKey,
-      pendingChatPanelThreadKeys: new Set<string>(),
-      releaseChatPanelReservation: () => undefined,
-      removeThread: h.removeCenterThread,
-    }),
-  },
-}));
+vi.mock("./centerPanelStore", () => {
+  const reshowChatPanels = new Set<string>();
+  const state = () => ({
+    byThreadKey: h.centerByThreadKey,
+    pendingChatPanelThreadKeys: new Set<string>(),
+    reshowChatPanels,
+    releaseChatPanelReservation: () => undefined,
+    removeThread: h.removeCenterThread,
+  });
+  return {
+    useCenterPanelStore: Object.assign(
+      (select: (value: ReturnType<typeof state>) => unknown) => select(state()),
+      { getState: state },
+    ),
+  };
+});
 vi.mock("./rightPanelStore", () => ({
   useRightPanelStore: {
     getState: () => ({ byThreadKey: {}, removeThread: h.removeRightThread }),

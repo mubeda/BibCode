@@ -33,8 +33,8 @@ const h = vi.hoisted(() => ({
   newCommandId: vi.fn(),
   startTurn: vi.fn(),
   pending: new Set<string>(),
-  creating: new Set<string>(),
-  closed: [] as Array<{ key: string; closeId: string; liveAt?: number; archivedAt?: number }>,
+  closing: new Set<string>(),
+  reshow: new Set<string>(),
   drafts: new Map<string, { prompt: string; attachments: unknown[] }>(),
 }));
 
@@ -90,37 +90,19 @@ vi.mock("~/centerPanelStore", () => ({
       mergeGroup: h.mergeGroup,
       openChatPanel: h.openChatPanel,
       pendingChatPanelThreadKeys: h.pending,
-      creatingChatPanelThreadKeys: h.creating,
-      beginChatPanelCreation: (ref: { environmentId: string; threadId: string }) =>
-        h.creating.add(`${ref.environmentId}:${ref.threadId}`),
-      endChatPanelCreation: (ref: { environmentId: string; threadId: string }) =>
-        h.creating.delete(`${ref.environmentId}:${ref.threadId}`),
-      closingChatPanels: h.closed,
-      recordChatPanelClose: (ref: { environmentId: string; threadId: string }) => {
-        const key = `${ref.environmentId}:${ref.threadId}`;
-        const index = h.closed.findIndex((intent) => intent.key === key);
-        if (index >= 0) h.closed.splice(index, 1);
-        const closeId = `close-${h.closed.length + 1}`;
-        h.closed.push({ key, closeId });
-        return closeId;
+      closingChatPanels: h.closing,
+      reshowChatPanels: h.reshow,
+      hideClosingChatPanel: (ref: { environmentId: string; threadId: string }) => {
+        h.closing.add(`${ref.environmentId}:${ref.threadId}`);
+        h.pending.delete(`${ref.environmentId}:${ref.threadId}`);
       },
-      updateChatPanelClose: (
+      releaseClosingChatPanel: (
         ref: { environmentId: string; threadId: string },
-        closeId: string,
-        patch: object,
+        reshow: boolean,
       ) => {
-        const intent = h.closed.find(
-          (candidate) =>
-            candidate.key === `${ref.environmentId}:${ref.threadId}` &&
-            candidate.closeId === closeId,
-        );
-        if (intent) Object.assign(intent, patch);
-      },
-      clearChatPanelClose: (ref: { environmentId: string; threadId: string }) => {
-        const index = h.closed.findIndex(
-          (intent) => intent.key === `${ref.environmentId}:${ref.threadId}`,
-        );
-        if (index >= 0) h.closed.splice(index, 1);
+        const key = `${ref.environmentId}:${ref.threadId}`;
+        if (!h.closing.delete(key)) return;
+        if (reshow) h.reshow.add(key);
       },
     }),
   },
@@ -130,10 +112,6 @@ vi.mock("@bibcode/client-runtime/environment", () => ({
   scopeThreadRef: (environmentId: string, threadId: string) => ({ environmentId, threadId }),
   scopedThreadKey: (ref: { environmentId: string; threadId: string }) =>
     `${ref.environmentId}:${ref.threadId}`,
-  parseScopedThreadKey: (key: string) => {
-    const [environmentId, threadId] = key.split(":");
-    return environmentId && threadId ? { environmentId, threadId } : null;
-  },
 }));
 
 vi.mock("~/state/projects", () => ({
@@ -203,8 +181,8 @@ beforeEach(() => {
     Promise.resolve({ _tag: "Failure", cause: new Error("no running turn") }),
   );
   h.pending.clear();
-  h.creating.clear();
-  h.closed.length = 0;
+  h.closing.clear();
+  h.reshow.clear();
   h.drafts.clear();
   h.reserveChatPanel.mockImplementation((_host: unknown, threadId: string) =>
     h.pending.add(`${hostRef.environmentId}:${threadId}`),
@@ -496,13 +474,6 @@ describe("center panel actions", () => {
       ]!;
     expect(h.interruptTurn.mock.invocationCallOrder[0]).toBeLessThan(archiveRunOrder);
     expect(h.addToast).not.toHaveBeenCalled();
-  });
-
-  it("forgets a close when the panel is reopened, so nothing archives it again", async () => {
-    h.closed.push({ key: `${hostRef.environmentId}:panel-1`, closeId: "close-1", archivedAt: 3 });
-    const actions = useCenterPanelActions({ onCloseTerminal });
-    await actions.reopenChatPanel(hostRef, ThreadId.make("panel-1"), "Codex");
-    expect(h.closed).toEqual([]);
   });
 
   it("reopens a closed chat panel as the active tab and rolls back explicit failures", async () => {

@@ -4,12 +4,7 @@ import {
   scopedThreadKey,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
-import type {
-  EnvironmentId,
-  ScopedThreadRef,
-  TerminalMetadataStreamEvent,
-  ThreadId,
-} from "@bibcode/contracts";
+import type { EnvironmentId, TerminalMetadataStreamEvent, ThreadId } from "@bibcode/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -20,7 +15,6 @@ import {
   createCenterPanelAdoptionTracker,
 } from "./centerPanelAdoption";
 
-import type { PanelArchiveResult } from "./centerPanelClose";
 import { useCenterPanelStore } from "./centerPanelStore";
 import { useComposerDraftStore } from "./composerDraftStore";
 import { useArchivedThreadSnapshots } from "./lib/archivedThreadsState";
@@ -30,9 +24,6 @@ import { requestThreadShells } from "./state/offShell";
 import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
 import { environmentShell } from "./state/shell";
 import { terminalEnvironment } from "./state/terminal";
-import { threadEnvironment } from "./state/threads";
-import { useAtomCommand } from "./state/use-atom-command";
-import { isAtomCommandInterrupted } from "@bibcode/client-runtime/state/runtime";
 
 function collectPersistedThreadIds(environmentId: EnvironmentId): Set<ThreadId> {
   const threadIds = new Set<ThreadId>();
@@ -176,30 +167,19 @@ function EnvironmentThreadLifecycleReconciler({
     [adoptionTracker, environmentId],
   );
   useAtomSubscribe(terminalMetadataEventsAtom, handleTerminalMetadataEvent, { immediate: true });
-  const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
-  // Archives a panel this client closed once a snapshot shows it live (see `centerPanelClose`).
-  const archiveClosedPanel = useCallback(
-    async ({ threadId }: ScopedThreadRef): Promise<PanelArchiveResult> => {
-      const result = await archiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Success") return { kind: "archived", sequence: result.value.sequence };
-      return { kind: isAtomCommandInterrupted(result) ? "interrupted" : "refused" };
-    },
-    [archiveThread, environmentId],
-  );
 
+  // Also when a close ends: a panel to show again uses the snapshot already held.
+  const reshowChatPanels = useCenterPanelStore((state) => state.reshowChatPanels);
   useEffect(() => {
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) return;
-    const snapshot = shellState.snapshot.value;
     applyPanelThreadAdoption(
       environmentId,
       adoptionTracker,
-      snapshot.threads,
-      snapshot.capped === true,
-      archiveClosedPanel,
-      // The engine's sequence, which an archive's reply sequence is comparable with (#223).
-      snapshot.engineSequence ?? snapshot.snapshotSequence,
+      shellState.snapshot.value.threads,
+      shellState.snapshot.value.capped === true,
+      reshowChatPanels,
     );
-  }, [adoptionTracker, archiveClosedPanel, environmentId, shellState]);
+  }, [adoptionTracker, environmentId, reshowChatPanels, shellState]);
 
   // The archived snapshot is refetched only when a thread enters or leaves the live list
   // (create, archive, unarchive, delete, panel close), never on every live sequence

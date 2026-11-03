@@ -2132,29 +2132,22 @@ The client opens a side chat with `createPanel` (`sideChat: true`,
 `thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
 draft stays until the question was handed over.
 
-Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): the
-user's close is a durable close intent (`closingChatPanels`, persisted in the
-center panel store, version 5, at most 50), which the open, adoption and the
-lifecycle reconciler check before anything else, so a closing panel is never
-adopted, shown again or sent its first question. Replies are not authoritative;
-the server's ordered state is. Each close has its own id, and an archive reply
-applies only to the close that sent it, recording the archive's event sequence
-(`DispatchResult.sequence`). Live shell snapshots settle a close through their
-engine sequence (`engineSequence ?? snapshotSequence`, the order the archive's
-sequence shares): a snapshot that leaves the panel out at or after that close's
-own archive, or after the newest snapshot that listed it live during the close,
-means the server archived or deleted it, and the intent is dropped; one that
-lists it live after the close's own archive means someone reopened it, so the
-intent is dropped, the panel is shown again and never archived again; any other
-live sighting archives it (one request per panel at a time; a refused or lost
-request is tried again at the next sighting, and a newer close waiting on an
-older request gets its own as soon as that one answers). A capped snapshot
-settles nothing by leaving a panel out. Whatever ends a creation settles a
-pending close itself: a refused creation drops it, any other end archives the
-panel at once. A reopen forgets the close. One ordering is left to chance: an
-archive whose reply was lost, then another client's reopen, with no live
-snapshot in between, looks like a close still owed, and the panel is archived
-again.
+Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): a
+close hides the panel from adoption only while this page's own request about it
+is in flight (its archive, or the creation it waits on), and an archive is sent
+once and never retried. When that request ends, whatever its outcome, the panel
+is no longer hidden; adoption runs again on the snapshot it holds, and a panel
+still live (an archive that did not land, or another client's reopen) comes back
+as a tab, so the user can close it again. A closed tab coming back is the
+accepted cost of never closing a panel someone else reopened. The first
+question of a side chat is guarded by the creation itself: the open's
+continuation remembers that its tab closed while `createPanel` was in flight,
+sends nothing and keeps the host draft, archives the panel once (nobody can have
+reopened a panel that was never archived) unless the server refused the
+creation, and is never overridden by a snapshot. Nothing about a close is
+persisted: after a reload, a panel created late, or whose archive did not land,
+is adopted as a tab. A definite archive failure shows **Failed to close chat
+panel**.
 
 Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
