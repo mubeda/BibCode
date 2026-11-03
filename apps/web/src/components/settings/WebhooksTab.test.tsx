@@ -194,6 +194,22 @@ function button(container: HTMLElement, text: string): HTMLButtonElement {
   return found;
 }
 
+function statusKindBoxes(container: HTMLElement): HTMLInputElement[] {
+  return [
+    ...container
+      .querySelector('[role="group"][aria-label="Status changes sent"]')!
+      .querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+  ];
+}
+
+function eventBox(container: HTMLElement, label: string): HTMLInputElement {
+  const found = [...container.querySelectorAll("label")].find(
+    (candidate) => candidate.textContent === label,
+  );
+  if (found === undefined) throw new Error(`no event ${label}`);
+  return found.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+}
+
 function setInput(input: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
   setter.call(input, value);
@@ -425,23 +441,54 @@ describe("WebhooksTab", () => {
 
   it("asks for at least one status change and keeps kinds it does not know", async () => {
     h.settings = { enableWebhooks: true };
-    h.endpoints = [endpoint({ statusKinds: ["turn.failed", "future.kind"] })];
+    h.endpoints = [endpoint({ statusKinds: ["turn.failed"] })];
     const container = await render();
     await act(async () => button(container, "Edit").click());
-    const kinds = () => [
-      ...container
-        .querySelector('[role="group"][aria-label="Status changes sent"]')!
-        .querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
-    ];
-    expect(kinds().map((kind) => kind.checked)).toEqual([false, false, false, true, false]);
-    await act(async () => kinds()[3]!.click());
+    expect(statusKindBoxes(container).map((kind) => kind.checked)).toEqual([
+      false,
+      false,
+      false,
+      true,
+      false,
+    ]);
+    await act(async () => statusKindBoxes(container)[3]!.click());
     expect(submitButton(container).disabled).toBe(true);
     expect(container.textContent).toContain(
       "Choose at least one status change, or stop sending Thread status changed.",
     );
-    await act(async () => kinds()[1]!.click());
+    await act(async () => statusKindBoxes(container)[1]!.click());
     await act(async () => submitButton(container).click());
-    expect(h.calls[0]!.request.input.statusKinds).toEqual(["turn.completed", "future.kind"]);
+    expect(h.calls[0]!.request.input.statusKinds).toEqual(["turn.completed"]);
+  });
+
+  it("saves a filter that holds only kinds a newer server added", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ statusKinds: ["turn.failed", "future.kind"] })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    await act(async () => statusKindBoxes(container)[3]!.click());
+    expect(submitButton(container).disabled).toBe(false);
+    expect(container.textContent).not.toContain("Choose at least one status change");
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.statusKinds).toEqual(["future.kind"]);
+  });
+
+  it("keeps the stored filter when every kind is cleared and the event is turned off", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [
+      endpoint({
+        eventTypes: ["thread.status_changed", "approval.requested"],
+        statusKinds: ["turn.failed"],
+      }),
+    ];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    await act(async () => statusKindBoxes(container)[3]!.click());
+    await act(async () => eventBox(container, "Thread status changed").click());
+    expect(submitButton(container).disabled).toBe(false);
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.eventTypes).toEqual(["approval.requested"]);
+    expect("statusKinds" in h.calls[0]!.request.input).toBe(false);
   });
 
   it("hides the status choices on an older server and never sends them", async () => {
