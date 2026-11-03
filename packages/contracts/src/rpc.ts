@@ -217,6 +217,7 @@ import {
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
   OrchestrationDispatchCommandError,
+  OrchestrationThreadInUseError,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetSnapshotError,
@@ -1999,6 +2000,7 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
       WorkspaceUnavailableError,
       WorkspaceIdentityError,
       EnvironmentRpcError,
+      OrchestrationThreadInUseError,
     ]),
   },
 );

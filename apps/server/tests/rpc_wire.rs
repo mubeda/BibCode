@@ -99,7 +99,7 @@ fn rust_registry_matches_the_active_typescript_rpc_group() {
     assert_eq!(manifest.expected_top_level_stream_shapes, 94);
     assert_eq!(manifest.expected_orchestration_event_shapes, 27);
     assert_eq!(manifest.stream_shape_fixtures.len(), 94);
-    assert_eq!(manifest.typed_failure_fixtures.len(), 403);
+    assert_eq!(manifest.typed_failure_fixtures.len(), 404);
     assert_eq!(
         manifest.stale_method_identifiers,
         ["projects.add", "projects.list", "projects.remove"]

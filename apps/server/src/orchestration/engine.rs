@@ -539,6 +539,15 @@ pub enum OrchestrationCommand {
         command_id: String,
         #[serde(rename = "threadId")]
         thread_id: String,
+        /// Refuse with [`OrchestrationError::ThreadInUse`] when a thread it would delete has
+        /// any message or turn (#265: closing an unused side chat). Omitted when false so a
+        /// plain delete keeps its digest.
+        #[serde(
+            rename = "onlyIfUnused",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        only_if_unused: bool,
     },
     #[serde(rename = "thread.archive")]
     ThreadArchive {
@@ -1227,6 +1236,10 @@ pub enum OrchestrationError {
         path: String,
         detail: String,
     },
+    /// `thread.delete` with `onlyIfUnused` found a message or turn on a thread it would
+    /// delete; nothing was deleted. Its own type so a client can archive instead.
+    #[error("Thread '{thread_id}' has messages or turns, so it was not deleted.")]
+    ThreadInUse { thread_id: String },
     #[error("orchestration worker has already shut down")]
     WorkerClosed,
     #[error("orchestration worker cancelled")]
@@ -4697,6 +4710,7 @@ async fn plan_command(
         OrchestrationCommand::ThreadDelete {
             command_id,
             thread_id,
+            only_if_unused,
         } => {
             let thread = require_thread(model, command, thread_id)?;
             if thread.kind == "default" {
@@ -4715,7 +4729,7 @@ async fn plan_command(
             }
             // Chat panels (live or closed, so archived) go with their host thread,
             // in stable id order (the model is a BTreeMap), before the host itself.
-            Ok(model
+            let deleted_ids = model
                 .threads
                 .iter()
                 .filter(|(_, candidate)| {
@@ -4725,6 +4739,24 @@ async fn plan_command(
                 })
                 .map(|(panel_id, _)| panel_id)
                 .chain([thread_id])
+                .collect::<Vec<_>>();
+            // Judged here, in the engine's command order, so a first send that commits first
+            // wins and the delete is refused; one that commits after finds the thread deleted.
+            if *only_if_unused {
+                for deleted_id in &deleted_ids {
+                    if repositories
+                        .thread_has_messages_or_turns((*deleted_id).clone())
+                        .await
+                        .map_err(wrap_persistence)?
+                    {
+                        return Err(OrchestrationError::ThreadInUse {
+                            thread_id: (*deleted_id).clone(),
+                        });
+                    }
+                }
+            }
+            Ok(deleted_ids
+                .into_iter()
                 .map(|deleted_id| {
                     make_event(
                         "thread.deleted",
@@ -9428,6 +9460,7 @@ mod tests {
                     OrchestrationCommand::ThreadDelete {
                         command_id: "remove-runtime".into(),
                         thread_id: "panel-a".into(),
+                        only_if_unused: false,
                     }
                 };
                 engine.dispatch(command).await.unwrap();
@@ -9466,6 +9499,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "delete-panel".into(),
                     thread_id: "deleted-panel".into(),
+                    only_if_unused: false,
                 })
                 .await
                 .unwrap();
@@ -9654,6 +9688,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "delete-panel-gone".into(),
                     thread_id: "panel-gone".into(),
+                    only_if_unused: false,
                 })
                 .await
                 .expect("delete panel");
@@ -9677,6 +9712,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "delete-host".into(),
                     thread_id: "host".into(),
+                    only_if_unused: false,
                 })
                 .await
                 .expect("delete host");
@@ -9752,6 +9788,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "generic-delete-owner".to_owned(),
                     thread_id: "workspace-owner".to_owned(),
+                    only_if_unused: false,
                 })
                 .await;
             assert!(
@@ -9775,6 +9812,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "generic-delete-panel".to_owned(),
                     thread_id: "owner-panel".to_owned(),
+                    only_if_unused: false,
                 })
                 .await
                 .expect("a dependent panel remains ordinary non-owner orchestration");
@@ -10960,6 +10998,7 @@ mod tests {
             .dispatch(OrchestrationCommand::ThreadDelete {
                 command_id: "delete-side".to_owned(),
                 thread_id: "side-thread".to_owned(),
+                only_if_unused: false,
             })
             .await
             .expect("side deleted");
@@ -11130,6 +11169,7 @@ mod tests {
             .dispatch(OrchestrationCommand::ThreadDelete {
                 command_id: "delete-host".to_owned(),
                 thread_id: "host".to_owned(),
+                only_if_unused: false,
             })
             .await
             .expect("delete host");
@@ -11144,6 +11184,233 @@ mod tests {
                 "{thread_id} is deleted"
             );
         }
+    }
+
+    fn unused_delete(command_id: &str, thread_id: &str) -> OrchestrationCommand {
+        OrchestrationCommand::ThreadDelete {
+            command_id: command_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            only_if_unused: true,
+        }
+    }
+
+    async fn is_deleted(engine: &OrchestrationEngine, thread_id: &str) -> bool {
+        engine
+            .repositories()
+            .get_thread(thread_id.to_owned())
+            .await
+            .expect("thread read")
+            .is_none_or(|thread| thread.deleted_at.is_some())
+    }
+
+    fn in_use_thread(result: Result<DispatchResult, OrchestrationError>) -> String {
+        match result {
+            Err(OrchestrationError::ThreadInUse { thread_id }) => thread_id,
+            other => panic!("expected a thread-in-use refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_if_unused_delete_deletes_an_unused_side_chat() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        engine
+            .dispatch(unused_delete("close-side", "side"))
+            .await
+            .expect("an unused side chat is deleted");
+        assert!(is_deleted(&engine, "side").await);
+        assert!(!is_deleted(&engine, &host_id).await, "the host stays");
+    }
+
+    #[tokio::test]
+    async fn only_if_unused_delete_refuses_a_thread_with_a_message_or_turn() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for thread_id in ["sent", "imported"] {
+            engine
+                .dispatch(side_chat_create(
+                    thread_id,
+                    thread_id,
+                    Some("panel"),
+                    Some(&host_id),
+                ))
+                .await
+                .expect("side chat");
+        }
+        // A first send records its message and a pending turn.
+        engine
+            .dispatch(delivery_turn("send", "sent", "why that file?"))
+            .await
+            .expect("first send");
+        // An imported history has messages and no turn.
+        engine
+            .dispatch(OrchestrationCommand::ThreadHistoryImport {
+                command_id: "import".to_owned(),
+                thread_id: "imported".to_owned(),
+                messages: vec![ImportedThreadMessage {
+                    message_id: "imported:0".to_owned(),
+                    role: "user".to_owned(),
+                    text: "earlier".to_owned(),
+                    created_at: "2026-11-02T00:00:02Z".to_owned(),
+                }],
+            })
+            .await
+            .expect("history import");
+        for thread_id in ["sent", "imported"] {
+            assert_eq!(
+                in_use_thread(
+                    engine
+                        .dispatch(unused_delete(&format!("close-{thread_id}"), thread_id))
+                        .await
+                ),
+                thread_id
+            );
+            assert!(!is_deleted(&engine, thread_id).await, "{thread_id} stays");
+        }
+        // A host whose cascade would take a used panel is refused too, and nothing goes.
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"create-host","threadId":"host",
+                    "projectId":"delivery-project","title":"Host",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","createdAt":"2026-11-02T00:00:00Z"
+                }))
+                .expect("host command"),
+            )
+            .await
+            .expect("unused host");
+        engine
+            .dispatch(plain_panel_create("plain-host", "plain-host", "host"))
+            .await
+            .expect("plain panel");
+        engine
+            .dispatch(delivery_turn_for_message(
+                "send-plain",
+                "plain-host",
+                "plain-message",
+                "hello",
+                "2026-11-02T00:00:03Z",
+            ))
+            .await
+            .expect("plain panel send");
+        assert_eq!(
+            in_use_thread(engine.dispatch(unused_delete("close-host", "host")).await),
+            "plain-host",
+            "the used panel is named"
+        );
+        for thread_id in ["host", "sent", "imported", "plain-host"] {
+            assert!(!is_deleted(&engine, thread_id).await, "{thread_id} stays");
+        }
+    }
+
+    /// A close on one client races a first send on another: the engine orders them, so the
+    /// side chat ends either deleted with the send refused, or used and still there.
+    #[tokio::test]
+    async fn a_first_send_and_an_unused_delete_never_both_succeed() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for round in 0..8 {
+            let side = format!("side-{round}");
+            engine
+                .dispatch(side_chat_create(
+                    &side,
+                    &side,
+                    Some("panel"),
+                    Some(&host_id),
+                ))
+                .await
+                .expect("side chat");
+            let message = format!("message-{round}");
+            let (sent, deleted) = tokio::join!(
+                engine.dispatch(delivery_turn_for_message(
+                    &format!("send-{round}"),
+                    &side,
+                    &message,
+                    "why that file?",
+                    "2026-11-02T00:00:03Z",
+                )),
+                engine.dispatch(unused_delete(&format!("close-{round}"), &side)),
+            );
+            match (sent, deleted) {
+                (Ok(_), Err(OrchestrationError::ThreadInUse { .. })) => {
+                    assert!(!is_deleted(&engine, &side).await, "a used side chat stays");
+                }
+                (Err(OrchestrationError::Invariant { .. }), Ok(_)) => {
+                    assert!(is_deleted(&engine, &side).await);
+                }
+                other => panic!("send and delete must not both succeed: {other:?}"),
+            }
+        }
+    }
+
+    /// A refused delete stays refused on a duplicate delivery or after a restart, and an
+    /// accepted one replays without touching the thread again.
+    #[tokio::test]
+    async fn an_unused_delete_replays_its_first_outcome() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for thread_id in ["used", "unused"] {
+            engine
+                .dispatch(side_chat_create(
+                    thread_id,
+                    thread_id,
+                    Some("panel"),
+                    Some(&host_id),
+                ))
+                .await
+                .expect("side chat");
+        }
+        engine
+            .dispatch(delivery_turn("send", "used", "hello"))
+            .await
+            .expect("first send");
+        in_use_thread(engine.dispatch(unused_delete("close-used", "used")).await);
+        assert!(matches!(
+            engine.dispatch(unused_delete("close-used", "used")).await,
+            Err(OrchestrationError::PreviouslyRejected { .. })
+        ));
+        assert!(!is_deleted(&engine, "used").await);
+        let first = engine
+            .dispatch(unused_delete("close-unused", "unused"))
+            .await
+            .expect("deleted");
+        let replay = engine
+            .dispatch(unused_delete("close-unused", "unused"))
+            .await
+            .expect("replayed");
+        assert_eq!(replay.sequence, first.sequence);
+        assert!(is_deleted(&engine, "unused").await);
+    }
+
+    #[test]
+    fn a_plain_delete_serializes_without_only_if_unused() {
+        let plain = serde_json::to_value(OrchestrationCommand::ThreadDelete {
+            command_id: "c".to_owned(),
+            thread_id: "t".to_owned(),
+            only_if_unused: false,
+        })
+        .expect("serializes");
+        assert_eq!(
+            plain,
+            json!({"type":"thread.delete","commandId":"c","threadId":"t"})
+        );
+        let unused: OrchestrationCommand = serde_json::from_value(
+            json!({"type":"thread.delete","commandId":"c","threadId":"t","onlyIfUnused":true}),
+        )
+        .expect("decodes");
+        assert!(matches!(
+            unused,
+            OrchestrationCommand::ThreadDelete {
+                only_if_unused: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

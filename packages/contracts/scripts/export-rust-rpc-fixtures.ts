@@ -844,6 +844,22 @@ for (const command of queueCommands) {
     } satisfies RpcMessage.RequestEncoded),
   );
 }
+// Closing an unused side chat (#265): the Rust command decodes `onlyIfUnused`.
+dynamicFixtures.set(
+  "contract-shapes/orchestration__thread__delete-only-if-unused-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: ORCHESTRATION_WS_METHODS.dispatchCommand,
+    payload: compileUnknownEncoder(ClientOrchestrationCommand)({
+      type: "thread.delete",
+      commandId: queueCommandFields.commandId,
+      threadId: queueCommandFields.threadId,
+      onlyIfUnused: true,
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
 const queueEventPayload = {
   threadId: "thread-1",
   messageId: "message-1",
@@ -1024,8 +1040,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 403) {
-  throw new Error(`Expected 403 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 404) {
+  throw new Error(`Expected 404 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 27) {
   throw new Error(`Expected 27 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

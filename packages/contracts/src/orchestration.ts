@@ -1017,6 +1017,12 @@ const ThreadDeleteCommand = Schema.Struct({
   type: Schema.Literal("thread.delete"),
   commandId: CommandId,
   threadId: ThreadId,
+  /**
+   * Refused with `OrchestrationThreadInUseError` when a thread it would delete has any message
+   * or turn (#265). Only for a server that advertises `threadDeleteOnlyIfUnused`: an older one
+   * ignores the field and deletes.
+   */
+  onlyIfUnused: Schema.optional(Schema.Boolean),
 });
 
 const ThreadArchiveCommand = Schema.Struct({
@@ -2121,6 +2127,15 @@ export class OrchestrationDispatchCommandError extends Schema.TaggedError<Orches
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+/** `thread.delete` with `onlyIfUnused` found a message or turn; nothing was deleted. */
+export class OrchestrationThreadInUseError extends Schema.TaggedError<OrchestrationThreadInUseError>()(
+  "OrchestrationThreadInUseError",
+  {
+    message: TrimmedNonEmptyString,
+    threadId: ThreadId,
   },
 ) {}
 
