@@ -1757,6 +1757,7 @@ mod tests {
                 codex_home: None,
                 open_url: None,
                 host_thread_id: None,
+                side_chat_host_thread_id: None,
             })
             .await
             .expect("provider launches");
@@ -2856,6 +2857,7 @@ mod tests {
                     pending_user_input_count: 0,
                     last_activity_at: None,
                     requester: None,
+                    side_chat: false,
                     has_actionable_proposed_plan: 0,
                     unresolved_delivery_state: None,
                     unresolved_delivery_detail: None,
@@ -4118,6 +4120,7 @@ pub(super) mod removal_test_support {
             codex_home: None,
             open_url: None,
             host_thread_id: None,
+            side_chat_host_thread_id: None,
         }
     }
 

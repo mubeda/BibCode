@@ -61,6 +61,10 @@ const legacyClientDecoders = {
 const decodeTerminalCapabilities = Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities);
 
 describe("execution environment contracts", () => {
+  it("reads side chats as off for an older server and keeps advertised support", () => {
+    expect(decodeTerminalCapabilities({}).sideChats).toBe(false);
+    expect(decodeTerminalCapabilities({ sideChats: true }).sideChats).toBe(true);
+  });
   it("defaults terminal size ownership off and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).terminalSizeOwnership).toBe(false);
     expect(decodeTerminalCapabilities({ terminalSizeOwnership: true }).terminalSizeOwnership).toBe(

@@ -278,6 +278,7 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         pending_user_input_count: 0,
         last_activity_at: None,
         requester: None,
+        side_chat: false,
         has_actionable_proposed_plan: 0,
         unresolved_delivery_state: None,
         unresolved_delivery_detail: None,

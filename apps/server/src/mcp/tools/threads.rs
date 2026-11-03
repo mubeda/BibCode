@@ -1605,7 +1605,7 @@ pub(crate) fn derive_status(
 pub(crate) fn thread_summary(thread: &Value) -> Value {
     let session_status = thread["session"]["status"].as_str();
     let turn_state = thread["latestTurn"]["state"].as_str();
-    json!({
+    let mut summary = json!({
         "threadId": thread["id"],
         "projectId": thread["projectId"],
         "title": thread["title"],
@@ -1631,7 +1631,11 @@ pub(crate) fn thread_summary(thread: &Value) -> Value {
         "hostThreadId": thread.get("hostThreadId"),
         "archived": !thread["archivedAt"].is_null(),
         "updatedAt": thread["updatedAt"],
-    })
+    });
+    if thread["sideChat"] == true {
+        summary["sideChat"] = json!(true);
+    }
+    summary
 }
 
 pub(crate) struct MessagePage {
@@ -1924,6 +1928,16 @@ mod tests {
     fn the_thread_list_does_not_promise_a_queued_status() {
         let (list, _) = tool_text("list_projects_and_threads");
         assert!(!list.contains("queued"), "{list}");
+    }
+
+    /// `list_projects_and_threads` and `list_chat_panels` mark a side chat (#265), and only one.
+    #[test]
+    fn a_thread_summary_marks_only_a_side_chat() {
+        let panel = json!({"id":"p","kind":"panel","hostThreadId":"h"});
+        assert!(thread_summary(&panel).get("sideChat").is_none());
+        let side_chat = json!({"id":"s","kind":"panel","hostThreadId":"h","sideChat":true});
+        assert_eq!(thread_summary(&side_chat)["sideChat"], json!(true));
+        assert_eq!(thread_summary(&side_chat)["hostThreadId"], json!("h"));
     }
 
     #[test]

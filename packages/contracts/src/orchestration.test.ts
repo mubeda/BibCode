@@ -531,6 +531,44 @@ const baseShellFixture = {
   hasActionableProposedPlan: false,
 } as const;
 
+describe("side chat marker", () => {
+  it("is absent on a thread from an older server and true on a side chat", () => {
+    expect(decodeShell(baseShellFixture).sideChat).toBeUndefined();
+    expect(
+      decodeShell({
+        ...baseShellFixture,
+        kind: "panel",
+        hostThreadId: "thread-host",
+        sideChat: true,
+      }).sideChat,
+    ).toBe(true);
+  });
+
+  it.effect("is optional on thread.created", () =>
+    Effect.gen(function* () {
+      const payload = {
+        threadId: "thread-side",
+        projectId: "project-1",
+        title: "Panel — Side chat · Codex",
+        modelSelection: { provider: "codex", model: "gpt-5" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        kind: "panel",
+        hostThreadId: "thread-host",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-11-02T00:00:00.000Z",
+        updatedAt: "2026-11-02T00:00:00.000Z",
+      };
+      assert.strictEqual((yield* decodeThreadCreatedPayload(payload)).sideChat, undefined);
+      assert.strictEqual(
+        (yield* decodeThreadCreatedPayload({ ...payload, sideChat: true })).sideChat,
+        true,
+      );
+    }),
+  );
+});
+
 describe("OrchestrationConversationPreview", () => {
   it("decodes a shell without the field (older server)", () => {
     const shell = decodeShell(baseShellFixture);

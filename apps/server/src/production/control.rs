@@ -2816,6 +2816,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "reviewDiffTools": true,
         "webhookQuestionEvents": true,
         "webhookBearerToken": true,
+        "sideChats": true,
     });
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
@@ -7167,6 +7168,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["webhookQuestionEvents"], true);
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
+        assert_eq!(descriptor["capabilities"]["sideChats"], true);
         // `server.getConfig` carries this descriptor; a client downloads a remote
         // environment's logs only when it says so (#194).
         assert_eq!(descriptor["capabilities"]["diagnosticLogs"], true);

@@ -78,6 +78,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "reviewDiffTools": true,
             "webhookQuestionEvents": true,
             "webhookBearerToken": true,
+            "sideChats": true,
         },
     })
 }
@@ -1301,6 +1302,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["webhookQuestionEvents"], true);
         assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
+        assert_eq!(descriptor["capabilities"]["sideChats"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // A client asks for `server.downloadDiagnosticLogs` only when this is set (#194).

@@ -1362,7 +1362,9 @@ async fn first_turn_baseline_steps(
     .await??;
     // A baseline writes ref 0 only. Ref `n >= 1` is turn `n`'s end state, written only by that
     // turn's own capture while its hold keeps later turns out.
-    if an_earlier_turn_is_numbered(&turns, message_id) {
+    if an_earlier_turn_is_numbered(&turns, message_id)
+        || is_side_chat(repositories, thread_id, cancellation).await?
+    {
         return Ok(false);
     }
     let Some(cwd) = until_cancelled(
@@ -1488,6 +1490,15 @@ pub(crate) async fn record_turn_end(
     {
         return Ok(());
     }
+    // A side chat shares its host's checkout and keeps no checkpoints, so it can never
+    // restore over the host's work (#265).
+    if repositories
+        .get_thread(thread_id.to_owned())
+        .await?
+        .is_some_and(|thread| thread.side_chat)
+    {
+        return Ok(());
+    }
     let latest = repositories
         .list_checkpoints_by_thread(thread_id.to_owned())
         .await?
@@ -1521,6 +1532,19 @@ pub(crate) async fn record_turn_end(
         _ => {}
     }
     recorded
+}
+
+/// Whether `thread_id` is a side chat, which captures no checkpoints (#265).
+async fn is_side_chat(
+    repositories: &crate::persistence::Repositories,
+    thread_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<bool, OrchestrationEffectsError> {
+    Ok(
+        until_cancelled(cancellation, repositories.get_thread(thread_id.to_owned()))
+            .await??
+            .is_some_and(|thread| thread.side_chat),
+    )
 }
 
 /// Whether `checkout` lies in a Git work tree: it or a directory above it has a `.git`.
@@ -2812,6 +2836,99 @@ mod tests {
             .unwrap();
         assert!(!engine.turns_held_for_checkpoint("t"));
         assert_eq!(numbers().await.len(), 3);
+        engine.shutdown().await;
+    }
+
+    /// A side chat shares its host's checkout: it is never numbered and writes no baseline,
+    /// so it has nothing to revert to and never restores over the host's work.
+    #[tokio::test]
+    async fn side_chat_turns_capture_no_checkpoints() {
+        const AT: &str = "2026-11-02T00:00:00Z";
+        let engine = empty_event_log().await;
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"host","threadId":"host","projectId":"p","title":"Host","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"side","threadId":"side","projectId":"p","title":"Panel: Side chat · Codex","kind":"panel","hostThreadId":"host","sideChat":true,"modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"approval-required","createdAt":AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap();
+        }
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".git")).unwrap();
+        let repositories = engine.repositories();
+        let numbered = |thread_id: &'static str| {
+            let repositories = repositories.clone();
+            async move {
+                repositories
+                    .list_checkpoints_by_thread(thread_id.to_owned())
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        record_turn_end(
+            &engine,
+            "side",
+            "turn-1",
+            AT,
+            TurnEnd::Live,
+            Some(checkout.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(numbered("side").await, 0);
+        assert!(!engine.turns_held_for_checkpoint("side"));
+        // The same checkout numbers the host's turn.
+        record_turn_end(
+            &engine,
+            "host",
+            "turn-1",
+            AT,
+            TurnEnd::Live,
+            Some(checkout.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(numbered("host").await, 1);
+
+        struct NoWorkspace(AtomicUsize);
+        impl OrchestrationEffectCallbacks for NoWorkspace {
+            fn workspace_for_thread<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxEffectFuture<'a, Option<PathBuf>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(None) })
+            }
+            fn rollback_provider<'a>(
+                &'a self,
+                _: &'a str,
+                _: i64,
+                _: &'a str,
+            ) -> BoxEffectFuture<'a, ProviderRewind> {
+                Box::pin(async { Ok(ProviderRewind::Rewound) })
+            }
+            fn stop_provider<'a>(&'a self, _: &'a str) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn close_terminals<'a>(&'a self, _: &'a str) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn refresh_workspace<'a>(&'a self, _: &'a Path) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let callbacks = NoWorkspace(AtomicUsize::new(0));
+        let cancellation = CancellationToken::new();
+        // The baseline never looks for a side chat's checkout, so it never writes its ref 0.
+        assert!(
+            !first_turn_baseline_steps(&repositories, &callbacks, "side", "m", &cancellation, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(callbacks.0.load(Ordering::SeqCst), 0);
         engine.shutdown().await;
     }
 

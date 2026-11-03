@@ -1358,6 +1358,7 @@ async fn create_managed_worktree_locked(
                     title: input.title,
                     kind: Some("workspace".to_owned()),
                     host_thread_id: None,
+                    side_chat: false,
                     purpose: input.purpose,
                     model_selection: input.thread_defaults.model_selection,
                     runtime_mode: input.thread_defaults.runtime_mode,
@@ -1511,6 +1512,7 @@ async fn create_worktree_panel(
                                     title: input.title,
                                     kind: Some("panel".to_owned()),
                                     host_thread_id: Some(host.thread_id),
+                                    side_chat: input.side_chat,
                                     purpose: input.purpose,
                                     model_selection: input.thread_defaults.model_selection,
                                     runtime_mode: input.thread_defaults.runtime_mode,
@@ -3493,6 +3495,10 @@ struct WorktreeCreatePanelInput {
     /// Why an outside agent creates it (#139, slices X1 and X4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     purpose: Option<String>,
+    /// A side chat of the host (#265). Omitted when false, so a plain panel request keeps the
+    /// digest of a receipt stored before side chats existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    side_chat: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -4179,6 +4185,7 @@ mod mutation_invalidation_tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    side_chat: false,
                     purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
@@ -5366,6 +5373,7 @@ mod mutation_invalidation_tests {
                 title: "Removed".to_owned(),
                 kind: Some("workspace".to_owned()),
                 host_thread_id: None,
+                side_chat: false,
                 purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
@@ -5439,6 +5447,127 @@ mod mutation_invalidation_tests {
         assert_eq!(
             fixture.catalog.invalidation_count_for_test("project-1"),
             Some(1)
+        );
+        fixture.shutdown().await;
+    }
+
+    fn panel_request(command_id: &str, side_chat: Option<bool>) -> serde_json::Value {
+        let mut payload = json!({
+            "commandId":command_id,
+            "hostThreadId":"host-thread",
+            "threadId":format!("{command_id}-thread"),
+            "title":"Panel: Side chat · Codex",
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"approval-required",
+                "interactionMode":"default"
+            }
+        });
+        if let Some(side_chat) = side_chat {
+            payload["sideChat"] = json!(side_chat);
+        }
+        payload
+    }
+
+    async fn create_host(fixture: &HandlerFixture) {
+        fixture
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"host-create","threadId":"host-thread",
+                    "projectId":"project-1","title":"Host",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","interactionMode":"default",
+                    "branch":"main","worktreePath":null,"createdAt":"2026-11-02T00:00:00Z"
+                }))
+                .expect("host command"),
+            )
+            .await
+            .expect("host created");
+    }
+
+    async fn create_panel(
+        fixture: &HandlerFixture,
+        payload: serde_json::Value,
+    ) -> super::RpcResult {
+        super::create_worktree_panel(
+            &fixture.services,
+            request("worktree.createPanel", payload),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_panel_with_side_chat_records_the_marker_and_replays() {
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        create_host(&fixture).await;
+        let created = create_panel(&fixture, panel_request("side", Some(true)))
+            .await
+            .expect("side chat created");
+        assert_eq!(created["threadId"], "side-thread");
+        let side_chat = fixture
+            .engine
+            .repositories()
+            .get_thread("side-thread".to_owned())
+            .await
+            .expect("side chat read")
+            .expect("side chat exists");
+        assert_eq!(side_chat.kind, "panel");
+        assert!(side_chat.side_chat);
+        assert_eq!(side_chat.host_thread_id.as_deref(), Some("host-thread"));
+        assert_eq!(side_chat.runtime_mode, "approval-required");
+        // The same command id replays the same thread.
+        assert_eq!(
+            create_panel(&fixture, panel_request("side", Some(true)))
+                .await
+                .expect("replay")["threadId"],
+            "side-thread"
+        );
+        // A replay that drops the marker is another request.
+        let conflict = create_panel(&fixture, panel_request("side", None))
+            .await
+            .expect_err("a changed marker conflicts");
+        assert_eq!(conflict["reason"], "command-conflict");
+        // A plain panel carries no marker.
+        create_panel(&fixture, panel_request("plain", Some(false)))
+            .await
+            .expect("plain panel created");
+        assert!(
+            !fixture
+                .engine
+                .repositories()
+                .get_thread("plain-thread".to_owned())
+                .await
+                .expect("plain panel read")
+                .expect("plain panel exists")
+                .side_chat
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_panel_replays_a_receipt_stored_before_side_chats() {
+        // A receipt stored before side chats hashed the input without a `sideChat` key, so
+        // a plain request must digest exactly as that payload did.
+        let old_format = panel_request("old", None);
+        let decoded: super::WorktreeCreatePanelInput =
+            serde_json::from_value(panel_request("old", Some(false))).expect("decode");
+        assert_eq!(
+            crate::orchestration::canonical_command_digest(&decoded).expect("digest"),
+            crate::orchestration::canonical_command_digest(&old_format).expect("old digest"),
+        );
+        let fixture = HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+        create_host(&fixture).await;
+        create_panel(&fixture, old_format.clone())
+            .await
+            .expect("plain panel created");
+        assert_eq!(
+            create_panel(&fixture, panel_request("old", Some(false)))
+                .await
+                .expect("an explicit false replays the old receipt")["threadId"],
+            "old-thread"
         );
         fixture.shutdown().await;
     }
