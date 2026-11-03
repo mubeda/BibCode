@@ -9,10 +9,14 @@
  * deleted elsewhere) loses its tab, and is adopted again if it is reopened. A
  * capped list (#223) leaves finished panels out, so leaving it proves nothing:
  * the panel keeps its tab, and the lifecycle reconciler drops it once the server
- * reports it archived or missing. A panel this client closed is never adopted: its close
- * intent is checked first, and a live sighting archives it (see `centerPanelClose`).
+ * reports it archived or missing. A panel this page is closing is left alone, and one whose
+ * close ended is shown again, as on first sight, if it is still live (see `centerPanelClose`).
  */
-import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
+import {
+  parseScopedThreadKey,
+  scopedThreadKey,
+  scopeThreadRef,
+} from "@bibcode/client-runtime/environment";
 import {
   ThreadId,
   type EnvironmentId,
@@ -21,11 +25,6 @@ import {
   type TerminalSummary,
 } from "@bibcode/contracts";
 
-import {
-  type ArchivePanelThread,
-  isChatPanelClosed,
-  reconcileChatPanelCloses,
-} from "./centerPanelClose";
 import { useCenterPanelStore } from "./centerPanelStore";
 import { useRightPanelStore } from "./rightPanelStore";
 import { isTerminalIdReserved } from "./terminalIdReservations";
@@ -110,41 +109,41 @@ export function applyPanelThreadAdoption(
     Pick<OrchestrationThreadShell, "id" | "kind" | "hostThreadId" | "title" | "archivedAt">
   >,
   capped = false,
-  archiveClosedPanel?: ArchivePanelThread,
-  /** The server's engine sequence this snapshot reflects; it orders closes (`centerPanelClose`). */
-  sequence?: number,
+  /** Panels whose close ended, to show again while live (the store's, by default). */
+  reshowChatPanels: ReadonlySet<string> = useCenterPanelStore.getState().reshowChatPanels,
 ): void {
   const liveThreadIds = new Set<string>(
     threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
   );
-  // Close intents first: a closed panel this snapshot shows live is archived, never adopted.
-  const reopened = reconcileChatPanelCloses(
-    environmentId,
-    liveThreadIds,
-    sequence,
-    capped,
-    archiveClosedPanel,
-  );
-  // Reopened elsewhere after this page closed it: shown again, as on first sight.
-  for (const threadId of reopened) tracker.panelThreadIds.delete(threadId);
   const store = useCenterPanelStore.getState();
+  const reshown = new Set<string>();
   for (const thread of threads) {
     const hostThreadId = thread.hostThreadId;
     if (thread.kind !== "panel" || hostThreadId === undefined || thread.archivedAt !== null) {
       continue;
     }
+    const panelKey = scopedThreadKey(scopeThreadRef(environmentId, thread.id));
+    if (store.closingChatPanels.has(panelKey)) continue;
+    if (reshowChatPanels.has(panelKey)) {
+      reshown.add(panelKey);
+      tracker.panelThreadIds.delete(thread.id);
+    }
     if (tracker.panelThreadIds.has(thread.id) || !liveThreadIds.has(hostThreadId)) continue;
-    const panelRef = scopeThreadRef(environmentId, thread.id);
-    if (isChatPanelClosed(panelRef)) continue;
     tracker.panelThreadIds.add(thread.id);
-    // The local open already shows its tab.
-    if (store.pendingChatPanelThreadKeys.has(scopedThreadKey(panelRef))) continue;
+    if (store.pendingChatPanelThreadKeys.has(panelKey)) continue;
     store.adoptChatPanel(
       scopeThreadRef(environmentId, hostThreadId),
       thread.id,
       panelProviderLabel(thread.title),
     );
   }
+  // A reshown panel a full list leaves out was archived; either way the request is answered.
+  if (!capped) {
+    for (const key of reshowChatPanels) {
+      if (parseScopedThreadKey(key)?.environmentId === environmentId) reshown.add(key);
+    }
+  }
+  store.clearReshowChatPanels(reshown);
   for (const threadId of tracker.panelThreadIds) {
     if (liveThreadIds.has(threadId)) continue;
     tracker.panelThreadIds.delete(threadId);

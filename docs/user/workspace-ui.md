@@ -479,7 +479,9 @@ the host thread deletes its chat panels, open or closed. A new chat panel's tab 
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
 Closing a tab whose panel is still being created opens nothing: the panel is
-closed as soon as the server creates it, also after a reload.
+closed as soon as the server creates it. If BiBCode can't tell whether a close
+reached the server (a dropped connection, or a reload meanwhile), the tab comes
+back rather than risk closing a chat someone reopened; close it again.
 
 ### Side chats
 

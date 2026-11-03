@@ -12,11 +12,10 @@
  * just register a surface — the terminal is attach-created lazily by the view.
  * History continues a Claude Code terminal session in a panel the server
  * creates (`agentSessions.openInPanel`), whose tab becomes active once it does.
- * Every close records a durable close intent (`centerPanelClose`), which the
- * open, adoption and the reconciler check first; a panel still being created is
- * archived once its creation ends, and one known only from a snapshot (after a
- * reload) by adoption. A side chat (#265) is a panel the server seeds with
- * the host's messages; `:btw` sends its question once it exists.
+ * A close hides the panel from adoption while this page archives it, or while
+ * the creation it waits on is in flight (`centerPanelClose`); a creation closed
+ * meanwhile never sends its first question. A side chat (#265) is a panel the
+ * server seeds with the host's messages; `:btw` sends its question once it exists.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -37,12 +36,9 @@ import { useCallback } from "react";
 
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import {
-  closeChatPanel,
-  forgetChatPanelClose,
-  isChatPanelClosed,
-  settleChatPanelClose,
-  dropChatPanelCloseOfUncreated,
-  type PanelArchiveResult,
+  archiveClosingChatPanel,
+  hideClosingChatPanel,
+  releaseUncreatedChatPanel,
 } from "~/centerPanelClose";
 import { useCenterPanelStore, type CenterSurface } from "~/centerPanelStore";
 import { useComposerDraftStore } from "~/composerDraftStore";
@@ -85,6 +81,12 @@ export const sideChatLabel = (providerLabel: string) => `Side chat · ${provider
 
 /** Hosts with a side chat being created, so a second Enter on the same `:btw` opens nothing. */
 const pendingSideChatHosts = new Set<string>();
+
+/**
+ * Each creation this page waits on, by scoped thread key: `closed` once its tab closed. The
+ * creation's own continuation reads it, so a closed one never sends its first question.
+ */
+const creations = new Map<string, { closed: boolean }>();
 
 /** Empty side chats whose composer takes focus once their thread shows. */
 const composerFocusRequests = new Set<string>();
@@ -172,8 +174,6 @@ export function usePanelThreadOpener(): PanelThreadOpener {
   const reopenChatPanel = useCallback(
     async (hostRef: ScopedThreadRef, threadId: ThreadId, providerLabel: string): Promise<void> => {
       const environmentId = hostRef.environmentId;
-      // The user wants it back, so an earlier close no longer applies.
-      forgetChatPanelClose(scopeThreadRef(environmentId, threadId));
       useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, providerLabel);
       const result = await unarchiveThread({ environmentId, input: { threadId } });
       if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
@@ -210,7 +210,6 @@ export function usePanelThreadOpener(): PanelThreadOpener {
         await reopenChatPanel(hostRef, threadId, label);
         return;
       }
-      forgetChatPanelClose(scopeThreadRef(hostRef.environmentId, threadId));
       useCenterPanelStore.getState().openChatPanel(hostRef, threadId, label);
     },
     [reopenChatPanel],
@@ -253,7 +252,7 @@ export function useCenterPanelActions({
   const { reopenChatPanel, openPanelThread } = usePanelThreadOpener();
 
   const archivePanelThread = useCallback(
-    async ({ environmentId, threadId }: ScopedThreadRef): Promise<PanelArchiveResult> => {
+    async ({ environmentId, threadId }: ScopedThreadRef) => {
       const session = readThreadShell(scopeThreadRef(environmentId, threadId))?.session;
       if (session?.status === "running") {
         // Best effort: an interrupt that fails must not keep the closed panel live.
@@ -266,11 +265,7 @@ export function useCenterPanelActions({
         });
       }
       const result = await archiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Success") return { kind: "archived", sequence: result.value.sequence };
-      if (isAtomCommandInterrupted(result)) return { kind: "interrupted" };
-      // Only a panel this page knows to exist failed to close; a not yet created one is
-      // archived once it shows up.
-      if (readThreadShell(scopeThreadRef(environmentId, threadId))?.archivedAt === null) {
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         toastManager.add(
           stackedThreadToast({
@@ -280,7 +275,6 @@ export function useCenterPanelActions({
           }),
         );
       }
-      return { kind: "refused" };
     },
     [archiveThread, interruptTurn],
   );
@@ -312,11 +306,11 @@ export function useCenterPanelActions({
         },
       });
       const store = useCenterPanelStore.getState();
-      const closed = isChatPanelClosed(panelRef);
+      const closed = creations.get(scopedThreadKey(panelRef))?.closed === true;
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         composerFocusRequests.delete(scopedThreadKey(panelRef));
-        // Never created: a close made meanwhile is settled with it.
-        if (closed) dropChatPanelCloseOfUncreated(panelRef);
+        // Never created: a close made meanwhile ends with it.
+        if (closed) releaseUncreatedChatPanel(panelRef);
         store.removeThread(panelRef);
         const error = squashAtomCommandFailure(result);
         toastManager.add(
@@ -328,9 +322,12 @@ export function useCenterPanelActions({
         );
         return null;
       }
+      // Closed meanwhile (success, or an outcome that may have created it): archive it now,
+      // just this once. Nobody else can have reopened a panel that was never archived.
+      if (closed) void archiveClosingChatPanel(panelRef, archivePanelThread);
       return { threadId, created: result._tag === "Success" && !closed };
     },
-    [createPanel],
+    [archivePanelThread, createPanel],
   );
 
   /**
@@ -349,16 +346,14 @@ export function useCenterPanelActions({
       const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
       const label = sideChat ? sideChatLabel(providerLabel) : providerLabel;
       useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
-      useCenterPanelStore.getState().beginChatPanelCreation(panelRef);
-      if (focusComposer) composerFocusRequests.add(scopedThreadKey(panelRef));
-      return settlePanelCreation(input, panelRef, label, sideChat).finally(() => {
-        useCenterPanelStore.getState().endChatPanelCreation(panelRef);
-        // The end of a creation, whatever it was, settles a close made while it waited. An
-        // interrupted one this page cannot see yet is archived by adoption when it shows.
-        settleChatPanelClose(panelRef, archivePanelThread);
-      });
+      const key = scopedThreadKey(panelRef);
+      creations.set(key, { closed: false });
+      if (focusComposer) composerFocusRequests.add(key);
+      return settlePanelCreation(input, panelRef, label, sideChat).finally(() =>
+        creations.delete(key),
+      );
     },
-    [archivePanelThread, settlePanelCreation],
+    [settlePanelCreation],
   );
 
   const createChatPanel = useCallback(
@@ -480,10 +475,12 @@ export function useCenterPanelActions({
     (hostRef: ScopedThreadRef, removed: readonly CenterSurface[]) => {
       for (const surface of removed) {
         if (surface.kind === "chat") {
-          closeChatPanel(
-            scopeThreadRef(hostRef.environmentId, surface.threadId),
-            archivePanelThread,
-          );
+          const panelRef = scopeThreadRef(hostRef.environmentId, surface.threadId);
+          hideClosingChatPanel(panelRef);
+          const creation = creations.get(scopedThreadKey(panelRef));
+          // A panel still being created is archived when its creation answers.
+          if (creation) creation.closed = true;
+          else void archiveClosingChatPanel(panelRef, archivePanelThread);
         } else if (surface.kind === "terminal") {
           onCloseTerminal(hostRef, surface);
         }
