@@ -128,12 +128,20 @@ relay exchanges it at `/oauth/token` over loopback, after proving the listener
 - **Ceiling.** Every call uses the lower of the session's `mcp_access` and the
   environment's `mcpServerAccess`. A session whose `mcp_access` is `NULL` is
   read-only.
-- **Lifetime.** The token lives only in the relay's memory. The relay records
-  `<state dir>/mcp-clients/<sid>.json` (`pid` and process start time, no
-  secret), revokes the session through the data root when it exits, and revokes
-  the sessions of records whose process is gone when it starts. Revoking the row
-  in Authorized clients ends it on the next call; the relay never mints again
-  after a 401.
+- **Lifetime.** The token lives only in the relay's memory. An `mcp-client`
+  session takes the id of the link it was exchanged from (#281). Before sending
+  the link, the relay publishes `<state dir>/mcp-clients/<link id>.link` (`pid`
+  and process start time, no secret; written to a temporary file and renamed),
+  and renames it to `<sid>.json` once the session is confirmed. If the record
+  cannot be written, it fences the link and fails the sign-in without sending
+  it. A sign-in that fails after the exchange was sent, a lost token response
+  included, revokes the link and the session of that id. The relay revokes its
+  credential through the data root when it exits, and revokes the credentials
+  of `.link` and `.json` records whose process is gone when it starts.
+  Revoking a relay credential sets the link's `revoked_at` even when it was
+  consumed, and the session insert is fenced on it, so a revoke between the
+  consume and the insert leaves no session. Revoking the row in Authorized
+  clients ends it on the next call; the relay never mints again after a 401.
 - **Off switch.** With `enableMcpServer` off, `bibcode mcp` exits before minting,
   and `/mcp` answers outside agents with `McpServerDisabledError`. No session is
   revoked, so turning it back on needs no new pairing.

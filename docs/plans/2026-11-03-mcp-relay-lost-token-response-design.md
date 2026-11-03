@@ -306,3 +306,24 @@ It raised two new P2 findings, both confirmed in source and neither refuted.
 | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | R2.1 | P2: a sweep lists a `.link` record, the live relay renames it to `.json`, and the sweep's read gets `NotFound`, which today's handling treats as an orphan and fences.     | Confirmed. A failed read becomes `unwrap_or_default()`, which reads as not alive (`relay.rs:837-847`). | **Fixed.** Any read error skips the record for that sweep. Only a record that was read, with a process that is not alive, is an orphan. Test: `a_record_renamed_between_a_sweeps_listing_and_its_read_is_not_fenced`.                                                                                                                                 |
 | R2.2 | P2: on an older server, if publishing `<sid>.json` and the immediate revoke both fail, only `link_id` stays tracked, so neither exit cleanup nor a sweep can revoke `sid`. | Confirmed against revision 1's step 3.                                                                 | **Fixed for exit cleanup.** `sid` is pushed onto `unconfirmed` before publication and stays there until it is recorded or revoked. A crash in that state is a documented shortcut: it needs an older server and three failures, and upgrading the server removes it. Test: `an_older_server_session_whose_record_and_revoke_fail_is_revoked_at_exit`. |
+
+## As built
+
+Implemented as designed, with these differences:
+
+- The fenced insert is `Repositories::create_fenced_mcp_auth_session`, a new method beside
+  `create_auth_session`. In one `IMMEDIATE` transaction it checks that the link is not
+  revoked, then inserts. That has the same effect as `INSERT … SELECT … WHERE NOT EXISTS`.
+- `revoke_mcp_credential` revokes the session only when its subject is `mcp-client`, so a
+  record name can never revoke another kind of session.
+- The R2.2 test needs no failure hooks. Once the server has answered, it replaces
+  `mcp-clients/` with a plain file and writes a recovery journal, so the publication and
+  the revoke both fail for real. The older server is the real server with a test-only
+  switch that gives `mcp-client` sessions random ids, as before #281.
+- The test holds are `cfg(test)` only: a per-sign-in plan on `Connection`, task-local holds
+  for record publication and for a sweep after its listing, and holds on `AuthService`
+  after the consume and after the session insert. `ServerHandle::auth_for_test` reaches the
+  last two through a running server.
+- `docs/user/mcp.md` gains one Troubleshooting row for the new sign-in failure. The
+  credential lifetime is described in `docs/cloud/environment-auth.md` as well as in
+  `docs/architecture/overview.md`.

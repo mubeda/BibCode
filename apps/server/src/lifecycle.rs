@@ -96,6 +96,8 @@ pub struct ServerHandle {
     _log_sink: Arc<logging::LogSinkLease>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
+    #[cfg(test)]
+    auth: AuthService,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,6 +528,8 @@ impl ServerRuntime {
                 gateway.shutdown().await;
             });
         }
+        #[cfg(test)]
+        let auth_for_test = auth.clone();
         let app = http::build_router(http::AppState {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
@@ -569,6 +573,8 @@ impl ServerRuntime {
             _log_sink: log_sink,
             shutdown,
             task: Some(task),
+            #[cfg(test)]
+            auth: auth_for_test,
         })
     }
 }
@@ -851,6 +857,12 @@ impl ServerHandle {
         self._production_runtime
             .as_ref()
             .map(|runtime| runtime.orchestration.event_subscriber_count_for_test())
+    }
+
+    /// The server's authentication, so a test can hold an exchange.
+    #[cfg(test)]
+    pub(crate) fn auth_for_test(&self) -> &AuthService {
+        &self.auth
     }
 
     /// The production runtime's orchestration engine, so a test can dispatch what a provider
