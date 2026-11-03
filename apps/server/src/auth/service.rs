@@ -7370,6 +7370,71 @@ mod tests {
         .expect("the watcher reconciled the revoke");
         resume.send(()).unwrap();
         exchange.await.unwrap().expect("issued");
+        // A tick that cached the row before the revoke queued a ClientRemoved the publication
+        // then undid; only one after the publication's ClientUpserted proves the removal.
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientUpserted(view) if view.session_id == link.id)
+        })
+        .await
+        .expect("the publication upserts the client");
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientRemoved { session_id } if *session_id == link.id)
+        })
+        .await
+        .expect("a ClientRemoved follows the publication");
+        assert!(
+            service
+                .list_clients("")
+                .await
+                .iter()
+                .all(|client| client.session_id != link.id)
+        );
+    }
+
+    /// The same revoke when a watcher tick cached the committed row before it: that tick's
+    /// ClientRemoved comes before the publication, which must still be removed after (R1.4).
+    #[tokio::test]
+    async fn a_revoke_after_a_tick_cached_the_committed_row_is_removed_from_settings() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let mut events = service.subscribe_access();
+        let link = issue_mcp_pairing_link(&repositories, "MCP · late".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let (held, reached, resume) = test_hold();
+        *service.test_hooks().after_session_insert.lock().unwrap() = Some(held);
+        let exchange = exchange_in_background(&service, &link.credential).await;
+        reached.await.expect("the row committed");
+        tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+            while !matches!(&events.recv().await.expect("events").change, AuthAccessChange::ClientUpserted(view) if view.session_id == link.id) {}
+        }).await.expect("a tick cached the committed row");
+        repositories
+            .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        // A later link the watcher must list proves it reconciled past the revoke.
+        let marker = issue_mcp_pairing_link(&repositories, "MCP · marker".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let mut wait_for = async |wanted: &dyn Fn(&AuthAccessChange) -> bool| {
+            tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+                while !wanted(&events.recv().await.expect("access events").change) {}
+            })
+            .await
+        };
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::PairingLinkUpserted(view) if view.id == marker.id)
+        })
+        .await
+        .expect("the watcher reconciled the revoke");
+        resume.send(()).unwrap();
+        exchange.await.unwrap().expect("issued");
+        // A tick that cached the row before the revoke queued a ClientRemoved the publication
+        // then undid; only one after the publication's ClientUpserted proves the removal.
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientUpserted(view) if view.session_id == link.id)
+        })
+        .await
+        .expect("the publication upserts the client");
         wait_for(&|change| {
             matches!(change, AuthAccessChange::ClientRemoved { session_id } if *session_id == link.id)
         })
