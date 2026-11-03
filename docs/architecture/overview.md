@@ -2800,7 +2800,14 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   mcp`) is a stdio relay (`mcp/relay.rs`). It finds the server through the
   endpoint record and its per-boot proof (`mcp/endpoint.rs`), mints its own
   `mcp-client` credential in the data root's store, relays each JSON-RPC message
-  to `POST /mcp`, and revokes the credential when it exits. `bibcode thread`
+  to `POST /mcp`, and revokes the credential when it exits. An `mcp-client`
+  session's id is the id of the pairing link it was exchanged from, so the relay
+  records `<state>/mcp-clients/<link id>.link` before it sends the link and can
+  revoke the session even when the token response is lost. Revoking a relay
+  credential (`Repositories::revoke_mcp_credential`) also revokes its link,
+  consumed or not, and the server's insert of that session is fenced on the link
+  not being revoked, so a revoke that lands between the consume and the insert
+  leaves no session (#281). `bibcode thread`
   (`mcp/thread_cli.rs`) calls the same tools from a shell. Both protocol eras
   are served (`mcp/protocol.rs`). Remote Streamable HTTP with OAuth is slice R.
 - **Registry.** Tools are registered in families (`mcp/tools/*.rs`, listed in
