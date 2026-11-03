@@ -144,15 +144,23 @@ pub(crate) fn tools_report(listed: Result<Value, String>) -> Report {
     }
 }
 
+/// Prints `report` and returns its exit code; 1 when its result could not be written, since a
+/// script reading standard output got nothing.
 fn print(report: &Report, out: &mut impl Write, err: &mut impl Write) -> i32 {
-    if let Some(value) = &report.out {
-        let _ = writeln!(out, "{value}");
-        let _ = out.flush();
-    }
+    let written = match &report.out {
+        Some(value) => writeln!(out, "{value}").and_then(|()| out.flush()),
+        None => Ok(()),
+    };
     for line in report.note.iter().flat_map(|note| note.lines()) {
         let _ = writeln!(err, "bibcode: {line}");
     }
-    report.code
+    match written {
+        Ok(()) => report.code,
+        Err(error) => {
+            let _ = writeln!(err, "bibcode: could not write the result: {error}");
+            1
+        }
+    }
 }
 
 /// Opens the connection, runs `work` on it unless Ctrl-C comes first, and revokes the

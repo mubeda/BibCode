@@ -158,6 +158,33 @@ fn tools_marks_each_tool_one_shot_or_not() {
     );
 }
 
+/// Standard output that is full or closed.
+struct Full;
+
+impl std::io::Write for Full {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("no space left on device"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("no space left on device"))
+    }
+}
+
+/// A result that cannot be written is a failure: `call ... > /dev/full` exits 1, not 0.
+#[test]
+fn a_result_that_cannot_be_written_exits_1() {
+    let mut err = Vec::new();
+    let report = call_report(Ok(json!({ "content": [], "structuredContent": {} })));
+    assert_eq!(report.code, 0);
+    assert_eq!(print(&report, &mut Full, &mut err), 1);
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.contains("could not write"), "{err}");
+    let listed = tools_report(Ok(json!({ "tools": [] })));
+    assert_eq!(print(&listed, &mut Full, &mut Vec::new()), 1);
+    assert_eq!(print(&listed, &mut Vec::new(), &mut Vec::new()), 0);
+}
+
 fn options(root: &Path, access: Option<McpAccess>) -> RelayOptions {
     RelayOptions {
         root: crate::data_root::resolve_data_root(crate::data_root::DataRootRequest::explicit(
