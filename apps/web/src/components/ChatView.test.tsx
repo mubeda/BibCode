@@ -4790,6 +4790,89 @@ describe("ChatView", () => {
       expect(planSidebar["label"]).toBe("Tasks");
       expect(planSidebar["environmentId"]).toBe(environmentId);
     });
+
+    // #275: the task panel's auto-open took the panel straight back, so View diff did nothing.
+    it("keeps a turn's diff open over the task panel that opened automatically", async () => {
+      const planTurnId = TurnId.make("turn-275");
+      const planUpdate = (id: string, turn: TurnId) => ({
+        id: EventId.make(id),
+        createdAt: now,
+        kind: "turn.plan.updated" as const,
+        summary: "Plan updated",
+        tone: "info" as const,
+        payload: { plan: [{ step: "Edit tasks.md", status: "inProgress" }] },
+        turnId: turn,
+      });
+      const completedTurn = (turn: TurnId) => ({
+        turnId: turn,
+        state: "completed" as const,
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        assistantMessageId: null,
+      });
+      h.settings = { ...h.settings, autoOpenPlanSidebar: true };
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          latestTurn: completedTurn(planTurnId),
+          activities: [planUpdate("plan-1", planTurnId)],
+        }),
+      );
+      seedGitStatus(true);
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      const activeSurfaceId = () =>
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.activeSurfaceId;
+      try {
+        await render();
+        expect(activeSurfaceId()).toBe("plan");
+
+        const timeline = capturedProps<{
+          onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+        }>("messagesTimeline");
+        await act(async () => timeline.onOpenTurnDiff(planTurnId, "docs/tasks.md"));
+        expect(activeSurfaceId()).toBe("diff");
+        expect(container.querySelector('[data-mock="diff-panel"]')).not.toBeNull();
+
+        // A later step of the same turn leaves the diff in place.
+        h.threadsByKey.set(
+          `${environmentId}:${threadId}`,
+          makeThread({
+            latestTurn: completedTurn(planTurnId),
+            activities: [planUpdate("plan-1", planTurnId), planUpdate("plan-2", planTurnId)],
+          }),
+        );
+        await render();
+        expect(activeSurfaceId()).toBe("diff");
+
+        // The next turn's tasks still open the panel.
+        const nextTurnId = TurnId.make("turn-275-next");
+        h.threadsByKey.set(
+          `${environmentId}:${threadId}`,
+          makeThread({
+            latestTurn: completedTurn(nextTurnId),
+            activities: [planUpdate("plan-1", planTurnId), planUpdate("plan-3", nextTurnId)],
+          }),
+        );
+        await render();
+        expect(activeSurfaceId()).toBe("plan");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
   });
 
   describe("when: native preview tabs are owned by the host chat view", () => {
