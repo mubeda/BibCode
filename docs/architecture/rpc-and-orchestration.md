@@ -2181,8 +2181,11 @@ reaches its sequence no longer lists the panel, and it never reaches **Reopen
 closed chat**, which lists archived panels only.
 
 **Bring back** in a side chat composes, on the client, the last finished
-assistant answer quoted under the user question before it
-(`apps/web/src/sideChatBringBack.ts`) and appends it to the host's composer
+assistant answer quoted under the user message that started its turn: the newest
+delivered user message without a turn id (a steer carries one) created by the
+time the answer was, since a queued message keeps its queued state until it is
+promoted and re-timed (`apps/web/src/sideChatBringBack.ts`). It appends that to
+the host's composer
 draft. It sends nothing and calls no RPC; it is disabled while the host's
 session is running.
 
