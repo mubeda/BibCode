@@ -863,7 +863,12 @@ Every fresh desktop process starts the actual primary backend local-only under
 the native `ServerExposureCoordinator`, regardless of a previously persisted
 wide setting. Once authenticated, the renderer compares authoritative share
 state with actual runtime topology and requests a widen only when a live native
-exposure reason exists. One coordinator serializes exposure applies and every
+exposure reason exists, so a host with a live native pairing restarts its server
+on every launch. That restart waits up to 30 seconds for the old server to stop,
+and the renderer's apply deadline outlasts it. If the stop still times out, the
+restart reports that error, including during local recovery: a timed-out stop
+never reads as "no backend" and so never as verified local-only. Relaunch the
+app to recover from that state. One coordinator serializes exposure applies and every
 other settings mutation that can restart the native or WSL topology. Those
 non-exposure mutations preserve the actual runtime exposure across their
 restart instead of reapplying a stale durable mode. Widening uses an

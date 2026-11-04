@@ -61,8 +61,8 @@ Each checkout write command has a 24-hour safety ceiling, including the scoped
 GitRepository clone used for managed creation and rollback; ordinary Git operations
 retain their existing deadlines. Graceful server shutdown closes worktree operation
 admission and drains these owners without a shorter abort timer before catalog and
-orchestration teardown. The desktop's existing five-second in-process backend stop
-wait can report a timeout but does not abort the owned server task. Forced host/OS
+orchestration teardown. The desktop's in-process backend stop wait (five seconds, or
+30 for a restart) can report a timeout but does not abort the owned server task. Forced host/OS
 termination and the safety ceiling remain outside graceful completion. If Git
 itself fails, inspect `git status` in the reported checkout path before retrying;
 checkout does not reset the tree or remove lock files automatically.
