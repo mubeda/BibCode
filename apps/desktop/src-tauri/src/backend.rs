@@ -56,6 +56,9 @@ const DEFAULT_BACKEND_READINESS_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_BACKEND_SOFT_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// A restart must get the old server out before starting the new one, and giving up strands
+/// the desktop with no server, so it waits far longer than a stop that only has to end.
+const BACKEND_RESTART_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BACKEND_RESTART_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_BACKEND_RESTART_MAX_DELAY: Duration = Duration::from_secs(5);
 const DEFAULT_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(250);
@@ -1440,9 +1443,18 @@ impl BackendSupervisor {
                 .state
                 .lock()
                 .expect("backend supervisor mutex poisoned");
-            let is_active = state.slots.values().any(|slot| {
-                slot.backend.is_some() || slot.launch_plan.is_some() || slot.last_error.is_some()
-            });
+            // A stop that timed out emptied the slots but its server may still be running.
+            // Answering "nothing was active" would let recovery verify a missing server.
+            let stop_failed = matches!(
+                state.lifecycle,
+                BackendLifecycle::Stopped { result: Err(_), .. }
+            );
+            let is_active = stop_failed
+                || state.slots.values().any(|slot| {
+                    slot.backend.is_some()
+                        || slot.launch_plan.is_some()
+                        || slot.last_error.is_some()
+                });
             let held_ports = state
                 .slots
                 .values()
@@ -1456,7 +1468,10 @@ impl BackendSupervisor {
             return Ok(None);
         }
 
-        self.stop(BackendShutdownConfig::default()).await?;
+        self.stop(BackendShutdownConfig {
+            timeout: BACKEND_RESTART_STOP_TIMEOUT,
+        })
+        .await?;
         self.start_default_with_reason(app, "restarted", exposure_override, &held_ports)
             .await
             .map(Some)
@@ -5312,6 +5327,96 @@ exit /b 9
         stop_managed_backend(ManagedBackend::Runtime(Box::new(running)), shutdown)
             .await
             .expect("the stop waits for the running tool update");
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_a_timed_out_stop_reports_it_instead_of_no_backend() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        let root = tempfile::tempdir().expect("isolated backend data");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(root.path().join("data-root")))
+            .build(mock_context(noop_assets()))
+            .expect("mock app");
+        let supervisor = BackendSupervisor::new();
+        let runtime = slow_runtime(None, Duration::from_millis(400));
+        supervisor
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .insert(
+                PRIMARY_LOCAL_ENVIRONMENT_ID.to_owned(),
+                BackendSlotState {
+                    backend: Some(ManagedBackend::Runtime(Box::new(runtime))),
+                    ..BackendSlotState::default()
+                },
+            );
+        supervisor
+            .stop(BackendShutdownConfig {
+                timeout: Duration::from_millis(50),
+            })
+            .await
+            .expect_err("the backend outlasts the stop");
+
+        // Local recovery reads `Ok(None)` as "no backend, so verified local": a stranded
+        // desktop with a window and no server, reported as success.
+        let error = supervisor
+            .restart_default_if_active_with_exposure(app.handle().clone(), "local-only")
+            .await
+            .expect_err("a restart cannot pretend nothing was running");
+        assert!(error.contains("Timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_exposure_restart_outlasts_a_stop_longer_than_the_default_deadline() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "backend::tests::an_exposure_restart_outlasts_a_stop_longer_than_the_default_deadline",
+        ) else {
+            return;
+        };
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        let root = tempfile::tempdir().expect("isolated backend data");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(root.path().join("data-root")))
+            .build(mock_context(noop_assets()))
+            .expect("mock app");
+        let port = free_test_port();
+        let supervisor =
+            BackendSupervisor::with_backend_port_resolver(Arc::new(SequenceBackendPortResolver {
+                ports: Mutex::new(VecDeque::from([port])),
+            }));
+        // What v0.15.0 measured: a server stopping just past the default deadline.
+        let runtime = slow_runtime(
+            None,
+            DEFAULT_BACKEND_SHUTDOWN_TIMEOUT + Duration::from_millis(300),
+        );
+        supervisor
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .insert(
+                PRIMARY_LOCAL_ENVIRONMENT_ID.to_owned(),
+                BackendSlotState {
+                    backend: Some(ManagedBackend::Runtime(Box::new(runtime))),
+                    ..BackendSlotState::default()
+                },
+            );
+
+        let restarted = supervisor
+            .restart_default_if_active_with_exposure(app.handle().clone(), "local-only")
+            .await
+            .expect("the restart waits for the old server")
+            .expect("a replacement server is running");
+        assert_eq!(restarted.port, port);
+
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("cleanup");
+        isolated.complete();
     }
 
     #[tokio::test]

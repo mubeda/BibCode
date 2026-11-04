@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.15.1] - 2026-11-04
+
+BiBCode v0.15.1 is an emergency fix for desktop hosts with an Another device pairing.
+
+- The desktop no longer loses its local server at launch. A host with a live Another device pairing restarts its server to switch remote access on. In v0.15.0 that server could take just over the 5 seconds the restart allowed to stop, and the desktop then stayed open with no server, showing cached data and "Local is not connected". Remote access read as switched off and paired clients looked lost, though their pairings were intact. The restart now waits up to 30 seconds, and a stop that still times out is reported as an error instead of being treated as a verified local-only state.
+
 ## [v0.15.0] - 2026-11-04
 
 BiBCode v0.15.0 adds side chats, lets outside agents authenticate webhooks and act from the CLI, and makes large threads and stores lighter to load and keep. It also fixes Codex chat when BiBCode's MCP is registered, hardens turn checkpoints, and lifts the Windows file-write limit on the MCP Files tools. This release includes the changes since v0.14.0.
