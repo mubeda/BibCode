@@ -229,7 +229,6 @@ export function ShareThisHostTab(): ReactElement {
                 getExposureState: () => desktopBridge.getServerExposureState(),
                 applyExposure: (desired) => desktopBridge.applyServerExposure(desired),
                 canStartExposure: () => canManageNativeExposureRef.current,
-                operationTimeoutMs: PRIMARY_PAIRING_OFFER_REQUEST_TIMEOUT_MS,
               });
               if (outcome === "narrowed") return "local-confirmed";
               if (outcome === "widened" || outcome === "rewidened") return "active-reason";

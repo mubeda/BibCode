@@ -51,6 +51,7 @@ vi.mock("./desktopNetworkAccess", () => ({
 
 import {
   reconcileShareExposureOnce,
+  SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS,
   shouldRevertExposure,
   useShareExposureReconciler,
 } from "./shareExposureReconciler";
@@ -220,6 +221,29 @@ describe("reconcileShareExposureOnce", () => {
       }),
     ).rejects.toThrow("Server exposure narrowing timed out after 5ms");
     expect(applyExposure).toHaveBeenCalledExactlyOnceWith("local-only");
+  });
+
+  it("waits out a native restart slower than the read deadline", async () => {
+    // Widening restarts the server, which can take longer to stop than a bridge read may
+    // take; giving up early retries against a server that is still going down.
+    vi.useFakeTimers();
+    try {
+      let finishApply: (state: typeof wideExposure) => void = () => {};
+      const outcome = reconcileShareExposureOnce({
+        getShareState: async () => ({ ...loopbackDesired, desiredExposure: "wide" as const }),
+        getExposureState: async () => localExposure,
+        applyExposure: () =>
+          new Promise<typeof wideExposure>((resolve) => {
+            finishApply = resolve;
+          }),
+        canStartExposure: () => true,
+      });
+      await vi.advanceTimersByTimeAsync(SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS + 1);
+      finishApply(wideExposure);
+      await expect(outcome).resolves.toBe("widened");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("leaves wide exposure unchanged while a legacy grant blocks narrowing", async () => {

@@ -40,6 +40,11 @@ export interface ShareExposureOperations {
 export type ShareExposureReconciliationOutcome = "unchanged" | "narrowed" | "widened" | "rewidened";
 
 export const SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS = 5_000;
+/**
+ * An apply restarts the server: the native side may wait 30 s for the old one to stop and
+ * 30 s for the new one to answer, so this outlasts both.
+ */
+export const SHARE_EXPOSURE_APPLY_TIMEOUT_MS = 70_000;
 const SHARE_EXPOSURE_RECONCILE_RETRY_LIMIT = 3;
 const SHARE_EXPOSURE_RECONCILE_RETRY_DELAY_MS = 5_000;
 
@@ -75,13 +80,14 @@ export async function withShareExposureBridgeTimeout<A>(
 export async function reconcileShareExposureOnce(
   operations: ShareExposureOperations,
 ): Promise<ShareExposureReconciliationOutcome> {
-  const operationTimeoutMs = operations.operationTimeoutMs ?? SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS;
+  const readTimeoutMs = operations.operationTimeoutMs ?? SHARE_EXPOSURE_BRIDGE_TIMEOUT_MS;
+  const applyTimeoutMs = operations.operationTimeoutMs ?? SHARE_EXPOSURE_APPLY_TIMEOUT_MS;
   const [shareState, exposureState] = await Promise.all([
     operations.getShareState(),
     withShareExposureBridgeTimeout(
       "Server exposure state",
       operations.getExposureState(),
-      operationTimeoutMs,
+      readTimeoutMs,
     ),
   ]);
   if (shareState.desiredExposure === "wide" && exposureState.mode === "local-only") {
@@ -89,7 +95,7 @@ export async function reconcileShareExposureOnce(
     const applied = await withShareExposureBridgeTimeout(
       "Server exposure widening",
       operations.applyExposure("network-accessible"),
-      operationTimeoutMs,
+      applyTimeoutMs,
     );
     if (applied.mode !== "network-accessible") {
       throw new Error("Server exposure did not reach network-accessible mode.");
@@ -105,7 +111,7 @@ export async function reconcileShareExposureOnce(
   const applied = await withShareExposureBridgeTimeout(
     "Server exposure narrowing",
     operations.applyExposure("local-only"),
-    operationTimeoutMs,
+    applyTimeoutMs,
   );
   if (applied.mode !== "local-only") {
     throw new Error("Server exposure did not reach local-only mode.");
@@ -117,7 +123,7 @@ export async function reconcileShareExposureOnce(
   const restored = await withShareExposureBridgeTimeout(
     "Server exposure restore",
     operations.applyExposure("network-accessible"),
-    operationTimeoutMs,
+    applyTimeoutMs,
   );
   if (restored.mode !== "network-accessible") {
     throw new Error("Server exposure did not return to network-accessible mode.");
