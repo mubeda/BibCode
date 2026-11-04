@@ -338,3 +338,14 @@ future waiter. A waiter registered after the releasing task runs can hang and
 hold a shared test permit. Lower concurrency can help diagnosis but is not a
 repair. Keep system limits and other sessions untouched, and use the shared
 [cleanup procedure](./cross-platform-validation.md#cleanup) for test-owned work.
+
+A Linux test that finds a child it just spawned by `/proc/<pid>/exe` waits until
+the child has run its own image, for example an echoed byte from `cat`.
+`Command::spawn` returns once the parent is released, which is before `exec`
+has switched the executable: for that moment the child is a live, non-zombie
+child whose `/proc/<pid>/exe` still names the test binary.
+`webview_exit::tests::running_children_are_found_by_executable_until_they_end`
+missed its `sleep` that way on the Linux arm64 job (main, run 41789911736) and
+passed on the identical tree in the release PR's run. A standalone loop of the
+same calls on arm64 Ubuntu 22.04 missed about once in 10,000 spawns under 8
+threads, with the child still running the test binary at the miss.
