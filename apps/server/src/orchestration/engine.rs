@@ -50,6 +50,15 @@ pub(crate) use compaction::{
     GUARD_WAITING_DETAIL, compaction_row_on, saved_conversation_on, unsettled_compaction_on,
 };
 
+fn diff_available_default() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes the field by reference.
+fn is_diff_available(diff_available: &bool) -> bool {
+    *diff_available
+}
+
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
 const DEFAULT_WORKTREE_DISCOVERY_JSON: &str =
     r#"{"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}"#;
@@ -315,6 +324,19 @@ pub trait ThreadTurnBootstrapEffects: Send + Sync {
         &'a self,
         input: BootstrapSetupInput,
     ) -> BoxBootstrapFuture<'a, BootstrapSetupResult>;
+
+    /// Captures `thread_id`'s checkpoint ref 0 before its first turn (`message_id`) is first
+    /// claimed, giving up after `limit`. `Ok(None)` when it is captured or not needed,
+    /// `Ok(Some(reason))` when it failed or timed out, and `Err` only when `cancellation` fired.
+    fn capture_first_turn_baseline<'a>(
+        &'a self,
+        _thread_id: &'a str,
+        _message_id: &'a str,
+        _limit: Duration,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxBootstrapFuture<'a, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 pub type BoxProjectCommandFuture<'a, T> =
@@ -478,6 +500,14 @@ pub enum OrchestrationCommand {
             skip_serializing_if = "Option::is_none"
         )]
         host_thread_id: Option<String>,
+        /// A side chat of its host (#265); only `worktree.createPanel` sets it, and only on a
+        /// panel. Omitted when false so a plain command keeps its digest.
+        #[serde(
+            rename = "sideChat",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        side_chat: bool,
         /// Why an outside agent created the thread (untrusted text, at most 200 characters);
         /// shown with the agent's label, never logged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,6 +539,15 @@ pub enum OrchestrationCommand {
         command_id: String,
         #[serde(rename = "threadId")]
         thread_id: String,
+        /// Refuse with [`OrchestrationError::ThreadInUse`] when a thread it would delete has
+        /// any message or turn (#265: closing an unused side chat). Omitted when false so a
+        /// plain delete keeps its digest.
+        #[serde(
+            rename = "onlyIfUnused",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        only_if_unused: bool,
     },
     #[serde(rename = "thread.archive")]
     ThreadArchive {
@@ -800,6 +839,14 @@ pub enum OrchestrationCommand {
         checkpoint_ref: String,
         status: String,
         files: Value,
+        /// Whether the turn before's checkpoint is a trusted baseline, so `files` are this
+        /// turn's change. Omitted when true, so earlier commands keep their shape.
+        #[serde(
+            rename = "diffAvailable",
+            default = "diff_available_default",
+            skip_serializing_if = "is_diff_available"
+        )]
+        diff_available: bool,
         #[serde(rename = "assistantMessageId")]
         assistant_message_id: Option<String>,
         #[serde(rename = "completedAt")]
@@ -901,6 +948,9 @@ pub struct TestHooks {
     pause_after_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
     fail_delivery_transitions: Arc<AtomicUsize>,
     delivery_transition_attempts: Arc<AtomicUsize>,
+    /// While set, a first turn's checkout probe waits for this gate before it walks the disk.
+    #[cfg(test)]
+    checkout_probe_gate: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -956,6 +1006,25 @@ struct FailProjector {
 }
 
 impl TestHooks {
+    /// Holds every first-turn checkout probe until the returned gate is notified.
+    #[cfg(test)]
+    pub(crate) fn hold_checkout_probe(&self) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *self
+            .checkout_probe_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_probe_gate(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.checkout_probe_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn fail_next_projector(&self, projector: impl Into<String>, event_type: Option<&str>) {
         self.fail_next_projectors(projector, event_type, 1);
     }
@@ -1167,6 +1236,10 @@ pub enum OrchestrationError {
         path: String,
         detail: String,
     },
+    /// `thread.delete` with `onlyIfUnused` found a message or turn on a thread it would
+    /// delete; nothing was deleted. Its own type so a client can archive instead.
+    #[error("Thread '{thread_id}' has messages or turns, so it was not deleted.")]
+    ThreadInUse { thread_id: String },
     #[error("orchestration worker has already shut down")]
     WorkerClosed,
     #[error("orchestration worker cancelled")]
@@ -1205,6 +1278,7 @@ struct ThreadState {
     project_id: String,
     kind: String,
     host_thread_id: Option<String>,
+    side_chat: bool,
     runtime_mode: String,
     interaction_mode: String,
     branch: Option<String>,
@@ -1976,6 +2050,9 @@ enum WorkerEnvelope {
     DeliveryTransition(DeliveryTransitionEnvelope),
 }
 
+/// Receives the working directory of a provider command that may have created a pull request.
+pub type PullRequestChangeObserver = Arc<dyn Fn(&Path) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct OrchestrationEngine {
     repositories: Repositories,
@@ -1986,6 +2063,7 @@ pub struct OrchestrationEngine {
     bootstrap_effects: Arc<StdMutex<Option<Arc<dyn ThreadTurnBootstrapEffects>>>>,
     turn_delivery_wake: Arc<StdMutex<Option<Arc<Notify>>>>,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
+    pull_request_change_observer: Arc<StdMutex<Option<PullRequestChangeObserver>>>,
     command_admission: CommandAdmissionFence,
     workspace_ownership: WorkspaceOwnershipFence,
     thread_turns: ThreadTurnFence,
@@ -2083,6 +2161,7 @@ impl OrchestrationEngine {
             bootstrap_effects: Arc::new(StdMutex::new(None)),
             turn_delivery_wake,
             project_command_effects,
+            pull_request_change_observer: Arc::new(StdMutex::new(None)),
             command_admission: CommandAdmissionFence::default(),
             workspace_ownership: WorkspaceOwnershipFence::default(),
             thread_turns: ThreadTurnFence::default(),
@@ -2833,10 +2912,36 @@ impl OrchestrationEngine {
         self.release_checkpoint_holds(|((thread, turn), _)| thread == thread_id && turn == turn_id);
     }
 
+    /// The worker is done with `turn_id`'s checkpoint: releases its hold unless the hold has
+    /// expired (the turn is stale), whose expiry task releases it after its one record attempt.
+    /// One decision under the hold lock, in `claim_checkpoint_completion`'s lock order, against
+    /// `expire_checkpoint_hold`: either the release comes first and the expiry finds no hold and
+    /// records nothing, or the expiry marks the turn first and keeps the hold.
+    pub(crate) fn release_checkpoint_hold_unless_stale(&self, thread_id: &str, turn_id: &str) {
+        let key = (thread_id.to_owned(), turn_id.to_owned());
+        let released = {
+            let mut holds = self
+                .checkpoint_holds
+                .turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale = self
+                .checkpoint_holds
+                .stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key);
+            !stale && holds.1.remove(&key).is_some()
+        };
+        if released {
+            self.wake_turn_delivery();
+        }
+    }
+
     /// Gives up hold `id` of `turn_id` before the worker captured the turn: marks the turn's
-    /// checkpoint stale and keeps the hold, which the caller releases once the stale checkpoint
-    /// is recorded. Returns `false`, changing nothing, when the hold is already gone (the worker
-    /// claimed the capture, or the thread was deleted).
+    /// checkpoint stale and keeps the hold, which the caller releases after its one attempt to
+    /// record the stale checkpoint. Returns `false`, changing nothing, when the hold is already
+    /// gone (the worker claimed the capture or released it, or the thread was deleted).
     pub(crate) fn expire_checkpoint_hold(&self, thread_id: &str, turn_id: &str, id: u64) -> bool {
         let key = (thread_id.to_owned(), turn_id.to_owned());
         let holds = self
@@ -2951,6 +3056,26 @@ impl OrchestrationEngine {
             .as_ref()
         {
             wake.notify_one();
+        }
+    }
+
+    /// Registers where a provider command that may have created a pull request (an agent running
+    /// `gh pr create`) is reported. It must only schedule work, never block.
+    pub fn set_pull_request_change_observer(&self, observer: PullRequestChangeObserver) {
+        *self
+            .pull_request_change_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    pub(crate) fn report_pull_request_change(&self, cwd: &Path) {
+        let observer = self
+            .pull_request_change_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer(cwd);
         }
     }
 
@@ -4503,6 +4628,7 @@ async fn plan_command(
             title,
             kind,
             host_thread_id,
+            side_chat,
             purpose,
             model_selection,
             runtime_mode,
@@ -4512,6 +4638,12 @@ async fn plan_command(
             created_at,
         } => {
             require_project(model, command, project_id)?;
+            if *side_chat && (kind.as_deref() != Some("panel") || host_thread_id.is_none()) {
+                return invariant(
+                    command,
+                    "A side chat must be a chat panel with a host thread.".to_owned(),
+                );
+            }
             if purpose
                 .as_deref()
                 .is_some_and(|purpose| purpose.chars().count() > MAX_THREAD_PURPOSE_CHARS)
@@ -4564,6 +4696,7 @@ async fn plan_command(
                 host_thread_id.as_ref().map(|v| json!(v)),
             );
             insert_optional(&mut payload, "purpose", purpose.as_ref().map(|v| json!(v)));
+            insert_optional(&mut payload, "sideChat", side_chat.then(|| json!(true)));
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -4577,6 +4710,7 @@ async fn plan_command(
         OrchestrationCommand::ThreadDelete {
             command_id,
             thread_id,
+            only_if_unused,
         } => {
             let thread = require_thread(model, command, thread_id)?;
             if thread.kind == "default" {
@@ -4595,7 +4729,7 @@ async fn plan_command(
             }
             // Chat panels (live or closed, so archived) go with their host thread,
             // in stable id order (the model is a BTreeMap), before the host itself.
-            Ok(model
+            let deleted_ids = model
                 .threads
                 .iter()
                 .filter(|(_, candidate)| {
@@ -4605,6 +4739,24 @@ async fn plan_command(
                 })
                 .map(|(panel_id, _)| panel_id)
                 .chain([thread_id])
+                .collect::<Vec<_>>();
+            // Judged here, in the engine's command order, so a first send that commits first
+            // wins and the delete is refused; one that commits after finds the thread deleted.
+            if *only_if_unused {
+                for deleted_id in &deleted_ids {
+                    if repositories
+                        .thread_has_messages_or_turns((*deleted_id).clone())
+                        .await
+                        .map_err(wrap_persistence)?
+                    {
+                        return Err(OrchestrationError::ThreadInUse {
+                            thread_id: (*deleted_id).clone(),
+                        });
+                    }
+                }
+            }
+            Ok(deleted_ids
+                .into_iter()
                 .map(|deleted_id| {
                     make_event(
                         "thread.deleted",
@@ -4690,7 +4842,10 @@ async fn plan_command(
                 }
             }
             let mut payload = json!({"threadId":thread_id,"updatedAt":occurred_at});
-            insert_optional(&mut payload, "title", title.as_ref().map(|v| json!(v)));
+            // A side chat keeps its `Panel: Side chat · <provider>` title, which every client
+            // labels its tab from; the first-message rename any client sends is dropped.
+            let title = title.as_ref().filter(|_| !thread.side_chat);
+            insert_optional(&mut payload, "title", title.map(|v| json!(v)));
             insert_optional(&mut payload, "modelSelection", model_selection.clone());
             insert_optional(
                 &mut payload,
@@ -4824,6 +4979,7 @@ async fn plan_command(
                             project_id: create.project_id.clone(),
                             kind: "workspace".to_owned(),
                             host_thread_id: None,
+                            side_chat: false,
                             runtime_mode: create.runtime_mode.clone(),
                             interaction_mode: create.interaction_mode.clone(),
                             branch: create.branch.clone(),
@@ -5131,6 +5287,19 @@ async fn plan_command(
                 json!({"threadId":thread_id,"requestId":request_id,"answers":answers,"createdAt":created_at}),
             )])
         }
+        OrchestrationCommand::ThreadCheckpointRevert { thread_id, .. }
+            if model
+                .threads
+                .get(thread_id)
+                .is_some_and(|thread| thread.side_chat) =>
+        {
+            // A side chat shares its host's checkout and has no checkpoints of its own, so a
+            // revert would fall back to `HEAD` and clean the host's uncommitted work.
+            invariant(
+                command,
+                "Side chats can't restore files. Restore from the main thread.".to_owned(),
+            )
+        }
         OrchestrationCommand::ThreadCheckpointRevert {
             command_id,
             thread_id,
@@ -5340,19 +5509,27 @@ async fn plan_command(
             checkpoint_ref,
             status,
             files,
+            diff_available,
             assistant_message_id,
             completed_at,
             created_at,
-        } => simple_thread_event(
-            model,
-            command,
-            "thread.turn-diff-completed",
-            command_id,
-            thread_id,
-            created_at,
-            metadata,
-            json!({"threadId":thread_id,"turnId":turn_id,"checkpointTurnCount":checkpoint_turn_count,"checkpointRef":checkpoint_ref,"status":status,"files":files,"assistantMessageId":assistant_message_id,"completedAt":completed_at}),
-        ),
+        } => {
+            let mut payload = json!({"threadId":thread_id,"turnId":turn_id,"checkpointTurnCount":checkpoint_turn_count,"checkpointRef":checkpoint_ref,"status":status,"files":files,"assistantMessageId":assistant_message_id,"completedAt":completed_at});
+            // Absent means true, so existing events and fixtures keep their shape.
+            if !diff_available {
+                payload["diffAvailable"] = json!(false);
+            }
+            simple_thread_event(
+                model,
+                command,
+                "thread.turn-diff-completed",
+                command_id,
+                thread_id,
+                created_at,
+                metadata,
+                payload,
+            )
+        }
         OrchestrationCommand::ThreadActivityAppend {
             command_id,
             thread_id,
@@ -6775,6 +6952,8 @@ fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent
                                 .get("hostThreadId")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
+                            side_chat: payload.get("sideChat").and_then(Value::as_bool)
+                                == Some(true),
                             runtime_mode: payload
                                 .get("runtimeMode")
                                 .and_then(Value::as_str)
@@ -6965,6 +7144,7 @@ async fn load_command_model(
                     project_id: thread.project_id.clone(),
                     kind: thread.kind.clone(),
                     host_thread_id: thread.host_thread_id.clone(),
+                    side_chat: thread.side_chat,
                     runtime_mode: thread.runtime_mode.clone(),
                     interaction_mode: thread.interaction_mode.clone(),
                     branch: thread.branch.clone(),
@@ -7116,10 +7296,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id, requester_json, side_chat) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?, ?, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, requester_json = excluded.requester_json, side_chat = excluded.side_chat, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -7152,6 +7332,7 @@ fn apply_threads_projector_tx(
                         &json!({ "actor": actor, "purpose": payload.get("purpose") }),
                     ))
                     .transpose()?,
+                payload.get("sideChat").and_then(Value::as_bool) == Some(true),
             ],
         )?;
     } else {
@@ -7495,10 +7676,11 @@ fn apply_messages_projector_tx(
         // timestamp through the event projector so live writes and replay agree;
         // queued receipt order and steered messages keep their enqueue time.
         transaction.execute(
-            "UPDATE projection_thread_messages SET created_at = ?, updated_at = ? WHERE thread_id = ? AND message_id = ? AND role = 'user'",
+            "UPDATE projection_thread_messages SET created_at = ?, updated_at = ?, written_sequence = ? WHERE thread_id = ? AND message_id = ? AND role = 'user'",
             params![
                 required_str(payload, "createdAt")?,
                 required_str(payload, "createdAt")?,
+                event.sequence,
                 required_str(payload, "threadId")?,
                 required_str(payload, "messageId")?,
             ],
@@ -7514,10 +7696,20 @@ fn apply_messages_projector_tx(
             "DELETE FROM projection_thread_reasoning WHERE thread_id = ? AND turn_id IN (SELECT json_extract(payload_json, '$.turnId') FROM orchestration_events WHERE event_type = 'thread.turn-diff-completed' AND stream_id = ? AND CAST(json_extract(payload_json, '$.checkpointTurnCount') AS INTEGER) > ?)",
             params![required_str(&event.event.payload, "threadId")?, required_str(&event.event.payload, "threadId")?, required_i64(&event.event.payload, "turnCount")?],
         )?;
+        // A revert is the only deletion of settled history rows: it starts a new history epoch,
+        // so every window and page cursor of the thread from before it is stale (#226). The
+        // event's sequence keeps the epoch the same after a projection rebuild.
+        transaction.execute(
+            "UPDATE projection_threads SET history_epoch = ? WHERE thread_id = ?",
+            params![
+                event.sequence,
+                required_str(&event.event.payload, "threadId")?
+            ],
+        )?;
         return Ok(());
     }
     if event.event.event_type == "thread.reasoning-sent" {
-        return apply_reasoning_sent_tx(transaction, &event.event.payload);
+        return apply_reasoning_sent_tx(transaction, &event.event.payload, event.sequence);
     }
     if event.event.event_type == "thread.turn-delivery-updated" {
         let payload = &event.event.payload;
@@ -7532,7 +7724,7 @@ fn apply_messages_projector_tx(
             return Ok(());
         }
         transaction.execute(
-            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_provider_instance_id = COALESCE(?, delivery_provider_instance_id), delivery_detail = ?, delivery_reason = ?, delivery_mode = COALESCE(?, delivery_mode), delivery_held = COALESCE(?, delivery_held), turn_id = COALESCE(?, turn_id), updated_at = ? WHERE message_id = ? AND thread_id = ?",
+            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_provider_instance_id = COALESCE(?, delivery_provider_instance_id), delivery_detail = ?, delivery_reason = ?, delivery_mode = COALESCE(?, delivery_mode), delivery_held = COALESCE(?, delivery_held), turn_id = COALESCE(?, turn_id), updated_at = ?, written_sequence = ? WHERE message_id = ? AND thread_id = ?",
             params![
                 required_str(payload, "state")?,
                 required_str(payload, "provider")?,
@@ -7543,6 +7735,7 @@ fn apply_messages_projector_tx(
                 payload.pointer("/delivery/held").or_else(|| payload.get("held")).and_then(Value::as_bool),
                 optional_string(payload.get("turnId")),
                 required_str(payload, "updatedAt")?,
+                event.sequence,
                 required_str(payload, "messageId")?,
                 required_str(payload, "threadId")?,
             ],
@@ -7555,11 +7748,12 @@ fn apply_messages_projector_tx(
     let payload = &event.event.payload;
     if context.mode == ProjectionMode::UpdateExistingAssistantMessage {
         context.existing_assistant_message_updated = transaction.execute(
-            "UPDATE projection_thread_messages SET is_streaming = 0, updated_at = ? \
+            "UPDATE projection_thread_messages SET is_streaming = 0, updated_at = ?, written_sequence = ? \
              WHERE message_id = ? AND thread_id = ? AND turn_id IS ? \
                AND role = 'assistant' AND is_streaming = 1",
             params![
                 required_str(payload, "updatedAt")?,
+                event.sequence,
                 required_str(payload, "messageId")?,
                 required_str(payload, "threadId")?,
                 optional_string(payload.get("turnId")),
@@ -7568,10 +7762,10 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id, actor_json, source_thread_id, written_sequence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (message_id) DO UPDATE SET \
-           thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
+           written_sequence = excluded.written_sequence, thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_messages.text || excluded.text WHEN excluded.text = '' THEN projection_thread_messages.text ELSE excluded.text END, \
            attachments_json = COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
            is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, \
@@ -7598,6 +7792,7 @@ fn apply_messages_projector_tx(
                 .map(json_string)
                 .transpose()?,
             optional_string(payload.get("sourceThreadId")),
+            event.sequence,
         ],
     )?;
     Ok(())
@@ -7610,6 +7805,7 @@ fn apply_messages_projector_tx(
 fn apply_reasoning_sent_tx(
     transaction: &Transaction<'_>,
     payload: &Value,
+    sequence: i64,
 ) -> Result<(), PersistenceError> {
     let streaming = payload
         .get("streaming")
@@ -7618,10 +7814,11 @@ fn apply_reasoning_sent_tx(
     let text = required_str(payload, "text")?;
     if !streaming && text.is_empty() {
         transaction.execute(
-            "UPDATE projection_thread_reasoning SET is_streaming = 0, updated_at = ? \
+            "UPDATE projection_thread_reasoning SET is_streaming = 0, updated_at = ?, written_sequence = ? \
              WHERE reasoning_id = ? AND thread_id = ? AND is_streaming = 1",
             params![
                 required_str(payload, "updatedAt")?,
+                sequence,
                 required_str(payload, "reasoningId")?,
                 required_str(payload, "threadId")?,
             ],
@@ -7629,11 +7826,11 @@ fn apply_reasoning_sent_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at, written_sequence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (reasoning_id) DO UPDATE SET \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_reasoning.text || excluded.text ELSE excluded.text END, \
-           is_streaming = excluded.is_streaming, updated_at = excluded.updated_at",
+           is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, written_sequence = excluded.written_sequence",
         params![
             required_str(payload, "reasoningId")?,
             required_str(payload, "threadId")?,
@@ -7642,6 +7839,7 @@ fn apply_reasoning_sent_tx(
             streaming,
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
+            sequence,
         ],
     )?;
     Ok(())
@@ -7718,10 +7916,10 @@ fn apply_plans_projector_tx(
         .get("proposedPlan")
         .ok_or_else(|| PersistenceError::Corrupt("missing proposedPlan payload".to_owned()))?;
     transaction.execute(
-        "INSERT INTO projection_thread_proposed_plans (plan_id, thread_id, turn_id, plan_markdown, implemented_at, implementation_thread_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_proposed_plans (plan_id, thread_id, turn_id, plan_markdown, implemented_at, implementation_thread_id, created_at, updated_at, written_sequence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (plan_id) DO UPDATE SET \
-           thread_id = excluded.thread_id, turn_id = excluded.turn_id, plan_markdown = excluded.plan_markdown, \
+           written_sequence = excluded.written_sequence, thread_id = excluded.thread_id, turn_id = excluded.turn_id, plan_markdown = excluded.plan_markdown, \
            implemented_at = excluded.implemented_at, implementation_thread_id = excluded.implementation_thread_id, \
            created_at = excluded.created_at, updated_at = excluded.updated_at",
         params![
@@ -7733,6 +7931,7 @@ fn apply_plans_projector_tx(
             optional_string(plan.get("implementationThreadId")),
             required_str(plan, "createdAt")?,
             required_str(plan, "updatedAt")?,
+            event.sequence,
         ],
     )?;
     Ok(())
@@ -7791,10 +7990,10 @@ fn apply_activities_projector_tx(
         )?;
     }
     transaction.execute(
-        "INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at, written_sequence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (activity_id) DO UPDATE SET \
-           thread_id = excluded.thread_id, turn_id = excluded.turn_id, tone = excluded.tone, kind = excluded.kind, \
+           written_sequence = excluded.written_sequence, thread_id = excluded.thread_id, turn_id = excluded.turn_id, tone = excluded.tone, kind = excluded.kind, \
            summary = excluded.summary, payload_json = excluded.payload_json, sequence = excluded.sequence, created_at = excluded.created_at",
         params![
             activity_id,
@@ -7809,6 +8008,7 @@ fn apply_activities_projector_tx(
             },
             activity.get("sequence").and_then(Value::as_i64).unwrap_or(event.sequence),
             required_str(activity, "createdAt")?,
+            event.sequence,
         ],
     )?;
     Ok(())
@@ -8075,9 +8275,12 @@ fn apply_turns_projector_tx(
             } else {
                 json_string(payload.get("files").unwrap_or(&Value::Array(Vec::new())))?
             };
+            // Only a `ready` capture can lack its baseline; every other row keeps the default.
+            let diff_available = status != "ready"
+                || payload.get("diffAvailable").and_then(Value::as_bool) != Some(false);
             // A turn its session ended interrupted or failed keeps that state, and an event that
             // names no answer keeps the one the turn already has.
-            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, thread_id, turn_id])?;
+            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = COALESCE(?, assistant_message_id), state = CASE WHEN state IN ('interrupted', 'error') THEN state ELSE ? END, started_at = COALESCE(started_at, ?), completed_at = ?, checkpoint_turn_count = ?, checkpoint_ref = ?, checkpoint_status = ?, checkpoint_files_json = ?, checkpoint_diff_available = ? WHERE thread_id = ? AND turn_id = ?", params![optional_string(payload.get("assistantMessageId")), next_state, completed_at, completed_at, checkpoint_turn_count, required_str(payload,"checkpointRef")?, status, files, diff_available, thread_id, turn_id])?;
             if updated == 0 {
                 transaction.execute(
                     TURN_UPSERT_SQL,
@@ -8097,6 +8300,10 @@ fn apply_turns_projector_tx(
                         Some(status),
                         files
                     ],
+                )?;
+                transaction.execute(
+                    "UPDATE projection_turns SET checkpoint_diff_available = ? WHERE thread_id = ? AND turn_id = ?",
+                    params![diff_available, thread_id, turn_id],
                 )?;
             }
         }
@@ -8775,6 +8982,7 @@ pub struct ProjectionCheckpointRow {
     pub checkpoint_ref: String,
     pub status: String,
     pub files: Value,
+    pub diff_available: bool,
     pub assistant_message_id: Option<String>,
     pub completed_at: String,
 }
@@ -8892,7 +9100,24 @@ pub async fn load_shell_snapshot(
         .load_shell_snapshot_rows(archived)
         .await
         .map_err(wrap_persistence)?;
-    Ok(Snapshot {
+    Ok(shell_rows_snapshot(rows))
+}
+
+/// The live shell capped for #223, with what each project and checkout left out.
+pub async fn load_capped_shell_snapshot(
+    repositories: &Repositories,
+    forced: std::collections::HashSet<String>,
+) -> Result<(Snapshot, Vec<crate::persistence::ShellOlderCount>), OrchestrationError> {
+    let (rows, older) = repositories
+        .load_capped_shell_snapshot_rows(forced)
+        .await
+        .map_err(wrap_persistence)?;
+    Ok((shell_rows_snapshot(rows), older))
+}
+
+/// A snapshot holding exactly the rows a shell read returned.
+pub fn shell_rows_snapshot(rows: crate::persistence::ShellSnapshotRows) -> Snapshot {
+    Snapshot {
         projects: rows.projects,
         threads: rows.threads,
         messages: rows.preview_messages,
@@ -8907,7 +9132,7 @@ pub async fn load_shell_snapshot(
         receipts: Vec::new(),
         diffs: Vec::new(),
     }
-    .in_canonical_order())
+    .in_canonical_order()
 }
 
 /// Loads one thread and the rows its detail shows, ordered as [`load_snapshot`] orders
@@ -9045,6 +9270,7 @@ impl From<crate::persistence::ProjectionCheckpoint> for ProjectionCheckpointRow 
             checkpoint_ref: checkpoint.checkpoint_ref,
             status: checkpoint.status,
             files: checkpoint.files,
+            diff_available: checkpoint.diff_available,
             assistant_message_id: checkpoint.assistant_message_id,
             completed_at: checkpoint.completed_at,
         }
@@ -9174,6 +9400,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    side_chat: false,
                     purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
@@ -9233,6 +9460,7 @@ mod tests {
                     OrchestrationCommand::ThreadDelete {
                         command_id: "remove-runtime".into(),
                         thread_id: "panel-a".into(),
+                        only_if_unused: false,
                     }
                 };
                 engine.dispatch(command).await.unwrap();
@@ -9271,6 +9499,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "delete-panel".into(),
                     thread_id: "deleted-panel".into(),
+                    only_if_unused: false,
                 })
                 .await
                 .unwrap();
@@ -9436,6 +9665,7 @@ mod tests {
                         title: id.to_owned(),
                         kind: Some(kind.to_owned()),
                         host_thread_id: host.map(str::to_owned),
+                        side_chat: false,
                         purpose: None,
                         model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                         runtime_mode: "full-access".to_owned(),
@@ -9458,6 +9688,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "delete-panel-gone".into(),
                     thread_id: "panel-gone".into(),
+                    only_if_unused: false,
                 })
                 .await
                 .expect("delete panel");
@@ -9481,6 +9712,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "delete-host".into(),
                     thread_id: "host".into(),
+                    only_if_unused: false,
                 })
                 .await
                 .expect("delete host");
@@ -9556,6 +9788,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "generic-delete-owner".to_owned(),
                     thread_id: "workspace-owner".to_owned(),
+                    only_if_unused: false,
                 })
                 .await;
             assert!(
@@ -9579,6 +9812,7 @@ mod tests {
                 .dispatch(OrchestrationCommand::ThreadDelete {
                     command_id: "generic-delete-panel".to_owned(),
                     thread_id: "owner-panel".to_owned(),
+                    only_if_unused: false,
                 })
                 .await
                 .expect("a dependent panel remains ordinary non-owner orchestration");
@@ -9778,6 +10012,7 @@ mod tests {
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
                     host_thread_id: None,
+                    side_chat: false,
                     purpose: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
@@ -10644,6 +10879,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host_id.clone()),
+                side_chat: false,
                 purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
@@ -10729,6 +10965,7 @@ mod tests {
                 title: "Panel".to_owned(),
                 kind: Some("panel".to_owned()),
                 host_thread_id: Some(host.to_owned()),
+                side_chat: false,
                 purpose: None,
                 model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                 runtime_mode: "full-access".to_owned(),
@@ -10761,6 +10998,7 @@ mod tests {
             .dispatch(OrchestrationCommand::ThreadDelete {
                 command_id: "delete-side".to_owned(),
                 thread_id: "side-thread".to_owned(),
+                only_if_unused: false,
             })
             .await
             .expect("side deleted");
@@ -10801,6 +11039,509 @@ mod tests {
                 "a refused panel is not created"
             );
         }
+    }
+
+    fn side_chat_create(
+        command_id: &str,
+        thread_id: &str,
+        kind: Option<&str>,
+        host: Option<&str>,
+    ) -> OrchestrationCommand {
+        OrchestrationCommand::ThreadCreate {
+            command_id: command_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            project_id: "delivery-project".to_owned(),
+            title: "Panel: Side chat · Codex".to_owned(),
+            kind: kind.map(str::to_owned),
+            host_thread_id: host.map(str::to_owned),
+            side_chat: true,
+            purpose: None,
+            model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+            runtime_mode: "approval-required".to_owned(),
+            interaction_mode: "default".to_owned(),
+            branch: None,
+            worktree_path: None,
+            created_at: "2026-11-02T00:00:01Z".to_owned(),
+        }
+    }
+
+    fn plain_panel_create(command_id: &str, thread_id: &str, host: &str) -> OrchestrationCommand {
+        let mut command = side_chat_create(command_id, thread_id, Some("panel"), Some(host));
+        if let OrchestrationCommand::ThreadCreate { side_chat, .. } = &mut command {
+            *side_chat = false;
+        }
+        command
+    }
+
+    fn invariant_detail<T: std::fmt::Debug>(result: Result<T, OrchestrationError>) -> String {
+        match result {
+            Err(OrchestrationError::Invariant { detail, .. }) => detail,
+            other => panic!("expected an invariant refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn side_chat_marker_requires_a_panel_with_a_host() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for command in [
+            side_chat_create("no-kind", "no-kind", None, Some(&host_id)),
+            side_chat_create("workspace", "workspace", Some("workspace"), Some(&host_id)),
+            side_chat_create("no-host", "no-host", Some("panel"), None),
+        ] {
+            let thread_id = command.aggregate_ref().1.to_owned();
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "A side chat must be a chat panel with a host thread."
+            );
+            assert!(
+                engine
+                    .repositories()
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn side_chat_cannot_host_a_panel_or_side_chat() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        for command in [
+            plain_panel_create("nested-panel", "nested-panel", "side-chat"),
+            side_chat_create(
+                "nested-side",
+                "nested-side",
+                Some("panel"),
+                Some("side-chat"),
+            ),
+        ] {
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "Host thread 'side-chat' is a chat panel itself."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_delete_cascades_to_open_and_archived_side_chats() {
+        let (engine, _) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"create-host","threadId":"host",
+                    "projectId":"delivery-project","title":"Host",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","createdAt":"2026-11-02T00:00:00Z"
+                }))
+                .expect("host command"),
+            )
+            .await
+            .expect("host");
+        for (command_id, thread_id) in [("open", "open-side"), ("closed", "closed-side")] {
+            engine
+                .dispatch(side_chat_create(
+                    command_id,
+                    thread_id,
+                    Some("panel"),
+                    Some("host"),
+                ))
+                .await
+                .expect("side chat");
+        }
+        engine
+            .dispatch(OrchestrationCommand::ThreadArchive {
+                command_id: "archive-closed".to_owned(),
+                thread_id: "closed-side".to_owned(),
+            })
+            .await
+            .expect("archive");
+        engine
+            .dispatch(OrchestrationCommand::ThreadDelete {
+                command_id: "delete-host".to_owned(),
+                thread_id: "host".to_owned(),
+                only_if_unused: false,
+            })
+            .await
+            .expect("delete host");
+        for thread_id in ["open-side", "closed-side", "host"] {
+            assert!(
+                engine
+                    .repositories()
+                    .get_thread(thread_id.to_owned())
+                    .await
+                    .expect("thread read")
+                    .is_none_or(|thread| thread.deleted_at.is_some()),
+                "{thread_id} is deleted"
+            );
+        }
+    }
+
+    fn unused_delete(command_id: &str, thread_id: &str) -> OrchestrationCommand {
+        OrchestrationCommand::ThreadDelete {
+            command_id: command_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            only_if_unused: true,
+        }
+    }
+
+    async fn is_deleted(engine: &OrchestrationEngine, thread_id: &str) -> bool {
+        engine
+            .repositories()
+            .get_thread(thread_id.to_owned())
+            .await
+            .expect("thread read")
+            .is_none_or(|thread| thread.deleted_at.is_some())
+    }
+
+    fn in_use_thread(result: Result<DispatchResult, OrchestrationError>) -> String {
+        match result {
+            Err(OrchestrationError::ThreadInUse { thread_id }) => thread_id,
+            other => panic!("expected a thread-in-use refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_if_unused_delete_deletes_an_unused_side_chat() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        engine
+            .dispatch(unused_delete("close-side", "side"))
+            .await
+            .expect("an unused side chat is deleted");
+        assert!(is_deleted(&engine, "side").await);
+        assert!(!is_deleted(&engine, &host_id).await, "the host stays");
+    }
+
+    #[tokio::test]
+    async fn only_if_unused_delete_refuses_a_thread_with_a_message_or_turn() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for thread_id in ["sent", "imported"] {
+            engine
+                .dispatch(side_chat_create(
+                    thread_id,
+                    thread_id,
+                    Some("panel"),
+                    Some(&host_id),
+                ))
+                .await
+                .expect("side chat");
+        }
+        // A first send records its message and a pending turn.
+        engine
+            .dispatch(delivery_turn("send", "sent", "why that file?"))
+            .await
+            .expect("first send");
+        // An imported history has messages and no turn.
+        engine
+            .dispatch(OrchestrationCommand::ThreadHistoryImport {
+                command_id: "import".to_owned(),
+                thread_id: "imported".to_owned(),
+                messages: vec![ImportedThreadMessage {
+                    message_id: "imported:0".to_owned(),
+                    role: "user".to_owned(),
+                    text: "earlier".to_owned(),
+                    created_at: "2026-11-02T00:00:02Z".to_owned(),
+                }],
+            })
+            .await
+            .expect("history import");
+        for thread_id in ["sent", "imported"] {
+            assert_eq!(
+                in_use_thread(
+                    engine
+                        .dispatch(unused_delete(&format!("close-{thread_id}"), thread_id))
+                        .await
+                ),
+                thread_id
+            );
+            assert!(!is_deleted(&engine, thread_id).await, "{thread_id} stays");
+        }
+        // A host whose cascade would take a used panel is refused too, and nothing goes.
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"create-host","threadId":"host",
+                    "projectId":"delivery-project","title":"Host",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","createdAt":"2026-11-02T00:00:00Z"
+                }))
+                .expect("host command"),
+            )
+            .await
+            .expect("unused host");
+        engine
+            .dispatch(plain_panel_create("plain-host", "plain-host", "host"))
+            .await
+            .expect("plain panel");
+        engine
+            .dispatch(delivery_turn_for_message(
+                "send-plain",
+                "plain-host",
+                "plain-message",
+                "hello",
+                "2026-11-02T00:00:03Z",
+            ))
+            .await
+            .expect("plain panel send");
+        assert_eq!(
+            in_use_thread(engine.dispatch(unused_delete("close-host", "host")).await),
+            "plain-host",
+            "the used panel is named"
+        );
+        for thread_id in ["host", "sent", "imported", "plain-host"] {
+            assert!(!is_deleted(&engine, thread_id).await, "{thread_id} stays");
+        }
+    }
+
+    /// A close on one client races a first send on another: the engine orders them, so the
+    /// side chat ends either deleted with the send refused, or used and still there.
+    #[tokio::test]
+    async fn a_first_send_and_an_unused_delete_never_both_succeed() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for round in 0..8 {
+            let side = format!("side-{round}");
+            engine
+                .dispatch(side_chat_create(
+                    &side,
+                    &side,
+                    Some("panel"),
+                    Some(&host_id),
+                ))
+                .await
+                .expect("side chat");
+            let message = format!("message-{round}");
+            let (sent, deleted) = tokio::join!(
+                engine.dispatch(delivery_turn_for_message(
+                    &format!("send-{round}"),
+                    &side,
+                    &message,
+                    "why that file?",
+                    "2026-11-02T00:00:03Z",
+                )),
+                engine.dispatch(unused_delete(&format!("close-{round}"), &side)),
+            );
+            match (sent, deleted) {
+                (Ok(_), Err(OrchestrationError::ThreadInUse { .. })) => {
+                    assert!(!is_deleted(&engine, &side).await, "a used side chat stays");
+                }
+                (Err(OrchestrationError::Invariant { .. }), Ok(_)) => {
+                    assert!(is_deleted(&engine, &side).await);
+                }
+                other => panic!("send and delete must not both succeed: {other:?}"),
+            }
+        }
+    }
+
+    /// A refused delete stays refused on a duplicate delivery or after a restart, and an
+    /// accepted one replays without touching the thread again.
+    #[tokio::test]
+    async fn an_unused_delete_replays_its_first_outcome() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        for thread_id in ["used", "unused"] {
+            engine
+                .dispatch(side_chat_create(
+                    thread_id,
+                    thread_id,
+                    Some("panel"),
+                    Some(&host_id),
+                ))
+                .await
+                .expect("side chat");
+        }
+        engine
+            .dispatch(delivery_turn("send", "used", "hello"))
+            .await
+            .expect("first send");
+        in_use_thread(engine.dispatch(unused_delete("close-used", "used")).await);
+        assert!(matches!(
+            engine.dispatch(unused_delete("close-used", "used")).await,
+            Err(OrchestrationError::PreviouslyRejected { .. })
+        ));
+        assert!(!is_deleted(&engine, "used").await);
+        let first = engine
+            .dispatch(unused_delete("close-unused", "unused"))
+            .await
+            .expect("deleted");
+        let replay = engine
+            .dispatch(unused_delete("close-unused", "unused"))
+            .await
+            .expect("replayed");
+        assert_eq!(replay.sequence, first.sequence);
+        assert!(is_deleted(&engine, "unused").await);
+    }
+
+    #[test]
+    fn a_plain_delete_serializes_without_only_if_unused() {
+        let plain = serde_json::to_value(OrchestrationCommand::ThreadDelete {
+            command_id: "c".to_owned(),
+            thread_id: "t".to_owned(),
+            only_if_unused: false,
+        })
+        .expect("serializes");
+        assert_eq!(
+            plain,
+            json!({"type":"thread.delete","commandId":"c","threadId":"t"})
+        );
+        let unused: OrchestrationCommand = serde_json::from_value(
+            json!({"type":"thread.delete","commandId":"c","threadId":"t","onlyIfUnused":true}),
+        )
+        .expect("decodes");
+        assert!(matches!(
+            unused,
+            OrchestrationCommand::ThreadDelete {
+                only_if_unused: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn side_chat_marker_round_trips_through_projection_threads() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        let side_chat_of = |thread_id: String| {
+            let repositories = engine.repositories();
+            async move {
+                repositories
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .expect("thread exists")
+                    .side_chat
+            }
+        };
+        assert!(side_chat_of("side-chat".to_owned()).await);
+        assert!(!side_chat_of(host_id.clone()).await);
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE projection_threads SET side_chat = 0", [])?;
+                connection.execute(
+                    "DELETE FROM projection_state WHERE projector = 'projection.threads'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("reset thread projection");
+        bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+            .await
+            .expect("replay threads");
+        assert!(side_chat_of("side-chat".to_owned()).await);
+        assert!(!side_chat_of(host_id).await);
+    }
+
+    #[tokio::test]
+    async fn side_chat_checkpoint_revert_is_refused() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        let revert = |command_id: &str, thread_id: &str| {
+            serde_json::from_value::<OrchestrationCommand>(json!({
+                "type":"thread.checkpoint.revert","commandId":command_id,"threadId":thread_id,
+                "turnCount":0,"createdAt":"2026-11-02T00:00:02Z"
+            }))
+            .expect("revert command")
+        };
+        assert_eq!(
+            invariant_detail(engine.dispatch(revert("revert-side", "side-chat")).await),
+            "Side chats can't restore files. Restore from the main thread."
+        );
+        engine
+            .dispatch(revert("revert-host", &host_id))
+            .await
+            .expect("the host can still request a revert");
+    }
+
+    async fn rename(engine: &OrchestrationEngine, command_id: &str, thread_id: &str) {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update","commandId":command_id,"threadId":thread_id,
+                    "title":"why did you pick that file?",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+                }))
+                .expect("meta update command"),
+            )
+            .await
+            .expect("meta update applies");
+    }
+
+    #[tokio::test]
+    async fn side_chat_title_survives_a_meta_update() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(side_chat_create(
+                "side",
+                "side-chat",
+                Some("panel"),
+                Some(&host_id),
+            ))
+            .await
+            .expect("side chat");
+        rename(&engine, "rename-side", "side-chat").await;
+        let thread = engine
+            .repositories()
+            .get_thread("side-chat".to_owned())
+            .await
+            .expect("thread read")
+            .expect("thread exists");
+        assert_eq!(thread.title, "Panel: Side chat · Codex");
+        assert_eq!(thread.model_selection["model"], "gpt-5.1");
+    }
+
+    #[tokio::test]
+    async fn plain_panel_meta_update_still_renames() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(plain_panel_create("panel", "plain-panel", &host_id))
+            .await
+            .expect("panel");
+        rename(&engine, "rename-panel", "plain-panel").await;
+        assert_eq!(
+            engine
+                .repositories()
+                .get_thread("plain-panel".to_owned())
+                .await
+                .expect("thread read")
+                .expect("thread exists")
+                .title,
+            "why did you pick that file?"
+        );
     }
 
     fn delivery_turn_for_message(
@@ -14092,5 +14833,253 @@ mod tests {
                 .await,
             Err(OrchestrationError::Cancelled)
         ));
+    }
+
+    /// The history window's write marks (#226): the history rows' `written_sequence` by table
+    /// and id, and the thread's `history_epoch`.
+    async fn history_write_marks(
+        engine: &OrchestrationEngine,
+        thread_id: &str,
+    ) -> (BTreeMap<(String, String), i64>, i64) {
+        let thread_id = thread_id.to_owned();
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                let mut marks = BTreeMap::new();
+                for (table, id) in [
+                    ("projection_thread_messages", "message_id"),
+                    ("projection_thread_activities", "activity_id"),
+                    ("projection_thread_reasoning", "reasoning_id"),
+                    ("projection_thread_proposed_plans", "plan_id"),
+                ] {
+                    let mut statement = connection.prepare(&format!(
+                        "SELECT {id}, written_sequence FROM {table} WHERE thread_id = ?"
+                    ))?;
+                    for row in statement.query_map([&thread_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })? {
+                        let (id, written) = row?;
+                        marks.insert((table.to_owned(), id), written);
+                    }
+                }
+                let epoch = connection.query_row(
+                    "SELECT history_epoch FROM projection_threads WHERE thread_id = ?",
+                    [&thread_id],
+                    |row| row.get(0),
+                )?;
+                Ok((marks, epoch))
+            })
+            .await
+            .expect("history marks")
+    }
+
+    /// Writes every history row through each projector write path: an import (insert), an
+    /// assistant reply streamed (insert, append) and settled, reasoning streamed and settled
+    /// without text, reasoning that arrives whole, a plan upserted twice, an activity, a
+    /// delivery admitted, claimed, failed and dismissed, and a revert.
+    async fn engine_with_every_history_write(thread_label: &str) -> (OrchestrationEngine, String) {
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let at = |second: u32| format!("2026-08-01T00:01:{second:02}Z");
+        let commands = [
+            json!({"type":"thread.history.import","commandId":"import","threadId":thread_id,"messages":[
+                {"messageId":"imported-user","role":"user","text":thread_label,"createdAt":at(1)},
+                {"messageId":"imported-reply","role":"assistant","text":"reply","createdAt":at(2)}
+            ]}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-1","threadId":thread_id,"messageId":"streamed","delta":"hel","turnId":"turn-1","createdAt":at(3)}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-2","threadId":thread_id,"messageId":"streamed","delta":"lo","turnId":"turn-1","createdAt":at(4)}),
+            json!({"type":"thread.message.assistant.complete","commandId":"complete","threadId":thread_id,"messageId":"streamed","turnId":"turn-1","createdAt":at(5)}),
+            json!({"type":"thread.reasoning.delta","commandId":"thought-1","threadId":thread_id,"reasoningId":"thought","delta":"Weighing","turnId":"turn-1","createdAt":at(6)}),
+            json!({"type":"thread.reasoning.complete","commandId":"thought-2","threadId":thread_id,"reasoningId":"thought","turnId":"turn-1","createdAt":at(7)}),
+            json!({"type":"thread.reasoning.complete","commandId":"summary","threadId":thread_id,"reasoningId":"summary","text":"Plan","turnId":"turn-1","createdAt":at(8)}),
+            json!({"type":"thread.proposed-plan.upsert","commandId":"plan-1","threadId":thread_id,"proposedPlan":{"id":"plan","turnId":"turn-1","planMarkdown":"Do it","createdAt":at(9),"updatedAt":at(9)},"createdAt":at(9)}),
+            json!({"type":"thread.proposed-plan.upsert","commandId":"plan-2","threadId":thread_id,"proposedPlan":{"id":"plan","turnId":"turn-1","planMarkdown":"Do it now","createdAt":at(9),"updatedAt":at(10)},"createdAt":at(10)}),
+            json!({"type":"thread.activity.append","commandId":"activity","threadId":thread_id,"activity":{"id":"activity","tone":"tool","kind":"command","summary":"ran","payload":{},"turnId":"turn-1","createdAt":at(11)},"createdAt":at(11)}),
+        ];
+        for command in commands {
+            engine
+                .dispatch(serde_json::from_value(command).expect("command"))
+                .await
+                .expect("history write");
+        }
+        admit_delivery(&engine, "delivery", &thread_id, "delivered", &at(12)).await;
+        let claimed = engine
+            .repositories()
+            .claim_provider_turn("delivery".to_owned(), at(13))
+            .await
+            .expect("claim")
+            .expect("claimed");
+        for (expected, next, second) in [
+            (TurnDeliveryState::Sending, TurnDeliveryState::Failed, 14),
+            (TurnDeliveryState::Failed, TurnDeliveryState::Dismissed, 15),
+        ] {
+            assert!(
+                engine
+                    .transition_turn_delivery(TurnDeliveryTransition {
+                        turn_id: None,
+                        command_id: claimed.command_id.clone(),
+                        expected_states: vec![expected],
+                        expected_attempt: 1,
+                        next_state: next,
+                        detail: Some("refused".to_owned()),
+                        updated_at: at(second),
+                    })
+                    .await
+                    .expect("delivery transition")
+            );
+        }
+        engine
+            .dispatch(OrchestrationCommand::ThreadRevertComplete {
+                command_id: "revert".to_owned(),
+                thread_id: thread_id.clone(),
+                turn_count: 0,
+                created_at: at(16),
+            })
+            .await
+            .expect("revert");
+        (engine, thread_id)
+    }
+
+    /// #226: every write to a history row sets its `written_sequence` to the sequence of the
+    /// event being projected, so a window opened at a sequence can tell what changed after it.
+    #[tokio::test]
+    async fn every_history_write_path_sets_written_sequence() {
+        let (engine, thread_id) = engine_with_every_history_write("hello").await;
+        let mut expected = BTreeMap::new();
+        let mut revert = 0;
+        for event in engine.read_events(0).await.expect("events") {
+            let payload = &event.event.payload;
+            let text = |pointer: &str| payload.pointer(pointer).and_then(Value::as_str);
+            let row = match event.event.event_type.as_str() {
+                "thread.message-sent" | "thread.turn-delivery-updated" => {
+                    text("/messageId").map(|id| ("projection_thread_messages", id))
+                }
+                "thread.turn-start-requested" => {
+                    text("/messageId").map(|id| ("projection_thread_messages", id))
+                }
+                "thread.reasoning-sent" => {
+                    text("/reasoningId").map(|id| ("projection_thread_reasoning", id))
+                }
+                "thread.proposed-plan-upserted" => {
+                    text("/proposedPlan/id").map(|id| ("projection_thread_proposed_plans", id))
+                }
+                "thread.activity-appended" => {
+                    text("/activity/id").map(|id| ("projection_thread_activities", id))
+                }
+                "thread.reverted" => {
+                    revert = event.sequence;
+                    None
+                }
+                _ => None,
+            };
+            if let Some((table, id)) = row {
+                expected.insert((table.to_owned(), id.to_owned()), event.sequence);
+            }
+        }
+        let (marks, epoch) = history_write_marks(&engine, &thread_id).await;
+        assert!(marks.len() >= 8, "{marks:?}");
+        for (row, written) in &marks {
+            assert!(*written > 0, "{row:?} was never marked");
+            assert_eq!(Some(written), expected.get(row), "{row:?}");
+        }
+        assert!(revert > 0);
+        assert_eq!(
+            epoch, revert,
+            "a revert starts the history epoch at its sequence"
+        );
+        engine.shutdown().await;
+    }
+
+    /// #226: a projection rebuild replays the same event sequences, so it gives every history
+    /// row the same `written_sequence` and the thread the same `history_epoch`; rowids change.
+    #[tokio::test]
+    async fn written_sequence_survives_a_projection_rebuild() {
+        let (engine, thread_id) = engine_with_every_history_write("hello").await;
+        let before = history_write_marks(&engine, &thread_id).await;
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute_batch(
+                    "DELETE FROM projection_thread_messages;
+                     DELETE FROM projection_thread_activities;
+                     DELETE FROM projection_thread_reasoning;
+                     DELETE FROM projection_thread_proposed_plans;
+                     UPDATE projection_threads SET history_epoch = 0;
+                     DELETE FROM projection_state WHERE projector IN ('projection.thread-messages', 'projection.thread-activities', 'projection.thread-proposed-plans');",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("reset the history projections");
+        bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+            .await
+            .expect("rebuild");
+        assert_eq!(history_write_marks(&engine, &thread_id).await, before);
+        engine.shutdown().await;
+    }
+
+    /// A capture's hold release and the hold's expiry decide once, in either order: the expiry
+    /// that marks the turn stale keeps the hold (its task releases it after its record), and an
+    /// expiry that finds the hold released marks nothing. Raced 1,000 times, the expiry returns
+    /// `true` exactly when the hold is still there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_release_and_its_expiry_decide_once_in_either_order() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        engine.set_checkpoint_hold_limit(Some(Duration::from_secs(60)));
+
+        // Order A: the release first. The expiry finds no hold and marks nothing.
+        let id = engine.hold_turns_for_checkpoint("t", "a").expect("hold");
+        engine.release_checkpoint_hold_unless_stale("t", "a");
+        assert!(!engine.turns_held_for_checkpoint("t"));
+        assert!(!engine.expire_checkpoint_hold("t", "a", id));
+        assert!(!engine.checkpoint_is_stale("t", "a"));
+
+        // Order B: the expiry first. The release leaves the hold to the expiry's task.
+        let id = engine.hold_turns_for_checkpoint("t", "b").expect("hold");
+        assert!(engine.expire_checkpoint_hold("t", "b", id));
+        engine.release_checkpoint_hold_unless_stale("t", "b");
+        assert!(engine.turns_held_for_checkpoint("t"));
+        engine.release_thread_checkpoint_holds("t");
+
+        for iteration in 0..1_000 {
+            let turn = format!("race-{iteration}");
+            let id = engine.hold_turns_for_checkpoint("t", &turn).expect("hold");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release = tokio::task::spawn_blocking({
+                let (engine, barrier, turn) = (engine.clone(), barrier.clone(), turn.clone());
+                move || {
+                    barrier.wait();
+                    engine.release_checkpoint_hold_unless_stale("t", &turn);
+                }
+            });
+            let expire = tokio::task::spawn_blocking({
+                let (engine, barrier, turn) = (engine.clone(), barrier.clone(), turn.clone());
+                move || {
+                    barrier.wait();
+                    engine.expire_checkpoint_hold("t", &turn, id)
+                }
+            });
+            release.await.expect("release");
+            let expired = expire.await.expect("expire");
+            assert_eq!(
+                expired,
+                engine.turns_held_for_checkpoint("t"),
+                "iteration {iteration}: the expiry returned {expired}"
+            );
+            engine.release_thread_checkpoint_holds("t");
+        }
+        engine.set_checkpoint_hold_limit(None);
+        engine.shutdown().await;
     }
 }

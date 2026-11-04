@@ -1,10 +1,10 @@
 //! The webhook event catalog, and how each event is made from its durable source: an entry of
 //! X3's change feed (`changes_since`), a profiler finding, or a person's **Send test event**.
 //!
-//! A payload is `{ id, type, occurredAt, environmentId, threadId?, actor?, cursor?, kind?,
-//! status?, requestId?, tool?, target?, finding? }`: ids, kinds, statuses and the feed cursor
-//! only. Every event made from the feed carries that entry's `cursor`, so a receiver that
-//! missed deliveries calls `changes_since { cursor }` from the last one it processed;
+//! A payload is `{ id, type, occurredAt, environmentId, threadId?, projectId?, actor?, cursor?,
+//! kind?, status?, requestId?, tool?, target?, finding? }`: ids, kinds, statuses and the feed
+//! cursor only. Every event made from the feed carries that entry's `cursor`, so a receiver
+//! that missed deliveries calls `changes_since { cursor }` from the last one it processed;
 //! `profiler.finding` carries `finding: { id, count, lastSeen }` instead, and a receiver
 //! catches up with `profiler_findings { since: lastSeen }`. No prompt, message, reply,
 //! terminal output, file content, diff, token or secret is ever read into an event, and no
@@ -20,6 +20,8 @@ pub(crate) const WORKTREE_CREATED: &str = "worktree.created";
 pub(crate) const PANEL_CREATED: &str = "panel.created";
 pub(crate) const APPROVAL_REQUESTED: &str = "approval.requested";
 pub(crate) const APPROVAL_RESOLVED: &str = "approval.resolved";
+pub(crate) const INPUT_REQUESTED: &str = "input.requested";
+pub(crate) const INPUT_RESOLVED: &str = "input.resolved";
 pub(crate) const CLONE_COMPLETED: &str = "clone.completed";
 pub(crate) const SCM_OPERATION_COMPLETED: &str = "scm.operation_completed";
 pub(crate) const TRANSFER_COMPLETED: &str = "transfer.completed";
@@ -35,11 +37,23 @@ pub(crate) const EVENT_TYPES: &[(&str, &str)] = &[
     (PANEL_CREATED, "threads"),
     (APPROVAL_REQUESTED, "approvals"),
     (APPROVAL_RESOLVED, "approvals"),
+    (INPUT_REQUESTED, "questions"),
+    (INPUT_RESOLVED, "questions"),
     (CLONE_COMPLETED, "operations"),
     (SCM_OPERATION_COMPLETED, "operations"),
     (TRANSFER_COMPLETED, "operations"),
     (TRANSFER_FAILED, "operations"),
     (PROFILER_FINDING, "diagnostics"),
+];
+
+/// The change-feed kinds a `thread.status_changed` event carries as its `kind`; an endpoint
+/// can choose among them.
+pub(crate) const STATUS_KINDS: &[&str] = &[
+    "turn.started",
+    "turn.completed",
+    "turn.interrupted",
+    "turn.failed",
+    "session.status",
 ];
 
 pub(crate) fn is_event_type(name: &str) -> bool {
@@ -54,7 +68,7 @@ pub(crate) struct Event {
     pub(crate) id: String,
     pub(crate) occurred_at: String,
     pub(crate) thread_id: Option<String>,
-    /// For an endpoint's project filter; not in the payload.
+    /// The thread's project, for an endpoint's project filter and the payload's `projectId`.
     pub(crate) project_id: Option<String>,
     /// The rest of the payload: `actor`, `cursor`, `kind`, `status`, `requestId`, `tool`,
     /// `target` or `finding`.
@@ -71,6 +85,9 @@ impl Event {
         payload.insert("environmentId".to_owned(), environment_id.into());
         if let Some(thread_id) = &self.thread_id {
             payload.insert("threadId".to_owned(), thread_id.clone().into());
+        }
+        if let Some(project_id) = &self.project_id {
+            payload.insert("projectId".to_owned(), project_id.clone().into());
         }
         for (key, value) in &self.fields {
             payload.insert(key.clone(), value.clone());
@@ -105,6 +122,8 @@ pub(crate) fn from_feed_entry(entry: &Value, route: ThreadRoute) -> Option<Event
         "panel.created" => PANEL_CREATED,
         "approval.requested" => APPROVAL_REQUESTED,
         "approval.resolved" => APPROVAL_RESOLVED,
+        "input.requested" => INPUT_REQUESTED,
+        "input.resolved" => INPUT_RESOLVED,
         "agent.call" => agent_call_event(entry)?,
         _ => return None,
     };
@@ -200,6 +219,8 @@ pub(crate) fn test_event(occurred_at: String) -> Event {
 mod tests {
     use super::*;
 
+    const MARKER: &str = "QUESTION-TEXT-never-in-a-payload";
+
     fn entry(kind: &str) -> Value {
         json!({ "at": "2026-10-31T00:00:00Z", "kind": kind, "threadId": "t1", "cursor": "v1.7.2" })
     }
@@ -216,10 +237,11 @@ mod tests {
             ("panel.created", Some(PANEL_CREATED)),
             ("approval.requested", Some(APPROVAL_REQUESTED)),
             ("approval.resolved", Some(APPROVAL_RESOLVED)),
+            ("input.requested", Some(INPUT_REQUESTED)),
+            ("input.resolved", Some(INPUT_RESOLVED)),
             ("thread.created", None),
             ("thread.archived", None),
             ("turn.requested", None),
-            ("input.requested", None),
         ] {
             let event = from_feed_entry(&entry(kind), route.clone());
             assert_eq!(event.map(|event| event.event_type), expected, "{kind}");
@@ -279,7 +301,8 @@ mod tests {
         assert_eq!(body["threadId"], "t1");
         assert_eq!(body["cursor"], "v1.9.0");
         assert_eq!(body["requestId"], "req-1");
-        assert!(body.get("projectId").is_none());
+        // The thread's project is as opaque an id as the thread's.
+        assert_eq!(body["projectId"], "p1");
         assert!(!body.to_string().contains("hunter2"), "{body}");
         // A label is free text a client chose (it may be a path): only the kind and the
         // opaque client id are sent.
@@ -295,6 +318,9 @@ mod tests {
         )
         .unwrap();
         assert!(odd.fields.get("actor").is_none());
+        // An entry whose thread names no project carries none.
+        let unrouted: Value = serde_json::from_str(&odd.body("env-1")).unwrap();
+        assert!(unrouted.get("projectId").is_none(), "{unrouted}");
         // The same entry always makes the same event id.
         assert_eq!(
             event.id,
@@ -305,6 +331,24 @@ mod tests {
             .unwrap()
             .id
         );
+        // A question carries its id and how it was resolved, never its text or answers.
+        let answered = from_feed_entry(
+            &json!({ "kind": "input.resolved", "cursor": "v1.9.2", "threadId": "t1", "requestId": "q-1", "status": "expired", "questions": MARKER, "answers": MARKER }),
+            None,
+        )
+        .expect("an input event");
+        let body: Value = serde_json::from_str(&answered.body("env-1")).unwrap();
+        assert_eq!(body["type"], INPUT_RESOLVED);
+        assert_eq!(body["requestId"], "q-1");
+        assert_eq!(body["status"], "expired");
+        assert!(!body.to_string().contains(MARKER), "{body}");
+        // An agent's purpose is text it chose: the feed entry has it, the payload never.
+        let panel = from_feed_entry(
+            &json!({ "kind": "panel.created", "cursor": "v1.9.3", "threadId": "t2", "purpose": MARKER }),
+            None,
+        )
+        .expect("a panel event");
+        assert!(!panel.body("env-1").contains(MARKER));
         let finding = from_finding("f1", 3, "2026-10-31T00:00:01Z");
         let body: Value = serde_json::from_str(&finding.body("env-1")).unwrap();
         assert_eq!(

@@ -366,7 +366,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "git_discard" => (
-            "Destructive: discards the changes of files or folders, restoring tracked files and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in trashUnavailable, unless permanent is true. An ignored file that permanent deletion leaves in place is listed there too.",
+            "Destructive: discards the changes of files or folders, restoring tracked files and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in trashUnavailable, unless permanent is true. An ignored file that permanent deletion leaves in place is listed there too. A file the trash refused that could not be put back, because something else took its name, is not deleted: it is listed in keptInStaging with stagedAt, its path under the repository's Git directory. Tell the person; BiBCode moves it back on the next discard once its name is free. permanent never removes it.",
             object(
                 json!({
                     "threadId": thread,
@@ -1083,6 +1083,7 @@ async fn discard(call: &ToolCall<'_>) -> ToolResult {
                 "trashed": discarded.get("trashed"),
                 "permanentlyDiscarded": discarded.get("permanentlyDiscarded"),
                 "trashUnavailable": discarded.get("trashUnavailable"),
+                "keptInStaging": discarded.get("keptInStaging"),
             }))
         })
         .await;

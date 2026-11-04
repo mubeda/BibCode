@@ -107,6 +107,10 @@
       "types": "./src/state/models.ts",
       "default": "./src/state/models.ts"
     },
+    "./state/off-shell-threads": {
+      "types": "./src/state/offShellThreads.ts",
+      "default": "./src/state/offShellThreads.ts"
+    },
     "./state/orchestration": {
       "types": "./src/state/orchestration.ts",
       "default": "./src/state/orchestration.ts"
@@ -151,6 +155,10 @@
       "types": "./src/state/runtime.ts",
       "default": "./src/state/runtime.ts"
     },
+    "./state/server-tools": {
+      "types": "./src/state/serverTools.ts",
+      "default": "./src/state/serverTools.ts"
+    },
     "./state/server": {
       "types": "./src/state/server.ts",
       "default": "./src/state/server.ts"
@@ -174,6 +182,10 @@
     "./state/threads": {
       "types": "./src/state/threads.ts",
       "default": "./src/state/threads.ts"
+    },
+    "./state/thread-history": {
+      "types": "./src/state/threadHistory.ts",
+      "default": "./src/state/threadHistory.ts"
     },
     "./state/thread-sort": {
       "types": "./src/state/threadSort.ts",

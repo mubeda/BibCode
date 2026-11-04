@@ -91,6 +91,8 @@ const BIBCODE_ACTIONS: ReadonlyArray<{
   { action: "model", description: "Switch response model for this thread" },
   { action: "plan", description: "Switch this thread into plan mode" },
   { action: "default", description: "Switch this thread back to normal build mode" },
+  { action: "btw", description: "Side chat: ask without adding to this thread" },
+  { action: "side", description: "Side chat: ask without adding to this thread" },
 ];
 
 function normalizedQuery(query: string): string {

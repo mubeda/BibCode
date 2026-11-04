@@ -268,7 +268,7 @@ function DiscoveryItemRow({
                 {item.auth.hosts.map((host) => (
                   <li key={host.host} className="flex flex-wrap items-center gap-x-1">
                     <span>
-                      {host.host} — {host.authenticated ? "Authenticated as" : "Not authenticated"}
+                      {host.host}: {host.authenticated ? "Authenticated as" : "Not authenticated"}
                     </span>
                     {host.authenticated ? <RedactedAccount account={host.account} /> : null}
                   </li>

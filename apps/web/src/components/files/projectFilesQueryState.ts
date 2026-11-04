@@ -1,9 +1,11 @@
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import type {
   EnvironmentId,
+  ProjectFileFailure,
   ProjectListEntriesResult,
   ProjectReadFileResult,
 } from "@bibcode/contracts";
+import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { useCallback, useEffect } from "react";
@@ -151,6 +153,14 @@ function errorMessage<A>(result: AsyncResult.AsyncResult<A, unknown>): string | 
     : null;
 }
 
+function readFailureKind<A>(
+  result: AsyncResult.AsyncResult<A, unknown>,
+): ProjectFileFailure | null {
+  if (result._tag !== "Failure") return null;
+  const error = Cause.squash(result.cause) as { readonly failure?: ProjectFileFailure } | null;
+  return error?.failure ?? null;
+}
+
 /**
  * The Files panel's entry list. While `enabled` is false nothing is read and the list shows as
  * loading; every switch to enabled reads it once.
@@ -242,6 +252,8 @@ export interface ProjectFileQueryState extends ProjectQueryState<ProjectReadFile
    * without a version (a ticked task not yet saved) shows in `data` but says nothing about disk.
    */
   readonly disk: ProjectReadFileResult | null;
+  /** Why the read failed, when the server said (for example `binary_file`). */
+  readonly failure: ProjectFileFailure | null;
 }
 
 export function useProjectFileQuery(
@@ -263,6 +275,7 @@ export function useProjectFileQuery(
     data: optimisticFile?.data ?? data,
     disk: optimisticFile?.data.version === undefined ? data : optimisticFile.data,
     error: errorMessage(result),
+    failure: readFailureKind(result),
     isPending: result.waiting,
     refresh,
     revalidate: refreshAtom,

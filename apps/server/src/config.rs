@@ -203,6 +203,14 @@ impl ServerConfig {
         self
     }
 
+    /// Resolves the requested data root, as server startup does, and makes it `base_dir`.
+    pub fn resolve_data_root(&mut self) -> Result<ResolvedDataRoot, DataRootError> {
+        let resolved = crate::data_root::resolve_data_root(self.data_root_request.clone())?;
+        self.base_dir = resolved.effective.clone();
+        self.resolved_data_root = Some(resolved.clone());
+        Ok(resolved)
+    }
+
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
         self.base_dir.join(if self.dev_url.is_some() {
@@ -520,6 +528,77 @@ mod tests {
     }
 
     #[test]
+    fn storage_compact_parses_dry_run_and_json() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let base_dir = temp.path().to_string_lossy().into_owned();
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec!["bibcode", "storage", "compact", "--base-dir", &base_dir];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+
+        let action = parse(&[])
+            .expect("parse storage compact")
+            .into_action()
+            .expect("compact action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Compact {
+                dry_run: false,
+                json: false,
+                ..
+            })
+        ));
+        let action = parse(&["--dry-run", "--json"])
+            .expect("parse storage compact --dry-run --json")
+            .into_action()
+            .expect("compact action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Compact {
+                dry_run: true,
+                json: true,
+                ..
+            })
+        ));
+        assert!(parse(&["--force"]).is_err(), "unknown flags are rejected");
+    }
+
+    #[test]
+    fn storage_restore_takes_a_backup_id_or_resume() {
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let base_dir = temp.path().to_string_lossy().into_owned();
+        let backup_id = uuid::Uuid::new_v4().to_string();
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec!["bibcode", "storage", "restore", "--base-dir", &base_dir];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+
+        let action = parse(&["--backup-id", &backup_id])
+            .expect("parse restore --backup-id")
+            .into_action()
+            .expect("restore action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Restore { .. })
+        ));
+        let action = parse(&["--resume", "--json"])
+            .expect("parse restore --resume")
+            .into_action()
+            .expect("resume action");
+        assert!(matches!(
+            action,
+            CliAction::Storage(StorageCommand::Resume { json: true, .. })
+        ));
+        assert!(parse(&[]).is_err(), "one of the two is required");
+        assert!(
+            parse(&["--resume", "--backup-id", &backup_id]).is_err(),
+            "they are exclusive"
+        );
+    }
+
+    #[test]
     fn cli_parses_open_url_without_data_root() {
         // Control: a relative explicit data root cannot be resolved.
         let unusable_root = "relative-root";
@@ -727,6 +806,12 @@ pub enum McpSubcommand {
     /// Approve or deny a remote AI tool's request to connect over HTTPS, or list the
     /// requests waiting.
     Authorize(crate::mcp::authorize_cli::AuthorizeArgs),
+    /// Call one read-only tool and print its result as JSON: 0 on success, 1 on a failure,
+    /// 2 when the thread waits on a person.
+    Call(crate::mcp::call_cli::CallArgs),
+    /// Print the tools this command's credential sees as JSON, each with `oneShot`: whether
+    /// `call` takes it.
+    Tools,
 }
 
 #[derive(Debug, Args)]
@@ -744,8 +829,12 @@ enum StorageSubcommand {
     },
     #[command(about = "Restore a verified backup into an offline store.")]
     Restore {
+        #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
+        backup_id: Option<uuid::Uuid>,
+        /// Finish a restore or start-empty that was interrupted after it began changing the
+        /// store.
         #[arg(long)]
-        backup_id: uuid::Uuid,
+        resume: bool,
         #[arg(long)]
         json: bool,
     },
@@ -754,6 +843,16 @@ enum StorageSubcommand {
         about = "Preserve an offline store and start empty."
     )]
     StartEmpty {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Back up, then compact an offline project-data store to reclaim free space.")]
+    Compact {
+        #[arg(
+            long,
+            help = "Report what compaction would reclaim and need, without changing anything."
+        )]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -893,6 +992,13 @@ pub enum CliAction {
         options: crate::mcp::relay::RelayOptions,
         args: crate::mcp::authorize_cli::AuthorizeArgs,
     },
+    /// Calls one read-only MCP tool on the data root's running server; never starts one.
+    McpCall {
+        options: crate::mcp::relay::RelayOptions,
+        args: crate::mcp::call_cli::CallArgs,
+    },
+    /// Lists the data root's running server's MCP tools; never starts one.
+    McpTools(crate::mcp::relay::RelayOptions),
     /// Calls the data root's running server's MCP thread tools; never starts one.
     Thread {
         options: crate::mcp::relay::RelayOptions,
@@ -931,8 +1037,18 @@ pub enum StorageCommand {
         backup_id: uuid::Uuid,
         json: bool,
     },
+    /// `storage restore --resume`.
+    Resume {
+        root: ResolvedDataRoot,
+        json: bool,
+    },
     StartEmpty {
         root: ResolvedDataRoot,
+        json: bool,
+    },
+    Compact {
+        root: ResolvedDataRoot,
+        dry_run: bool,
         json: bool,
     },
 }
@@ -1037,9 +1153,10 @@ impl Cli {
             CliAction::OpenUrl { .. } => Err(ConfigError::OpenUrlCommandIsNotServer),
             CliAction::Profiler { .. } => Err(ConfigError::ProfilerCommandIsNotServer),
             CliAction::Diagnostics { .. } => Err(ConfigError::DiagnosticsCommandIsNotServer),
-            CliAction::Mcp(_) | CliAction::McpAuthorize { .. } => {
-                Err(ConfigError::McpCommandIsNotServer)
-            }
+            CliAction::Mcp(_)
+            | CliAction::McpAuthorize { .. }
+            | CliAction::McpCall { .. }
+            | CliAction::McpTools(_) => Err(ConfigError::McpCommandIsNotServer),
             CliAction::Thread { .. } => Err(ConfigError::ThreadCommandIsNotServer),
         }
     }
@@ -1074,14 +1191,26 @@ impl Cli {
                 let root = crate::data_root::resolve_data_root(request)?;
                 return Ok(CliAction::Storage(match storage.command {
                     StorageSubcommand::Inspect { json } => StorageCommand::Inspect { root, json },
-                    StorageSubcommand::Restore { backup_id, json } => StorageCommand::Restore {
-                        root,
+                    StorageSubcommand::Restore {
                         backup_id,
+                        resume,
                         json,
+                    } => match backup_id {
+                        Some(backup_id) if !resume => StorageCommand::Restore {
+                            root,
+                            backup_id,
+                            json,
+                        },
+                        _ => StorageCommand::Resume { root, json },
                     },
                     StorageSubcommand::StartEmpty { json } => {
                         StorageCommand::StartEmpty { root, json }
                     }
+                    StorageSubcommand::Compact { dry_run, json } => StorageCommand::Compact {
+                        root,
+                        dry_run,
+                        json,
+                    },
                 }));
             }
             Some(CliCommand::Pairing(pairing)) => {
@@ -1279,7 +1408,7 @@ pub(crate) fn profiler_state_dir(
 
 /// What `mcp` relays to, resolved as every command that reads a data root does: with no
 /// `--base-dir`, `BIBCODE_HOME` or `~/.bibcode`, which is also the desktop's root.
-/// `bibcode mcp`, or its `authorize` subcommand.
+/// `bibcode mcp`, or its `authorize`, `call` or `tools` subcommand.
 pub(crate) fn mcp_action(
     base_dir: Option<PathBuf>,
     dev_url: Option<Url>,
@@ -1289,6 +1418,8 @@ pub(crate) fn mcp_action(
     let options = relay_options(base_dir, dev_url, mcp)?;
     Ok(match command {
         Some(McpSubcommand::Authorize(args)) => CliAction::McpAuthorize { options, args },
+        Some(McpSubcommand::Call(args)) => CliAction::McpCall { options, args },
+        Some(McpSubcommand::Tools) => CliAction::McpTools(options),
         None => CliAction::Mcp(options),
     })
 }

@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -15,6 +16,7 @@ export const WEBHOOK_EVENT_CATEGORIES = [
     events: ["thread.status_changed", "worktree.created", "panel.created"],
   },
   { key: "approvals", events: ["approval.requested", "approval.resolved"] },
+  { key: "questions", events: ["input.requested", "input.resolved"] },
   {
     key: "operations",
     events: ["clone.completed", "scm.operation_completed", "transfer.completed", "transfer.failed"],
@@ -22,12 +24,27 @@ export const WEBHOOK_EVENT_CATEGORIES = [
   { key: "diagnostics", events: ["profiler.finding"] },
 ] as const;
 
+/**
+ * The change-feed kinds a `thread.status_changed` event carries as its `kind`. An endpoint
+ * may choose among them (`statusKinds`).
+ */
+export const WEBHOOK_STATUS_KINDS = [
+  "turn.started",
+  "turn.completed",
+  "turn.interrupted",
+  "turn.failed",
+  "session.status",
+] as const;
+export type WebhookStatusKind = (typeof WEBHOOK_STATUS_KINDS)[number];
+
 export const WebhookEventType = Schema.Literals([
   "thread.status_changed",
   "worktree.created",
   "panel.created",
   "approval.requested",
   "approval.resolved",
+  "input.requested",
+  "input.resolved",
   "clone.completed",
   "scm.operation_completed",
   "transfer.completed",
@@ -57,10 +74,26 @@ export const WebhookEndpoint = Schema.Struct({
   name: Schema.String,
   url: Schema.String,
   enabled: Schema.Boolean,
-  eventTypes: Schema.Array(WebhookEventType),
+  /**
+   * Strings, not `WebhookEventType`: an event a newer server added never breaks the list,
+   * and the form saves it back unchanged.
+   */
+  eventTypes: Schema.Array(Schema.String),
   projectId: Schema.NullOr(Schema.String),
   /** The outside agent's session it is paired with: revoking that client disables it. */
   pairedClientId: Schema.NullOr(Schema.String),
+  /**
+   * Whether it sends `Authorization: Bearer <token>`. The token itself is never returned;
+   * an older server, which has none, leaves this out.
+   */
+  bearerTokenSet: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * The `thread.status_changed` kinds it is sent, or `null` for all of them. Strings, like
+   * `eventTypes`; an older server, which has no filter, leaves this out.
+   */
+  statusKinds: Schema.NullOr(Schema.Array(Schema.String)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   consecutiveFailures: NonNegativeInt,
   disabledReason: Schema.NullOr(WebhookDisabledReason),
   pendingDeliveries: NonNegativeInt,
@@ -85,7 +118,8 @@ export const WebhookDelivery = Schema.Struct({
   lastStatus: Schema.NullOr(Schema.Int),
   /**
    * Why the last attempt failed: `status` (see `lastStatus`), `timeout`, `connect`,
-   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `redirect`, `cancelled`,
+   * `unresolved`, `address_refused`, `url_refused`, `secret_missing`, `token_missing` (its
+   * bearer token could not be read, so nothing was sent), `redirect`, `cancelled`,
    * `queue_full` (dropped: the queue was full), `endpoint_changed` (dropped: the endpoint's
    * URL or filters changed while it waited) or `interrupted`.
    */
@@ -126,9 +160,23 @@ export const WebhooksUpsertInput = Schema.Struct({
   /** `https://` with a public host and no user name or password. */
   url: TrimmedNonEmptyString,
   enabled: Schema.Boolean,
-  eventTypes: Schema.Array(WebhookEventType),
+  /** Event names this client does not know are sent back as they were listed. */
+  eventTypes: Schema.Array(Schema.String),
   projectId: Schema.optional(Schema.NullOr(Schema.String)),
   pairedClientId: Schema.optional(Schema.NullOr(Schema.String)),
+  /**
+   * Absent keeps the endpoint's bearer token, `null` removes it and a string sets or
+   * replaces it (1 to 1,024 visible ASCII characters, without the word `Bearer`). Changing
+   * `url` while a token is set needs this field. Send it only to a server that advertises
+   * `webhookBearerToken`.
+   */
+  bearerToken: Schema.optional(Schema.NullOr(Schema.String)),
+  /**
+   * Absent keeps the endpoint's `thread.status_changed` filter, `null` sends every kind and a
+   * list only those (`WEBHOOK_STATUS_KINDS`, at least one). Send it only to a server that
+   * advertises `webhookStatusKinds`.
+   */
+  statusKinds: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
 });
 export type WebhooksUpsertInput = typeof WebhooksUpsertInput.Type;
 export const WebhooksUpsertResult = Schema.Struct({

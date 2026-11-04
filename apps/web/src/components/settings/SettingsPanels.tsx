@@ -93,6 +93,7 @@ import {
   type ProviderUpdateCandidate,
 } from "../ProviderUpdateLaunchNotification.logic";
 import { ProviderUpdateAllSection } from "./ProviderUpdateAllSection";
+import { ToolsSection } from "./ToolsSection";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
 import { DRIVER_OPTIONS, getDriverOption } from "./providerDriverMeta";
 import {
@@ -1807,6 +1808,7 @@ function EnvironmentScopedProviderSettingsPanel({
   return (
     <SettingsPageContainer>
       <ProviderUpdateAllSection />
+      <ToolsSection />
       <SettingsSection
         title="Providers"
         contentVariant="stack"

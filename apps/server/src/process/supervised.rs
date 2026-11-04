@@ -569,7 +569,10 @@ fn request_termination(child: &mut dyn ChildWrapper, report: &mut ProcessCleanup
 fn only_exited_members_refused(child: &dyn ChildWrapper, error: &io::Error) -> bool {
     #[cfg(target_os = "macos")]
     {
-        error.raw_os_error() == Some(libc::EPERM) && crate::process::exited_status(child).is_some()
+        crate::process::group_kill_refusal_is_stopped(
+            error.raw_os_error(),
+            crate::process::exited_status(child).is_some(),
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {

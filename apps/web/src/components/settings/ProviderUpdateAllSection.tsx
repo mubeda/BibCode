@@ -21,7 +21,7 @@ import {
   type ProviderUpdatePlanEnvironment,
   type ServerInstallTarget,
 } from "../ProviderUpdateAll.logic";
-import { formatProviderList } from "../ProviderUpdateLaunchNotification.logic";
+import { formatProviderList, toolUpdateWarning } from "../ProviderUpdateLaunchNotification.logic";
 import { useProviderUpdateEnvironments } from "../ProviderUpdateLaunchNotification.environments";
 import { Button } from "../ui/button";
 import {
@@ -134,6 +134,9 @@ function ConfirmUpdateAllDialog({
   readonly onConfirm: () => void;
 }) {
   const servers = plan.serverInstallCount > 0;
+  const toolWarning = toolUpdateWarning(
+    plan.environments.flatMap((environment) => environment.updates),
+  );
   return (
     <Dialog
       open
@@ -149,6 +152,7 @@ function ConfirmUpdateAllDialog({
           <DialogDescription>
             Each environment installs its own updates. New sessions use the new versions.
             {servers ? " A server restarts only after its providers update." : ""}
+            {toolWarning === null ? "" : ` ${toolWarning}`}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>

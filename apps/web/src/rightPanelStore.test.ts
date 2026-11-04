@@ -103,6 +103,52 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("shows a chat panel's diff in its host's Diff surface, across a reload", () => {
+    const store = useRightPanelStore.getState();
+    store.openDiff(refA, refB.threadId);
+    const diff = { id: "diff", kind: "diff", threadId: refB.threadId };
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual(
+      diff,
+    );
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: { "env-1:thread-A": { activeSurfaceId: "diff", surfaces: [diff] } },
+      }).byThreadKey["env-1:thread-A"]?.surfaces,
+    ).toEqual([diff]);
+
+    // The host's own Diff (or its own thread) shows the host's diff again.
+    store.open(refA, "diff");
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      id: "diff",
+      kind: "diff",
+    });
+    store.openDiff(refA, refB.threadId);
+    store.openDiff(refA, refA.threadId);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([{ id: "diff", kind: "diff" }]);
+  });
+
+  it("drops a host's Diff on a thread when that thread is removed", () => {
+    const refC = scopeThreadRef("env-2" as EnvironmentId, refB.threadId);
+    const store = useRightPanelStore.getState();
+    store.openDiff(refA, refB.threadId);
+    store.openDiff(refC, ThreadId.make("thread-C"));
+    store.open(refB, "files");
+
+    store.removeThread(refB);
+
+    const byThreadKey = useRightPanelStore.getState().byThreadKey;
+    expect(selectActiveRightPanelSurface(byThreadKey, refA)).toEqual({ id: "diff", kind: "diff" });
+    expect(selectThreadRightPanelState(byThreadKey, refB).surfaces).toEqual([]);
+    // Another environment's thread with the same id is a different thread.
+    expect(selectActiveRightPanelSurface(byThreadKey, refC)).toEqual({
+      id: "diff",
+      kind: "diff",
+      threadId: ThreadId.make("thread-C"),
+    });
+  });
+
   it("open sets the active panel for a thread", () => {
     useRightPanelStore.getState().open(refA, "preview");
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe("preview");

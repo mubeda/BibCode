@@ -79,6 +79,19 @@ impl Harness {
     /// A harness whose registry also holds the methods `register` adds: fake git and pull
     /// request handlers under their real tags, so scope and admission run as for the real ones.
     pub(crate) async fn with_methods(register: impl FnOnce(&mut RpcRegistry)) -> Self {
+        Self::with_settings_and_methods(|registry, _| register(registry)).await
+    }
+
+    /// [`Self::with_methods`], whose `register` also gets the live MCP settings, as a
+    /// handler gated on them in production does.
+    pub(crate) async fn with_settings_and_methods(
+        register: impl FnOnce(&mut RpcRegistry, watch::Receiver<McpServerSettings>),
+    ) -> Self {
+        let (settings, receiver) = watch::channel(McpServerSettings {
+            enabled: true,
+            access: McpAccess::FullAccess,
+            ..McpServerSettings::default()
+        });
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -135,7 +148,7 @@ impl Harness {
             uploads,
             state.path().join("pastes"),
         );
-        register(&mut registry);
+        register(&mut registry, receiver.clone());
         let repositories = Repositories::new(database);
         let secrets = tempfile::tempdir().expect("secrets");
         let auth = AuthService::new_with_persistence(
@@ -148,11 +161,6 @@ impl Harness {
         )
         .await
         .expect("auth");
-        let (settings, receiver) = watch::channel(McpServerSettings {
-            enabled: true,
-            access: McpAccess::FullAccess,
-            ..McpServerSettings::default()
-        });
         let control = McpControl::new(registry, auth.clone(), engine.clone(), receiver);
         Self {
             engine,
@@ -175,9 +183,24 @@ impl Harness {
 
     /// [`Self::agent`] with the credential's label `label`.
     async fn agent_labelled(&self, label: &str, access: McpAccess) -> (ClientPrincipal, String) {
-        let link = issue_mcp_pairing_link(&self.repositories, label.into(), access.as_str(), &[])
-            .await
-            .expect("link");
+        self.agent_with_scopes(label, access, &[]).await
+    }
+
+    /// [`Self::agent_labelled`] whose credential also holds `extra_scopes` (`terminal:operate`).
+    pub(crate) async fn agent_with_scopes(
+        &self,
+        label: &str,
+        access: McpAccess,
+        extra_scopes: &[&str],
+    ) -> (ClientPrincipal, String) {
+        let link = issue_mcp_pairing_link(
+            &self.repositories,
+            label.into(),
+            access.as_str(),
+            extra_scopes,
+        )
+        .await
+        .expect("link");
         let session = self
             .auth
             .exchange_bootstrap(
@@ -262,6 +285,13 @@ impl Harness {
         self.provider.shutdown().await.expect("provider shutdown");
         self.engine.shutdown().await;
     }
+}
+
+/// `folder`'s canonical path as Git can read it. On Windows `canonicalize` spells a path
+/// `\\?\C:\...`, which Git reads as a host name and refuses ("hostname contains invalid
+/// characters"), so the prefix is dropped there; elsewhere the path is unchanged.
+pub(super) fn canonical(folder: &std::path::Path) -> std::path::PathBuf {
+    crate::git::without_verbatim_prefix(folder.canonicalize().expect("canonical folder"))
 }
 
 pub(super) fn command(value: Value) -> crate::orchestration::engine::OrchestrationCommand {

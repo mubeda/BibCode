@@ -158,6 +158,49 @@ async fn mcp_sessions(
     rows
 }
 
+/// Ctrl-C, or a dropped call, after the server made the session but before the caller heard
+/// back: `revoke` waits for that sign-in to finish and revokes its credential, so none is
+/// left live and untracked.
+#[tokio::test]
+async fn a_sign_in_dropped_after_the_server_made_the_session_is_still_revoked() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    connection.sign_in_plan.lock().unwrap().hold_after_sign_in = Some((reached_tx, resume_rx));
+    tokio::select! {
+        biased;
+        _ = reached => {}
+        called = connection.call_tool(1, "server_capabilities", json!({}), "MCP · test") => {
+            panic!("the sign-in was not held: {called:?}");
+        }
+    }
+    // The call is dropped here, as Ctrl-C drops it; the server has made the session.
+    assert_eq!(live_sessions(root.path()).await, 1);
+    tokio::join!(connection.revoke(), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = resume.send(());
+    });
+    assert_eq!(
+        live_sessions(root.path()).await,
+        0,
+        "{:?}",
+        mcp_sessions(root.path()).await
+    );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// The `mcp-client` sessions not revoked.
+async fn live_sessions(root: &Path) -> usize {
+    mcp_sessions(root)
+        .await
+        .iter()
+        .filter(|session| session.3.is_none())
+        .count()
+}
+
 async fn mcp_links(root: &Path) -> i64 {
     let (repositories, database) = repositories(root).await;
     let count = repositories
@@ -843,10 +886,12 @@ async fn a_legacy_clients_version_is_sent_on_every_later_request() {
             endpoint: Mutex::new(Endpoint {
                 base: format!("http://127.0.0.1:{port}/").parse().unwrap(),
             }),
-            credential: Mutex::new(Some(Credential {
+            credential: Arc::new(Mutex::new(Some(Credential {
                 token: "test-bearer".into(),
                 session_id: "test-session".into(),
-            })),
+            }))),
+            unconfirmed: Arc::default(),
+            sign_in_plan: std::sync::Mutex::default(),
         },
         legacy_version: std::sync::Mutex::new(None),
     };
@@ -1200,4 +1245,429 @@ fn a_credential_carries_the_terminal_scope_only_with_terminals_on_at_full_access
     assert!(extra_scopes(settings, McpAccess::AutoAcceptEdits).is_empty());
     settings.access = McpAccess::AutoAcceptEdits;
     assert!(extra_scopes(settings, McpAccess::FullAccess).is_empty());
+}
+
+#[tokio::test]
+async fn open_store_refuses_during_an_interrupted_recovery() {
+    for interrupted in ["journal", "staging"] {
+        let root = tempfile::tempdir().expect("data root");
+        let options = options(root.path());
+        let paths = options.paths();
+        std::fs::create_dir_all(&paths.state_dir).expect("state directory");
+        std::fs::write(&paths.database, b"left by an interrupted restore").expect("database");
+        std::fs::write(paths.runtime_lock(), b"").expect("runtime lock");
+        if interrupted == "journal" {
+            std::fs::write(paths.recovery_journal(), b"{}\n").expect("journal");
+        } else {
+            std::fs::create_dir(paths.recovery_staging_dir(uuid::Uuid::new_v4())).expect("staging");
+        }
+
+        let error = open_store(&options)
+            .await
+            .expect_err("the MCP relay must refuse an interrupted recovery");
+
+        assert!(
+            error.contains(crate::persistence::RESUME_COMMAND),
+            "{interrupted}: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&paths.database).expect("database"),
+            b"left by an interrupted restore"
+        );
+        let mut wal = paths.database.as_os_str().to_os_string();
+        wal.push("-wal");
+        assert!(
+            !std::path::PathBuf::from(wal).exists(),
+            "{interrupted}: SQLite never opened"
+        );
+    }
+}
+
+/// One pairing link row: its id, credential, `consumed_at` and `revoked_at`.
+type LinkRow = (String, String, Option<String>, Option<String>);
+
+async fn mcp_link_rows(root: &Path) -> Vec<LinkRow> {
+    let (repositories, database) = repositories(root).await;
+    let rows = repositories
+        .database()
+        .call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, credential, consumed_at, revoked_at FROM auth_pairing_links WHERE subject = 'mcp-client' ORDER BY created_at",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("links");
+    database.close().await;
+    rows
+}
+
+/// The files in `<state>/mcp-clients/` whose name ends with `suffix`.
+fn records_ending(root: &Path, suffix: &str) -> Vec<PathBuf> {
+    let dir = ServerConfig::new(root).state_dir().join(CLIENT_RECORDS_DIR);
+    std::fs::read_dir(dir).map_or_else(
+        |_| Vec::new(),
+        |entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.to_string_lossy().ends_with(suffix))
+                .collect()
+        },
+    )
+}
+
+/// A hold, the signal that it was reached, and its resume.
+fn hold() -> (
+    SignInHold,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    ((reached_tx, resume_rx), reached, resume)
+}
+
+const DEAD_RECORD: &str = r#"{"pid":4294967294,"processStartedAt":1}"#;
+
+/// The server committed the session, but its token response never arrived: the relay still
+/// revokes the session, by the link id it already held (#281).
+#[tokio::test]
+async fn a_token_response_lost_after_the_session_commit_is_revoked() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    connection.sign_in_plan.lock().unwrap().lose_token_response = true;
+    let listed = connection.list_tools(1, "MCP · test").await;
+    assert!(listed.is_err(), "{listed:?}");
+    assert_eq!(
+        mcp_sessions(root.path()).await.len(),
+        1,
+        "the server made it"
+    );
+    connection.revoke().await;
+    assert_eq!(
+        live_sessions(root.path()).await,
+        0,
+        "{:?}",
+        mcp_sessions(root.path()).await
+    );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A relay that died once the server answered its exchange leaves a `.link` record, and the
+/// next relay's sweep revokes that session (R1.5).
+#[tokio::test]
+async fn a_relay_that_died_after_its_exchange_is_swept() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    connection.sign_in_plan.lock().unwrap().die_after_send = true;
+    // The call awaits the sign-in task's handle, so nothing of it keeps running.
+    let listed = connection.list_tools(1, "MCP · test").await;
+    assert!(listed.is_err(), "{listed:?}");
+    drop(connection);
+    assert_eq!(live_sessions(root.path()).await, 1);
+    let records = records_ending(root.path(), ".link");
+    assert_eq!(
+        records.len(),
+        1,
+        "the credential was recorded before its exchange"
+    );
+    std::fs::write(&records[0], DEAD_RECORD).unwrap();
+    sweep_orphans(&options(root.path())).await;
+    assert_eq!(
+        live_sessions(root.path()).await,
+        0,
+        "{:?}",
+        mcp_sessions(root.path()).await
+    );
+    assert!(!records[0].exists());
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A relay that cannot record its credential never sends it, and fences its link (R1.2).
+#[tokio::test]
+async fn an_unwritable_client_records_dir_sends_no_credential() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let state_dir = ServerConfig::new(root.path()).state_dir();
+    std::fs::write(state_dir.join(CLIENT_RECORDS_DIR), "not a directory").unwrap();
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    let error = connection
+        .list_tools(1, "MCP · test")
+        .await
+        .expect_err("the sign-in fails");
+    assert!(
+        error.starts_with("Could not record this MCP connection in "),
+        "{error}"
+    );
+    assert!(mcp_sessions(root.path()).await.is_empty());
+    let links = mcp_link_rows(root.path()).await;
+    assert_eq!(links.len(), 1);
+    assert!(links[0].2.is_none(), "never exchanged: {links:?}");
+    assert!(links[0].3.is_some(), "fenced: {links:?}");
+    connection.revoke().await;
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A second relay's sweep while the first is writing its record never reads it half-written,
+/// so it never fences a live relay (R1.3).
+#[tokio::test]
+async fn a_sweep_racing_a_record_being_written_leaves_the_live_relay_signed_in() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let first = Arc::new(Connection::open(options(root.path())).await.expect("opens"));
+    let (held, reached, resume) = hold();
+    first.sign_in_plan.lock().unwrap().hold_publication = Some(held);
+    let call = tokio::spawn({
+        let first = Arc::clone(&first);
+        async move { first.list_tools(1, "MCP · first").await }
+    });
+    reached
+        .await
+        .expect("the record file is created, still empty");
+    let second = Connection::open(options(root.path())).await.expect("opens");
+    resume.send(()).unwrap();
+    let listed = call.await.unwrap();
+    assert!(listed.is_ok(), "{listed:?}");
+    assert_eq!(live_sessions(root.path()).await, 1);
+    first.revoke().await;
+    second.revoke().await;
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// How a sweep before #281 worked: it revoked the session each dead `*.json` stem names.
+async fn sweep_as_before_281(root: &Path) {
+    let (repositories, database) = repositories(root).await;
+    for path in records_ending(root, ".json") {
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap_or_default()).unwrap_or_default();
+        let alive = record["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(process_started_at)
+            .is_some_and(|started| record["processStartedAt"].as_u64() == Some(started));
+        let session_id = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if !alive
+            && repositories
+                .revoke_auth_session(session_id, crate::auth::format_iso(crate::auth::now_ms()))
+                .await
+                .is_ok()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    database.close().await;
+}
+
+/// An unconfirmed record is invisible to an older relay's sweep, which would revoke a session
+/// not inserted yet and lose it; a new sweep revokes it once it exists (R1.1).
+#[tokio::test]
+async fn an_older_sweep_cannot_lose_an_unconfirmed_credential() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let base = format!("http://{}", server.local_addr());
+    let (repositories, database) = repositories(root.path()).await;
+    let link =
+        crate::auth::issue_mcp_pairing_link(&repositories, "MCP · died".into(), "read-only", &[])
+            .await
+            .unwrap();
+    database.close().await;
+    let state_dir = ServerConfig::new(root.path()).state_dir();
+    std::fs::create_dir_all(state_dir.join(CLIENT_RECORDS_DIR)).unwrap();
+    let record = record_path(&state_dir, &format!("{}.{UNCONFIRMED_RECORD}", link.id));
+    std::fs::write(&record, DEAD_RECORD).unwrap();
+    let (held, reached, resume) = hold();
+    *server
+        .auth_for_test()
+        .test_hooks()
+        .after_consume
+        .lock()
+        .unwrap() = Some(held);
+    let exchange = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("{base}/oauth/token"))
+            .form(&[
+                ("grant_type", crate::auth::TOKEN_GRANT_TYPE),
+                ("subject_token", link.credential.as_str()),
+                ("subject_token_type", crate::auth::BOOTSTRAP_TOKEN_TYPE),
+                ("requested_token_type", crate::auth::ACCESS_TOKEN_TYPE),
+            ])
+            .send(),
+    );
+    reached.await.expect("the exchange consumed its link");
+    sweep_as_before_281(root.path()).await;
+    assert!(record.exists(), "an older sweep leaves it");
+    resume.send(()).unwrap();
+    let exchanged = exchange.await.unwrap().expect("exchange");
+    assert!(exchanged.status().is_success(), "{}", exchanged.status());
+    assert_eq!(live_sessions(root.path()).await, 1);
+    sweep_orphans(&options(root.path())).await;
+    assert_eq!(
+        live_sessions(root.path()).await,
+        0,
+        "{:?}",
+        mcp_sessions(root.path()).await
+    );
+    assert!(!record.exists());
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A sweep that listed a live relay's `.link` record, which the relay then renamed to `.json`,
+/// skips it rather than fencing the live relay (R2.1).
+#[tokio::test]
+async fn a_record_renamed_between_a_sweeps_listing_and_its_read_is_not_fenced() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let first = Arc::new(Connection::open(options(root.path())).await.expect("opens"));
+    let (held, reached, resume) = hold();
+    first.sign_in_plan.lock().unwrap().hold_after_sign_in = Some(held);
+    let call = tokio::spawn({
+        let first = Arc::clone(&first);
+        async move { first.list_tools(1, "MCP · first").await }
+    });
+    reached.await.expect("the server answered");
+    assert_eq!(records_ending(root.path(), ".link").len(), 1);
+    let (sweep_held, sweep_reached, sweep_resume) = hold();
+    let options = options(root.path());
+    let sweep = tokio::spawn(
+        HOLD_SWEEP_AFTER_LISTING.scope(std::cell::RefCell::new(Some(sweep_held)), async move {
+            sweep_orphans(&options).await
+        }),
+    );
+    sweep_reached.await.expect("the sweep listed the records");
+    resume.send(()).unwrap();
+    let listed = call.await.unwrap();
+    assert!(listed.is_ok(), "{listed:?}");
+    assert!(records_ending(root.path(), ".link").is_empty(), "renamed");
+    sweep_resume.send(()).unwrap();
+    sweep.await.unwrap();
+    let listed = first.list_tools(2, "MCP · first").await;
+    assert!(listed.is_ok(), "{listed:?}");
+    assert_eq!(live_sessions(root.path()).await, 1);
+    let links = mcp_link_rows(root.path()).await;
+    assert!(links[0].3.is_none(), "not fenced: {links:?}");
+    first.revoke().await;
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// Against an older server (its own session id), a relay that can neither record that session
+/// nor revoke it at once keeps it, and revokes it at exit (R2.2).
+#[tokio::test]
+async fn an_older_server_session_whose_record_and_revoke_fail_is_revoked_at_exit() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    server
+        .auth_for_test()
+        .test_hooks()
+        .random_mcp_session_ids
+        .store(true, std::sync::atomic::Ordering::Release);
+    let connection = Arc::new(Connection::open(options(root.path())).await.expect("opens"));
+    let (held, reached, resume) = hold();
+    connection.sign_in_plan.lock().unwrap().hold_after_sign_in = Some(held);
+    let call = tokio::spawn({
+        let connection = Arc::clone(&connection);
+        async move { connection.list_tools(1, "MCP · test").await }
+    });
+    reached.await.expect("the server answered");
+    // From here the records folder cannot be written and the store cannot be opened.
+    let paths = options(root.path()).paths();
+    let records = paths.state_dir.join(CLIENT_RECORDS_DIR);
+    std::fs::rename(&records, paths.state_dir.join("mcp-clients-moved")).unwrap();
+    std::fs::write(&records, "not a directory").unwrap();
+    std::fs::write(paths.recovery_journal(), b"{}\n").unwrap();
+    resume.send(()).unwrap();
+    let error = call.await.unwrap().expect_err("the sign-in fails");
+    assert!(
+        error.starts_with("Could not record this MCP connection in "),
+        "{error}"
+    );
+    assert_eq!(live_sessions(root.path()).await, 1);
+    std::fs::remove_file(paths.recovery_journal()).unwrap();
+    connection.revoke().await;
+    assert_eq!(
+        live_sessions(root.path()).await,
+        0,
+        "{:?}",
+        mcp_sessions(root.path()).await
+    );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// Against an older server, the relay records the session by the token's `sid`, and fences
+/// and forgets the link it minted.
+#[tokio::test]
+async fn a_relay_records_by_the_token_sid_when_the_server_assigns_another_id() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    server
+        .auth_for_test()
+        .test_hooks()
+        .random_mcp_session_ids
+        .store(true, std::sync::atomic::Ordering::Release);
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    let listed = connection.list_tools(1, "MCP · test").await;
+    assert!(listed.is_ok(), "{listed:?}");
+    let sessions = mcp_sessions(root.path()).await;
+    let links = mcp_link_rows(root.path()).await;
+    assert_eq!((sessions.len(), links.len()), (1, 1));
+    assert_ne!(sessions[0].0, links[0].0, "the server chose its own id");
+    let state_dir = ServerConfig::new(root.path()).state_dir();
+    assert!(client_record_path(&state_dir, &sessions[0].0).exists());
+    assert!(records_ending(root.path(), ".link").is_empty());
+    assert!(links[0].3.is_some(), "the link is fenced");
+    connection.revoke().await;
+    assert_eq!(live_sessions(root.path()).await, 0);
+    assert!(!client_record_path(&state_dir, &sessions[0].0).exists());
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A record holds the process only: neither the token nor the pairing credential.
+#[tokio::test]
+async fn a_client_record_holds_no_credential() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let connection = Connection::open(options(root.path())).await.expect("opens");
+    connection
+        .list_tools(1, "MCP · test")
+        .await
+        .expect("signed in");
+    let token = connection
+        .credential
+        .lock()
+        .await
+        .as_ref()
+        .expect("credential")
+        .token
+        .clone();
+    let links = mcp_link_rows(root.path()).await;
+    let records = records_ending(root.path(), ".json");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].file_stem().unwrap().to_string_lossy(),
+        links[0].0,
+        "the session id is the link's"
+    );
+    let text = std::fs::read_to_string(&records[0]).unwrap();
+    assert!(!text.contains(&token), "{text}");
+    assert!(!text.contains(&links[0].1), "{text}");
+    let record: Value = serde_json::from_str(&text).unwrap();
+    let mut keys: Vec<&String> = record.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["pid", "processStartedAt"]);
+    connection.revoke().await;
+    server.shutdown();
+    server.join().await.expect("server joins");
 }

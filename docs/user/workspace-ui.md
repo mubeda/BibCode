@@ -186,7 +186,27 @@ appear again when you expand it.
 - Worktree cards represent worktree threads. Creating a worktree creates both
   the Git worktree and its thread before the first message.
 - Other chats open in a worktree show as **N more chats** under its card;
-  chats in the main checkout count on the primary card.
+  chats in the main checkout count on the primary card. The count includes
+  finished chats the panel did not load. Selecting it lists the checkout's
+  chats; the ones the panel did not load follow, 20 at a time, and selecting a
+  chat opens it in its workspace.
+
+To load quickly, the panel loads each server's live and recent threads: every
+working or waiting agent, every workspace card, threads you pinned, left unread
+or have open, and the newest finished ones (25 in all, and at least the 3
+newest of each project). A project with more finished threads ends with **N
+older threads**; selecting it loads them 20 at a time (**Load 20 more**), and
+**Hide older threads** folds them away again. While the server is not
+connected the row reads **N older threads: reconnect to load**. In the Agents
+view and the Inbox, the **Done** group ends with **Show older**, which loads
+the finished agents the panel did not load, chat panels included; when none
+loaded, the Agents view offers **Show older finished agents** instead. The command
+palette's search also asks the server once you pause typing, and lists matches
+the panel did not load under **Older threads**. Under its results it says
+**Searching older threads…** until the server answers, offers **Retry** when
+the search fails, and names any server that is not connected, whose older
+threads it cannot search. A thread you open from these lists opens as usual,
+however slow the connection.
 
 Tab moves between cards; **Enter** opens one, and **Shift+F10** or the
 **Menu** key opens its menu at the card.
@@ -436,6 +456,7 @@ moved between split panes, or closed from the center layout without deleting the
 thread. While present, it remains mounted throughout layout and tab changes. The
 chat header `+` menu contains:
 
+- Side chat, which opens an empty [side chat](#side-chats) of this thread
 - enabled AI providers, which create new chat panels
 - Reopen closed chat, which lists this thread's ten most recently closed chat
   panels, newest first; it is disabled with **No closed chats** when there are
@@ -457,6 +478,55 @@ behind a stopped turn then offer **Send now**), and a
 the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
+Closing a tab whose panel is still being created opens nothing: the panel is
+closed as soon as the server creates it. If BiBCode can't tell whether a close
+reached the server (a dropped connection, or a reload meanwhile), the tab comes
+back rather than risk closing a chat someone reopened; close it again.
+
+### Side chats
+
+A side chat is a chat panel that starts with what its thread knows. Use it to
+ask about the thread while it keeps working, without adding to its messages,
+queue or context. Type `:btw <question>` or `:side <question>` as the whole
+message in a thread's composer, or choose **Side chat** in the `+` menu. The
+side chat opens as the active tab, runs on the thread's provider and model, and
+sends your question there; the thread's composer is cleared once it did. A bare
+`:btw` (or the menu) opens an empty side chat with focus in its composer. The
+`:` menu lists `:btw` and `:side` with the other composer actions (`:model`,
+`:plan`, `:default`); `/btw` still goes to the provider as its own command.
+
+Its first answer is based on the thread's delivered messages, up to the last 40
+and 24,000 characters, sent with that first question; the work log shows
+**Started with the thread's last N messages**. Later questions use the side
+chat's own history. It sees message text only, not tool output or attachments,
+and reads files from the same checkout, which the thread may still be changing.
+A side chat starts in **Supervised** mode, so it asks before it edits files or
+runs commands; its runtime mode picker can change that. Its tab reads **Side chat
+· <provider>**. It keeps no checkpoints and offers no restore: restore files from
+the main thread.
+
+Side chats follow the chat panel rules: hidden from the left panel and Settings
+→ Archived, an Inbox row opens the thread with the side chat active, closing
+archives it, **Reopen closed chat** lists it, and deleting the thread deletes
+it. One exception: closing a side chat nobody ever sent a message to deletes it,
+so **Reopen closed chat** does not fill with empty ones. If someone sent it a
+message meanwhile, on any client, it is archived as usual. A server too old to
+refuse deleting a used side chat always archives it. **Side chat** and `:btw`
+are unavailable inside a chat panel or side chat ("Side chats start from the
+main chat. Use :btw there."), on a server too old to support them ("This server
+doesn't support side chats. Update it to use them."), before the thread has
+started, and while the thread's provider is not ready. The menu item stays
+visible with its reason; a refused `:btw` keeps your text and shows the reason
+under the composer. A `:btw` with attachments or contexts is refused too, so
+nothing is split between two chats. If the question can't be sent, it waits in
+the side chat's composer.
+
+**Bring back**, above the side chat's composer, puts the side chat's last answer,
+quoted under "From the side chat:", into the thread's composer as a draft and
+shows the thread. Anything already typed there stays, with the answer after it.
+Nothing is sent: read, edit and send it yourself. It is unavailable while the
+thread is working ("Available when the thread is idle.") and before the side
+chat has answered.
 
 The composer's **History** button (left of **Attach files**) brings back
 earlier work for the thread, in a chat panel's composer too, where it acts for
@@ -585,6 +655,14 @@ with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
 These keys and the minimap jump instead of scrolling smoothly when the system
 asks for reduced motion.
 
+A long thread opens with its latest turns, so it shows quickly on a slow link.
+Scrolling up near the top loads the turns before them and keeps the line you are
+reading in place; the top row, **Load earlier messages (N more)**, does the same
+without scrolling. While a page loads it reads **Loading earlier messages…**; if
+one fails it reads **Couldn't load earlier messages.** with **Retry**. The
+earlier turns stay loaded until you switch threads or reload. A turn whose start
+has not loaded yet shows **Worked** without a duration until it does.
+
 While a reply streams, the timeline follows it. Scrolling the timeline yourself
 stops that: the wheel, a touch, the scrollbar, or the arrow keys, PageUp,
 PageDown, Home, End, or Space while the timeline has focus (for example after
@@ -615,7 +693,11 @@ outlined instead.
 whatever find opened stay as they are, and reopening find restores the last
 search. Find searches the copy of the thread the app holds: while the
 connection is restoring, the status adds **may be out of date**, and while a
-thread is still loading it says **Loading thread…**. One chat's find is open at
+thread is still loading it says **Loading thread…**. While the thread's earlier
+turns are not loaded yet, find searches the loaded messages and says **Searched
+loaded messages.** with **Search all**, which loads every earlier turn and
+searches again; if a page fails it says **Couldn't load all earlier messages.**
+with **Retry**. Closing the bar stops Search all. One chat's find is open at
 a time; opening it in a chat panel closes the host chat's. The palette opens it
 in the chat you were using, or the chat on screen. Outside a chat, Mod+F
 keeps its usual meaning. To use another key, bind the `chat.find` command (see
@@ -838,7 +920,10 @@ open, that project's header row stays highlighted in the left panel, and the
 toolbar leads with the project's name (its checkout path on hover) and the
 environment it is connected to. The selected
 environment owns every path and Git process, so a remote project's checkout
-path remains opaque to the browser.
+path remains opaque to the browser. Git Manager handles line endings the way
+your own Git does on that host, including Git for Windows' system
+`core.autocrlf`. If an earlier version committed files with CRLF line endings,
+they stay that way. To normalize them, run `git add --renormalize .` yourself.
 
 The toolbar has three segments:
 
@@ -1009,7 +1094,15 @@ that enforces eviction. The companion toolbar record contains
 read the legacy `commitDraft` field; its active draft instead uses the shared
 `bibcode:source-control-panel-state:v1` store keyed by environment and checkout,
 so the right-panel Source Control surface and Git Manager do not diverge. The
-selected worktree is intentionally session-only and resets to the main checkout
+store keeps each checkout's draft in its own entry
+(`bibcode:source-control-panel-state:v1:draft:<environment>::<checkout>`) and follows
+other tabs through `storage` events, so tabs editing different checkouts cannot overwrite
+each other. When tabs write different messages for one checkout, the newest stays in the
+box and the others (up to five, oldest dropped after that) are listed under it, each with
+**Use** and **Dismiss**; no text any tab wrote leaves storage until someone uses,
+dismisses or commits it. A commit clears only the message it sent, and only if the box
+still holds it. Web Storage has no cross-window lock, so two saves landing in the same
+instant can still lose one version. The selected worktree is intentionally session-only and resets to the main checkout
 after a reload. Evicted or hidden projects retain no mounted panel or live Git
 Manager subscription.
 
@@ -1393,7 +1486,10 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Diff** reviews the working tree, branch changes, or a turn's changes (see
   [Diff](#diff)).
 - **Activity** shows structured provider activity when available.
-- **Plan** displays the active agent plan when available.
+- **Plan** displays the active agent plan when available. With **Auto-open task
+  panel** on, it opens when a turn's steps appear. Closing it, or switching to
+  another surface such as a turn's **View diff**, keeps it closed until the next
+  turn's steps.
 - **Device** shows an Android emulator or, on a macOS server, an iOS simulator
   running on the environment's server (see [Device previews](#device-previews)).
   It is in the `+` menu only while device previews are on.
@@ -1499,7 +1595,10 @@ plain HTTP from that server, and every other link opens a new browser tab.
 
 - **Chat:** Ctrl/Cmd-, Shift-, or Alt-click or middle-click opens the other
   target. Right-click on an `http(s)` link offers **Open in BiBCode browser**,
-  **Open in system browser**, and **Copy link**. Any
+  **Open in system browser**, and **Copy link**. A link, file, or turn diff in a
+  chat panel opens in its host thread's right panel, the one on screen. If the
+  BiBCode browser can't open a link, a notice says so and offers **Open in
+  system browser**. Any
   modifier-click on an `.html`, `.htm`, or `.pdf` file chip opens
   it in the editor instead of the browser. Links to network or device paths
   (`file://server/…`, `file:////server/…`, `\\server\share`, `\\?\…`, `\\.\…`)
@@ -1516,7 +1615,11 @@ plain HTTP from that server, and every other link opens a new browser tab.
   `\\.\…`) is refused with "Network paths can't be opened from the terminal."
   A `file://` URL with a host shows "Unable to open this file link." Relative
   links under a network working directory, such as a WSL `\\wsl.localhost\…`
-  folder, still open. A hyperlink a program emits (OSC 8)
+  folder, still open. On Windows, relative paths with backslashes
+  (`src\index.ts:12`, `.\a.ts`, `..\a.ts`) and `~\` or `~/` paths are links
+  too, `~` resolves against a home folder written in any case or with forward
+  slashes, and a path in quotes keeps its spaces (put `:line` inside the
+  quotes). A hyperlink a program emits (OSC 8)
   needs the same Ctrl/Cmd activation. When its visible text doesn't match its
   destination, a menu shows **Open …** with the destination and **Copy link**.
 - **Browser tabs:** popups and `target=_blank` links inside a preview tab open
@@ -2008,6 +2111,22 @@ The Files surface is a full file manager for the active workspace:
 - Git-ignored files and directory roots remain visible with ignored styling,
   and the contents below an ignored directory are loaded eagerly with the rest
   of the tree.
+- Opening a file shows it in the panel by its extension, before any text read.
+  Text and code open in the editor. Images (PNG, JPEG, GIF, WebP, AVIF, ICO)
+  show as pictures, with their pixel size and a **Fit** / **Actual size**
+  switch. **SVG** shows as an image, never as live markup, so a script inside it
+  cannot run; **View source** opens its XML in the editor, and the editor's
+  switch brings the image back. A **PDF** opens in the browser's or webview's own
+  viewer, and audio (MP3, M4A, WAV, OGG, OGA, WebM, FLAC) plays in the native
+  player. These previews come from the same size-capped file route as the
+  integrated browser, so a file over 10 MiB, or one the viewer cannot decode,
+  explains itself instead of failing: it says the file is too large (or cannot be
+  shown) and points at **Open in** in the header, or at the machine the
+  environment runs on when the environment is remote. Other binary files (an
+  archive, an executable) say that no preview exists for their type. Video is not
+  previewed. The PDF viewer depends on the host webview; where it has none (some
+  Linux builds), use **Open in**. Message images and draft thumbnails load only
+  when they scroll near the viewport.
 - Right-click files, folders, or the tree background to create files/folders,
   rename, delete, duplicate, copy paths, add a folder as a project, download or
   upload files, open in an external editor, or open previewable files in the

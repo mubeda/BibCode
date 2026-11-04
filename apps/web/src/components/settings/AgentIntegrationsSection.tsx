@@ -31,7 +31,7 @@ import { DiagnosticsEnvironmentSelect, useDiagnosticsEnvironment } from "./diagn
 import { McpAgentsPanel } from "./McpAgentsPanel";
 import { McpRemoteAgentsPanel } from "./McpRemoteAgentsPanel";
 import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayout";
-import { WebhooksTab } from "./WebhooksTab";
+import { type WebhookCapabilities, WebhooksTab } from "./WebhooksTab";
 
 const SERVER_TITLE = "MCP server";
 const SERVER_DESCRIPTION =
@@ -117,6 +117,13 @@ const PATH_SEPARATOR = /[\\/]/;
 
 type IntegrationsTab = "mcp" | "webhooks";
 
+/** An environment whose server has not reported its capabilities offers no newer controls. */
+const NO_CAPABILITIES: WebhookCapabilities = {
+  webhookQuestionEvents: false,
+  webhookBearerToken: false,
+  webhookStatusKinds: false,
+};
+
 /**
  * Settings → Agents → Agent integrations of the chosen environment: its MCP server and its
  * outbound webhooks, one tab each, under a status line that summarizes both.
@@ -188,6 +195,7 @@ export function AgentIntegrationsSection() {
             environmentId={environment.environmentId}
             isPrimary={isPrimary}
             supported={supported}
+            capabilities={environment.serverConfig?.environment.capabilities ?? NO_CAPABILITIES}
           />
         </TabsPanel>
       </Tabs>

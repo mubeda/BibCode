@@ -268,7 +268,7 @@ mod tests {
     /// `.github` folder is (#139 X5 review round 6).
     #[tokio::test]
     async fn a_folder_download_leaves_out_gits_own_metadata() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = temp.path().join("folder");
         std::fs::create_dir_all(root.join("lib/.git/hooks")).unwrap();
         std::fs::write(root.join("lib/.git/config"), b"[core]\n").unwrap();
@@ -296,9 +296,17 @@ mod tests {
         assert_eq!(names, [".github/", ".github/ci.yml", "lib/", "lib/a.txt"]);
     }
 
+    /// A link to the folder `target` at `link`: a symlink on Unix, a junction on Windows.
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        junction::create(target, link).unwrap();
+    }
+
     #[tokio::test]
     async fn plans_and_streams_a_zip_skipping_symlinks() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = temp.path().join("folder");
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("a.txt"), b"hello").unwrap();
@@ -337,11 +345,10 @@ mod tests {
         assert_eq!(content, "hello");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_folder_swapped_for_an_outside_symlink_while_it_zips_is_never_followed() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
+        let outside = crate::test_support::canonical_tempdir();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::create_dir_all(root.join("folder/sub")).unwrap();
         std::fs::write(root.join("folder/sub/mine.txt"), b"mine").unwrap();
@@ -352,9 +359,9 @@ mod tests {
         // After the route opened the folder: the folder, and a folder inside it, each become
         // a symlink to somewhere outside.
         std::fs::rename(root.join("folder"), root.join("moved")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("folder")).unwrap();
+        link_dir(outside.path(), &root.join("folder"));
         std::fs::rename(root.join("moved/sub"), root.join("moved/sub.real")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("moved/sub")).unwrap();
+        link_dir(outside.path(), &root.join("moved/sub"));
 
         let body = archive_body_from(plan, folder, root.join("folder"), ArchiveLimits::default());
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
@@ -375,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_read_failure_rejects_the_body_instead_of_completing_a_partial_zip() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = temp.path().join("folder");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("file.txt"), b"content").unwrap();
@@ -390,11 +397,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_plan_sizes_the_held_folder_never_a_swapped_link() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
+        let outside = crate::test_support::canonical_tempdir();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::create_dir_all(root.join("folder/sub")).unwrap();
         std::fs::write(root.join("folder/sub/mine.txt"), b"mine").unwrap();
@@ -403,9 +409,9 @@ mod tests {
         let folder = Dir::open(&validated, &root.join("folder"), false).unwrap();
         // After the route opened it, the folder and a folder inside it become outside links.
         std::fs::rename(root.join("folder"), root.join("moved")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("folder")).unwrap();
+        link_dir(outside.path(), &root.join("folder"));
         std::fs::rename(root.join("moved/sub"), root.join("moved/sub.real")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join("moved/sub")).unwrap();
+        link_dir(outside.path(), &root.join("moved/sub"));
         let plan = plan_dir(&folder, ArchiveLimits::default()).unwrap();
         assert_eq!(
             plan,
@@ -418,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_folder_that_outgrows_its_limits_after_planning_fails_the_stream() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::write(root.join("a.txt"), b"1234").unwrap();
         let limits = ArchiveLimits {
@@ -457,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_rejects_oversized_trees() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::canonical_tempdir();
         std::fs::write(temp.path().join("big"), vec![0u8; 16]).unwrap();
         let error = plan_archive_with_limits(temp.path(), 10, 8)
             .await

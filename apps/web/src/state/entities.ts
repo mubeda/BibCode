@@ -16,11 +16,22 @@ import type {
 } from "@bibcode/contracts";
 import type { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { Atom } from "effect/reactivity";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
+import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { scopeThreadShell } from "@bibcode/client-runtime/state/models";
+import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { readActiveEnvironmentId, setActiveEnvironmentId } from "./activeEnvironment";
 import { environmentProjects } from "./projects";
 import { environmentServerConfigsAtom } from "./server";
+import {
+  isShellCapped,
+  readOffShellThreadShell,
+  requestThreadShells,
+  type ResolvedThreadShell,
+  resolveThreadShellWith,
+  useOffShellThread,
+} from "./offShell";
 import { environmentThreadDetails, environmentThreadShells } from "./threads";
 
 export {
@@ -140,9 +151,32 @@ export function useProject(ref: ScopedProjectRef | null): EnvironmentProject | n
   return useAtomValue(ref === null ? EMPTY_PROJECT_ATOM : environmentProjects.projectAtom(ref));
 }
 
+/**
+ * The thread's shell from the live shell, else from the threads a capped shell left out
+ * (#223), which it looks up once when neither holds it.
+ */
 export function useThreadShell(ref: ScopedThreadRef | null): EnvironmentThreadShell | null {
-  return useAtomValue(
+  const shell = useAtomValue(
     ref === null ? EMPTY_THREAD_SHELL_ATOM : environmentThreadShells.threadShellAtom(ref),
+  );
+  const offShell = useOffShellThread(
+    shell === null ? (ref?.environmentId ?? null) : null,
+    shell === null ? (ref?.threadId ?? null) : null,
+  );
+  const fallback = offShell.thread;
+  const unresolved = shell === null && fallback === null && ref !== null && !offShell.missing;
+  const environmentId = ref?.environmentId;
+  const threadId = ref?.threadId;
+  useEffect(() => {
+    if (!unresolved || environmentId === undefined || threadId === undefined) return;
+    if (isShellCapped(environmentId)) void requestThreadShells(environmentId, [threadId]);
+  }, [environmentId, threadId, unresolved]);
+  return useMemo(
+    () =>
+      shell !== null || fallback === null || ref === null
+        ? shell
+        : scopeThreadShell(ref.environmentId, fallback),
+    [fallback, ref, shell],
   );
 }
 
@@ -193,8 +227,22 @@ export function readProject(ref: ScopedProjectRef): EnvironmentProject | null {
   return appAtomRegistry.get(environmentProjects.projectAtom(ref));
 }
 
+/** The thread's shell from the live shell, else from what a capped shell left out (#223). */
 export function readThreadShell(ref: ScopedThreadRef): EnvironmentThreadShell | null {
+  return readLiveThreadShell(ref) ?? readOffShellThreadShell(ref);
+}
+
+function readLiveThreadShell(ref: ScopedThreadRef): EnvironmentThreadShell | null {
   return appAtomRegistry.get(environmentThreadShells.threadShellAtom(ref));
+}
+
+/**
+ * Resolves a thread for an action: the live shell, the threads a capped shell left out, then the
+ * server. `missing` is the only evidence the thread is gone; `unknown` (an old server's
+ * uncapped shell) keeps the behavior from before #223.
+ */
+export function resolveThreadShell(ref: ScopedThreadRef): Promise<ResolvedThreadShell> {
+  return resolveThreadShellWith(ref, readLiveThreadShell);
 }
 
 export function readThreadDetail(ref: ScopedThreadRef): EnvironmentThread | null {
@@ -212,9 +260,12 @@ export function readThreadRefs(): ReadonlyArray<ScopedThreadRef> {
 }
 
 export function findThreadRef(threadId: ThreadId): ScopedThreadRef | null {
-  return (
-    appAtomRegistry
-      .get(environmentThreadShells.threadRefsAtom)
-      .find((ref) => ref.threadId === threadId) ?? null
-  );
+  const live = appAtomRegistry
+    .get(environmentThreadShells.threadRefsAtom)
+    .find((ref) => ref.threadId === threadId);
+  if (live !== undefined) return live;
+  const environmentId = offShellThreads
+    .environmentIds()
+    .find((candidate) => offShellThreads.get(candidate).threads.has(threadId));
+  return environmentId === undefined ? null : scopeThreadRef(environmentId, threadId);
 }

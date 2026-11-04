@@ -113,7 +113,8 @@ that follows the recipe above. Plain HTTP on a LAN address is refused; use
 `ssh <host> bibcode mcp` there instead.
 
 1. In **Settings → Agents → Agent integrations → MCP**, the **Remote agents** row
-   shows the MCP URL (`https://<host>/mcp`) with **Copy for Claude Code**
+   shows the MCP URL (`https://<host>/mcp`) with **Copy URL** (for any other MCP
+   client), **Copy for Claude Code**
    (`claude mcp add --transport http bibcode <url>`) and **Copy for Codex**
    (`codex mcp add bibcode --url <url>`), for BiBCode Connect's address or the
    HTTPS address the app reaches the environment at. Behind a proxy or tunnel

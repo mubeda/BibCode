@@ -163,6 +163,8 @@ const testState = vi.hoisted(() => ({
   projects: [] as unknown[],
   threads: [] as unknown[],
   environments: [] as unknown[],
+  cappedShells: [] as Array<{ environmentId: string; live: boolean }>,
+  olderSearchOutcome: "loaded" as "loaded" | "failed",
   activeEnvironmentId: null as EnvironmentId | null,
   activeThread: null as unknown,
   deviceAvailability: { known: true, supported: true, enabled: false },
@@ -201,7 +203,16 @@ vi.mock("react/compiler-runtime", () => ({
 }));
 
 vi.mock("@effect/atom-react", () => ({
-  useAtomValue: () => testState.keybindings,
+  useAtomValue: (atom: unknown) =>
+    atom === "capped-shells" ? testState.cappedShells : testState.keybindings,
+}));
+vi.mock("../state/shell", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../state/shell")>()),
+  cappedShellEnvironmentsAtom: "capped-shells",
+}));
+vi.mock("../state/offShell", () => ({
+  useOffShellThreadShells: () => [],
+  loadOlderThreads: async () => testState.olderSearchOutcome,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -617,6 +628,8 @@ beforeEach(() => {
     },
   ];
   testState.activeEnvironmentId = null;
+  testState.cappedShells = [];
+  testState.olderSearchOutcome = "loaded";
   testState.activeThread = makeThread("thread-1");
   testState.deviceAvailability = { known: true, supported: true, enabled: false };
   testState.deviceAvailabilityFor = [];
@@ -954,6 +967,34 @@ describe("root actions", () => {
     expect(testState.handleNewThread).toHaveBeenCalledWith(
       expect.objectContaining({ projectId: PROJECT_B }),
     );
+  });
+
+  it("says which disconnected server's older threads go unsearched (#223)", () => {
+    testState.cappedShells = [{ environmentId: ENV_REMOTE, live: false }];
+    openPalette();
+    lastCommand().onValueChange?.("thread");
+    expect(rerender()).toContain("Older threads are searched when AI-SERVER is connected.");
+  });
+
+  it("shows the older search while it runs, then its failure with Retry (#223)", async () => {
+    testState.cappedShells = [{ environmentId: ENV_PRIMARY, live: true }];
+    testState.olderSearchOutcome = "failed";
+    Object.assign(windowStub, {
+      setTimeout: (callback: () => void) => {
+        callback();
+        return 1;
+      },
+      clearTimeout: () => undefined,
+    });
+    openPalette();
+    lastCommand().onValueChange?.("thread");
+    expect(rerender()).toContain("Searching older threads…");
+    hooks.runEffects();
+    await flushPromises();
+    const markup = rerender();
+    expect(markup).toContain("Couldn&#x27;t search older threads.");
+    expect(markup).toContain("Retry");
+    expect(markup).not.toContain("Searching older threads…");
   });
 
   it("navigates to a searched thread", async () => {

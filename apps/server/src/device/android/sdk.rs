@@ -296,7 +296,10 @@ mod tests {
     async fn failed_avd_listing_is_not_parsed_into_avds() {
         let sdk = FakeSdk::new().avds(&["a"]).write();
         let script = "#!/bin/sh\necho 'ERROR | broken sdk'\nexit 1\n";
-        std::fs::write(sdk.root().join("emulator/emulator"), script).unwrap();
+        crate::test_support::executable_fixture::write_executable(
+            &sdk.root().join("emulator/emulator"),
+            script,
+        );
         let (availability, avds, _) = discover(&sdk.env()).await;
         assert_eq!(availability.kind, AvailabilityKind::SdkMissing);
         assert!(avds.is_empty());

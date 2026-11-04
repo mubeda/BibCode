@@ -217,13 +217,17 @@ import {
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
   OrchestrationDispatchCommandError,
+  OrchestrationThreadInUseError,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetSnapshotError,
+  OrchestrationListOlderThreadsError,
   OrchestrationGetTurnDiffError,
   OrchestrationGetTurnDiffInput,
   OrchestrationReplayEventsError,
   OrchestrationReplayEventsInput,
+  OrchestrationGetThreadHistoryPageError,
+  OrchestrationThreadHistoryStaleError,
   OrchestrationRpcSchemas,
   ProviderInteractionMode,
   RuntimeMode,
@@ -347,6 +351,9 @@ import {
   ServerProviderCapabilitiesError,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
+  ServerToolUpdateError,
+  ServerToolUpdateInput,
+  ServerToolUpdatedPayload,
   ServerLifecycleStreamEvent,
   ServerRemoveKeybindingInput,
   ServerRemoveKeybindingResult,
@@ -457,6 +464,8 @@ export const WorktreeCreatePanelInput = Schema.Struct({
   purpose: Schema.optional(
     Schema.NullOr(Schema.String.check(Schema.isMaxLength(THREAD_PURPOSE_MAX_LENGTH))),
   ),
+  /** Opens a side chat of the host (#265). Only for a server that advertises `sideChats`. */
+  sideChat: Schema.optional(Schema.Boolean),
 });
 export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
 
@@ -672,6 +681,7 @@ export const WS_METHODS = {
   serverGetProviderCapabilities: "server.getProviderCapabilities",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
+  serverUpdateTool: "server.updateTool",
   serverUpsertKeybinding: "server.upsertKeybinding",
   serverRemoveKeybinding: "server.removeKeybinding",
   serverGetSettings: "server.getSettings",
@@ -819,6 +829,12 @@ export const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvide
   payload: ServerProviderUpdateInput,
   success: ServerProviderUpdatedPayload,
   error: Schema.Union([ServerProviderUpdateError, EnvironmentRpcError]),
+});
+
+export const WsServerUpdateToolRpc = Rpc.make(WS_METHODS.serverUpdateTool, {
+  payload: ServerToolUpdateInput,
+  success: ServerToolUpdatedPayload,
+  error: Schema.Union([ServerToolUpdateError, EnvironmentRpcError]),
 });
 
 export const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
@@ -1984,6 +2000,7 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
       WorkspaceUnavailableError,
       WorkspaceIdentityError,
       EnvironmentRpcError,
+      OrchestrationThreadInUseError,
     ]),
   },
 );
@@ -2017,11 +2034,46 @@ export const WsOrchestrationReplayEventsRpc = Rpc.make(ORCHESTRATION_WS_METHODS.
   error: Schema.Union([OrchestrationReplayEventsError, EnvironmentRpcError]),
 });
 
+export const WsOrchestrationGetThreadHistoryPageRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.getThreadHistoryPage,
+  {
+    payload: OrchestrationRpcSchemas.getThreadHistoryPage.input,
+    success: OrchestrationRpcSchemas.getThreadHistoryPage.output,
+    error: Schema.Union([
+      OrchestrationThreadHistoryStaleError,
+      OrchestrationGetThreadHistoryPageError,
+      EnvironmentRpcError,
+    ]),
+  },
+);
+
 export const WsOrchestrationGetArchivedShellSnapshotRpc = Rpc.make(
   ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot,
   {
     payload: OrchestrationRpcSchemas.getArchivedShellSnapshot.input,
     success: OrchestrationRpcSchemas.getArchivedShellSnapshot.output,
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentRpcError]),
+  },
+);
+
+export const WsOrchestrationListOlderThreadsRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.listOlderThreads,
+  {
+    payload: OrchestrationRpcSchemas.listOlderThreads.input,
+    success: OrchestrationRpcSchemas.listOlderThreads.output,
+    error: Schema.Union([
+      OrchestrationListOlderThreadsError,
+      OrchestrationGetSnapshotError,
+      EnvironmentRpcError,
+    ]),
+  },
+);
+
+export const WsOrchestrationGetThreadShellsRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.getThreadShells,
+  {
+    payload: OrchestrationRpcSchemas.getThreadShells.input,
+    success: OrchestrationRpcSchemas.getThreadShells.output,
     error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentRpcError]),
   },
 );
@@ -2254,6 +2306,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
+  WsServerUpdateToolRpc,
   WsServerUpsertKeybindingRpc,
   WsServerRemoveKeybindingRpc,
   WsServerGetSettingsRpc,
@@ -2428,7 +2481,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,
   WsOrchestrationReplayEventsRpc,
+  WsOrchestrationGetThreadHistoryPageRpc,
   WsOrchestrationGetArchivedShellSnapshotRpc,
+  WsOrchestrationListOlderThreadsRpc,
+  WsOrchestrationGetThreadShellsRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,
 );

@@ -1,4 +1,4 @@
-//! The webhook tables (migration 61): endpoints, the durable delivery queue and log, and the
+//! The webhook tables (migrations 61 and 66): endpoints, the durable delivery queue and log, and the
 //! dispatcher's positions. Every write that changes more than one row runs in one SQLite
 //! transaction, so a restart finds the queue and the positions agreeing.
 
@@ -51,6 +51,11 @@ pub(crate) struct Endpoint {
     /// Bumped by every edit that changes where its deliveries go or which events it gets,
     /// and by turning it off or on; each queued delivery is stamped with it.
     pub(crate) revision: i64,
+    /// The secret-store name of the file holding its bearer token, if it has one. Only this
+    /// name is ever in the row or in memory outside a send; never the token.
+    pub(crate) bearer_secret: Option<String>,
+    /// The change-feed kinds of `thread.status_changed` it gets; `None` for all of them.
+    pub(crate) status_kinds: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,10 +129,19 @@ fn now_iso() -> String {
 }
 
 const ENDPOINT_COLUMNS: &str = "endpoint_id, name, url, enabled, event_types_json, project_id, \
-    paired_session_id, consecutive_failures, disabled_reason, created_at, updated_at, revision";
+    paired_session_id, consecutive_failures, disabled_reason, created_at, updated_at, revision, \
+    bearer_secret, status_kinds_json";
 const DELIVERY_COLUMNS: &str = "sequence, delivery_id, endpoint_id, event_id, event_type, body, \
     state, attempts, next_attempt_ms, last_status, last_error, latency_ms, created_at, updated_at, \
     endpoint_revision";
+
+/// What an endpoint's deliveries are addressed by: `enabled`, `url`, `project_id`,
+/// `event_types_json` and `status_kinds_json`.
+type Addressing = (i64, String, Option<String>, String, Option<String>);
+
+fn status_kinds_json(kinds: Option<&[String]>) -> Option<String> {
+    kinds.map(|kinds| serde_json::to_string(kinds).unwrap_or_else(|_| "[]".to_owned()))
+}
 
 fn decode_endpoint(row: &Row<'_>) -> rusqlite::Result<Endpoint> {
     let event_types: String = row.get(4)?;
@@ -144,6 +158,10 @@ fn decode_endpoint(row: &Row<'_>) -> rusqlite::Result<Endpoint> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         revision: row.get(11)?,
+        bearer_secret: row.get(12)?,
+        status_kinds: row
+            .get::<_, Option<String>>(13)?
+            .and_then(|kinds| serde_json::from_str(&kinds).ok()),
     })
 }
 
@@ -228,7 +246,7 @@ impl Store {
                     return Ok(Err(StoreError::Limit));
                 }
                 transaction.execute(
-                    &format!("INSERT INTO webhook_endpoints ({ENDPOINT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+                    &format!("INSERT INTO webhook_endpoints ({ENDPOINT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"),
                     params![
                         endpoint.id,
                         endpoint.name,
@@ -242,6 +260,8 @@ impl Store {
                         endpoint.created_at,
                         endpoint.updated_at,
                         endpoint.revision,
+                        endpoint.bearer_secret,
+                        status_kinds_json(endpoint.status_kinds.as_deref()),
                     ],
                 )?;
                 transaction.commit()?;
@@ -251,31 +271,39 @@ impl Store {
     }
 
     /// Replaces an endpoint's editable fields. Turning it off abandons what it has queued;
-    /// turning it on clears its failure count and reason.
+    /// turning it on clears its failure count and reason. `bearer_secret` is written only
+    /// when `set_bearer` (the upsert carried `bearerToken`), in the same commit as the URL,
+    /// so an edit never writes back a name it read before another edit replaced it.
     pub(crate) async fn update_endpoint(
         &self,
         endpoint: Endpoint,
+        set_bearer: bool,
     ) -> std::result::Result<(), StoreError> {
         self.database
             .call(move |connection| {
                 let transaction = connection.transaction()?;
-                let before: Option<(i64, String, Option<String>, String)> = transaction
-                    .query_row(
-                        "SELECT enabled, url, project_id, event_types_json FROM webhook_endpoints WHERE endpoint_id = ?1",
-                        params![endpoint.id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .optional()?;
-                let Some((was_enabled, url, project_id, event_types)) = before else {
+                let before: Option<Addressing> =
+                    transaction
+                        .query_row(
+                            "SELECT enabled, url, project_id, event_types_json, status_kinds_json FROM webhook_endpoints WHERE endpoint_id = ?1",
+                            params![endpoint.id],
+                            |row| {
+                                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                            },
+                        )
+                        .optional()?;
+                let Some((was_enabled, url, project_id, event_types, status_kinds)) = before else {
                     return Ok(Err(StoreError::NotFound));
                 };
                 let event_types_json =
                     serde_json::to_string(&endpoint.event_types).unwrap_or_else(|_| "[]".to_owned());
                 // Queued deliveries were addressed to the old URL and chosen by the old
                 // filters: none of them goes to the new destination.
+                let status_kinds_json = status_kinds_json(endpoint.status_kinds.as_deref());
                 let readdressed = url != endpoint.url
                     || project_id != endpoint.project_id
-                    || event_types != event_types_json;
+                    || event_types != event_types_json
+                    || status_kinds != status_kinds_json;
                 let turned_on = was_enabled == 0 && endpoint.enabled;
                 // A new destination, filters, or on/off is a new revision: whatever was chosen
                 // or built under the old one is never sent.
@@ -286,7 +314,8 @@ impl Store {
                      consecutive_failures = CASE WHEN ?8 THEN 0 ELSE consecutive_failures END, \
                      disabled_reason = CASE WHEN ?4 THEN NULL ELSE disabled_reason END, \
                      revision = revision + CASE WHEN ?10 THEN 1 ELSE 0 END, \
-                     updated_at = ?9 WHERE endpoint_id = ?1",
+                     bearer_secret = CASE WHEN ?11 THEN ?12 ELSE bearer_secret END, \
+                     status_kinds_json = ?13, updated_at = ?9 WHERE endpoint_id = ?1",
                     params![
                         endpoint.id,
                         endpoint.name,
@@ -298,6 +327,9 @@ impl Store {
                         turned_on,
                         now_iso(),
                         new_revision,
+                        set_bearer,
+                        endpoint.bearer_secret,
+                        status_kinds_json,
                     ],
                 )?;
                 if readdressed {

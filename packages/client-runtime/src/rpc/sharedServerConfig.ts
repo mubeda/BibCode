@@ -19,7 +19,14 @@ export function applyServerConfigEvent(
         ? null
         : { ...config, keybindings: event.payload.keybindings, issues: event.payload.issues };
     case "providerStatuses":
-      return config === null ? null : { ...config, providers: event.payload.providers };
+      // `tools` is absent from an event that did not change them, and from an older server.
+      return config === null
+        ? null
+        : {
+            ...config,
+            providers: event.payload.providers,
+            ...(event.payload.tools === undefined ? {} : { tools: event.payload.tools }),
+          };
     case "settingsUpdated":
       return config === null ? null : { ...config, settings: event.payload.settings };
   }

@@ -81,7 +81,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
             object_schema(
                 json!({
                     "hostThreadId": host,
-                    "title": { "type": "string", "description": "The panel's tab title; \"Panel — <provider>\" unless set." },
+                    "title": { "type": "string", "description": "The panel's tab title; \"Panel: <provider>\" unless set." },
                     "providerInstanceId": { "type": "string", "description": "An instance id from list_providers_and_models." },
                     "model": { "type": "string", "description": "A model slug from list_providers_and_models." },
                     "runtimeMode": {
@@ -193,7 +193,7 @@ impl ToolCall<'_> {
                 .map_or_else(
                     || {
                         format!(
-                            "Panel — {}",
+                            "Panel: {}",
                             selection["instanceId"].as_str().unwrap_or("agent")
                         )
                     },
@@ -249,11 +249,7 @@ impl ToolCall<'_> {
             .into_iter()
             .flatten()
             .filter(|thread| thread["kind"] == "panel" && thread["hostThreadId"] == host_thread_id)
-            .map(|thread| {
-                let mut summary = super::threads::thread_summary(thread);
-                summary["requester"] = thread.get("requester").cloned().unwrap_or(Value::Null);
-                summary
-            })
+            .map(super::threads::thread_summary)
             .collect();
         let mut content = json!({ "hostThreadId": host_thread_id, "panels": panels });
         fit_list(&mut content, "/panels", Cut::Back, 1);

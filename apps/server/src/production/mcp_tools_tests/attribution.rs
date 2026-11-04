@@ -120,6 +120,24 @@ async fn an_agents_events_message_and_thread_carry_its_actor_and_a_persons_carry
         .await;
     let read = structured(&read);
     assert_eq!(read["requester"]["purpose"], "Fix the flaky test");
+    // A list names the same requester as the thread it lists.
+    let listed = harness
+        .call(&agent, "list_projects_and_threads", json!({}))
+        .await;
+    let listed = structured(&listed);
+    let summary = |thread_id: &str| {
+        listed["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|summary| summary["threadId"] == thread_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{thread_id} listed: {listed}"))
+    };
+    assert_eq!(
+        summary(&thread_id)["requester"],
+        json!({ "actor": expected, "purpose": "Fix the flaky test" })
+    );
     let sent = read["messages"]
         .as_array()
         .unwrap()
@@ -155,6 +173,17 @@ async fn an_agents_events_message_and_thread_carry_its_actor_and_a_persons_carry
         .unwrap()
         .unwrap();
     assert_eq!(mine.requester, None);
+    let listed = harness
+        .call(&agent, "list_projects_and_threads", json!({}))
+        .await;
+    let person_listed = structured(&listed)["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|summary| summary["threadId"] == mine.thread_id.as_str())
+        .cloned()
+        .expect("the person's thread is listed");
+    assert_eq!(person_listed["requester"], Value::Null, "{person_listed}");
     let shown = shell_snapshot(&harness.engine, false).await.unwrap();
     assert!(
         shown["threads"]

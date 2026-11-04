@@ -8,6 +8,10 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { normalizeWebDriverRequest } from "../../../desktop/e2e/support/webdriver-request.ts";
 
+/** A cold runner can take over 15 s to start Chrome for the first session; no retry, so one session. */
+const SESSION_START_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+
 /** Paths the hostile diagram fixture names. A request for one means a diagram loaded a URL. */
 const MERMAID_PROBE_PREFIX = "/mermaid-probe/";
 
@@ -454,7 +458,7 @@ async function main() {
     browser = await remote(
       engine === "chromium"
         ? {
-            connectionRetryTimeout: 15_000,
+            connectionRetryTimeout: SESSION_START_TIMEOUT_MS,
             connectionRetryCount: 0,
             transformRequest: normalizeWebDriverRequest,
             capabilities: {
@@ -473,7 +477,7 @@ async function main() {
         : {
             hostname: "127.0.0.1",
             port: 4444,
-            connectionRetryTimeout: 15_000,
+            connectionRetryTimeout: SESSION_START_TIMEOUT_MS,
             connectionRetryCount: 0,
             transformRequest: normalizeWebDriverRequest,
             capabilities: {
@@ -492,6 +496,8 @@ async function main() {
     await gallery.close();
     throw error;
   }
+  // Only the new session waits for a cold browser start; every later request keeps 15 s.
+  browser.options.connectionRetryTimeout = REQUEST_TIMEOUT_MS;
   await bootstrap("driver-ready");
   await captureFixtures({
     browser,

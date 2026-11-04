@@ -1107,9 +1107,13 @@ mod tests {
         use crate::device::android::testing::{FakeSdk, wait_until};
         let port = closed_port();
         let sdk = FakeSdk::new().adb_forwards_to(port).write();
-        // Cancelled while it retries the connection.
-        let start = tokio::time::timeout(Duration::from_millis(500), session_on(&sdk)).await;
-        assert!(start.is_err(), "start was still connecting");
+        // Cancelled while it retries the connection: the server's launch in the adb log proves
+        // the forward exists. A fixed delay could cancel the start before `adb forward`
+        // returned, when there is no forward to remove, on a loaded host.
+        tokio::select! {
+            started = session_on(&sdk) => panic!("start was still connecting: {:?}", started.err()),
+            () = wait_until(|| sdk.adb_log().contains(" shell CLASSPATH=")) => {}
+        }
         let removed = format!("forward --remove tcp:{port}");
         wait_until(|| sdk.adb_log().contains(&removed)).await;
     }

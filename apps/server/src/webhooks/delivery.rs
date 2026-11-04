@@ -150,6 +150,9 @@ pub(crate) enum Failure {
     UrlRefused,
     /// The endpoint's secret could not be read, so nothing was sent unsigned.
     SecretMissing,
+    /// The endpoint has a bearer token whose file could not be read, so nothing was sent
+    /// without it.
+    TokenMissing,
     /// The host resolved to a loopback, private, link-local or other non-public address.
     AddressRefused,
     /// The host did not resolve.
@@ -171,6 +174,7 @@ impl Failure {
         match self {
             Self::UrlRefused => "url_refused",
             Self::SecretMissing => "secret_missing",
+            Self::TokenMissing => "token_missing",
             Self::AddressRefused => "address_refused",
             Self::Unresolved => "unresolved",
             Self::Timeout => "timeout",
@@ -192,6 +196,8 @@ pub(crate) struct Headers<'a> {
     pub(crate) delivery_id: &'a str,
     pub(crate) timestamp: i64,
     pub(crate) signature: &'a str,
+    /// `Bearer <token>`, marked sensitive, when the endpoint has a token.
+    pub(crate) authorization: Option<&'a reqwest::header::HeaderValue>,
 }
 
 /// Sends `body` to `url` once, as the module describes. Never panics and never reads the
@@ -283,8 +289,11 @@ async fn attempt(
         builder = builder.tls_certs_only(fixture.roots.clone());
     }
     let client = builder.build().map_err(|_| Failure::Connect)?;
-    let response = client
-        .post(target.url)
+    let mut request = client.post(target.url);
+    if let Some(authorization) = headers.authorization {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
+    }
+    let response = request
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(super::signing::EVENT_HEADER, headers.event_type)
         .header(super::signing::DELIVERY_HEADER, headers.delivery_id)

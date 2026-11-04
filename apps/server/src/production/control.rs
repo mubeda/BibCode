@@ -30,6 +30,7 @@ use crate::{
         },
         provider_runtime::resolve_provider_executable_with_environment,
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
+        tool_maintenance::{ToolMaintenance, ToolPublisher, ToolSetup},
     },
     server_settings::{ProviderSettingsState, normalize_agent_activity_settings},
 };
@@ -130,7 +131,14 @@ fn provider_snapshot_content_eq(current: &Value, next: &Value) -> bool {
     equal_at_path(current, next, &[])
 }
 
-fn provider_update_state(
+fn update_checks_enabled(settings: &Value) -> bool {
+    settings
+        .get("enableProviderUpdateChecks")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub(super) fn provider_update_state(
     status: &str,
     started_at: Option<&str>,
     finished_at: Option<&str>,
@@ -327,6 +335,7 @@ pub struct NativeServerControl {
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
     provider_maintenance: ProviderMaintenance,
+    tools: ToolMaintenance,
     capability_tasks: TaskTracker,
     capability_shutdown: CancellationToken,
     capability_admission: Arc<std::sync::Mutex<()>>,
@@ -401,7 +410,16 @@ impl NativeServerControl {
             .into_iter()
             .map(|result| result.snapshot)
             .collect();
+        let providers = Arc::new(RwLock::new(providers));
         let (config_events, _) = broadcast::channel(32);
+        let tools = ToolMaintenance::new(
+            ToolSetup::production(provider_maintenance.clone(), state_directory.clone()),
+            ToolPublisher {
+                providers: providers.clone(),
+                events: config_events.clone(),
+            },
+        );
+        tools.refresh(update_checks_enabled(&settings), &cwd).await;
         Self {
             config,
             auth_descriptor,
@@ -444,8 +462,9 @@ impl NativeServerControl {
             provider_update_verifications: Arc::new(std::sync::Mutex::new(Vec::new())),
             keybinding_rules: Arc::new(RwLock::new(loaded_keybindings.rules)),
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
-            providers: Arc::new(RwLock::new(providers)),
+            providers,
             provider_maintenance,
+            tools,
             capability_tasks: TaskTracker::new(),
             capability_shutdown: CancellationToken::new(),
             capability_admission: Arc::new(std::sync::Mutex::new(())),
@@ -484,6 +503,7 @@ impl NativeServerControl {
             "keybindings": keybindings::resolve(&rules),
             "issues": issues,
             "providers": providers,
+            "tools": self.tools.snapshots(),
             "availableEditors": available_editors(),
             "observability": observability_snapshot(&self.state_directory),
             "settings": settings,
@@ -817,6 +837,45 @@ impl NativeServerControl {
             None => self.providers.read().await.clone(),
         };
         json!({ "providers": providers })
+    }
+
+    /// Starts a server-owned tool update (CodeGraph) and waits for it; a caller that goes away
+    /// leaves it running. `admission` is the caller's maintenance permit, kept until it settles.
+    async fn run_tool_update(
+        &self,
+        payload: Value,
+        admission: Option<crate::maintenance::RpcPermit>,
+    ) -> Result<Value, Value> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        self.tools.update(&payload, admission, cwd).await
+    }
+
+    #[cfg(test)]
+    fn tools_with(&self, setup: ToolSetup) -> ToolMaintenance {
+        ToolMaintenance::new(
+            setup,
+            ToolPublisher {
+                providers: self.providers.clone(),
+                events: self.config_events.clone(),
+            },
+        )
+    }
+
+    /// Whether a tool update is running, for a host that stops the server on a deadline of its own.
+    pub(crate) fn tool_updates_running(&self) -> bool {
+        self.tools.updates_running()
+    }
+
+    /// Waits for a running tool update before shutdown goes on, then refuses new ones.
+    pub(crate) async fn shutdown_tool_updates(&self) {
+        self.tools.shutdown().await;
+    }
+
+    pub(crate) fn attach_process_attribution(
+        &self,
+        registry: crate::diagnostics::ProcessAttributionRegistry,
+    ) {
+        self.tools.attach_attribution(registry);
     }
 
     pub(crate) async fn shutdown_capability_discovery(&self) {
@@ -1414,7 +1473,21 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
-        provider_inventory::probe_full(settings, instance_id, cwd, &self.provider_maintenance).await
+        if instance_id.is_some() {
+            return provider_inventory::probe_full(
+                settings,
+                instance_id,
+                cwd,
+                &self.provider_maintenance,
+            )
+            .await;
+        }
+        // Tools are re-checked with every full refresh; they publish their own changes.
+        let (providers, ()) = tokio::join!(
+            provider_inventory::probe_full(settings, None, cwd, &self.provider_maintenance),
+            self.tools.refresh(update_checks_enabled(settings), cwd),
+        );
+        providers
     }
 
     #[cfg(test)]
@@ -1855,6 +1928,15 @@ impl NativeServerControl {
 }
 
 impl ProductionServerControl for NativeServerControl {
+    fn update_tool(
+        &self,
+        payload: Value,
+        admission: Option<crate::maintenance::RpcPermit>,
+    ) -> JsonFuture {
+        let control = self.clone();
+        Box::pin(async move { control.run_tool_update(payload, admission).await })
+    }
+
     fn call(
         &self,
         method: &'static str,
@@ -1895,6 +1977,7 @@ impl ProductionServerControl for NativeServerControl {
                     }
                 }
                 "server.updateProvider" => control.update_provider(&payload, cancellation).await,
+                "server.updateTool" => control.run_tool_update(payload, None).await,
                 "server.upsertKeybinding" | "server.removeKeybinding" => {
                     control.update_keybinding(method, payload).await
                 }
@@ -2731,6 +2814,11 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "cliSessionHistory": true,
         "previewTunnels": true,
         "reviewDiffTools": true,
+        "webhookQuestionEvents": true,
+        "webhookBearerToken": true,
+        "webhookStatusKinds": true,
+        "sideChats": true,
+        "threadDeleteOnlyIfUnused": true,
     });
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
@@ -3154,6 +3242,115 @@ mod tests {
         .await
         .expect("write settings");
         NativeServerControl::new(config, json!({"policy":"test"})).await
+    }
+
+    async fn control_with_stub_tool(
+        temp: &tempfile::TempDir,
+        sandbox: &crate::test_support::TestSandbox,
+    ) -> (NativeServerControl, PathBuf) {
+        let mut control = scheduler_control(temp).await;
+        let (setup, _stub, stub_state) =
+            crate::production::tool_maintenance::tests::stub_setup(sandbox, Duration::from_secs(5))
+                .await;
+        control.tools = control.tools_with(setup);
+        control.tools.refresh(true, sandbox.root()).await;
+        (control, stub_state)
+    }
+
+    async fn until_exists(path: &Path) {
+        for _ in 0..600 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn config_snapshots_always_carry_the_tools_key_and_refuse_an_unknown_tool() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        assert_eq!(control.config_snapshot().await["tools"], json!([]));
+        let error = control
+            .call(
+                "server.updateTool",
+                json!({ "toolId": "nope" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unknown tool");
+        assert_eq!(error["_tag"], "ServerToolUpdateError");
+        assert_eq!(error["toolId"], "nope");
+    }
+
+    #[tokio::test]
+    async fn a_running_tool_update_survives_a_settings_save_and_a_provider_refresh() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("control-tool-survives");
+        let (control, stub_state) = control_with_stub_tool(&temp, &sandbox).await;
+        let mut events = control.config_events.subscribe();
+        assert_eq!(
+            control.config_snapshot().await["tools"][0]["versionAdvisory"]["status"],
+            "behind_latest"
+        );
+        std::fs::write(stub_state.join("hold"), "x").expect("hold the updater");
+        let update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .call(
+                        "server.updateTool",
+                        json!({ "toolId": "codegraph" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        until_exists(&stub_state.join("started")).await;
+
+        // A change to a provider instance revalidates provider update lifecycles.
+        control
+            .call(
+                "server.updateSettings",
+                json!({ "patch": { "providers": { "codex": { "enabled": false } } } }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("settings saved");
+        // A full refresh prunes provider update states.
+        control
+            .call(
+                "server.refreshProviders",
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("providers refreshed");
+        // And a provider update for another driver goes through the same locks.
+        let _ = control
+            .call(
+                "server.updateProvider",
+                json!({ "provider": "codex" }),
+                CancellationToken::new(),
+            )
+            .await;
+
+        let during = control.config_snapshot().await;
+        assert_eq!(during["tools"][0]["updateState"]["status"], "running");
+        std::fs::write(stub_state.join("release"), "x").expect("release the updater");
+        let result = update.await.expect("join").expect("tool update");
+        assert_eq!(result["tools"][0]["updateState"]["status"], "succeeded");
+        assert_eq!(result["tools"][0]["versionAdvisory"]["status"], "current");
+        let mut saw_tools_event = false;
+        while let Ok(event) = events.try_recv() {
+            saw_tools_event |= event["type"] == "providerStatuses"
+                && event["payload"]["tools"][0]["updateState"]["status"] == "succeeded";
+        }
+        assert!(
+            saw_tools_event,
+            "the final state reaches config subscribers"
+        );
     }
 
     #[test]
@@ -6971,6 +7168,11 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
+        assert_eq!(descriptor["capabilities"]["webhookQuestionEvents"], true);
+        assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
+        assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
+        assert_eq!(descriptor["capabilities"]["sideChats"], true);
+        assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         // `server.getConfig` carries this descriptor; a client downloads a remote
         // environment's logs only when it says so (#194).
         assert_eq!(descriptor["capabilities"]["diagnosticLogs"], true);

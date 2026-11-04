@@ -3,9 +3,103 @@
   "requestId": "900719925474099312345",
   "values": [
     {
-      "kind": "thread-removed",
+      "kind": "project-upserted",
       "sequence": 0,
-      "threadId": ""
+      "revision": "😀",
+      "engineSequence": 85,
+      "project": {
+        "id": "😀",
+        "title": "Az9",
+        "workspaceRoot": "0M,-0{M1~h",
+        "defaultModelSelection": {
+          "instanceId": "Q9VkQFcm9I",
+          "model": ":"
+        },
+        "scripts": [
+          {
+            "id": "prototype",
+            "name": "toString",
+            "command": "\u0000",
+            "icon": "debug",
+            "runOnWorktreeCreate": true
+          },
+          {
+            "id": "t2]YG",
+            "name": "J",
+            "command": "�",
+            "icon": "configure",
+            "runOnWorktreeCreate": true
+          },
+          {
+            "id": "d",
+            "name": "toString",
+            "command": "prototype",
+            "icon": "lint",
+            "runOnWorktreeCreate": true,
+            "previewUrl": "U"
+          },
+          {
+            "id": "(0bHFdC",
+            "name": "N",
+            "command": "P+=x!A#45k",
+            "icon": "lint",
+            "runOnWorktreeCreate": true,
+            "autoOpenPreview": false
+          },
+          {
+            "id": "GsV*KV{$p^",
+            "name": "gkHI",
+            "command": "-1",
+            "icon": "test",
+            "runOnWorktreeCreate": true,
+            "previewUrl": "/x>=H*$*4I",
+            "autoOpenPreview": false
+          },
+          {
+            "id": "'",
+            "name": "",
+            "command": "v:9#-g7oj!",
+            "icon": "lint",
+            "runOnWorktreeCreate": false
+          },
+          {
+            "id": "`",
+            "name": "prototype",
+            "command": "HW(r?gY1i`",
+            "icon": "debug",
+            "runOnWorktreeCreate": true,
+            "autoOpenPreview": false
+          },
+          {
+            "id": "4294967295",
+            "name": ">LZ/{cPb=!",
+            "command": "\u0000",
+            "icon": "configure",
+            "runOnWorktreeCreate": false
+          },
+          {
+            "id": "�",
+            "name": "",
+            "command": "!",
+            "icon": "lint",
+            "runOnWorktreeCreate": false
+          },
+          {
+            "id": "zhqX4;4IP@",
+            "name": "😀",
+            "command": "�",
+            "icon": "build",
+            "runOnWorktreeCreate": true
+          }
+        ],
+        "worktreeDiscovery": {
+          "visibility": "hidden",
+          "initialPromptDismissedAt": null,
+          "baselinePaths": ["\u0000", "toString", "Xg", "n", "toString"]
+        },
+        "createdAt": "",
+        "updatedAt": "�"
+      }
     }
   ]
 }

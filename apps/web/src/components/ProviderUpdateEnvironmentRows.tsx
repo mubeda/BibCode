@@ -12,6 +12,7 @@ import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useLocalEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
 import {
+  toolUpdateWarning,
   collectProviderUpdateOutcomeSnapshots,
   firstRejectedProviderUpdateMessage,
   getProviderUpdateProgressToastView,
@@ -145,6 +146,11 @@ function EnvironmentUpdateRow({
       <div className="flex min-w-0 flex-col">
         <span className="truncate font-medium text-foreground">{group.label}</span>
         <span className={cn("truncate text-xs", rowToneClass(status.kind))}>{status.text}</span>
+        {toolUpdateWarning(group.candidates) === null ? null : (
+          <span className="text-xs text-muted-foreground">
+            {toolUpdateWarning(group.candidates)}
+          </span>
+        )}
       </div>
       <div className="shrink-0">{trailing}</div>
     </div>
@@ -261,7 +267,7 @@ export function ProviderUpdateEnvironmentRows({
         inFlightEnvironmentsRef.current.delete(environmentId);
         clearPending(environmentId);
         setErrorByEnvironment((previous) =>
-          new Map(previous).set(environmentId, "Update timed out — try again."),
+          new Map(previous).set(environmentId, "Update timed out. Try again."),
         );
       }, PENDING_EXPIRY_MS);
       try {
@@ -308,7 +314,7 @@ export function ProviderUpdateEnvironmentRows({
           setErrorByEnvironment((previous) =>
             new Map(previous).set(
               environmentId,
-              "This environment isn’t connected — try again once it reconnects.",
+              "This environment isn’t connected. Try again once it reconnects.",
             ),
           );
           return;

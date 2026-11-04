@@ -40,6 +40,11 @@ export function makeTestExecutionEnvironmentCapabilities(
     cliSessionHistory: false,
     previewTunnels: false,
     reviewDiffTools: false,
+    webhookQuestionEvents: false,
+    webhookBearerToken: false,
+    webhookStatusKinds: false,
+    sideChats: false,
+    threadDeleteOnlyIfUnused: false,
     ...overrides,
   };
 }

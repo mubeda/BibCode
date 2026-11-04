@@ -406,7 +406,18 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(tauri.bundle.resources, undefined);
       assert.notEqual(tauri.app.security.csp, null);
       assert.match(tauri.app.security.csp ?? "", /default-src 'self'/);
-      assert.match(tauri.app.security.csp ?? "", /object-src 'none'/);
+      // The Files panel previews PDF and audio from blob: URLs the app makes from the capped
+      // asset route. blob: is the only addition: an environment origin (a relay or LAN host)
+      // is never an object or media source, and img-src stays free of off-host wildcards.
+      for (const policy of [tauri.app.security.csp, tauri.app.security.devCsp]) {
+        const directive = (name: string) =>
+          (new RegExp(`(?:^|; )${name} ([^;]*)`).exec(policy ?? "")?.[1] ?? "").split(" ");
+        assert.deepEqual(directive("media-src"), ["'self'", "blob:"]);
+        assert.deepEqual(directive("object-src"), ["blob:"]);
+        assert.include(directive("img-src"), "blob:");
+        assert.notInclude(directive("img-src"), "http:");
+        assert.notInclude(directive("img-src"), "https:");
+      }
       assert.match(tauri.app.security.csp ?? "", /frame-ancestors 'none'/);
       assert.notEqual(tauri.app.security.devCsp, null);
       // Remote servers are user-chosen plain-HTTP endpoints on a LAN or

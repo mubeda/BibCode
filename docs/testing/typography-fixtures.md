@@ -30,11 +30,15 @@ path. The gallery listener records any request for such a path, and the
 capture then records a `mermaid-probe-request` failure and refuses the run, so
 a sanitizer that let a resource through fails in each real engine.
 
-The startup gate first captures the real Badge in both themes under a short
-external process deadline. It uses the runner's installed Chrome and matching
-driver, with bounded page/script waits and an early bootstrap record. This
-smoke gate does not establish the full changed-component inventory. Complete
-that inventory in subsequent capture batches before accepting the issue.
+CI captures the full Chromium groups and selected WebKitGTK fixtures with the
+runner's installed Chrome and matching driver, recording each bootstrap stage
+early. The new-session request has a 60-second budget with no retry, because
+a cold runner can take more than 15 seconds to start the browser; after the
+session starts, every request has 15 seconds. Page and script waits are 20 and
+15 seconds. The external capture deadlines are 1080 seconds for Chromium and
+600 seconds for WebKitGTK, each with 15 seconds of termination grace. The
+optional `smoke` mode captures the real Badge in both themes; it does not
+establish the full changed-component inventory.
 
 To fill a reviewed gap without repeating accepted fixtures, pass `selected` and
 a comma-separated list of catalog IDs after the engine and output directory.

@@ -481,6 +481,43 @@ fn origin_snapshot_and_tool_metadata_cover_wire_variants() {
         .find(|tool| tool["name"] == "preview_click")
         .unwrap();
     assert_eq!(click["annotations"]["destructiveHint"], true);
+    // Every tool lists its real arguments: the generated contract schema, never an open object.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../../packages/contracts/fixtures/mcp-tools/preview-tools.json"
+    ))
+    .unwrap();
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(tool["inputSchema"], fixture[name]["inputSchema"], "{name}");
+        assert_ne!(
+            tool["inputSchema"]["additionalProperties"],
+            json!(true),
+            "{name}"
+        );
+        assert!(tool["inputSchema"]["properties"].is_object(), "{name}");
+    }
+    assert_eq!(
+        click["inputSchema"]["properties"]["locator"]["type"],
+        "string"
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .find(|tool| tool["name"] == "preview_resize")
+            .unwrap()["inputSchema"]["required"],
+        json!(["mode"])
+    );
+}
+
+/// The provider's 13 `preview_*` descriptors took 3,720 bytes with the open schema; the real
+/// arguments and descriptions make them 12,472. A bound keeps `tools/list` from growing
+/// silently; raise it only for a tool or argument that earns it.
+#[test]
+fn the_provider_preview_tools_stay_within_their_list_budget() {
+    let size = serde_json::to_string(&tool_descriptors(false))
+        .unwrap()
+        .len();
+    assert!(size < 14_000, "the preview descriptors take {size} bytes");
 }
 
 #[test]
@@ -2566,12 +2603,10 @@ mod device_tools {
             .tools
             .call(&scope(), "open", json!({}), CancellationToken::new())
             .await;
-        assert_eq!(result["isError"], true);
+        assert_eq!(result["isError"], true, "{result}");
         assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Pass imageId as one of: Pixel, Tablet")
+            text(&result).contains("Pass imageId as one of: Pixel, Tablet"),
+            "{result}"
         );
     }
 

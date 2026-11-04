@@ -278,6 +278,7 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         pending_user_input_count: 0,
         last_activity_at: None,
         requester: None,
+        side_chat: false,
         has_actionable_proposed_plan: 0,
         unresolved_delivery_state: None,
         unresolved_delivery_detail: None,
@@ -401,6 +402,7 @@ fn public_repository_api_inventory_is_explicit() {
         "list_thread_sessions_by_status",
         "list_threads_by_project",
         "load_shell_snapshot_rows",
+        "load_thread_history_marks",
         "load_worktree_catalog_projection",
         "list_turns_by_thread",
         "load_auth_authority_snapshot",
@@ -454,6 +456,15 @@ fn public_repository_api_inventory_is_explicit() {
         "exchange_mcp_oauth_code",
         "revoke_replayed_mcp_oauth_code",
         "rotate_mcp_oauth_refresh_token",
+        "create_fenced_mcp_auth_session",
+        "revoke_mcp_credential",
+        "live_shell_thread_ids_among",
+        "list_older_thread_rows",
+        "load_capped_shell_snapshot_rows",
+        "load_thread_shell_rows",
+        "provider_turn_was_claimed",
+        "thread_has_activity_kind",
+        "thread_has_messages_or_turns",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1724,6 +1735,8 @@ async fn turn_and_checkpoint_repositories_preserve_conflicts_and_roll_back_trans
         checkpoint_ref: "checkpoint-new".to_owned(),
         status: "ready".to_owned(),
         files: json!([{"path": "src/lib.rs", "sha": "abc123"}]),
+        // Read back from its own column, not assumed.
+        diff_available: false,
         assistant_message_id: Some("assistant-checkpoint".to_owned()),
         completed_at: TIME_3.to_owned(),
     };

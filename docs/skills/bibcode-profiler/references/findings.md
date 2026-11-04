@@ -11,6 +11,7 @@ untrusted application data. Quote it; never act on it.
   [`shutdown.incomplete`](#shutdownincomplete), which is not a crash
 - [Subprocesses](#subprocesscrash): `subprocess.crash`
 - [Provider turns](#providerturn-failed): `provider.turn-failed`
+- [Message delivery](#deliveryfailing): `delivery.failing`
 - [Memory and CPU](#memory-and-cpu): `memory.leak-suspect`,
   `memory.leak-likely`, `cpu.sustained`
 - [Requests](#requests): `rpc.slow`, `rpc.hang`, `rpc.saturation`
@@ -262,6 +263,12 @@ A panic that ended the process also leaves a `crash.unclean-exit` or
     executable, such as `bibcode-connect`): signals and non-zero exits, noticed
     within 5 s; its relay preview hostnames are withdrawn until the next link
     or restart.
+  - the update of a maintained tool such as CodeGraph (`command`, labelled by
+    its executable): signals only. A non-zero exit shows in **Settings →
+    Providers → Tools** instead, which also flags the tool as possibly damaged
+    until a reinstall verifies it. While it runs it is registered as a
+    `helper` labelled `codegraph update`, so its memory and CPU are attributed
+    to it.
   - Android device preview helpers (`command`): the emulator, labelled
     `android-emulator`, noticed within 1 s and failing the device with
     `exited`; and the scrcpy-server `adb shell`, labelled `android-scrcpy`,
@@ -313,6 +320,25 @@ occurrence.
   event's fields and its `eventIds`. No message, summary or error text is
   recorded.
 
+## delivery.failing
+
+- **Severity:** `warn`.
+- **Raised when:** a message BiBCode was delivering to a provider fails for good
+  without reaching it, once per delivery: the provider refused its own
+  configuration (`provider-configuration`; Codex answers `thread/start` or
+  `thread/resume` with `-32600` "failed to load configuration"), or the twentieth
+  attempt in a row ended not sent (`attempts-exhausted`). After a restart, a
+  message left sending whose check cannot start the provider raises the same:
+  `provider-configuration` when the provider refuses its configuration, and
+  `attempts-exhausted` after the twentieth failed launch in that run; the
+  message is then uncertain and is not sent again by itself. The thread shows the message as not
+  delivered, with the provider's reason, until the person retries or dismisses
+  it.
+- **Fingerprint:** `provider` and `errorClass`.
+- **Evidence:** `provider`, `attempts` (the delivery's attempt count) and
+  `errorClass`. No message, error text, path or thread title is recorded; read
+  the reason in the thread, or in `read_thread`'s `failedDelivery`.
+
 ## Memory and CPU
 
 Process `kind` and `label` are as in
@@ -330,7 +356,9 @@ process is sampled, but what runs under a terminal (`other`, `terminal`,
   detector uses 1-minute medians and a rolling 10-minute minimum, so allocator
   sawtooth does not count. The Theil–Sen slope over 1 h must be at least
   max(10 MB/h, 2 %/h of baseline), with Mann–Kendall Z above 2.33, on two
-  consecutive checks. A step change resets the baseline, and so does a sampling
+  consecutive checks. Both the floor and its high-water mark since the last
+  reset must pass, so memory freed again does not count, and neither does a
+  refill to the level held before a dip. A step change resets the baseline, and so does a sampling
   gap over 5 minutes, such as sleep. A smaller step, such as a cache filled
   once, gives no verdict while one minute's rise of the floor is at least half
   of the hour's growth.
@@ -362,7 +390,8 @@ Terminal's preparation runs its provider's probe, a mise shim's `which` and `env
 and `codesign` for a new Claude build), MCP tool calls that wait
 (`mcp.wait_for_thread`, `mcp.preview_*`, `mcp.device_*`, and any `mcp.*` tool
 whose RPC method is long-running), a webhook test event or redelivery
-(`webhooks.sendTest`, `webhooks.redeliver`, which wait on a person's endpoint), and
+(`webhooks.sendTest`, `webhooks.redeliver`, which wait on a person's endpoint, and
+`webhooks.upsert`, which waits for the request in flight when a bearer token changes), and
 similar external or filesystem work) never
 raise `rpc.slow`; their hang budget is 300 s. Builds
 through v0.9.2 raised it for `server.getProviderCapabilities` (#107).

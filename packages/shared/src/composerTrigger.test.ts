@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   detectComposerTrigger,
+  parseComposerSideChatCommand,
   parseStandaloneComposerBiBCodeAction,
   replaceTextRange,
   serializeComposerFileLink,
@@ -204,6 +205,37 @@ describe("parseStandaloneComposerBiBCodeAction", () => {
     expect(parseStandaloneComposerBiBCodeAction(":plan now")).toBeNull();
     expect(parseStandaloneComposerBiBCodeAction("/plan")).toBeNull();
     expect(parseStandaloneComposerBiBCodeAction("plan")).toBeNull();
+  });
+});
+
+describe("parseComposerSideChatCommand", () => {
+  it("opens a side chat with :btw or :side as the whole message", () => {
+    expect(parseComposerSideChatCommand(":btw")).toBe("");
+    expect(parseComposerSideChatCommand("  :btw  ")).toBe("");
+    expect(parseComposerSideChatCommand(":btw why did you pick that file?")).toBe(
+      "why did you pick that file?",
+    );
+    expect(parseComposerSideChatCommand(":side what does this error mean?")).toBe(
+      "what does this error mean?",
+    );
+    expect(parseComposerSideChatCommand(":BTW Remind me")).toBe("Remind me");
+    expect(parseComposerSideChatCommand(":Side\nfirst line\nsecond line\n")).toBe(
+      "first line\nsecond line",
+    );
+  });
+
+  it("leaves other text, other actions and /btw alone", () => {
+    expect(parseComposerSideChatCommand("/btw why")).toBeNull();
+    expect(parseComposerSideChatCommand(":btwx why")).toBeNull();
+    expect(parseComposerSideChatCommand(":plan")).toBeNull();
+    expect(parseComposerSideChatCommand("tell me :btw why")).toBeNull();
+    expect(parseStandaloneComposerBiBCodeAction(":btw")).toBeNull();
+  });
+
+  it("keeps /btw a provider slash token", () => {
+    expect(
+      detectComposerTrigger("/btw", 4, { providerSlash: true, providerDollarSkill: false }),
+    ).toMatchObject({ kind: "provider-slash", query: "btw" });
   });
 });
 

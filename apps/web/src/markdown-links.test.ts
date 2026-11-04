@@ -73,6 +73,12 @@ describe("resolveMarkdownFileLinkTarget", () => {
     );
   });
 
+  it("keeps a trailing apostrophe in the file name", () => {
+    expect(resolveMarkdownFileLinkTarget("./src/notes%27#L12", "/repo")).toBe(
+      "/repo/./src/notes':12",
+    );
+  });
+
   it("ignores external urls", () => {
     expect(resolveMarkdownFileLinkTarget("https://example.com/docs")).toBeNull();
   });

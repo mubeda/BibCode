@@ -33,6 +33,7 @@ import {
 } from "../src/server.ts";
 import { DEFAULT_SERVER_SETTINGS } from "../src/settings.ts";
 import { TerminalBeginInput, TerminalOpenInput } from "../src/terminal.ts";
+import { WebhooksUpsertInput } from "../src/webhooks.ts";
 
 const StreamSchemaTypeId = "~effect/rpc/RpcSchema/StreamSchema";
 const requestId = "900719925474099312345";
@@ -781,6 +782,33 @@ dynamicFixtures.set(
     headers: [],
   } satisfies RpcMessage.RequestEncoded),
 );
+// `webhooks.upsert` with its bearer token absent (kept), `null` (removed) and set, and with
+// a status-kind filter.
+for (const [name, bearerToken, statusKinds] of [
+  ["token-absent", undefined, undefined],
+  ["token-null", null, undefined],
+  ["token-set", "fixture-token", undefined],
+  ["status-kinds", undefined, ["turn.completed", "turn.failed"]],
+] as const) {
+  dynamicFixtures.set(
+    `contract-shapes/webhooks__upsert-${name}-request.json`,
+    serializeWireFixture({
+      _tag: "Request",
+      id: requestId,
+      tag: "webhooks.upsert",
+      payload: compileUnknownEncoder(WebhooksUpsertInput)({
+        id: "endpoint-1",
+        name: "CI",
+        url: "https://hooks.example.com/bibcode",
+        enabled: true,
+        eventTypes: ["thread.status_changed"],
+        ...(bearerToken === undefined ? {} : { bearerToken }),
+        ...(statusKinds === undefined ? {} : { statusKinds }),
+      }),
+      headers: [],
+    } satisfies RpcMessage.RequestEncoded),
+  );
+}
 const queueCommandFields = {
   commandId: "queue-command-1",
   threadId: "thread-1",
@@ -816,6 +844,22 @@ for (const command of queueCommands) {
     } satisfies RpcMessage.RequestEncoded),
   );
 }
+// Closing an unused side chat (#265): the Rust command decodes `onlyIfUnused`.
+dynamicFixtures.set(
+  "contract-shapes/orchestration__thread__delete-only-if-unused-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: ORCHESTRATION_WS_METHODS.dispatchCommand,
+    payload: compileUnknownEncoder(ClientOrchestrationCommand)({
+      type: "thread.delete",
+      commandId: queueCommandFields.commandId,
+      threadId: queueCommandFields.threadId,
+      onlyIfUnused: true,
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
 const queueEventPayload = {
   threadId: "thread-1",
   messageId: "message-1",
@@ -979,16 +1023,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 190) {
-  throw new Error(`Expected 190 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 194) {
+  throw new Error(`Expected 194 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
 if (streamMethodCount !== 29) {
   throw new Error(`Expected 29 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 90) {
+if (topLevelStreamShapeCount !== 94) {
   throw new Error(
-    `Expected 90 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 94 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
@@ -996,8 +1040,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 393) {
-  throw new Error(`Expected 393 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 404) {
+  throw new Error(`Expected 404 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 27) {
   throw new Error(`Expected 27 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

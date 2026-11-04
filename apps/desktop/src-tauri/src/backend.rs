@@ -381,6 +381,8 @@ struct ManagedBackendRuntime {
     run_id: u64,
     // Supervisor slots can outlive their runtime; update snapshots retain strong owners.
     update_maintenance: Option<Weak<bibcode_server::UpdateMaintenance>>,
+    /// Whether a tool update is running in this server; see [`Self::stop_timeout`].
+    tool_updates: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     stop_requested: Arc<AtomicBool>,
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     completion: Arc<Notify>,
@@ -394,6 +396,7 @@ impl ManagedBackendRuntime {
         let update_maintenance = handle
             .update_maintenance()
             .map(|maintenance| Arc::downgrade(&maintenance));
+        let tool_updates = handle.tool_updates_probe();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let completion = Arc::new(Notify::new());
         let join_result = Arc::new(AsyncMutex::new(None));
@@ -418,12 +421,23 @@ impl ManagedBackendRuntime {
         Self {
             run_id,
             update_maintenance,
+            tool_updates,
             stop_requested,
             shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
             completion,
             join_result,
             #[cfg(test)]
             stop_requested_event: Arc::default(),
+        }
+    }
+
+    /// How long a stop may take. A running tool update gets the server's own wait on top: killing
+    /// an updater mid-replacement is what damages an installation.
+    fn stop_timeout(&self, shutdown: BackendShutdownConfig) -> Duration {
+        if self.tool_updates.as_ref().is_some_and(|running| running()) {
+            shutdown.timeout + bibcode_server::TOOL_UPDATE_SHUTDOWN_WAIT
+        } else {
+            shutdown.timeout
         }
     }
 
@@ -2113,6 +2127,10 @@ async fn start_managed_backend(
             if let Some(window) = listener_bind_retry {
                 server_config = server_config.with_listener_bind_retry(window);
             }
+            // Once per process: a backend restart keeps the first result. Tests keep NOSYSTEM.
+            #[cfg(not(test))]
+            bibcode_server::git::system_line_endings::install_once(&server_config.state_dir())
+                .await;
             let handle = match remote_update_delegate {
                 Some(delegate) => {
                     ServerRuntime::start_with_desktop_integration(
@@ -2340,13 +2358,14 @@ async fn stop_managed_backend(
     match backend {
         ManagedBackend::Child(child) => stop_managed_child(*child, shutdown).await,
         ManagedBackend::Runtime(runtime) => {
+            // Read before the stop begins, while the answer is the user's.
+            let timeout = runtime.stop_timeout(shutdown);
             runtime.request_stop();
-            tokio::time::timeout(shutdown.timeout, runtime.wait_for_completion())
+            tokio::time::timeout(timeout, runtime.wait_for_completion())
                 .await
                 .map_err(|_| {
                     format!(
-                        "Timed out after {:?} while stopping in-process desktop backend.",
-                        shutdown.timeout
+                        "Timed out after {timeout:?} while stopping in-process desktop backend."
                     )
                 })?
         }
@@ -5246,6 +5265,83 @@ exit /b 9
         assert!(!supervisor.restart_still_desired(PRIMARY_LOCAL_ENVIRONMENT_ID));
     }
 
+    /// An in-process backend that finishes `after` its stop is requested.
+    fn slow_runtime(
+        tool_updates: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        after: Duration,
+    ) -> ManagedBackendRuntime {
+        let join_result = Arc::new(AsyncMutex::new(None));
+        let completion = Arc::new(Notify::new());
+        let runtime = ManagedBackendRuntime {
+            run_id: 91,
+            update_maintenance: None,
+            tool_updates,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Mutex::new(None)),
+            completion: completion.clone(),
+            join_result: join_result.clone(),
+            stop_requested_event: Arc::default(),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            *join_result.lock().await = Some(Ok(()));
+            completion.notify_waiters();
+        });
+        runtime
+    }
+
+    #[tokio::test]
+    async fn a_running_tool_update_extends_the_in_process_stop_deadline() {
+        let shutdown = BackendShutdownConfig {
+            timeout: Duration::from_millis(100),
+        };
+        // Without an update the stop gives up at its own deadline.
+        let idle = slow_runtime(None, Duration::from_millis(400));
+        let error = stop_managed_backend(ManagedBackend::Runtime(Box::new(idle)), shutdown)
+            .await
+            .expect_err("an idle backend that outlasts the deadline times out");
+        assert!(error.contains("Timed out"), "{error}");
+
+        // With one running, the same stop waits for the server's own wait on top.
+        let updating: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let running = slow_runtime(Some(updating.clone()), Duration::from_millis(400));
+        assert_eq!(
+            running.stop_timeout(shutdown),
+            shutdown.timeout + bibcode_server::TOOL_UPDATE_SHUTDOWN_WAIT
+        );
+        stop_managed_backend(ManagedBackend::Runtime(Box::new(running)), shutdown)
+            .await
+            .expect("the stop waits for the running tool update");
+    }
+
+    #[tokio::test]
+    async fn the_exit_path_waits_for_a_running_tool_update() {
+        // The supervisor's exit stop uses the default deadline, shorter than the update.
+        let supervisor = BackendSupervisor::new();
+        let updating: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let runtime = slow_runtime(Some(updating), Duration::from_millis(300));
+        supervisor
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .insert(
+                PRIMARY_LOCAL_ENVIRONMENT_ID.to_owned(),
+                BackendSlotState {
+                    backend: Some(ManagedBackend::Runtime(Box::new(runtime))),
+                    ..BackendSlotState::default()
+                },
+            );
+        let began = std::time::Instant::now();
+        supervisor
+            .stop_for_exit(BackendShutdownConfig {
+                timeout: Duration::from_millis(50),
+            })
+            .await
+            .expect("exit waits for the update instead of cutting it short");
+        assert!(began.elapsed() >= Duration::from_millis(250));
+    }
+
     #[tokio::test]
     async fn stopping_an_empty_supervisor_is_idempotent() {
         let supervisor = BackendSupervisor::new();
@@ -5273,6 +5369,7 @@ exit /b 9
         let runtime = ManagedBackendRuntime {
             run_id: 77,
             update_maintenance: None,
+            tool_updates: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Mutex::new(None)),
             completion: Arc::new(Notify::new()),
@@ -5358,6 +5455,7 @@ exit /b 9
         let runtime = ManagedBackendRuntime {
             run_id: 78,
             update_maintenance: None,
+            tool_updates: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Mutex::new(None)),
             completion: Arc::new(Notify::new()),

@@ -2,6 +2,7 @@ pub mod checks;
 mod discovery;
 mod hosts;
 mod open_pull_request_lookups;
+pub(crate) mod pr_create_command;
 mod pull_request;
 pub mod repository_identity;
 

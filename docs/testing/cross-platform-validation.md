@@ -590,6 +590,17 @@ The scenario releases it only after reload assertions. Support tests cover
 steer/start log discrimination, turn identity, release, timeout, and interrupt
 cleanup without requiring provider accounts or listeners.
 
+The default suite also includes `chat-side-chat.e2e.ts` (isolate it with
+`BIBCODE_E2E_SPEC=./specs/chat-side-chat.e2e.ts`). It starts a `[[slow]]` host
+turn, types `:btw <question>` into the running thread, and checks that a
+**Side chat · Codex** tab opens active, that the side chat's first provider
+input carries the host's messages in `<bibcode_thread_context>` with side-chat
+framing, that the side chat shows the fixture reply, and that the host's
+provider input, transcript and queue are unchanged. The host's `[[slow]]`
+marker is part of the seed, so the side chat's turn is slow too; the scenario
+releases both turns one after the other through the release file. It saves
+`side-chat-reply.png` and `side-chat-host-untouched.png`.
+
 The native composer fixture must advertise each user-invocable Claude skill in
 both the `initialize.commands` catalog and `reload_skills.skills`. The server
 filters out reload-only model skills, so adding a fixture skill only to the
@@ -759,6 +770,18 @@ node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/provider-shims.t
 vp run test:ui:desktop:build
 vp run test:ui:desktop
 ```
+
+For a change to the timeline's item types (`resolveTimelineItemType`) or to how
+LegendList estimates rows, also run `chat-huge-thread-scroll.e2e.ts`
+(`BIBCODE_E2E_SPEC=./specs/chat-huge-thread-scroll.e2e.ts`). A Claude prompt
+containing `[[long-reply]]` makes the fixture stream 1,000 paragraphs in ten
+deltas, so each long reply crosses length buckets while it renders. The
+spec builds 84 short turns and then 4 long ones in a Claude panel. It pages up
+from the composer and sets the scroller to the top, first in the list the
+replies streamed into and again after reopening the thread at its end.
+It asserts that the timeline stays mounted, the first turn shows, and neither the
+page nor the app logs report React's "Maximum update depth exceeded" (#228). The
+spec builds its thread through the UI, so it takes several minutes.
 
 A live check needs a real Claude CLI and model and a real Codex session. Record
 whether the Claude probe line reports `thinking_display`, that Thought rows sit
@@ -1101,6 +1124,12 @@ archive/package name, reported architecture, version, startup result, pairing re
 shutdown result, and evidence artifact location in the execution report.
 
 ### Grant-driven remote sharing
+
+The seeded remote-install lane mints its credential only through the **Another
+device** offer. If the share UI never enables **Generate pairing offer** or the
+server never widens, the lane fails with "pairing offer could not be generated"
+and does not fall back to the desktop bootstrap token, which the widening
+restart revokes (it would surface only as a coordinator 401).
 
 When pairing-offer generation, grant reach metadata, desktop exposure, or
 client revocation changes, validate the complete ceremony on every supported
@@ -1724,8 +1753,10 @@ Do not run destructive worktree scenarios against a user repository.
 
 Run on each desktop (macOS, Windows, Linux) and on a server, against a disposable
 project. The focused gates are `cargo test -p bibcode-server --lib -- mcp::
-mcp_tools_tests connect_mcp auth::service::tests::the_mcp` (`mcp::` includes the
-`bibcode thread` tests in `mcp::thread_cli`) and
+mcp_tools_tests connect_mcp auth::service::tests::the_mcp git::clone_policy` (`mcp::`
+includes the `bibcode thread` tests in `mcp::thread_cli`; `git::clone_policy` runs the real
+`ssh -G` checks of an agent's SSH clone command, which skip with a note where no `ssh`
+runs) and
 `vp test run --project unit src/components/settings/AgentIntegrationsSection.test.tsx`
 from `apps/web`.
 
@@ -1754,8 +1785,13 @@ from `apps/web`.
    --wait` (the desktop executable's `thread` on a desktop): it prints the reply and
    exits 0, and **CLI · bibcode thread** shows in **Authorized clients** only while
    it runs. `bibcode thread list --json` lists the thread. With a Supervised thread
-   stopped at an approval, `send <thread> <message> --wait` exits 2. With **MCP
-   server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
+   stopped at an approval, `send <thread> <message> --wait` exits 2; `requests <thread>`
+   lists the approval's request id, `approve <thread> <request>` exits 0 and the turn goes
+   on (`decline` on another approval also exits 0), and `changes` prints a cursor that a
+   second `changes --cursor <c>` accepts. `bibcode mcp call list_projects_and_threads`
+   prints one JSON result and exits 0, `bibcode mcp tools` marks `files_download`
+   `oneShot: false`, and `bibcode mcp call files_upload` exits 1 without a row ever showing
+   in **Authorized clients**. With **MCP server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
    that the desktop executable's output reaches the terminal and a pipe.
 8. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
 9. **A destructive tool.** At Supervised, make a change in the disposable project and ask
@@ -1779,17 +1815,20 @@ from `apps/web`.
     its MCP server, press **Take over**: reads still work and its next change is refused as
     read-only. **Hand back** restores the level it had, and its next change works.
 13. **A webhook delivery.** In the **Webhooks** tab turn **Webhooks** on, add an endpoint at
-    a disposable public HTTPS receiver with `thread.status_changed`, copy the secret, and
-    **Send test event**: the receiver gets `webhook.test`, and its `X-BibCode-Signature`
-    verifies with the secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
-    shows. Start a thread: the receiver gets `thread.status_changed` events, and
-    `changes_since` from the first event's `cursor` returns the entries after it.
+    a disposable public HTTPS receiver with `thread.status_changed` and a **Bearer token**,
+    copy the secret, and **Send test event**: the receiver gets `webhook.test` with
+    `Authorization: Bearer <that token>`, and its `X-BibCode-Signature` verifies with the
+    secret as the [webhooks reference](../reference/webhooks.md#headers-and-signature)
+    shows. **Edit** shows "A token is set", never the token. Start a thread: the receiver gets `thread.status_changed` events, each with the
+    thread's `projectId`, and `changes_since` from the first event's `cursor` returns the
+    entries after it. Untick **Turn started** under **Thread status changed** and start
+    another turn: only its `turn.completed` arrives.
 14. **A remote OAuth connect**, once with Claude Code and once with Codex, on another
     computer, through BiBCode Connect's managed tunnel and through an HTTPS reverse proxy
     that follows the [Remote access](../user/remote-access.md#remote-ai-tools-over-https)
     recipe (see the [MCP reference](../reference/mcp.md#remote-http-with-oauth) for the
     flow):
-    1. **Connect.** Copy the command from **MCP → Remote agents**
+    1. **Connect.** **Copy URL** copies `https://<host>/mcp` alone. Copy the command from **MCP → Remote agents**
        (`claude mcp add --transport http bibcode https://<host>/mcp`, or
        `codex mcp add bibcode --url https://<host>/mcp`) and run it. The tool opens a sign-in
        page showing a code.
@@ -1814,6 +1853,38 @@ from `apps/web`.
        Claude Code: the server's `oauth.scopes`, then **Re-authenticate**), allow terminals
        when approving, and open a terminal.
 
+15. **An agent SSH clone** (#217). The hermetic tests fake ssh; this step needs a real sshd,
+    SSH agent and key. Run it on Windows twice (once with the OpenSSH Authentication Agent
+    service and `SSH_AUTH_SOCK` unset, once with an MSYS `ssh-agent` or `ssh-pageant` whose
+    `SSH_AUTH_SOCK` the server inherits), on Linux and on macOS, against one of your
+    `SourceControlTest` repositories, with its key loaded (`ssh-add`) and the host in
+    `~/.ssh/known_hosts`. Turn **Terminals** on at Full access and connect the agent with
+    terminals.
+    1. **The gate.** Ask an agent connected without terminals to clone
+       `ssh://git@github.com/<owner>/<repo>.git`: it is refused with `clone_ssh_not_allowed`
+       naming `https://github.com/<owner>/<repo>.git`. The terminal agent's clone of the same
+       URL finishes and registers the project. Turn **Terminals** off: its next SSH clone is
+       refused again.
+    2. **Unknown host.** Move the host's line out of `known_hosts` (keep a copy) and clone: the
+       error names the known_hosts file and prints `ssh -F none -p 22 -o HostKeyAlias=<host>
+       -T git@<host>`. Run it, compare the fingerprint with the one the host publishes, answer
+       yes, and retry: the clone succeeds, and `known_hosts` gained only that line. Repeat
+       against a Linux sshd on port 2222 (`ssh://git@<host>:2222/...`): the command carries
+       `-p 2222 -o 'HostKeyAlias=[<host>]:2222'` and the saved line is `[<host>]:2222 ...`.
+    3. **Host certificate** (Linux). An sshd for `git.example` with a host certificate is
+       accepted on port 22 with only `@cert-authority * <CA>` in `known_hosts`. On port 2222
+       with the same `known_hosts`, the clone is refused with the certificate message; the
+       printed command asks to trust the plain key, after `yes` `known_hosts` holds a plain
+       `[git.example]:2222` line (not merely the CA line), and the retried clone succeeds.
+    4. **`ssh-add -c`** (Linux). Start the agent with `SSH_ASKPASS_REQUIRE=never` and add the
+       key with `ssh-add -c`: the clone fails at once with the publickey message. Start it
+       again with `SSH_ASKPASS=<a script that sleeps>` and `SSH_ASKPASS_REQUIRE=force`: the
+       clone waits and returns `running` after 50 s; `cancel_clone` removes the folder and
+       leaves no Git or ssh process, while the sleeping helper remains the agent's child (the
+       documented limitation).
+    5. **No agent.** Stop the agent (on Windows, the service) and clone: the clone is
+       `clone_ssh_unavailable` with the platform's message.
+
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.
 
@@ -1830,11 +1901,14 @@ Record fake-host UI/session evidence separately from real installation evidence.
 The seeded `remote-install` lane runs only on disposable native CI runners. It
 checks candidate boot/version, retained storage/project/backup, observed
 percent/stage, requester log count, and Linux mount/runtime ownership. Record
-whether a live native grant actually widened; `widened: false` is not a wide
-live pass. When the private credential receipt is not published, raw remote
-WebDriver logs stay withheld. The retained `remote-credential-trace.log`
-records whether the share control was found, clicked, and widened, plus the
-redacted credential error. A pairing-link failure includes the HTTP status,
+whether a live native grant actually widened. The lane fails fast when the
+share UI cannot generate a pairing offer; the desktop bootstrap token is not a
+fallback, so `widened: false` is never a passing result. When the private
+credential receipt is not published, raw remote WebDriver logs stay withheld.
+The retained `remote-credential-trace.log` records whether the share control was
+found, clicked, and widened, plus the redacted credential error, and the phase
+failure and `seed-and-install.log` repeat its last message (for example
+"Remote verification pairing offer could not be generated"). A pairing-link failure includes the HTTP status,
 attempt count, and whether the bootstrap endpoint changed during the wait. It
 does not include the endpoint or the response body. The wait re-reads the
 desktop bootstrap on each attempt because that cache updates when the restarted
@@ -1844,14 +1918,20 @@ isolated data root; legacy cleanup can terminate another desktop app.
 
 For seeded CI qualification, distinguish a packaging-child timeout from a
 runtime-upgrade failure. The candidate, previous stable, and protected baseline
-are three sequential builds with separate cold Cargo outputs outside the
-workflow's cached repository `target`; `remote-install` reuses the protected
-package. Only macOS (x64 and arm64) gives each packaging child 90 minutes and
+are three sequential builds into one run-owned Cargo target under the isolated
+run root, outside every checkout and the workflow's cached repository `target`.
+The first build is cold; the later two reuse its registry dependencies and
+rebuild only the workspace crates whose versions or sources changed. Before each
+build the harness removes only the shared `<triple>/release/bundle` directory,
+and after it succeeds renames that whole directory into the build's own
+artifact root, so a later build cannot overwrite or contaminate an earlier
+package; a missing bundle or occupied destination stops the run before any
+publish or install. `remote-install` reuses the protected package. Only macOS (x64 and arm64) gives each packaging child 90 minutes and
 the complete job 360 minutes. Windows gives each packaging child 60 minutes and
 Linux 45, both within 240-minute jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
 10 minutes per checkout. Each macOS job reserves 60 additional minutes after the
 three packaging and install bounds for setup, all lanes, evidence, and cleanup.
-Product, WebDriver, and restart deadlines remain unchanged. Record a command
+Product, WebDriver, and restart deadlines remain unchanged. The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release and CI packaging outside this harness keep the full release profile. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs. Read `build-timings.txt` first when a lane stops during packaging. Record a command
 timeout and the last completed phase as unavailable native evidence; passing
 tooling tests cannot substitute for completed upgrade observations.
 
@@ -2127,6 +2207,12 @@ Then check liveness during large-diff transfers:
 Record the rates, transfer durations, close codes, the exact status text, and
 the server log lines.
 
+`node scripts/throttle-proxy.ts --preset 3g` (or `/set?preset=3g`) sets the 3G link
+used by the [load measurement](#high-latency-measurement): 50,000 bytes/s each way and a
+200 ms one-way delay. Add `--new-connections 1` (`new-connections=1`) to make each new
+connection pay its own handshake and each HTTP request open a new connection; an explicit
+`--down`, `--up` or `--delay` overrides the preset.
+
 ## High-latency measurement
 
 For changes that add, remove or reorder RPCs on a user action, or change how
@@ -2152,6 +2238,30 @@ round trips, or terminal echo lag above about two round trips, is a regression
 to explain. The sequential column is inferred from timing and is noisy for
 typing rows; use their echo lag instead. Record the tables in the execution
 report.
+
+### Load on a 3G link
+
+For changes that alter what the shell, a thread open or a reconnect sends, measure the bytes
+and time on the 3G preset against the large-thread fixture, and run the byte budget:
+
+```sh
+cargo build -p bibcode-server --bin bibcode
+cargo build -p bibcode-server --example write_load_fixture
+VITE_HOSTED_APP_URL=https://hosted.invalid vp run --filter=@bibcode/web build
+node scripts/measure-remote-latency.ts --link 3g --out <report>.json
+cargo test -p bibcode-server --test transfer_budget
+```
+
+`--link 3g` writes the fixture's store (one 200-turn thread, a 160-thread shell) before the
+server starts, then limits the link and runs five rows: cold connect onto the big thread, open
+it from the sidebar with no cache, switch back to it, reconnect, and a reload onto the big thread
+while the page's cache still holds it. Each row reports RPCs,
+sequential round trips, bytes received after the transport's deflate and decoded, and time to
+visible. Static assets are served locally, so the rows count RPC bytes only. Compare against the
+latest `docs/architecture/measurements/remote-load-3g-*.md`; add a new dated capture rather than
+rewriting one. The byte budget needs no browser: raise a budget in
+`apps/server/tests/transfer_budget.json` only when the growth is intended, and lower it when a
+change shrinks a payload. Time at 3G is a reported number, never a gate.
 
 ## Git Manager validation scenario
 
@@ -2437,7 +2547,12 @@ starts.
    explicit confirmation, and confirm the message and changes return without
    deleting files. Exercise whole-file discard and **Discard All**; tracked
    content must restore, an untracked path must use OS trash when available, and
-   a trash failure must require the separate permanent-discard confirmation.
+   a trash failure must require the separate permanent-discard confirmation. The
+   one exception is an entry the trash refused whose name something else took
+   meanwhile: it is kept in the Git directory, the Changes view shows where
+   (until dismissed, also across a permanent-discard confirmation for other
+   files), and no permanent discard is offered for it. That race cannot be
+   reproduced by hand; its automated tests run on Linux and macOS.
    While two or more files are changed, drag the handles above the diff and
    above the commit form and move them with the arrow keys; confirm the sizes
    return after reopening the tab and both handles take keyboard focus. Press **F7** and **Shift+F7** (and the **Next change** / **Previous
@@ -3312,6 +3427,24 @@ sizes. Cover relevant:
   entry in the clicked nested folder while expanded folders stay expanded, a
   drag-move onto a folder row and onto the tree root, and a refused move (a name
   the target already holds) reported as an error with the tree resynced;
+- Files binary previews: from the Files tree open a PNG (check the pixel size and
+  the **Actual size** switch), an SVG whose markup contains a `<script>` that
+  would write to `document.title` or call `alert` (it must show as a picture, the
+  script must not run, **View source** must show the markup and the editor's
+  switch must return to the picture), a multi-page PDF (the viewer scrolls and
+  pages), an MP3 (the native player plays and seeks), and a file over 10 MiB
+  (a PDF or audio file renamed from a large file works; the panel says it is
+  too large and names **Open in**, with no raw status text); open an archive or
+  executable and verify "No preview for this file type". Repeat on a remote
+  environment, where the notices point at the machine the environment runs on.
+  On Linux record whether the webview shows PDFs inline or reports the file
+  unreadable. Scroll a long thread with image attachments with the network panel
+  open: off-screen images load only as they near the viewport. The packaged
+  `files-binary-preview` spec automates the PNG, SVG (its script must not run),
+  PDF and WAV steps and fails on any `securitypolicyviolation` event; the previews
+  load from `blob:` URLs, so check the console of a remote environment shows no
+  CSP violation for the PDF or audio either. Rerun it alone with
+  `BIBCODE_E2E_SPEC=./specs/files-binary-preview.e2e.ts`;
 - Files Download and Upload: right-click a folder → **Download** → pick a
   destination folder → verify the resulting `.zip`; right-click the tree
   background → **Upload Files…** → pick a file → verify it appears in the
@@ -3381,6 +3514,25 @@ sizes. Cover relevant:
   confirmation lists its server version and running work; after confirming, the
   host restarts only once its providers show **Updated**, its Remote Servers
   row shows the same progress, and a manual host is listed as skipped;
+- with CodeGraph installed (standalone installer or a global package-manager
+  install), **Settings → Providers → Tools** lists it with its version. Point
+  `PATH` at a stub `codegraph` that records its environment and arguments,
+  never the real CLI or a real agent configuration, to confirm **Update** runs
+  `upgrade` with `CODEGRAPH_NO_PROMPT_HOOK=1` and `CODEGRAPH_NO_INSTALL_REFRESH=1`
+  and leaves a sentinel agent-config file untouched. The row shows **Close
+  agent sessions that use CodeGraph before updating** next to **Update**. Close
+  the window or disconnect mid-update: the stub keeps running and the row shows
+  the result on return. Quit the desktop app mid-update: it waits for the stub (up
+  to 30 s beyond its usual 5 s stop) before exiting, and a stub that outlasts that
+  leaves **may be damaged** with a reinstall on the next start, or **still being
+  updated** with no reinstall while it still runs. Kill the server process outright:
+  the next start says the same.
+  A stub that exits non-zero leaves **may be damaged** with a reinstall; a
+  wrapper outside the installer layout is shown as manual with the reason. A
+  WSL or remote environment reports its own CodeGraph, and an older server that
+  reports no tools shows no Tools group. When Claude Code updates itself (or a
+  stub `claude` reports a higher version after a refresh), one **Claude updated
+  to `<version>`** notice appears per version;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
@@ -3736,7 +3888,8 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
   middle-click. Right-click offers **Open in BiBCode browser**, **Open in
   system browser**, and **Copy link**; other link types show no custom menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
   any modifier-click opens the editor. A file outside the workspace shows the
-  notice with **Open in editor**.
+  notice with **Open in editor**. Repeat the chat rows in a chat panel beside
+  the host chat: the BiBCode browser opens in the host's right panel.
 - Terminal URL: plain click does nothing; Ctrl/Cmd-click opens the setting's
   target; Ctrl/Cmd+Shift-click opens the other.
 - OSC 8: `printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'` opens
@@ -3752,6 +3905,16 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
   relative `x.html` under a UNC working directory (WSL `\\wsl.localhost\…`)
   still opens. With the thread's environment disconnected, an HTML path shows
   "Couldn't preview this file" with **Open in editor**.
+- Windows terminal paths: `echo src\index.ts:12` (also `.\src\index.ts:12`)
+  underlines the whole path. For quoted paths the terminal must print the
+  quotes, which PowerShell `echo "…"` does not, so single-quote the argument:
+  `echo '"C:\Users\Jane Doe\a.ts:3"'`, `echo '"C:\Users\Jane Doe\a.ts":3:7'`,
+  and a relative `echo '"My Dir\src\a.ts:3"'` each underline the whole path,
+  spaces included, and Ctrl-click opens it in the editor at that line (and
+  column). The quotes are excluded from the link, except a closing quote
+  followed by a `:line` suffix. `~\x.ts` and
+  `~/x.ts` open under the home folder even when the working directory is
+  written `c:\users\jane\…` or `C:/Users/Jane/…`.
 - Preview tab `target=_blank` link and `window.open` popup open a new tab in the
   same thread; `window.open('about:blank')` opens nothing. Git Manager pull
   request title opens in the system browser, not nowhere.
@@ -3772,8 +3935,8 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
 - Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an
   HTML file shows a `content-security-policy` header of
   `sandbox allow-scripts allow-forms allow-popups`; for SVG, XML, and any other `+xml` type, of
-  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt` or raster
-  image asset has none. In the BiBCode browser, a script
+  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt`, raster
+  image, PDF or audio asset has none (every asset response has `x-content-type-options: nosniff`). In the BiBCode browser, a script
   in the HTML reads `localStorage` and `document.cookie` as unavailable.
 - Port attribution: start `python3 -m http.server 8123` in a thread's terminal;
   the port appears in that thread's and terminal's discovered ports (port

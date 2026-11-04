@@ -379,12 +379,37 @@ or `LNK1140: limit exceeded for program database` rather than a disk error.
 Delete only the checkout's own `target\debug` to recover; never the retained
 validation tree.
 
-Git for Windows installs with `core.autocrlf=true` in the system and global
-configuration. Test fixtures that assert on checked-out file bytes pin
-`core.autocrlf=false` on the repository they create right after `git init`;
-a `"base\r\n"` versus `"base\n"` assertion failure means a fixture is missing
-that pin, not that the product rewrote line endings. Do not change the host
-Git configuration to make a suite pass.
+Git for Windows installs with `core.autocrlf=true` in the system configuration
+(`<Git>\etc\gitconfig`); the installer does not set it globally. Test fixtures
+that assert on checked-out file bytes pin `core.autocrlf=false` on the
+repository they create right after `git init`; a `"base\r\n"` versus `"base\n"`
+assertion failure means a fixture is missing that pin, not that the product
+rewrote line endings. Do not change the host Git configuration to make a suite
+pass. A fixture whose repository production Git reads (a revert, a checkpoint,
+a worktree removal) pins `core.autocrlf=false` in the repository's own
+configuration, because the test's `IsolatedGitConfig` reaches only the commands
+the fixture runs itself. The pin is still required: the packaged app's Git reads
+the system line-ending keys
+([Git process environment](../architecture/rpc-and-orchestration.md#git-process-environment)),
+but test servers never install that policy and keep `GIT_CONFIG_NOSYSTEM=1`,
+while checkpoints read the full system configuration. The repository pin beats
+both. `apps/server/tests/git_system_line_endings.rs` covers the policy with a
+fixture `GIT_CONFIG_SYSTEM` file, never the host's.
+
+`bibcode-server` library tests run on a Windows development machine, and these
+Windows behaviors decide how a fixture is written:
+
+- `canonicalize()` returns a `\\?\C:\...` path. Git reads that as a host name
+  and refuses it ("hostname contains invalid characters"), so a path handed to
+  Git comes from `without_verbatim_prefix` (the MCP tool tests use
+  `mcp_tools_tests::canonical`). Code whose contract is a canonical root (the
+  workspace, upload and archive handles) is tested with
+  `test_support::canonical_tempdir()`, not `tempfile::tempdir()`.
+- The default terminal shell is PowerShell, not `cmd.exe`. Windows PowerShell
+  5.1 rejects `a & b`; use `a; b` in a command typed into a terminal.
+- A connection to a closed loopback port is refused after about two seconds,
+  as long as the MCP endpoint owner probe's timeout. A test that needs a fast
+  refusal is Unix only.
 
 Run the desktop E2E support contract and the launcher contracts natively on
 Windows:

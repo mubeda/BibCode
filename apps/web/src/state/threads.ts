@@ -7,6 +7,7 @@ import {
   EMPTY_ENVIRONMENT_THREAD_STATE,
   type EnvironmentThreadState,
   type EnvironmentThreadStatus,
+  type ThreadOlderHistory,
   createThreadEnvironmentAtoms,
 } from "@bibcode/client-runtime/state/threads";
 import type { EnvironmentId, ScopedThreadRef, ThreadId } from "@bibcode/contracts";
@@ -45,11 +46,12 @@ const threadFindLoadStateAtomFamily = Atom.family((key: string) =>
       state.status,
       Option.isSome(state.data) ? "1" : "0",
       Option.getOrElse(state.error, () => ""),
+      Option.getOrUndefined(state.data)?.history?.hasOlder === true ? "1" : "0",
     ].join("\u0000");
   }).pipe(Atom.withLabel(`web-thread-find-load-state:${key}`)),
 );
 
-const LIVE_THREAD_FIND_LOAD_STATE = "live\u00001\u0000";
+const LIVE_THREAD_FIND_LOAD_STATE = "live\u00001\u0000\u00000";
 const LIVE_THREAD_FIND_LOAD_STATE_ATOM = Atom.make(LIVE_THREAD_FIND_LOAD_STATE).pipe(
   Atom.withLabel("web-thread-find-load-state:live"),
 );
@@ -58,6 +60,8 @@ export interface ThreadFindLoadState {
   readonly status: EnvironmentThreadStatus;
   readonly error: string | null;
   readonly hasData: boolean;
+  /** Older history is still on the server (#226): find searches only what is loaded. */
+  readonly hasOlderHistory?: boolean;
 }
 
 /** A server thread's load state; a draft, which has no server state, reads as live. */
@@ -68,13 +72,33 @@ export function useThreadFindLoadState(ref: ScopedThreadRef | null): ThreadFindL
       : threadFindLoadStateAtomFamily(scopedThreadKey(ref)),
   );
   return useMemo(() => {
-    const [status, hasData, error] = encoded.split("\u0000");
+    const [status, hasData, error, hasOlderHistory] = encoded.split("\u0000");
     return {
       status: (status ?? "live") as EnvironmentThreadStatus,
       hasData: hasData === "1",
       error: error ? error : null,
+      hasOlderHistory: hasOlderHistory === "1",
     };
   }, [encoded]);
+}
+
+const NO_OLDER_HISTORY_ATOM = Atom.make<ThreadOlderHistory | null>(null).pipe(
+  Atom.withLabel("web-thread-older-history:none"),
+);
+
+/** A thread's older-history loading (#226); its identity changes only with the load status. */
+const threadOlderHistoryAtomFamily = Atom.family((key: string) =>
+  Atom.make((get): ThreadOlderHistory | null => {
+    const ref = parseScopedThreadKey(key);
+    return ref ? (get(environmentThreadDetails.stateAtom(ref)).olderHistory ?? null) : null;
+  }).pipe(Atom.withLabel(`web-thread-older-history:${key}`)),
+);
+
+/** The older-history loading of a server thread; null for a draft. */
+export function useThreadOlderHistory(ref: ScopedThreadRef | null): ThreadOlderHistory | null {
+  return useAtomValue(
+    ref === null ? NO_OLDER_HISTORY_ATOM : threadOlderHistoryAtomFamily(scopedThreadKey(ref)),
+  );
 }
 
 export function useEnvironmentThread(

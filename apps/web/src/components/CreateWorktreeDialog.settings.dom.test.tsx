@@ -97,7 +97,10 @@ vi.mock("~/state/environments", () => ({
         label: "local",
         connection: { phase: "connected" },
         // Its launch command shows Agent integrations' Connect an agent row (#139).
-        serverConfig: { mcpLaunch: { argv: ["/usr/local/bin/bibcode", "mcp"] } },
+        serverConfig: {
+          environment: { capabilities: {} },
+          mcpLaunch: { argv: ["/usr/local/bin/bibcode", "mcp"] },
+        },
       },
     ],
     isReady: true,

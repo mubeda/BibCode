@@ -79,6 +79,7 @@ pub use maintenance::{
     MAINTENANCE_UPDATE_STATUS_PATH, MaintenanceError, PrepareForUpdateResult, RpcAdmissionGate,
     RpcMutability, UpdateMaintenance, http_mutability, rpc_mutability,
 };
+pub use production::TOOL_UPDATE_SHUTDOWN_WAIT;
 pub use remote_update::{
     HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallKind,
     RemoteUpdateInstallMode, RemoteUpdateRequester, RemoteUpdateService, RemoteUpdateSnapshot,
@@ -106,6 +107,10 @@ pub enum RunError {
     OpenBrowser(#[source] std::io::Error),
     #[error(transparent)]
     Recovery(#[from] persistence::RecoveryError),
+    #[error(
+        "BiBCode is using this data root. Quit the BiBCode app, stop `bibcode serve` and any WSL backend, and stop the background service (`bibcode service status` shows it), then retry."
+    )]
+    StoreRunning,
     #[error("failed to encode storage command output")]
     StorageOutput(#[source] serde_json::Error),
     #[error("could not issue a pairing credential: {0}")]
@@ -139,6 +144,16 @@ pub async fn run_cli() -> Result<(), RunError> {
                 code => std::process::exit(code),
             }
         }
+        CliAction::McpCall { options, args } => {
+            match mcp::call_cli::run_mcp_call(options, args).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        CliAction::McpTools(options) => match mcp::call_cli::run_mcp_tools(options).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        },
         CliAction::Thread { options, args } => {
             match mcp::thread_cli::run_thread_cli(options, args).await {
                 0 => Ok(()),
@@ -164,8 +179,11 @@ pub async fn run_cli() -> Result<(), RunError> {
     }
 }
 
-async fn run_server(config: ServerConfig) -> Result<(), RunError> {
+async fn run_server(mut config: ServerConfig) -> Result<(), RunError> {
     let open_browser = !config.no_browser;
+    // The absolute data root startup will use, not the requested (possibly relative) one.
+    config.resolve_data_root().map_err(ServerError::from)?;
+    git::system_line_endings::install_once(&config.state_dir()).await;
     let handle = ServerRuntime::start_standalone(config).await?;
     let http_base_url = format!("http://{}", handle.local_addr());
     let browser_target = handle
@@ -202,7 +220,30 @@ async fn run_server(config: ServerConfig) -> Result<(), RunError> {
 }
 
 async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
-    let (value, json_output) = match command {
+    let (value, json_output) =
+        storage_command_output(command)
+            .await
+            .map_err(|error| match error {
+                RunError::Recovery(persistence::RecoveryError::StoreRunning) => {
+                    RunError::StoreRunning
+                }
+                other => other,
+            })?;
+    if json_output {
+        println!("{value}");
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(RunError::StorageOutput)?
+        );
+    }
+    Ok(())
+}
+
+async fn storage_command_output(
+    command: StorageCommand,
+) -> Result<(serde_json::Value, bool), RunError> {
+    Ok(match command {
         StorageCommand::Inspect { root, json } => {
             let inspection = persistence::inspect_store(&root).await?;
             let backups = inspection
@@ -223,6 +264,7 @@ async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
             (
                 json!({
                     "classification": inspection.classification,
+                    "database": inspection.database,
                     "storageInstanceId": inspection.storage_instance_id,
                     "backups": backups,
                     "backupIssues": issues,
@@ -239,7 +281,12 @@ async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
             backup_id,
             json,
         } => (
-            serde_json::to_value(persistence::restore_backup(&root, backup_id).await?)
+            serde_json::to_value(run_storage_restore(&root, backup_id).await?)
+                .map_err(RunError::StorageOutput)?,
+            json,
+        ),
+        StorageCommand::Resume { root, json } => (
+            serde_json::to_value(persistence::resume_recovery(&root).await?)
                 .map_err(RunError::StorageOutput)?,
             json,
         ),
@@ -248,16 +295,161 @@ async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
                 .map_err(RunError::StorageOutput)?,
             json,
         ),
-    };
-    if json_output {
-        println!("{value}");
+        StorageCommand::Compact {
+            root,
+            dry_run,
+            json,
+        } => (
+            serde_json::to_value(run_storage_compact(&root, dry_run).await?)
+                .map_err(RunError::StorageOutput)?,
+            json,
+        ),
+    })
+}
+
+/// How often a long storage command says it is still working.
+const STILL_WORKING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn backup_progress_line(bytes: u64, budget: std::time::Duration) -> String {
+    format!(
+        "Backing up {} before compacting. This can take up to {}; press Ctrl-C to stop without changing the database.",
+        persistence::format_bytes(bytes),
+        persistence::format_duration_words(budget)
+    )
+}
+
+fn restore_progress_line(backup_id: uuid::Uuid) -> String {
+    format!(
+        "Restoring backup {backup_id}. Press Ctrl-C to stop before the current database is replaced."
+    )
+}
+
+fn still_working_line(activity: &str, elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let elapsed = if seconds < 60 {
+        format!("{seconds} s")
     } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(RunError::StorageOutput)?
+        format!("{} min", seconds / 60)
+    };
+    format!("Still {activity} ({elapsed} elapsed)…")
+}
+
+/// Runs `operation`, cancelling `cancellation` on Ctrl-C, and prints a "still working" line
+/// for the current `activity` every [`STILL_WORKING_INTERVAL`].
+async fn run_with_progress<T, E>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+    cancellation: &tokio_util::sync::CancellationToken,
+    activity: &std::sync::Mutex<&'static str>,
+) -> Result<T, E> {
+    let started = std::time::Instant::now();
+    tokio::pin!(operation);
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + STILL_WORKING_INTERVAL,
+        STILL_WORKING_INTERVAL,
+    );
+    let mut signalled = false;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = ticker.tick() => {
+                let current = *activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !current.is_empty() {
+                    eprintln!("{}", still_working_line(current, started.elapsed()));
+                }
+            }
+            signal = termination_signal(), if !signalled => {
+                signalled = true;
+                if signal.is_ok() {
+                    eprintln!("Cancelling…");
+                    cancellation.cancel();
+                }
+            }
+        }
+    }
+}
+
+/// Runs `bibcode storage restore --backup-id`, with Ctrl-C honored until the restore starts
+/// replacing the current database.
+async fn run_storage_restore(
+    root: &ResolvedDataRoot,
+    backup_id: uuid::Uuid,
+) -> Result<persistence::RecoveryResult, RunError> {
+    eprintln!("{}", restore_progress_line(backup_id));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let activity = std::sync::Mutex::new("restoring");
+    Ok(run_with_progress(
+        persistence::restore_backup(root, backup_id, cancellation.clone()),
+        &cancellation,
+        &activity,
+    )
+    .await?)
+}
+
+/// Runs `bibcode storage compact`. Stdout carries only the JSON report; progress and the
+/// summary go to stderr because a real run can take minutes.
+async fn run_storage_compact(
+    root: &ResolvedDataRoot,
+    dry_run: bool,
+) -> Result<persistence::CompactReport, RunError> {
+    use persistence::{CompactProgress, format_bytes};
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let activity = std::sync::Arc::new(std::sync::Mutex::new(""));
+    let options = persistence::CompactOptions {
+        dry_run,
+        cancellation: cancellation.clone(),
+        on_progress: Some(std::sync::Arc::new({
+            let activity = activity.clone();
+            move |phase| {
+                let (line, current) = match phase {
+                    CompactProgress::BackingUp { bytes, budget } => {
+                        (backup_progress_line(bytes, budget), "backing up")
+                    }
+                    CompactProgress::Compacting => ("Compacting…".to_owned(), "compacting"),
+                    CompactProgress::CheckingIntegrity => {
+                        ("Checking integrity…".to_owned(), "checking integrity")
+                    }
+                };
+                eprintln!("{line}");
+                *activity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = current;
+            }
+        })),
+    };
+    let report = run_with_progress(
+        persistence::compact_store(root, options),
+        &cancellation,
+        &activity,
+    )
+    .await?;
+    let backup = format_bytes(report.plan.backup_bytes);
+    if report.dry_run {
+        match report.plan.estimated_reclaim_bytes {
+            Some(reclaim) => eprintln!(
+                "Compaction would reclaim about {} and first take a {backup} backup.",
+                format_bytes(reclaim)
+            ),
+            None => eprintln!(
+                "The real run first writes back the changes left in state.sqlite-wal, then takes a backup of at most {backup}."
+            ),
+        }
+        eprintln!(
+            "A dry run does not check whether another program has the database open. The real run refuses at once if one does, before taking the backup."
+        );
+    } else {
+        let before = report.before.file_bytes + report.before.wal_bytes;
+        let after = report
+            .after
+            .as_ref()
+            .map_or(0, |after| after.file_bytes + after.wal_bytes);
+        eprintln!(
+            "Done: {} → {}. The pre-compact backup ({backup}) is kept until newer backups replace it.",
+            format_bytes(before),
+            format_bytes(after)
         );
     }
-    Ok(())
+    Ok(report)
 }
 
 #[derive(Serialize)]
@@ -301,6 +493,9 @@ async fn open_existing_data_root(
     let mut config = ServerConfig::new(&root.effective);
     config.dev_url = dev_url;
     let paths = persistence::StatePaths::from_config(&config);
+    // Under the shared runtime lock, so a restore or `--resume` cannot start meanwhile.
+    persistence::ensure_no_interrupted_recovery(&paths)
+        .map_err(|error| RunError::PairingIssue(error.to_string()))?;
     if !paths.database.exists() {
         let (other_state, remedy) = match paths.state_kind {
             persistence::StateKind::Userdata => (
@@ -505,4 +700,115 @@ async fn termination_signal() -> Result<(), std::io::Error> {
         diagnostics::profiler::exits::note_terminating();
     }
     received
+}
+
+#[cfg(test)]
+mod storage_cli_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn listing(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut entries = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).expect("listing") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path.clone());
+                }
+                entries.push(path);
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn long_operation_lines_name_the_size_and_limit() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            backup_progress_line(0, Duration::from_secs(30)),
+            "Backing up 0 B before compacting. This can take up to 30 seconds; press Ctrl-C to stop without changing the database."
+        );
+        assert_eq!(
+            backup_progress_line(
+                7 * gib,
+                persistence::StoreIoBudget::LARGE_STORE.for_bytes(7 * gib)
+            ),
+            "Backing up 7.5 GB before compacting. This can take up to 29 minutes; press Ctrl-C to stop without changing the database."
+        );
+        assert_eq!(
+            still_working_line("backing up", Duration::from_secs(30)),
+            "Still backing up (30 s elapsed)…"
+        );
+        assert_eq!(
+            still_working_line("restoring", Duration::from_secs(125)),
+            "Still restoring (2 min elapsed)…"
+        );
+        let backup_id = uuid::Uuid::nil();
+        assert_eq!(
+            restore_progress_line(backup_id),
+            format!(
+                "Restoring backup {backup_id}. Press Ctrl-C to stop before the current database is replaced."
+            )
+        );
+        let deadline = persistence::RecoveryError::RestoreDeadline {
+            budget: Duration::from_secs(1_710),
+            bytes: 7 * gib,
+        };
+        assert!(
+            deadline.to_string().starts_with(
+                "The restore did not finish within 29 minutes, the limit for a 7.5 GB backup"
+            ),
+            "{deadline}"
+        );
+        let short = persistence::RecoveryError::RestoreDeadline {
+            budget: Duration::from_secs(30),
+            bytes: 0,
+        };
+        assert!(short.to_string().contains("within 30 seconds"), "{short}");
+    }
+
+    #[tokio::test]
+    async fn pairing_refuses_to_open_a_store_during_an_interrupted_recovery() {
+        for interrupted in ["journal", "staging"] {
+            let temp = tempfile::tempdir().expect("data root");
+            let root = data_root::resolve_data_root(data_root::DataRootRequest::explicit(
+                data_root::DataRootSource::Cli,
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+            ))
+            .expect("resolve root");
+            let paths = persistence::StatePaths::from_config(&ServerConfig::new(&root.effective));
+            std::fs::create_dir_all(&paths.state_dir).expect("state directory");
+            std::fs::write(&paths.database, b"left by an interrupted restore").expect("database");
+            std::fs::write(paths.runtime_lock(), b"").expect("runtime lock");
+            if interrupted == "journal" {
+                std::fs::write(paths.recovery_journal(), b"{}\n").expect("journal");
+            } else {
+                let staging = paths.recovery_staging_dir(uuid::Uuid::new_v4());
+                std::fs::create_dir(&staging).expect("staging");
+            }
+            let before = listing(&root.effective);
+
+            let Err(RunError::PairingIssue(message)) = open_existing_data_root(&root, None).await
+            else {
+                panic!("the pairing CLI must refuse an interrupted recovery");
+            };
+
+            assert!(
+                message.contains(persistence::RESUME_COMMAND),
+                "{interrupted}: {message}"
+            );
+            assert_eq!(
+                listing(&root.effective),
+                before,
+                "{interrupted}: no file created"
+            );
+            assert_eq!(
+                std::fs::read(&paths.database).expect("database"),
+                b"left by an interrupted restore"
+            );
+        }
+    }
 }

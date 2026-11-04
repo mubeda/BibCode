@@ -17,6 +17,9 @@ use crate::rpc::RpcRegistry;
 
 const MAX_NAME_CHARS: usize = 80;
 const MAX_ID_CHARS: usize = 256;
+const MAX_TOKEN_BYTES: usize = 1_024;
+const TOKEN_MESSAGE: &str = "The token must be 1 to 1,024 visible ASCII characters with no spaces.";
+const TOKEN_FOR_NEW_URL: &str = "Enter the token for the new URL, or remove it.";
 /// Deliveries `webhooks.listDeliveries` returns: `(default, most)`.
 const DELIVERIES_LIMIT: (i64, i64) = (50, 200);
 
@@ -93,6 +96,8 @@ fn endpoint_view(
         "eventTypes": endpoint.event_types,
         "projectId": endpoint.project_id,
         "pairedClientId": endpoint.paired_session_id,
+        "bearerTokenSet": endpoint.bearer_secret.is_some(),
+        "statusKinds": endpoint.status_kinds,
         "consecutiveFailures": endpoint.consecutive_failures,
         "disabledReason": endpoint.disabled_reason,
         "pendingDeliveries": pending,
@@ -144,6 +149,89 @@ struct UpsertInput {
     event_types: Vec<String>,
     project_id: Option<String>,
     paired_client_id: Option<String>,
+    /// Absent keeps the endpoint's token, `null` clears it and a string sets or replaces it.
+    /// No `Debug`: it holds the token.
+    #[serde(default, deserialize_with = "present")]
+    bearer_token: Option<Option<String>>,
+    /// Absent keeps the endpoint's `thread.status_changed` filter, so an older client's save
+    /// never resets it; `null` sends every kind and a list only those.
+    #[serde(default, deserialize_with = "present_kinds")]
+    status_kinds: Option<Option<Vec<String>>>,
+}
+
+/// [`present`] for `statusKinds`.
+fn present_kinds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<Vec<String>>>, D::Error> {
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
+}
+
+/// A `statusKinds` list as it is stored: known kinds, once each, in the catalog's order.
+fn status_kinds(kinds: Vec<String>) -> Result<Vec<String>, Value> {
+    if let Some(unknown) = kinds
+        .iter()
+        .find(|kind| !events::STATUS_KINDS.contains(&kind.as_str()))
+    {
+        return Err(refusal(
+            "invalid",
+            &format!("{unknown} is not a thread.status_changed kind."),
+        ));
+    }
+    let kinds: Vec<String> = events::STATUS_KINDS
+        .iter()
+        .filter(|known| kinds.iter().any(|kind| kind == *known))
+        .map(|kind| (*kind).to_owned())
+        .collect();
+    if kinds.is_empty() {
+        return Err(refusal(
+            "invalid",
+            "Choose at least one status change, or stop sending Thread status changed.",
+        ));
+    }
+    Ok(kinds)
+}
+
+/// A field that is present, as `Some`, so `null` and absent differ. A value of the wrong
+/// type gets fixed text, because serde's own error quotes it and it may be the token.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("bearerToken must be a string or null"))
+}
+
+/// A bearer token as it is stored: trimmed, 1 to 1,024 bytes of visible ASCII, so it is
+/// always a valid header value. No refusal ever holds any part of it.
+fn bearer_token(value: &str) -> Result<String, Value> {
+    let token = value.trim();
+    if token
+        .get(..7)
+        .is_some_and(|start| start.eq_ignore_ascii_case("bearer "))
+    {
+        return Err(refusal(
+            "invalid",
+            "Paste the token without the word Bearer.",
+        ));
+    }
+    if token.is_empty()
+        || token.len() > MAX_TOKEN_BYTES
+        || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(refusal("invalid", TOKEN_MESSAGE));
+    }
+    Ok(token.to_owned())
+}
+
+/// An upsert can hold a token, and serde's errors quote values and unknown keys, so a
+/// malformed one gets fixed text that never reaches the reply or the RPC trace.
+fn decode_upsert(payload: Value) -> Result<UpsertInput, Value> {
+    serde_json::from_value(payload).map_err(|_| {
+        refusal(
+            "invalid",
+            "Invalid request: an endpoint needs name, url, enabled and eventTypes, bearerToken must be a string or null, and statusKinds a list of strings or null.",
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -206,7 +294,7 @@ impl Webhooks {
     }
 
     pub(super) async fn upsert(&self, payload: Value) -> Result<Value, Value> {
-        let input: UpsertInput = decode(payload)?;
+        let input = decode_upsert(payload)?;
         let name = input.name.trim().to_owned();
         if name.is_empty()
             || name.chars().count() > MAX_NAME_CHARS
@@ -250,24 +338,50 @@ impl Webhooks {
                 "Pair the endpoint with an MCP client that is still authorized.",
             ));
         }
+        let bearer = match input.bearer_token {
+            Some(Some(token)) => Some(Some(bearer_token(&token)?)),
+            other => other,
+        };
+        let kinds = match input.status_kinds {
+            Some(Some(kinds)) => Some(Some(status_kinds(kinds)?)),
+            other => other,
+        };
         let now = crate::mcp::control::now_iso();
-        let existing = match optional_id(input.id, "id")? {
-            Some(id) => Some(
-                self.store()
+        let (endpoint, secret) = match optional_id(input.id, "id")? {
+            Some(id) => {
+                // One edit at a time, from this read through the cleanup: the URL check below
+                // and the row it writes see the same stored URL and token.
+                let edit = self.edit_lock(&id);
+                let _edit = edit.lock().await;
+                let existing = self
+                    .store()
                     .endpoint(&id)
                     .await
                     .map_err(storage)?
-                    .ok_or_else(not_found)?,
-            ),
-            None => None,
-        };
-        let (endpoint, secret) = match existing {
-            Some(existing) => {
+                    .ok_or_else(not_found)?;
+                // Keeping the token would send receiver A's credential to receiver B.
+                if existing.url != url && existing.bearer_secret.is_some() && bearer.is_none() {
+                    return Err(refusal("invalid", TOKEN_FOR_NEW_URL));
+                }
+                let written = match &bearer {
+                    Some(Some(token)) => {
+                        Some(self.write_bearer(&id, token).await.map_err(storage)?)
+                    }
+                    _ => None,
+                };
+                self.after_token_write().await;
                 // Where its deliveries go, which events it gets, or on/off: a new revision.
+                // A token change alone is not: the next attempt reads the new token.
+                let status_kinds = kinds.unwrap_or_else(|| existing.status_kinds.clone());
                 let new_revision = existing.url != url
                     || existing.project_id != project_id
                     || existing.event_types != event_types
+                    || existing.status_kinds != status_kinds
                     || existing.enabled != input.enabled;
+                let bearer_secret = match &bearer {
+                    None => existing.bearer_secret.clone(),
+                    Some(_) => written.clone(),
+                };
                 let endpoint = Endpoint {
                     name,
                     url,
@@ -275,9 +389,13 @@ impl Webhooks {
                     event_types,
                     project_id,
                     paired_session_id: paired,
+                    bearer_secret,
+                    status_kinds,
                     ..existing
                 };
-                let update = self.store().update_endpoint(endpoint.clone());
+                let update = self
+                    .store()
+                    .update_endpoint(endpoint.clone(), bearer.is_some());
                 // A new revision commits only between requests, so no sender can post under
                 // the old one after it; a rename touches nothing a sender reads.
                 let updated = if new_revision {
@@ -285,14 +403,24 @@ impl Webhooks {
                 } else {
                     update.await
                 };
-                updated.map_err(|error| match error {
-                    StoreError::NotFound => not_found(),
-                    error => storage(error),
-                })?;
+                if let Err(error) = updated {
+                    // Nothing changed: the old URL keeps the old token.
+                    if let Some(name) = &written
+                        && let Err(error) = self.inner.secrets.remove(name).await
+                    {
+                        tracing::warn!(endpoint = %id, %error, "could not remove a webhook bearer token");
+                    }
+                    return Err(match error {
+                        StoreError::NotFound => not_found(),
+                        error => storage(error),
+                    });
+                }
+                self.prune_bearer_files(&id, endpoint.bearer_secret.as_deref())
+                    .await;
                 (endpoint, None)
             }
             None => {
-                let endpoint = Endpoint {
+                let mut endpoint = Endpoint {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     url,
@@ -305,6 +433,8 @@ impl Webhooks {
                     created_at: now.clone(),
                     updated_at: now,
                     revision: 0,
+                    bearer_secret: None,
+                    status_kinds: kinds.flatten(),
                 };
                 let secret = signing::generate_secret().map_err(storage)?;
                 self.inner
@@ -312,8 +442,20 @@ impl Webhooks {
                     .set(&secret_name(&endpoint.id), secret.as_bytes())
                     .await
                     .map_err(storage)?;
+                if let Some(Some(token)) = &bearer {
+                    match self.write_bearer(&endpoint.id, token).await {
+                        Ok(name) => endpoint.bearer_secret = Some(name),
+                        Err(error) => {
+                            let _ = self.inner.secrets.remove(&secret_name(&endpoint.id)).await;
+                            return Err(storage(error));
+                        }
+                    }
+                }
                 if let Err(error) = self.store().insert_endpoint(endpoint.clone()).await {
                     let _ = self.inner.secrets.remove(&secret_name(&endpoint.id)).await;
+                    if let Some(name) = &endpoint.bearer_secret {
+                        let _ = self.inner.secrets.remove(name).await;
+                    }
                     return Err(match error {
                         StoreError::Limit => refusal(
                             "limit",
@@ -344,6 +486,8 @@ impl Webhooks {
 
     pub(super) async fn delete(&self, payload: Value) -> Result<Value, Value> {
         let input: EndpointRef = decode(payload)?;
+        let edit = self.edit_lock(&input.id);
+        let _edit = edit.lock().await;
         let deleted = self
             .under_send_lock(&input.id, self.store().delete_endpoint(&input.id))
             .await;
@@ -353,6 +497,7 @@ impl Webhooks {
         if let Err(error) = self.inner.secrets.remove(&secret_name(&input.id)).await {
             tracing::warn!(endpoint = %input.id, %error, "could not remove a webhook secret");
         }
+        self.prune_bearer_files(&input.id, None).await;
         Ok(json!({ "deleted": true }))
     }
 
@@ -514,5 +659,97 @@ impl Webhooks {
             .map_err(storage)?
             .ok_or_else(not_found)?;
         Ok(json!({ "delivery": delivery_view(&stored) }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bearer_token_is_visible_ascii_without_the_word_bearer() {
+        assert_eq!(bearer_token("  tok-1.A_b~  ").unwrap(), "tok-1.A_b~");
+        assert!(bearer_token(&"a".repeat(MAX_TOKEN_BYTES)).is_ok());
+        const SECRET: &str = "SECRET9x";
+        for (value, message) in [
+            (
+                format!("Bearer {SECRET}"),
+                "Paste the token without the word Bearer.",
+            ),
+            (
+                format!("bearer {SECRET}"),
+                "Paste the token without the word Bearer.",
+            ),
+            (format!("{SECRET}\u{7}"), TOKEN_MESSAGE),
+            (format!("{SECRET}\n{SECRET}"), TOKEN_MESSAGE),
+            (format!("{SECRET} {SECRET}"), TOKEN_MESSAGE),
+            (format!("{SECRET}\u{e9}"), TOKEN_MESSAGE),
+            (
+                format!("{SECRET}{}", "a".repeat(MAX_TOKEN_BYTES)),
+                TOKEN_MESSAGE,
+            ),
+            ("   ".to_owned(), TOKEN_MESSAGE),
+        ] {
+            let refusal = bearer_token(&value).unwrap_err();
+            assert_eq!(refusal["reason"], "invalid", "{value:?}");
+            assert_eq!(refusal["message"], message, "{value:?}");
+            assert!(!refusal.to_string().contains("SECRET"), "{refusal}");
+        }
+    }
+
+    /// The contract's own encodings of an upsert: absent keeps the token and the status
+    /// filter, `null` clears the token and a string sets it, and a list sets the filter. An
+    /// upsert in the v0.14 shape is the absent case.
+    #[test]
+    fn upsert_fixtures_decode_to_keep_clear_and_set() {
+        let fixture = |name: &str| -> UpsertInput {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../../packages/contracts/fixtures/rpc-wire/contract-shapes/webhooks__upsert-{name}-request.json"
+            ));
+            let request: Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            serde_json::from_value(request["payload"].clone()).unwrap()
+        };
+        assert!(fixture("token-absent").bearer_token.is_none());
+        assert!(fixture("token-absent").status_kinds.is_none());
+        assert_eq!(
+            fixture("status-kinds").status_kinds,
+            Some(Some(vec![
+                "turn.completed".to_owned(),
+                "turn.failed".to_owned()
+            ]))
+        );
+        assert!(fixture("status-kinds").bearer_token.is_none());
+        assert_eq!(fixture("token-null").bearer_token, Some(None));
+        assert_eq!(
+            fixture("token-set").bearer_token,
+            Some(Some("fixture-token".to_owned()))
+        );
+    }
+
+    /// A malformed upsert is refused without echoing a token, so neither the reply nor
+    /// the RPC trace that records the reply holds it.
+    #[test]
+    fn a_bearer_token_of_the_wrong_type_is_refused_without_its_value() {
+        let endpoint = |token: Value| {
+            json!({
+                "name": "n", "url": "https://example.test/h", "enabled": true,
+                "eventTypes": [], "bearerToken": token,
+            })
+        };
+        for payload in [
+            endpoint(json!(123_456_789_012_345_u64)),
+            endpoint(json!(["SECRET9x"])),
+            endpoint(json!({ "SECRET9x": 1 })),
+            // A token pasted as the whole payload or as a key.
+            json!("SECRET9x"),
+            json!({ "SECRET9x": null }),
+        ] {
+            let refusal = decode_upsert(payload).err().unwrap();
+            assert_eq!(refusal["reason"], "invalid");
+            let shown = refusal.to_string();
+            assert!(!shown.contains("123456789012345"), "{shown}");
+            assert!(!shown.contains("SECRET9x"), "{shown}");
+        }
     }
 }

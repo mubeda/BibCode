@@ -186,6 +186,8 @@ vi.mock("../state/use-atom-command", () => ({
 }));
 
 vi.mock("../state/threads", () => ({
+  useThreadOlderHistory: () => null,
+  useThreadFindLoadState: () => ({ status: "live", hasData: true, error: null }),
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
@@ -4507,7 +4509,7 @@ describe("ChatView project script handlers", () => {
     expect(createInput).toMatchObject({
       environmentId,
       input: {
-        title: "Panel — Claude",
+        title: "Panel: Claude",
         hostThreadId: threadId,
         threadDefaults: {
           modelSelection: {

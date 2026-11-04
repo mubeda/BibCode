@@ -20,6 +20,9 @@ import {
   type ProviderInstanceEntry,
 } from "~/providerInstances";
 
+/** Why panel actions wait: a panel copies its host, which exists once the thread has started. */
+export const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
+
 /** The most closed chats Reopen closed chat and History list. */
 export const MAX_CLOSED_CHATS = 10;
 
@@ -51,7 +54,7 @@ export function selectClosedChatPanels(
 
 /** Reason shown on a visible-but-not-ready provider item. */
 export const PROVIDER_NOT_READY_REASON =
-  "This provider isn't ready yet — check its connection in Settings.";
+  "This provider isn't ready yet. Check its connection in Settings.";
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 
 export interface PanelMenuProviderItem {

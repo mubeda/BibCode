@@ -833,20 +833,29 @@ async fn entry_change_subscribers_share_one_sweep_per_root() {
 async fn save_atomically(root: &Path, relative: &str, contents: &[u8]) {
     let target = root.join(relative);
     let temp = target.with_extension("bibcode-save-tmp");
-    tokio::fs::write(&temp, contents).await.expect("temp file");
-    tokio::fs::rename(&temp, &target)
+    save_atomically_via(&temp, &target, contents).await;
+}
+
+async fn save_atomically_via(temp: &Path, target: &Path, contents: &[u8]) {
+    tokio::fs::write(temp, contents).await.expect("temp file");
+    tokio::fs::rename(temp, target)
         .await
         .expect("rename over target");
 }
 
-/// An atomic save moves the parent directory's mtime twice but leaves the entry list unchanged.
+/// An atomic save moves the parent directory's mtime but leaves the entry list unchanged.
 ///
 /// Every signal makes each subscriber re-read the whole list, so a formatter run over a large
 /// workspace used to push the full list once per sweep while nothing a client shows had changed
 /// (#111).
+///
+/// The temp file is written outside the watched root. A sweep that ran while a sibling temp file
+/// existed would rightly announce it, so a sibling temp made this test depend on the gap between
+/// the write and the rename staying shorter than a sweep (#237).
 #[tokio::test]
 async fn atomic_saves_that_keep_the_entry_list_do_not_signal() {
     let root = TempDir::new().expect("root");
+    let staging = TempDir::new_in(root.path().parent().expect("root parent")).expect("staging");
     write(root.path(), "nested/tracked.txt", b"tracked").await;
     let rpc = WorkspaceRpc::new(WorkspaceService::default())
         .with_watch_timing(Duration::from_millis(25), Duration::from_millis(20));
@@ -856,9 +865,9 @@ async fn atomic_saves_that_keep_the_entry_list_do_not_signal() {
         .expect("subscription");
 
     for round in 0..3 {
-        save_atomically(
-            root.path(),
-            "nested/tracked.txt",
+        save_atomically_via(
+            &staging.path().join("tracked.txt"),
+            &root.path().join("nested/tracked.txt"),
             format!("{round}").as_bytes(),
         )
         .await;

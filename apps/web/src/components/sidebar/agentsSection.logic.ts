@@ -4,9 +4,10 @@ import {
   scopedProjectKey,
   scopedThreadKey,
 } from "@bibcode/client-runtime/environment";
-import type {
-  EnvironmentProject,
-  EnvironmentThreadShell,
+import {
+  type EnvironmentProject,
+  type EnvironmentThreadShell,
+  threadActivityAgeMs,
 } from "@bibcode/client-runtime/state/models";
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import {
@@ -244,7 +245,7 @@ export function buildAgentRows(input: {
             evidenceAt: input.freshness.evidenceAt(
               key,
               shell.lastActivityAt,
-              shell.lastActivityAgeMs,
+              threadActivityAgeMs(shell, Date.now()),
               live,
             ),
           },
@@ -459,4 +460,44 @@ export function countUnreadAgentRows(
     }
   }
   return count;
+}
+
+/** The live shells, then the left-out threads they don't hold. */
+export function mergeOffShellThreads(
+  live: ReadonlyArray<EnvironmentThreadShell>,
+  offShell: ReadonlyArray<EnvironmentThreadShell>,
+): ReadonlyArray<EnvironmentThreadShell> {
+  if (offShell.length === 0) return live;
+  const held = new Set(
+    live.map((shell) => scopedThreadKey(scopeThreadRef(shell.environmentId, shell.id))),
+  );
+  const extra = offShell.filter(
+    (shell) => !held.has(scopedThreadKey(scopeThreadRef(shell.environmentId, shell.id))),
+  );
+  return extra.length === 0 ? live : [...live, ...extra];
+}
+
+/** The hosts of AI Terminals that no loaded shell holds, by environment. */
+export function terminalHostsMissing(
+  shells: ReadonlyArray<EnvironmentThreadShell>,
+  sources: ReadonlyArray<{
+    readonly environmentId: EnvironmentId;
+    readonly rows: ReadonlyArray<{ readonly threadId: string; readonly agentStatus?: unknown }>;
+  }>,
+): ReadonlyMap<EnvironmentId, ReadonlyArray<ThreadId>> {
+  const held = new Set(
+    shells.map((shell) => scopedThreadKey(scopeThreadRef(shell.environmentId, shell.id))),
+  );
+  const missing = new Map<EnvironmentId, ThreadId[]>();
+  for (const source of sources) {
+    for (const terminal of source.rows) {
+      if (terminal.agentStatus === undefined) continue;
+      const threadId = ThreadId.make(terminal.threadId);
+      if (held.has(scopedThreadKey(scopeThreadRef(source.environmentId, threadId)))) continue;
+      const ids = missing.get(source.environmentId) ?? [];
+      if (!ids.includes(threadId)) ids.push(threadId);
+      missing.set(source.environmentId, ids);
+    }
+  }
+  return missing;
 }

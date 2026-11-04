@@ -171,8 +171,16 @@ flowchart TB
   create a fresh watcher generation. Server shutdown closes subscription and
   read admission and awaits owned setup, physical reads, and lifecycle tasks.
   A completed terminal launched as a structured BiBCode command notifies the
-  deepest active canonical worktree ancestor after terminal exit publication;
-  provider, session, and delivery events do not. Commands typed inside a
+  deepest active canonical worktree ancestor after terminal exit publication.
+  A settled provider command item (a Codex or Cursor `command_execution`, a
+  Claude `Bash` call with a result) that runs `gh pr create` or
+  `glab mr create` at command position (repository flags such as `-R` allowed)
+  reports a possible pull request for the thread's own cwd through the
+  orchestration engine's pull-request change observer: that worktree's open-PR
+  lookups are forgotten, its passive summary restarts even when no status view
+  watches it, and an active status view reads its remote again. Nothing is
+  redirected to a parent checkout. Only the match is used, never the command
+  text. Other provider, session, and delivery events do not notify. Commands typed inside a
   persistent interactive shell have no structured completion boundary and
   therefore converge through native watcher events or the safety read. Native
   watching covers only filesystem paths visible to the server execution host;
@@ -639,7 +647,11 @@ explicitly disconnected environment.
 
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
-with an atomic no-replace hard link. Platform file identity checks bind cleanup
+with an atomic no-replace hard link. The staging open, the only connection that
+sees a zero-page database, sets `auto_vacuum = INCREMENTAL` before
+`journal_mode = WAL`, so new stores keep pointer maps for a future incremental
+reclaim. Existing stores keep `NONE` until `bibcode storage compact` rewrites
+them; nothing runs `incremental_vacuum` yet. Platform file identity checks bind cleanup
 and the final reopen to that staged filesystem object, so a competing or
 replacement final path is never configured, migrated, removed, or overwritten.
 
@@ -663,9 +675,14 @@ before the migration transaction begins. SQLite's online backup API copies the
 live connection, including committed WAL data, in bounded cancellable page
 batches into a same-filesystem staging directory. The server then closes and
 checks the staged database, records its pre-migration ledger version, hashes it
-with SHA-256, writes a path-free manifest, flushes both files and supported
-directories, atomically renames the generation, and reloads it for checksum and
-`quick_check` verification. Unix backup directories and files use `0700` and
+with SHA-256, writes a path-free manifest whose `createdAt` is taken just before
+it is written, flushes both files and supported directories, atomically renames
+the generation, and reloads it for checksum and `quick_check` verification. A
+creation that fails or is cancelled before the rename removes its staging
+directory (only the files it wrote, then the empty directory). Pre-update and
+pre-migration backups have 30 seconds; the pre-compact backup's deadline is 30
+seconds plus 4 minutes per GiB of the store (`StoreIoBudget`) and follows the
+caller's cancellation. Unix backup directories and files use `0700` and
 `0600`; Windows generations inherit the private data-root ACL. Only after that
 publication is verified may migration start or retention remove older verified
 generations. Every backup ancestor is identity-bound beneath the effective root,
@@ -674,10 +691,20 @@ writes. Verified generations contain exactly one singly-linked `state.sqlite`
 and one singly-linked `manifest.json`; their manifest ledger version must match
 an exact migration prefix recognized by the running binary, and their canonical
 UTC creation time must agree with the generation's filesystem publication time.
-Retention keeps the newest three for the store and state kind, ordered by that
-filesystem time with a backup-ID tie-break. It reopens and revalidates each
-expired generation, deletes only the two bound files, and removes the now-empty
-directory without recursive deletion. Staging entries, extra or linked content,
+Listing and deletion check only what does not grow with the file: those
+structural rules, the size from metadata and the ledger version. The checksum
+and `quick_check` run when a generation is published, when retention counts it
+as a replacement, and when restore selects it, so a backup that rots later is
+refused at restore before any live file moves. Retention keeps the newest three
+for the store and state kind, ordered by that filesystem time with a backup-ID
+tie-break, and deletes an older generation only behind three newer ones that
+pass the checksum and `quick_check` now; a generation that fails is kept and
+never counts. If the creation's deadline or token ends first, retention deletes
+nothing and the creation still succeeds. Publishing a `pre-compact`
+generation first expires the older `pre-compact` generations, so at most one is
+kept and repeated compaction displaces at most one other generation. It reopens and revalidates the
+identity of each expired generation, deletes only the two bound files, and
+removes the now-empty directory without recursive deletion. Staging entries, extra or linked content,
 malformed manifests, location or identity mismatches, future-schema ledgers,
 implausible timestamps, and failed verification are reported and never selected
 for deletion. Newly created backup ancestors and their parents are flushed
@@ -686,7 +713,19 @@ syncing.
 
 Offline recovery is explicit and state-kind scoped. `bibcode storage inspect`
 classifies the resolved store and inventories verified backups without changing
-database, WAL, marker, or catalog bytes. `bibcode storage restore --backup-id`
+database, WAL, marker, or catalog bytes, or creating any file. It decides
+whether SQLite may be opened from the runtime lock, which it opens without
+creating and holds exclusively for classification and its header read of page
+statistics: while a BiBCode process holds the lock it reports the store from
+its files and never joins the live WAL; offline it opens `immutable=1` when no
+sidecar exists and the plain read-only path only when both sidecars exist under
+its lock; any other sidecar state is reported as unsafe without opening SQLite.
+It releases the lock before the backup inventory, which reads only `backups/`.
+Restore verifies only the selected generation, not every generation of its
+identity, under a deadline of 30 seconds plus 4 minutes per GiB of that
+generation's length, read from metadata first; the CLI cancels it on Ctrl-C
+until its journal is published, and a failure before then removes its staging
+directory, temporary journal and empty preserved directory. `bibcode storage restore --backup-id`
 accepts only a selected generation whose manifest, location, storage identity,
 checksum, SQLite integrity, and migration prefix verify for that same state
 kind. Restore reopens the verified database through a no-follow, read-capable
@@ -694,15 +733,49 @@ file handle before copying it into recovery staging; on Windows, directories
 remain attributes-only while database files explicitly request generic read
 access. `bibcode storage start-empty` is the separate destructive choice. Both
 mutating commands first acquire an exclusive runtime lock and the storage
-operation lock, write and flush a recovery journal, and preserve every existing
-database, WAL, SHM, and marker entry in a private recovery generation before
+operation lock, publish a version-2 recovery journal (written to a temporary
+file, synced, then renamed into place), and preserve every existing database,
+WAL, SHM, and marker entry in a private recovery generation, syncing it, before
 installing a verified database or allowing the next startup to create a new
-store. Normal server handles hold the runtime lock shared, so multiple
-established servers remain supported while offline recovery fails closed if any
-server owns the root. Startup refuses to create or open SQLite while a recovery
-journal or strict recovery-staging entry remains. A crash or cancellation after
-preservation therefore leaves recoverable files and an explicit incomplete
-operation instead of silently converting the root into a first-run store.
+store. The journal rename is the commit point: after it, no failure removes the
+journal, the staging entry or a staged file. Before it, the next restore or
+start-empty clears a staging entry that holds only a staged database and marker
+when no journal of either state kind exists. Normal server handles hold the
+runtime lock shared, so multiple established servers remain supported while
+offline recovery fails closed if any server owns the root. Startup, the pairing
+CLI and the MCP relay call `ensure_no_interrupted_recovery` under the shared
+runtime lock and refuse to open SQLite while a recovery journal or strict
+recovery-staging entry remains; the refusal names
+`bibcode storage restore --resume`. That command, under both locks, finishes the
+operation from the files: it preserves every live file whose identity is not one
+the journal recorded as staged, syncs the preserved directory, installs the
+staged files and removes staging and the journal, or refuses and changes nothing
+when the journal or files match no known state. A crash, kill or cancellation
+after the commit point therefore leaves recoverable files and an explicit
+incomplete operation instead of silently converting the root into a first-run
+store.
+
+`bibcode storage compact` takes the same two locks, then checks the store from
+its files (a marked store, no symbolic link or junction for the state directory
+or `state.sqlite`, since SQLite keeps sidecars beside a link's target, a SQLite
+header, no rollback journal) and opens one
+writable connection with `busy_timeout = 0` and `locking_mode = EXCLUSIVE` set
+before its first access, so SQLite keeps the WAL index in heap memory and a
+`BEGIN EXCLUSIVE` probe refuses at once while another program has the database
+open. That access replays a crash-left WAL under the lock. When a `-wal`
+existed, `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` keeps the close from checkpointing
+it until a compaction verifies, so every refusal before the backup leaves the
+database and its sidecars byte for byte as found. It then checks the schema,
+measures the logical size, checks free space on the data-root and SQLite
+temporary-file volumes, publishes a verified `pre-compact` backup through the
+online-backup API on that connection under a deadline of 30 seconds plus 4
+minutes per GiB of its logical size, cancelled by Ctrl-C within one copy step,
+and runs a cancellable `VACUUM` into `auto_vacuum = INCREMENTAL`. After a verified
+compaction it removes a crash-left `-shm` that no WAL needs any more. It needs
+no recovery journal: there is no rename, `VACUUM` is one SQLite transaction,
+and backup publication is already atomic. `--dry-run` takes only the
+non-creating runtime lock, reads `immutable=1` or not at all, and does not
+check SQLite locks.
 
 ## Desktop project-data recovery
 
@@ -837,6 +910,20 @@ The preview panel's local-server suggestions come from
 `subscribeDiscoveredLocalServers`. Each subscriber's task scans the host's
 listening ports every second, but it sends the list only on subscribe and when
 the servers change; `scannedAt` is the time of the scan that was sent (#168).
+
+A terminal's running-command indicator (`hasRunningSubprocess` and the child
+label) comes from one manager-wide activity tick, not a poll per terminal. Each
+tick (1 s by default, off at zero) takes one process-table snapshot for every
+terminal that needs a sample and skips the snapshot when none does. A terminal
+with a running child is sampled every tick, so the indicator clears within a
+tick of the child's exit. A childless terminal is quiet after two unchanged
+samples with no input or output; input (unary or ordered), output, a resize or
+an attach samples it on the next tick, and a quiet terminal is still sampled
+every 10 ticks, so a child that starts and prints nothing is reported within
+about 10 s (the user's choice on 2026-11-01, #232). `Activity` is published
+only when the sample changes. A terminal whose publication lock is held by a
+close or restart is skipped until the next tick rather than delaying the
+others.
 
 When WSL-only mode is selected, that intent is authoritative even if an older
 persisted document has a stale disabled-backend flag. WSL planning and primary
@@ -1139,6 +1226,17 @@ thread. Reopening a closed (archived) chat panel reserves its surface the same
 way before unarchiving the thread and removes it on a confirmed failure. This
 ordering is shared by browser and all desktop hosts; it does not depend on a
 WebView-specific scheduling delay.
+
+A chat panel renders no right panel. Its `ChatView` provides its host thread
+through `RightPanelThreadContext`, so a link or file its chat Markdown opens in
+the BiBCode browser or file viewer goes to the host's right panel, the one on
+screen. A turn's changed files and **View diff** open the host's Diff surface
+on the panel's thread (`openDiff`; the surface keeps that `threadId`, and the
+host's own Diff action resets it). Removing the panel's thread, or the panel
+leaving the live list when it closes, resets it too. Until the panel's thread
+loads, the surface shows a loading state, or an error with **Show this chat's
+diff** if it fails; it never pairs the host's diff with the panel's composer. A command's open request
+(`OpenRequestRouter`) for a panel thread still uses the system browser.
 
 Center-panel layout is renderer-local, but the panels it holds are shared.
 Center terminals open or attach with `centerPanel: true`; the terminal manager
@@ -1523,6 +1621,20 @@ are listed in the
   that report always says `exit 1`, with the `launchd_sim` pid, or pid `0` when
   that process was not found after boot. The sampler attributes a booted
   simulator's `launchd_sim` to BiBCode as a `helper`.
+- **Offline commands.** `bibcode storage compact` runs with no server, so it
+  cannot reach the global handle. While it holds the store's exclusive runtime
+  lock, and only when the persisted `enableProfiler` is on, it starts an
+  `OfflineWriter`: a `ProfilerStore` with a fresh `sid` that writes events with
+  source `cli` and writes no `session.json`. It holds `profiler/.lock` for its
+  life, with the runtime's brief retry, and records nothing when another writer
+  still holds it. Dropping it waits at most 2 s for the writer to finish, and a
+  writer stuck on disk keeps its lock until it does.
+  It records `storage.compact` `start` and `end` (outcome, failed step, page
+  size, before and after sizes, free pages and `auto_vacuum`, timings, and the
+  pre-compact backup's size-scaled deadline as `backupBudgetMs`), never paths,
+  IDs or error text. `bibcode storage restore` and `--resume` record no
+  profiler event. A refusal because BiBCode owns the store is
+  not recorded, and the dry run starts no writer.
 - `ProductionRuntime::start` starts the runtime on a blocking thread, because it
   replays `findings.ndjson`, before the orchestration engine starts.
 - **Global handle.** Hot paths reach the runtime through a process-global
@@ -1566,14 +1678,14 @@ are listed in the
 Everything lives in `<state dir>/profiler/`: `<data root>/userdata/profiler`, or
 `<data root>/dev/profiler` with a development URL.
 
-| Path                   | Contents                                                                                                                                                                                                                                                                                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.lock`                | The single-writer lock.                                                                                                                                                                                                                                                                                                                           |
-| `events-NNNNNN.ndjson` | One event per line: `{ v: 1, seq, sid, eventId, ts, kind, source, …payload }`. `sid` (8 hex digits) names the writer session, so `"<sid>:<seq>"` locates an event across restarts. `eventId`, `"<sid>-<n>"`, is taken by the sender before the writer runs, so a finding can cite the event at once. `source` is `server` or `client:<clientId>`. |
-| `findings.ndjson`      | One line per persisted finding state; the last line for an id wins.                                                                                                                                                                                                                                                                               |
-| `session.json`         | The clean-shutdown sentinel: `state` is `running`, then `stopping` once shutdown begins, then `clean`.                                                                                                                                                                                                                                            |
-| `capabilities.json`    | `{ nativeDumps, osCrashRecords }`, written by the crash monitor detector.                                                                                                                                                                                                                                                                         |
-| `crashes/`             | Minidumps `<uuid>.dmp` and their `<uuid>.json` sidecars.                                                                                                                                                                                                                                                                                          |
+| Path                   | Contents                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.lock`                | The single-writer lock.                                                                                                                                                                                                                                                                                                                                   |
+| `events-NNNNNN.ndjson` | One event per line: `{ v: 1, seq, sid, eventId, ts, kind, source, …payload }`. `sid` (8 hex digits) names the writer session, so `"<sid>:<seq>"` locates an event across restarts. `eventId`, `"<sid>-<n>"`, is taken by the sender before the writer runs, so a finding can cite the event at once. `source` is `server`, `client:<clientId>`, or `cli`. |
+| `findings.ndjson`      | One line per persisted finding state; the last line for an id wins.                                                                                                                                                                                                                                                                                       |
+| `session.json`         | The clean-shutdown sentinel: `state` is `running`, then `stopping` once shutdown begins, then `clean`.                                                                                                                                                                                                                                                    |
+| `capabilities.json`    | `{ nativeDumps, osCrashRecords }`, written by the crash monitor detector.                                                                                                                                                                                                                                                                                 |
+| `crashes/`             | Minidumps `<uuid>.dmp` and their `<uuid>.json` sidecars.                                                                                                                                                                                                                                                                                                  |
 
 Retention keeps 7 days or 256 MB per profiler directory, dumps included. Anything
 older than 7 days goes first. Crash dumps then leave only when they alone exceed
@@ -1618,6 +1730,13 @@ it.
   provider, trigger and reason) cites its `provider.compaction` event, which
   every settled compaction writes without any message or summary text. An event dropped by a full
   channel is never cited.
+- `delivery.failing` (#273) is recorded once for a message delivery that fails
+  for good without reaching its provider: the provider refused its own
+  configuration (`provider-configuration`, also when restart recovery meets
+  it), or the twentieth not-sent attempt or failed restart-recovery launch
+  (`attempts-exhausted`; the recovered message then stays uncertain). It keeps the
+  provider, the attempt count and that class, never the error text, and cites
+  no event; each such failure also logs a `tracing::warn!`.
 - `server.getProfilerStatus` returns the 20 newest findings without evidence;
   the CLI and MCP readers return the evidence too.
 - **Versions (#98).** Every event line names the build that wrote it
@@ -1812,7 +1931,9 @@ it.
   on its CPU. A tick over 50 ms doubles the interval, up to 60 s; ten fast ticks
   in a row halve it again.
 - **Leak and CPU rules** (`leak.rs`, after RESIN). After a 15-minute warm-up and
-  on a rolling 10-minute minimum, `memory.leak-suspect` (warn) needs a Theil–Sen
+  on a rolling 10-minute minimum and on that floor's high-water mark since the
+  last reset, both of which must pass so neither memory freed again nor a refill
+  after a dip is growth, `memory.leak-suspect` (warn) needs a Theil–Sen
   slope of at least max(10 MB/h, 2% of the baseline per hour) over 1 h with a
   Mann–Kendall Z above 2.33. `memory.leak-likely` (error) needs 6 h of that
   growth fitting a line (R² > 0.8), or growth of at least 50% and 200 MB since
@@ -2054,8 +2175,9 @@ bounded memory, and works while the server is stopped.
   ending every wait in flight and interrupting owned mutations (recorded `unknown`),
   before the orchestration engine shuts down.
 - **Webhook dispatcher.** Outbound HTTP is not a child process. `webhooks.sendTest`
-  and `webhooks.redeliver` wait on a person's endpoint and are long-running; the
-  other `webhooks.*` methods are timed as usual. A failed delivery logs a
+  and `webhooks.redeliver` wait on a person's endpoint, and `webhooks.upsert` waits for
+  the endpoint's request in flight before it removes a replaced bearer token's file, so
+  all three are long-running; the other `webhooks.*` methods are timed as usual. A failed delivery logs a
   `tracing::warn!` with the endpoint id, status and error tag, never the URL. The
   dispatcher stops right after the MCP service in the quiesce sequence, before the
   profiler's teardown (see [Outbound webhooks](#outbound-webhooks)).
@@ -2620,6 +2742,22 @@ other client tool (see [Outside agents over MCP](#outside-agents-over-mcp)).
 environment, thread, and owner ids with the operation at `debug`, never the
 arguments.
 
+**Preview tool schemas.** Every `preview_*` tool, provider and client twin,
+advertises the compact input schema and description in
+`packages/contracts/fixtures/mcp-tools/preview-tools.json`. It is generated
+from the `PreviewAutomation*Input` schemas in
+`packages/contracts/src/previewAutomation.ts` by
+`packages/contracts/scripts/previewToolSchemas.ts` (`vp run check:contracts`
+regenerates it and fails on drift), and `mcp/tools/previews.rs` embeds it. The
+advertised schema drops what an agent cannot use: no `additionalProperties`, no
+safe-integer bounds, no `null` branch on optional fields, no regex patterns,
+and one object for a tagged union (`target`). Rules a JSON schema cannot state
+(exactly one click target, `tabId` with `reuseExistingTab: false`) are in the
+tool description. Decoding keeps the full contract: the web automation host
+decodes `request.input` with the operation's schema and answers a refusal with
+`PreviewAutomationInvalidInputError`, which names the fields and rules, never
+the values. A client twin adds a required `threadId` to the same schema.
+
 **Ownership and shutdown.** `ProductionRuntime` calls
 `DeviceManager::shutdown` after the preview gateway and before process
 ownership is frozen, so emulators and simulators stop gracefully rather than
@@ -2662,7 +2800,14 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   mcp`) is a stdio relay (`mcp/relay.rs`). It finds the server through the
   endpoint record and its per-boot proof (`mcp/endpoint.rs`), mints its own
   `mcp-client` credential in the data root's store, relays each JSON-RPC message
-  to `POST /mcp`, and revokes the credential when it exits. `bibcode thread`
+  to `POST /mcp`, and revokes the credential when it exits. An `mcp-client`
+  session's id is the id of the pairing link it was exchanged from, so the relay
+  records `<state>/mcp-clients/<link id>.link` before it sends the link and can
+  revoke the session even when the token response is lost. Revoking a relay
+  credential (`Repositories::revoke_mcp_credential`) also revokes its link,
+  consumed or not, and the server's insert of that session is fenced on the link
+  not being revoked, so a revoke that lands between the consume and the insert
+  leaves no session (#281). `bibcode thread`
   (`mcp/thread_cli.rs`) calls the same tools from a shell. Both protocol eras
   are served (`mcp/protocol.rs`). Remote Streamable HTTP with OAuth is slice R.
 - **Registry.** Tools are registered in families (`mcp/tools/*.rs`, listed in
@@ -2685,8 +2830,9 @@ mapping is in [RPC and orchestration](./rpc-and-orchestration.md#outside-agent-t
   events; each mutating call writes a content-free `mcp_activity` row
   (`mcp/activity.rs`); Stop, Take over and Hand back act on the session.
 - **Change feed.** `changes_since` (`mcp/tools/feed.rs`) pages the event log and
-  the activity log by a monotonic cursor without reading payload text; the
-  webhook dispatcher follows the same pages.
+  the activity log by a monotonic cursor without reading payload text other than
+  an agent's `purpose` on `thread.created`; the webhook dispatcher follows the same
+  pages and copies no `purpose`.
 - **Drift test.** `mcp::reference_docs` fails when a registered client tool,
   a `feed::ERRORS` tag or a webhook event type is missing from
   `docs/reference/`.
@@ -2731,10 +2877,25 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md),
   the checked addresses only (reqwest's resolve override, every other name refused),
   ignores proxies, follows no redirects, and gives up after 10 seconds without
   reading the body.
-- **Content.** Payloads carry ids, kinds, statuses and the feed cursor (or a
-  finding's `{ id, count, lastSeen }`); an agent is its kind and opaque client id,
-  never its label. Each body is HMAC-SHA256 signed over its timestamp with
+- **Content.** Payloads carry ids (the thread's and its project's), kinds, statuses and
+  the feed cursor (or a finding's `{ id, count, lastSeen }`); an agent is its kind and
+  opaque client id, never its label. An endpoint may limit `thread.status_changed` to
+  some feed kinds (`status_kinds_json`, migration 68; NULL sends all), which `address`
+  applies and a change of which is a new revision. Each body is HMAC-SHA256 signed over its timestamp with
   the endpoint's secret, kept in the secret store as `webhook-<id>`.
+- **Bearer token (#271).** An endpoint may also send `Authorization: Bearer`. Each
+  token value is its own secret-store file, `webhook-bearer-<id>-<32 hex>`, and the
+  row's `bearer_secret` (migration 66) names the current one, so the URL and the token
+  change in one commit and a destination is never paired with another one's token.
+  Every upsert and delete of an endpoint holds its edit lock from its read of the row
+  through cleanup; a file is written before the commit and removed only after the
+  commit stops naming it, under the endpoint's send lock (waited for, never cancelling
+  the request in flight), so a sender never reads a name whose file is gone. Each edit
+  also removes that endpoint's files the row does not name, which a crash between write
+  and commit leaves; there is no startup sweep, which would race a save. A URL change
+  must restate or remove the token. A row naming a file that cannot be read fails the
+  delivery as `token_missing`, never sent without it. The token is never listed
+  (`bearerTokenSet` only), logged or put in a profiler record.
 - **Controls.** `enableWebhooks` (default off) is a live setting: off cancels every
   request in flight, abandons the queue and resets the positions to the heads.
   Disabling an endpoint does the same for it; revoking its paired MCP client
@@ -3273,6 +3434,24 @@ anchoring a sent turn (the sent row glides to `CHAT_LIST_ANCHOR_OFFSET`, 16 px
 below the top, and the turn's end is revealed as the reply grows past the
 view), or free scrolling.
 
+- **Row estimates.** LegendList places a row it has not measured at the
+  average measured size of rows of its item type. `resolveTimelineItemType`
+  buckets message rows by role and text length (up to 2,000 characters, then
+  one bucket per doubling), so a short reply never takes its estimate from very
+  long ones. With one type for every reply, scrolling up past short replies
+  placed at a long reply's average shrank the list on each measurement and
+  pulled the next row in within the same layout pass, until React threw
+  "Maximum update depth exceeded" (#228). A row keeps the first type it
+  resolves to for the life of the timeline (`createStickyTimelineItemType`),
+  even after it leaves the rows, as a folded turn's rows do: LegendList keeps a
+  row's measured size and moves it into a new type's average without counting
+  it there, so a streaming reply crossing a bucket, or a folded row coming back
+  under another one, would inflate that bucket's estimate. The timeline is
+  keyed by thread, so a new thread starts both afresh. A row first seen
+  streaming takes a type of its own (`message:<role>:live:<row id>`), so a reply
+  that streams long sets no other row's estimate: an unmeasured live row gets
+  the default estimate. LegendList still reuses containers across types.
+  History loads with its full text and takes its own bucket.
 - **Reader takeover.** The reader scrolling stops following: the wheel, a
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,

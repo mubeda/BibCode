@@ -150,15 +150,19 @@ the user's running instance for this check.
 
 The CI-only seeded-upgrade matrix gives both macOS architectures 90-minute
 packaging children and 360-minute complete jobs; the Apple silicon runners have
-taken 43 minutes for one package. There are three sequential cold packages with separate Cargo
-outputs (candidate, previous stable, protected baseline), each with a separate
-10-minute frozen install; the cached repository `target` does not warm these
-outputs. Intel's remaining 60 minutes cover setup, all upgrade lanes, evidence,
-and cleanup. `remote-install` reuses the protected package. These allowances
+taken 43 minutes for one package. There are three sequential packages (candidate, previous stable,
+protected baseline) built into one run-owned Cargo target, each with a separate
+10-minute frozen install; the cached repository `target` does not warm it. Only
+the first build is cold: the later two reuse its registry dependencies, and each
+build's whole bundle directory is renamed into its own artifact root before the
+next build starts. Intel's remaining 60 minutes cover setup, all upgrade lanes, evidence,
+and cleanup. The smoke builds override the release profile with 16 codegen units, LTO off, and `opt-level` 1, because they prove upgrade behaviour, not optimised code: a single thin-LTO codegen unit kept Intel runners on one core for up to an hour per package, and optimising the workspace crates dominates what the shared target cannot remove. Release and CI packaging outside this harness keep the full release profile. The harness appends each install's and build's start, end, duration, and exit code or timeout to `build-timings.txt` in the evidence folder, plus a five-minute heartbeat with a `ps` sample of `rustc`, `cargo`, and `ld` (skipped on Windows), so a killed build still uploads evidence. The harness step ends 15 minutes before its job (345 of 360 minutes on macOS, 225 of 240 elsewhere) so the always-run upload still runs. `remote-install` reuses the protected package. These allowances
 leave product, WebDriver, and restart deadlines intact. Verify retries once
 when WebKit reports `Load failed` or the shell snapshot is not ready yet, and
 it still requires the candidate version, retained project, and storage
-identity. Record a packaging
+identity. Each lane also requires the embedded server's `serverVersion` to be the
+baseline version before the update and the candidate version after it; `result.json`
+records both as `observedServerVersions`. Record a packaging
 timeout separately from native upgrade results, and never run this CI harness
 locally. See the [seeded matrix procedure](../operations/release.md#seeded-packaged-upgrade-matrix).
 

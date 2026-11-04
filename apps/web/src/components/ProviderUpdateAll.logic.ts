@@ -33,7 +33,7 @@ import { remoteUpdateFailureMessage } from "./settings/remoteUpdatePresentation"
 
 /** The same copy the per-environment update rows show for an environment that dropped. */
 export const DISCONNECTED_ENVIRONMENT_REASON =
-  "This environment isn’t connected — try again once it reconnects.";
+  "This environment isn’t connected. Try again once it reconnects.";
 /** The copy a manual host's install refusal carries. */
 export const MANUAL_SERVER_UPDATE_REASON = new RemoteUpdateInstallError({
   code: REMOTE_UPDATE_MANUAL_REQUIRED,

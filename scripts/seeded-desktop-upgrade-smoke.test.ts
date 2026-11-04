@@ -1,4 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - The packaged-upgrade harness owns host paths.
+// @effect-diagnostics globalDate:off - The harness tests wait on real host processes.
+// @effect-diagnostics globalTimers:off - The harness tests poll real host processes with bounded waits.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -22,6 +24,9 @@ import {
 
 import {
   assertBaselineVersionIsOlder,
+  baselinePackage,
+  publishCandidateUpdater,
+  verifySeededUpgradeServerVersions,
   assertSeededUpgradeBuildVersion,
   assertWebDriverPhaseExit,
   remoteEvidenceReadFailure,
@@ -53,6 +58,7 @@ import {
   stopRemoteUploadFixture,
   removeSeededUpgradeDependencyTree,
   runBoundedCommand,
+  runTimedBuildCommand,
   seededUpgradeVitePlusExecutable,
   seededUpgradeBundleRoot,
   seededUpgradeRustTarget,
@@ -410,6 +416,33 @@ describe("remote phase receipt retention boundaries", () => {
       await fixture.dispose();
     }
   });
+  it("surfaces the driver's pairing-offer failure when no credential receipt exists", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      const message =
+        "Remote verification pairing offer could not be generated (share UI found=true, clicked=false).";
+      // The spec traces this line, then throws before any receipt is written.
+      fixture.runCommand.mockImplementation(async () => {
+        await NodeFS.promises.writeFile(
+          NodePath.join(fixture.evidenceDirectory, "remote-credential-trace.log"),
+          `${JSON.stringify({ step: "pairing-offer", widened: false, message })}
+`,
+        );
+        return { exitCode: 1, stdout: "fixture-private-returned-token", stderr: "" };
+      });
+      const error = await fixture.runPhase().catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).toContain(message);
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain(message);
+      expect(log).not.toContain("fixture-private-returned-token");
+    } finally {
+      await fixture.dispose();
+    }
+  });
   it.each(["returned", "thrown"])(
     "refuses final copies after a %s remote phase failure without a bootstrap receipt",
     async (kind) => {
@@ -515,7 +548,10 @@ const publicPairingGrant = {
 };
 
 /** Executes the generated credential callback and its receipt/driver handoff without a desktop. */
-const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
+const remoteGrantFixture = (
+  responses: ReadonlyArray<unknown>,
+  options: { readonly fromShareUi?: boolean } = {},
+) => {
   const input = {
     candidateVersion: "0.7.3",
     expectedDataRoot: absolute("remote", "data"),
@@ -531,9 +567,13 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     remoteSecretPath: absolute("remote", "private.json"),
     remoteUploadSecretPath: absolute("remote", "upload-private.json"),
     remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
+    remoteTracePath: absolute("remote", "evidence", "remote-credential-trace.log"),
   };
   const spec = createSeededUpgradeDriverSpec(input);
-  const start = spec.indexOf("    let credentials;");
+  // From the share UI, the generated scenario also runs the real widening guard.
+  const start = spec.indexOf(
+    options.fromShareUi ? "    const traceRemote = (entry) => {" : "    let credentials;",
+  );
   const end = spec.indexOf("\n  });\n});", start);
   if (start < 0 || end < 0) throw new Error("Generated remote credential scenario is missing.");
   // Replace module loading only; run the actual browser callback and handoff statements.
@@ -547,13 +587,31 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
   const driver = vi.fn(async (_credentials: unknown) => ({ phases: ["succeeded"] }));
   const execute = async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
     callback(...args);
+  const traces: string[] = [];
   const context = {
     input,
     widened: true,
     traceRemote: () => {},
     observation: { projectId: "remote-project" },
-    browser: { execute },
+    browser: {
+      execute,
+      // Poll the condition once per interval without a real clock.
+      waitUntil: async (
+        condition: () => Promise<boolean>,
+        { timeout, interval }: { timeout: number; interval: number },
+      ) => {
+        for (let elapsed = 0; elapsed < timeout; elapsed += interval) {
+          if (await condition()) return true;
+        }
+        throw new Error("waitUntil timed out");
+      },
+    },
+    document: {
+      // The share control exists but never becomes enabled.
+      querySelectorAll: () => [{ textContent: " Generate pairing offer ", disabled: true }],
+    },
     window: {
+      location: { hash: "" },
       desktopBridge: {
         getLocalEnvironmentBootstraps: () => [
           {
@@ -568,6 +626,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     NodeFS: {
       writeFileSync: (path: string, contents: string, options?: { mode: number }) =>
         files.set(path, { contents, ...options }),
+      appendFileSync: (_path: string, line: string) => traces.push(line),
     },
     loadFixture: async (path: string) => {
       if (path === input.remoteInstallDriverPath) return { runRemoteInstallDriver: driver };
@@ -586,6 +645,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     input,
     context,
     files,
+    traces,
     fetch,
     driver,
     run: () =>
@@ -624,6 +684,17 @@ describe("generated remote sharing grant handoff", () => {
       if (path !== fixture.input.remoteSecretPath)
         expect(file.contents).not.toContain("fixture-distinct-grant");
     }
+  });
+
+  it("fails fast without a credential receipt or coordinator call when the pairing offer cannot be generated", async () => {
+    const fixture = remoteGrantFixture([[publicPairingGrant]], { fromShareUi: true });
+    await expect(fixture.run()).rejects.toThrow(
+      "Remote verification pairing offer could not be generated (share UI found=false, clicked=false).",
+    );
+    expect(fixture.files.size).toBe(0);
+    expect(fixture.fetch).not.toHaveBeenCalled();
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(fixture.traces.join("")).toContain('"step":"pairing-offer"');
   });
 
   it("waits for minting after native exposure has already widened", async () => {
@@ -879,19 +950,86 @@ describe("seeded packaging build budgets", () => {
   if ([commandStart, commandEnd, buildStart, buildEnd, callsStart, callsEnd].some((i) => i < 0))
     throw new Error("Seeded packaging command source is unavailable.");
 
-  const fixture = (platform: SeededDesktopUpgradeSmokeInput["platform"], arch: "arm64" | "x64") => {
-    const layout = createSeededUpgradeRunLayout(absolute("work"), "budget-fixture");
-    const runCommand = vi.fn(async (_input: Parameters<typeof runBoundedCommand>[0]) => ({
-      exitCode: 0,
-      stderr: "",
-      stdout: "",
-    }));
+  const roots: string[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      roots.splice(0).map((root) => NodeFS.promises.rm(root, { recursive: true, force: true })),
+    );
+  });
+
+  const packageName = (platform: SeededDesktopUpgradeSmokeInput["platform"]) =>
+    platform === "mac"
+      ? "dmg/BiBCode.dmg"
+      : platform === "linux"
+        ? "appimage/BiBCode.AppImage"
+        : "nsis/BiBCode-setup.exe";
+  const payloadName = (platform: SeededDesktopUpgradeSmokeInput["platform"]) =>
+    platform === "mac" ? "macos/BiBCode.app.tar.gz" : packageName(platform);
+
+  const fixture = (
+    platform: SeededDesktopUpgradeSmokeInput["platform"],
+    arch: "arm64" | "x64",
+    options: {
+      readonly omitBundleFor?: string;
+      /** Error codes the first bundle renames fail with, as a scanner holding a file would. */
+      readonly renameFailures?: ReadonlyArray<string>;
+      readonly wsl?: boolean;
+    } = {},
+  ) => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "seeded-packaging-"));
+    roots.push(root);
+    const layout = createSeededUpgradeRunLayout(root, "budget-fixture");
+    const triple = seededUpgradeRustTarget(platform, arch);
+    const bundleAtStart: Record<string, ReadonlyArray<string>> = {};
+    // Stands in for `tauri build`: like Tauri, it adds to whatever bundle directory exists
+    // and leaves compilation state beside it in the Cargo target it was given.
+    const runCommand = vi.fn(async (command: Parameters<typeof runBoundedCommand>[0]) => {
+      const target = command.env?.CARGO_TARGET_DIR;
+      const build = command.label?.endsWith(" vp run build")
+        ? command.label.slice(0, -" vp run build".length)
+        : undefined;
+      if (build !== undefined && target !== undefined) {
+        const release = NodePath.join(target, triple, "release");
+        const bundle = NodePath.join(release, "bundle");
+        bundleAtStart[build] = NodeFS.existsSync(bundle)
+          ? NodeFS.readdirSync(bundle, { recursive: true }).map(String)
+          : [];
+        const write = (path: string, text: string) => {
+          NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
+          NodeFS.writeFileSync(path, text);
+        };
+        write(NodePath.join(release, "deps", `${build}.rlib`), build);
+        if (options.omitBundleFor !== build) {
+          write(NodePath.join(bundle, packageName(platform)), `${build} package`);
+          if (build === "candidate") {
+            if (platform === "mac")
+              write(NodePath.join(bundle, payloadName(platform)), `${build} payload`);
+            write(NodePath.join(bundle, `${payloadName(platform)}.sig`), `${build} signature`);
+          }
+        }
+      }
+      return { exitCode: 0, stderr: "", stdout: "" };
+    });
     const prepareSeededUpgradeBuild = vi.fn(async () => {});
     const signingEnvironment = { TAURI_SIGNING_PRIVATE_KEY: "fixture-private-key" };
+    const artifactDirectory = NodePath.join(root, "evidence");
+    const renameFailures = [...(options.renameFailures ?? [])];
+    const rename = vi.fn(async (from: string, to: string) => {
+      const code = renameFailures.shift();
+      if (code !== undefined) throw Object.assign(new Error(code), { code });
+      await NodeFS.promises.rename(from, to);
+    });
     const context = {
       NodePath,
+      NodeFS: { ...NodeFS, promises: { ...NodeFS.promises, rename } },
+      console,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      SeededUpgradeCommandTimeoutError,
       runCommand,
       prepareSeededUpgradeBuild,
+      seededUpgradeBundleRoot,
       seededUpgradeVitePlusExecutable,
       seededUpgradeRustTarget,
       SeededDesktopUpgradeSmokeError,
@@ -904,14 +1042,27 @@ describe("seeded packaging build budgets", () => {
         arch,
         platform,
         bundle: platform === "mac" ? "dmg" : platform === "win" ? "nsis" : "appimage",
+        artifactDirectory,
         repositoryRoot,
         candidateVersion: "9.9.9-upgrade.1",
         previousVersion: "1.2.3",
-        wsl: false,
+        wsl: options.wsl === true,
       },
     };
+    const staged = (buildRoot: string, relative = packageName(platform)) =>
+      NodeFS.readFileSync(
+        NodePath.join(seededUpgradeBundleRoot(buildRoot, platform, arch), relative),
+        "utf8",
+      );
     return {
       ...context,
+      bundleAtStart,
+      rename,
+      sharedBundle: seededUpgradeBundleRoot(layout.cargoTargetRoot, platform, arch),
+      staged,
+      timings: () =>
+        NodeFS.readFileSync(NodePath.join(artifactDirectory, "build-timings.txt"), "utf8"),
+      triple,
       run: () =>
         NodeVM.runInNewContext(
           NodeModule.stripTypeScriptTypes(
@@ -923,40 +1074,58 @@ describe("seeded packaging build budgets", () => {
     };
   };
 
-  it.each([
+  const combinations = [
     ["mac", "x64", 90],
     ["mac", "arm64", 90],
     ["linux", "x64", 45],
     ["linux", "arm64", 45],
     ["win", "x64", 60],
     ["win", "arm64", 60],
-  ] as const)(
-    "bounds all three %s/%s packaging commands at %i minutes",
+  ] as const;
+
+  it.each(combinations)(
+    "bounds all three %s/%s packaging commands at %i minutes in one shared Cargo target",
     async (platform, arch, minutes) => {
       const owned = fixture(platform, arch);
       await owned.run();
       expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(3);
       expect(owned.runCommand).toHaveBeenCalledTimes(6);
       const builds = [
-        [owned.layout.candidateCheckout, owned.layout.candidateBuildRoot, owned.candidateOverlay],
         [
+          "candidate",
+          owned.layout.candidateCheckout,
+          owned.layout.candidateBuildRoot,
+          owned.candidateOverlay,
+        ],
+        [
+          "previous-stable",
           owned.layout.previousStable.checkout,
           owned.layout.previousStable.buildRoot,
           owned.previousOverlay,
         ],
         [
+          "protected-baseline",
           owned.layout.protectedBaseline.checkout,
           owned.layout.protectedBaseline.buildRoot,
           owned.protectedOverlay,
         ],
-      ];
-      expect(new Set(builds.map(([, target]) => target)).size).toBe(3);
-      for (const [index, [checkout, target, overlay]] of builds.entries()) {
+      ] as const;
+      // One run-owned Cargo target outside every checkout; three distinct artifact roots.
+      const shared = owned.layout.cargoTargetRoot;
+      expect(NodePath.dirname(shared)).toBe(NodePath.dirname(owned.layout.updaterRoot));
+      expect(new Set(builds.map(([, , artifacts]) => artifacts)).size).toBe(3);
+      for (const [name, checkout, artifacts, overlay] of builds) {
+        expect(NodePath.relative(checkout, shared).startsWith("..")).toBe(true);
+        expect(artifacts).not.toBe(shared);
+        // Each package keeps its own bundle although every build overwrote the shared one.
+        expect(owned.staged(artifacts)).toBe(`${name} package`);
+        const index = builds.findIndex(([build]) => build === name);
         expect(owned.runCommand).toHaveBeenNthCalledWith(index * 2 + 1, {
           command: seededUpgradeVitePlusExecutable,
           args: ["install", "--frozen-lockfile"],
           cwd: checkout,
           inherit: true,
+          label: `${name} vp install`,
           timeoutMs: 10 * 60_000,
         });
         expect(owned.runCommand).toHaveBeenNthCalledWith(index * 2 + 2, {
@@ -969,9 +1138,9 @@ describe("seeded packaging build budgets", () => {
             "--features",
             "desktop-e2e",
             "--config",
-            NodePath.join(checkout!, "apps/desktop/src-tauri/tauri.release.conf.json"),
+            NodePath.join(checkout, "apps/desktop/src-tauri/tauri.release.conf.json"),
             "--config",
-            NodePath.join(checkout!, "apps/desktop/src-tauri/tauri.e2e.conf.json"),
+            NodePath.join(checkout, "apps/desktop/src-tauri/tauri.e2e.conf.json"),
             "--config",
             overlay,
             "--bundles",
@@ -980,13 +1149,150 @@ describe("seeded packaging build budgets", () => {
             seededUpgradeRustTarget(platform, arch),
           ],
           cwd: checkout,
-          env: { ...owned.signingEnvironment, CARGO_TARGET_DIR: target },
+          // The smoke proves upgrade behaviour, not optimised code, so every build shares
+          // one smoke-only profile override.
+          env: {
+            ...owned.signingEnvironment,
+            CARGO_TARGET_DIR: shared,
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16",
+            CARGO_PROFILE_RELEASE_LTO: "off",
+            CARGO_PROFILE_RELEASE_OPT_LEVEL: "1",
+          },
           inherit: true,
+          label: `${name} vp run build`,
           timeoutMs: minutes * 60_000,
         });
       }
+      // Every install and build leaves a start and an end line even if a later one times out.
+      const lines = owned.timings().trim().split("\n");
+      expect(lines).toHaveLength(12);
+      expect(lines[0]).toMatch(/^candidate vp install started \d{4}-\d\d-\d\dT/);
+      expect(lines[11]).toMatch(/^protected-baseline vp run build ended .* exit code 0$/);
     },
   );
+
+  it("builds only the candidate and protected baseline into the shared target under WSL", async () => {
+    const owned = fixture("win", "x64", { wsl: true });
+    await owned.run();
+    expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(2);
+    const builds = owned.runCommand.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command.args[0] === "run");
+    expect(builds.map((command) => command.label)).toEqual([
+      "candidate vp run build",
+      "protected-baseline vp run build",
+    ]);
+    for (const command of builds)
+      expect(command.env?.CARGO_TARGET_DIR).toBe(owned.layout.cargoTargetRoot);
+    expect(owned.staged(owned.layout.candidateBuildRoot)).toBe("candidate package");
+    expect(owned.staged(owned.layout.protectedBaseline.buildRoot)).toBe(
+      "protected-baseline package",
+    );
+    expect(NodeFS.existsSync(owned.layout.previousStable.buildRoot)).toBe(false);
+  });
+
+  it.each(combinations)(
+    "publishes the %s/%s candidate payload and installs each baseline's own package",
+    async (platform, arch) => {
+      const owned = fixture(platform, arch);
+      await owned.run();
+      await NodeFS.promises.mkdir(owned.layout.updaterRoot, { recursive: true });
+      await publishCandidateUpdater({
+        arch,
+        candidateBuildRoot: owned.layout.candidateBuildRoot,
+        candidateVersion: owned.input.candidateVersion,
+        platform,
+        updaterPort: 4312,
+        updaterRoot: owned.layout.updaterRoot,
+      });
+      const payload = NodePath.basename(payloadName(platform));
+      const manifest = JSON.parse(
+        await NodeFS.promises.readFile(
+          NodePath.join(owned.layout.updaterRoot, "latest.json"),
+          "utf8",
+        ),
+      );
+      expect(manifest.platforms[updaterTargetFor(platform, arch)]).toEqual({
+        signature: "candidate signature",
+        url: `http://127.0.0.1:4312/${payload}`,
+      });
+      expect(
+        await NodeFS.promises.readFile(NodePath.join(owned.layout.updaterRoot, payload), "utf8"),
+      ).toBe(platform === "mac" ? "candidate payload" : "candidate package");
+      for (const [buildRoot, name] of [
+        [owned.layout.previousStable.buildRoot, "previous-stable"],
+        [owned.layout.protectedBaseline.buildRoot, "protected-baseline"],
+      ] as const) {
+        const found = await baselinePackage(buildRoot, platform, arch);
+        expect(await NodeFS.promises.readFile(found, "utf8")).toBe(`${name} package`);
+      }
+    },
+  );
+
+  it("clears a stale shared bundle before every build without touching compilation state", async () => {
+    const owned = fixture("mac", "x64");
+    const stale = NodePath.join(owned.sharedBundle, "macos", "Stale.app.tar.gz.sig");
+    await NodeFS.promises.mkdir(NodePath.dirname(stale), { recursive: true });
+    await NodeFS.promises.writeFile(stale, "stale signature");
+    await owned.run();
+    expect(owned.bundleAtStart).toEqual({
+      candidate: [],
+      "previous-stable": [],
+      "protected-baseline": [],
+    });
+    for (const buildRoot of [
+      owned.layout.candidateBuildRoot,
+      owned.layout.previousStable.buildRoot,
+      owned.layout.protectedBaseline.buildRoot,
+    ]) {
+      expect(
+        NodeFS.existsSync(
+          NodePath.join(
+            seededUpgradeBundleRoot(buildRoot, "mac", "x64"),
+            "macos",
+            "Stale.app.tar.gz.sig",
+          ),
+        ),
+      ).toBe(false);
+    }
+    // Staging moves only the bundle; dependency outputs stay for the next build to reuse.
+    const deps = NodePath.join(owned.layout.cargoTargetRoot, owned.triple, "release", "deps");
+    expect((await NodeFS.promises.readdir(deps)).toSorted()).toEqual([
+      "candidate.rlib",
+      "previous-stable.rlib",
+      "protected-baseline.rlib",
+    ]);
+    expect(NodeFS.existsSync(owned.sharedBundle)).toBe(false);
+  });
+
+  it("stops before later builds when a build leaves no bundle to stage", async () => {
+    const owned = fixture("linux", "x64", { omitBundleFor: "candidate" });
+    await expect(owned.run()).rejects.toThrow(/stage the candidate bundle/);
+    expect(owned.runCommand).toHaveBeenCalledTimes(2);
+    expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a bundle rename that a scanner briefly blocks", async () => {
+    const owned = fixture("win", "x64", { renameFailures: ["EBUSY", "EPERM"] });
+    await owned.run();
+    expect(owned.rename).toHaveBeenCalledTimes(5);
+    expect(owned.staged(owned.layout.candidateBuildRoot)).toBe("candidate package");
+  });
+
+  it("refuses an occupied bundle destination and stops before later builds", async () => {
+    const owned = fixture("win", "x64");
+    const occupied = NodePath.join(
+      seededUpgradeBundleRoot(owned.layout.previousStable.buildRoot, "win", "x64"),
+      "earlier.txt",
+    );
+    await NodeFS.promises.mkdir(NodePath.dirname(occupied), { recursive: true });
+    await NodeFS.promises.writeFile(occupied, "earlier");
+    await expect(owned.run()).rejects.toThrow(/previous-stable bundle destination already exists/);
+    expect(owned.runCommand).toHaveBeenCalledTimes(4);
+    expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(2);
+    expect(await NodeFS.promises.readFile(occupied, "utf8")).toBe("earlier");
+    expect(owned.staged(owned.layout.candidateBuildRoot)).toBe("candidate package");
+  });
 
   it.each([1, 2])(
     "still stops on failed command %i before later packages",
@@ -1000,6 +1306,63 @@ describe("seeded packaging build budgets", () => {
       expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(1);
     },
   );
+});
+
+describe("runTimedBuildCommand", () => {
+  const withDirectory = async (body: (directory: string) => Promise<void>) => {
+    const directory = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-build-timings-"),
+    );
+    try {
+      await body(directory);
+    } finally {
+      await NodeFS.promises.rm(directory, { recursive: true, force: true });
+    }
+  };
+
+  it("records the start, end, duration, and exit code of a failed build", () =>
+    withDirectory(async (directory) => {
+      await expect(
+        runTimedBuildCommand({
+          artifactDirectory: directory,
+          command: process.execPath,
+          args: ["-e", "process.exit(3)"],
+          cwd: directory,
+          label: "candidate vp run build",
+          timeoutMs: 60_000,
+        }),
+      ).rejects.toThrow("candidate vp run build exited with code 3.");
+      const lines = (
+        await NodeFS.promises.readFile(NodePath.join(directory, "build-timings.txt"), "utf8")
+      )
+        .trim()
+        .split("\n");
+      expect(lines[0]).toMatch(/^candidate vp run build started \d{4}-\d\d-\d\dT[\d:.]+Z$/);
+      expect(lines.at(-1)).toMatch(
+        /^candidate vp run build ended \d{4}-\d\d-\d\dT[\d:.]+Z after \d+s: exit code 3$/,
+      );
+    }));
+
+  it("names the build in the timeout and leaves heartbeat evidence", () =>
+    withDirectory(async (directory) => {
+      const pending = runTimedBuildCommand({
+        artifactDirectory: directory,
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: directory,
+        heartbeatMs: 200,
+        label: "previous-stable vp run build",
+        timeoutMs: 1_500,
+      });
+      await expect(pending).rejects.toBeInstanceOf(SeededUpgradeCommandTimeoutError);
+      await expect(pending).rejects.toThrow("previous-stable vp run build timed out after 1500ms.");
+      const text = await NodeFS.promises.readFile(
+        NodePath.join(directory, "build-timings.txt"),
+        "utf8",
+      );
+      expect(text).toMatch(/^previous-stable vp run build heartbeat .*\(0 min\)$/m);
+      expect(text.trim().split("\n").at(-1)).toMatch(/: timed out$/);
+    }));
 });
 
 /** Minimal VERSIONINFO whose ProductVersion alignment is relative to the resource, not the file. */
@@ -1481,6 +1844,9 @@ describe("seeded packaged desktop upgrade harness", () => {
       expect(spec).toContain("remote-credential-trace.log");
       expect(spec).toContain('step: "share-ui"');
       expect(spec).toContain('step: "credentials"');
+      expect(spec).toContain("pairing offer could not be generated");
+      expect(spec).toContain('step: "pairing-offer"');
+      expect(spec).not.toContain("bootstrap unavailable");
       expect(spec).toContain("[redacted]");
       expect(spec).not.toContain("bridge.installUpdate()");
     } finally {
@@ -1836,6 +2202,8 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(layout.candidateCheckout).not.toBe(layout.previousStable.checkout);
     expect(layout.candidateCheckout).not.toBe(layout.protectedBaseline.checkout);
     expect(layout.updaterRoot).toBe(absolute("work", "run-17", "updater"));
+    // One run-owned Cargo target beside, never inside, the checkouts and artifact roots.
+    expect(layout.cargoTargetRoot).toBe(absolute("work", "run-17", "cargo-target"));
   });
 
   it("pins real checkout manifests and lock entries for every build without changing the caller", async () => {
@@ -1979,12 +2347,14 @@ describe("seeded packaged desktop upgrade harness", () => {
       effectiveRoot: absolute("work", "data"),
       projectId: "project-seeded",
       projectIds: ["project-seeded"],
+      serverVersion: "0.3.10",
       storageInstanceId: null,
     } as const;
     const after = {
       appVersion: "0.3.11",
       effectiveRoot: absolute("work", "data"),
       projectIds: ["project-seeded"],
+      serverVersion: "0.3.11",
       storageInstanceId: "8a8c318a-e2c3-4f78-a61c-3ba53b0a10af",
       preUpdateBackups: [],
     } as const;
@@ -2012,12 +2382,14 @@ describe("seeded packaged desktop upgrade harness", () => {
       effectiveRoot: absolute("work", "data"),
       projectId: "project-seeded",
       projectIds: ["project-seeded"],
+      serverVersion: "0.3.10",
       storageInstanceId,
     } as const;
     const after = {
       appVersion: "0.3.11",
       effectiveRoot: before.effectiveRoot,
       projectIds: ["project-seeded"],
+      serverVersion: "0.3.11",
       storageInstanceId,
       preUpdateBackups: [{ storageInstanceId, trigger: "pre-update" }],
     } as const;
@@ -2060,6 +2432,31 @@ describe("seeded packaged desktop upgrade harness", () => {
     ).toThrow(/pre-update backup/);
   });
 
+  it("requires the baseline then candidate native server version around the update", () => {
+    const versions = { baselineVersion: "0.3.10", candidateVersion: "0.3.11" } as const;
+    const verify =
+      (before: string | null, after: string | null, wsl = false) =>
+      () =>
+        verifySeededUpgradeServerVersions({
+          ...versions,
+          before: { serverVersion: before },
+          after: { serverVersion: after },
+          wsl,
+        });
+
+    expect(verify("0.3.10", "0.3.11")).not.toThrow();
+    // A stale shared-target binary would carry the other build's version.
+    expect(verify("0.3.11", "0.3.11")).toThrow(
+      "The baseline server reported 0.3.11 before update, not 0.3.10.",
+    );
+    expect(verify("0.3.10", "0.3.10")).toThrow(
+      "The candidate server reported 0.3.10 after update, not 0.3.11.",
+    );
+    expect(verify(null, "0.3.11")).toThrow(/baseline server reported no version/);
+    // WSL's primary server is built separately and does not carry the desktop version.
+    expect(verify(null, "0.1.0", true)).not.toThrow();
+  });
+
   it("names why the candidate listed no pre-update backup", () => {
     const storageInstanceId = "8a8c318a-e2c3-4f78-a61c-3ba53b0a10af";
     const before = {
@@ -2067,12 +2464,14 @@ describe("seeded packaged desktop upgrade harness", () => {
       effectiveRoot: absolute("work", "data"),
       projectId: "project-seeded",
       projectIds: ["project-seeded"],
+      serverVersion: "0.3.10",
       storageInstanceId,
     } as const;
     const after = {
       appVersion: "0.3.11",
       effectiveRoot: before.effectiveRoot,
       projectIds: ["project-seeded"],
+      serverVersion: "0.3.11",
       storageInstanceId,
       preUpdateBackups: [],
     } as const;
@@ -2102,7 +2501,10 @@ describe("seeded packaged desktop upgrade harness", () => {
       ]),
     ).toThrow("The candidate could not inspect primary project data: database is locked");
     expect(verify([primary])).toThrow(
-      `primary healthy, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+      `primary healthy, issue: none, 0 listed for storage ${storageInstanceId}; rejected generations, if any, are in remote-install-backup-inventory.log`,
+    );
+    expect(verify([{ ...primary, issue: "generation 3 rejected" }])).toThrow(
+      "primary healthy, issue: generation 3 rejected, 0 listed",
     );
     expect(verify(undefined)).toThrow(
       /^The protected update did not retain a verified pre-update backup\.$/,
@@ -2236,18 +2638,22 @@ describe("seeded packaged desktop upgrade harness", () => {
       NodePath.join(NodeOS.tmpdir(), "bibcode-command-close-"),
     );
     const finishedPath = NodePath.join(root, "writer-finished");
+    const writerPidPath = NodePath.join(root, "writer-pid");
     const writerSource = `
       setTimeout(() => {
         process.stdout.write("late-tail");
         require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
       }, 125);
     `;
+    // Detached: on Windows, Node puts children in a kill-on-close job, so an
+    // attached writer dies with its parent and never writes the late tail.
     const parentSource = `
       const writer = require("node:child_process").spawn(
         process.execPath,
         ["-e", ${JSON.stringify(writerSource)}],
-        { stdio: ["ignore", "inherit", "inherit"] }
+        { detached: true, stdio: ["ignore", "inherit", "inherit"] }
       );
+      require("node:fs").writeFileSync(${JSON.stringify(writerPidPath)}, String(writer.pid));
       writer.once("spawn", () => {
         process.stdout.write("early|");
         process.exit(0);
@@ -2258,20 +2664,22 @@ describe("seeded packaged desktop upgrade harness", () => {
         command: process.execPath,
         args: ["-e", parentSource],
         cwd: root,
-        timeoutMs: 2_000,
+        // Two Node startups on a loaded host; the bound only stops a hung test.
+        timeoutMs: 20_000,
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe("early|late-tail");
       expect(NodeFS.existsSync(finishedPath)).toBe(true);
     } finally {
-      // Even the old exit-only counterexample owns its bounded writer until
-      // completion, before removing the directory that writer uses.
-      await waitForUpgradeCondition({
-        description: "synthetic writer completion",
-        intervalMs: 10,
-        timeoutMs: 2_000,
-        probe: async () => NodeFS.existsSync(finishedPath),
-      });
+      // The detached writer has no job or parent to end it, so a failed run
+      // stops it before removing the directory it writes to. A finished writer
+      // is already gone: the command waited for its stdout to close.
+      const writerPid = NodeFS.existsSync(writerPidPath)
+        ? Number(NodeFS.readFileSync(writerPidPath, "utf8"))
+        : undefined;
+      if (writerPid !== undefined && !NodeFS.existsSync(finishedPath)) {
+        await stopDetachedWriter(writerPid);
+      }
       await NodeFS.promises.rm(root, { recursive: true, force: true });
     }
   });
@@ -2372,6 +2780,7 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(combined).toContain("getLocalEnvironmentBootstraps");
     expect(combined).toContain("getLocalEnvironmentBearerToken");
     expect(combined).toContain("/.well-known/bibcode/environment");
+    expect(combined).toContain('typeof descriptor?.serverVersion === "string"');
     expect(combined).toContain("orchestration.dispatchCommand");
     expect(combined).toContain("project.create");
     expect(combined).toContain("orchestration.subscribeShell");
@@ -2497,3 +2906,32 @@ describe("waitForWindowsRelaunchedApplication", () => {
     ).rejects.toThrow("ENOENT");
   });
 });
+
+const processIsAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Ends a detached test writer and its tree, then waits up to 5 s for it to go. */
+const stopDetachedWriter = async (pid: number): Promise<void> => {
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- the real host decides how to end this real child.
+  const treeKill = ownedChildTreeKillCommand(process.platform, pid);
+  try {
+    if (treeKill === undefined) process.kill(pid, "SIGKILL");
+    else
+      NodeChildProcess.spawnSync(treeKill.command, [...treeKill.args], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+  } catch {
+    // Already gone.
+  }
+  const deadline = Date.now() + 5_000;
+  while (processIsAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};

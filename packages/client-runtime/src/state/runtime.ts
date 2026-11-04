@@ -902,14 +902,26 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
 
 export function createEnvironmentCommand<R, ER, Input, A, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: EnvironmentAtomOptions<Input, A, E, EnvironmentSupervisor | R>,
+  options: Omit<EnvironmentAtomOptions<Input, A, E, EnvironmentSupervisor | R>, "execute"> & {
+    /** The context is what a command reads when it runs, such as the environment's config. */
+    readonly execute: (
+      input: Input,
+      context: {
+        readonly environmentId: EnvironmentIdType;
+        readonly registry: AtomRegistry.AtomRegistry;
+      },
+    ) => Effect.Effect<A, E, EnvironmentSupervisor | R>;
+  },
 ) {
   return createRuntimeCommand(runtime, {
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (target) => {
-      const effect = runInEnvironment(target.environmentId, options.execute(target.input));
+    execute: (target, registry) => {
+      const effect = runInEnvironment(
+        target.environmentId,
+        options.execute(target.input, { environmentId: target.environmentId, registry }),
+      );
       return options.timeoutMs === undefined
         ? effect
         : effect.pipe(Effect.timeout(options.timeoutMs));

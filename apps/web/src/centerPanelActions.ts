@@ -12,8 +12,14 @@
  * just register a surface — the terminal is attach-created lazily by the view.
  * History continues a Claude Code terminal session in a panel the server
  * creates (`agentSessions.openInPanel`), whose tab becomes active once it does.
+ * A close hides the panel from adoption while this page archives it, or while
+ * the creation it waits on is in flight (`centerPanelClose`); a creation closed
+ * meanwhile never sends its first question. A side chat (#265) is a panel the
+ * server seeds with the host's messages; `:btw` sends its question once it exists.
+ * Closing a side chat nobody sent to deletes it instead of archiving it, where the server
+ * can refuse a used one; a refusal archives it.
  */
-import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -22,7 +28,6 @@ import type {
   AgentSessionOpenInPanelResult,
   AgentSessionOpenMode,
   CommandId,
-  EnvironmentId,
   ModelSelection,
   ProjectId,
   ScopedThreadRef,
@@ -32,8 +37,16 @@ import { DEFAULT_PROVIDER_INTERACTION_MODE, DEFAULT_RUNTIME_MODE } from "@bibcod
 import { useCallback } from "react";
 
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
+import {
+  archiveClosingChatPanel,
+  closesByUnusedDelete,
+  hideClosingChatPanel,
+  markChatPanelSent,
+  releaseUncreatedChatPanel,
+} from "~/centerPanelClose";
 import { useCenterPanelStore, type CenterSurface } from "~/centerPanelStore";
-import { newCommandId, newThreadId } from "~/lib/utils";
+import { useComposerDraftStore } from "~/composerDraftStore";
+import { newCommandId, newMessageId, newThreadId } from "~/lib/utils";
 import { readThreadShell } from "~/state/entities";
 import { projectEnvironment } from "~/state/projects";
 import { threadEnvironment } from "~/state/threads";
@@ -53,6 +66,40 @@ export interface CreateChatPanelInput {
   readonly providerLabel: string;
 }
 
+/** A side chat of the host: a chat panel the server seeds with the host's messages. */
+export interface CreateSideChatInput extends CreateChatPanelInput {
+  /** Sent to the side chat once it exists; empty opens it empty. */
+  readonly question: string;
+  /**
+   * The host draft's text a `:btw` submitted. The host draft is cleared once the question
+   * was handed over, and only while it still holds exactly this text. Absent from the menu.
+   */
+  readonly submittedText?: string;
+}
+
+export const SIDE_CHAT_SEND_FAILED_TITLE = "Couldn't send to the side chat";
+export const SIDE_CHAT_SEND_FAILED_DESCRIPTION = "Your question is in its composer.";
+
+/** The tab label of a side chat; its thread title is this behind the panel prefix. */
+export const sideChatLabel = (providerLabel: string) => `Side chat · ${providerLabel}`;
+
+/** Hosts with a side chat being created, so a second Enter on the same `:btw` opens nothing. */
+const pendingSideChatHosts = new Set<string>();
+
+/**
+ * Each creation this page waits on, by scoped thread key: `closed` once its tab closed. The
+ * creation's own continuation reads it, so a closed one never sends its first question.
+ */
+const creations = new Map<string, { closed: boolean }>();
+
+/** Empty side chats whose composer takes focus once their thread shows. */
+const composerFocusRequests = new Set<string>();
+
+/** Whether `ref`'s composer was asked to take focus; answers true once. */
+export function takeComposerFocusRequest(ref: ScopedThreadRef): boolean {
+  return composerFocusRequests.delete(scopedThreadKey(ref));
+}
+
 /** A Claude Code terminal session History continues in a chat panel. */
 export interface OpenSessionPanelInput {
   readonly sessionId: string;
@@ -68,6 +115,12 @@ export interface OpenSessionPanelInput {
  * making another copy. A success or the server's own refusal settles the open.
  */
 const unsettledSessionOpens = new Map<string, CommandId>();
+
+/** `thread.delete` with `onlyIfUnused` refused: the thread was used. */
+const isThreadInUse = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  (error as { readonly _tag?: unknown })._tag === "OrchestrationThreadInUseError";
 
 /** A failure the server decided, as opposed to a request that may not have reached it. */
 const isServerRefusal = (error: unknown): boolean =>
@@ -95,6 +148,12 @@ export interface PanelThreadOpener {
 
 export interface CenterPanelActions extends PanelThreadOpener {
   createChatPanel: (input: CreateChatPanelInput) => Promise<ThreadId | null>;
+  /**
+   * Opens a side chat of `hostRef` and sends `question` there. Resolves the side chat's
+   * thread, or `null` when none opened (one is already being created for this host, or the
+   * creation failed and was shown).
+   */
+  createSideChat: (input: CreateSideChatInput) => Promise<ThreadId | null>;
   /**
    * Continues a terminal session in a chat panel of `hostRef`, which becomes the active tab when
    * the panel is `hostRef`'s. Resolves where the session landed, or `null` once a failure was
@@ -169,19 +228,43 @@ export function usePanelThreadOpener(): PanelThreadOpener {
   return { reopenChatPanel, openPanelThread };
 }
 
+/**
+ * Clears the host draft a `:btw` submitted, only while it still holds exactly that text and
+ * nothing else: an edit made meanwhile is the user's and stays.
+ */
+function clearSubmittedHostDraft(hostRef: ScopedThreadRef, submittedText: string): void {
+  const drafts = useComposerDraftStore.getState();
+  const draft = drafts.getComposerDraft(hostRef);
+  if (
+    !draft ||
+    draft.prompt !== submittedText ||
+    draft.attachments.length > 0 ||
+    draft.terminalContexts.length > 0 ||
+    draft.elementContexts.length > 0 ||
+    draft.previewAnnotations.length > 0 ||
+    draft.reviewComments.length > 0
+  ) {
+    return;
+  }
+  drafts.setPrompt(hostRef, "");
+}
+
 export function useCenterPanelActions({
   onCloseTerminal,
 }: CenterPanelActionsOptions): CenterPanelActions {
   const createPanel = useAtomCommand(worktreeEnvironment.createPanel, { reportFailure: false });
   const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
+  const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
+  const startTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const interruptTurn = useAtomCommand(threadEnvironment.interruptTurn, { reportFailure: false });
   const openInPanel = useAtomCommand(projectEnvironment.openAgentSessionInPanel, {
     reportFailure: false,
   });
   const { reopenChatPanel, openPanelThread } = usePanelThreadOpener();
 
+  /** Resolves the archive's event sequence once the server archived it, else `null`. */
   const archivePanelThread = useCallback(
-    async (environmentId: EnvironmentId, threadId: ThreadId) => {
+    async ({ environmentId, threadId }: ScopedThreadRef): Promise<number | null> => {
       const session = readThreadShell(scopeThreadRef(environmentId, threadId))?.session;
       if (session?.status === "running") {
         // Best effort: an interrupt that fails must not keep the closed panel live.
@@ -194,7 +277,8 @@ export function useCenterPanelActions({
         });
       }
       const result = await archiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      if (result._tag === "Success") return result.value.sequence;
+      if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         toastManager.add(
           stackedThreadToast({
@@ -204,36 +288,75 @@ export function useCenterPanelActions({
           }),
         );
       }
+      return null;
     },
     [archiveThread, interruptTurn],
   );
 
-  const createChatPanel = useCallback(
-    async (input: CreateChatPanelInput): Promise<ThreadId | null> => {
-      const { hostRef, modelSelection, providerLabel } = input;
-      const environmentId = hostRef.environmentId;
-      const threadId = newThreadId();
-      const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
-      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, providerLabel);
+  /**
+   * Ends a closed panel: deletes a side chat nobody sent to, else archives it. Resolves the
+   * event sequence of whichever the server did, or `null` for any other outcome.
+   */
+  const closePanelThread = useCallback(
+    async (ref: ScopedThreadRef, sideChat: boolean): Promise<number | null> => {
+      if (sideChat && closesByUnusedDelete(ref)) {
+        const result = await deleteThread({
+          environmentId: ref.environmentId,
+          input: { threadId: ref.threadId, onlyIfUnused: true },
+        });
+        if (result._tag === "Success") return result.value.sequence;
+        if (isAtomCommandInterrupted(result)) return null;
+        const error = squashAtomCommandFailure(result);
+        // Anything else is reported as a failed archive would be; a used one is archived.
+        if (!isThreadInUse(error)) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Failed to close chat panel",
+              description: error instanceof Error ? error.message : "An error occurred.",
+            }),
+          );
+          return null;
+        }
+      }
+      return archivePanelThread(ref);
+    },
+    [archivePanelThread, deleteThread],
+  );
+
+  /** Creates the reserved panel and settles a close made while it waited. */
+  const settlePanelCreation = useCallback(
+    async (
+      input: CreateChatPanelInput,
+      panelRef: ScopedThreadRef,
+      label: string,
+      sideChat: boolean,
+    ): Promise<{ readonly threadId: ThreadId; readonly created: boolean } | null> => {
+      const { hostRef, modelSelection } = input;
+      const { environmentId, threadId } = panelRef;
       const result = await createPanel({
         environmentId,
         input: {
           commandId: newCommandId(),
           hostThreadId: hostRef.threadId,
           threadId,
-          title: `Panel — ${providerLabel}`,
+          title: `Panel: ${label}`,
           threadDefaults: {
             modelSelection,
-            runtimeMode: DEFAULT_RUNTIME_MODE,
+            // A side chat asks before it edits the host's checkout; its picker can change it.
+            runtimeMode: sideChat ? "approval-required" : DEFAULT_RUNTIME_MODE,
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           },
+          ...(sideChat ? { sideChat: true } : {}),
         },
       });
-      if (result._tag === "Failure") {
-        if (isAtomCommandInterrupted(result)) {
-          return threadId;
-        }
-        useCenterPanelStore.getState().removeThread(panelRef);
+      const store = useCenterPanelStore.getState();
+      const closed = creations.get(scopedThreadKey(panelRef))?.closed === true;
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        composerFocusRequests.delete(scopedThreadKey(panelRef));
+        // Never created: a close made meanwhile ends with it.
+        if (closed) releaseUncreatedChatPanel(panelRef);
+        store.removeThread(panelRef);
         const error = squashAtomCommandFailure(result);
         toastManager.add(
           stackedThreadToast({
@@ -244,9 +367,104 @@ export function useCenterPanelActions({
         );
         return null;
       }
-      return threadId;
+      // Closed meanwhile (success, or an outcome that may have created it): archive it now,
+      // just this once. Nobody else can have reopened a panel that was never archived.
+      if (closed) {
+        void archiveClosingChatPanel(panelRef, (ref) => closePanelThread(ref, sideChat));
+      }
+      return { threadId, created: result._tag === "Success" && !closed };
     },
-    [createPanel],
+    [closePanelThread, createPanel],
+  );
+
+  /**
+   * Reserves the tab, then creates the panel. `created` false: the outcome is unknown (the
+   * tab stays for adoption) or the tab closed meanwhile (the panel is archived once it exists).
+   */
+  const createPanelThread = useCallback(
+    async (
+      input: CreateChatPanelInput,
+      sideChat: boolean,
+      focusComposer = false,
+    ): Promise<{ readonly threadId: ThreadId; readonly created: boolean } | null> => {
+      const { hostRef, providerLabel } = input;
+      const environmentId = hostRef.environmentId;
+      const threadId = newThreadId();
+      const panelRef = { environmentId, threadId } satisfies ScopedThreadRef;
+      const label = sideChat ? sideChatLabel(providerLabel) : providerLabel;
+      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, label);
+      const key = scopedThreadKey(panelRef);
+      creations.set(key, { closed: false });
+      if (focusComposer) composerFocusRequests.add(key);
+      return settlePanelCreation(input, panelRef, label, sideChat).finally(() =>
+        creations.delete(key),
+      );
+    },
+    [settlePanelCreation],
+  );
+
+  const createChatPanel = useCallback(
+    async (input: CreateChatPanelInput): Promise<ThreadId | null> =>
+      (await createPanelThread(input, false))?.threadId ?? null,
+    [createPanelThread],
+  );
+
+  const openSideChat = useCallback(
+    async (input: CreateSideChatInput): Promise<ThreadId | null> => {
+      const { hostRef, question, submittedText } = input;
+      // An empty side chat is opened to type in.
+      const panel = await createPanelThread(input, true, question.length === 0);
+      // Not created, or closed meanwhile: nothing is sent and the host draft keeps the text.
+      if (!panel?.created) return panel?.threadId ?? null;
+      const sideRef = scopeThreadRef(hostRef.environmentId, panel.threadId);
+      if (question.length > 0) {
+        // The side chat's own draft is never written on success: what the user types or
+        // attaches there meanwhile stays.
+        markChatPanelSent(sideRef);
+        const result = await startTurn({
+          environmentId: hostRef.environmentId,
+          input: {
+            threadId: panel.threadId,
+            message: { messageId: newMessageId(), role: "user", text: question, attachments: [] },
+            modelSelection: input.modelSelection,
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          },
+        });
+        // The send may have landed: the `:btw` text stays in the host draft, nothing is lost.
+        if (result._tag === "Failure" && isAtomCommandInterrupted(result)) {
+          return panel.threadId;
+        }
+        if (result._tag === "Failure") {
+          const drafts = useComposerDraftStore.getState();
+          const current = drafts.getComposerDraft(sideRef)?.prompt ?? "";
+          drafts.setPrompt(
+            sideRef,
+            current === question ? current : [current, question].filter(Boolean).join("\n\n"),
+          );
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: SIDE_CHAT_SEND_FAILED_TITLE,
+              description: SIDE_CHAT_SEND_FAILED_DESCRIPTION,
+            }),
+          );
+        }
+      }
+      if (submittedText !== undefined) clearSubmittedHostDraft(hostRef, submittedText);
+      return panel.threadId;
+    },
+    [createPanelThread, startTurn],
+  );
+
+  const createSideChat = useCallback(
+    async (input: CreateSideChatInput): Promise<ThreadId | null> => {
+      const hostKey = scopedThreadKey(input.hostRef);
+      if (pendingSideChatHosts.has(hostKey)) return null;
+      pendingSideChatHosts.add(hostKey);
+      return openSideChat(input).finally(() => pendingSideChatHosts.delete(hostKey));
+    },
+    [openSideChat],
   );
 
   const openSessionPanel = useCallback(
@@ -305,17 +523,21 @@ export function useCenterPanelActions({
     (hostRef: ScopedThreadRef, removed: readonly CenterSurface[]) => {
       for (const surface of removed) {
         if (surface.kind === "chat") {
-          useCenterPanelStore.getState().releaseChatPanelReservation({
-            environmentId: hostRef.environmentId,
-            threadId: surface.threadId,
-          });
-          void archivePanelThread(hostRef.environmentId, surface.threadId);
+          const panelRef = scopeThreadRef(hostRef.environmentId, surface.threadId);
+          hideClosingChatPanel(panelRef);
+          const creation = creations.get(scopedThreadKey(panelRef));
+          // A panel still being created is archived when its creation answers.
+          if (creation) creation.closed = true;
+          else {
+            const sideChat = readThreadShell(panelRef)?.sideChat === true;
+            void archiveClosingChatPanel(panelRef, (ref) => closePanelThread(ref, sideChat));
+          }
         } else if (surface.kind === "terminal") {
           onCloseTerminal(hostRef, surface);
         }
       }
     },
-    [archivePanelThread, onCloseTerminal],
+    [closePanelThread, onCloseTerminal],
   );
 
   const activateSurface = useCallback(
@@ -364,6 +586,7 @@ export function useCenterPanelActions({
 
   return {
     createChatPanel,
+    createSideChat,
     reopenChatPanel,
     openPanelThread,
     openSessionPanel,

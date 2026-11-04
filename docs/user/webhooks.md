@@ -1,9 +1,9 @@
 # Webhooks
 
 BiBCode can tell another service when something happens in an environment: a thread's
-turn starts or ends, an approval is asked for or answered, an outside agent commits or
+turn starts or ends, an approval or a question is asked for or answered, an outside agent commits or
 clones, or the profiler records a finding. It sends a signed HTTPS `POST` to each endpoint
-you register. A request carries ids, kinds, statuses and a cursor, never a prompt, a
+you register. A request body carries ids, kinds, statuses and a cursor, never a prompt, a
 message, a reply, terminal output, file contents, a diff or a token.
 
 The [webhooks reference](../reference/webhooks.md) is the complete contract for a
@@ -17,9 +17,13 @@ receiver: every event's payload, signature verification, retries and catch-up.
 3. Click **Add endpoint**, give it a name and an `https://` URL, and choose the events to
    send. You can limit it to one project, and pair it with an MCP client so that revoking
    that client turns the endpoint off.
-4. Copy the **signing secret** shown once. BiBCode keeps it in its secret store and never
+4. If your receiver wants a key, enter it as the **Bearer token**: every request then
+   carries `Authorization: Bearer <token>`. It is never shown again. Editing the endpoint
+   shows only "A token is set", with **Replace** and **Remove**; changing the URL asks you
+   to enter the new receiver's token or remove it.
+5. Copy the **signing secret** shown once. BiBCode keeps it in its secret store and never
    shows it again; **Rotate secret** makes a new one, and the old one stops working at once.
-5. Click **Send test event** to check that your receiver answers.
+6. Click **Send test event** to check that your receiver answers.
 
 The section header sums up the environment: whether MCP is on, how many agents are
 connected, and how many endpoints are active and failing. Each endpoint lists its recent
@@ -54,6 +58,8 @@ delivery log and secret go with it.
 | `panel.created`           | A chat panel is created                                                                               | Threads          |
 | `approval.requested`      | A thread asks for an approval (`requestId` when the provider's id is a plain id)                      | Approvals        |
 | `approval.resolved`       | An approval is answered (`status: resolved`) or expires (`status: expired`)                           | Approvals        |
+| `input.requested`         | A thread asks you a question (`requestId`; never the question's text)                                 | Questions        |
+| `input.resolved`          | A question is answered (`status: resolved`) or expires (`status: expired`); never the answers         | Questions        |
 | `clone.completed`         | An outside agent's `clone_repository` call answered (`status` is its outcome; see below)              | Agent operations |
 | `scm.operation_completed` | An outside agent's Git or pull request tool changed something (`tool`, `status`, `target`)            | Agent operations |
 | `transfer.completed`      | An outside agent's file download or upload finished                                                   | Agent operations |
@@ -63,6 +69,16 @@ delivery log and secret go with it.
 
 `profiler.finding` is sent only while MCP is on and **What agents can use → Diagnostics** is
 on, because a receiver catches up on findings through the MCP `profiler_findings` tool.
+
+Under **Thread status changed** you can choose which changes are sent: **Turn started**,
+**Turn finished**, **Turn interrupted**, **Turn failed** and **Other status changes**. All of
+them are sent until you untick one. Every request names the thread's project (`projectId`)
+next to its thread. An environment that runs an older BiBCode sends every status change and
+the form says so.
+
+An endpoint added before the **Questions** events existed keeps the events it had: edit it
+and tick them to get them. The form hides them, and says so, for an
+environment that runs an older BiBCode.
 
 `clone.completed` follows the call, not the clone: a clone still running when the call
 returned is reported with `status: success` and its `target.cloneId`; `clone_status` says
@@ -146,7 +162,7 @@ signature is `v1=35495024f4ef3f94e5a93e22221544c4b75e9a42300cd965ab81cb85cd994e9
 - One request at a time goes to each endpoint, oldest first, so events arrive in order. A
   test event or a redelivery waits for the endpoint's request in flight. **Redeliver** works
   on a finished delivery only, never one still queued or being sent.
-- Changing an endpoint's URL, project or events drops what was waiting for it (the log shows
+- Changing an endpoint's URL, project, events or status changes drops what was waiting for it (the log shows
   "Not sent: the endpoint's URL or events changed"): nothing queued for the old destination
   or filters goes to the new one. Renaming it keeps the queue. A test event or redelivery
   waiting to be sent when the endpoint is edited, or turned off or on, is not sent: it says

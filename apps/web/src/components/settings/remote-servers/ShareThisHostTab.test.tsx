@@ -480,7 +480,7 @@ describe("ShareThisHostTab", () => {
     expect(container.textContent).toContain("bibcode://pair?code=c0de");
     expect(container.textContent).toContain("for networks you trust");
     expect(
-      container.querySelector('svg[aria-label="Pairing code — scan with a BiBCode client"]'),
+      container.querySelector('svg[aria-label="Pairing code: scan with a BiBCode client"]'),
     ).not.toBeNull();
   });
 
@@ -684,7 +684,7 @@ describe("ShareThisHostTab", () => {
 
   it("keeps browser exposure read-only while server-side minting remains available", async () => {
     await renderTab();
-    expect(container.textContent).toContain("restart `bibcode serve` with `--host`");
+    expect(container.textContent).toContain("Restart `bibcode serve` with `--host`");
     await click("Generate pairing offer");
     expect(h.createOffer).toHaveBeenCalledOnce();
   });

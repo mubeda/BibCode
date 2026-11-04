@@ -12,6 +12,8 @@ interface TestThread {
 interface TestSnapshot {
   readonly snapshotSequence: number;
   readonly threads: ReadonlyArray<TestThread>;
+  readonly capped?: boolean;
+  readonly engineSequence?: number;
 }
 
 const h = vi.hoisted(() => ({
@@ -34,6 +36,13 @@ const h = vi.hoisted(() => ({
   removeRightThread: vi.fn(),
   emptyDrafts: {},
   archivedOptions: undefined as unknown,
+  // The server's answer to `getThreadShells`: ids it does not know are missing.
+  known: new Set<string>(),
+  lookups: [] as string[][],
+  // While set, a lookup waits for it before it answers.
+  holdLookups: null as Promise<void> | null,
+  // Ids the server reports archived, with their kind.
+  archivedKnown: new Map<string, "default" | "panel">(),
 }));
 
 vi.mock("@effect/atom-react", () => ({
@@ -42,6 +51,28 @@ vi.mock("@effect/atom-react", () => ({
 }));
 vi.mock("./state/shell", () => ({
   environmentShell: { stateValueAtom: () => "shell-atom" },
+}));
+vi.mock("./state/offShell", () => ({
+  requestThreadShells: async (environmentId: string, threadIds: ReadonlyArray<string>) => {
+    h.lookups.push([...threadIds]);
+    const { offShellThreads } = await import("@bibcode/client-runtime/state/off-shell-threads");
+    const generation = offShellThreads.get(environmentId as never).generation;
+    if (h.holdLookups !== null) await h.holdLookups;
+    offShellThreads.applyLookup(environmentId as never, generation, {
+      threads: [
+        ...threadIds
+          .filter((threadId) => h.known.has(threadId))
+          .map((threadId) => ({ id: threadId, kind: "default", archivedAt: null })),
+        ...threadIds.flatMap((threadId) => {
+          const kind = h.archivedKnown.get(threadId);
+          return kind === undefined ? [] : [{ id: threadId, kind, archivedAt: "2026-11-02" }];
+        }),
+      ] as never,
+      missing: threadIds.filter(
+        (threadId) => !h.known.has(threadId) && !h.archivedKnown.has(threadId),
+      ) as never,
+    });
+  },
 }));
 vi.mock("./state/terminal", () => ({
   terminalEnvironment: { metadataEvents: () => "terminal-metadata-atom" },
@@ -54,16 +85,22 @@ vi.mock("./centerPanelAdoption", () => ({
   applyTerminalMetadataAdoption: () => undefined,
   createCenterPanelAdoptionTracker: () => ({}),
 }));
-vi.mock("./centerPanelStore", () => ({
-  useCenterPanelStore: {
-    getState: () => ({
-      byThreadKey: h.centerByThreadKey,
-      pendingChatPanelThreadKeys: new Set<string>(),
-      releaseChatPanelReservation: () => undefined,
-      removeThread: h.removeCenterThread,
-    }),
-  },
-}));
+vi.mock("./centerPanelStore", () => {
+  const reshowChatPanels = new Set<string>();
+  const state = () => ({
+    byThreadKey: h.centerByThreadKey,
+    pendingChatPanelThreadKeys: new Set<string>(),
+    reshowChatPanels,
+    releaseChatPanelReservation: () => undefined,
+    removeThread: h.removeCenterThread,
+  });
+  return {
+    useCenterPanelStore: Object.assign(
+      (select: (value: ReturnType<typeof state>) => unknown) => select(state()),
+      { getState: state },
+    ),
+  };
+});
 vi.mock("./rightPanelStore", () => ({
   useRightPanelStore: {
     getState: () => ({ byThreadKey: {}, removeThread: h.removeRightThread }),
@@ -80,6 +117,8 @@ vi.mock("./lib/archivedThreadsState", () => ({
   },
 }));
 
+import { offShellThreads } from "@bibcode/client-runtime/state/off-shell-threads";
+
 import { ThreadLifecycleReconciler } from "./ThreadLifecycleReconciler";
 
 let container: HTMLDivElement;
@@ -95,8 +134,12 @@ function render(): void {
   });
 }
 
-function setLive(snapshotSequence: number, threads: ReadonlyArray<TestThread>): void {
-  const snapshot: TestSnapshot = { snapshotSequence, threads };
+function setLive(
+  snapshotSequence: number,
+  threads: ReadonlyArray<TestThread>,
+  capped = false,
+): void {
+  const snapshot: TestSnapshot = { snapshotSequence, threads, ...(capped ? { capped } : {}) };
   h.shell = { status: "live", snapshot: { _tag: "Some", value: snapshot } };
 }
 
@@ -154,6 +197,11 @@ beforeEach(() => {
     delete h.centerByThreadKey[`${environmentId}:${threadId}`];
   });
   h.removeRightThread.mockReset();
+  h.known = new Set();
+  h.lookups = [];
+  h.holdLookups = null;
+  h.archivedKnown = new Map();
+  offShellThreads.reset("primary" as never);
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -243,5 +291,148 @@ describe("ThreadLifecycleReconciler", () => {
     render();
     expect(h.removeCenterThread).not.toHaveBeenCalled();
     expect(h.refresh).not.toHaveBeenCalled();
+  });
+});
+
+describe("ThreadLifecycleReconciler with a capped shell (#223)", () => {
+  /** A capped live shell at sequence 1 whose archived snapshot then settles with `archived`. */
+  async function settleCapped(
+    live: ReadonlyArray<TestThread>,
+    archived: ReadonlyArray<TestThread>,
+  ): Promise<void> {
+    h.serverSequence = 1;
+    setLive(1, live, true);
+    startArchivedRequest();
+    render();
+    await act(async () => {
+      settleArchived(archived);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  it("keeps panel state of a thread left out of a capped snapshot", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:older": { surfaces: [] } };
+    h.known = new Set(["older"]);
+    await settleCapped([thread("a")], []);
+    expect(h.lookups).toEqual([["older"]]);
+    expect(removedThreadIds()).toEqual([]);
+  });
+
+  it("deletes panel state only for ids getThreadShells reports missing", async () => {
+    h.centerByThreadKey = {
+      "primary:a": { surfaces: [] },
+      "primary:older": { surfaces: [] },
+      "primary:gone": { surfaces: [] },
+    };
+    h.known = new Set(["older"]);
+    await settleCapped([thread("a")], []);
+    expect(removedThreadIds()).toEqual(["gone"]);
+  });
+
+  it("keeps an archived workspace's state after a removal item and restores it on unarchive", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:archived": { surfaces: [] } };
+    // Archived: the live shell sent a removal item, which deletes nothing on its own.
+    await settleCapped([thread("a")], [thread("archived")]);
+    expect(h.lookups).toEqual([]);
+    expect(removedThreadIds()).toEqual([]);
+    // Unarchived: back in the live shell with its saved state.
+    advanceLive([thread("a"), thread("archived")]);
+    expect(h.centerByThreadKey["primary:archived"]).toBeDefined();
+  });
+
+  it("drops an archived chat panel's state", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:closed": { surfaces: [] } };
+    await settleCapped([thread("a")], [thread("closed", "panel")]);
+    expect(removedThreadIds()).toEqual(["closed"]);
+  });
+
+  it("drops a panel the lookup finds closed, and keeps a workspace it finds archived", async () => {
+    h.centerByThreadKey = {
+      "primary:a": { surfaces: [] },
+      "primary:closed-elsewhere": { surfaces: [] },
+      "primary:archived-workspace": { surfaces: [] },
+    };
+    // Closed or archived after the archived snapshot, while the capped shell left them out.
+    h.archivedKnown = new Map([
+      ["closed-elsewhere", "panel"],
+      ["archived-workspace", "default"],
+    ]);
+    await settleCapped([thread("a")], []);
+    expect(removedThreadIds()).toEqual(["closed-elsewhere"]);
+  });
+
+  it("does not look a resolved thread up again on every shell update", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] }, "primary:older": { surfaces: [] } };
+    h.known = new Set(["older"]);
+    await settleCapped([thread("a")], []);
+    expect(h.lookups).toEqual([["older"]]);
+    // A turn streams: the shell's sequence advances, its membership does not.
+    for (let sequence = 2; sequence < 6; sequence += 1) {
+      await act(async () => {
+        setLive(sequence, [thread("a")], true);
+        render();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(h.lookups).toEqual([["older"]]);
+    expect(removedThreadIds()).toEqual([]);
+  });
+
+  it("drops a delayed cleanup when a newer shell reopened a closed panel", async () => {
+    h.centerByThreadKey = {
+      "primary:a": { surfaces: [] },
+      "primary:older": { surfaces: [] },
+      "primary:closed": { surfaces: [] },
+    };
+    h.known = new Set(["older"]);
+    let release = () => {};
+    h.holdLookups = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // `older` is looked up while `closed` is still an archived panel.
+    await settleCapped([thread("a")], [thread("closed", "panel")]);
+    expect(h.lookups).toEqual([["older"]]);
+    // Reopened before the lookup answers: back in the live shell.
+    await act(async () => {
+      h.serverSequence = 2;
+      setLive(2, [thread("a"), thread("closed", "panel")], true);
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(removedThreadIds()).not.toContain("closed");
+  });
+
+  it("compares the archived snapshot with the engine's sequence, not one past it", async () => {
+    h.centerByThreadKey = { "primary:a": { surfaces: [] } };
+    await settleCapped([thread("a")], []);
+    h.centerByThreadKey["primary:gone"] = { surfaces: [] };
+    // A terminal's agent started working: its host joins at sequence 2, past the engine's 1.
+    await act(async () => {
+      h.shell = {
+        status: "live",
+        snapshot: {
+          _tag: "Some",
+          value: {
+            snapshotSequence: 2,
+            engineSequence: 1,
+            threads: [thread("a"), thread("host")],
+            capped: true,
+          } satisfies TestSnapshot,
+        },
+      };
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    if (h.inFlight.length > 0) {
+      await act(async () => {
+        settleArchived([]);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(removedThreadIds()).toEqual(["gone"]);
   });
 });

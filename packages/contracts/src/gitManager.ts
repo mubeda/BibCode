@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { NonNegativeInt, PositiveInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -469,10 +470,23 @@ export const GitManagerDiscardInput = Schema.Struct({
 });
 export type GitManagerDiscardInput = typeof GitManagerDiscardInput.Type;
 
+export const GitManagerKeptInStaging = Schema.Struct({
+  path: TrimmedNonEmptyStringSchema,
+  // Where it is now, relative to the repository's Git directory.
+  stagedAt: TrimmedNonEmptyStringSchema,
+});
+export type GitManagerKeptInStaging = typeof GitManagerKeptInStaging.Type;
+
 export const GitManagerDiscardResult = Schema.Struct({
   trashed: Schema.Array(TrimmedNonEmptyStringSchema),
   permanentlyDiscarded: Schema.Array(TrimmedNonEmptyStringSchema),
   trashUnavailable: Schema.Array(TrimmedNonEmptyStringSchema),
+  // Entries the trash refused that could not go back because something else took their name.
+  // They are in the Git directory's staging folder, not in the working tree, and are never also
+  // in `trashUnavailable`. Absent from an older server, and ignored by an older client.
+  keptInStaging: Schema.Array(GitManagerKeptInStaging).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 export type GitManagerDiscardResult = typeof GitManagerDiscardResult.Type;
 

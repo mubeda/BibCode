@@ -42,7 +42,23 @@ public package has no root export; callers use focused subpaths such as
   domain state, and held data meets a connected environment. `session` then
   publishes the same object, so nothing subscribes twice: each followed thread
   sends one `subscribeThread` per connection, resuming from the revision it
-  holds (`rpc/client.reconnect.test.ts`). An attempt that ends
+  holds (`rpc/client.reconnect.test.ts`). The revision is cached with the
+  thread in `EnvironmentCacheStore` (the web store keeps it in the same
+  IndexedDB record as `resumeFrom`), so the first subscribe after a reload or
+  an app restart resumes too, and a server that kept running answers
+  `unchanged` instead of resending the thread (#227). A record written before
+  this has no revision and subscribes without `resume`; any change that clears
+  the in-memory revision rewrites the record without it. Each subscribe asks for
+  a history window (`history`, #226) and echoes the floor of the window it
+  holds, so a reconnect keeps the older pages it loaded contiguous. The thread
+  state holds the server's window, which patches apply to, and the older pages
+  loaded this session apart from it; it publishes them merged by id (the
+  window's copy wins over a carried row, which wins over a page's) and in each
+  collection's server order, so every state reader reads one thread. Only the
+  window is cached. `olderHistory.loadOlder` is single-flight and drops a page
+  that answers a floor or cursor the state no longer holds; a snapshot with a
+  new floor or no `history`, or a page answered stale, drops the loaded pages.
+  An attempt that ends
   unverified clears `subscriptionSession`, which interrupts its followers; their
   held data is dropped. What changes is that a read subscription's request (its
   input, such as a thread ID or cwd) reaches the server before the config's
@@ -910,6 +926,39 @@ cached snapshot as non-authoritative and requires a new full snapshot. Deltas
 are ignored until that snapshot arrives; afterward only strictly newer deltas
 may update state or the persistence queue. Duplicate and stale deltas publish
 nothing.
+
+The client subscribes with the finished-thread cap (#223): `cap.include` names
+its routed thread, its open chat panels' hosts and its pinned and unread
+threads, and `resume` sends the revision of the cached shell. An `unchanged`
+answer from the current session and generation makes the cached shell `live`
+and re-ages its threads from `activityAges`. The cached shell keeps its
+`revision` and `capped` marker; an item without a revision clears it. It also
+keeps the `engineSequence` an item past the engine's sequence carries (an item
+without one clears it, as do a snapshot and `unchanged`); a resume sends that
+value, and the lifecycle reconciler compares the archived snapshot's sequence
+with it rather than with the item sequence.
+
+**Absence from a capped shell never means a thread is gone.** Threads the
+shell left out live in a session-only store (`state/offShellThreads.ts`):
+older pages and threads looked up with `orchestration.getThreadShells`. Every
+removal item, snapshot, `unchanged` and session change bumps its generation,
+and a page or lookup reply sent under an older generation is dropped, so a
+reply that crossed a deletion never brings a row back. A new session empties
+it, `missing` included, and removing an environment drops its entry; within a session a thread stays `missing` until a
+snapshot lists it or a lookup returns it. One resolver serves
+every thread reader in the web app (`state/entities.ts`): the live shell, then
+that store, then, for a capped shell only, the server. It answers `missing`
+only from `getThreadShells`, and `unknown` for an old server's uncapped shell,
+where readers behave as before. Lifecycle cleanup of persisted panel state, for
+a capped shell, deletes only ids `getThreadShells` reports missing (and closed
+chat panels, as before, including a panel a lookup finds archived); a removal
+item never deletes state. It looks up only
+threads the store has not resolved, so a streaming turn asks for nothing, and a
+lookup's answer applies only if no newer shell or archived snapshot arrived
+while it ran. Panel adoption likewise never closes a tracked chat panel's tab
+because a capped shell left it out. The thread route
+never runs its 1 s missing-thread redirect for a capped shell: it redirects
+only when the resolver reports the routed thread missing.
 
 ## Data boundary
 

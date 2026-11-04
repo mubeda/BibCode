@@ -14,6 +14,11 @@ that the contracts already define: agent automation (`snapshot`, `click`,
 (`apps/web/src/tauriPreviewBridge.ts`) reports all of them unsupported, and the
 desktop advertises only `status`, `open`, and `navigate`.
 
+> Update (v0.15): the MCP `preview_*` input schemas are generated from the
+> `PreviewAutomation*Input` contracts (`packages/contracts/fixtures/mcp-tools/`),
+> and the web automation host decodes each request's input with the same
+> contract. See `docs/architecture/overview.md`, "Preview tool schemas".
+
 ## Constraints
 
 - Preview webviews have **no IPC** by design (a previewed page must not reach

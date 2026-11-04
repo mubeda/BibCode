@@ -12,7 +12,12 @@ use std::{
     time::Duration,
 };
 
-use axum::{Router, body::Bytes, extract::State, http::HeaderMap, http::StatusCode};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode, Uri},
+};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
@@ -45,6 +50,7 @@ enum Reply {
 
 #[derive(Clone, Debug)]
 struct Received {
+    path: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -81,16 +87,27 @@ struct Receiver {
     certificates: TestCertificates,
 }
 
-async fn handle(State(state): State<ReceiverState>, headers: HeaderMap, body: Bytes) -> StatusCode {
+async fn handle(
+    State(state): State<ReceiverState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
     let open = state.open.fetch_add(1, Ordering::SeqCst) + 1;
     state.most_open.fetch_max(open, Ordering::SeqCst);
-    let status = answer(&state, headers, body).await;
+    let status = answer(&state, uri.path().to_owned(), headers, body).await;
     state.open.fetch_sub(1, Ordering::SeqCst);
     status
 }
 
-async fn answer(state: &ReceiverState, headers: HeaderMap, body: Bytes) -> StatusCode {
+async fn answer(
+    state: &ReceiverState,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
     state.received.lock().unwrap().push(Received {
+        path,
         headers: headers
             .iter()
             .map(|(name, value)| {
@@ -183,6 +200,8 @@ struct Timing {
     retry_delays: Vec<Duration>,
     poll: Duration,
     max_pending: i64,
+    /// Holds the first dispatcher's start (a restart starts unpaused).
+    start_pause: Option<Arc<super::Pause>>,
 }
 
 impl Default for Timing {
@@ -191,6 +210,7 @@ impl Default for Timing {
             retry_delays: FAST_RETRIES.to_vec(),
             poll: Duration::from_millis(30),
             max_pending: store::MAX_PENDING,
+            start_pause: None,
         }
     }
 }
@@ -257,7 +277,7 @@ impl Harness {
         resolver: Arc<dyn HostResolver>,
         secrets_dir: tempfile::TempDir,
         profiler_dir: tempfile::TempDir,
-        timing: Timing,
+        mut timing: Timing,
     ) -> Self {
         let repositories = Repositories::new(database.clone());
         let (enabled, enabled_rx) = watch::channel(true);
@@ -275,6 +295,7 @@ impl Harness {
             retry_delays: timing.retry_delays.clone(),
             poll: timing.poll,
             max_pending: timing.max_pending,
+            start_pause: timing.start_pause.take(),
         });
         Self {
             timing,
@@ -337,6 +358,61 @@ impl Harness {
             created["endpoint"]["id"].as_str().unwrap().to_owned(),
             created["secret"].as_str().unwrap().to_owned(),
         )
+    }
+
+    /// A new endpoint at `url` for `events` that sends `token`; returns its id and secret.
+    async fn endpoint_with_token(
+        &self,
+        url: &str,
+        events: &[&str],
+        token: &str,
+    ) -> (String, String) {
+        let created = self
+            .call(
+                "upsert",
+                json!({ "name": "CI", "url": url, "enabled": true, "eventTypes": events, "bearerToken": token }),
+            )
+            .await
+            .expect("an endpoint");
+        (
+            created["endpoint"]["id"].as_str().unwrap().to_owned(),
+            created["secret"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// An upsert of endpoint `id` at the receiver for `thread.status_changed`, with `extra`
+    /// fields set over that.
+    async fn edit(&self, id: &str, extra: Value) -> Result<Value, Value> {
+        let mut payload = json!({ "id": id, "name": "CI", "url": self.receiver.url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] });
+        for (key, value) in extra.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        self.call("upsert", payload).await
+    }
+
+    /// The endpoint's bearer token files in the secret store.
+    async fn bearer_files(&self, id: &str) -> Vec<String> {
+        let prefix = super::bearer_prefix(id);
+        SecretStore::new(self.secrets_dir.path())
+            .await
+            .unwrap()
+            .names()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    }
+
+    /// The bearer token file the endpoint's row names.
+    async fn bearer_secret(&self, id: &str) -> Option<String> {
+        self.webhooks
+            .store()
+            .endpoint(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .bearer_secret
     }
 
     async fn deliveries(&self, endpoint: &str) -> Vec<Value> {
@@ -689,6 +765,7 @@ async fn a_private_or_unresolvable_host_is_refused_and_nothing_else_resolves_it(
         delivery_id: "d",
         timestamp: 0,
         signature: "v1=",
+        authorization: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     // Private, link-local and loopback answers are refused without the fixture allowance.
@@ -783,6 +860,7 @@ async fn each_attempt_resolves_once_and_connects_to_that_address_without_redirec
         delivery_id: "d",
         timestamp: 0,
         signature: "v1=",
+        authorization: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let attempt = send(&policy, &receiver.url, &headers, b"{}", &cancel).await;
@@ -1954,5 +2032,598 @@ async fn changes_since_from_dropped_from_cursor_returns_the_first_dropped_event(
         .map(|entry| entry["cursor"].as_str().unwrap())
         .collect();
     assert_eq!(resumed_cursors, cursors);
+    harness.webhooks.shutdown().await;
+}
+
+const TOKEN_A: &str = "tok-A.1_x~";
+const TOKEN_B: &str = "tok-B.2_y~";
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// A status change on `thread-1`, which a `thread.status_changed` endpoint is sent.
+async fn status_change(harness: &Harness) {
+    harness
+        .event(
+            "thread.session-set",
+            "thread-1",
+            json!({ "session": { "status": "idle", "activeTurnId": null } }),
+        )
+        .await;
+}
+
+async fn send_test(harness: &Harness, id: &str) -> Value {
+    harness.call("sendTest", json!({ "id": id })).await.unwrap()["delivery"].clone()
+}
+
+/// An upsert of endpoint `id` at the receiver, with `extra` fields over it, run on its own.
+fn spawn_edit(
+    harness: &Harness,
+    id: &str,
+    extra: Value,
+) -> tokio::task::JoinHandle<Result<Value, Value>> {
+    let webhooks = harness.webhooks.clone();
+    let mut payload = json!({ "id": id, "name": "CI", "url": harness.receiver.url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED] });
+    for (key, value) in extra.as_object().unwrap() {
+        payload[key] = value.clone();
+    }
+    tokio::spawn(async move { webhooks.upsert(payload).await })
+}
+
+async fn reached(pause: &super::Pause, what: &str) {
+    tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bearer_token_is_sent_on_deliveries_retries_redeliveries_and_tests() {
+    let harness = Harness::new().await;
+    harness.receiver.script(&[Reply::Status(500)]);
+    let url = harness.receiver.url.clone();
+    let (id, secret) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    wait_for_feed_position(&harness).await;
+    status_change(&harness).await;
+    // The first attempt gets a 500 and the retry a 200.
+    wait_for_requests(&harness.receiver, 2).await;
+    eventually("the delivery recorded", async || {
+        harness.deliveries(&id).await[0]["state"] == "delivered"
+    })
+    .await;
+    let delivered = harness.deliveries(&id).await[0]["deliveryId"].clone();
+    harness
+        .call("redeliver", json!({ "deliveryId": delivered }))
+        .await
+        .unwrap();
+    assert_eq!(send_test(&harness, &id).await["state"], "delivered");
+    let received = harness.receiver.received();
+    assert_eq!(received.len(), 4);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    for request in &received {
+        assert_eq!(request.header("Authorization"), bearer(TOKEN_A));
+        // The signature is unchanged and does not cover the header.
+        assert!(signing::verify(
+            &secret,
+            request.header("X-BibCode-Timestamp"),
+            &request.body,
+            request.header("X-BibCode-Signature"),
+            now,
+            300,
+        ));
+    }
+    harness.webhooks.shutdown().await;
+}
+
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// In a process of its own, so no sibling test can turn a callsite off for this capture, and
+/// on one thread, so the scoped subscriber sees the dispatcher's tasks.
+#[tokio::test]
+async fn a_bearer_token_is_never_listed_or_logged() {
+    let Some(child) = crate::test_support::in_own_process(
+        "webhooks::tests::a_bearer_token_is_never_listed_or_logged",
+    ) else {
+        return;
+    };
+    const CANARY: &str = "TOKEN-CANARY-31337";
+    let log = CapturedLog::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+    let harness = Harness::new().await;
+    harness.receiver.answer_by_default(Reply::Status(400));
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], CANARY)
+        .await;
+    wait_for_feed_position(&harness).await;
+    status_change(&harness).await;
+    wait_for_requests(&harness.receiver, 1).await;
+    assert_eq!(
+        harness.receiver.received()[0].header("Authorization"),
+        bearer(CANARY)
+    );
+    eventually("the failure recorded", async || {
+        harness.deliveries(&id).await[0]["state"] == "failed"
+    })
+    .await;
+    // Refusals never echo the value.
+    for refused in [
+        format!("Bearer {CANARY}"),
+        format!("{CANARY} x"),
+        format!("{CANARY}\u{7}"),
+    ] {
+        let refusal = harness
+            .edit(&id, json!({ "bearerToken": refused }))
+            .await
+            .unwrap_err();
+        assert!(!refusal.to_string().contains(CANARY), "{refusal}");
+    }
+    // A missing file fails unsent, and that is logged too.
+    let name = harness.bearer_secret(&id).await.unwrap();
+    std::fs::remove_file(harness.secrets_dir.path().join(format!("{name}.bin"))).unwrap();
+    assert_eq!(send_test(&harness, &id).await["lastError"], "token_missing");
+    let listed = harness.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["endpoints"][0]["bearerTokenSet"], true);
+    let deliveries = harness
+        .call("listDeliveries", json!({ "endpointId": id }))
+        .await
+        .unwrap();
+    for shown in [&listed, &deliveries] {
+        assert!(!shown.to_string().contains(CANARY), "{shown}");
+        assert!(!shown.to_string().contains("webhook-bearer-"), "{shown}");
+    }
+    harness.webhooks.shutdown().await;
+    let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("webhook delivery failed"),
+        "the capture saw the run:\n{log}"
+    );
+    assert!(!log.contains(CANARY), "the token reached the log:\n{log}");
+    child.complete();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upsert_without_the_token_keeps_it_and_null_clears_it() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    // An older client's save names no token: it is kept.
+    let renamed = harness
+        .edit(&id, json!({ "name": "Renamed" }))
+        .await
+        .unwrap();
+    assert_eq!(renamed["endpoint"]["bearerTokenSet"], true);
+    send_test(&harness, &id).await;
+    assert_eq!(
+        harness.receiver.received()[0].header("Authorization"),
+        bearer(TOKEN_A)
+    );
+    // A string replaces it without a new revision, so the queue is kept.
+    let store = harness.webhooks.store();
+    let revision = store.endpoint(&id).await.unwrap().unwrap().revision;
+    harness
+        .edit(&id, json!({ "bearerToken": TOKEN_B }))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.endpoint(&id).await.unwrap().unwrap().revision,
+        revision
+    );
+    send_test(&harness, &id).await;
+    assert_eq!(
+        harness.receiver.received()[1].header("Authorization"),
+        bearer(TOKEN_B)
+    );
+    assert_eq!(harness.bearer_files(&id).await.len(), 1);
+    // `null` clears it and removes its file.
+    let cleared = harness
+        .edit(&id, json!({ "bearerToken": null }))
+        .await
+        .unwrap();
+    assert_eq!(cleared["endpoint"]["bearerTokenSet"], false);
+    send_test(&harness, &id).await;
+    assert_eq!(harness.receiver.received()[2].header("Authorization"), "");
+    assert!(harness.bearer_files(&id).await.is_empty());
+    // Delete removes every file of the endpoint.
+    harness
+        .edit(&id, json!({ "bearerToken": TOKEN_A }))
+        .await
+        .unwrap();
+    harness.call("delete", json!({ "id": id })).await.unwrap();
+    assert!(harness.bearer_files(&id).await.is_empty());
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_token_that_is_missing_fails_the_delivery_unsent() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    let name = harness.bearer_secret(&id).await.unwrap();
+    std::fs::remove_file(harness.secrets_dir.path().join(format!("{name}.bin"))).unwrap();
+    let sent = send_test(&harness, &id).await;
+    assert_eq!(sent["state"], "failed");
+    assert_eq!(sent["lastError"], "token_missing");
+    wait_for_feed_position(&harness).await;
+    status_change(&harness).await;
+    eventually("the queued delivery failed", async || {
+        harness.deliveries(&id).await.iter().any(|delivery| {
+            delivery["eventType"] == events::THREAD_STATUS_CHANGED && delivery["state"] == "failed"
+        })
+    })
+    .await;
+    let queued = harness.deliveries(&id).await;
+    assert_eq!(queued[0]["lastError"], "token_missing");
+    // Never retried, and never sent without the token.
+    assert_eq!(queued[0]["attempts"], 1);
+    assert!(harness.receiver.received().is_empty());
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_commit_of_a_url_and_token_change_keeps_the_old_url_with_the_old_token() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    let before = harness.bearer_files(&id).await;
+    let run = |sql: &'static str| {
+        harness.database.call(move |connection| {
+            connection.execute_batch(sql)?;
+            Ok(())
+        })
+    };
+    run(
+        "CREATE TRIGGER refuse_edit BEFORE UPDATE ON webhook_endpoints \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .await
+    .unwrap();
+    let moved = harness
+        .edit(
+            &id,
+            json!({ "url": format!("{url}/b"), "bearerToken": TOKEN_B }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(moved["reason"], "storage");
+    run("DROP TRIGGER refuse_edit;").await.unwrap();
+    // The new file went with the failed commit.
+    assert_eq!(harness.bearer_files(&id).await, before);
+    send_test(&harness, &id).await;
+    let received = harness.receiver.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].path, "/hook");
+    assert_eq!(received[0].header("Authorization"), bearer(TOKEN_A));
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_url_change_without_the_token_is_refused_while_one_is_set() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    let moved = format!("{url}/b");
+    let refused = harness
+        .edit(&id, json!({ "url": moved }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused["reason"], "invalid");
+    assert_eq!(
+        refused["message"],
+        "Enter the token for the new URL, or remove it."
+    );
+    let store = harness.webhooks.store();
+    assert_eq!(store.endpoint(&id).await.unwrap().unwrap().url, url);
+    // Restated, or removed, it is saved.
+    harness
+        .edit(&id, json!({ "url": moved, "bearerToken": TOKEN_B }))
+        .await
+        .unwrap();
+    harness
+        .edit(
+            &id,
+            json!({ "url": format!("{url}/c"), "bearerToken": null }),
+        )
+        .await
+        .unwrap();
+    // With no token set, a URL change needs nothing more.
+    harness.edit(&id, json!({})).await.unwrap();
+    assert_eq!(store.endpoint(&id).await.unwrap().unwrap().url, url);
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_file_left_by_a_crash_is_removed_by_the_next_edit_and_never_sent() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    // An edit that wrote its file and stopped before its commit.
+    SecretStore::new(harness.secrets_dir.path())
+        .await
+        .unwrap()
+        .set(&super::new_bearer_name(&id), TOKEN_B.as_bytes())
+        .await
+        .unwrap();
+    let harness = harness.restart().await;
+    send_test(&harness, &id).await;
+    assert_eq!(
+        harness.receiver.received()[0].header("Authorization"),
+        bearer(TOKEN_A)
+    );
+    assert_eq!(harness.bearer_files(&id).await.len(), 2);
+    harness
+        .edit(&id, json!({ "name": "Renamed" }))
+        .await
+        .unwrap();
+    let kept = harness.bearer_secret(&id).await.unwrap();
+    assert_eq!(harness.bearer_files(&id).await, [kept]);
+    send_test(&harness, &id).await;
+    assert_eq!(
+        harness.receiver.received()[1].header("Authorization"),
+        bearer(TOKEN_A)
+    );
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_during_dispatcher_start_keeps_its_token() {
+    let pause = Arc::new(super::Pause::default());
+    let harness = Harness::new_timed(Timing {
+        start_pause: Some(pause.clone()),
+        ..Timing::default()
+    })
+    .await;
+    reached(&pause, "the dispatcher held at its start").await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    harness
+        .edit(&id, json!({ "bearerToken": TOKEN_B }))
+        .await
+        .unwrap();
+    pause.release.notify_one();
+    wait_for_feed_position(&harness).await;
+    status_change(&harness).await;
+    let received = wait_for_requests(&harness.receiver, 1).await;
+    assert_eq!(received[0].header("Authorization"), bearer(TOKEN_B));
+    assert_eq!(harness.bearer_files(&id).await.len(), 1);
+    eventually("the delivery recorded", async || {
+        harness.deliveries(&id).await[0]["state"] == "delivered"
+    })
+    .await;
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_clear_and_replace_leave_a_readable_token_or_none() {
+    // The edit held after its token write, the one that waits for it, and the token left.
+    for (first, second, expected) in [
+        (
+            json!({ "bearerToken": TOKEN_B }),
+            json!({ "bearerToken": null }),
+            None,
+        ),
+        (
+            json!({ "bearerToken": null }),
+            json!({ "bearerToken": TOKEN_B }),
+            Some(TOKEN_B),
+        ),
+    ] {
+        let harness = Harness::new().await;
+        let url = harness.receiver.url.clone();
+        let (id, _) = harness
+            .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+            .await;
+        let pause = harness.webhooks.pause_next_edit_after_token_write();
+        let held = spawn_edit(&harness, &id, first);
+        reached(&pause, "the first edit held after its token write").await;
+        let waiting = spawn_edit(&harness, &id, second);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the second edit ran inside the first"
+        );
+        pause.release.notify_one();
+        held.await.unwrap().unwrap();
+        let last = waiting.await.unwrap().unwrap();
+        assert_eq!(last["endpoint"]["bearerTokenSet"], expected.is_some());
+        // The row names a readable file, or none, and nothing else is left.
+        let named = harness.bearer_secret(&id).await;
+        assert_eq!(
+            harness.bearer_files(&id).await,
+            named.into_iter().collect::<Vec<_>>()
+        );
+        let sent = send_test(&harness, &id).await;
+        assert_eq!(sent["state"], "delivered", "{sent}");
+        assert_eq!(
+            harness.receiver.received()[0].header("Authorization"),
+            expected.map(bearer).unwrap_or_default()
+        );
+        harness.webhooks.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_token_file_is_not_removed_under_a_sender_that_read_it() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    let old = harness.bearer_secret(&id).await.unwrap();
+    let pause = harness.webhooks.pause_next_sender_after_revision_read();
+    let webhooks = harness.webhooks.clone();
+    let payload = json!({ "id": id });
+    let send = tokio::spawn(async move { webhooks.send_test(payload).await });
+    reached(&pause, "a sender past its row read").await;
+    let edit = spawn_edit(&harness, &id, json!({ "bearerToken": TOKEN_B }));
+    // The edit commits, then waits for the sender before it removes the file the sender read.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!edit.is_finished(), "the edit did not wait for the sender");
+    assert!(harness.bearer_files(&id).await.contains(&old));
+    pause.release.notify_one();
+    let sent = send.await.unwrap().unwrap();
+    assert_eq!(sent["delivery"]["state"], "delivered", "{sent}");
+    assert_eq!(
+        harness.receiver.received()[0].header("Authorization"),
+        bearer(TOKEN_A)
+    );
+    edit.await.unwrap().unwrap();
+    assert!(!harness.bearer_files(&id).await.contains(&old));
+    send_test(&harness, &id).await;
+    assert_eq!(
+        harness.receiver.received()[1].header("Authorization"),
+        bearer(TOKEN_B)
+    );
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_racing_a_url_and_token_change_never_pairs_the_old_url_with_the_new_token() {
+    let harness = Harness::new().await;
+    let url = harness.receiver.url.clone();
+    let (id, _) = harness
+        .endpoint_with_token(&url, &[events::THREAD_STATUS_CHANGED], TOKEN_A)
+        .await;
+    // The rename reads URL A and is held before its commit.
+    let pause = harness.webhooks.pause_next_edit_after_token_write();
+    let rename = spawn_edit(&harness, &id, json!({ "name": "Renamed" }));
+    reached(&pause, "the rename held after its read").await;
+    // Meanwhile another edit moves the endpoint to URL B with token B.
+    let moved = format!("{url}/b");
+    let relocate = spawn_edit(
+        &harness,
+        &id,
+        json!({ "url": moved, "bearerToken": TOKEN_B }),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!relocate.is_finished(), "the move ran inside the rename");
+    pause.release.notify_one();
+    rename.await.unwrap().unwrap();
+    relocate.await.unwrap().unwrap();
+    let store = harness.webhooks.store();
+    assert_eq!(store.endpoint(&id).await.unwrap().unwrap().url, moved);
+    send_test(&harness, &id).await;
+    let received = harness.receiver.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].path, "/hook/b");
+    assert_eq!(received[0].header("Authorization"), bearer(TOKEN_B));
+    harness.webhooks.shutdown().await;
+}
+
+/// An endpoint whose status filter leaves out `turn.started` gets only the turn's completion;
+/// one with no filter gets both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_that_skips_turn_started_gets_no_such_delivery() {
+    let harness = Harness::new().await;
+    let created = harness
+        .call(
+            "upsert",
+            json!({ "name": "Done only", "url": harness.receiver.url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED], "statusKinds": ["turn.completed"] }),
+        )
+        .await
+        .expect("an endpoint");
+    assert_eq!(
+        created["endpoint"]["statusKinds"],
+        json!(["turn.completed"])
+    );
+    let filtered = created["endpoint"]["id"].as_str().unwrap().to_owned();
+    let (every, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    wait_for_feed_position(&harness).await;
+    harness.turn("thread-1", "turn-1").await;
+    let received = wait_for_requests(&harness.receiver, 3).await;
+    let mut kinds: Vec<String> = received
+        .iter()
+        .map(|request| request.json()["kind"].as_str().unwrap().to_owned())
+        .collect();
+    kinds.sort();
+    assert_eq!(kinds, ["turn.completed", "turn.completed", "turn.started"]);
+    assert_eq!(harness.deliveries(&filtered).await.len(), 1);
+    assert_eq!(harness.deliveries(&every).await.len(), 2);
+    harness.webhooks.shutdown().await;
+}
+
+/// `statusKinds` absent keeps the stored filter (an older client's save), `null` sends every
+/// kind, and a change is a new revision; unknown and empty lists are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upsert_without_status_kinds_keeps_them_and_null_clears_them() {
+    let harness = Harness::new().await;
+    let (id, _) = harness.endpoint(&[events::THREAD_STATUS_CHANGED]).await;
+    let listed = harness.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["endpoints"][0]["statusKinds"], Value::Null);
+    let set = harness
+        .edit(
+            &id,
+            json!({ "statusKinds": ["turn.failed", "turn.completed", "turn.failed"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        set["endpoint"]["statusKinds"],
+        json!(["turn.completed", "turn.failed"]),
+        "known kinds, once each, in the catalog's order"
+    );
+    let store = harness.webhooks.store();
+    let revision = store.endpoint(&id).await.unwrap().unwrap().revision;
+    // The v0.14 shape: no `statusKinds`.
+    let renamed = harness
+        .edit(&id, json!({ "name": "Renamed" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed["endpoint"]["statusKinds"],
+        json!(["turn.completed", "turn.failed"])
+    );
+    assert_eq!(
+        store.endpoint(&id).await.unwrap().unwrap().revision,
+        revision
+    );
+    for refused in [json!(["turn.started", "turn.exploded"]), json!([])] {
+        let refusal = harness
+            .edit(&id, json!({ "statusKinds": refused }))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal["reason"], "invalid", "{refused}");
+    }
+    let cleared = harness
+        .edit(&id, json!({ "statusKinds": null }))
+        .await
+        .unwrap();
+    assert_eq!(cleared["endpoint"]["statusKinds"], Value::Null);
+    assert!(store.endpoint(&id).await.unwrap().unwrap().revision > revision);
     harness.webhooks.shutdown().await;
 }

@@ -16,7 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import type { LegendListRef } from "@legendapp/list/react";
 
 let MessagesTimelineComponent: typeof import("./MessagesTimeline").MessagesTimeline | null = null;
-const SLOW_MESSAGES_TIMELINE_IMPORT_TIMEOUT_MS = 60_000;
+// The first test's beforeEach pays for importing the whole timeline graph: about 8 s
+// alone and 42 s beside other suites, so loaded full runs crossed a 60 s bound.
+const SLOW_MESSAGES_TIMELINE_IMPORT_TIMEOUT_MS = 180_000;
 
 const h = vi.hoisted(() => ({
   legendListProps: null as Record<string, unknown> | null,
@@ -1156,6 +1158,39 @@ describe("MessagesTimeline assistant rows", () => {
     expect(markup).toContain("alpha.ts");
     expect(markup).toContain("beta.ts");
   });
+
+  it("says when a captured turn's changes cannot be shown", async () => {
+    const assistantMessageId = MessageId.make("message-assistant-no-diff");
+    const markup = await renderTimeline({
+      timelineEntries: [
+        buildUserTimelineEntry("Change files."),
+        buildAssistantTimelineEntry({
+          id: "entry-2",
+          messageId: "message-assistant-no-diff",
+          text: "Changed a file.",
+          turnId: TURN_ID,
+        }),
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [
+          assistantMessageId,
+          {
+            turnId: TURN_ID,
+            checkpointTurnCount: 2,
+            checkpointRef: CheckpointRef.make("checkpoint-2"),
+            status: "ready" as const,
+            files: [],
+            diffAvailable: false,
+            assistantMessageId,
+            completedAt: LATER_CREATED_AT,
+          },
+        ],
+      ]),
+    });
+
+    expect(markup).toContain("for this turn: the checkpoint before it is missing.");
+    expect(markup).not.toContain("View diff");
+  });
 });
 
 describe("MessagesTimeline turn folds", () => {
@@ -1733,7 +1768,7 @@ describe("MessagesTimeline user message affordances", () => {
       },
       onCancelAttachmentUpload: cancel,
     });
-    expect(container.textContent).toContain("Uploading 2 attachments — 3.1 of 20 MiB");
+    expect(container.textContent).toContain("Uploading 2 attachments (3.1 of 20 MiB)");
     const button = [...container.querySelectorAll("button")].find(
       (value) => value.textContent === "Cancel",
     )!;
@@ -1803,6 +1838,8 @@ describe("MessagesTimeline user message affordances", () => {
     expect(markup).toContain("1 selected element.");
     expect(markup).toContain("lucide-paintbrush");
     expect(markup).toContain("Annotated preview crop");
+    // Off-screen crops wait until they scroll near the viewport.
+    expect(markup).toMatch(/<img[^>]*alt="Annotated preview crop"[^>]*loading="lazy"/);
     expect(markup).toContain("Make the button blue");
     expect(markup).not.toContain("<preview_annotation>");
   });
@@ -1823,8 +1860,8 @@ describe("MessagesTimeline row typing and scroll wiring", () => {
       ],
     });
 
-    expect(markup).toContain('data-item-type="message:user"');
-    expect(markup).toContain('data-item-type="message:assistant"');
+    expect(markup).toContain('data-item-type="message:user:0"');
+    expect(markup).toContain('data-item-type="message:assistant:0"');
     expect(markup).toContain('data-item-type="work"');
     expect(markup).toContain('data-item-type="working"');
   });
@@ -2447,6 +2484,10 @@ describe("MessagesTimeline mounted interactions", () => {
     await click(revert!);
 
     expect(container.textContent).toContain("missing.png");
+    // Message attachments load only near the viewport, decoded off the main thread.
+    const image = container.querySelector<HTMLImageElement>('img[alt="screen.png"]');
+    expect(image?.getAttribute("loading")).toBe("lazy");
+    expect(image?.getAttribute("decoding")).toBe("async");
     expect(onImageExpand).toHaveBeenCalledWith(
       expect.objectContaining({
         index: 0,
@@ -2518,6 +2559,59 @@ describe("MessagesTimeline mounted interactions", () => {
     expect(viewDiff).toBeDefined();
     await click(viewDiff!);
     expect(onOpenTurnDiff).toHaveBeenCalledWith(TURN_ID, "src/a.ts");
+  });
+
+  // The thread stream sends 200 files of a large checkpoint and the total (#227).
+  it.each([
+    { shown: 2, total: 2_000, label: `and ${(1_998).toLocaleString()} more files` },
+    { shown: 0, total: 40, label: "40 files changed" },
+  ])("opens the turn diff from a capped file list ($shown of $total)", async (input) => {
+    const onOpenTurnDiff = vi.fn();
+    const assistantMessageId = MessageId.make("message-assistant-capped");
+    const container = await mountTimeline({
+      timelineEntries: [
+        buildUserTimelineEntry("Format everything"),
+        buildAssistantTimelineEntry({
+          id: "entry-assistant-capped",
+          messageId: "message-assistant-capped",
+          text: "Done",
+          turnId: TURN_ID,
+        }),
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [
+          assistantMessageId,
+          {
+            turnId: TURN_ID,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("checkpoint-capped"),
+            status: "ready" as const,
+            files: Array.from({ length: input.shown }, (_, index) => ({
+              path: `src/file-${index}.ts`,
+              kind: "modified",
+              additions: 1,
+              deletions: 1,
+            })),
+            filesTotal: input.total,
+            assistantMessageId,
+            completedAt: LATER_CREATED_AT,
+          },
+        ],
+      ]),
+      onOpenTurnDiff,
+    });
+
+    const heading = Array.from(container.querySelectorAll("p")).find((paragraph) =>
+      paragraph.textContent?.startsWith("Changed files"),
+    );
+    // No line totals: counted from the shown files only, they would understate the turn.
+    expect(heading?.textContent).toBe(`Changed files (${input.total.toLocaleString()})`);
+    const more = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent === input.label,
+    );
+    expect(more).toBeDefined();
+    await click(more!);
+    expect(onOpenTurnDiff).toHaveBeenCalledWith(TURN_ID);
   });
 
   it("toggles a work row with Enter and Space while preventing their defaults", async () => {
@@ -2902,5 +2996,130 @@ describe("MessagesTimeline thinking rows", () => {
     await scrollTo(1_500 - 256 - 3);
     await stream("First, then more, and more, and the end", 2_000);
     expect(scrollTop).toBe(2_000);
+  });
+});
+
+// The thread history window (#226).
+describe("MessagesTimeline older history", () => {
+  const turn = (index: number) => {
+    const createdAt = `2026-03-17T19:${String(index).padStart(2, "0")}:00.000Z`;
+    return [
+      {
+        ...buildUserTimelineEntry(`Question ${index}`),
+        id: `user-${index}`,
+        createdAt,
+        message: {
+          ...buildUserTimelineEntry(`Question ${index}`).message,
+          id: MessageId.make(`user-${index}`),
+          createdAt,
+          updatedAt: createdAt,
+        },
+      },
+      buildAssistantTimelineEntry({
+        id: `answer-${index}`,
+        messageId: `answer-${index}`,
+        text: `Answer ${index}`,
+        createdAt,
+      }),
+    ];
+  };
+  const olderHistory = (
+    status: "idle" | "loading" | "error",
+    onLoadOlder: () => void = () => {},
+  ) => ({ olderRows: 42, status, onLoadOlder });
+  const rowIds = () =>
+    (h.legendListProps?.data as ReadonlyArray<{ id: string }> | undefined)?.map((row) => row.id) ??
+    [];
+
+  it("keeps the first visible row in place when an older page loads", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mountedTrees.push({ container, root });
+    const render = (entries: ReturnType<typeof turn>) =>
+      act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={entries}
+            olderHistory={olderHistory("idle")}
+          />,
+        ),
+      );
+    // LegendList's data-change anchor: the first row in view it may restore (its fallback when
+    // no anchor is locked), here with every row in view.
+    const anchor = (inView: ReadonlyArray<string>) => {
+      const rows = h.legendListProps?.data as ReadonlyArray<{ id: string }>;
+      const keep = (
+        h.legendListProps?.maintainVisibleContentPosition as
+          | {
+              shouldRestorePosition?: (
+                item: { id: string },
+                index: number,
+                data: unknown,
+              ) => boolean;
+            }
+          | undefined
+      )?.shouldRestorePosition;
+      return inView.find((id) => {
+        const index = rows.findIndex((row) => row.id === id);
+        return index >= 0 && (keep === undefined || keep(rows[index]!, index, rows));
+      });
+    };
+    await render([...turn(10), ...turn(11)]);
+    const before = rowIds();
+    expect(before[0]).toBe("history-start");
+    expect(h.legendListProps?.maintainVisibleContentPosition).toMatchObject({ data: true });
+    // The control at the top is never the anchor: the first message being read is.
+    expect(anchor(before)).toBe("user-10");
+
+    await render([...turn(8), ...turn(9), ...turn(10), ...turn(11)]);
+    const after = rowIds();
+    // The rows already shown keep their keys and order, the page lands between the control and
+    // them, and the anchor is still the message that was being read.
+    expect(after.slice(after.indexOf("user-10"))).toEqual(before.slice(1));
+    expect(after.indexOf("user-10")).toBeGreaterThan(1);
+    expect(anchor(before)).toBe("user-10");
+  });
+
+  it("loads earlier messages from the top row without scrolling", async () => {
+    const onLoadOlder = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("idle", onLoadOlder),
+    });
+    const button = [...container.querySelectorAll("button")].find(
+      (element) => element.textContent === "Load earlier messages (42 more)",
+    );
+    expect(button).toBeDefined();
+    await click(button!);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    // Scrolling within a viewport of the top loads it too.
+    expect(h.legendListProps?.onStartReached).toBe(onLoadOlder);
+    expect(h.legendListProps?.onStartReachedThreshold).toBe(1);
+  });
+
+  it("offers a retry when an older page fails", async () => {
+    const onLoadOlder = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("error", onLoadOlder),
+    });
+    expect(container.textContent).toContain("Couldn't load earlier messages.");
+    const retry = [...container.querySelectorAll("button")].find(
+      (element) => element.textContent === "Retry",
+    );
+    await click(retry!);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    // A failed page is not retried by scrolling, only by the button.
+    expect(h.legendListProps?.onStartReached).toBeUndefined();
+
+    const loading = await mountTimeline({
+      timelineEntries: turn(10),
+      olderHistory: olderHistory("loading"),
+    });
+    expect(loading.textContent).toContain("Loading earlier messages…");
+    expect(h.legendListProps?.onStartReached).toBeUndefined();
   });
 });

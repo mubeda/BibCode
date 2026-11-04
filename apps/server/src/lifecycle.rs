@@ -13,7 +13,7 @@ use crate::{
         },
     },
     config::{ServerConfig, ServerMode},
-    data_root::{DataRootError, ResolvedDataRoot, resolve_data_root},
+    data_root::{DataRootError, ResolvedDataRoot},
     diagnostics::{
         DesktopUiProcessObserver, NotApplicableUiProcessObserver,
         UnavailableDesktopUiProcessObserver,
@@ -76,6 +76,11 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "cliSessionHistory": true,
             "previewTunnels": true,
             "reviewDiffTools": true,
+            "webhookQuestionEvents": true,
+            "webhookBearerToken": true,
+            "webhookStatusKinds": true,
+            "sideChats": true,
+            "threadDeleteOnlyIfUnused": true,
         },
     })
 }
@@ -91,6 +96,8 @@ pub struct ServerHandle {
     _log_sink: Arc<logging::LogSinkLease>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
+    #[cfg(test)]
+    auth: AuthService,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,9 +218,7 @@ impl ServerRuntime {
         process_tree_cleanup: ProcessTreeCleanup,
         update_delegate: Option<Arc<dyn RemoteUpdateDelegate>>,
     ) -> Result<ServerHandle, ServerError> {
-        let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
-        config.base_dir = resolved_data_root.effective.clone();
-        config.resolved_data_root = Some(resolved_data_root.clone());
+        let resolved_data_root = config.resolve_data_root()?;
         tokio::fs::create_dir_all(&config.base_dir)
             .await
             .map_err(ServerError::CreateBaseDirectory)?;
@@ -226,6 +231,7 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
+        crate::git::system_line_endings::log_install_warnings();
         if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
             tracing::info!(
                 static_dir = %static_dir.display(),
@@ -521,6 +527,8 @@ impl ServerRuntime {
                 gateway.shutdown().await;
             });
         }
+        #[cfg(test)]
+        let auth_for_test = auth.clone();
         let app = http::build_router(http::AppState {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
@@ -564,6 +572,8 @@ impl ServerRuntime {
             _log_sink: log_sink,
             shutdown,
             task: Some(task),
+            #[cfg(test)]
+            auth: auth_for_test,
         })
     }
 }
@@ -818,6 +828,19 @@ impl ServerHandle {
         self.update_maintenance.clone()
     }
 
+    /// A probe for whether a tool update is running, for a host that stops this server on a
+    /// deadline of its own. It does not keep the runtime alive. `None` without a production
+    /// runtime.
+    #[must_use]
+    pub fn tool_updates_probe(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        let runtime = Arc::downgrade(self._production_runtime.as_ref()?);
+        Some(Arc::new(move || {
+            runtime
+                .upgrade()
+                .is_some_and(|runtime| runtime.tool_updates_running())
+        }))
+    }
+
     /// The production runtime's committed `enableProfiler`, which a desktop host follows to
     /// run the crash monitor for itself and this in-process server. `None` without one.
     #[must_use]
@@ -833,6 +856,12 @@ impl ServerHandle {
         self._production_runtime
             .as_ref()
             .map(|runtime| runtime.orchestration.event_subscriber_count_for_test())
+    }
+
+    /// The server's authentication, so a test can hold an exchange.
+    #[cfg(test)]
+    pub(crate) fn auth_for_test(&self) -> &AuthService {
+        &self.auth
     }
 
     /// The production runtime's orchestration engine, so a test can dispatch what a provider
@@ -1284,6 +1313,11 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
+        assert_eq!(descriptor["capabilities"]["webhookQuestionEvents"], true);
+        assert_eq!(descriptor["capabilities"]["webhookBearerToken"], true);
+        assert_eq!(descriptor["capabilities"]["webhookStatusKinds"], true);
+        assert_eq!(descriptor["capabilities"]["sideChats"], true);
+        assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // A client asks for `server.downloadDiagnosticLogs` only when this is set (#194).

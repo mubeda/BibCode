@@ -20,6 +20,7 @@ import {
   type ReactElement,
   type ReactNode,
   type RefObject,
+  use,
   useEffect,
   useLayoutEffect,
   useState,
@@ -84,6 +85,7 @@ const h = vi.hoisted(() => {
     environments: [] as unknown[],
     primaryEnvironment: null as unknown,
     threadsByKey: new Map<string, unknown>(),
+    threadLoadStatesByKey: new Map<string, unknown>(),
     projectsByKey: new Map<string, unknown>(),
     allProjects: [] as unknown[],
     threadRefs: [] as unknown[],
@@ -166,6 +168,13 @@ vi.mock("../state/use-atom-command", () => ({
 }));
 
 vi.mock("../state/threads", () => ({
+  useThreadOlderHistory: () => null,
+  useThreadFindLoadState: (ref: { environmentId: string; threadId: string } | null) =>
+    (ref ? h.threadLoadStatesByKey.get(`${ref.environmentId}:${ref.threadId}`) : undefined) ?? {
+      status: "live",
+      hasData: true,
+      error: null,
+    },
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
@@ -507,29 +516,33 @@ vi.mock("./chat/threadFind/useThreadFind", () => ({
   },
 }));
 
-vi.mock("./chat/MessagesTimeline", () => ({
-  MessagesTimeline: (props: Record<string, unknown>) => {
-    h.captured["messagesTimeline"] = props;
-    // A new instance is a new find session: its query and selection start over.
-    useState(() => ++h.messagesTimelineInstanceCount);
-    if (h.timelineList !== null) {
-      (props["listRef"] as { current: unknown }).current = h.timelineList;
-    }
-    // The list reports that it mounted, as LegendList's ref does.
-    const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
-    useLayoutEffect(() => {
-      if (h.timelineList === null) return undefined;
-      onListMount?.(h.timelineList);
-      return () => onListMount?.(null);
-    }, [onListMount]);
-    return (
-      <div
-        data-mock="messages-timeline"
-        data-entry-count={String((props["timelineEntries"] as readonly unknown[]).length)}
-      />
-    );
-  },
-}));
+vi.mock("./chat/MessagesTimeline", async () => {
+  const { RightPanelThreadContext } = await import("./chat/rightPanelThread");
+  return {
+    MessagesTimeline: (props: Record<string, unknown>) => {
+      h.captured["messagesTimeline"] = props;
+      h.captured["rightPanelThread"] = use(RightPanelThreadContext);
+      // A new instance is a new find session: its query and selection start over.
+      useState(() => ++h.messagesTimelineInstanceCount);
+      if (h.timelineList !== null) {
+        (props["listRef"] as { current: unknown }).current = h.timelineList;
+      }
+      // The list reports that it mounted, as LegendList's ref does.
+      const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
+      useLayoutEffect(() => {
+        if (h.timelineList === null) return undefined;
+        onListMount?.(h.timelineList);
+        return () => onListMount?.(null);
+      }, [onListMount]);
+      return (
+        <div
+          data-mock="messages-timeline"
+          data-entry-count={String((props["timelineEntries"] as readonly unknown[]).length)}
+        />
+      );
+    },
+  };
+});
 
 vi.mock("./chat/ChatHeaderActions", () => ({
   ChatHeaderActions: (props: Record<string, unknown>) => {
@@ -709,7 +722,10 @@ vi.mock("./preview/PreviewPanel", () => ({
   PreviewPanel: () => <div data-mock="preview-panel" />,
 }));
 vi.mock("./DiffPanel", () => ({
-  default: () => <div data-mock="diff-panel" />,
+  default: (props: Record<string, unknown>) => {
+    h.captured["diffPanel"] = props;
+    return <div data-mock="diff-panel" />;
+  },
 }));
 vi.mock("./SourceControlPanel", () => ({
   default: () => <div data-mock="source-control-panel" />,
@@ -1063,6 +1079,7 @@ beforeEach(() => {
   h.environments = [];
   h.primaryEnvironment = null;
   h.threadsByKey.clear();
+  h.threadLoadStatesByKey.clear();
   h.projectsByKey.clear();
   h.allProjects = [];
   h.threadRefs = [];
@@ -2016,7 +2033,10 @@ describe("ChatView", () => {
             contentLength: 3_000,
             data: [{}, {}],
             positionAtIndex: (index: number) => index * 1_000,
-            sizeAtIndex: () => 1_000,
+            // A just-sent turn is anchored before its reply arrives: the sent row is the whole
+            // turn and ends inside the view, so a follow has no end to reveal. With a tall reply
+            // below the fold, ChatView does follow the end when the inset grows (#204).
+            sizeAtIndex: (index: number) => (anchored && index === 1 ? 120 : 1_000),
           }),
           ...listScroll,
         };
@@ -2103,13 +2123,30 @@ describe("ChatView", () => {
               )(sent.input.message.messageId, 1),
             );
           }
-          // Let the send's own anchoring settle before the panel is toggled.
+          // The send's own anchoring scrolls the list for a while: a glide, then landings a few
+          // frames apart, then a follow. Wait until it has begun and has stayed quiet for longer
+          // than its longest gap, counted in frames, so how long the host takes per frame cannot
+          // end the wait early and let a late landing count as the panel's scroll.
+          if (anchored) {
+            await vi.waitFor(() => expect(listScroll.scrollToOffset).toHaveBeenCalled(), {
+              timeout: 10_000,
+            });
+          }
           await act(
             () =>
               new Promise<void>((resolve) => {
-                const step = (left: number) =>
-                  left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
-                step(6);
+                const scrolls = () =>
+                  Object.values(listScroll).reduce((sum, spy) => sum + spy.mock.calls.length, 0);
+                let last = scrolls();
+                let quietFrames = 0;
+                const step = () => {
+                  const now = scrolls();
+                  quietFrames = now === last ? quietFrames + 1 : 0;
+                  last = now;
+                  if (quietFrames >= 12) resolve();
+                  else requestAnimationFrame(step);
+                };
+                requestAnimationFrame(step);
               }),
           );
           for (const spy of Object.values(listScroll)) spy.mockClear();
@@ -4245,7 +4282,7 @@ describe("ChatView", () => {
         input: {
           commandId: expect.any(String),
           hostThreadId: threadId,
-          title: "Panel — Codex",
+          title: "Panel: Codex",
           threadDefaults: {
             modelSelection: expect.objectContaining({ instanceId: codexInstanceId }),
             runtimeMode: "full-access",
@@ -4541,6 +4578,187 @@ describe("ChatView", () => {
       expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
     });
 
+    it("opens its chat's links and files in its host's right panel", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      const hostRef = scopeThreadRef(environmentId, ThreadId.make("thread-host"));
+
+      renderToStaticMarkup(
+        <ChatView
+          variant="panel"
+          panelThreadRef={threadRef}
+          activityPaneHostRef={hostRef}
+          workspaceUnavailable={null}
+        />,
+      );
+      expect(h.captured["rightPanelThread"]).toEqual(hostRef);
+
+      renderServerRoute();
+      expect(h.captured["rightPanelThread"]).toBeNull();
+    });
+
+    it("opens a turn's diff in its host's Diff surface, showing the panel's thread", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-diff");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Panel thread" }));
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+
+      renderToStaticMarkup(
+        <ChatView
+          variant="panel"
+          panelThreadRef={panelThreadRef}
+          activityPaneHostRef={threadRef}
+          workspaceUnavailable={null}
+        />,
+      );
+      const timeline = capturedProps<{
+        onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+      }>("messagesTimeline");
+      act(() => timeline.onOpenTurnDiff(TurnId.make("turn-panel-1"), "src/index.ts"));
+
+      const byThreadKey = useRightPanelStore.getState().byThreadKey;
+      expect(byThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
+        isOpen: true,
+        activeSurfaceId: "diff",
+        surfaces: [{ id: "diff", kind: "diff", threadId: panelThreadId }],
+      });
+      expect(byThreadKey[scopedThreadKey(panelThreadRef)]).toBeUndefined();
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(panelThreadId);
+        expect(diffPanel.composerDraftTarget).toEqual(panelThreadRef);
+
+        // The host's own Diff action shows the host's diff again.
+        act(() => useRightPanelStore.getState().open(threadRef, "diff"));
+        await vi.waitFor(() =>
+          expect(capturedProps<{ thread: { id: string } }>("diffPanel").thread.id).toBe(threadId),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("waits for a panel thread that arrives late, never pairing the host's diff with it", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-late");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      // After a reload the host's Diff still shows the panel, whose thread is not loaded yet.
+      useRightPanelStore.getState().openDiff(threadRef, panelThreadId);
+      h.threadLoadStatesByKey.set(`${environmentId}:${panelThreadId}`, {
+        status: "synchronizing",
+        hasData: false,
+        error: null,
+      });
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      try {
+        await render();
+        expect(container.textContent).toContain("Loading the chat panel's diff");
+        expect(h.captured["diffPanel"]).toBeUndefined();
+
+        h.threadsByKey.set(
+          `${environmentId}:${panelThreadId}`,
+          makeThread({ id: panelThreadId, title: "Panel thread" }),
+        );
+        h.threadLoadStatesByKey.delete(`${environmentId}:${panelThreadId}`);
+        await render();
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(panelThreadId);
+        expect(diffPanel.composerDraftTarget).toEqual(panelThreadRef);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("says when a panel thread fails to load and offers this chat's diff", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-failed");
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().openDiff(threadRef, panelThreadId);
+      h.threadLoadStatesByKey.set(`${environmentId}:${panelThreadId}`, {
+        status: "synchronizing",
+        hasData: false,
+        error: "Thread stream failed.",
+      });
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      try {
+        await render();
+        expect(container.textContent).toContain("Couldn't load the chat panel's diff.");
+        expect(h.captured["diffPanel"]).toBeUndefined();
+
+        const button = [...container.querySelectorAll("button")].find(
+          (candidate) => candidate.textContent === "Show this chat's diff",
+        );
+        expect(button).toBeDefined();
+        await act(async () => button!.click());
+        await vi.waitFor(() => expect(h.captured["diffPanel"]).toBeDefined());
+        const diffPanel = capturedProps<{
+          thread: { id: string } | null;
+          composerDraftTarget: unknown;
+        }>("diffPanel");
+        expect(diffPanel.thread?.id).toBe(threadId);
+        expect(diffPanel.composerDraftTarget).not.toEqual(
+          scopeThreadRef(environmentId, panelThreadId),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("shows an opening state instead of the global empty state before its thread arrives", () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
@@ -4571,6 +4789,89 @@ describe("ChatView", () => {
       const planSidebar = capturedProps<Record<string, unknown>>("planSidebar");
       expect(planSidebar["label"]).toBe("Tasks");
       expect(planSidebar["environmentId"]).toBe(environmentId);
+    });
+
+    // #275: the task panel's auto-open took the panel straight back, so View diff did nothing.
+    it("keeps a turn's diff open over the task panel that opened automatically", async () => {
+      const planTurnId = TurnId.make("turn-275");
+      const planUpdate = (id: string, turn: TurnId) => ({
+        id: EventId.make(id),
+        createdAt: now,
+        kind: "turn.plan.updated" as const,
+        summary: "Plan updated",
+        tone: "info" as const,
+        payload: { plan: [{ step: "Edit tasks.md", status: "inProgress" }] },
+        turnId: turn,
+      });
+      const completedTurn = (turn: TurnId) => ({
+        turnId: turn,
+        state: "completed" as const,
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        assistantMessageId: null,
+      });
+      h.settings = { ...h.settings, autoOpenPlanSidebar: true };
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          latestTurn: completedTurn(planTurnId),
+          activities: [planUpdate("plan-1", planTurnId)],
+        }),
+      );
+      seedGitStatus(true);
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const render = () =>
+        act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+      const activeSurfaceId = () =>
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.activeSurfaceId;
+      try {
+        await render();
+        expect(activeSurfaceId()).toBe("plan");
+
+        const timeline = capturedProps<{
+          onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+        }>("messagesTimeline");
+        await act(async () => timeline.onOpenTurnDiff(planTurnId, "docs/tasks.md"));
+        expect(activeSurfaceId()).toBe("diff");
+        expect(container.querySelector('[data-mock="diff-panel"]')).not.toBeNull();
+
+        // A later step of the same turn leaves the diff in place.
+        h.threadsByKey.set(
+          `${environmentId}:${threadId}`,
+          makeThread({
+            latestTurn: completedTurn(planTurnId),
+            activities: [planUpdate("plan-1", planTurnId), planUpdate("plan-2", planTurnId)],
+          }),
+        );
+        await render();
+        expect(activeSurfaceId()).toBe("diff");
+
+        // The next turn's tasks still open the panel.
+        const nextTurnId = TurnId.make("turn-275-next");
+        h.threadsByKey.set(
+          `${environmentId}:${threadId}`,
+          makeThread({
+            latestTurn: completedTurn(nextTurnId),
+            activities: [planUpdate("plan-1", planTurnId), planUpdate("plan-3", nextTurnId)],
+          }),
+        );
+        await render();
+        expect(activeSurfaceId()).toBe("plan");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
     });
   });
 

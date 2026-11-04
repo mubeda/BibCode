@@ -26,7 +26,13 @@ Words used below:
   terminal. It connects with an `mcp-client` credential and sees the tools on this page.
 - **Provider**: an agent BiBCode itself launched for a thread. It reaches the same `/mcp`
   endpoint with a provider credential and sees only the provider `preview_*` and
-  `device_*` tools. This page does not cover providers.
+  `device_*` tools. This page does not cover providers. A Codex chat reaches it as the MCP
+  server `bibcode_thread`, which BiBCode adds to each launch as
+  `-c mcp_servers.bibcode_thread.url=…` and `-c mcp_servers.bibcode_thread.bearer_token_env_var=…`.
+  That key is BiBCode's own: Codex merges overrides into a table of the same name, so a
+  `[mcp_servers.bibcode_thread]` table in your Codex config makes Codex refuse its whole
+  configuration and the message fails to deliver. The `bibcode` entry that Connect an agent
+  adds (below) is a separate server and is left as it is.
 - **Thread**: a BiBCode conversation with one provider and model. A thread works in a
   folder: its worktree, else its project's folder ("the thread's folder").
 - **Person**: the human using BiBCode. Some things only a person can do (grant access, turn
@@ -108,9 +114,12 @@ What the relay does, in order:
    the typed tool error `McpServerUnreachableError`; a sign-in failure is
    `McpSignInError`; a revoked credential is `McpCredentialRefusedError`. Other requests
    get a JSON-RPC error.
-6. **Revokes its credential** when it exits. A relay that crashed is cleaned up by the next
-   relay on that data root (it records each live credential's session in
-   `<state>/mcp-clients/`).
+6. **Revokes its credential** when it exits. It records each credential in
+   `<state>/mcp-clients/` before it signs in, so a sign-in whose answer was lost is revoked
+   too. A relay that crashed is cleaned up by the next relay on that data root; a crash in the
+   middle of a sign-in is cleaned up only by a relay from v0.15 or later. When
+   `<state>/mcp-clients/` cannot be written, the sign-in fails ("Could not record this MCP
+   connection in …") and no credential is sent.
 
 Limits: one stdio line is at most 4 MiB (a longer line is skipped and answered with a
 JSON-RPC parse error); connecting times out after 5 s and one request after 120 s (longer
@@ -176,30 +185,70 @@ server runs (the desktop executable takes it as `<desktop exe> thread`), finds t
 and signs in as `bibcode mcp` does, with its own credential labelled
 `CLI · bibcode thread`, and revokes that credential when it exits.
 
-| Command                                    | Tools it calls                                                              |
-| ------------------------------------------ | --------------------------------------------------------------------------- |
-| `bibcode thread list`                      | `list_projects_and_threads` (every page, at most 50)                        |
-| `bibcode thread start <project> <message>` | `start_thread`; `.` is the project whose folder holds the current directory |
-| `bibcode thread send <thread> <message>`   | `send_message` (queued behind a running turn, never interrupting)           |
-| `bibcode thread show <thread>`             | `read_thread`                                                               |
+| Command                                                  | Tools it calls                                                              |
+| -------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `bibcode thread list`                                    | `list_projects_and_threads` (every page, at most 50)                        |
+| `bibcode thread start <project> <message>`               | `start_thread`; `.` is the project whose folder holds the current directory |
+| `bibcode thread send <thread> <message>`                 | `send_message` (queued behind a running turn, never interrupting)           |
+| `bibcode thread show <thread>`                           | `read_thread`                                                               |
+| `bibcode thread requests <thread>`                       | `list_pending_requests`: the open questions and approvals, with request ids |
+| `bibcode thread answer <thread> <request> <answers>`     | `answer_question`; `<answers>` is a JSON object, or `-` for standard input  |
+| `bibcode thread approve <thread> <request>`              | `answer_approval` with `accept`, or `acceptForSession` with `--for-session` |
+| `bibcode thread decline <thread> <request>`              | `answer_approval` with `decline`, or `cancel` with `--cancel`               |
+| `bibcode thread interrupt <thread>`                      | `interrupt_turn`; `--turn <id>` stops only that turn                        |
+| `bibcode thread changes [--cursor] [--thread] [--limit]` | `changes_since`, one page; it prints the cursor to pass next time           |
 
 - `-` as the message reads it from standard input.
 - `start` takes `--title`, `--provider <instance>` and `--model`.
 - `--wait` (on `start` and `send`) calls `wait_for_thread` in 30-second calls until the turn
-  settles or needs a person, and prints the reply. Ctrl-C stops only the waiting.
+  settles or needs a person, and prints the reply. Ctrl-C stops only the waiting. `answer`,
+  `approve` and `decline` take no `--wait`: right after an answer, a wait could still report
+  the request just answered. Follow the thread with `show`, `changes`, or the
+  `input.resolved` and `approval.resolved` webhooks.
+- `answer` and `approve` are refused (`McpAccessCeilingError`) when the thread's mode is
+  above **Agents may**; `decline` and `interrupt` never are. The CLI takes no `--access`.
 - `--json` prints one JSON document. For `start` and `send` it is
   `{ "threadId", "messageId", "status", "reply", "requestId", "error" }`, also on failure.
-- `--request-id <id>` (1 to 256 characters) is the `clientRequestId`. Without it one is made
-  up and printed as `requestId`. After an interrupted run, run the same command with
-  `--request-id <id>`: it returns the original thread and message instead of repeating them
+  For `answer`, `approve` and `decline` it is the tool's result with `clientRequestId`
+  added, or `{ "error", "clientRequestId" }`; for the other commands, the tool's result or
+  `{ "error" }`.
+- `--request-id <id>` (1 to 256 characters, on `start`, `send`, `answer`, `approve` and
+  `decline`) is the `clientRequestId`. Without it one is made up and printed (as `requestId`
+  for `start` and `send`, else `clientRequestId`). After an interrupted run, run the same
+  command with `--request-id <id>`: it returns the original result instead of repeating it
   (for 24 hours); the same id with anything else changed is `idempotency_conflict`.
+  `interrupt` takes none, as `interrupt_turn` takes none. Answers, like messages, are never
+  echoed or logged.
 - `--base-dir <root>` picks another data root.
 - Exit codes: 0 success; 1 failure, or a turn that ended interrupted, failed or undelivered;
   2 the thread waits on a person (an approval or a question).
 
-Each run mints a new credential, so `clientRequestId` rows (kept per credential) and the
-"thread this agent opened or last drove" rule of `send_panel_message` do not carry over
-between runs.
+Each run mints a new credential, but every `bibcode thread` run shares one `clientRequestId`
+scope, so the `--request-id` retry above works across runs. Only the "thread this agent
+opened or last drove" rule of `send_panel_message` does not carry over between runs.
+
+### One tool from a shell: `bibcode mcp call` and `bibcode mcp tools`
+
+`bibcode mcp call <tool> [<arguments-json>|-]` calls one tool and prints its MCP `result`
+(`content`, `structuredContent`, `isError`) as one JSON document. `bibcode mcp tools` prints
+`{ "tools": [...] }`, the `tools/list` entries this command's credential sees, each with
+`oneShot`: whether `call` takes it. Both find the server and sign in as `bibcode mcp` does,
+take `--access`, `--url` and `--base-dir` before the subcommand
+(`bibcode mcp --access read-only call read_thread '{"threadId":"..."}'`), mint a credential
+labelled `CLI · bibcode mcp` and revoke it on exit.
+
+- **Read-only tools only, and not `files_download`.** Revoking the credential ends what a
+  call handed back: a transfer URL is bound to the session that minted it, and owned work
+  such as a clone stops. Read-only tools finish within the call; `files_download` is the
+  one that hands back a URL. Any other tool, and an unknown one, is refused before a
+  credential is minted: "`<tool>` needs a connection that stays open. Use it from
+  `bibcode mcp` in your agent, or `bibcode thread` for messages, answers and approvals."
+- `-` reads the arguments from standard input; without them the call sends `{}`. Arguments
+  that are not a JSON object are refused before anything connects.
+- Exit codes: 0 success; 1 a tool error (its message on standard error, the result still
+  printed), an unknown or refused tool, a transport failure, or a result that could not be
+  written to standard output; 2 a result whose `status` is
+  `awaiting_approval` or `awaiting_input`.
 
 ### Remote HTTP with OAuth
 
@@ -208,7 +257,8 @@ An environment reachable over HTTPS also serves MCP as Streamable HTTP at
 registration, rotating refresh tokens). A person approves each sign-in in BiBCode.
 
 **Setup commands.** **Settings → Agents → Agent integrations → MCP → Remote agents** shows
-the URL with **Copy for Claude Code** and **Copy for Codex**:
+the URL with **Copy URL** (for any other MCP client, including one hosted on the web that
+registers an `https` callback) and **Copy for Claude Code** and **Copy for Codex**:
 
 ```sh
 claude mcp add --transport http bibcode https://<host>/mcp
@@ -316,7 +366,9 @@ Cache-Control: no-store
 
 - Public clients only: `token_endpoint_auth_method` is `none` or absent.
 - 1 to 5 `redirect_uris`, each `http://localhost`, `http://127.0.0.1` or `http://[::1]`
-  (any port, any path) or an `https://` URI, without a fragment, at most 2,048 bytes.
+  (any port, any path) or an `https://` URI, without a fragment, at most 2,048 bytes. A
+  client hosted on the web registers its `https` callback; an authorization request must
+  then name exactly that URI, or it is refused with 400 and no redirect.
 - `client_name` is optional, at most 100 characters, `MCP client` unless set. The person
   sees it on the request, and the grant's row in **Authorized clients** is
   `MCP · <client_name> (remote)`.
@@ -1072,7 +1124,7 @@ specific to it; the errors every tool can return are in the
 
 ### Change feed and capabilities
 
-Two tools that belong to no capability set, so they are always listed (even at the read-only ceiling, with the Diagnostics or Workspace sets off). `server_capabilities` describes this server, your connection and every error tag; `changes_since` is a durable, content-free change feed you catch up with using a cursor. Both are read-only, need `orchestration:read`, and take no `clientRequestId`; `changes_since` has an optional `threadId` filter. Call `server_capabilities` first to learn which tools you can use, then poll `changes_since`.
+Two tools that belong to no capability set, so they are always listed (even at the read-only ceiling, with the Diagnostics or Workspace sets off). `server_capabilities` describes this server, your connection and every error tag; `changes_since` is a durable change feed of ids and states you catch up with using a cursor. Both are read-only, need `orchestration:read`, and take no `clientRequestId`; `changes_since` has an optional `threadId` filter. Call `server_capabilities` first to learn which tools you can use, then poll `changes_since`.
 
 #### `server_capabilities`
 
@@ -1103,7 +1155,7 @@ This BiBCode server and your connection: versions, the MCP protocol versions it 
 
 #### `changes_since`
 
-What changed since a cursor, as ids and states only, never text: threads and chat panels created or archived, turns requested, started, completed, interrupted or failed, session status, approvals and input requested or resolved, and each change outside agents made through MCP (tool, outcome and a target of ids). Use it to notice that a person or another agent did something without re-reading threads.
+What changed since a cursor, as ids and states only, never text other than the purpose an agent gave a thread or panel it created: threads and chat panels created or archived, turns requested, started, completed, interrupted or failed, session status, approvals and input requested or resolved, and each change outside agents made through MCP (tool, outcome and a target of ids). Use it to notice that a person or another agent did something without re-reading threads.
 
 - **Set / scope:** none (always listed; no capability set) · `orchestration:read`
 - **Access:** any level
@@ -1126,7 +1178,7 @@ What changed since a cursor, as ids and states only, never text: threads and cha
 
 Scan limits: one call scans at most 5,000 events of the orchestration event log (of any type, fewer when payloads are large: the scan stops before the event that would take the transition-type payload bytes it parses past a 4 MiB budget; the first event is always scanned, so a call progresses past one large payload). It returns its position even when no scanned event matched, with `more: true` if the window was full or cut short.
 
-**Entry shape:** `{ cursor, at, kind, threadId?, status?, requestId?, actor?, tool?, target? }`
+**Entry shape:** `{ cursor, at, kind, threadId?, status?, requestId?, actor?, purpose?, tool?, target? }`
 
 - `cursor` (string): the position just after this entry.
 - `at` (string): RFC 3339 time of the change.
@@ -1135,6 +1187,7 @@ Scan limits: one call scans at most 5,000 events of the orchestration event log 
 - `status` (string): per kind, below. Absent when the kind has none.
 - `requestId` (string): on approval and input entries, only when the provider's request id is a plain id (1 to 128 of letters, digits, `_`, `.`, `:`, `-`); otherwise omitted and `list_pending_requests` names it.
 - `actor` (object): `{ kind, clientId, label }` when an outside agent caused the change (`kind` is `"mcp-client"`; `label` may be `null`); absent for changes made by a person, the provider or the server. On `agent.call` it is always `{ kind: "mcp-client", clientId, label }`, where `clientId` is that connection's session id.
+- `purpose` (string): on `thread.created` and `panel.created`, only when the outside agent that created it gave one (`purpose` of `start_thread`, `create_worktree` or `create_chat_panel`, at most 200 characters). It is the agent's own text. Webhooks never carry it.
 - `tool`, `target`: `agent.call` only. `tool` is the MCP tool name. `target` is an object of ids and counts, possibly empty: `sha`, `revertedSha`, `pullRequest` (number), `worktreeKey`, `cloneId`, `transferId`, `fileCount` (number); never a path, message or branch name.
 
 | `kind`               | Meaning                                                                                                                | `status`                                                                                    |
@@ -1154,7 +1207,7 @@ Scan limits: one call scans at most 5,000 events of the orchestration event log 
 | `input.resolved`     | A question was answered or lapsed.                                                                                     | `resolved` or `expired`                                                                     |
 | `agent.call`         | An outside agent's mutating tool call that ran work (retries of a keyed call are not repeated).                        | `success`, or the failure's error tag such as `McpBusyError`                                |
 
-A session update with an unrecognised status, or one that changes nothing, produces no entry. Not in the feed: Git operations a person ran in the app, worktree and file changes, thread deletion and unarchiving, and profiler findings (`profiler_findings` has its own cursor). The feed is content-free: no prompt, message, summary or output text.
+A session update with an unrecognised status, or one that changes nothing, produces no entry. Not in the feed: Git operations a person ran in the app, worktree and file changes, thread deletion and unarchiving, and profiler findings (`profiler_findings` has its own cursor). The feed is otherwise content-free: no prompt, message, summary or output text; the only text is an agent's own `purpose`.
 
 **Errors:**
 
@@ -1264,7 +1317,7 @@ Lists BiBCode projects (with their folders) and their threads, newest first, wit
 **Result** (`structuredContent`):
 
 - `projects`: array of `{ projectId, title, workspaceRoot, defaultModelSelection }` (`defaultModelSelection` is `{ instanceId, model }` or null). Not limited by `limit`; only the result-size fit can shorten it.
-- `threads`: array of thread summaries, sorted by `updatedAt` descending then `threadId`: `{ threadId, projectId, title, status, hasPendingApprovals, hasPendingUserInput, latestTurn, providerInstanceId, model, runtimeMode, interactionMode, branch, hostThreadId, archived, updatedAt }`. `latestTurn` is `{ turnId, state, completedAt }` or null. `hostThreadId` is set on a chat panel (its host thread). `branch` is null for a thread in the project's folder.
+- `threads`: array of thread summaries, sorted by `updatedAt` descending then `threadId`: `{ threadId, projectId, title, status, hasPendingApprovals, hasPendingUserInput, latestTurn, providerInstanceId, model, runtimeMode, interactionMode, branch, hostThreadId, requester, archived, updatedAt }`. `latestTurn` is `{ turnId, state, completedAt }` or null. `requester` is null for a person's thread, or `{ actor: { kind: "mcp-client", clientId, label }, purpose }` for one an outside agent created, as `read_thread` returns it. `hostThreadId` is set on a chat panel (its host thread). A side chat (a chat panel that started with its host's messages) also has `sideChat: true`; other threads leave the field out. `branch` is null for a thread in the project's folder.
 - `threadCount`, `projectCount`: totals after the `projectId` and `includeArchived` filters, not the page sizes.
 - `nextCursor`: string or null (`t:<n>`); null when no more threads. Treat as opaque.
 - `nextProjectCursor`: string or null (`p:<n>`); null when no more projects. Treat as opaque.
@@ -1399,7 +1452,7 @@ Waits until a thread's turn settles, needs a person, fails, or the timeout passe
 - `timedOut`: boolean. True only when the timeout passed while the wait was not done. `status`, `turnState` and `reply` then show the state at that moment.
 - `effectiveTimeoutMs`: integer, the timeout actually used.
 - `queuedAhead`: integer or null. Set only while the message is queued: how many queued messages are ahead of it (0 means next).
-- `error`: string or null. The session's last error when `status` is `error`.
+- `error`: string or null. The session's last error when `status` is `error`. When `status` is `delivery_failed`, why the message was not delivered: with `messageId` that message's delivery, otherwise the thread's oldest failed one (as `read_thread`'s `failedDelivery`).
 - `reply`: null, or `{ messageId, text, textLength, streaming }`. It is the selected turn's own assistant message, never the thread's newest one. `text` is cut at 16,000 characters; `textLength` is the full length in characters; `streaming` is true while it is still being written. Read the rest with `read_thread` (`messageId`, `textOffset`).
 
 The wait returns (not timed out) as soon as `settled` is true or the status is `awaiting_approval`, `awaiting_input`, `delivery_failed` or `error`. A wait that needs a person (`awaiting_approval`, `awaiting_input`) returns with `settled` false: answer with `answer_approval` or `answer_question`, then wait again.
@@ -1438,6 +1491,7 @@ Returns a thread's status and a page of its messages, newest last, with queued m
 - `requester`: null for a person's thread, or `{ actor: { kind: "mcp-client", clientId, label }, purpose }` for a thread an outside agent created.
 - `hasPendingApprovals`, `hasPendingUserInput`: booleans.
 - `session`: null, or `{ status, providerInstanceId, runtimeMode, activeTurnId, lastError }` (`providerInstanceId`, `activeTurnId`, `lastError` may be null).
+- `failedDelivery`: null, or `{ messageId, detail }` for the thread's oldest message whose delivery failed or is uncertain, which holds back its later messages until a person retries or dismisses it in BiBCode. `detail` (string or null) says why, such as the provider refusing its own configuration. It is set whether or not the thread has a session.
 - `messages`: delivered messages, oldest first within the page. Each is `{ messageId, role, turnId, text, textLength, streaming, createdAt }` plus `actor` (`{ kind, clientId, label }`) when an outside agent sent it and `sourceThreadId` when it was passed from another thread of the worktree (see `send_panel_message`). `turnId` may be null. `text` is the first 16,000 characters; `textLength` is the full length in characters.
 - `queuedMessages`: up to 20 messages still waiting to be delivered, oldest first, each `{ messageId, text, textLength, createdAt }` (text cut at 16,000).
 - `queuedCount`: integer, all queued messages (may exceed the 20 listed).
@@ -1547,7 +1601,7 @@ Reverts a thread to its checkpoint after turn `turnCount` (0 means before its fi
 **Errors:**
 
 - `McpTurnRunningError`: a turn is running on the thread. Stop it with `interrupt_turn`, then revert.
-- `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
+- `McpCheckpointRevertError`: the target turn has no captured checkpoint (its capture failed or timed out; refused before anything is requested), the revert failed (the message has the detail; a turn's checkpoint still being recorded is retried in a moment), or the conversation was rewound but the files could not be restored (also reported when the wait ended before the files were restored).
 - `McpInvalidArgumentError`: `turnCount` is above the latest turn that has a checkpoint.
 - `McpAccessCeilingError`: the thread runs above this connection's limit.
 - `McpThreadNotFoundError`, `OrchestrationDispatchCommandError`.
@@ -1579,7 +1633,7 @@ Stops a thread's running turn: the one `turnId` names, else the thread's latest 
 
 #### `get_turn_diff`
 
-Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only (a project outside Git has none). Turns that ended before BiBCode recorded checkpoints have none. A turn whose capture failed or that a restart cut off is not captured (the default skips it); asked for by `turnCount`, its patch also holds anything changed before the next turn started. A turn whose capture was still pending after 120 seconds has no patch at all, and the next turn's patch cannot be read either. While a turn's checkpoint is being captured, the thread's next turn waits. In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
+Returns the file changes one turn made, as a patch: the changed files first, then the patch from `cursor`. `nextCursor` continues a long patch. A turn's checkpoint is captured just after the turn ends, in a Git checkout only (a project outside Git has none). Turns that ended before BiBCode recorded checkpoints have none. A turn whose capture failed or that a restart cut off is not captured (the default skips it); asked for by `turnCount`, its patch also holds anything changed before the next turn started. A turn whose capture was still pending after 120 seconds has no patch at all. The turn after one that was not captured has no patch either (the default skips it), but it can still be reverted to. While a turn's checkpoint is being captured, the thread's next turn waits. In a thread without its own worktree, the patch holds every change made in the project folder while the turn ran.
 
 - **Set / scope:** Workspace · `orchestration:read`
 - **Access:** any level
@@ -1603,7 +1657,7 @@ Returns the file changes one turn made, as a patch: the changed files first, the
 
 **Errors:**
 
-- `McpNoTurnDiffError`: no `turnCount` was given and the thread has no turn with a captured checkpoint yet (none has ended since BiBCode recorded checkpoints, the project is not a Git checkout, or its only turn is still being captured); or the `turnCount` asked for has no captured checkpoint (its capture failed or timed out), refused before anything is read, as `revert_thread_to_turn` refuses it.
+- `McpNoTurnDiffError`: no `turnCount` was given and the thread has no turn with a captured checkpoint yet (none has ended since BiBCode recorded checkpoints, the project is not a Git checkout, or its only turn is still being captured); or the `turnCount` asked for has no captured checkpoint (its capture failed or timed out), refused before anything is read, as `revert_thread_to_turn` refuses it; or the turn was captured but the checkpoint before it is missing ("Turn n has no diff: the checkpoint before it is missing. You can still revert to it.").
 - `McpInvalidArgumentError`: `turnCount` is 0, or the cursor is malformed.
 - `OrchestrationGetTurnDiffError`: the checkpoint for a turn is no longer in the repository, or the workspace could not be resolved.
 - `WorkspaceUnavailableError`: the thread's workspace is being removed or is gone.
@@ -1904,7 +1958,7 @@ Opens a chat panel on a host thread and returns its `threadId`. Give it work wit
 | Argument             | Type   | Required | Limits and default                                                                          | Meaning                                                       |
 | -------------------- | ------ | -------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
 | `hostThreadId`       | string | yes      | a live thread that is not itself a panel                                                    | The host.                                                     |
-| `title`              | string | no       | trimmed; default `Panel — <provider instance id>`                                           | The panel's tab title.                                        |
+| `title`              | string | no       | trimmed; default `Panel: <provider instance id>`                                            | The panel's tab title.                                        |
 | `providerInstanceId` | string | no       | an instance id from `list_providers_and_models`                                             | Provider instance (selection rules as for `start_thread`).    |
 | `model`              | string | no       | a model slug                                                                                | Model.                                                        |
 | `runtimeMode`        | string | no       | `approval-required`, `auto-accept-edits`, `full-access`; default is this connection's limit | The panel's mode; above the limit is `McpAccessCeilingError`. |
@@ -1943,7 +1997,7 @@ Lists the open chat panels of a host thread, with each one's status, model and m
 **Result** (`structuredContent`):
 
 - `hostThreadId`: string.
-- `panels`: array of thread summaries (the same fields as in `list_projects_and_threads`: `threadId`, `projectId`, `title`, `status`, `hasPendingApprovals`, `hasPendingUserInput`, `latestTurn`, `providerInstanceId`, `model`, `runtimeMode`, `interactionMode`, `branch`, `hostThreadId`, `archived`, `updatedAt`) plus `requester` (null, or `{ actor, purpose }` for a panel an outside agent opened). Only non-archived panels of this host are listed.
+- `panels`: array of thread summaries (the same fields as in `list_projects_and_threads`: `threadId`, `projectId`, `title`, `status`, `hasPendingApprovals`, `hasPendingUserInput`, `latestTurn`, `providerInstanceId`, `model`, `runtimeMode`, `interactionMode`, `branch`, `hostThreadId`, `requester` (null, or `{ actor, purpose }` for a panel an outside agent opened), `archived`, `updatedAt`, and `sideChat: true` on a side chat). Only non-archived panels of this host are listed.
 - `truncated`: true when panels were dropped from the end to fit the size cap (at least one is kept).
 
 **Errors:** `McpNotAHostThreadError`, `McpThreadNotFoundError`.
@@ -2536,7 +2590,7 @@ Destructive: deletes a branch on a remote, leaving any local branch alone. It al
 
 #### `git_discard`
 
-Destructive: discards the changes of files or folders, restoring tracked files to HEAD and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in `trashUnavailable`, unless `permanent` is true. An ignored file that permanent deletion leaves in place is listed there too. Staged changes of the discarded paths are unstaged before the restore. On macOS 15 and later the system trash is reached through `/usr/bin/trash`, without Finder automation (older macOS asks Finder, which needs Automation consent); on macOS a trash that has not answered within 10 seconds counts as unavailable.
+Destructive: discards the changes of files or folders, restoring tracked files to HEAD and removing untracked ones. Files go to the system trash; a file the trash cannot take is kept and listed in `trashUnavailable`, unless `permanent` is true. An ignored file that permanent deletion leaves in place is listed there too. A file the trash refused that could not be put back, because something else took its name, is listed in `keptInStaging` with where it is. Staged changes of the discarded paths are unstaged before the restore. On macOS 15 and later the system trash is reached through `/usr/bin/trash`, without Finder automation (older macOS asks Finder, which needs Automation consent); on macOS a trash that has not answered within 10 seconds counts as unavailable.
 
 - **Set / scope:** Source control · `orchestration:operate`
 - **Access:** operate (hidden at read-only)
@@ -2550,12 +2604,13 @@ Destructive: discards the changes of files or folders, restoring tracked files t
 | `permanent`       | boolean         | no       | `false`                                                    | Delete permanently what the trash cannot take.                |
 | `clientRequestId` | string          | no       | 1 to 256 characters                                        | Makes a retry replay.                                         |
 
-**Result** (`structuredContent`): `{ threadId, trashed, permanentlyDiscarded, trashUnavailable, status }`, each of the three a list of the normalized paths given:
+**Result** (`structuredContent`): `{ threadId, trashed, permanentlyDiscarded, trashUnavailable, keptInStaging, status }`, the first three each a list of the normalized paths given:
 
 - `trashed`: moved to the system trash.
 - `permanentlyDiscarded`: deleted for good (only when `permanent` was true and the trash could not take them).
 - `trashUnavailable`: left on disk because the trash could not take them and `permanent` was false, or an ignored file that permanent deletion did not remove.
   A tracked file already missing from disk is simply restored and appears in none of the lists.
+- `keptInStaging`: `[{ path, stagedAt }]`, files the trash refused that could not be put back because something else took their name. They are not in the folder: `stagedAt` is their path below the repository's Git directory (`bibcode-discard/<id>/<name>`). Nothing is deleted, not even with `permanent`; tell the person, and BiBCode moves them back on the next discard in that repository once the name is free. Never also in `trashUnavailable`.
 
 **Errors:**
 
@@ -2853,7 +2908,7 @@ Merging a pull request with the head sha that `view_pull_request` returned.
 
 The Files set lists, searches, reads, writes, creates, renames and deletes files in the folder a thread works in, and mints short-lived URLs to download or upload whole files. It is the capability set `files` (Settings label "Files"); when a person turns it off the nine tools disappear from `tools/list` and a call is refused with `McpCapabilityDisabledError`, and any transfer already started from a URL these tools minted is cut. Every tool takes `threadId`: the tool works in that thread's worktree if it has one, otherwise in its project's workspace root (called "the thread's folder" below). Every path argument is relative to that folder and is checked before anything runs: it must be literal, 1 to 512 characters, not absolute, with no `..` component and no NUL; globs and Git pathspec magic are refused (a leading `:`, or any of `*`, `?`, `[`, `\`); `./` and repeated `/` are normalized away; and a path whose existing parent resolves through a symlink to outside the folder is refused (a path that is itself a symlink is allowed here, and the workspace layer then refuses to follow one that points out). Git's own metadata is refused for every Files tool, `files_upload`'s `directory` and `fileName` included: a path with a `.git` component (any letter case, anywhere in the path, after `./` and trailing `/` are removed, so `.git/config`, `.GIT/config`, `./.git/HEAD` and `vendor/lib/.git` alike), and a path that resolves into the thread's Git directory or common directory (through a symlink such as `gitlink -> .git`, or where a `.git` file names a folder inside the thread's folder), or a folder that holds one of those. That refusal is `McpInvalidArgumentError` with a message that says the path is Git's own metadata (the workspace layer's `failure` is `git_metadata`); use the `git_*` tools for repository state. A symlink that points at `.git` may itself be renamed or deleted (only the link changes). `files_list`, `files_search` and a folder's zip from `files_download` leave every `.git` entry out. `.gitignore`, `.github/` and other names that only start with `.git` are ordinary files. Each tool names at most two paths (`files_rename`), so the limit of 200 paths per call never applies here. A bad path is `McpInvalidArgumentError`; `.` and `""` are not valid paths (so the thread's folder itself cannot be downloaded; only `files_upload`'s `directory` accepts `""`, `.` or `./` for the folder). Results and failures always name a path as you gave it (normalized), never the host's absolute path.
 
-The four read tools (`files_list`, `files_search`, `files_read`, `files_download`) are listed and callable at every access level. The five that change files (`files_write`, `files_create`, `files_rename`, `files_delete`, `files_upload`) are operate tools: hidden and refused at the read-only ceiling. None of the nine checks the thread's own runtime mode, so a thread running above the connection's limit does not block them (unlike tools that advance a thread). Those five are also refused with `McpPlatformUnsupportedError` when the BiBCode server runs on a non-Unix operating system (Windows), because BiBCode cannot hold a folder open there while it works in it; reading, listing, searching and `files_download` keep working on every platform. Nothing a tool names (a path, file content) is logged.
+The four read tools (`files_list`, `files_search`, `files_read`, `files_download`) are listed and callable at every access level. The five that change files (`files_write`, `files_create`, `files_rename`, `files_delete`, `files_upload`) are operate tools: hidden and refused at the read-only ceiling. None of the nine checks the thread's own runtime mode, so a thread running above the connection's limit does not block them (unlike tools that advance a thread). All nine work on Unix and Windows servers alike: every change goes through folder handles opened without following a symlink or junction (see [Files tools](../architecture/rpc-and-orchestration.md)). Nothing a tool names (a path, file content) is logged.
 
 Failures that come from the workspace layer keep their `failure` string (documented per tool below) and the `_tag` of the RPC that failed; the message is rewritten to name your path. Tags that every Files tool can also return, besides the common ones: `McpProjectNotFoundError` (the thread's project is gone), `WorkspaceUnavailableError` (the folder is missing, registered but gone, or being removed; the `reason` field is kept only by `files_list` and `files_search`), `WorkspaceIdentityError` (the folder's physical identity could not be verified), and `McpInvalidArgumentError` (any bad or unknown argument). Failure strings and tags not named under a tool fall into `operation_failed` with the operating system's reason, for example `BiBCode could not complete this on docs/a.md: Permission denied (os error 13).`
 
@@ -2941,7 +2996,7 @@ Reads a text file in pages of at most 16,000 characters. The first call uses `of
 Replaces a text file's whole content, creating missing parent folders, in place. It needs exactly one precondition: `expectedVersion`, the `version` `files_read` returned (the write is refused with `file_changed_on_disk` if the file changed since, and with `file_missing_on_disk` if it no longer exists), or `createOnly: true` to create a file that must not exist yet (refused with `file_changed_on_disk` if anything exists at the path). It never replaces a file it has not been shown the version of. The write opens the existing file and truncates and rewrites it, so the file keeps its inode, hard links, owner and permissions; it is not a write-to-temp-and-rename. A write to a path that is a symlink pointing inside the folder writes the file the link names; a link pointing out is refused. A file with more than one hard link is refused for agents (`McpHardLinkedFileError`), because writing it would also change its other names, which can be outside the folder.
 
 - **Set / scope:** Files · `orchestration:operate`
-- **Access:** operate (hidden at read-only); refused with `McpPlatformUnsupportedError` on a non-Unix server
+- **Access:** operate (hidden at read-only)
 - **Annotations:** `readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false`
 - **Retries:** no `clientRequestId`. A repeat with `expectedVersion` fails with `file_changed_on_disk` unless the file still hashes to that version (identical content rewrites identically); a repeat with `createOnly` fails with `file_changed_on_disk` because the file now exists. Use the new `version` the first call returned for your next write.
 - **Runs long / waits:** not long-running. A write waits at most 10 seconds for another BiBCode writer of the same path, then fails with `path_busy` (`McpFileBusyError`); if an upload of that path is in progress or queued, it fails at once without waiting.
@@ -2961,7 +3016,6 @@ Replaces a text file's whole content, creating missing parent folders, in place.
 
 **Errors:**
 
-- `McpPlatformUnsupportedError`: the server is not on a Unix operating system.
 - `McpInvalidArgumentError`: bad path; `content` over 1 MiB; neither or both of `expectedVersion` and `createOnly: true`; `expectedVersion` not 64 hex characters.
 - `McpFileBusyError` (`failure` `path_busy`): an upload or another write holds the path.
 - `McpHardLinkedFileError` (`failure` `hard_linked`): the file has more than one hard link. Ask the person to change it in BiBCode.
@@ -2974,7 +3028,7 @@ Replaces a text file's whole content, creating missing parent folders, in place.
 Creates an empty file or a folder, and any missing folders above it. Refused if anything already exists at the path.
 
 - **Set / scope:** Files · `orchestration:operate`
-- **Access:** operate (hidden at read-only); refused with `McpPlatformUnsupportedError` on a non-Unix server
+- **Access:** operate (hidden at read-only)
 - **Annotations:** `readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false`
 - **Retries:** no `clientRequestId`. A repeat fails with `entry_already_exists`; nothing is changed twice.
 
@@ -2988,7 +3042,7 @@ Creates an empty file or a folder, and any missing folders above it. Refused if 
 
 **Errors:**
 
-- `McpPlatformUnsupportedError`; `McpInvalidArgumentError` (bad path or `kind`).
+- `McpInvalidArgumentError` (bad path or `kind`).
 - `ProjectCreateEntryError` with `failure`: `entry_already_exists`; the outside-the-folder failures; `operation_failed` (for example a parent that is a file).
 
 #### `files_rename`
@@ -2996,7 +3050,7 @@ Creates an empty file or a folder, and any missing folders above it. Refused if 
 Renames or moves a file or folder inside the thread's folder. It never replaces: it is refused if anything exists at `to`. Missing folders above `to` are created. Renaming a symlink moves the link, not its target.
 
 - **Set / scope:** Files · `orchestration:operate`
-- **Access:** operate (hidden at read-only); refused with `McpPlatformUnsupportedError` on a non-Unix server
+- **Access:** operate (hidden at read-only)
 - **Annotations:** `readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false`
 - **Retries:** no `clientRequestId`. A repeat fails with `path_not_found` (the source no longer exists).
 - **Runs long / waits:** takes the locks of both paths (in a fixed order); waits at most 10 seconds each, then `path_busy` (`McpFileBusyError`); refused at once while an upload holds either path.
@@ -3011,7 +3065,7 @@ Renames or moves a file or folder inside the thread's folder. It never replaces:
 
 **Errors:**
 
-- `McpPlatformUnsupportedError`; `McpInvalidArgumentError` (bad `from` or `to`).
+- `McpInvalidArgumentError` (bad `from` or `to`).
 - `McpFileBusyError` (`failure` `path_busy`).
 - `ProjectRenameEntryError` with `failure`: `entry_already_exists` (named as `to`), `path_not_found` (named as `from`), the outside-the-folder failures, or `operation_failed` (also when the file system lacks a no-replace rename, which is refused rather than risking a replace).
 
@@ -3020,7 +3074,7 @@ Renames or moves a file or folder inside the thread's folder. It never replaces:
 Destructive. Deletes a file or a folder with everything in it. By default it goes to the system trash; with `permanent: true` it is removed for good. If the trash cannot take it, the entry is left in place and the call fails with `trash_unavailable`; BiBCode never falls back to deleting permanently. Use `permanent: true` only when the person asked for that. Deleting a symlink removes the link, not what it points at. The call is audited.
 
 - **Set / scope:** Files · `orchestration:operate`
-- **Access:** operate (hidden at read-only); refused with `McpPlatformUnsupportedError` on a non-Unix server
+- **Access:** operate (hidden at read-only)
 - **Annotations:** `readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false`
 - **Retries:** recorded with `clientRequestId`. With an id, the call runs at most once; a retry with the same id and the same arguments replays the stored outcome (success, failure such as `trash_unavailable`, or unknown) and deletes nothing more. The same id with other arguments (for example adding `permanent`) is `idempotency_conflict`; use a new id to try permanent deletion after `trash_unavailable`. The id is remembered for 24 hours per MCP connection. Without an id, a repeat deletes whatever is at the path then.
 - **Runs long / waits:** not long-running; waits at most 10 seconds for another writer of the path, then `path_busy` (`McpFileBusyError`).
@@ -3036,11 +3090,11 @@ Destructive. Deletes a file or a folder with everything in it. By default it goe
 
 **Errors:**
 
-- `McpPlatformUnsupportedError`; `McpInvalidArgumentError`.
+- `McpInvalidArgumentError`.
 - `McpFileBusyError` (`failure` `path_busy`).
 - `McpTrashStagedError` (`failure` `kept_in_staging`): the trash refused the entry and its name was taken meanwhile, so it is kept in BiBCode's staging folder; `stagedIn` (`git-dir` or `state-dir`) and `stagedAt` say where. Tell the person.
 - `ProjectDeleteEntryError` with `failure`:
-  - `trash_unavailable`: the system trash did not take it (no trash, another file system, or the trash refused); the entry was left in place. Nothing was deleted. Ask the person before retrying with `permanent: true`.
+  - `trash_unavailable`: the system trash did not take it (no trash, another file system, on Windows a file system other than NTFS or ReFS, or the trash refused); the entry was left in place. Nothing was deleted. Ask the person before retrying with `permanent: true`.
   - `partially_removed`: a permanent delete of a folder stopped part-way. The field `leftAt` is a name (never a path) in the entry's own folder under which what is left now sits: the entry's own name if it was put back, else a hidden name it was parked under. The message gives `<folder>/<leftAt>`. Tell the person rather than retrying.
   - `path_not_found` (nothing at the path), the outside-the-folder failures, `operation_failed`.
 
@@ -3083,7 +3137,7 @@ Returns a URL that downloads one file, or a folder as a zip, with an HTTP GET. N
 Destructive when `overwrite` is true. Returns a URL that takes one file's bytes as an HTTP POST body and writes them to `fileName` inside `directory`. The directory must already exist (it is not created); the file name is fixed by the URL, so a leaked URL can write only that one file. Without `overwrite`, an existing file at that name is refused with 409; an existing folder at that name is refused with 409 even with `overwrite`. See "Using a minted transfer URL" below.
 
 - **Set / scope:** Files · `orchestration:operate`
-- **Access:** operate (hidden at read-only); refused with `McpPlatformUnsupportedError` on a non-Unix server
+- **Access:** operate (hidden at read-only)
 - **Annotations:** `readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false`
 - **Retries:** no `clientRequestId`. Every call mints a new URL; minting changes nothing on disk. Using the URL twice with `overwrite` false fails the second time with 409. The call is audited.
 
@@ -3107,7 +3161,7 @@ Destructive when `overwrite` is true. Returns a URL that takes one file's bytes 
 
 **Errors:**
 
-- `McpPlatformUnsupportedError`; `McpTransferUnavailableError` (no transfer address yet).
+- `McpTransferUnavailableError` (no transfer address yet).
 - `McpInvalidArgumentError`: bad `directory`; invalid `fileName` (the message states the rule).
 - `ProjectTransferError` with `failure`: `not_found` (the directory does not exist or is not a folder; named as the directory, `.` for the thread's folder), `outside_root`, `not_configured`, `operation_failed`.
 
@@ -3456,7 +3510,7 @@ Family-wide rules:
 - Preview tabs. The preview runs in an open BiBCode window (the desktop app or the web UI) for this environment. Each MCP agent session gets its own preview tab per thread (internally the provider session id is `mcp:<sid>:<threadId>`), so two agents on one thread do not share a tab. The first call that returns a `tabId` makes that tab the session's default for that thread. Pass `tabId` on any `preview_*` twin to act on another tab; `tabId` is consumed by the server and is not forwarded to the page. A chat panel thread keeps its own preview tabs under its own `threadId`.
 - Devices. Device tools act for the root thread of the one you name: a chat panel thread acts for its host thread. A thread sees and may stop only the devices it started; it may screenshot any device. Up to four devices run at once on the server, one per image.
 - Device twins stay listed when Device previews are off in Settings. Calling one then returns `DevicePreviewsDisabledError` ("Device previews are off. Turn on Device previews in Settings to start a device."). The same error is returned if the device service is not attached to this server.
-- Unknown arguments. The preview twins accept any arguments (`additionalProperties: true`) and forward them, except `threadId` and `tabId`, to the preview host; the host validates them. `device_open` refuses an unknown argument with `DeviceInputError`; the other device twins ignore extra arguments.
+- Arguments. Each preview twin lists its real arguments in `tools/list` (the tables below), generated from the same contract the preview host decodes with, plus the required `threadId`. The schema is compact: it omits constraints a schema cannot state, which the tool description gives instead (exactly one click target, `tabId` with `reuseExistingTab: false`). The server forwards the arguments, except `threadId` and `tabId`, to the preview host, and the host validates them against the full contract: a bad call returns `PreviewAutomationInvalidInputError` naming the field or rule, and an argument it does not know is dropped. `device_open` refuses an unknown argument with `DeviceInputError`; the other device twins ignore extra arguments.
 - Timing. All twins are long-running (no server-side progress is sent). For `preview_*` the server waits at most 15,000 ms in total for the host to answer, whatever `timeoutMs` says (see below); `device_open` waits up to 180 s for the device to boot. A call cancelled by the client ends the wait; a booting device keeps booting.
 - A failure carries its tag, its message and, when the device service sets them, `kind` (why the SDK is unusable), `running` (the device a full server names), `imageId` (the image another thread holds) and `state` (the state a device that is not ready is in). They are short strings; nothing else of the service's error is kept.
 
@@ -3469,6 +3523,7 @@ Family-wide rules:
 - `PreviewAutomationExecutionError`: the page or host failed while running the operation (also a page that could not load; the message says why).
 - `PreviewAutomationTargetNotEditableError`: `preview_type` hit a target that is not editable.
 - `PreviewAutomationClientDisconnectedError`, `PreviewAutomationRequestQueueClosedError`: the BiBCode window closed or reconnected while the call was pending.
+- `PreviewAutomationInvalidInputError`: the arguments do not satisfy the tool's contract (a missing required field, a wrong type, or a broken rule such as two click targets). The message names the fields and the rule, never the values you sent. Correct the call and retry.
 - Other tags that begin with `PreviewAutomation` and end with `Error` (for example `PreviewAutomationInvalidSelectorError`, `PreviewAutomationMalformedResponseError`): passed through unchanged when the host reports them. Any other host failure is reported as `PreviewAutomationExecutionError`.
 
 #### `preview_status`
@@ -3933,18 +3988,20 @@ session's current tab from now on.
 
 ### Clone
 
-The Clone tools let an agent clone a public Git repository into the folder that holds a registered project and register the clone as a project. The set is Workspace. `clone_repository` is always a recorded mutation: its `clientRequestId` (or one the server mints) is the `cloneId` that `clone_status` and `cancel_clone` take. The agent clone policy (`git/clone_policy.rs`, applied inside `vcs.clone`) is strict and cannot be loosened; to clone anything it refuses, ask a person to clone in BiBCode.
+The Clone tools let an agent clone a public Git repository (or, over SSH with the person's SSH agent, any repository their keys reach, for an agent that passes the Terminals gate) into the folder that holds a registered project and register the clone as a project. The set is Workspace. `clone_repository` is always a recorded mutation: its `clientRequestId` (or one the server mints) is the `cloneId` that `clone_status` and `cancel_clone` take. The agent clone policy (`git/clone_policy.rs`, applied inside `vcs.clone`) is strict and cannot be loosened; to clone anything it refuses, ask a person to clone in BiBCode.
 
 **Policy for a clone an agent starts.**
 
-- HTTPS only. SSH (`ssh://`, `git+ssh://`, `git@host:path`), scp-like `host:path`, `git://`, `file://`, `ext::`, plain `http://` and local paths are refused with reason `clone_url_refused`.
-- The URL must be written canonically, exactly as `https://host/owner/repo`: no user name or password (a credential never sits in tool arguments; Git uses the credentials it already has, which in this isolated environment means none), no spaces, no percent-encoded characters, no unicode or numeric (decimal, octal, hex) host spelling, no explicit default port (`:443`), no trailing dot on the host. The URL must equal what a URL parser would write for it (case is ignored; a trailing `/` is allowed). IPv6 literals in brackets are allowed if the address is public. Anything else is `clone_url_refused`.
-- Public hosts only. The host name is resolved (10 second limit) and every resolved address must be globally reachable (not loopback, private, link-local, shared CGNAT, documentation, multicast, reserved, and so on; IPv4-mapped, NAT64 and 6to4 addresses are judged by the IPv4 address they embed). If any address is not public: `clone_host_refused`. If the name does not resolve: `clone_host_unresolved`. The first checked address is pinned for Git's connection (`http.curloptResolve`), so DNS cannot change after the check. Git's own `url.<base>.insteadOf` rewrites are expanded first (`git ls-remote --get-url`) and the rewritten URL must pass the same checks. Redirects are not followed, and only the HTTPS protocol is allowed.
-- Isolated environment: Git starts from an allowlisted environment (`PATH`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TZ`, plus the Windows system variables), with no global or system Git configuration and `HOME` pointing at the null device, so no credential helper, proxy, rewrite, hook, filter or `.netrc` of the person's applies. Proxy variables are cleared. Consequently only public repositories can be cloned; a private repository fails with a Git error. Hooks are disabled (`core.hooksPath` is the null device, `core.fsmonitor=false`), submodules are not cloned (`submodule.recurse=false`), and Git LFS smudge is off (`GIT_LFS_SKIP_SMUDGE=1` and an empty optional `lfs` filter), so LFS files stay pointer files.
+- HTTPS, or SSH for an agent that may act as the server's user. `ssh://[user@]host[:port]/path` is accepted only when the agent passes the Terminals gate: the **Terminals** set on, an effective ceiling (Agents may) of Full access, and a credential holding `terminal:operate`, read live at each clone (a Take over, or a person turning Terminals off, applies to the next one). Such an agent can already run `git clone` over SSH from a terminal, so the tool adds no reach; it adds the checks below. Every other agent gets `clone_ssh_not_allowed`, whose message names the `https://` URL of the same repository on `github.com`, `gitlab.com`, `bitbucket.org` and `codeberg.org` (port 22), or says to use the repository's `https://` URL. The scp-like `[user@]host:path` and `git+ssh://` / `ssh+git://` are `clone_url_refused` with a message naming the `ssh://` spelling. `git://`, `file://`, `ext::`, plain `http://` and local paths are `clone_url_refused`.
+- An `ssh://` URL must equal what a URL parser would write for it (case ignored), with a user of letters, digits, `.`, `_` and `-` that does not start with `-`, no password, and a host that is an IP address or a DNS name of letters, digits, `-` and `.` whose last label does not start with a digit (no numeric IPv4 spelling, no trailing dot, no encoding). Anything else is `clone_url_refused`.
+- An `https://` URL must be written canonically, exactly as `https://host/owner/repo`: no user name or password (a credential never sits in tool arguments; Git uses the credentials it already has, which in this isolated environment means none), no spaces, no percent-encoded characters, no unicode or numeric (decimal, octal, hex) host spelling, no explicit default port (`:443`), no trailing dot on the host. The URL must equal what a URL parser would write for it (case is ignored; a trailing `/` is allowed). IPv6 literals in brackets are allowed if the address is public. Anything else is `clone_url_refused`.
+- Public hosts only. The host name is resolved (10 second limit) and every resolved address must be globally reachable (not loopback, private, link-local, shared CGNAT, documentation, multicast, reserved, and so on; IPv4-mapped, NAT64 and 6to4 addresses are judged by the IPv4 address they embed). If any address is not public: `clone_host_refused`. If the name does not resolve: `clone_host_unresolved`. The first checked address is pinned for Git's connection (`http.curloptResolve` for HTTPS), so DNS cannot change after the check. Git's own `url.<base>.insteadOf` rewrites are expanded first (`git ls-remote --get-url`, which reads the repository around the clone folder; `git clone` reads none, so Git clones the URL as written): an HTTPS URL's expansion must pass the same checks and may not be SSH, and an SSH URL whose expansion differs from it is `clone_url_refused`. Redirects are not followed, and only the URL's protocol is allowed (`protocol.allow=never` with `protocol.https.allow` or `protocol.ssh.allow`, and `GIT_ALLOW_PROTOCOL`).
+- SSH pinned and isolated. An SSH clone runs ssh through `GIT_SSH_COMMAND` (above any `core.sshCommand`; the server's own `GIT_SSH_COMMAND`, `GIT_SSH` and `GIT_SSH_VARIANT` are never inherited) with `GIT_SSH_VARIANT=ssh` and: `-F none` (no `~/.ssh/config` or system file, so no `Include`, `ProxyJump`, `ProxyCommand`, `Match exec`, `LocalCommand`, multiplexing or custom identity of the person's), `HostName=<first checked address>`, `HostKeyAlias=<host>` (or `[<host>]:<port>` off port 22, as known_hosts files it), `StrictHostKeyChecking=yes`, `BatchMode=yes`, `UpdateHostKeys=no`, `CheckHostIP=no`, `UserKnownHostsFile=<home>/.ssh/known_hosts <home>/.ssh/known_hosts2` (the server process's home), `IdentityFile=none`, `IdentityAgent=SSH_AUTH_SOCK`, `ProxyCommand=none`, `ControlMaster=no`, `ControlPath=none`, `ForwardAgent=no`, `ClearAllForwardings=yes`, `ConnectTimeout=30`, `ServerAliveInterval=15` and `ServerAliveCountMax=4`. ssh connects to the checked address and checks the key the person trusts for the host name; BiBCode never adds or rewrites a known_hosts entry for an agent. Only keys loaded in the person's SSH agent are offered. ssh ends a server that is silent for 60 seconds at any point after the connect; a server that keeps answering but trickles data holds the clone until `cancel_clone` or the 24-hour bound. The agent: on Linux and macOS, the server process's `SSH_AUTH_SOCK` when it names a socket; on Windows, Git's bundled `ssh` with `SSH_AUTH_SOCK` when it is set, else the Windows OpenSSH client with the OpenSSH Authentication Agent service. Without one, or when the home folder's path holds `${` or a control character, the clone is `clone_ssh_unavailable`; so is an ssh too old for one of the options. A server started over SSH or in WSL has an agent only when its own environment carries one. A known_hosts file set elsewhere in the person's `ssh_config` is not read, a jump host is not used, and a host certificate verifies on port 22 only (on another port, trust the host's plain key).
+- Isolated environment: Git starts from an allowlisted environment (`PATH`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TZ`, plus the Windows system variables), with no global or system Git configuration and `HOME` pointing at the null device, so no credential helper, proxy, rewrite, hook, filter or `.netrc` of the person's applies. Proxy variables are cleared. Consequently an HTTPS clone reaches only public repositories; a private one fails with a Git error. Hooks are disabled (`core.hooksPath` is the null device, `core.fsmonitor=false`), submodules are not cloned (`submodule.recurse=false`), and Git LFS smudge is off (`GIT_LFS_SKIP_SMUDGE=1` and an empty optional `lfs` filter), so LFS files stay pointer files.
 - Git 2.37 or later is required (`http.curloptResolve`); older Git gives `clone_git_too_old`.
 - Destination: the clone goes into the folder that holds a live (not deleted) registered project, as a sibling of that project's folder. A project whose folder is a filesystem root has no such folder (`McpCloneRefusedError`). A finished clone of the same URL already at the destination is reused, not cloned again.
 
-**Refusal reasons.** A policy refusal is the clone's recorded failure: `structuredContent.error` is `{ _tag: "GitCommandError", message, reason }` with `reason` one of `clone_url_refused`, `clone_host_refused`, `clone_host_unresolved`, `clone_git_too_old`, `clone_destination_refused` (the parent folder does not hold a registered project). `clone_url_refused` also covers a `directoryName` that starts with `-`. The reasons `clone_detach_refused` and `clone_not_owned` belong to the direct `vcs.clone` / `vcs.cancelClone` RPCs; these tools never send `detach` and `cancel_clone` does not use `vcs.cancelClone`, so these two tools do not return them.
+**Refusal reasons.** A policy refusal is the clone's recorded failure: `structuredContent.error` is `{ _tag: "GitCommandError", message, reason }` with `reason` one of `clone_url_refused`, `clone_host_refused`, `clone_host_unresolved`, `clone_git_too_old`, `clone_ssh_not_allowed` (an `ssh://` URL from an agent that fails the Terminals gate), `clone_ssh_unavailable` (no SSH agent, an unreadable home path, or an ssh without a needed option), `clone_destination_refused` (the parent folder does not hold a registered project). `clone_url_refused` also covers a `directoryName` that starts with `-`. An SSH clone that ssh itself refuses is a `GitCommandError` without a `reason` whose message ends with what to do: for an unknown host key, the known_hosts file BiBCode reads and the command that trusts the key under the clone's own alias and port (`ssh -F none -p <port> -o HostKeyAlias=<alias> -T <user>@<host>`); for a changed key, a warning to check the host; for a publickey denial, to add a key with `ssh-add`; for a host certificate on a port other than 22, to trust the plain key with that command. The reasons `clone_detach_refused` and `clone_not_owned` belong to the direct `vcs.clone` / `vcs.cancelClone` RPCs; these tools never send `detach` and `cancel_clone` does not use `vcs.cancelClone`, so these two tools do not return them.
 
 #### `clone_repository`
 
@@ -3956,14 +4013,14 @@ Clones a repository into the folder that holds a registered project (beside it),
 - **Retries:** recorded with `clientRequestId`. Always recorded: without a `clientRequestId` the server mints one (`clone-<uuid>`) and returns it as `cloneId`. Retrying with the same id and the same arguments attaches to the running clone (waiting up to another 50 seconds) or replays the stored outcome (done, failed or unknown); the same id with other arguments is `idempotency_conflict`. The id is remembered 24 hours per MCP connection.
 - **Runs long / waits:** long-running (open world). The call waits up to 50 seconds, then answers `running` while the clone continues as work owned by the server. It sends no progress notifications. Each connection may hold at most 2 owned mutations in flight (8 per environment), beyond which `McpBusyError`.
 
-| Argument          | Type    | Required | Limits and default                                                                                                            | Meaning                                                                |
-| ----------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `url`             | string  | yes      | Non-empty. Must satisfy the policy above.                                                                                     | The `https://` clone URL, such as `https://github.com/owner/repo.git`. |
-| `parentProjectId` | string  | yes      | Non-empty; a live project id as `list_projects_and_threads` returns.                                                          | The clone goes into the folder that holds this project's folder.       |
-| `directoryName`   | string  | no       | One folder name: no slashes, not `.` or `..`, and not starting with `-`. Default: the URL's last path segment without `.git`. | The new folder's name.                                                 |
-| `addAsProject`    | boolean | no       | Default `true`.                                                                                                               | Add the clone as a project.                                            |
-| `title`           | string  | no       | Trimmed; default: the folder name.                                                                                            | The new project's title.                                               |
-| `clientRequestId` | string  | no       | 1 to 256 characters.                                                                                                          | Retry key and `cloneId`.                                               |
+| Argument          | Type    | Required | Limits and default                                                                                                            | Meaning                                                                                                              |
+| ----------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `url`             | string  | yes      | Non-empty. Must satisfy the policy above.                                                                                     | The `https://` clone URL, such as `https://github.com/owner/repo.git`, or an `ssh://` one behind the Terminals gate. |
+| `parentProjectId` | string  | yes      | Non-empty; a live project id as `list_projects_and_threads` returns.                                                          | The clone goes into the folder that holds this project's folder.                                                     |
+| `directoryName`   | string  | no       | One folder name: no slashes, not `.` or `..`, and not starting with `-`. Default: the URL's last path segment without `.git`. | The new folder's name.                                                                                               |
+| `addAsProject`    | boolean | no       | Default `true`.                                                                                                               | Add the clone as a project.                                                                                          |
+| `title`           | string  | no       | Trimmed; default: the folder name.                                                                                            | The new project's title.                                                                                             |
+| `clientRequestId` | string  | no       | 1 to 256 characters.                                                                                                          | Retry key and `cloneId`.                                                                                             |
 
 **Result** (`structuredContent`):
 
@@ -4457,58 +4514,57 @@ the tool ran, as the app sees it (for example `GitOperationFailedError`,
 `PullRequestsOperationError`, `ProjectWriteFileError`, `UiIntentError`, `UploadError`); its
 `message` says what failed, and the tool sections above list the ones each tool can return.
 
-| Tag                                     | Meaning                                                                                                                                                                                                    | What fixes it                                                                                                                                         |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `McpServerDisabledError`                | The MCP server is turned off for this environment.                                                                                                                                                         | A person turns on Settings → Agents → Agent integrations → MCP server.                                                                                |
-| `McpServerStoppingError`                | This BiBCode server is shutting down.                                                                                                                                                                      | Retry once it is back.                                                                                                                                |
-| `McpCredentialRefusedError`             | BiBCode refused this connection's credential: it was revoked (Stop or Revoke in Authorized clients) or expired. Over HTTP the server answers 401 instead of a tool result.                                 | Restart the MCP server in your agent to sign in again; a remote client reauthorizes.                                                                  |
-| `McpServerUnreachableError`             | The stdio relay could not reach a BiBCode server on its data root.                                                                                                                                         | Start or restart BiBCode, then retry the call.                                                                                                        |
-| `McpSignInError`                        | The stdio relay could not sign in to BiBCode.                                                                                                                                                              | Check that BiBCode runs with MCP server on, then restart the MCP server in your agent.                                                                |
-| `McpScopeError`                         | This credential does not hold the tool's scope (for terminals, terminal:operate).                                                                                                                          | Reconnect with a credential that holds it; the terminal scope is granted only with Terminals on at Full access.                                       |
-| `McpUnknownToolError`                   | No tool has this name for this credential.                                                                                                                                                                 | List tools again; toolsVersion tells when the list changed.                                                                                           |
-| `McpCapabilityDisabledError`            | The tool's set is turned off for outside agents in this environment.                                                                                                                                       | A person turns the set on in Settings → Agents → Agent integrations.                                                                                  |
-| `McpAccessCeilingError`                 | The call needs more access than this connection has: it is read-only, the thread runs above its limit, or terminals need Full access. After Take over the message says a person took the agent over.       | A person raises Agents may in Settings → Agents → Agent integrations; then restart the MCP server in your agent. After Take over, wait for Hand back. |
-| `McpBusyError`                          | Too many calls, waits or keyed changes are in flight for this connection or environment.                                                                                                                   | Retry when one of them returns.                                                                                                                       |
-| `McpInvalidArgumentError`               | An argument is missing, of the wrong type, out of range or unknown.                                                                                                                                        | Correct it as the message and the tool's input schema say.                                                                                            |
-| `idempotency_conflict`                  | This clientRequestId was already used for a different call.                                                                                                                                                | Use a new clientRequestId.                                                                                                                            |
-| `McpCancelledError`                     | The call was cancelled; work started under a clientRequestId may still be running.                                                                                                                         | Call again with the same clientRequestId to get its outcome.                                                                                          |
-| `McpOutcomeUnknownError`                | BiBCode cannot tell whether the change ran: it was interrupted (off switch, read-only, revocation, shutdown or restart) or got no answer.                                                                  | Check the state (git_status, view_pull_request, read_thread), then retry with a new clientRequestId if it did not happen.                             |
-| `McpStreamEndedError`                   | An operation stopped reporting before its result, so its outcome is unknown.                                                                                                                               | Check the state, then retry with a new clientRequestId if it did not happen.                                                                          |
-| `McpPartialOutcomeError`                | Part of a change landed and part did not; the result names each part.                                                                                                                                      | Run the tool and arguments in its recovery field, or check the state first.                                                                           |
-| `McpStorageError`                       | BiBCode could not read or write its store.                                                                                                                                                                 | Retry.                                                                                                                                                |
-| `McpToolError`                          | The operation failed without a more specific type.                                                                                                                                                         | Read the message; retry only if it says the failure was temporary.                                                                                    |
-| `UpdateMaintenanceActiveError`          | BiBCode is preparing an update and refuses changes until it finishes.                                                                                                                                      | Retry after the update.                                                                                                                               |
-| `McpThreadNotFoundError`                | No live thread has this id.                                                                                                                                                                                | Use list_projects_and_threads to find it.                                                                                                             |
-| `McpNotAHostThreadError`                | A chat panel can only be opened on a host thread, and this thread is itself a panel.                                                                                                                       | Open the panel on its host thread instead.                                                                                                            |
-| `McpNotSameWorktreeError`               | The two threads belong to different worktrees.                                                                                                                                                             | Name a thread of the target's own worktree: its host or one of its panels.                                                                            |
-| `McpSourceThreadNotOwnedError`          | This agent neither opened the source thread nor sent its latest message.                                                                                                                                   | Name a panel this agent opened or last drove, or omit the source.                                                                                     |
-| `McpCloneNotFoundError`                 | No clone with this cloneId was started on this MCP connection in the last 24 hours.                                                                                                                        | Use the cloneId clone_repository returned on this connection; after a restart, clone again.                                                           |
-| `McpCloneRefusedError`                  | The parent project's folder is a filesystem root, so there is no folder beside it to clone into.                                                                                                           | Pass a parentProjectId whose folder sits inside another folder.                                                                                       |
-| `McpProjectNotFoundError`               | No project has this id, or the thread's project is gone.                                                                                                                                                   | Use list_projects_and_threads to find it.                                                                                                             |
-| `McpRequestKindError`                   | The request id names an approval where a question was expected, or the reverse.                                                                                                                            | Use the tool its answerWith names.                                                                                                                    |
-| `McpTurnRunningError`                   | A turn is running, and this change needs the thread idle.                                                                                                                                                  | Wait for it (wait_for_thread) or interrupt it (interrupt_turn) first.                                                                                 |
-| `McpCheckpointRevertError`              | Reverting to a checkpoint failed; the message says why.                                                                                                                                                    | Read the thread, fix what the message names, then retry.                                                                                              |
-| `McpAttachmentExpiredError`             | A stored request's attachment upload is gone (it expires after 10 minutes idle, or on restart).                                                                                                            | Send it again without the clientRequestId.                                                                                                            |
-| `McpNoTurnDiffError`                    | This thread has no turn with recorded changes yet, or the turn asked for has no captured checkpoint (its capture failed or timed out).                                                                     | Ask again after a turn changed files, or ask for another turn.                                                                                        |
-| `McpNotAWorktreeError`                  | This thread works in its project's folder, or in a worktree another thread hosts.                                                                                                                          | Pass the hosting thread's id, as the message says.                                                                                                    |
-| `McpPruneImpactTooLongError`            | The removal would prune more stale worktrees than a plan can show.                                                                                                                                         | Remove this worktree in the BiBCode app.                                                                                                              |
-| `McpTerminalsUnavailableError`          | This server cannot reach its terminals now.                                                                                                                                                                | Retry once it is back.                                                                                                                                |
-| `McpTerminalNotFoundError`              | The thread has no terminal with this id (a closed terminal is gone).                                                                                                                                       | Use terminal_list, or open one with terminal_open.                                                                                                    |
-| `McpTerminalExitedError`                | The terminal's process has exited; its output stays readable.                                                                                                                                              | Open a new terminal.                                                                                                                                  |
-| `McpTerminalInputFullError`             | The terminal's input queue (1 MiB) is full because its program is not reading input; none of the write was taken.                                                                                          | Read the terminal with terminal_read, and write again once the program reads.                                                                         |
-| `McpProfilerUnavailableError`           | This server has no profiler storage it can read.                                                                                                                                                           | Diagnose through the other diagnostics tools.                                                                                                         |
-| `McpProfilerReadError`                  | The profiler records could not be read.                                                                                                                                                                    | Retry.                                                                                                                                                |
-| `McpCrashNotFoundError`                 | No crash record has this id.                                                                                                                                                                               | Use profiler_status for the newest crash ids.                                                                                                         |
-| `McpFileTooLargeError`                  | The file is larger than 1 MiB, too large to read or write over MCP.                                                                                                                                        | Get it with files_download instead.                                                                                                                   |
-| `McpFileChangedError`                   | The file changed since the page files_read continues was read, so the pages would mix two versions.                                                                                                        | Read it again from offset 0.                                                                                                                          |
-| `McpFileBusyError`                      | Another BiBCode writer holds the file: an upload in progress, or another write that did not finish in time.                                                                                                | Retry when it ends; read the file again first if you write with expectedVersion.                                                                      |
-| `McpHardLinkedFileError`                | The file has more than one hard link: writing it in place would change its other names too, which can be outside the thread's folder.                                                                      | Ask the person to change it in BiBCode.                                                                                                               |
-| `McpTrashStagedError`                   | The system trash refused the entry and something else took its name meanwhile, so it could not go back: it is kept in BiBCode's staging folder (`stagedIn` and `stagedAt` say where).                      | Tell the person where it is; BiBCode moves it back on the next delete or discard in that folder once the name is free.                                |
-| `McpTransferUnavailableError`           | This BiBCode server has no transfer address yet: it is still starting.                                                                                                                                     | Retry in a moment.                                                                                                                                    |
-| `McpPlatformUnsupportedError`           | Tools that change files (files_write, files_create, files_rename, files_delete, files_upload) are refused on this server's operating system, where BiBCode cannot hold a folder open while it works in it. | Read, list, search and download only; ask the person to make the change in BiBCode.                                                                   |
-| `PreviewAutomationNoAvailableHostError` | No BiBCode window can show this thread's browser preview.                                                                                                                                                  | Ask the person to open BiBCode on the thread, then try again.                                                                                         |
-| `DevicePreviewsDisabledError`           | Device previews are off on this server.                                                                                                                                                                    | A person turns on device previews in BiBCode.                                                                                                         |
-| `DeviceBusyError`                       | Another thread is using this device.                                                                                                                                                                       | Use another device, or wait until that thread closes it.                                                                                              |
+| Tag                                     | Meaning                                                                                                                                                                                              | What fixes it                                                                                                                                         |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `McpServerDisabledError`                | The MCP server is turned off for this environment.                                                                                                                                                   | A person turns on Settings → Agents → Agent integrations → MCP server.                                                                                |
+| `McpServerStoppingError`                | This BiBCode server is shutting down.                                                                                                                                                                | Retry once it is back.                                                                                                                                |
+| `McpCredentialRefusedError`             | BiBCode refused this connection's credential: it was revoked (Stop or Revoke in Authorized clients) or expired. Over HTTP the server answers 401 instead of a tool result.                           | Restart the MCP server in your agent to sign in again; a remote client reauthorizes.                                                                  |
+| `McpServerUnreachableError`             | The stdio relay could not reach a BiBCode server on its data root.                                                                                                                                   | Start or restart BiBCode, then retry the call.                                                                                                        |
+| `McpSignInError`                        | The stdio relay could not sign in to BiBCode.                                                                                                                                                        | Check that BiBCode runs with MCP server on, then restart the MCP server in your agent.                                                                |
+| `McpScopeError`                         | This credential does not hold the tool's scope (for terminals, terminal:operate).                                                                                                                    | Reconnect with a credential that holds it; the terminal scope is granted only with Terminals on at Full access.                                       |
+| `McpUnknownToolError`                   | No tool has this name for this credential.                                                                                                                                                           | List tools again; toolsVersion tells when the list changed.                                                                                           |
+| `McpCapabilityDisabledError`            | The tool's set is turned off for outside agents in this environment.                                                                                                                                 | A person turns the set on in Settings → Agents → Agent integrations.                                                                                  |
+| `McpAccessCeilingError`                 | The call needs more access than this connection has: it is read-only, the thread runs above its limit, or terminals need Full access. After Take over the message says a person took the agent over. | A person raises Agents may in Settings → Agents → Agent integrations; then restart the MCP server in your agent. After Take over, wait for Hand back. |
+| `McpBusyError`                          | Too many calls, waits or keyed changes are in flight for this connection or environment.                                                                                                             | Retry when one of them returns.                                                                                                                       |
+| `McpInvalidArgumentError`               | An argument is missing, of the wrong type, out of range or unknown.                                                                                                                                  | Correct it as the message and the tool's input schema say.                                                                                            |
+| `idempotency_conflict`                  | This clientRequestId was already used for a different call.                                                                                                                                          | Use a new clientRequestId.                                                                                                                            |
+| `McpCancelledError`                     | The call was cancelled; work started under a clientRequestId may still be running.                                                                                                                   | Call again with the same clientRequestId to get its outcome.                                                                                          |
+| `McpOutcomeUnknownError`                | BiBCode cannot tell whether the change ran: it was interrupted (off switch, read-only, revocation, shutdown or restart) or got no answer.                                                            | Check the state (git_status, view_pull_request, read_thread), then retry with a new clientRequestId if it did not happen.                             |
+| `McpStreamEndedError`                   | An operation stopped reporting before its result, so its outcome is unknown.                                                                                                                         | Check the state, then retry with a new clientRequestId if it did not happen.                                                                          |
+| `McpPartialOutcomeError`                | Part of a change landed and part did not; the result names each part.                                                                                                                                | Run the tool and arguments in its recovery field, or check the state first.                                                                           |
+| `McpStorageError`                       | BiBCode could not read or write its store.                                                                                                                                                           | Retry.                                                                                                                                                |
+| `McpToolError`                          | The operation failed without a more specific type.                                                                                                                                                   | Read the message; retry only if it says the failure was temporary.                                                                                    |
+| `UpdateMaintenanceActiveError`          | BiBCode is preparing an update and refuses changes until it finishes.                                                                                                                                | Retry after the update.                                                                                                                               |
+| `McpThreadNotFoundError`                | No live thread has this id.                                                                                                                                                                          | Use list_projects_and_threads to find it.                                                                                                             |
+| `McpNotAHostThreadError`                | A chat panel can only be opened on a host thread, and this thread is itself a panel.                                                                                                                 | Open the panel on its host thread instead.                                                                                                            |
+| `McpNotSameWorktreeError`               | The two threads belong to different worktrees.                                                                                                                                                       | Name a thread of the target's own worktree: its host or one of its panels.                                                                            |
+| `McpSourceThreadNotOwnedError`          | This agent neither opened the source thread nor sent its latest message.                                                                                                                             | Name a panel this agent opened or last drove, or omit the source.                                                                                     |
+| `McpCloneNotFoundError`                 | No clone with this cloneId was started on this MCP connection in the last 24 hours.                                                                                                                  | Use the cloneId clone_repository returned on this connection; after a restart, clone again.                                                           |
+| `McpCloneRefusedError`                  | The parent project's folder is a filesystem root, so there is no folder beside it to clone into.                                                                                                     | Pass a parentProjectId whose folder sits inside another folder.                                                                                       |
+| `McpProjectNotFoundError`               | No project has this id, or the thread's project is gone.                                                                                                                                             | Use list_projects_and_threads to find it.                                                                                                             |
+| `McpRequestKindError`                   | The request id names an approval where a question was expected, or the reverse.                                                                                                                      | Use the tool its answerWith names.                                                                                                                    |
+| `McpTurnRunningError`                   | A turn is running, and this change needs the thread idle.                                                                                                                                            | Wait for it (wait_for_thread) or interrupt it (interrupt_turn) first.                                                                                 |
+| `McpCheckpointRevertError`              | Reverting to a checkpoint failed; the message says why.                                                                                                                                              | Read the thread, fix what the message names, then retry.                                                                                              |
+| `McpAttachmentExpiredError`             | A stored request's attachment upload is gone (it expires after 10 minutes idle, or on restart).                                                                                                      | Send it again without the clientRequestId.                                                                                                            |
+| `McpNoTurnDiffError`                    | This thread has no turn with recorded changes yet, or the turn asked for has no captured checkpoint (its capture failed or timed out).                                                               | Ask again after a turn changed files, or ask for another turn.                                                                                        |
+| `McpNotAWorktreeError`                  | This thread works in its project's folder, or in a worktree another thread hosts.                                                                                                                    | Pass the hosting thread's id, as the message says.                                                                                                    |
+| `McpPruneImpactTooLongError`            | The removal would prune more stale worktrees than a plan can show.                                                                                                                                   | Remove this worktree in the BiBCode app.                                                                                                              |
+| `McpTerminalsUnavailableError`          | This server cannot reach its terminals now.                                                                                                                                                          | Retry once it is back.                                                                                                                                |
+| `McpTerminalNotFoundError`              | The thread has no terminal with this id (a closed terminal is gone).                                                                                                                                 | Use terminal_list, or open one with terminal_open.                                                                                                    |
+| `McpTerminalExitedError`                | The terminal's process has exited; its output stays readable.                                                                                                                                        | Open a new terminal.                                                                                                                                  |
+| `McpTerminalInputFullError`             | The terminal's input queue (1 MiB) is full because its program is not reading input; none of the write was taken.                                                                                    | Read the terminal with terminal_read, and write again once the program reads.                                                                         |
+| `McpProfilerUnavailableError`           | This server has no profiler storage it can read.                                                                                                                                                     | Diagnose through the other diagnostics tools.                                                                                                         |
+| `McpProfilerReadError`                  | The profiler records could not be read.                                                                                                                                                              | Retry.                                                                                                                                                |
+| `McpCrashNotFoundError`                 | No crash record has this id.                                                                                                                                                                         | Use profiler_status for the newest crash ids.                                                                                                         |
+| `McpFileTooLargeError`                  | The file is larger than 1 MiB, too large to read or write over MCP.                                                                                                                                  | Get it with files_download instead.                                                                                                                   |
+| `McpFileChangedError`                   | The file changed since the page files_read continues was read, so the pages would mix two versions.                                                                                                  | Read it again from offset 0.                                                                                                                          |
+| `McpFileBusyError`                      | Another BiBCode writer holds the file: an upload in progress, or another write that did not finish in time.                                                                                          | Retry when it ends; read the file again first if you write with expectedVersion.                                                                      |
+| `McpHardLinkedFileError`                | The file has more than one hard link: writing it in place would change its other names too, which can be outside the thread's folder.                                                                | Ask the person to change it in BiBCode.                                                                                                               |
+| `McpTrashStagedError`                   | The system trash refused the entry and something else took its name meanwhile, so it could not go back: it is kept in BiBCode's staging folder (`stagedIn` and `stagedAt` say where).                | Tell the person where it is; BiBCode moves it back on the next delete or discard in that folder once the name is free.                                |
+| `McpTransferUnavailableError`           | This BiBCode server has no transfer address yet: it is still starting.                                                                                                                               | Retry in a moment.                                                                                                                                    |
+| `PreviewAutomationNoAvailableHostError` | No BiBCode window can show this thread's browser preview.                                                                                                                                            | Ask the person to open BiBCode on the thread, then try again.                                                                                         |
+| `DevicePreviewsDisabledError`           | Device previews are off on this server.                                                                                                                                                              | A person turns on device previews in BiBCode.                                                                                                         |
+| `DeviceBusyError`                       | Another thread is using this device.                                                                                                                                                                 | Use another device, or wait until that thread closes it.                                                                                              |
 
 Two more tags exist in the code but are never a tool result: `McpEndpointProofError` (the
 relay's endpoint proof) and `McpActivityError` (the app's activity stream).

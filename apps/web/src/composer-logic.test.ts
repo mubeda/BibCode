@@ -8,6 +8,8 @@ import {
   expandCollapsedComposerCursor,
   isCollapsedCursorAdjacentToInlineToken,
   parseStandaloneComposerBiBCodeAction,
+  resolveComposerSideChatSubmit,
+  SIDE_CHAT_TEXT_ONLY_REASON,
   replaceTextRange,
 } from "./composer-logic";
 import { INLINE_TERMINAL_CONTEXT_PLACEHOLDER } from "./lib/terminalContext";
@@ -560,5 +562,46 @@ describe("parseStandaloneComposerBiBCodeAction", () => {
 
   it("ignores actions with extra message text", () => {
     expect(parseStandaloneComposerBiBCodeAction(":plan explain this")).toBeNull();
+  });
+});
+
+describe("resolveComposerSideChatSubmit", () => {
+  const open = { unavailableReason: null, hasNonTextContent: false };
+
+  it("opens a side chat for :btw <q> and :side <q>, and a bare :btw opens it empty", () => {
+    expect(resolveComposerSideChatSubmit({ ...open, prompt: ":btw why?" })).toEqual({
+      kind: "open",
+      question: "why?",
+    });
+    expect(resolveComposerSideChatSubmit({ ...open, prompt: ":side what\nnext" })).toEqual({
+      kind: "open",
+      question: "what\nnext",
+    });
+    expect(resolveComposerSideChatSubmit({ ...open, prompt: ":btw" })).toEqual({
+      kind: "open",
+      question: "",
+    });
+  });
+
+  it("leaves other messages, :model/:plan/:default and /btw to the thread", () => {
+    for (const prompt of ["why?", ":plan", ":model", ":default", "/btw why"]) {
+      expect(resolveComposerSideChatSubmit({ ...open, prompt })).toEqual({ kind: "none" });
+    }
+  });
+
+  it("refuses with the unavailable reason first, then for non-text content", () => {
+    expect(
+      resolveComposerSideChatSubmit({
+        prompt: ":btw why?",
+        unavailableReason: "Side chats start from the main chat. Use :btw there.",
+        hasNonTextContent: true,
+      }),
+    ).toEqual({
+      kind: "refused",
+      reason: "Side chats start from the main chat. Use :btw there.",
+    });
+    expect(
+      resolveComposerSideChatSubmit({ ...open, prompt: ":btw why?", hasNonTextContent: true }),
+    ).toEqual({ kind: "refused", reason: SIDE_CHAT_TEXT_ONLY_REASON });
   });
 });

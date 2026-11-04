@@ -26,6 +26,7 @@ import {
   AuthTokenExchangeGrantType,
   EnvironmentId,
   OrchestrationShellSnapshot,
+  OrchestrationThreadShell,
   TerminalSummary,
 } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
@@ -317,19 +318,28 @@ class RpcClient {
 const decodeShellSnapshot = Schema.decodeUnknownSync(
   Schema.toCodecJson(OrchestrationShellSnapshot),
 );
+const decodeThreadShell = Schema.decodeUnknownSync(Schema.toCodecJson(OrchestrationThreadShell));
 const decodeTerminalSummary = Schema.decodeUnknownSync(Schema.toCodecJson(TerminalSummary));
 
-/** The decoded shell of our thread from the next snapshot that satisfies `ready`. */
+/**
+ * The decoded shell of our thread from the next snapshot, or the next upsert of it (after the
+ * first snapshot the stream sends only changed threads), that satisfies `ready`.
+ */
 function shellWhere(
   client: RpcClient,
   ready: (thread: EnvironmentThreadShell) => boolean,
 ): Promise<EnvironmentThreadShell> {
   return client.waitForStreamItem("orchestration.subscribeShell", {}, (item) => {
-    const envelope = item as { kind?: string; snapshot?: unknown };
-    if (envelope.kind !== "snapshot") return undefined;
-    const snapshot = decodeShellSnapshot(envelope.snapshot);
-    const thread = snapshot.threads.find((candidate) => candidate.id === THREAD_ID);
-    if (thread === undefined) return undefined;
+    const envelope = item as { kind?: string; snapshot?: unknown; thread?: unknown };
+    const thread =
+      envelope.kind === "snapshot"
+        ? decodeShellSnapshot(envelope.snapshot).threads.find(
+            (candidate) => candidate.id === THREAD_ID,
+          )
+        : envelope.kind === "thread-upserted"
+          ? decodeThreadShell(envelope.thread)
+          : undefined;
+    if (thread === undefined || thread.id !== THREAD_ID) return undefined;
     const shell = { ...thread, environmentId: ENVIRONMENT } as EnvironmentThreadShell;
     return ready(shell) ? shell : undefined;
   });

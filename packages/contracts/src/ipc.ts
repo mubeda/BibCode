@@ -36,6 +36,8 @@ import type {
   ServerProcessResourceHistoryResult,
   ServerProviderUpdateInput,
   ServerProviderUpdatedPayload,
+  ServerToolUpdateInput,
+  ServerToolUpdatedPayload,
   ServerRemoveKeybindingResult,
   ServerSignalProcessInput,
   ServerSignalProcessResult,
@@ -306,7 +308,7 @@ export interface DesktopProjectDataStatusChangedEvent {
 export interface DesktopProjectDataBackup {
   backupId: string;
   createdAt: string;
-  trigger: "pre-migration" | "pre-update";
+  trigger: "pre-migration" | "pre-update" | "pre-compact";
   appVersion: string;
   schemaVersion: number;
   sizeBytes: number;
@@ -315,7 +317,7 @@ export interface DesktopProjectDataBackup {
 export const DesktopProjectDataBackupSchema = Schema.Struct({
   backupId: Schema.String,
   createdAt: Schema.String,
-  trigger: Schema.Literals(["pre-migration", "pre-update"]),
+  trigger: Schema.Literals(["pre-migration", "pre-update", "pre-compact"]),
   appVersion: Schema.String,
   schemaVersion: Schema.Finite,
   sizeBytes: Schema.Finite,
@@ -1552,6 +1554,7 @@ export interface LocalApi {
       readonly instanceId?: ProviderInstanceId;
     }) => Promise<ServerProviderUpdatedPayload>;
     updateProvider: (input: ServerProviderUpdateInput) => Promise<ServerProviderUpdatedPayload>;
+    updateTool: (input: ServerToolUpdateInput) => Promise<ServerToolUpdatedPayload>;
     upsertKeybinding: (input: ServerUpsertKeybindingInput) => Promise<ServerUpsertKeybindingResult>;
     removeKeybinding: (input: ServerRemoveKeybindingInput) => Promise<ServerRemoveKeybindingResult>;
     getSettings: () => Promise<ServerSettings>;

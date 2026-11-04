@@ -11,7 +11,8 @@ export interface ComposerTriggerProfile {
   readonly providerDollarSkill: boolean;
 }
 
-export type ComposerBiBCodeAction = "model" | "plan" | "default";
+/** `btw` and `side` open a side chat; the others change this composer's draft. */
+export type ComposerBiBCodeAction = "model" | "plan" | "default" | "btw" | "side";
 
 export interface ComposerTrigger {
   kind: ComposerTriggerKind;
@@ -137,6 +138,15 @@ export function parseStandaloneComposerBiBCodeAction(text: string): ComposerBiBC
   if (command === "model") return "model";
   if (command === "plan") return "plan";
   return "default";
+}
+
+/**
+ * The question of a whole-message `:btw` or `:side` (any case), trimmed; empty for a bare one.
+ * `null` for anything else, so `/btw` stays the provider's slash command.
+ */
+export function parseComposerSideChatCommand(text: string): string | null {
+  const match = /^:(?:btw|side)(\s[\s\S]*)?$/i.exec(text.trim());
+  return match ? (match[1] ?? "").trim() : null;
 }
 
 export function replaceTextRange(

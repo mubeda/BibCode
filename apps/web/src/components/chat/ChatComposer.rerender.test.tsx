@@ -315,6 +315,8 @@ function makeProps(
     composerElementContextsRef: { current: [] },
     composerRef,
     onSend: vi.fn(),
+    onOpenSideChat: vi.fn(),
+    sideChatUnavailableReason: null,
     onInterrupt: vi.fn(),
     onImplementPlanInNewThread: vi.fn(),
     onRespondToApproval: vi.fn(async () => undefined),

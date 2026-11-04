@@ -12,6 +12,7 @@ use axum::{
         ConnectInfo, FromRef, Request, State, WebSocketUpgrade, connect_info::Connected,
         rejection::ExtensionRejection,
     },
+    handler::Handler,
     http::{
         HeaderMap, HeaderValue, Method, StatusCode, Uri,
         header::{
@@ -29,7 +30,10 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::fs::File;
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
-use tower_http::cors::{AllowCredentials, AllowOrigin, Any, CorsLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{AllowCredentials, AllowOrigin, Any, CorsLayer},
+};
 
 use crate::{
     auth,
@@ -57,7 +61,7 @@ pub(crate) const MIN_COMPATIBLE_REMOTE_PROTOCOL: u32 = 1;
 pub const DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/bibcode/desktop/shutdown";
 pub const DESKTOP_SHUTDOWN_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
 
-const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src blob:; base-uri 'self'; frame-ancestors 'none'";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const HTML_CACHE_CONTROL: &str = "no-cache";
 const MAX_PLAIN_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -474,7 +478,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(MAINTENANCE_UPDATE_STATUS_PATH, get(update_status))
         .route("/ws", get(websocket))
         .route(WS_E2EE_PATH, get(websocket_e2ee))
-        .fallback(static_or_dev)
+        // Gzip for the web build a remote browser loads (#227): only the static fallback, so
+        // `/ws`, the E2EE route, the JSON routes and preview traffic are never compressed here.
+        .fallback(static_or_dev.layer(CompressionLayer::new()))
         .layer(middleware::from_fn_with_state(
             state.admission_gate.clone(),
             request_admission,
@@ -1213,10 +1219,15 @@ async fn stream_file(
             StatusCode::OK
         })
         .header(CONTENT_TYPE, content_type.as_ref())
-        .header(CONTENT_LENGTH, metadata.len())
         .header(CACHE_CONTROL, cache_control)
+        // The static fallback gzips for clients that accept it (#227): every answer, a 304
+        // included, varies by encoding, and a 304 carries no length since the encoding sets it.
+        .header(VARY, "accept-encoding")
         .header("x-content-type-options", "nosniff")
         .header("content-security-policy", content_security_policy(headers));
+    if !not_modified {
+        response = response.header(CONTENT_LENGTH, metadata.len());
+    }
     if let Some(etag) = etag {
         response = response.header(ETAG, etag);
     }
@@ -1272,6 +1283,29 @@ fn internal_server_error() -> Response {
 #[cfg(test)]
 mod tests {
     use tower::ServiceExt;
+
+    fn directive(csp: &str, name: &str) -> Vec<String> {
+        csp.split(';')
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix(name)?.strip_prefix(' '))
+            .map(|sources| sources.split(' ').map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// The Files panel previews PDF and audio from `blob:` URLs the app makes from the capped
+    /// asset route, so the page allows `blob:` for objects and media and nothing wider: the
+    /// environment's origin is never a media or object source.
+    #[test]
+    fn the_ui_may_play_media_and_objects_from_blob_urls_only() {
+        let csp = super::content_security_policy(&HeaderMap::new());
+        assert_eq!(directive(&csp, "media-src"), ["'self'", "blob:"]);
+        assert_eq!(directive(&csp, "object-src"), ["blob:"]);
+        let images = directive(&csp, "img-src");
+        assert!(images.contains(&"blob:".to_owned()), "{images:?}");
+        for wide in ["http:", "https:", "*"] {
+            assert!(!images.contains(&wide.to_owned()), "img-src allows {wide}");
+        }
+    }
 
     #[test]
     fn the_ui_may_frame_only_its_own_hosts_preview_gateways() {

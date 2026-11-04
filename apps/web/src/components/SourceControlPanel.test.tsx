@@ -481,6 +481,11 @@ vi.mock("./SourceControlAgentSuggestion", () => ({
   SourceControlAgentSuggestion: () => null,
 }));
 
+// Its own test covers the draft conflict offer (#219).
+vi.mock("./SourceControlDraftConflict", () => ({
+  SourceControlDraftConflict: () => null,
+}));
+
 vi.mock("./SourceControlCommits", () => ({
   SourceControlCommits: (props: { reloadToken: number; nowMs: number; gitCwd: string | null }) => {
     captured.commits.push(props);
@@ -1103,6 +1108,32 @@ describe("SourceControlPanel", () => {
     expect(captured.dialogs[1]?.open).toBe(false);
   });
 
+  describe("Commit, push & PR", () => {
+    const settle = async (message: string) => {
+      testState.draft = { message };
+      testState.statusQuery.data = stagingStatus();
+      const props = buildProps();
+      render(props);
+      menuItemByText("Commit, Push &")?.onClick?.();
+      await flushPromises();
+      render(props);
+      captured.createPullRequest?.onSettled({
+        commit: { status: "created" },
+      } as Parameters<GitManagerCreatePullRequestDialogProps["onSettled"]>[0]);
+    };
+
+    it("clears the draft only when the message it sent is the one in the box", async () => {
+      await settle("Panel message");
+      expect(testState.clearDraft).toHaveBeenCalledWith("Panel message");
+    });
+
+    it("leaves a draft typed meanwhile when no message was sent", async () => {
+      await settle("");
+      expect(captured.createPullRequest?.commitInput).not.toHaveProperty("commitMessage");
+      expect(testState.clearDraft).not.toHaveBeenCalled();
+    });
+  });
+
   it("commits the staged index as-is and clears the draft on success", async () => {
     testState.draft = { message: "Panel message" };
     render(buildProps());
@@ -1120,7 +1151,7 @@ describe("SourceControlPanel", () => {
       }),
     );
     expect(testState.runAction.mock.calls[0]?.[0]).not.toHaveProperty("filePaths");
-    expect(testState.clearDraft).toHaveBeenCalledWith();
+    expect(testState.clearDraft).toHaveBeenCalledWith("Panel message");
     expect(testState.toast.add).toHaveBeenCalledWith(expect.objectContaining({ type: "loading" }));
     expect(testState.toast.update).toHaveBeenCalledWith(
       "toast-1",

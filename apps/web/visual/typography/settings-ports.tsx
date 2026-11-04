@@ -66,6 +66,11 @@ export const primaryServerSettingsAtom = Atom.make<
 export const primaryServerProvidersAtom = Atom.make<
   Atom.Type<typeof ServerPorts.primaryServerProvidersAtom>
 >([liveProvider]);
+export const primaryUpdateSubjectsAtom = Atom.make<
+  Atom.Type<typeof ServerPorts.primaryUpdateSubjectsAtom>
+>([liveProvider]);
+export const primaryServerToolsAtom =
+  Atom.make<Atom.Type<typeof ServerPorts.primaryServerToolsAtom>>(undefined);
 export const primaryServerKeybindingsAtom =
   Atom.make<Atom.Type<typeof ServerPorts.primaryServerKeybindingsAtom>>(keybindings);
 export const primaryServerKeybindingsConfigPathAtom =
@@ -90,6 +95,21 @@ export const environmentSnapshotAtom: typeof ShellPorts.environmentSnapshotAtom 
   (_environmentId: Parameters<typeof ShellPorts.environmentSnapshotAtom>[0]) =>
     Atom.make<Atom.Type<ReturnType<typeof ShellPorts.environmentSnapshotAtom>>>(null),
 );
+
+/**
+ * An uncapped shell for every environment, so a thread no shell holds never looks threads up
+ * (#223). shortcut: capped shells are not modelled; add getThreadShells when a fixture needs one.
+ */
+export const environmentShell: Pick<typeof ShellPorts.environmentShell, "stateValueAtom"> = {
+  stateValueAtom: Atom.family(
+    (_environmentId: Parameters<typeof ShellPorts.environmentShell.stateValueAtom>[0]) =>
+      Atom.make<Atom.Type<ReturnType<typeof ShellPorts.environmentShell.stateValueAtom>>>({
+        snapshot: Option.none(),
+        status: "live",
+        error: Option.none(),
+      }),
+  ),
+};
 
 const traceQuery = Atom.make(AsyncResult.success(traceDiagnostics));
 const processesQuery = Atom.make(AsyncResult.success(resourceProcesses));

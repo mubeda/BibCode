@@ -134,15 +134,34 @@ import { WebhooksTab } from "./WebhooksTab";
 
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
-async function render(): Promise<HTMLDivElement> {
+async function render({
+  questionEvents = true,
+  bearerToken = true,
+  statusKinds = true,
+} = {}): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   mounted.push({ root, container });
   await act(async () => {
-    root.render(<WebhooksTab environmentId={"local" as never} isPrimary={true} supported={true} />);
+    root.render(
+      <WebhooksTab
+        environmentId={"local" as never}
+        isPrimary={true}
+        supported={true}
+        capabilities={{
+          webhookQuestionEvents: questionEvents,
+          webhookBearerToken: bearerToken,
+          webhookStatusKinds: statusKinds,
+        }}
+      />,
+    );
   });
   return container;
+}
+
+function submitButton(container: HTMLElement): HTMLButtonElement {
+  return container.querySelector<HTMLButtonElement>('form button[type="submit"]')!;
 }
 
 function endpoint(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -154,6 +173,8 @@ function endpoint(overrides: Record<string, unknown> = {}): Record<string, unkno
     eventTypes: ["thread.status_changed"],
     projectId: null,
     pairedClientId: null,
+    bearerTokenSet: false,
+    statusKinds: null,
     consecutiveFailures: 0,
     disabledReason: null,
     pendingDeliveries: 0,
@@ -171,6 +192,22 @@ function button(container: HTMLElement, text: string): HTMLButtonElement {
   );
   if (found === undefined) throw new Error(`no button ${text}`);
   return found;
+}
+
+function statusKindBoxes(container: HTMLElement): HTMLInputElement[] {
+  return [
+    ...container
+      .querySelector('[role="group"][aria-label="Status changes sent"]')!
+      .querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+  ];
+}
+
+function eventBox(container: HTMLElement, label: string): HTMLInputElement {
+  const found = [...container.querySelectorAll("label")].find(
+    (candidate) => candidate.textContent === label,
+  );
+  if (found === undefined) throw new Error(`no event ${label}`);
+  return found.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
 }
 
 function setInput(input: HTMLInputElement, value: string) {
@@ -243,7 +280,7 @@ describe("WebhooksTab", () => {
       projectId: null,
       pairedClientId: null,
     });
-    expect(h.calls[0]!.request.input.eventTypes).toHaveLength(10);
+    expect(h.calls[0]!.request.input.eventTypes).toHaveLength(12);
     expect(container.querySelector('[aria-label="Signing secret"]')?.textContent).toBe(
       "whsec_0123",
     );
@@ -252,6 +289,219 @@ describe("WebhooksTab", () => {
     expect(h.copied).toEqual(["whsec_0123"]);
     await act(async () => button(container, "Done").click());
     expect(container.querySelector('[aria-label="Signing secret"]')).toBeNull();
+  });
+
+  it("offers the Questions events and leaves them out for an older server", async () => {
+    h.settings = { enableWebhooks: true };
+    const container = await render();
+    await act(async () => button(container, "Add endpoint").click());
+    expect(container.textContent).toContain("Questions");
+    expect(container.textContent).toContain("Question asked");
+    expect(container.textContent).toContain("Question answered");
+    expect(container.textContent).not.toContain("Update BiBCode on this environment");
+
+    const older = await render({ questionEvents: false });
+    await act(async () => button(older, "Add endpoint").click());
+    expect(older.textContent).not.toContain("Question asked");
+    expect(older.textContent).toContain(
+      "Update BiBCode on this environment to send question events.",
+    );
+    const inputs = older.querySelectorAll<HTMLInputElement>("form input:not([type])");
+    await act(async () => {
+      setInput(inputs[0]!, "CI");
+      setInput(inputs[1]!, "https://hooks.example.com/bibcode");
+    });
+    await act(async () => submitButton(older).click());
+    const sent = h.calls[0]!.request.input.eventTypes as string[];
+    expect(sent).toHaveLength(10);
+    expect(sent).not.toContain("input.requested");
+  });
+
+  it("saves back event types it does not know", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ eventTypes: ["thread.status_changed", "future.event"] })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.eventTypes).toEqual(["thread.status_changed", "future.event"]);
+  });
+
+  it("adds an endpoint with a masked bearer token that is gone from the page once saved", async () => {
+    h.settings = { enableWebhooks: true };
+    const container = await render();
+    await act(async () => button(container, "Add endpoint").click());
+    const inputs = container.querySelectorAll<HTMLInputElement>("form input:not([type])");
+    const token = container.querySelector<HTMLInputElement>('form input[type="password"]')!;
+    expect(token.getAttribute("autocomplete")).toBe("off");
+    expect(container.textContent).toContain("Sent as Authorization: Bearer");
+    await act(async () => {
+      setInput(inputs[0]!, "CI");
+      setInput(inputs[1]!, "https://hooks.example.com/bibcode");
+      setInput(token, "  tok-secret-1  ");
+    });
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.bearerToken).toBe("tok-secret-1");
+    expect(container.querySelector("form")).toBeNull();
+    expect(container.innerHTML).not.toContain("tok-secret-1");
+  });
+
+  it("keeps, replaces and removes an endpoint's token", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ bearerTokenSet: true })];
+    const container = await render();
+    // Untouched, the token is kept: the field is left out.
+    await act(async () => button(container, "Edit").click());
+    expect(container.textContent).toContain("A token is set.");
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    await act(async () => submitButton(container).click());
+    expect("bearerToken" in h.calls[0]!.request.input).toBe(false);
+
+    await act(async () => button(container, "Edit").click());
+    await act(async () => button(container, "Replace").click());
+    expect(submitButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("Enter the new token, or keep the current one.");
+    await act(async () =>
+      setInput(container.querySelector<HTMLInputElement>('input[type="password"]')!, "tok-2"),
+    );
+    await act(async () => submitButton(container).click());
+    expect(h.calls[1]!.request.input.bearerToken).toBe("tok-2");
+    expect(container.innerHTML).not.toContain("tok-2");
+
+    await act(async () => button(container, "Edit").click());
+    await act(async () => button(container, "Remove").click());
+    expect(container.textContent).toContain("The token is removed when you save.");
+    await act(async () => submitButton(container).click());
+    expect(h.calls[2]!.request.input.bearerToken).toBeNull();
+  });
+
+  it("asks for the token again when the URL changes", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ bearerTokenSet: true })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    const url = container.querySelectorAll<HTMLInputElement>("form input:not([type])")[1]!;
+    await act(async () => setInput(url, "https://other.example.com/hook"));
+    expect(container.querySelector('input[type="password"]')).not.toBeNull();
+    expect(submitButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("Enter the token for the new URL, or remove it.");
+    await act(async () => button(container, "Remove").click());
+    expect(submitButton(container).disabled).toBe(false);
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input).toMatchObject({
+      url: "https://other.example.com/hook",
+      bearerToken: null,
+    });
+  });
+
+  it("hides the token field on an older server and never sends it", async () => {
+    h.settings = { enableWebhooks: true };
+    const container = await render({ bearerToken: false });
+    await act(async () => button(container, "Add endpoint").click());
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    expect(container.textContent).toContain(
+      "Update BiBCode on this environment to send a bearer token.",
+    );
+    const inputs = container.querySelectorAll<HTMLInputElement>("form input:not([type])");
+    await act(async () => {
+      setInput(inputs[0]!, "CI");
+      setInput(inputs[1]!, "https://hooks.example.com/bibcode");
+    });
+    await act(async () => submitButton(container).click());
+    expect("bearerToken" in h.calls[0]!.request.input).toBe(false);
+  });
+
+  it("sends only the status changes chosen, and every one by default", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint()];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    const group = container.querySelector('[role="group"][aria-label="Status changes sent"]')!;
+    const kinds = [...group.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    expect(group.textContent).toContain("Turn started");
+    expect(kinds.every((kind) => kind.checked)).toBe(true);
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.statusKinds).toBeNull();
+
+    await act(async () => button(container, "Edit").click());
+    const again = [
+      ...container
+        .querySelector('[role="group"][aria-label="Status changes sent"]')!
+        .querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
+    ];
+    // Leave out "Turn started".
+    await act(async () => again[0]!.click());
+    await act(async () => submitButton(container).click());
+    expect(h.calls[1]!.request.input.statusKinds).toEqual([
+      "turn.completed",
+      "turn.interrupted",
+      "turn.failed",
+      "session.status",
+    ]);
+  });
+
+  it("asks for at least one status change and keeps kinds it does not know", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ statusKinds: ["turn.failed"] })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    expect(statusKindBoxes(container).map((kind) => kind.checked)).toEqual([
+      false,
+      false,
+      false,
+      true,
+      false,
+    ]);
+    await act(async () => statusKindBoxes(container)[3]!.click());
+    expect(submitButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "Choose at least one status change, or stop sending Thread status changed.",
+    );
+    await act(async () => statusKindBoxes(container)[1]!.click());
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.statusKinds).toEqual(["turn.completed"]);
+  });
+
+  it("saves a filter that holds only kinds a newer server added", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ statusKinds: ["turn.failed", "future.kind"] })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    await act(async () => statusKindBoxes(container)[3]!.click());
+    expect(submitButton(container).disabled).toBe(false);
+    expect(container.textContent).not.toContain("Choose at least one status change");
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.statusKinds).toEqual(["future.kind"]);
+  });
+
+  it("keeps the stored filter when every kind is cleared and the event is turned off", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [
+      endpoint({
+        eventTypes: ["thread.status_changed", "approval.requested"],
+        statusKinds: ["turn.failed"],
+      }),
+    ];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    await act(async () => statusKindBoxes(container)[3]!.click());
+    await act(async () => eventBox(container, "Thread status changed").click());
+    expect(submitButton(container).disabled).toBe(false);
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.eventTypes).toEqual(["approval.requested"]);
+    expect("statusKinds" in h.calls[0]!.request.input).toBe(false);
+  });
+
+  it("hides the status choices on an older server and never sends them", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint()];
+    const container = await render({ statusKinds: false });
+    await act(async () => button(container, "Edit").click());
+    expect(container.querySelector('[aria-label="Status changes sent"]')).toBeNull();
+    expect(container.textContent).toContain(
+      "Update BiBCode on this environment to choose which status changes are sent.",
+    );
+    await act(async () => submitButton(container).click());
+    expect("statusKinds" in h.calls[0]!.request.input).toBe(false);
   });
 
   it("refuses to submit a URL that is not https", async () => {

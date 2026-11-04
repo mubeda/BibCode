@@ -543,6 +543,26 @@ describe("centerPanelStore", () => {
     });
   });
 
+  describe("side chats", () => {
+    const SIDE = ThreadId.make("side-chat");
+
+    it("opens, closes and reopens a side chat as a chat surface with its label", () => {
+      store().reserveChatPanel(HOST, SIDE, "Side chat · Codex");
+      expect(stateOf().surfaces.at(-1)).toEqual({
+        id: `chat:${SIDE}`,
+        kind: "chat",
+        threadId: SIDE,
+        providerLabel: "Side chat · Codex",
+      });
+      expect(selectActiveCenterSurface(store().byThreadKey, HOST)?.id).toBe(`chat:${SIDE}`);
+      const removed = store().closeSurface(HOST, CENTER_PANEL_ROOT_GROUP_ID, `chat:${SIDE}`);
+      expect(removed.map((surface) => surface.id)).toEqual([`chat:${SIDE}`]);
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID]);
+      store().reserveChatPanel(HOST, SIDE, "Side chat · Codex");
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${SIDE}`]);
+    });
+  });
+
   describe("thread cleanup", () => {
     it("removes a stored thread and preserves absent state identity", () => {
       store().openChatPanel(HOST, PANEL_A);

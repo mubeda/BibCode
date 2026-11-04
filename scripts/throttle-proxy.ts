@@ -17,9 +17,16 @@
  * stops both directions without closing either socket.
  *
  *   node scripts/throttle-proxy.ts --listen 127.0.0.1:13854 --target 127.0.0.1:13853 \
- *     --control 127.0.0.1:13855 [--down <bytes/s>] [--up <bytes/s>] [--delay <ms>] [--jitter <ms>]
+ *     --control 127.0.0.1:13855 [--preset 3g] [--down <bytes/s>] [--up <bytes/s>] \
+ *     [--delay <ms>] [--jitter <ms>] [--new-connections 1]
  *
- * Control API: GET /set?down=<B/s>&up=<B/s>&freeze=0|1&delay=<ms>&jitter=<ms>
+ * `--preset 3g` is 400 kbps each way and a 400 ms round trip; an explicit flag overrides it.
+ * `--new-connections 1` makes every connection pay its own TCP handshake (one round trip before
+ * its first byte) and ends HTTP keep-alive: the first response on a connection says
+ * `Connection: close`, so the client's next request opens a new connection. A WebSocket upgrade
+ * keeps its connection.
+ *
+ * Control API: GET /set?preset=3g&down=<B/s>&up=<B/s>&freeze=0|1&delay=<ms>&jitter=<ms>&new-connections=0|1
  * (0 B/s is unlimited); GET /drop closes every open connection; GET /state.
  */
 import * as NodeHttp from "node:http";
@@ -36,9 +43,46 @@ export interface LinkSettings {
   readonly delay: number;
   /** Extra one-way latency of up to this many milliseconds, chosen per piece. */
   readonly jitter: number;
+  /** Each connection pays a TCP handshake, and an HTTP client cannot reuse one for a second request. */
+  readonly newConnections?: boolean;
 }
 
 export const UNTHROTTLED: LinkSettings = { down: 0, up: 0, frozen: false, delay: 0, jitter: 0 };
+
+/** Named links. 3g is a common 3G preset: 400 kbps each way, a 400 ms round trip. */
+export const LINK_PRESETS: Readonly<Record<string, Partial<LinkSettings>>> = {
+  "3g": { down: 50_000, up: 50_000, delay: 200 },
+};
+
+/**
+ * The settings named by `read`, a lookup of option names (`preset`, `down`, `up`, `delay`,
+ * `jitter`, `freeze`, `new-connections`): the preset first, then each explicit option over it.
+ */
+export function parseLink(
+  read: (name: string) => string | null | undefined,
+): Partial<LinkSettings> {
+  const preset = read("preset");
+  if (preset != null && LINK_PRESETS[preset] === undefined) {
+    throw new Error(
+      `unknown link preset ${preset}; known: ${Object.keys(LINK_PRESETS).join(", ")}`,
+    );
+  }
+  const number = (name: string) => {
+    const value = read(name);
+    return value == null ? {} : { [name]: Number(value) };
+  };
+  const freeze = read("freeze");
+  const newConnections = read("new-connections");
+  return {
+    ...(preset == null ? {} : LINK_PRESETS[preset]),
+    ...number("down"),
+    ...number("up"),
+    ...number("delay"),
+    ...number("jitter"),
+    ...(freeze == null ? {} : { frozen: freeze === "1" }),
+    ...(newConnections == null ? {} : { newConnections: newConnections === "1" }),
+  };
+}
 
 const QUEUE_HIGH_WATER_BYTES = 64 * 1024;
 /** Extra room while bytes wait out a delay, so latency alone does not cap an unlimited link. */
@@ -55,6 +99,36 @@ export interface ThrottleProxy {
   readonly close: () => Promise<void>;
 }
 
+const MAX_RESPONSE_HEAD_BYTES = 16 * 1024;
+
+/**
+ * Rewrites the head of the first HTTP response on a connection to say `Connection: close`, so
+ * the client opens a new connection for its next request. Anything that is not a plain response
+ * (a 101 upgrade, other bytes) passes through unchanged.
+ * shortcut: a response head cut short by the connection ending is dropped, not flushed; fine for
+ * a development proxy whose servers answer in one write.
+ */
+function closeAfterFirstResponse(): (data: Buffer) => Buffer {
+  let held: Buffer | undefined = Buffer.alloc(0);
+  return (data) => {
+    if (held === undefined) return data;
+    held = Buffer.concat([held, data]);
+    const end = held.indexOf("\r\n\r\n");
+    if (end < 0 && held.length <= MAX_RESPONSE_HEAD_BYTES) return Buffer.alloc(0);
+    const bytes = held;
+    held = undefined;
+    if (end < 0) return bytes;
+    const [status = "", ...fields] = bytes.subarray(0, end).toString("latin1").split("\r\n");
+    if (!/^HTTP\/1\.[01] /.test(status) || status.split(" ")[1] === "101") return bytes;
+    const head = [
+      status,
+      ...fields.filter((field) => !/^connection:/i.test(field)),
+      "Connection: close",
+    ];
+    return Buffer.concat([Buffer.from(head.join("\r\n"), "latin1"), bytes.subarray(end)]);
+  };
+}
+
 /** Forwards `source` to `destination` at `rate()` bytes per second; returns a stop function. */
 function pace(
   source: NodeNet.Socket,
@@ -62,6 +136,7 @@ function pace(
   rate: () => number,
   frozen: () => boolean,
   latency: () => number,
+  rewrite: (data: Buffer) => Buffer = (data) => data,
 ): () => void {
   const queue: Array<{ readonly piece: Buffer; readonly readyAt: number }> = [];
   let queued = 0;
@@ -112,7 +187,9 @@ function pace(
     schedule(nextSendAt - Date.now());
   }
 
-  source.on("data", (data: Buffer) => {
+  source.on("data", (chunk: Buffer) => {
+    const data = rewrite(chunk);
+    if (data.length === 0) return;
     // Later bytes never overtake earlier ones, whatever the jitter.
     const readyAt = Math.max(lastReadyAt, Date.now() + latency());
     lastReadyAt = readyAt;
@@ -147,19 +224,27 @@ export async function startThrottleProxy(options: {
     sockets.add(client);
     sockets.add(upstream);
     const latency = () => settings.delay + Math.random() * settings.jitter;
+    const newConnections = settings.newConnections === true;
+    // The handshake is one round trip before the client's first byte can leave.
+    let handshaking = newConnections;
     const stopDown = pace(
       upstream,
       client,
       () => settings.down,
       () => settings.frozen,
       latency,
+      newConnections ? closeAfterFirstResponse() : undefined,
     );
     const stopUp = pace(
       client,
       upstream,
       () => settings.up,
       () => settings.frozen,
-      latency,
+      () => {
+        const handshake = handshaking ? 2 * settings.delay : 0;
+        handshaking = false;
+        return latency() + handshake;
+      },
     );
     const destroyBoth = (): void => {
       stopDown();
@@ -206,18 +291,13 @@ export function startControlServer(
     const url = new URL(request.url ?? "/", "http://control.invalid");
     if (url.pathname === "/drop") proxy.drop();
     if (url.pathname === "/set") {
-      const down = url.searchParams.get("down");
-      const up = url.searchParams.get("up");
-      const freeze = url.searchParams.get("freeze");
-      const delay = url.searchParams.get("delay");
-      const jitter = url.searchParams.get("jitter");
-      proxy.update({
-        ...(delay === null ? {} : { delay: Number(delay) }),
-        ...(jitter === null ? {} : { jitter: Number(jitter) }),
-        ...(down === null ? {} : { down: Number(down) }),
-        ...(up === null ? {} : { up: Number(up) }),
-        ...(freeze === null ? {} : { frozen: freeze === "1" }),
-      });
+      try {
+        proxy.update(parseLink((name) => url.searchParams.get(name)));
+      } catch (error) {
+        response.writeHead(400, { "content-type": "text/plain" });
+        response.end(String(error));
+        return;
+      }
     }
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(proxy.settings()));
@@ -253,12 +333,7 @@ export async function runThrottleProxyMain(
     listenPort: listen.port,
     targetHost: target.host,
     targetPort: target.port,
-    initial: {
-      down: Number(args.get("--down") ?? 0),
-      up: Number(args.get("--up") ?? 0),
-      delay: Number(args.get("--delay") ?? 0),
-      jitter: Number(args.get("--jitter") ?? 0),
-    },
+    initial: parseLink((name) => args.get(`--${name}`)),
   });
   const controlServer = await startControlServer(proxy, control.host, control.port);
   const controlPort = (controlServer.address() as NodeNet.AddressInfo).port;

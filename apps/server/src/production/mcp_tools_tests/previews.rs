@@ -562,3 +562,23 @@ mod devices {
         harness.shutdown().await;
     }
 }
+
+/// `tools/list` is context an agent pays on every session, so the real argument schemas stay
+/// compact. Before them the 13 twins took 12,823 bytes and the provider descriptors 3,720;
+/// the real arguments and descriptions cost about 6,400 and 8,750 more. Raise a bound only
+/// for a tool or argument that earns it.
+#[tokio::test]
+async fn the_preview_tools_stay_within_their_list_budget() {
+    let harness = harness().await;
+    let (agent, _) = harness.agent(McpAccess::ApprovalRequired).await;
+    let listed = harness.control.tools(&agent);
+    let twins: usize = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool["name"].as_str().unwrap().starts_with("preview_"))
+        .map(|tool| tool.to_string().len())
+        .sum();
+    assert!(twins < 21_000, "the preview twins take {twins} bytes");
+    harness.shutdown().await;
+}

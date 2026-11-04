@@ -2924,6 +2924,7 @@ async fn removal_command_reservation_allows_only_one_cross_repository_git_mutati
     let second_external = fixture.root.path().join("second-external");
     fs::create_dir(&second_main).expect("second primary directory");
     git(&second_main, &["init", "--initial-branch", "main"], None);
+    git(&second_main, &["config", "core.autocrlf", "false"], None);
     git(
         &second_main,
         &["config", "user.email", "rpc@example.invalid"],
@@ -4677,6 +4678,10 @@ impl CatalogRpcFixture {
         let external = root.path().join("external");
         fs::create_dir(&main).expect("primary directory");
         git(&main, &["init", "--initial-branch", "main"], None);
+        // Test servers never install the system line-ending policy, so their Git ignores a
+        // host `core.autocrlf=true` that the fixture's Git reads; the checkout would look
+        // dirty to them (docs/testing/windows-desktop.md).
+        git(&main, &["config", "core.autocrlf", "false"], None);
         git(
             &main,
             &["config", "user.email", "rpc@example.invalid"],
@@ -4829,6 +4834,7 @@ impl CatalogRpcFixture {
                 pending_user_input_count: 0,
                 last_activity_at: None,
                 requester: None,
+                side_chat: false,
                 has_actionable_proposed_plan: 0,
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,

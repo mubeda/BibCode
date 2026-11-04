@@ -11,11 +11,15 @@ import {
   ClientOrchestrationCommand,
   DispatchResult,
   ModelSelection,
+  OrchestrationCheckpointSummary,
   OrchestrationCommand,
   OrchestrationEvent,
   OrchestrationMessage,
   OrchestrationProject,
   OrchestrationProjectShell,
+  OrchestrationShellSnapshot,
+  OrchestrationShellStreamItem,
+  OrchestrationSubscribeShellInput,
   OrchestrationThreadShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
@@ -32,6 +36,7 @@ import {
   ThreadTurnStartCommand,
   ThreadCreatedPayload,
   ThreadTurnDiff,
+  ThreadTurnDiffCompletedPayload,
   ThreadTurnStartRequestedPayload,
   ThreadTurnDeliveryUpdatedPayload,
   TurnDelivery,
@@ -99,6 +104,46 @@ const decodeOlderMessage = Schema.decodeUnknownSync(
     updatedAt: Schema.String,
   }),
 );
+
+const decodeSummary = Schema.decodeUnknownSync(OrchestrationCheckpointSummary);
+const decodeTurnDiffPayload = Schema.decodeUnknownSync(ThreadTurnDiffCompletedPayload);
+// What a client built before the flag existed decodes.
+const { diffAvailable: _flag, ...legacySummaryFields } = OrchestrationCheckpointSummary.fields;
+const decodeLegacySummary = Schema.decodeUnknownSync(Schema.Struct(legacySummaryFields));
+
+describe("checkpoint diff availability", () => {
+  const summary = {
+    turnId: "turn-2",
+    checkpointTurnCount: 2,
+    checkpointRef: "refs/bibcode/checkpoints/dA/turn/2",
+    status: "ready",
+    files: [],
+    assistantMessageId: null,
+    completedAt: "2026-11-01T00:00:00.000Z",
+  };
+
+  it("decodes a summary without the flag, whose diff is then available", () => {
+    const decoded = decodeSummary(summary);
+    expect(decoded).toEqual(summary);
+    expect(decoded.diffAvailable !== false).toBe(true);
+  });
+
+  it("keeps a captured turn without a diff", () => {
+    expect(decodeSummary({ ...summary, diffAvailable: false })).toEqual({
+      ...summary,
+      diffAvailable: false,
+    });
+    const payload = { ...summary, threadId: "thread-1" };
+    expect(decodeTurnDiffPayload({ ...payload, diffAvailable: false }).diffAvailable).toBe(false);
+    expect(Object.hasOwn(decodeTurnDiffPayload(payload), "diffAvailable")).toBe(false);
+  });
+
+  it("lets an older client ignore the flag", () => {
+    const decoded = decodeLegacySummary({ ...summary, diffAvailable: false });
+    expect(decoded).toEqual(summary);
+    expect(Object.hasOwn(decoded, "diffAvailable")).toBe(false);
+  });
+});
 
 describe("delivery failure reasons", () => {
   const delivery = { state: "failed", provider: "codex" };
@@ -485,6 +530,44 @@ const baseShellFixture = {
   hasPendingUserInput: false,
   hasActionableProposedPlan: false,
 } as const;
+
+describe("side chat marker", () => {
+  it("is absent on a thread from an older server and true on a side chat", () => {
+    expect(decodeShell(baseShellFixture).sideChat).toBeUndefined();
+    expect(
+      decodeShell({
+        ...baseShellFixture,
+        kind: "panel",
+        hostThreadId: "thread-host",
+        sideChat: true,
+      }).sideChat,
+    ).toBe(true);
+  });
+
+  it.effect("is optional on thread.created", () =>
+    Effect.gen(function* () {
+      const payload = {
+        threadId: "thread-side",
+        projectId: "project-1",
+        title: "Panel — Side chat · Codex",
+        modelSelection: { provider: "codex", model: "gpt-5" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        kind: "panel",
+        hostThreadId: "thread-host",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-11-02T00:00:00.000Z",
+        updatedAt: "2026-11-02T00:00:00.000Z",
+      };
+      assert.strictEqual((yield* decodeThreadCreatedPayload(payload)).sideChat, undefined);
+      assert.strictEqual(
+        (yield* decodeThreadCreatedPayload({ ...payload, sideChat: true })).sideChat,
+        true,
+      );
+    }),
+  );
+});
 
 describe("OrchestrationConversationPreview", () => {
   it("decodes a shell without the field (older server)", () => {
@@ -1772,5 +1855,56 @@ describe("reasoning contracts", () => {
     ]) {
       expect(decodeReasoningCommand(command).type).toBe(command.type);
     }
+  });
+});
+
+const decodeSubscribeShellInput = Schema.decodeUnknownSync(OrchestrationSubscribeShellInput);
+const decodeShellSnapshot = Schema.decodeUnknownSync(OrchestrationShellSnapshot);
+const decodeShellStreamItem = Schema.decodeUnknownSync(OrchestrationShellStreamItem);
+
+describe("shell cap and resume wire (#223)", () => {
+  it("decodes an old client's `{}` and the new input", () => {
+    const decode = decodeSubscribeShellInput;
+    expect(decode({})).toEqual({});
+    expect(
+      decode({ cap: { include: ["t1"] }, resume: { revision: "r", snapshotSequence: 3 } }),
+    ).toEqual({ cap: { include: ["t1"] }, resume: { revision: "r", snapshotSequence: 3 } });
+  });
+
+  it("decodes an old server's snapshot and project shell without the new fields", () => {
+    const snapshot = decodeShellSnapshot({
+      snapshotSequence: 1,
+      projects: [
+        {
+          id: "p",
+          title: "P",
+          workspaceRoot: "/p",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z",
+        },
+      ],
+      threads: [],
+      updatedAt: "2026-07-11T00:00:00.000Z",
+    });
+    expect(snapshot.capped).toBeUndefined();
+    expect(snapshot.revision).toBeUndefined();
+    expect(snapshot.projects[0]?.olderThreads).toBeUndefined();
+  });
+
+  it("decodes `unchanged` with its activity ages", () => {
+    const item = decodeShellStreamItem({
+      kind: "unchanged",
+      snapshotSequence: 4,
+      revision: "r",
+      activityAges: { t1: 1200 },
+    });
+    expect(item).toEqual({
+      kind: "unchanged",
+      snapshotSequence: 4,
+      revision: "r",
+      activityAges: { t1: 1200 },
+    });
   });
 });

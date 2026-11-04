@@ -340,6 +340,73 @@ authorization mapping is
 [`required_scope`](../../apps/server/src/auth/scope.rs); adding a live method
 without exactly one declared scope fails a server test.
 
+## Git process environment
+
+Status, diff, the Git Manager, worktrees, refs, the watcher and the other commands built on
+`git_environment()` (`apps/server/src/git/repository.rs`) run Git noninteractively:
+`GCM_INTERACTIVE=never`, empty `GIT_ASKPASS` and `SSH_ASKPASS`,
+`SSH_ASKPASS_REQUIRE=never`, `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`. Reads add
+`GIT_OPTIONAL_LOCKS=0`.
+
+They read only the line-ending keys of the system configuration (#282,
+[design](../plans/2026-11-03-git-system-line-endings-design.md)), so line endings match the
+person's own Git, for example Git for Windows' system `core.autocrlf=true`:
+
+- **Probe.** Before the server starts, `git::system_line_endings::install_once` reads
+  `core.autocrlf`, `core.eol` and `core.safecrlf` with
+  `git config --system --includes -z --get-regexp`, from an empty temporary directory. The
+  two binaries call it, `bibcode serve` and the desktop's in-process backend, and
+  `ServerRuntime::start` does not, so library and lifecycle tests keep
+  `GIT_CONFIG_NOSYSTEM=1`. `bibcode serve` first resolves its data root the way startup
+  does (`ServerConfig::resolve_data_root`), so the state directory is the absolute one the
+  server will use, never a relative `--base-dir`.
+- **Includes.** Unconditional `include.path` files are followed. `includeIf` cannot be
+  resolved outside a repository and is not applied.
+- **Values.** The last value of each key wins. Booleans are canonicalized as Git reads them,
+  and an invalid last value drops its key.
+- **The generated file.** The canonical values are written to
+  `<state>/git/system-line-endings-<hash>.gitconfig` in the server's own state directory.
+  The path loses a Windows `\\?\` verbatim prefix, which Git ignores in
+  `GIT_CONFIG_SYSTEM`, and must be absolute, because Git resolves a relative one inside
+  each repository. The write is atomic: a fresh `create_new` temporary name (`0600` on
+  Unix) is renamed into place, in a `0700` directory on Unix. The server uses the file only
+  if `<state>/git` is a real directory and the file is a regular file with exactly the bytes
+  written. On Unix both must also be owned by the server and writable by no group or other
+  user. The ancestors and Windows ACLs are not checked: the state directory already holds
+  the database, so it is the trust boundary. Git then runs with `GIT_CONFIG_SYSTEM=<file>`
+  and without `GIT_CONFIG_NOSYSTEM`. These are system-scope values, so repository and global settings
+  still win. No credential helper, hook, filter, include or URL rule from the system
+  configuration gets in.
+- **Fallback.** With no key set, the policy stays at `GIT_CONFIG_NOSYSTEM=1`, today's
+  isolation. It also stays there when any of these hold:
+  - on Unix, the child `PATH` has a relative entry, which could resolve another Git per
+    directory (Windows searches it from the server's own directory, so it cannot);
+  - the resolved Git is older than 2.32, which ignores `GIT_CONFIG_SYSTEM`;
+  - the probe takes more than 2 s in total, and its children are killed;
+  - the write or a check fails.
+
+  A failure, or an invalid value, logs one warning with no path. The probe runs before
+  logging starts, so the server logs the warnings right after it installs logging.
+
+- **Restart rule.** The result is fixed for the process. A desktop backend restart reuses
+  it, and quitting and reopening the app, or restarting `bibcode serve`, reads the settings
+  again.
+- **Known limits.** A Git downgraded below 2.32 while BiBCode runs reads the full system
+  file until restart. A generated file that goes missing is ignored by Git, which is the
+  same as `GIT_CONFIG_NOSYSTEM=1`.
+
+These spawns keep their own configuration:
+
+- The clone tools' fully isolated configuration ([Clone tools](#clone-tools)). A clone's
+  LF checkout is clean for both Gits under `autocrlf=true`.
+- Turn checkpoints and the bootstrap fetch, which inherit the full system configuration,
+  so they already agree on line endings.
+- The streamed review diff, workspace search's `git ls-files` and the pull-request
+  discovery default.
+- The external difftool, whose tool definitions can live in the system configuration.
+
+Isolating checkpoints is a follow-up (#283).
+
 ## VCS status and mutation coordination
 
 `subscribeVcsStatus` and `vcs.refreshStatus` add the optional
@@ -673,8 +740,14 @@ first staged by folder handle:
 4. A refused entry is renamed back, never over a file created meanwhile
    (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). The holder and its
    record are removed once the entry is trashed or back. An entry whose name was taken
-   meanwhile stays in its holder: a discard lists it in `trashUnavailable`, and a Files
-   delete answers `kept_in_staging` with where it is (below).
+   meanwhile stays in its holder: a discard lists it in `keptInStaging` (`path`, and
+   `stagedAt`, its path below the Git directory), never in `trashUnavailable`, and a
+   Files delete answers `kept_in_staging` with where it is (below). Under
+   `permitPermanent` it is still not removed: its name belongs to something else now,
+   which `git clean` would delete, and the next discard's recovery moves it back once
+   the name is free. `keptInStaging` is additive: a client that predates it ignores it
+   (and sees nothing for that path), and a client reading an older server's answer
+   decodes an empty list.
 5. Each discard first recovers what a crash left behind. A discard holds an
    exclusive `flock` on its holder folder from just after creating it until it is
    done, so recovery, which takes that lock without waiting, never touches a holder a
@@ -842,21 +915,47 @@ range from `review.getDiffPreview`, and a turn or the whole thread from
 
 ### Turn checkpoints
 
-A checkpoint is a commit of the whole checkout, written by the orchestration
-effects worker (`orchestration_effects.rs`) through a temporary index, so the
-person's own index and branches are untouched. `refs/bibcode/checkpoints/<base64
+A checkpoint is a commit of the whole checkout, written through a temporary
+index, so the person's own index and branches are untouched. The orchestration
+effects worker (`orchestration_effects.rs`) writes every numbered ref; turn
+delivery writes ref 0. `refs/bibcode/checkpoints/<base64
 thread id>/turn/<n>` is the checkout after turn `n`; ref 0 is the checkout
 before the thread's first recorded turn. Turn `n`'s patch is ref `n - 1` to ref
 `n`, and the read model's `projection_turns.checkpoint_*` columns hold each
-turn's number, ref, status and changed files.
+turn's number, ref, status, changed files and whether its diff is available
+(`checkpoint_diff_available`, migration 63).
 
-1. **Turn start.** `thread.turn-start-requested` (and a non-imported user
-   `thread.message-sent`) captures ref `n`, `n` being the latest number among
-   the turns before the starting one, if it is missing. A thread with settled
-   turns but no recorded checkpoint, whose turns predate turn checkpoints,
-   captures ref 0 again on `thread.turn-start-requested` unless another turn
-   runs, so its first recorded turn does not reach back to the thread's first
-   turn. A latest turn whose checkpoint went stale (step 3) gets no ref.
+A `ready` turn's ref `n` is its end state, so it is a revert target. Its diff
+also needs a **trusted baseline**: ref 0, or ref `n - 1` of a `ready` turn. A
+numbered ref is written only by that turn's own capture, while the turn's hold
+keeps every later turn out of the checkout. That is the only time the checkout
+is known to be the turn's end state.
+
+1. **Turn start.** Turn delivery captures ref 0 before it first claims a start
+   (attempt 0) of a thread with no numbered turn (#261), so ref 0 is the
+   checkout before that turn. A baseline stage in the delivery loop
+   (`FirstTurnBaselines` in `turn_delivery.rs`) runs the capture
+   (`ensure_first_turn_baseline`) outside the delivery slots, at most four at a
+   time and one per thread. The row takes a slot only once the stage has
+   ended. A start with a `bootstrap` runs it in a slot first, then releases the
+   slot, so its baseline is taken in the checkout the bootstrap set up. A thread
+   with a numbered turn costs one read and no Git, and a project outside Git
+   costs a filesystem probe. Every step is bounded by the checkpoint hold limit.
+   Cancelled steps get 10 seconds to stop, and a capture waits at most 5
+   seconds to remove its temporary index. That removal is then left to finish
+   on its own and logged, so a stalled filesystem never holds the stage.
+   A failure or timeout is logged and shown once as a
+   `checkpoint.capture.failed` activity (`turnCount: 0`, no turn id). The turn
+   still goes, and its capture is then `ready` without a diff. Shutdown cancels
+   the stage, which leaves the row pending and unclaimed. A row claimed before
+   never captures, because the checkout may hold its edits. A claim sets
+   `provider_turn_outbox.claimed_once` (migration 65), which a manual retry
+   does not clear, and every row from before the migration counts as claimed. Every Git command whose output ref 0 holds finishes before the claim.
+   Only `update-ref` can outlive a timeout (a stalled Windows spawn), and it
+   publishes a commit fixed before the claim. A turn start never writes a
+   numbered ref. A thread with settled turns but no recorded checkpoint, whose
+   turns predate turn checkpoints, captures ref 0 again at that first claim, so
+   its first recorded turn does not reach back to the thread's first turn.
 2. **Turn end.** Provider ingestion's `turn.completed` (not a compaction's own
    turn) records the turn's number, the latest plus one, with status `missing`
    before the session settles (`record_turn_end`). A turn that already has a
@@ -864,7 +963,9 @@ turn's number, ref, status and changed files.
    projection before the session settles. Only a thread with a recorded
    checkpoint, or a turn whose working directory lies in a Git work tree (a
    `.git` in it or above), is numbered, so numbering never waits for the
-   effects worker and a project outside Git gets no checkpoints. It also takes
+   effects worker and a project outside Git gets no checkpoints. A side chat's
+   turns are never numbered, and turn start writes no ref 0 for it, so a side
+   chat captures no checkpoints in the checkout it shares with its host. It also takes
    a checkpoint hold for the turn: turn delivery holds every turn of the
    thread (direct starts, Send now, promoted follow-ups, steers, MCP sends)
    while any of its ended turns is held, so no turn edits the checkout before
@@ -872,27 +973,39 @@ turn's number, ref, status and changed files.
    thread's holds are released.
 3. **Capture.** The worker handles the `missing` record: it captures ref `n`
    (always written: a ref already there is a leftover a revert could not
-   delete; a capture that fails deletes it), diffs it against ref `n - 1`,
-   records `ready` with the changed files and the turn's own answer id, appends
-   a `checkpoint.captured` activity, and releases that turn's hold however it
-   ends. A `ready` or `error` row is never captured again. `ready` requires
-   ref `n - 1`, and turn `n - 1` not given up (`error`); without them, and
-   after a failed capture,
-   the turn stays `missing` with a `checkpoint.capture.failed` activity, and
-   the next turn start writes ref `n` if it is still missing. A hold still
-   pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds) gives
-   the capture up: the turn's checkpoint is recorded `error` (terminal: no
-   later record of it changes that) before the hold is released, with a
-   warning and one `checkpoint.capture.failed` activity. The worker never
-   captures or records that turn `ready`, and no later baseline writes its
-   ref, across restarts too. Expiry and completion decide once per turn under
-   the hold lock (`claim_checkpoint_completion`): a turn ends `ready` or
-   `error`, never both. An `error` checkpoint does not change the turn's own
-   state.
+   delete; a capture that fails tries to delete it, and one left behind is
+   never read), records `ready` with the turn's own answer id, appends a
+   `checkpoint.captured` activity, and releases that turn's hold. A `ready` or
+   `error` row is never captured again. When ref `n - 1` is a trusted baseline
+   and resolves, the row carries the changed files from ref `n - 1`. Otherwise
+   it is `ready` with no files and `diffAvailable: false`, and its
+   `checkpoint.captured` activity has tone `warning` and says the turn's
+   changes cannot be shown but it can still be reverted to. A failed capture
+   leaves the turn `missing` with a `checkpoint.capture.failed` activity. So
+   the turn after one whose capture did not complete (it failed, timed out or
+   was cut off by a restart) has no diff, though it can be reverted to. It
+   never gets a diff from a late baseline that may hold its own edits. A hold
+   still pending after `EffectsOptions::checkpoint_hold_limit` (120 seconds)
+   gives the capture up: one attempt records the turn's checkpoint `error`
+   (terminal: no later record of it changes that) before the hold is released,
+   with a warning and one `checkpoint.capture.failed` activity. If that record
+   fails, it is logged and the row stays `missing`, which is just as safe: it
+   is no revert target, no baseline, and no baseline writes its ref, across
+   restarts too. The worker never captures or records a stale turn `ready`.
+   Expiry and completion decide once per turn under the hold lock
+   (`claim_checkpoint_completion`): a turn ends `ready` or `error`, never both.
+   A stale turn's hold is released only by its expiry task, after its record
+   attempt: the worker's release (`release_checkpoint_hold_unless_stale`)
+   reads the stale mark and removes the hold under that same lock, so no
+   record of the turn lands after its release. An `error` checkpoint does not
+   change the turn's own state.
 4. **Restart.** Startup reconciliation records a turn the restart cut off as
    `missing`, without a capture, when the thread already has a recorded
    checkpoint, so the numbers stay dense and a revert's provider rewind
-   (current number minus target) still counts every turn.
+   (current number minus target) still counts every turn. No baseline writes
+   that turn's ref, so the next turn is captured without a diff. A first turn
+   still pending at the restart passes the baseline stage before its first
+   claim, even though the effects worker never replays its start event.
 
 A provider stream that ends mid-turn synthesizes a failed `turn.completed`, so
 that turn is recorded too. The turn-diff projector keeps a turn's `interrupted` or `error` state and its answer
@@ -910,12 +1023,14 @@ Turn and full-thread patches are computed live from the checkpoint refs at
 `refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
 
 0. It serves only captured turns, as a revert restores only them: each end of
-   the range past turn 0 must have a `ready` checkpoint row (the start of a
-   one-turn range is vouched for by its end, whose capture required that
-   ref). Otherwise it returns the method's error with "Turn n has no captured
-   checkpoint (its capture failed or timed out), so its changes cannot be
-   shown.", whatever refs exist. The Diff panel shows it as it shows a
-   checkpoint that is gone.
+   the range past turn 0 must have a `ready` checkpoint row. Otherwise it
+   returns the method's error with "Turn n has no captured checkpoint (its
+   capture failed or timed out), so its changes cannot be shown.", whatever
+   refs exist. The start of a one-turn range is vouched for only by its end's
+   `diffAvailable`; an end without it returns "Turn n has no diff: the
+   checkpoint before it is missing. You can still revert to it." A wider
+   range between two `ready` ends is served, since both refs are end states.
+   The Diff panel shows either error as it shows a checkpoint that is gone.
 1. It acquires the thread's workspace admission, which resolves the thread's
    worktree or its project's root. The lease is held until Git exits. A
    workspace that is being removed, or is gone, returns
@@ -1678,7 +1793,8 @@ missing remotes, unsupported/unconfigured hosts, missing or outdated CLIs,
 authentication, and repository access. Process failures remain typed errors.
 
 `HostCommandRunner` is the module's single process boundary and delegates all
-Git/provider work to `ProcessRunner`. It supplies noninteractive Git settings,
+Git/provider work to `ProcessRunner`. It supplies noninteractive Git settings
+([Git process environment](#git-process-environment)),
 host environment variables, repository operands, cancellation, output caps,
 and deadlines. One overall deadline covers context/vocabulary (30 seconds),
 lists, detail/tab reads and ordinary mutations (60 seconds), including their
@@ -2058,8 +2174,89 @@ every client can open the panel under its host; public `thread.create` rejects a
 client-supplied `hostThreadId`. A generic `thread.delete` emits `thread.deleted`
 for every non-deleted panel whose `hostThreadId` is the deleted thread, live or
 archived, in id order before the thread's own event and in the same command, so
-the existing deletion effects clean up their sessions and terminals. Similarly,
-`worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
+the existing deletion effects clean up their sessions and terminals.
+
+A **side chat** (#265) is a panel with `sideChat: true`. Only
+`worktree.createPanel` sets it, and only on a server that advertises
+`capabilities.sideChats`; an older server's `deny_unknown_fields` input would
+refuse the field, so the client never sends it there. The Rust input omits a
+`false` marker when it hashes the command (`skip_serializing_if`), so a plain
+panel request digests as it did before side chats and replays its stored
+receipt. The engine requires a side chat to be a `panel` with a host, copies
+the marker into `thread.created` only when true, and the projector stores it in
+`projection_threads.side_chat` (migration 67); replaying older events yields
+`false`. Thread shells, details and MCP thread summaries carry `sideChat: true`
+only for a side chat. A side chat is a panel, so nesting, the delete cascade,
+visibility and the MCP credential scope are the panel rules. The engine drops
+`title` from `thread.meta.update` on a side chat (the first-message rename any
+client sends), so its `Panel: Side chat · <provider>` title, which every client
+labels its tab from, stays; the other fields apply. It refuses
+`thread.checkpoint.revert` for a side chat ("Side chats can't restore files.
+Restore from the main thread."): with no checkpoints of its own, a revert would
+fall back to `HEAD` and clean the host's uncommitted work.
+
+The client opens a side chat with `createPanel` (`sideChat: true`,
+`approval-required`, the host's model) and then sends its question with
+`thread.turn.start`; no first prompt rides on `createPanel`. The host's `:btw`
+draft stays until the question was handed over.
+
+Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): a
+close hides the panel from adoption while this page's own request about it is
+in flight (its archive, or the creation it waits on), and an archive is sent
+once and never retried. A successful archive keeps the panel hidden until a
+shell at or after the archive's own sequence (`DispatchResult.sequence`,
+compared with `engineSequence ?? snapshotSequence`): the shell is published up
+to 500 ms after the reply, and the shell held meanwhile still lists the panel.
+A shell row carries no sequence of its own, so the release is decided by the
+panel's row in such a shell: gone, it was archived; still live, it was reopened
+by someone, but only in a shell that ends a publication (a whole snapshot, or
+the last item of a delta chunk, which alone carries the shell's revision),
+because between per-thread deltas the shell can be past the archive and still
+show the panel's old row. A reopened panel comes back as a tab. Any other outcome (a refusal, an interruption, a lost
+reply) is uncertain: the panel stops being hidden at once, adoption runs again
+on the shell it holds, and a panel still listed live comes back as a tab, so the
+user can close it again. A closed tab coming back is the accepted cost of never
+closing a panel someone else reopened. The first question of a side chat is
+guarded by the creation itself: the open's continuation remembers that its tab
+closed while `createPanel` was in flight, sends nothing and keeps the host
+draft, archives the panel once unless the server refused the creation, and is
+never overridden by a snapshot. One ordering of that archive is accepted: if
+another client archives and then reopens the panel while this page's creation
+reply is still withheld, the late continuation archives the reopened panel.
+Nothing about a close is persisted: after a reload, a panel created late, or
+whose archive did not land, is adopted as a tab. A definite archive failure
+shows **Failed to close chat panel**.
+
+Closing a side chat nobody sent to deletes it instead (#265, P1).
+`thread.delete` takes `onlyIfUnused`; the engine then refuses with
+`OrchestrationThreadInUseError` (`threadId`: the used thread) when any thread
+the command would delete, its cascaded panels included, has a message (queued
+ones too) or a turn (pending ones too) in the projection. The check runs in
+`plan_command`, in the engine's command order, so a first send that commits
+first makes the delete refused, and one that commits after finds the thread
+deleted. A refusal is stored as a rejected receipt, so a duplicate of the same
+command replays as rejected and never deletes. The Rust field is omitted when
+`false`, so a plain delete digests as before. The serde command enum accepts
+unknown fields, so an older server would ignore `onlyIfUnused` and delete a
+used side chat: the client sends it only to a server that advertises
+`capabilities.threadDeleteOnlyIfUnused`, and only for a side chat whose shell
+shows no turn or user message and that this page has not sent to (every
+`thread.turn.start` from `ChatView` and the `:btw` send note it first). A
+refusal archives the side chat through the normal close (interrupt, then
+`thread.archive`); an interrupted delete is uncertain, as an interrupted
+archive is. A delete settles the close as an archive does: the shell that
+reaches its sequence no longer lists the panel, and it never reaches **Reopen
+closed chat**, which lists archived panels only.
+
+**Bring back** in a side chat composes, on the client, "From the side chat:" and
+the last finished assistant answer as a Markdown quote
+(`apps/web/src/sideChatBringBack.ts`), and appends it to the host's composer
+draft. It names no question: the thread detail carries no link from a turn to
+the user message that started it, so a question queued or retried meanwhile
+could be named wrongly. It sends nothing and calls no RPC; it is disabled while
+the host's session is running.
+
+Similarly, `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the
 resolved metadata change. Neither operation accepts generic path or kind
@@ -2681,7 +2878,87 @@ initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery. Live
 updates are coalesced: a thread stream re-reads its thread 100 ms after the
 first of a burst of its events, and the shell stream re-reads the shell
-500 ms after the first event of a burst. A thread subscriber that sends
+500 ms after the first event of a burst. After its first snapshot the shell
+stream sends only what changed (#223). Per subscription it keeps a keyed
+64-bit fingerprint of each project and thread shell it last sent, never the
+shell itself, and leaves `lastActivityAgeMs` out of it: that age grows on every
+re-read. The client pins each received age to its own clock on receipt
+(`lastActivityObservedAt`), since an unchanged thread is not sent again and its
+age would otherwise be as old as the item that carried it. Each
+re-read sends, in one chunk, `project-upserted` and `thread-upserted` for the
+entries that changed or appeared, then `thread-removed` and `project-removed`
+for those that left the live shell (deleted, archived, or in a deleted
+project). A re-read that changes nothing sends nothing. The items take
+consecutive sequences ending at the re-read shell's `snapshotSequence`, so the
+client's reducer, which drops an item at or below the sequence it holds,
+applies each item once, drops a redelivered one, and ends at the sequence a new
+snapshot would carry. When a window had fewer events than items (an AI
+Terminal's agent started working, which is no orchestration event), the
+numbering continues past that sequence instead, always above what the client
+holds, and each item past it carries the engine's sequence as
+`engineSequence`. The client keeps that value beside its shell: the lifecycle
+reconciler compares the archived snapshot's sequence with it, never with the
+item sequence, and a resume sends it as `snapshotSequence`. The stream sends a
+whole snapshot instead when its event receiver lagged. A failed re-read sends
+nothing and keeps the stream open, because the client resubscribes only when
+its session changes: the stream logs a warning, re-reads 2 s later whether or
+not events arrive, and sends a whole snapshot once a read succeeds. A capped
+stream keeps the ids it held across the failure, so that snapshot keeps them
+too. Every
+subscription, including each one after a reconnect, starts with a snapshot (or
+`unchanged`, below), so a client cannot miss a delta between streams. Every
+released client decodes and applies these items (the union and its reducer
+predate them), so no input flag gates them; an older server keeps sending
+snapshots.
+
+**The finished-thread cap and shell resume** ([design](../plans/2026-11-02-shell-finished-thread-cap-design.md)).
+A subscriber that sends `cap: { include? }` gets the kept set instead of every
+thread: live threads (a starting or running session, a running latest turn, a
+pending request, an unresolved delivery, an unsettled compaction, a queued
+message), hosts of AI Terminals whose agent is working, blocked or waiting,
+every `default` thread and every `workspace` thread with a worktree, the
+client's `include` ids (at most 256: its routed thread, open chat panels'
+hosts, pinned and unread threads), and of the rest the newest 25 across the
+environment plus the newest 3 non-panel threads of each project, newest by
+`COALESCE(latest_user_message_at, updated_at)` then `thread_id`. The cap is
+applied in `load_capped_shell_snapshot_rows` before the per-thread reads, so a
+left-out thread costs one row of the thread scan. The snapshot carries
+`capped: true`, and each project shell `olderThreads { count, chats }`: its
+left-out non-panel threads, and its left-out chat panels per checkout, grouped
+as the left panel groups chats. The kept set is sticky within a subscription:
+each re-read and each fallback snapshot keeps every thread the client holds, so
+a thread never disappears for leaving the cap. A held or included thread keeps
+its place in the newest-first ranking, so it never hands its slot to an older
+thread and a re-read never widens the cap. Removals for left-out threads:
+the stream collects the ids of the window's `thread.archived`,
+`thread.deleted` and `thread.unarchived` events and, at the tick, sends
+`thread-removed` for those that are not live-shell threads then (an archive
+undone in the same window sends nothing). A removal only says "no longer in the
+live shell": it never deletes client state.
+
+`orchestration.listOlderThreads` pages left-out threads newest first with an
+opaque keyset cursor (base64url JSON of a timestamp and an id): scope
+`project` (its non-panel threads), `checkout` (its chat panels in one
+checkout), `agents` (every left-out thread with a session, panels included),
+or `search` (every unarchived thread whose title contains `query`,
+case-insensitively and literally, kept or not; `query` is required). Without a
+query the set is computed without `include`. `orchestration.getThreadShells`
+returns the named threads, live or archived, and lists the ids that are
+deleted or never existed as `missing`: the only evidence a capped shell's
+client has that a thread is gone. Both are local reads registered with
+`register_unary` and are not long-running.
+
+A subscriber that sends `cap` or `resume` gets a `revision` on each snapshot
+and on the last item of each delta chunk: a 128-bit digest of the held
+fingerprints, ids and cap flag under keys secret to the server process. A
+resubscribe with `resume: { revision, snapshotSequence }` is answered
+`{ kind: "unchanged", snapshotSequence, revision, activityAges }` when the
+fresh kept set has that revision and the server's sequence is at least the
+client's; anything else gets a snapshot. `activityAges` re-ages each kept
+thread's provider progress, which a cached shell cannot age itself; the client
+pins those ages on receipt. A request with neither `cap` nor `resume`, as an
+old client sends, gets today's full list without any of these fields.
+A thread subscriber that sends
 `patches: true` then receives a `patch` item against the snapshot it holds:
 changed fields are replaced, removed fields listed, and each changed array
 sends its new length and only the entries that differ, by index, so an
@@ -2694,6 +2971,14 @@ client decodes only the changed fields with the thread's field
 schemas, and `packages/contracts/fixtures/thread-stream/lifecycle.json` pins
 that patches rebuild the server's snapshot exactly. Older clients omit
 `patches` and keep receiving whole snapshots; older servers ignore it.
+The thread stream sends at most the first 200 files of each checkpoint, in
+their stored (path) order so patches do not churn, and the checkpoint's
+`filesTotal` (#227): one formatter run or generated folder made every open of
+its thread carry thousands of entries. The chat's changed-files section shows
+the total and an "and N more files" row that opens the turn diff, which
+`getTurnDiff` computes from the checkpoint refs with every file. The HTTP read
+model keeps the full list and no total; an older server sends every file
+without `filesTotal`, and an older client ignores the field.
 
 A resubscribe resumes instead of resending the thread
 ([design](../superpowers/specs/2026-10-17-thread-resubscribe-resume-design.md)).
@@ -2704,7 +2989,9 @@ the last item it applied in full and sends it on each resubscribe as
 `resume: { revision, snapshotSequence }`. The server loads the thread as
 before, and answers `{ kind: "unchanged", snapshotSequence, revision }` only
 when the thread still has that revision and its sequence is at least the
-client's. It then patches against that thread. Anything else gets the whole
+client's. It then patches against that thread. The client caches the revision
+with the thread, so this also holds for its first subscribe after a reload or
+an app restart ([connection runtime](./connection-runtime.md)). Anything else gets the whole
 snapshot: a change the client missed, a revision from before a restart (new
 keys), one the server never produced, a sequence newer than the server's, or a
 client that does not apply patches. The client clears its revision whenever it
@@ -2714,6 +3001,67 @@ servers ignore it and send no `revision`, so either side alone keeps today's
 full snapshot. `packages/contracts/fixtures/thread-stream/resume.json` pins the
 items; revisions in it are placeholders, because they mean nothing to another
 process.
+
+A subscriber that sends `history: {}` opens a **history window** (#226,
+[design](../plans/2026-11-01-thread-history-window-design.md)): the first item
+holds recent history under a byte budget, and older rows load in pages. The
+four history arrays (messages, activities, reasoning, proposed plans) are cut by
+the key `K = (createdAt, kindRank, id)`, the timeline's order across kinds. A
+window has a fixed floor `{ K | ALL, openedAt, epoch }`, and a row is in it when
+`K >= floor.K`, when its `written_sequence` is greater than `openedAt` (it was
+written after the window opened), or when it is live: a streaming message or
+reasoning row, or a message whose delivery is `queued`, `pending`, `sending`,
+`uncertain` or `failed`. Every projector write to a history row sets
+`written_sequence` to the sequence of the event it projects, so it never
+repeats and a projection rebuild gives the same values; a rowid would do
+neither. A row stops being live only through a write, so rows only ever enter a
+window: index patches stay exact and nothing outside the window is sent as a
+removal. The server chooses a fresh floor by serializing the fixed parts first
+(the shell, live rows, carried rows and the turn index) and then walking the
+other rows newest first by `K` until 1 MiB of JSON, 500 rows or 10 user
+messages, always taking the newest row. The floor is the oldest whole turn
+reached, the oldest row taken inside one oversized turn, or `ALL` when the walk
+reaches the oldest row. The thread then has `history: { floor, hasOlder,
+olderRows, carried }`; `floor` is opaque base64url JSON of ids, timestamps and
+sequences.
+
+State a window may not hold travels in `history.carried`, selected by the same
+rules the web's readers use: every `*.requested` activity of a request still
+open (a pending approval in `projection_pending_approvals`, or a user-input
+request `open_user_input_requests_sql` lists, of any turn or none), the
+context-window and MCP status rows `deriveLatestContextWindowSnapshot` and
+`deriveMcpStatusSnapshot` would select (the newest valid one in canonical
+activity order, per provider instance for MCP), the newest proposed plan, the
+newest of the latest turn, and any plan a `running` turn names as its source.
+`packages/contracts/fixtures/thread-stream/carried-status.json` runs the Rust
+selector and the web readers on the same cases. Every checkpoint is sent, but
+one whose turn has no row in the window comes with `files: []` and its
+`filesTotal`: the turn index. A resubscribe echoes `history.floor`; the server
+keeps that floor when its epoch is the thread's and the whole value it admits
+is at most 4 MiB, and opens a fresh window otherwise. The revision covers the
+window value, so a resubscribe at the current revision with its floor still
+answers `unchanged`.
+
+`orchestration.getThreadHistoryPage { threadId, cursor }` (orchestration read
+scope; a local database read, so not in the profiler's `is_long_running`)
+returns the rows below the cursor that its window does not hold
+(`written_sequence <= openedAt` and not live), newest first, at most 75 rows or
+512 KiB but always one, the checkpoints of their turns with their files, the
+next `cursor` (`null` when nothing is older) and `olderRows`. The first cursor
+is the window's floor. A revert is the only deletion of settled rows: the
+`thread.reverted` projection sets `projection_threads.history_epoch` to its
+event sequence. Every re-read compares that epoch with the window's and
+re-windows with a snapshot when it moved, a revert lost to `Lagged` included;
+a resubscribe with an older floor gets a fresh window, and a page whose cursor
+carries an older epoch fails with `OrchestrationThreadHistoryStaleError`. A
+malformed cursor or an unreadable thread fails with
+`OrchestrationGetThreadHistoryPageError`, logged with the method, the thread id
+and the reason only. Without `history` the stream is byte-identical to a whole
+thread, and an older server ignores the field and sends one.
+`packages/contracts/fixtures/thread-stream/window.json` pins the windowed
+snapshot, a patch, every page, a stale page and the whole thread the client
+merges them back into.
+
 A thread stream ends with its first error, such as `Thread … was not found`
 for a missing or deleted thread, whose targeted load reads none of its rows.
 The client retries a failed `subscribeThread` or `subscribeActivity` with
@@ -2769,8 +3117,9 @@ The shell carries what the left panel's agent status reads (#187):
   and it never moves backwards. Migration 057 seeds it from each thread's latest
   provider event.
 - **`lastActivityAgeMs`** is how old `lastActivityAt` was on the server's clock
-  when the snapshot was built. The client ages a Working status from its own
-  receipt of that value, so it never compares clocks with the server.
+  when the shell item carrying it was built. The client ages a Working status
+  from its own receipt of that value, recorded when the item arrives rather than
+  when a row first renders, so it never compares clocks with the server.
 
 Requests also settle without an answer:
 
@@ -3317,11 +3666,17 @@ orchestration effects, before the Profiler's teardown.
 the work. A provider cannot undo a rewind, so the effect orders the steps to
 keep a failure from leaving the files and the conversation out of step:
 
-1. It checks that the workspace is a Git repository and that the target
-   checkpoint is `ready` and its ref resolves (turn 0: ref 0, or `HEAD`). A
-   turn whose checkpoint was not captured (`missing`) or was given up
-   (`error`) is refused: "Turn n has no captured checkpoint (its capture
-   failed or timed out), so the thread cannot be reverted to it."
+1. It checks that no checkpoint hold stands on the thread, that the workspace
+   is a Git repository, and that the target checkpoint is `ready` and its ref
+   resolves (turn 0: ref 0, or `HEAD`). A `ready` turn without a diff
+   (`diffAvailable: false`) is a target like any other. While a hold stands
+   (a stale turn's expiry is still writing its record) the revert is refused:
+   "The last turn's checkpoint is still being recorded. Try the revert again
+   in a moment." Every record of a turn lands before its hold is released, so
+   none can bring back a row the revert deletes. A turn whose checkpoint was
+   not captured (`missing`) or was given up (`error`) is refused: "Turn n has
+   no captured checkpoint (its capture failed or timed out), so the thread
+   cannot be reverted to it."
 2. It asks the provider to drop the newer turns. If the session was suspended
    while idle, the supervisor first reopens it with the launch a new message
    would use: the thread's provider, modes and saved resume cursor. One case
@@ -3494,7 +3849,8 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   that is off hides its tools and refuses them with `McpCapabilityDisabledError`,
   live.
 - **Clients.** `bibcode mcp` relays an agent's messages unchanged. `bibcode thread`
-  (`mcp::thread_cli`) calls the same tools itself in the modern era, over the
+  (`mcp::thread_cli`) calls the same tools itself in the modern era (`requests`,
+  `answer`, `approve`, `decline`, `interrupt` and `changes` are one tool call each), over the
   relay's `Connection` (setting check, endpoint proof, credential minted on first
   call and revoked on exit, orphan sweep). It resolves `start .` from
   `list_projects_and_threads`'s `workspaceRoot` over every project page, sends a
@@ -3679,7 +4035,9 @@ instead of failing the call.
   charged), of which `thread.created`, `thread.archived`, `thread.turn-start-requested`,
   `thread.session-set` and the approval and input `thread.activity-appended` events come
   back with only ids, enums, timestamps and `metadata.actor`, extracted by `json_extract`
-  (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`);
+  (a `requestId` is returned only when it matches `[A-Za-z0-9_.:-]{1,128}`), and a
+  `thread.created` with its `purpose` (the agent's own reason, at most 200 characters,
+  #271), which webhook payloads never copy;
   and the `mcp_activity` rows after the cursor's activity id. A session update reads the
   status and turn of the thread's previous session update (both that lookup and its cost
   seek the partial index `idx_orch_events_thread_session_updates`, migration 60), so it maps
@@ -3730,7 +4088,17 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
 `ReservedClone::transfer` runs Git with:
 
 - the URL is `https://`, written as the URL parser would write it, without user
-  information, and the folder name does not start with `-` (`clone_url_refused`);
+  information, or `ssh://[user@]host[:port]/path` written plainly (a plain user, no
+  password, a host that is an address or a DNS name with a non-numeric last label), and the
+  folder name does not start with `-` (`clone_url_refused`; the scp-like `host:path` and
+  `git+ssh://` get a message naming the `ssh://` spelling);
+- an `ssh://` URL needs the Terminals gate (#217, option A1):
+  `GitVcsRpcServices::agent_acts_as_server_user` reads the live MCP settings
+  (`with_mcp_settings`) and the session's live `mcpAccess` (`AuthService::mcp_client_access`)
+  and applies `mcp::control::acts_as_server_user`, the predicate the terminal tools use
+  (MCP on, Terminals on, effective ceiling Full access, `terminal:operate`); otherwise
+  `clone_ssh_not_allowed`, naming the `https://` URL on a known forge, before Git or DNS
+  run;
 - Git is 2.37 or later, for `http.curloptResolve` (`clone_git_too_old`);
 - every Git command of the clone runs with an isolated configuration:
   `GIT_CONFIG_GLOBAL` is the null device, `GIT_CONFIG_NOSYSTEM=1`,
@@ -3739,10 +4107,14 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   `http.<url>.*` settings, hooks, fsmonitor or filter drivers apply; the commands inherit
   nothing from the server (`env_clear`) but an allowlist (`PATH`, `TMPDIR`, `TEMP`, `TMP`,
   `LANG`, `LC_*`, `TZ`, and the Windows system variables), with `HOME` the null device, and
-  the clone gets `--template=` so no hooks are copied;
+  the clone gets `--template=` so no hooks are copied, and it does not get the system
+  line-ending keys of the [Git process environment](#git-process-environment);
 - `git ls-remote --get-url -- <url>` gives the URL after any `insteadOf` left (the clone
-  folder's enclosing repository), which must pass the same checks;
-- every address of the original and the rewritten host is globally reachable: no range the
+  folder's enclosing repository, which `git ls-remote` reads and `git clone` does not, so
+  Git clones the URL as written): an HTTPS expansion must pass the same checks and may not
+  be SSH, and an SSH URL whose expansion differs from it is refused;
+- every address of the original and the rewritten host (an SSH URL's written host) is
+  globally reachable: no range the
   IANA special-purpose registries mark otherwise, no multicast, no IPv6 outside `2000::/3`,
   and mapped, NAT64 and 6to4 addresses judged by the IPv4 address they embed
   (`clone_host_refused`, or `clone_host_unresolved`);
@@ -3750,7 +4122,23 @@ and `git::clone_policy` checks the URL and returns the `ClonePlan` that
   `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false`, one
   `http.curloptResolve=<host>:<port>:<first address>` per named host, `http.proxy=`,
   `core.hooksPath` and `core.fsmonitor` off, an empty and optional `filter.lfs` smudge and
-  process, `GIT_LFS_SKIP_SMUDGE=1` and `submodule.recurse=false`.
+  process, `GIT_LFS_SKIP_SMUDGE=1` and `submodule.recurse=false`;
+- an SSH plan instead admits `protocol.ssh.allow=always` and `GIT_ALLOW_PROTOCOL=ssh`, sets
+  no `curloptResolve`, and pins ssh through `GIT_SSH_COMMAND` (above `core.sshCommand`) with
+  `GIT_SSH_VARIANT=ssh`: `-F none`, `HostName=<first checked address>`,
+  `HostKeyAlias=<host>` (`[<host>]:<port>` off port 22), strict host key checking against
+  the server user's `~/.ssh/known_hosts` and `known_hosts2` without writing them,
+  `IdentityFile=none` with `IdentityAgent=SSH_AUTH_SOCK`, no proxy, multiplexing or
+  forwarding, `ConnectTimeout=30` and `ServerAliveInterval=15` x `ServerAliveCountMax=4`.
+  The known_hosts paths are refused when they hold `${` or a control character, `%`-escaped,
+  quoted for ssh's `argv_split`, and then quoted for Git's `sh -c`. `SSH_AUTH_SOCK` is passed
+  when the agent is a socket (Linux, macOS, an MSYS agent on Windows); on Windows without it,
+  the Windows OpenSSH client uses its agent service's pipe. No agent is
+  `clone_ssh_unavailable`. ssh runs as Git's child inside the clone's supervised process
+  group, so cancel, the 24-hour bound and reaping cover it. A failed SSH transfer keeps its
+  `GitCommandError` and gets one line built from the plan (`ClonePlan::explain_failure`):
+  unknown host key, changed key, publickey denial, host certificate off port 22, and an ssh
+  without an option (`reason: clone_ssh_unavailable`).
 
 For an agent principal `vcs.clone` also refuses `detach: true` (`clone_detach_refused`): a
 long clone goes through `clone_repository`, which owns it. A clone records the agent session
@@ -3862,9 +4250,35 @@ them, and can move, swap or write anything there at any moment.
   `renameatx_np(RENAME_EXCL)`. A file system without the flag is refused
   (`ErrorKind::Unsupported`), for files and folders alike. An upload replaces or removes its
   name only while it is still its own empty reservation (`Dir::remove_own`).
-- **Windows.** `std` has no `*at` calls there, so every operation re-checks its folder and
-  works by path, as the Files panel did before; the MCP tools that change files answer
-  `McpPlatformUnsupportedError` instead of running with that race.
+- **Windows.** The same design through native handles (`workspace::beneath`, Windows
+  `imp`), for the Files panel and the tools alike. Every folder is opened with
+  `FILE_OPEN_REPARSE_POINT`, the root by its canonical path and each component by name
+  relative to its parent's handle (`NtCreateFile` with `RootDirectory`); a reparse point
+  that names another entry (a symlink, junction or mount point, `IsReparseTagNameSurrogate`)
+  met on the walk is `resolved_path_outside_root`. The root's identity is its volume serial
+  and 128-bit file ID (`FileIdInfo`). A name must be one plain entry: a separator, `:` (an
+  alternate data stream), NUL, `.` and `..` are refused, and the entry opened must carry the
+  name asked for (compared with `CompareStringOrdinal`, ignoring case, against its normalized
+  final path), so an 8.3 short name that stands for another entry (`GIT~1`) is refused. A
+  file is opened without truncation and truncated only after it is known to be a plain file;
+  a data reparse point (a cloud placeholder) is read as stored and never changed. Renames
+  use `FileRenameInformation` through `NtSetInformationFile` (kernel32 refuses a
+  `RootDirectory`), with the target folder's handle as `RootDirectory`: no-replace when
+  `ReplaceIfExists` is false, in one step. Deletes set `FileDispositionInfoEx` with POSIX
+  semantics on the entry's own handle. `Dir::contained` compares the final paths of the
+  held folder and the held root (they follow every rename). Hard links are counted with
+  `FileStandardInfo` for `singleLinkOnly`. NTFS also refuses to rename any folder above one
+  held open, so a held folder's ancestors cannot move while BiBCode works in it.
+- **Trash on Windows.** The native trash (`Microsoft.VisualBasic.FileIO`) takes a path, so
+  there is no staging: the entry's folder is held and pinned for the whole trash call
+  (`Dir::pin`: reopened through its own handle without `FILE_SHARE_DELETE`, refused unless
+  the volume is NTFS or ReFS), so no folder on the path can be renamed or replaced, and the
+  trash moves a junction or symlink at the entry itself, never what it names. The pinned
+  handle must be the folder held (same file ID), and the folder's path, reopened without
+  following a link, must be that same folder at that very final path; a folder put at the
+  path before the pin is refused. The entry's name is checked through its handle and the
+  trash gets its full name, so an 8.3 short name (`GIT~1` for `.git`) is refused. A volume
+  that cannot pin answers `trash_unavailable`.
 - **Trash.** `projects.deleteEntry { toTrash }` uses the same `FileTrash` as Source
   Control's discard and fails `trash_unavailable` rather than deleting.
 - **Errors.** A workspace error's `failure` is kept on the tool failure, and the message is
@@ -3893,7 +4307,8 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   `projection_threads.requester_json` `{ actor, purpose }` for a thread an agent created
   (a `thread.create` or `bootstrap.createThread` `purpose`, at most 200 characters, an
   engine invariant). The thread stream's messages carry `actor` and `sourceThreadId`, the
-  shell's threads carry `requester`, and `read_thread` returns both.
+  shell's threads carry `requester`, and `read_thread` and every thread summary
+  (`list_projects_and_threads`, `list_chat_panels`) return it.
 - **Activity rows.** `McpControl::call_in` records one `mcp_activity` row per call of a
   non-read-only tool that reached its handler: time, session, label, tool, thread, outcome
   (`success` or the error tag) and a target of ids and counts only (`sha`, `revertedSha`,
@@ -4659,7 +5074,7 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   `pullRequests.checkout`, `runAction`, `list`, `get`, `getTimeline`,
   `getCommits`, `getChecks`, `getFiles`, `getContext`, `getVocabulary`, and
   `getCreateDefaults`; `updater.check` and `updater.install`;
-  `server.updateProvider`, `server.refreshProviders`, and
+  `server.updateProvider`, `server.updateTool`, `server.refreshProviders`, and
   `server.refreshProviderUsage`; `worktree.createManaged` and `worktree.remove`
   (which deletes the whole tree, dependencies and build output included); and
   `agentSessions.import` and `agentSessions.openInPanel` (a whole transcript
@@ -4837,6 +5252,34 @@ H.264 video does not travel over RPC. The ticket from
 - Device H.264 media is the only application traffic outside typed RPC. It is
   admitted by a single-use ticket minted over typed RPC and bound to that
   session, device, and channel, and it is Noise-encrypted on pinned profiles.
+- `GET /api/assets/{token}/{path}` serves workspace files, chat attachments and
+  project icons. `assets.createUrl` mints a one-hour HMAC capability for one
+  resource. A `workspace-file` request is checked at issue time: the path must
+  resolve to a regular file inside the thread's normalized workspace root (no
+  traversal, no link out of it) and have an allowed extension. Images (including
+  SVG) and audio (`flac`, `m4a`, `mp3`, `oga`, `ogg`, `wav`, `webm`) get an
+  exact-file capability that reaches no sibling; HTML and PDF get a sibling
+  capability for their directory. Every response is `nosniff` with a
+  `mime_guess` content type and at most 10 MiB (`MAX_ATTACHMENT_BYTES`): a file
+  over the cap is refused from its size before any read, as `413
+  AssetTooLargeError`, and the read is bounded again for a file that grew. HTML
+  gets `sandbox allow-scripts allow-forms allow-popups`; SVG and any XML type get
+  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; images, audio and
+  PDF get no policy. The Files panel (`FileMediaPreview`) fetches the bytes
+  through the capability URL (`connect-src` already reaches the environment, so
+  this works on a relay or LAN host too), refuses a 413 or a body past 10 MiB,
+  and renders from a `blob:` URL it creates: `<img>`, `<audio>` and `<embed>`
+  (PDF only). The URL is revoked on unmount and when the asset URL changes, and
+  the fetch is `no-cache` and credential-free, so a file saved since the last
+  view is read again. SVG goes through `<img>` only, which runs no script
+  whatever the file holds. The page policies (`tauri.conf.json` `csp` and
+  `devCsp`, and the server's `CONTENT_SECURITY_POLICY_VALUE`) therefore add
+  exactly `media-src 'self' blob:` and `object-src blob:` (was `'none'`), with
+  `img-src` already allowing `blob:`; an environment origin is deliberately not
+  an image, media or object source. `scripts/tauri-hardening.test.ts` and the
+  server's `the_ui_may_play_media_and_objects_from_blob_urls_only` pin them. The
+  signed URL is reissued by the asset atom's refresh interval, well before the
+  hour ends. No asset bytes or tokens enter profiler records or logs.
 - `GET`/`POST /api/transfers/{token}` authenticate with a five-minute HMAC
   token minted by `projects.createDownloadUrl` (read scope) or
   `projects.createUploadUrl` (operate scope) while those RPCs hold the

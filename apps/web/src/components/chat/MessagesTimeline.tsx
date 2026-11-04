@@ -92,6 +92,7 @@ import {
   detailsOpenForScope,
   EMPTY_TIMELINE_DISCLOSURES,
   type EntryDisclosure,
+  HISTORY_START_ROW_ID,
   MESSAGE_BODY_DISCLOSURE_KEY,
   normalizeCompactToolLabel,
   PROPOSED_PLAN_DISCLOSURE_KEY,
@@ -101,6 +102,7 @@ import {
   TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  createStickyTimelineItemType,
   resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMaintainVisibleContentPosition,
   resolveTimelineMinimapHasPersistentGutter,
@@ -193,6 +195,8 @@ interface TimelineRowSharedState {
   onSetEntryDisclosure: (entryId: string, key: string, open: boolean) => void;
   /** A Thinking row was expanded or collapsed: the owner keeps the end in view if it was. */
   onReasoningRowToggle: () => void;
+  /** Loads the next page of older history (#226). */
+  onLoadOlderHistory: () => void;
 }
 
 interface TimelineRowActivityState {
@@ -214,10 +218,20 @@ const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
 const TIMELINE_LIST_CONTENT_STYLE = { paddingBottom: 16 };
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
 const NO_MINIMAP_STEP_TARGETS: TimelineMinimapStepTargets = { previous: null, next: null };
+const NO_OLDER_HISTORY_LOAD = () => {};
+/** Scrolling within a viewport of the top loads the next older page. */
+const OLDER_HISTORY_START_THRESHOLD = 1;
 
 // ---------------------------------------------------------------------------
 // Props (public API)
 // ---------------------------------------------------------------------------
+
+/** Older history still on the server (#226), and how its next page loads. */
+export interface TimelineOlderHistory {
+  readonly olderRows: number;
+  readonly status: "idle" | "loading" | "error";
+  readonly onLoadOlder: () => void;
+}
 
 interface MessagesTimelineProps {
   attachmentUploads: Readonly<Record<string, PendingAttachmentUpload>>;
@@ -292,6 +306,8 @@ interface MessagesTimelineProps {
   /** Closing find returns focus to the composer. */
   onFindFocusComposer?: () => void;
   onReasoningRowToggle: () => void;
+  /** Present while older history is on the server; null once all of it is loaded. */
+  olderHistory?: TimelineOlderHistory | null;
 }
 
 const NO_FIND_FOCUS = () => {};
@@ -352,6 +368,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   isHostFindSurface = false,
   onFindFocusComposer = NO_FIND_FOCUS,
   onReasoningRowToggle,
+  olderHistory = null,
 }: MessagesTimelineProps) {
   const [disclosures, setDisclosures] = useState<TimelineDisclosures>(EMPTY_TIMELINE_DISCLOSURES);
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
@@ -397,38 +414,55 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
   useFoldPreviousTurnOnNewTurn(latestTurn, setDisclosures);
 
-  const rawRows = useMemo(
-    () =>
-      deriveMessagesTimelineRows({
-        timelineEntries,
-        queuedMessages,
-        queuedStatuses,
-        latestTurn,
-        runningTurnId,
-        turnFoldChoices: disclosures.turns,
-        workGroupChoices: disclosures.groups,
-        entryDisclosures: disclosures.entries,
-        verboseChat,
-        isWorking,
-        activeTurnStartedAt,
-        turnDiffSummaryByAssistantMessageId,
-        revertTurnCountByUserMessageId,
-      }),
-    [
+  const olderRows = olderHistory?.olderRows ?? null;
+  const olderHistoryStatus = olderHistory?.status ?? null;
+  const rawRows = useMemo(() => {
+    const derived = deriveMessagesTimelineRows({
       timelineEntries,
       queuedMessages,
       queuedStatuses,
       latestTurn,
       runningTurnId,
-      disclosures,
+      turnFoldChoices: disclosures.turns,
+      workGroupChoices: disclosures.groups,
+      entryDisclosures: disclosures.entries,
       verboseChat,
       isWorking,
       activeTurnStartedAt,
       turnDiffSummaryByAssistantMessageId,
       revertTurnCountByUserMessageId,
-    ],
-  );
+      hasOlderHistory: olderRows !== null,
+    });
+    return olderRows === null || olderHistoryStatus === null
+      ? derived
+      : [
+          {
+            kind: "history-start" as const,
+            id: HISTORY_START_ROW_ID,
+            createdAt: "",
+            olderRows,
+            status: olderHistoryStatus,
+          },
+          ...derived,
+        ];
+  }, [
+    olderRows,
+    olderHistoryStatus,
+    timelineEntries,
+    queuedMessages,
+    queuedStatuses,
+    latestTurn,
+    runningTurnId,
+    disclosures,
+    verboseChat,
+    isWorking,
+    activeTurnStartedAt,
+    turnDiffSummaryByAssistantMessageId,
+    revertTurnCountByUserMessageId,
+  ]);
   const rows = useStableRows(rawRows);
+  // Lives as long as the list: see `createStickyTimelineItemType`.
+  const [getItemType] = useState(createStickyTimelineItemType);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
@@ -555,6 +589,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleWorkGroup,
       onSetEntryDisclosure,
       onReasoningRowToggle,
+      onLoadOlderHistory: olderHistory?.onLoadOlder ?? NO_OLDER_HISTORY_LOAD,
     }),
     [
       timestampFormat,
@@ -581,6 +616,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleWorkGroup,
       onSetEntryDisclosure,
       onReasoningRowToggle,
+      olderHistory?.onLoadOlder,
     ],
   );
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
@@ -717,6 +753,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                     nativeScrollPending,
                   )}
                   onScroll={handleScroll}
+                  // Not while a key scroll's native scroll may start: a page landing then
+                  // would move the list under it (#207).
+                  {...(olderHistory?.status === "idle" && !nativeScrollPending
+                    ? {
+                        onStartReached: olderHistory.onLoadOlder,
+                        onStartReachedThreshold: OLDER_HISTORY_START_THRESHOLD,
+                      }
+                    : {})}
                   {...(onRowSizeChanged ? { onItemSizeChanged: onRowSizeChanged } : {})}
                   onMetricsChange={onListMetricsChange}
                   className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
@@ -867,10 +911,6 @@ function useStableAnchorCallbacks(
 
 function keyExtractor(item: MessagesTimelineRow) {
   return item.id;
-}
-
-function getItemType(item: MessagesTimelineRow) {
-  return item.kind === "message" ? `message:${item.message.role}` : item.kind;
 }
 
 interface TimelineMinimapItem {
@@ -1252,6 +1292,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
       {row.kind === "queued-message" ? <QueuedTimelineRow row={row} /> : null}
+      {row.kind === "history-start" ? <HistoryStartTimelineRow row={row} /> : null}
     </div>
   );
 });
@@ -1336,7 +1377,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             {regularImages.map((image) => (
               <div
                 key={image.id}
-                className="overflow-hidden rounded-lg border border-border/80 bg-background/70"
+                className="min-h-[72px] overflow-hidden rounded-lg border border-border/80 bg-background/70"
               >
                 {image.previewUrl ? (
                   <button
@@ -1352,6 +1393,8 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                     <img
                       src={image.previewUrl}
                       alt={image.name}
+                      loading="lazy"
+                      decoding="async"
                       className="block h-auto max-h-[220px] w-full object-cover"
                     />
                   </button>
@@ -1471,6 +1514,38 @@ function RevertUserMessageButton({ messageId }: { messageId: MessageId }) {
       </TooltipTrigger>
       <TooltipPopup side="top">Revert to this message</TooltipPopup>
     </Tooltip>
+  );
+}
+
+/**
+ * The top row while older history is on the server (#226). Scrolling near it loads the next
+ * page; the button loads it without scrolling and retries a page that failed.
+ */
+function HistoryStartTimelineRow({
+  row,
+}: {
+  row: Extract<TimelineRow, { kind: "history-start" }>;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const buttonClassName =
+    "rounded-md px-2 py-1 text-xs font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70";
+  return (
+    <div className="flex items-center justify-center gap-1.5 pt-1 text-xs text-muted-foreground">
+      {row.status === "loading" ? (
+        <span role="status">Loading earlier messages…</span>
+      ) : row.status === "error" ? (
+        <>
+          <span role="alert">Couldn't load earlier messages.</span>
+          <button type="button" className={buttonClassName} onClick={ctx.onLoadOlderHistory}>
+            Retry
+          </button>
+        </>
+      ) : (
+        <button type="button" className={buttonClassName} onClick={ctx.onLoadOlderHistory}>
+          Load earlier messages ({row.olderRows.toLocaleString()} more)
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -1653,7 +1728,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
         {/* The timer never truncates; the thought takes what is left of the one line. */}
         <span className="shrink-0">
           {row.answerDelivered
-            ? "Answer delivered — waiting for the provider to close the turn "
+            ? "Answer delivered, waiting for the provider to close the turn "
             : "Waiting for "}
           <WorkingTimer createdAt={row.createdAt} />
         </span>
@@ -1836,8 +1911,17 @@ const AssistantChangedFilesSection = memo(function AssistantChangedFilesSection(
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
 }) {
   if (!turnSummary) return null;
+  // Captured, so still a revert target, but with no baseline to read its changes against.
+  if (turnSummary.status === "ready" && turnSummary.diffAvailable === false) {
+    return (
+      <p className="mt-2 text-muted-foreground text-xs">
+        Changes can't be shown for this turn: the checkpoint before it is missing.
+      </p>
+    );
+  }
   const checkpointFiles = turnSummary.files;
-  if (checkpointFiles.length === 0) return null;
+  // The thread stream sends at most 200 files of a checkpoint and their total (#227).
+  if ((turnSummary.filesTotal ?? checkpointFiles.length) === 0) return null;
 
   return (
     <AssistantChangedFilesSectionInner
@@ -1869,8 +1953,12 @@ function AssistantChangedFilesSectionInner({
     (store) => store.threadChangedFilesExpandedById[routeThreadKey]?.[turnSummary.turnId] ?? true,
   );
   const setExpanded = useUiStateStore((store) => store.setThreadChangedFilesExpanded);
-  const summaryStat = summarizeTurnDiffStats(checkpointFiles);
-  const changedFileCountLabel = String(checkpointFiles.length);
+  const totalFiles = Math.max(turnSummary.filesTotal ?? 0, checkpointFiles.length);
+  const hiddenFiles = totalFiles - checkpointFiles.length;
+  // Line totals of the shown files alone would understate a capped turn.
+  const summaryStat =
+    hiddenFiles > 0 ? { additions: 0, deletions: 0 } : summarizeTurnDiffStats(checkpointFiles);
+  const changedFileCountLabel = totalFiles.toLocaleString();
 
   return (
     <div className="mt-2 rounded-lg border border-border/80 bg-card/45 p-2.5">
@@ -1912,6 +2000,18 @@ function AssistantChangedFilesSectionInner({
         resolvedTheme={resolvedTheme}
         onOpenTurnDiff={onOpenTurnDiff}
       />
+      {hiddenFiles > 0 && (
+        <button
+          type="button"
+          data-scroll-anchor-ignore
+          className="flex w-full items-center rounded-xl px-1.5 py-1 text-left text-muted-foreground text-xs transition-colors hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+          onClick={() => onOpenTurnDiff(turnSummary.turnId)}
+        >
+          {checkpointFiles.length > 0
+            ? `and ${hiddenFiles.toLocaleString()} more ${hiddenFiles === 1 ? "file" : "files"}`
+            : `${hiddenFiles.toLocaleString()} ${hiddenFiles === 1 ? "file" : "files"} changed`}
+        </button>
+      )}
     </div>
   );
 }
@@ -1975,6 +2075,8 @@ function UserMessagePreviewAnnotationCard(props: {
           <img
             src={props.image.previewUrl}
             alt="Annotated preview crop"
+            loading="lazy"
+            decoding="async"
             className="size-full object-cover"
           />
         </button>
