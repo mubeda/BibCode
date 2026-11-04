@@ -400,16 +400,26 @@ mod tests {
 
     #[test]
     fn running_children_are_found_by_executable_until_they_end() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
+        use std::io::{Read as _, Write as _};
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn cat");
         let pid = child.id();
+        // `spawn` returns while the child is still a copy of this process, before its `exec`
+        // has switched the executable `/proc/<pid>/exe` names. A byte it echoes back proves
+        // `cat` is running, so the scan has the executable to find. The scan itself is only
+        // asked about children that have run for a while (web processes after a page load).
+        child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+        child.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
         assert!(is_running_child(pid));
         assert!(
-            children_named("sleep")
+            children_named("cat")
                 .iter()
-                .any(|(found, exe)| *found == pid && exe.ends_with("/sleep"))
+                .any(|(found, exe)| *found == pid && exe.ends_with("/cat"))
         );
         child.kill().unwrap();
         child.wait().unwrap();
