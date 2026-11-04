@@ -1,5 +1,73 @@
 # Changelog
 
+## [v0.15.0] - 2026-11-04
+
+BiBCode v0.15.0 adds side chats, lets outside agents authenticate webhooks and act from the CLI, and makes large threads and stores lighter to load and keep. It also fixes Codex chat when BiBCode's MCP is registered, hardens turn checkpoints, and lifts the Windows file-write limit on the MCP Files tools. This release includes the changes since v0.14.0.
+
+### Agents and MCP
+
+- Outside agents can authenticate webhooks (bearer token, projectId, per-endpoint status filters), keep one identity across runs, and act from the CLI with `bibcode thread ...` and `bibcode mcp call/tools`. (#271)
+- Codex chat works again when BiBCode's MCP is registered and enabled. The `mcp_servers.bibcode` collision no longer breaks it. (#273)
+- The MCP Files tools write through handle-bound file changes on Windows. (#216)
+- MCP agents can clone over SSH, pinned to the checked public address. (#217)
+- MCP `preview_*` tools declare real, compact argument schemas. (#220)
+- A lost `/oauth/token` response no longer leaves an unrevoked mcp-client session. The relay publishes a pending link record and revokes unconfirmed credentials. (#281)
+
+### Chats and timeline
+
+- Side chats (`:btw`, `:side` and the + menu) start with the thread's context, delete themselves when closed unused, and can bring an answer back to the host draft. (#265)
+- Scrolling up through very long replies no longer loops the list into React's maximum update depth. (#228)
+- "Open in BiBCode browser" on a chat link opens it in the in-app browser. (#210)
+- Threads open with a byte-budgeted history window and page older history on scroll. (#226)
+- Cached threads resume as unchanged after a cold start, checkpoint file lists are capped, and HTTP assets are compressed. (#227)
+- The shell stream sends only the threads that changed, instead of the full list every 500 ms. (#223)
+
+### Source Control and Files
+
+- The Git Changes diff has resizable panes and next and previous difference navigation across files. (#211)
+- Git discard reports a stranded staged entry as `kept_in_staging`. (#218)
+- Commit-message drafts typed in two tabs no longer overwrite each other. (#219)
+- The thread's pull request refreshes right after an agent runs `gh pr create` or `glab mr create`. (#221)
+- Images, SVG, PDF and audio preview through the capped asset route, and timeline images load lazily. (#224)
+- On Windows, BiBCode's Git reads the system `core.autocrlf`, `core.eol` and `core.safecrlf`, and nothing else from the system configuration. (#282)
+
+### Turn checkpoints
+
+- A failed write of the error status keeps the thread. (#234)
+- A turn captured with a missing baseline is handled. (#235)
+- Leftover refs from two Git failures on one turn number are fenced from later diffs. (#236)
+- The first turn's delivery waits for its ref-0 baseline capture. (#261)
+
+### Storage and performance
+
+- Storage reports database size and free space, new stores use incremental auto-vacuum, and the offline `bibcode storage compact` command compacts a store. (#230)
+- `bibcode storage compact` also handles stores whose pre-compact backup takes longer than 30 seconds. (#262)
+- Load bytes and time are measured on a 3G profile and gated by a CI byte budget. (#225)
+- Idle terminals stop scanning the host process table every second. (#232)
+- Recovery after a memory dip no longer reads as growth in small processes in the memory leak check. (#272)
+
+### Terminals and providers
+
+- Terminal file links match Windows backslash relative paths and case- or slash-variant home folders. (#231)
+- The Cursor skill scan is bounded and keeps a partial list on timeout. (#229)
+- Update notices cover Claude Code and CodeGraph, as they already did for Codex. (#212)
+
+### Upgrades, tests and CI
+
+- Remote install no longer falls back to a desktop bootstrap token that the restart revokes. (#233)
+- The seeded-upgrade lane on macOS arm64 sees the pre-update backup. (#238)
+- The three seeded-upgrade builds share one Cargo target, which cut the macOS x64 lane from 185 to 122 minutes. (#239)
+- Three server tests that failed under heavy local load are hardened. (#237)
+- A lint rule bans em dashes in interface text. A lone dash placeholder is allowed. (#222)
+
+### Known limitations
+
+- The fix for "View diff" staying closed over a task panel that opened automatically has shipped, and the issue stays open until the reporter confirms. (#275)
+- Test hardening for load-sensitive tests and for tests that fail only on a Windows development machine is partial. (#263, #264)
+- Some checks have no native evidence yet: the Windows WSL seeded-upgrade lane was skipped, and the Unix-only permission checks for the Git configuration change (#282) run only on CI.
+- Open follow-ups: checkpoint and bootstrap Git policy (#283), backup resume content check (#289), and access-event ordering in Settings (#294).
+- The macOS reconnect footprint still needs heap evidence. (#134)
+
 ## [v0.14.0] - 2026-11-01
 
 BiBCode v0.14.0 lets outside AI agents operate BiBCode through its MCP server, locally or remotely, with a person always able to see, take over and stop what they do. Every turn now records a checkpoint again, so turn diffs and revert work. The timeline keeps its reading line during the sent-row glide, and Linux AppImage clones no longer load bundled libraries into Git. This release includes the changes since v0.13.0.
