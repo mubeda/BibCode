@@ -8,7 +8,9 @@ import { missingRouteThreadRedirectDelay, resolveThreadRouteRef } from "../threa
 import { ChatRouteInset } from "./-ChatRouteInset";
 import { useEnvironmentThreadRefs, useThreadDetail, useThreadShell } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
+import { useOffShellState } from "../state/offShell";
 import { environmentShell } from "../state/shell";
+import type { EnvironmentId } from "@bibcode/contracts";
 
 function ChatThreadRouteView() {
   const navigate = useNavigate();
@@ -33,6 +35,10 @@ function ChatThreadRouteView() {
   const routeThreadExists = threadExists || draftThreadExists;
   const serverThreadStarted = threadHasStarted(serverThreadDetail);
   const shellStatus = shell.data?.status ?? null;
+  const shellCapped =
+    shell.data?.snapshot._tag === "Some" && shell.data.snapshot.value.capped === true;
+  const offShell = useOffShellState(threadRef?.environmentId ?? ("" as EnvironmentId));
+  const routeThreadMissing = threadRef !== null && offShell.missing.has(threadRef.threadId);
 
   useEffect(() => {
     if (!threadRef) {
@@ -43,6 +49,8 @@ function ChatThreadRouteView() {
       shellStatus,
       routeThreadExists,
       environmentHasServerThreads,
+      shellCapped,
+      routeThreadMissing,
     });
     if (delay === null) {
       return;
@@ -51,7 +59,15 @@ function ChatThreadRouteView() {
       void navigate({ to: "/", replace: true });
     }, delay);
     return () => window.clearTimeout(timeoutId);
-  }, [environmentHasServerThreads, navigate, routeThreadExists, shellStatus, threadRef]);
+  }, [
+    environmentHasServerThreads,
+    navigate,
+    routeThreadExists,
+    routeThreadMissing,
+    shellCapped,
+    shellStatus,
+    threadRef,
+  ]);
 
   useEffect(() => {
     if (!threadRef || !serverThreadStarted || !draftThread) {

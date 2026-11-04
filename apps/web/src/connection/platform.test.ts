@@ -48,6 +48,7 @@ const pf = vi.hoisted(() => ({
   bearerBootstrapCalls: [] as string[],
   clearCalls: [] as string[],
   previewForgetCalls: [] as string[],
+  offShellForgetCalls: [] as string[],
   trackCalls: [] as Array<{ requestId: string; request: EnvironmentRpcRequestObservation }>,
   ackCalls: [] as string[],
 }));
@@ -75,6 +76,14 @@ vi.mock("../browser/previewStorageCleanup", () => ({
   forgetPreviewStorage: (environmentId: string) => {
     pf.previewForgetCalls.push(environmentId);
     return Promise.resolve();
+  },
+}));
+
+vi.mock("@bibcode/client-runtime/state/off-shell-threads", () => ({
+  offShellThreads: {
+    forget: (environmentId: string) => {
+      pf.offShellForgetCalls.push(environmentId);
+    },
   },
 }));
 
@@ -340,6 +349,7 @@ function resetPf(): void {
   pf.bearerBootstrapCalls = [];
   pf.clearCalls.length = 0;
   pf.previewForgetCalls.length = 0;
+  pf.offShellForgetCalls.length = 0;
   pf.trackCalls.length = 0;
   pf.ackCalls.length = 0;
 }
@@ -841,6 +851,8 @@ describe("connectionPlatformLayer environment side effects", () => {
       expect(pf.clearCalls).toContain("environment-x");
       // A removed environment's desktop preview storage goes with it.
       expect(pf.previewForgetCalls).toContain("environment-x");
+      // And the threads its capped shell left out (#223).
+      expect(pf.offShellForgetCalls).toContain("environment-x");
     }).pipe(Effect.provide(connectionPlatformLayer));
   });
 

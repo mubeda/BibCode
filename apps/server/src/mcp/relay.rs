@@ -29,9 +29,15 @@ use super::{
 };
 use crate::data_root::ResolvedDataRoot;
 
-/// Where each running relay records its credential's session id, so a later relay can revoke
-/// the credential of one that crashed.
+/// Where each running relay records its credential, so a later relay can revoke the credential
+/// of one that crashed: `<link id>.link` from before the exchange until the session is
+/// confirmed, then `<session id>.json` (#281).
 pub const CLIENT_RECORDS_DIR: &str = "mcp-clients";
+/// A credential whose session this relay has not confirmed yet. Sweeps before #281 read only
+/// `*.json`, so they never revoke one by a session id that may not exist yet.
+const UNCONFIRMED_RECORD: &str = "link";
+/// A pairing link's lifetime: a temporary record this old never preceded an exchange.
+const STALE_TEMPORARY_RECORD: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longer than the longest wait (50 s) plus its slack.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -222,8 +228,50 @@ pub(crate) struct Connection {
     http: reqwest::Client,
     access: McpAccess,
     endpoint: Mutex<Endpoint>,
-    /// Minted on the first request, so the relay's label can name the agent.
-    credential: Mutex<Option<Credential>>,
+    /// Minted on the first request, so the relay's label can name the agent; held by the
+    /// sign-in while it runs.
+    credential: Arc<Mutex<Option<Credential>>>,
+    /// Ids this connection minted whose revocation it still owes: a link whose session it never
+    /// heard about, or an older server's session it could not record. [`Connection::revoke`]
+    /// revokes them.
+    unconfirmed: Arc<std::sync::Mutex<Vec<String>>>,
+    /// What a test does to the next sign-in.
+    #[cfg(test)]
+    sign_in_plan: std::sync::Mutex<SignInPlan>,
+}
+
+/// Reached, then resumed: where a test holds a sign-in.
+#[cfg(test)]
+type SignInHold = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+#[derive(Default)]
+struct SignInPlan {
+    /// Held once the server answered the exchange.
+    hold_after_sign_in: Option<SignInHold>,
+    /// The token response reads as unreadable, after the server committed the session.
+    lose_token_response: bool,
+    /// The task ends right after the server answered, as a process death would.
+    die_after_send: bool,
+    /// Held once the first record's file is created, before its contents are written.
+    hold_publication: Option<SignInHold>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static HOLD_PUBLICATION: std::cell::RefCell<Option<SignInHold>>;
+    static HOLD_SWEEP_AFTER_LISTING: std::cell::RefCell<Option<SignInHold>>;
+}
+
+#[cfg(test)]
+async fn reach(hold: &'static tokio::task::LocalKey<std::cell::RefCell<Option<SignInHold>>>) {
+    if let Some((reached, resume)) = hold.try_with(|hold| hold.take()).ok().flatten() {
+        let _ = reached.send(());
+        let _ = resume.await;
+    }
 }
 
 struct Relay {
@@ -269,7 +317,10 @@ impl Connection {
             http,
             access,
             endpoint: Mutex::new(endpoint),
-            credential: Mutex::new(None),
+            credential: Arc::new(Mutex::new(None)),
+            unconfirmed: Arc::default(),
+            #[cfg(test)]
+            sign_in_plan: std::sync::Mutex::default(),
         })
     }
 
@@ -282,14 +333,26 @@ impl Connection {
         arguments: Value,
         label: &str,
     ) -> Result<Value, String> {
-        let message = json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments,
-                "_meta": { "io.modelcontextprotocol/protocolVersion": protocol::MODERN_VERSION },
-            },
-        });
+        let params = json!({ "name": name, "arguments": arguments });
+        self.request(id, "tools/call", params, label).await
+    }
+
+    /// The tool list this connection's credential sees, as `tools/list` returns it.
+    pub(crate) async fn list_tools(&self, id: u64, label: &str) -> Result<Value, String> {
+        self.request(id, "tools/list", json!({}), label).await
+    }
+
+    /// One request in the modern protocol era, and its `result`.
+    async fn request(
+        &self,
+        id: u64,
+        method: &str,
+        mut params: Value,
+        label: &str,
+    ) -> Result<Value, String> {
+        params["_meta"] =
+            json!({ "io.modelcontextprotocol/protocolVersion": protocol::MODERN_VERSION });
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let token = self.token(|| label.to_owned()).await?;
         let response = match self.send(&message, &token, None).await {
             Sent::Response(response) => response,
@@ -605,68 +668,173 @@ impl Connection {
         Ok(())
     }
 
-    /// The credential, minted on the first request: a 60 s link from the data root, exchanged
-    /// at once over loopback, labelled `label()`.
+    /// The credential, minted on the first request: a 60 s link from the data root, recorded,
+    /// then exchanged at once over loopback, labelled `label()`. The sign-in runs on a task of
+    /// its own that holds the credential slot, so a caller dropped once the server may have made
+    /// the session (Ctrl-C) still leaves it recorded, and [`Connection::revoke`] waits for it.
+    /// An `mcp-client` session takes its link's id (#281), so a sign-in whose answer is lost
+    /// still revokes the session the server made.
     async fn token(&self, label: impl FnOnce() -> String) -> Result<String, String> {
-        let mut credential = self.credential.lock().await;
-        if let Some(credential) = credential.as_ref() {
+        let mut slot = Arc::clone(&self.credential).lock_owned().await;
+        if let Some(credential) = slot.as_ref() {
             return Ok(credential.token.clone());
         }
-        let minted = mint(&self.options, &label(), self.access).await?;
+        let options = self.options.clone();
+        let http = self.http.clone();
+        let access = self.access;
+        let state_dir = self.state_dir.clone();
+        let unconfirmed = Arc::clone(&self.unconfirmed);
         let base = self.endpoint.lock().await.base.clone();
-        let exchanged = self
-            .http
-            .post(
-                base.join("oauth/token")
-                    .map_err(|error| error.to_string())?,
-            )
-            .form(&[
-                ("grant_type", crate::auth::TOKEN_GRANT_TYPE),
-                ("subject_token", minted.as_str()),
-                ("subject_token_type", crate::auth::BOOTSTRAP_TOKEN_TYPE),
-                ("requested_token_type", crate::auth::ACCESS_TOKEN_TYPE),
-                ("client_device_type", "desktop"),
-            ])
-            .send()
+        let label = label();
+        #[cfg(test)]
+        let mut plan = std::mem::take(&mut *self.sign_in_plan.lock().unwrap());
+        #[cfg(test)]
+        let hold_publication = plan.hold_publication.take();
+        let task = async move {
+            let (link_id, minted) = mint(&options, &label, access).await?;
+            let link_record = format!("{link_id}.{UNCONFIRMED_RECORD}");
+            // Recorded before the credential is sent, so it is revoked whatever happens next.
+            if let Err(error) = publish_record(&state_dir, &link_record).await {
+                let _ = revoke_credentials(&options, std::slice::from_ref(&link_id)).await;
+                return Err(record_error(&state_dir, &error));
+            }
+            track(&unconfirmed, &link_id);
+            let sent = http
+                .post(
+                    base.join("oauth/token")
+                        .map_err(|error| error.to_string())?,
+                )
+                .form(&[
+                    ("grant_type", crate::auth::TOKEN_GRANT_TYPE),
+                    ("subject_token", minted.as_str()),
+                    ("subject_token_type", crate::auth::BOOTSTRAP_TOKEN_TYPE),
+                    ("requested_token_type", crate::auth::ACCESS_TOKEN_TYPE),
+                    ("client_device_type", "desktop"),
+                ])
+                .send()
+                .await;
+            #[cfg(test)]
+            if plan.die_after_send {
+                return Err("The sign-in task died (test).".to_owned());
+            }
+            let read = async {
+                let exchanged =
+                    sent.map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
+                if !exchanged.status().is_success() {
+                    return Err(format!(
+                        "BiBCode refused this MCP server's sign-in ({}).",
+                        exchanged.status()
+                    ));
+                }
+                #[cfg(test)]
+                if let Some((reached, resume)) = plan.hold_after_sign_in.take() {
+                    let _ = reached.send(());
+                    let _ = resume.await;
+                }
+                #[cfg(test)]
+                if plan.lose_token_response {
+                    return Err("Could not sign in to BiBCode: the answer was lost (test).".into());
+                }
+                let exchanged: Value = exchanged
+                    .json()
+                    .await
+                    .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
+                let token = exchanged["access_token"]
+                    .as_str()
+                    .ok_or("BiBCode returned no credential.")?
+                    .to_owned();
+                let session_id = session_id_of(&token)
+                    .ok_or("BiBCode returned a credential this relay cannot read.")?;
+                Ok((token, session_id))
+            }
+            .await;
+            let (token, session_id) = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    // The server may have made the session anyway, under the link's id.
+                    forget(&options, &state_dir, &unconfirmed, &link_id).await;
+                    return Err(error);
+                }
+            };
+            if session_id == link_id {
+                // A failed rename leaves the `.link` record, which sweeps handle the same way.
+                let _ = std::fs::rename(
+                    record_path(&state_dir, &link_record),
+                    client_record_path(&state_dir, &session_id),
+                );
+                untrack(&unconfirmed, &link_id);
+            } else {
+                // An older server gave the session an id of its own: record that instead.
+                track(&unconfirmed, &session_id);
+                if let Err(error) = publish_record(&state_dir, &format!("{session_id}.json")).await
+                {
+                    // An id whose revoke fails stays tracked for `revoke` at exit.
+                    forget(&options, &state_dir, &unconfirmed, &session_id).await;
+                    forget(&options, &state_dir, &unconfirmed, &link_id).await;
+                    return Err(record_error(&state_dir, &error));
+                }
+                untrack(&unconfirmed, &session_id);
+                forget(&options, &state_dir, &unconfirmed, &link_id).await;
+            }
+            *slot = Some(Credential {
+                token: token.clone(),
+                session_id,
+            });
+            Ok(token)
+        };
+        #[cfg(test)]
+        let task = HOLD_PUBLICATION.scope(std::cell::RefCell::new(hold_publication), task);
+        tokio::spawn(task)
             .await
-            .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
-        if !exchanged.status().is_success() {
-            return Err(format!(
-                "BiBCode refused this MCP server's sign-in ({}).",
-                exchanged.status()
-            ));
-        }
-        let exchanged: Value = exchanged
-            .json()
-            .await
-            .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?;
-        let token = exchanged["access_token"]
-            .as_str()
-            .ok_or("BiBCode returned no credential.")?
-            .to_owned();
-        let session_id =
-            session_id_of(&token).ok_or("BiBCode returned a credential this relay cannot read.")?;
-        record_client(&self.state_dir, &session_id);
-        *credential = Some(Credential {
-            token: token.clone(),
-            session_id,
-        });
-        Ok(token)
+            .map_err(|error| format!("Could not sign in to BiBCode: {error}"))?
     }
 
-    /// Revokes this connection's credential through the data root and removes its record.
+    /// Revokes this connection's credential, and every id it still owes, through the data root,
+    /// and removes their records.
     pub(crate) async fn revoke(&self) {
-        let Some(credential) = self.credential.lock().await.take() else {
+        let credential = self.credential.lock().await.take();
+        let mut ids: Vec<String> = self.unconfirmed.lock().unwrap().clone();
+        ids.extend(credential.map(|credential| credential.session_id));
+        if ids.is_empty() {
             return;
-        };
-        if let Err(error) =
-            revoke_sessions(&self.options, std::slice::from_ref(&credential.session_id)).await
-        {
+        }
+        if let Err(error) = revoke_credentials(&self.options, &ids).await {
             eprintln!("bibcode: could not revoke this MCP connection's credential: {error}");
             return;
         }
-        let _ = std::fs::remove_file(client_record_path(&self.state_dir, &credential.session_id));
+        for id in &ids {
+            remove_records(&self.state_dir, id);
+            untrack(&self.unconfirmed, id);
+        }
     }
+}
+
+fn track(unconfirmed: &std::sync::Mutex<Vec<String>>, id: &str) {
+    unconfirmed.lock().unwrap().push(id.to_owned());
+}
+
+fn untrack(unconfirmed: &std::sync::Mutex<Vec<String>>, id: &str) {
+    unconfirmed.lock().unwrap().retain(|tracked| tracked != id);
+}
+
+/// Revokes `id` and, once that worked, forgets it: its records and its place in `unconfirmed`.
+async fn forget(
+    options: &RelayOptions,
+    state_dir: &Path,
+    unconfirmed: &std::sync::Mutex<Vec<String>>,
+    id: &str,
+) {
+    if revoke_credentials(options, &[id.to_owned()]).await.is_ok() {
+        remove_records(state_dir, id);
+        untrack(unconfirmed, id);
+    }
+}
+
+fn record_error(state_dir: &Path, error: &std::io::Error) -> String {
+    format!(
+        "Could not record this MCP connection in {}: {error}",
+        state_dir.join(CLIENT_RECORDS_DIR).display()
+    )
 }
 
 /// The `sid` in a session token's base64url JSON payload.
@@ -681,31 +849,51 @@ fn session_id_of(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn client_record_path(state_dir: &Path, session_id: &str) -> PathBuf {
-    state_dir
-        .join(CLIENT_RECORDS_DIR)
-        .join(format!("{session_id}.json"))
+fn record_path(state_dir: &Path, name: &str) -> PathBuf {
+    state_dir.join(CLIENT_RECORDS_DIR).join(name)
 }
 
-/// `{ pid, processStartedAt }` for this relay, with no secret.
-fn record_client(state_dir: &Path, session_id: &str) {
-    let path = client_record_path(state_dir, session_id);
-    let written = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| {
-            std::fs::write(
-                &path,
-                json!({
-                    "pid": std::process::id(),
-                    "processStartedAt": process_started_at(std::process::id()),
-                })
-                .to_string(),
-            )
-        });
-    if let Err(error) = written {
-        eprintln!("bibcode: could not record this MCP connection: {error}");
+fn client_record_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    record_path(state_dir, &format!("{session_id}.json"))
+}
+
+fn remove_records(state_dir: &Path, id: &str) {
+    let _ = std::fs::remove_file(client_record_path(state_dir, id));
+    let _ = std::fs::remove_file(record_path(
+        state_dir,
+        &format!("{id}.{UNCONFIRMED_RECORD}"),
+    ));
+}
+
+/// Publishes `{ pid, processStartedAt }` for this relay, with no secret, as `name`: written to
+/// a temporary file and renamed, so a sweep never reads a partial record.
+async fn publish_record(state_dir: &Path, name: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = record_path(state_dir, name);
+    let temporary = record_path(state_dir, &format!("{name}.tmp-{}", std::process::id()));
+    let published = async {
+        path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+        let mut file = std::fs::File::create(&temporary)?;
+        // A test holds here, with the file created and still empty.
+        #[cfg(test)]
+        reach(&HOLD_PUBLICATION).await;
+        file.write_all(
+            json!({
+                "pid": std::process::id(),
+                "processStartedAt": process_started_at(std::process::id()),
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)
     }
+    .await;
+    if published.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    published
 }
 
 pub(crate) async fn open_store(
@@ -719,6 +907,9 @@ pub(crate) async fn open_store(
 > {
     let guard = crate::persistence::StoreRuntimeGuard::acquire(&options.root.effective)
         .await
+        .map_err(|error| error.to_string())?;
+    // Under the shared runtime lock, so a restore or `--resume` cannot start meanwhile.
+    crate::persistence::ensure_no_interrupted_recovery(&options.paths())
         .map_err(|error| error.to_string())?;
     let database = crate::persistence::Database::open_existing(&options.paths().database)
         .await
@@ -736,7 +927,12 @@ fn extra_scopes(settings: McpServerSettings, access: McpAccess) -> &'static [&'s
     }
 }
 
-async fn mint(options: &RelayOptions, label: &str, access: McpAccess) -> Result<String, String> {
+/// A fresh link from the data root: its id, which its session takes, and its credential.
+async fn mint(
+    options: &RelayOptions,
+    label: &str,
+    access: McpAccess,
+) -> Result<(String, String), String> {
     let extra = extra_scopes(read_settings(&options.paths().settings)?, access);
     let (_guard, database) = open_store(options).await?;
     let repositories = crate::persistence::Repositories::new(database.clone());
@@ -749,17 +945,19 @@ async fn mint(options: &RelayOptions, label: &str, access: McpAccess) -> Result<
     .await
     .map_err(|error| format!("Could not issue this MCP connection's credential: {error:?}"));
     database.close().await;
-    issued.map(|issued| issued.credential)
+    issued.map(|issued| (issued.id, issued.credential))
 }
 
-async fn revoke_sessions(options: &RelayOptions, session_ids: &[String]) -> Result<(), String> {
+/// Revokes each relay credential `id`: its link, so no exchange of it can still succeed, and
+/// its session.
+async fn revoke_credentials(options: &RelayOptions, ids: &[String]) -> Result<(), String> {
     let (_guard, database) = open_store(options).await?;
     let repositories = crate::persistence::Repositories::new(database.clone());
     let now = crate::auth::format_iso(crate::auth::now_ms());
     let mut outcome = Ok(());
-    for session_id in session_ids {
+    for id in ids {
         if let Err(error) = repositories
-            .revoke_auth_session(session_id.clone(), now.clone())
+            .revoke_mcp_credential(id.clone(), now.clone())
             .await
         {
             outcome = Err(error.to_string());
@@ -775,41 +973,61 @@ async fn sweep_orphans(options: &RelayOptions) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
+    let listed: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    #[cfg(test)]
+    reach(&HOLD_SWEEP_AFTER_LISTING).await;
+    let unconfirmed_suffix = format!(".{UNCONFIRMED_RECORD}");
     let mut orphans = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(session_id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .filter(|_| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
+    for path in listed {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some((_, pid)) = name.rsplit_once(".tmp-") {
+            remove_stale_temporary_record(&path, pid);
+            continue;
+        }
+        let Some(id) = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(unconfirmed_suffix.as_str()))
             .map(str::to_owned)
         else {
             continue;
         };
-        let record = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .unwrap_or_default();
+        // Renamed (confirmed) or removed since the listing: the next sweep reads it again.
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let record = serde_json::from_slice::<Value>(&bytes).unwrap_or_default();
         let alive = record["pid"]
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
             .and_then(process_started_at)
             .is_some_and(|started| record["processStartedAt"].as_u64() == Some(started));
         if !alive {
-            orphans.push((session_id, path));
+            orphans.push((id, path));
         }
     }
     if orphans.is_empty() {
         return;
     }
     let ids: Vec<String> = orphans.iter().map(|(id, _)| id.clone()).collect();
-    if revoke_sessions(options, &ids).await.is_ok() {
+    if revoke_credentials(options, &ids).await.is_ok() {
         for (_, path) in orphans {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// A temporary record older than a link's lifetime, whose writer is gone, never preceded an
+/// exchange: there is nothing to revoke.
+fn remove_stale_temporary_record(path: &Path, pid: &str) {
+    let stale = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > STALE_TEMPORARY_RECORD);
+    if stale && pid.parse().is_ok_and(|pid| !process_alive(pid)) {
+        let _ = std::fs::remove_file(path);
     }
 }
 

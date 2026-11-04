@@ -246,6 +246,25 @@ export const ServerProviders = Schema.Array(ServerProvider);
 export type ServerProviders = typeof ServerProviders.Type;
 
 /**
+ * A command-line tool BiBCode keeps up to date but that is not an agent provider (CodeGraph).
+ * It shares the provider version advisory and update state, so the update notices, the pill and
+ * "Update all" treat it like a provider, but it never appears in provider pickers or sessions.
+ */
+export const ServerTool = Schema.Struct({
+  toolId: TrimmedNonEmptyString,
+  displayName: TrimmedNonEmptyString,
+  installed: Schema.Boolean,
+  version: Schema.NullOr(TrimmedNonEmptyString),
+  checkedAt: IsoDateTime,
+  versionAdvisory: Schema.optionalKey(ServerProviderVersionAdvisory),
+  updateState: Schema.optionalKey(ServerProviderUpdateState),
+});
+export type ServerTool = typeof ServerTool.Type;
+
+export const ServerTools = Schema.Array(ServerTool);
+export type ServerTools = typeof ServerTools.Type;
+
+/**
  * Treat the optional `availability` as "available" when absent. This is
  * the rule legacy producers (which omit the field) and new producers
  * (which set it explicitly) agree on so consumers never have to thread
@@ -693,6 +712,11 @@ export const ServerConfig = Schema.Struct({
   keybindings: ResolvedKeybindingsConfig,
   issues: ServerConfigIssues,
   providers: ServerProviders,
+  /**
+   * Absent from a server older than tool maintenance. A snapshot that carries the key, even
+   * empty, is how a client learns the server supports `server.updateTool`.
+   */
+  tools: Schema.optionalKey(ServerTools),
   availableEditors: Schema.Array(EditorId),
   observability: ServerObservability,
   settings: ServerSettings,
@@ -743,6 +767,8 @@ export type ServerConfigKeybindingsUpdatedPayload =
 
 export const ServerConfigProviderStatusesPayload = Schema.Struct({
   providers: ServerProviders,
+  /** Absent means unchanged, not empty: only a tool change carries it. */
+  tools: Schema.optionalKey(ServerTools),
 });
 export type ServerConfigProviderStatusesPayload = typeof ServerConfigProviderStatusesPayload.Type;
 
@@ -837,6 +863,29 @@ export const ServerProviderUpdateInput = Schema.Struct({
   instanceId: Schema.optionalKey(ProviderInstanceId),
 });
 export type ServerProviderUpdateInput = typeof ServerProviderUpdateInput.Type;
+
+export const ServerToolUpdatedPayload = Schema.Struct({
+  tools: ServerTools,
+});
+export type ServerToolUpdatedPayload = typeof ServerToolUpdatedPayload.Type;
+
+export const ServerToolUpdateInput = Schema.Struct({
+  toolId: TrimmedNonEmptyString,
+});
+export type ServerToolUpdateInput = typeof ServerToolUpdateInput.Type;
+
+export class ServerToolUpdateError extends Schema.TaggedError<ServerToolUpdateError>()(
+  "ServerToolUpdateError",
+  {
+    toolId: TrimmedNonEmptyString,
+    reason: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Tool update failed for ${this.toolId}: ${this.reason}`;
+  }
+}
 
 export class ServerProviderUpdateError extends Schema.TaggedError<ServerProviderUpdateError>()(
   "ServerProviderUpdateError",

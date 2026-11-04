@@ -25,6 +25,7 @@ import {
 } from "@bibcode/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@bibcode/contracts/settings";
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { mergeThreadHistory } from "@bibcode/client-runtime/state/thread-history";
 import type { EnvironmentConnectionPresentation } from "@bibcode/client-runtime/connection";
 import { serializeComposerReference } from "@bibcode/shared/composerReferences";
 import * as React from "react";
@@ -389,6 +390,7 @@ const STATE = {
   modelPickerOpen: 7,
   focused: 8,
   dismissedTrigger: 9,
+  sideChatRefusal: 10,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -855,6 +857,8 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     composerElementContextsRef: { current: [] },
     composerRef,
     onSend: spies.onSend,
+    onOpenSideChat: vi.fn(),
+    sideChatUnavailableReason: null,
     onInterrupt: spies.onInterrupt,
     onImplementPlanInNewThread: spies.onImplementPlanInNewThread,
     onRespondToApproval: spies.onRespondToApproval,
@@ -1104,6 +1108,73 @@ describe("ChatComposer rendering", () => {
     renderComposer({ providerStatuses: [codexProvider], activeThreadActivities });
     expect(filterCaptures("McpStatusPopover")).toHaveLength(1);
     expect(findCapture("McpStatusPopover")["supported"]).toBe(false);
+  });
+
+  // The thread history window (#226): status rows below the window arrive carried, and the
+  // composer reads them from the merged thread as from a whole one.
+  it("shows the carried MCP status and context-window usage of a windowed thread", () => {
+    const carried = [
+      {
+        id: "activity-context" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "context-window.updated",
+        summary: "context.window.updated",
+        payload: { usedTokens: 30, maxTokens: 100 },
+        turnId: null,
+        sequence: 1,
+        createdAt: now,
+      },
+      {
+        id: "activity-mcp" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "provider-event",
+        summary: "mcp.status.updated",
+        payload: { providerInstanceId: "codex", servers: [{ name: "docs", state: "needs-auth" }] },
+        turnId: null,
+        sequence: 2,
+        createdAt: now,
+      },
+    ] as Thread["activities"];
+    const windowed = mergeThreadHistory(
+      {
+        id: "thread-1" as Thread["id"],
+        projectId: "project-1" as Thread["projectId"],
+        title: "Thread",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        latestTurn: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        deletedAt: null,
+        messages: [],
+        reasoning: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+        session: null,
+        history: {
+          floor: "floor",
+          hasOlder: true,
+          olderRows: 9,
+          carried: { activities: carried, proposedPlans: [] },
+        },
+      },
+      null,
+    );
+    renderComposer({
+      providerStatuses: [
+        { ...codexProvider, supportsMcpStatus: true, supportsContextWindowUsage: true },
+      ],
+      activeThreadActivities: windowed.activities,
+    });
+    expect(findCapture("ContextWindowMeter")["usage"]).toMatchObject({ usedTokens: 30 });
+    expect(findCapture("McpStatusPopover")["snapshot"]).toEqual({
+      servers: [{ name: "docs", state: "needs-auth", detail: null }],
+    });
   });
 
   it("uses a provider-family lock without fixing the active instance", () => {
@@ -1612,6 +1683,8 @@ describe("ChatComposer attachments", () => {
     await flushMicrotasks();
 
     expect(markup).toContain('aria-label="Preview shot.png"');
+    // Draft thumbnails load lazily, so a long draft does not fetch every image at once.
+    expect(markup).toMatch(/<img[^>]*alt="shot.png"[^>]*loading="lazy"/);
     expect(markup).toContain("plain.png");
     expect(markup).toContain("Draft attachment may not persist");
 
@@ -1863,7 +1936,13 @@ describe("ChatComposer command menu", () => {
 
     const menu = findCapture("ComposerCommandMenu");
     const items = menu["items"] as Array<Record<string, unknown>>;
-    expect(items.map((item) => item["label"])).toEqual([":model", ":plan", ":default"]);
+    expect(items.map((item) => item["label"])).toEqual([
+      ":model",
+      ":plan",
+      ":default",
+      ":btw",
+      ":side",
+    ]);
     expect(items.every((item) => item["type"] === "bibcode-action")).toBe(true);
     expect(menu["emptyStateText"]).toBe("No matching BiBCode action.");
   });
@@ -2122,6 +2201,18 @@ describe("ChatComposer menu selection", () => {
     second.onSelect(second.items.find((item) => item["id"] === "bibcode-action:default")!);
     expect(second.spies.handleInteractionModeChange).toHaveBeenCalledWith("default");
     expect(second.spies.onSend).not.toHaveBeenCalled();
+  });
+
+  it("types :btw and :side for their question instead of running them", () => {
+    const first = renderCommandMenu(":bt");
+    first.onSelect(first.items.find((item) => item["id"] === "bibcode-action:btw")!);
+    expect(draftOf(threadRef)?.prompt).toBe(":btw ");
+    expect(first.spies.onSend).not.toHaveBeenCalled();
+    expect(first.spies.handleInteractionModeChange).not.toHaveBeenCalled();
+
+    const second = renderCommandMenu(":si");
+    second.onSelect(second.items.find((item) => item["id"] === "bibcode-action:side")!);
+    expect(draftOf(threadRef)?.prompt).toBe(":side ");
   });
 
   it("inserts provider slash commands with a trailing space", () => {
@@ -2805,6 +2896,81 @@ describe("ChatComposer paste and drag", () => {
     h.stateSeeds.set(STATE.dragOver, true);
     const { markup } = renderComposer();
     expect(markup).toContain("border-primary/70");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Side chats
+// ---------------------------------------------------------------------------
+
+describe("ChatComposer side chats", () => {
+  const question = "why did you pick that file?";
+  const submitted = `:btw ${question}`;
+  const submit = () => {
+    const form = findHost((element) => element.type === "form");
+    const event = { preventDefault: vi.fn() };
+    (form.props["onSubmit"] as (event: unknown) => void)(event);
+    return event;
+  };
+
+  it("opens a side chat for :btw <q> and never sends it", () => {
+    seedPrompt(submitted);
+    const onOpenSideChat = vi.fn();
+    const { spies } = renderComposer({ onOpenSideChat, promptRef: { current: submitted } });
+
+    const event = submit();
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(onOpenSideChat).toHaveBeenCalledWith(question, submitted);
+    expect(spies.onSend).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.prompt).toBe(submitted);
+  });
+
+  it.each([
+    ["in a panel", "Side chats start from the main chat. Use :btw there."],
+    ["without the capability", "This server doesn't support side chats. Update it to use them."],
+  ])("refuses :btw %s, keeping the text and showing why", (_case, reason) => {
+    seedPrompt(submitted);
+    const onOpenSideChat = vi.fn();
+    const { spies } = renderComposer({
+      onOpenSideChat,
+      sideChatUnavailableReason: reason,
+      promptRef: { current: submitted },
+    });
+
+    submit();
+
+    expect(onOpenSideChat).not.toHaveBeenCalled();
+    expect(spies.onSend).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.prompt).toBe(submitted);
+    expect(setStateValues(STATE.sideChatRefusal)).toContainEqual({ prompt: submitted, reason });
+    h.stateSeeds.set(STATE.sideChatRefusal, { prompt: submitted, reason });
+    expect(renderComposer({ sideChatUnavailableReason: reason }).markup).toContain(
+      reason.replace("'", "&#x27;"),
+    );
+  });
+
+  it("refuses :btw with attachments, keeping the draft", () => {
+    seedPrompt(submitted);
+    draftStore().addAttachments(threadRef, [makeFile()]);
+    const onOpenSideChat = vi.fn();
+    const { spies } = renderComposer({ onOpenSideChat, promptRef: { current: submitted } });
+
+    submit();
+
+    expect(onOpenSideChat).not.toHaveBeenCalled();
+    expect(spies.onSend).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.attachments).toHaveLength(1);
+    expect(setStateValues(STATE.sideChatRefusal)).toContainEqual({
+      prompt: submitted,
+      reason: "Side chats take text only. Remove the attachments, or add them in the side chat.",
+    });
+  });
+
+  it("hides the reason once the text changes", () => {
+    seedPrompt("something else");
+    h.stateSeeds.set(STATE.sideChatRefusal, { prompt: submitted, reason: "Hidden reason" });
+    expect(renderComposer().markup).not.toContain("Hidden reason");
   });
 });
 

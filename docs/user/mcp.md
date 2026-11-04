@@ -183,7 +183,10 @@ the same handlers as the Source Control panel. They belong to the **Source contr
   folder is, or turns into, a symlink is kept too, whatever `permanent` says. On macOS and
   Linux, BiBCode first moves each file into a folder of its own in the repository's Git
   directory (`bibcode-discard`), and the trash takes it from there. **Put Back** in the Trash
-  therefore does not return a file to the checkout; drag it back instead.
+  therefore does not return a file to the checkout; drag it back instead. If the trash
+  refuses a file and something else took its name meanwhile, the file is not in the folder:
+  it stays in that directory and `keptInStaging` says where. BiBCode moves it back on the
+  next discard in that repository once its name is free.
 
 #### Reading history and suggesting a commit message
 
@@ -357,7 +360,7 @@ These two belong to no set: they are always listed and work at read-only.
 - **Following changes.** Call `changes_since` once without a cursor: it returns where the
   logs are now and no entries. Pass each call's `cursor` to the next, and call again at once
   while `more` is true. An entry is `{ cursor, at, kind, threadId, status, requestId,
-  actor }`, never text:
+  actor, purpose }`, never text but the `purpose` an agent gave what it created:
   - `thread.created`, `panel.created`, `thread.archived`;
   - `turn.requested`, `turn.started`, `turn.completed`, `turn.interrupted`, `turn.failed`,
     and `session.status` for any other change of the session's status;
@@ -417,21 +420,34 @@ it, and add the clone as a project. These tools are in the **Workspace** set.
 
 | Tool               | What it does                                                                                                    |
 | ------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `clone_repository` | Clones an `https://` URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)   |
+| `clone_repository` | Clones a URL beside the project `parentProjectId` names and adds it as a project (`addAsProject`)               |
 | `clone_status`     | How a clone this connection started is going: `running`, the finished folder and project, or why it failed      |
 | `cancel_clone`     | Stops a clone this connection started and removes its folder; a clone you started that the agent joined goes on |
 
-- **HTTPS from public hosts only.** The URL must start with `https://`, with no user name or
-  token in it. SSH, `host:path`, `git://`, `file://` and other transports are refused, and so
-  is any host that does not resolve to a public internet address. Clone those in BiBCode
-  yourself: your own clones are unchanged. The address BiBCode checked is the one Git
+- **HTTPS from public hosts.** The URL must start with `https://`, with no user name or
+  token in it. `host:path`, `git://`, `file://` and other transports are refused, and so is
+  any host that does not resolve to a public internet address. Clone those in BiBCode
+  yourself: your own clones are unchanged.
+- **SSH only for agents you let use terminals.** An `ssh://git@host/owner/repo` URL uses
+  the keys loaded in your SSH agent, so BiBCode accepts it only from an agent that could
+  already run `git clone` in a terminal: Terminals on, **Agents may** at Full access, and the
+  agent approved with terminals. Any other agent is told the `https://` URL to use instead.
+  The SSH clone connects to the address BiBCode checked, reads none of your `~/.ssh/config`,
+  offers only keys in your agent, and checks the host's key against your
+  `~/.ssh/known_hosts` without ever adding one. If the host is not there yet, the error
+  gives the `ssh` command that trusts it: run it yourself, compare the fingerprint with the
+  one the host publishes, then retry. Start `ssh-agent` (on Windows, the OpenSSH
+  Authentication Agent service) and `ssh-add` your key first; a server started over SSH or
+  in WSL sees an agent only when its own environment has one. A key added with
+  `ssh-add -c` makes your agent ask you to confirm, and the clone waits until you answer or
+  cancel it. The address BiBCode checked is the one Git
   connects to, and a repository that redirects elsewhere fails with a message naming the
   redirect; clone the address it moved to.
 - **Your Git settings do not apply.** An agent's clone ignores your global and system Git
   configuration (rewrites, credentials, proxies, hooks, filters and URL-specific settings)
   and the server's environment variables beyond the basics (`PATH`, temporary folders,
-  language and time zone), proxies and Git variables included, so it reaches only public
-  repositories directly, and copies no hooks into the clone. On a
+  language and time zone), proxies and Git variables included, so over HTTPS it reaches
+  only public repositories directly, and copies no hooks into the clone. On a
   network that allows the internet only through a proxy, clone in BiBCode yourself.
 - **No Git LFS downloads.** LFS files stay pointer files, because a repository's
   `.lfsconfig` could point the download at any host. Run `git lfs pull` in the clone
@@ -505,9 +521,10 @@ read and download tools work at read-only.
   it back on the next delete or discard in that folder once the name is free. A permanent delete of a
   folder that stops part-way says where what is left is (`partially_removed`). `files_delete`
   takes a `clientRequestId`.
-- **Windows.** On a BiBCode server running on Windows, the tools that change files
-  (`files_write`, `files_create`, `files_rename`, `files_delete`, `files_upload`) are refused
-  (`McpPlatformUnsupportedError`); reading, listing, searching and downloading work.
+- **Windows.** The Files tools work the same on a BiBCode server running on Windows. A
+  junction or symlink is never followed out of the thread's folder, and a path that names
+  an alternate data stream (`file.txt:stream`) is refused. Moving an entry to the trash
+  needs an NTFS or ReFS drive; elsewhere it is left in place (`trash_unavailable`).
 - **Transfers.** No file bytes pass through MCP. A transfer URL works for 5 minutes, for one
   file or folder, and only while the agent's access lasts: Stop, Revoke, turning the MCP
   server or **Files** off, or (for an upload) **Take over** or read-only ends it, also
@@ -555,12 +572,18 @@ the server runs (the desktop app's executable takes it as `<desktop exe> thread`
 when it exits. While it runs it shows as one **CLI · bibcode thread** row in **Authorized
 clients**.
 
-| Command                                    | What it does                                                                 |
-| ------------------------------------------ | ---------------------------------------------------------------------------- |
-| `bibcode thread list`                      | Projects with their folders, and their threads with each status              |
-| `bibcode thread start <project> <message>` | Starts a thread; `.` is the project whose folder holds the current directory |
-| `bibcode thread send <thread> <message>`   | Sends a message; it queues behind a running turn and never interrupts it     |
-| `bibcode thread show <thread>`             | The thread's status and its latest messages                                  |
+| Command                                              | What it does                                                                       |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `bibcode thread list`                                | Projects with their folders, and their threads with each status                    |
+| `bibcode thread start <project> <message>`           | Starts a thread; `.` is the project whose folder holds the current directory       |
+| `bibcode thread send <thread> <message>`             | Sends a message; it queues behind a running turn and never interrupts it           |
+| `bibcode thread show <thread>`                       | The thread's status and its latest messages                                        |
+| `bibcode thread requests <thread>`                   | The thread's open questions and approvals, each with its request id                |
+| `bibcode thread answer <thread> <request> <answers>` | Answers a question; `<answers>` is a JSON object such as `{"color":"Red"}`, or `-` |
+| `bibcode thread approve <thread> <request>`          | Approves once, or for the rest of the session with `--for-session`                 |
+| `bibcode thread decline <thread> <request>`          | Declines, and the turn goes on; `--cancel` stops the turn where the provider can   |
+| `bibcode thread interrupt <thread>`                  | Stops the running turn (`--turn <id>`: only that turn)                             |
+| `bibcode thread changes`                             | What changed, as ids and states; pass the cursor it prints with `--cursor`         |
 
 - Pass `-` as the message to read it from standard input.
 - `start` takes `--title`, `--provider <instance>` and `--model`. Without them it uses the
@@ -570,8 +593,12 @@ clients**.
   only the waiting: the turn goes on.
 - `--json` prints one JSON document. For `start` and `send` it is
   `{ "threadId", "messageId", "status", "reply", "requestId", "error" }`, also on failure.
-- `start` and `send` take `--request-id <id>` (1 to 256 characters); without it one is made
-  up and printed as `requestId`. If a run is interrupted, or loses BiBCode before it hears
+- `answer` and `approve` are refused when the thread runs above **Agents may**; `decline`
+  and `interrupt` always work. They take no `--wait`: check the thread with `show` or
+  `changes` afterwards.
+- `start`, `send`, `answer`, `approve` and `decline` take `--request-id <id>` (1 to 256
+  characters); without it one is made up and printed (as `requestId` for `start` and
+  `send`, else `clientRequestId`). If a run is interrupted, or loses BiBCode before it hears
   back, it may already have started the thread or sent the message. It prints the id and
   the hint "Run the same command with --request-id <id> to finish it without repeating it."
   Run that exact command, with the same message and options: BiBCode returns the original
@@ -588,7 +615,17 @@ in BiBCode. With **MCP server** off it exits 1 with the same message as `bibcode
 ```sh
 bibcode thread start . "Summarize the README" --wait
 echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
+bibcode thread requests <thread id>
+bibcode thread approve <thread id> <request id>
 ```
+
+## One tool from a shell: `bibcode mcp call`
+
+`bibcode mcp call <tool> [<arguments>]` calls one tool and prints its result as JSON, for a
+script that only needs to read: `bibcode mcp call list_projects_and_threads`, or
+`bibcode mcp call read_thread '{"threadId":"<id>"}'`. It takes read-only tools only, other
+than `files_download`; `bibcode mcp tools` lists every tool with `oneShot: true` for those
+it takes. It exits 0 on success, 1 on a failure and 2 when the thread waits on a person.
 
 ## What it can and cannot do
 
@@ -645,6 +682,7 @@ echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
 | "This BiBCode server does not listen on this computer's loopback address." | The server binds only to another interface                  | Bind it to a loopback or wildcard address                   |
 | "The program listening on … is not this BiBCode server."                   | Another program took the recorded port, or BiBCode crashed  | Start BiBCode again                                         |
 | "BiBCode ended this MCP connection's access."                              | The agent's row was revoked                                 | Restart the MCP server in the agent                         |
+| "Could not record this MCP connection in …"                                | BiBCode's state folder cannot be written                    | Free disk space or fix the folder's permissions, then retry |
 | `--access … is above this environment's limit`                             | Asked for more than Agents may                              | Raise Agents may, or ask for less                           |
 
 When two BiBCode servers run on the same data root, such as the desktop app and a

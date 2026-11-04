@@ -92,6 +92,16 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   previewTunnels: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `review.listDiffTools` and `review.openDiffTool`: the Diff panel's **Open with**. */
   reviewDiffTools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Webhooks offer `input.requested` and `input.resolved` (the Questions events). */
+  webhookQuestionEvents: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `webhooks.upsert` takes `bearerToken`, and `webhooks.list` reports `bearerTokenSet`. */
+  webhookBearerToken: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `webhooks.upsert` takes `statusKinds`, and `webhooks.list` reports it. */
+  webhookStatusKinds: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `worktree.createPanel` takes `sideChat`: a panel seeded with its host's messages (#265). */
+  sideChats: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `thread.delete` takes `onlyIfUnused` and refuses a used thread (#265). */
+  threadDeleteOnlyIfUnused: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

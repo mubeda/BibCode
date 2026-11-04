@@ -138,7 +138,7 @@ describe("FileEditorToolbar", () => {
     render("saving", 0, null);
     expect(container.textContent).toContain("Saving…");
     render("failed", 0, null);
-    expect(container.textContent).toContain("Save failed — retry");
+    expect(container.textContent).toContain("Save failed, retry");
     render("clean", 0, "Editing unavailable");
     expect(container.textContent).toContain("Editing unavailable");
     render("clean", 1, null);

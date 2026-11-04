@@ -17,6 +17,8 @@ const ASSET_TOKEN_PURPOSE: &str = "asset";
 
 const PREVIEW_ENTRY_EXTENSIONS: &[&str] = &["htm", "html", "pdf"];
 const IMAGE_EXTENSIONS: &[&str] = &["avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp"];
+/// Single-file audio for the Files panel's native `<audio>` player; like images, no siblings.
+const AUDIO_EXTENSIONS: &[&str] = &["flac", "m4a", "mp3", "oga", "ogg", "wav", "webm"];
 const PREVIEW_SIBLING_EXTENSIONS: &[&str] = &[
     "htm", "html", "pdf", "avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp", "css", "js",
     "mjs", "otf", "ttf", "woff", "woff2",
@@ -110,7 +112,9 @@ impl AssetAccess {
                     return Err(AssetError::NotFound(path));
                 }
                 let extension = extension(&relative);
-                let claims = if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+                let claims = if IMAGE_EXTENSIONS.contains(&extension.as_str())
+                    || AUDIO_EXTENSIONS.contains(&extension.as_str())
+                {
                     Claims::WorkspaceExact {
                         root,
                         relative,
@@ -367,21 +371,67 @@ mod tests {
             Err(AssetError::NotFound(_))
         ));
 
-        tokio::fs::write(root.path().join("notes.txt"), b"notes")
+        for unsupported in ["notes.txt", "clip.mp4", "voice.aac", "archive.zip"] {
+            tokio::fs::write(root.path().join(unsupported), b"bytes")
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    access
+                        .issue(AssetIssueRequest {
+                            resource: AssetResource::WorkspaceFile {
+                                thread_id: "thread-1".to_owned(),
+                                path: unsupported.to_owned(),
+                            },
+                            workspace_root: Some(root.path().to_path_buf()),
+                        })
+                        .await,
+                    Err(AssetError::UnsupportedPreviewType(_))
+                ),
+                "{unsupported}"
+            );
+        }
+
+        // Audio previews in the Files panel get an exact-file URL, like images.
+        tokio::fs::write(root.path().join("style.css"), b"body{}")
             .await
             .unwrap();
-        assert!(matches!(
-            access
+        for audio in [
+            "song.mp3",
+            "song.m4a",
+            "song.wav",
+            "song.ogg",
+            "song.oga",
+            "song.webm",
+            "song.flac",
+            "SONG.MP3",
+        ] {
+            tokio::fs::write(root.path().join(audio), b"audio")
+                .await
+                .unwrap();
+            let issued = access
                 .issue(AssetIssueRequest {
                     resource: AssetResource::WorkspaceFile {
                         thread_id: "thread-1".to_owned(),
-                        path: "notes.txt".to_owned(),
+                        path: audio.to_owned(),
                     },
                     workspace_root: Some(root.path().to_path_buf()),
                 })
-                .await,
-            Err(AssetError::UnsupportedPreviewType(_))
-        ));
+                .await
+                .unwrap_or_else(|error| panic!("{audio}: {error}"));
+            assert!(
+                matches!(
+                    access.resolve(token_from(&issued), audio).await,
+                    Some(ResolvedAsset::File(_))
+                ),
+                "{audio}"
+            );
+            assert_eq!(
+                access.resolve(token_from(&issued), "style.css").await,
+                None,
+                "{audio} must not reach its siblings"
+            );
+        }
         assert!(matches!(
             access
                 .issue(AssetIssueRequest {
@@ -414,6 +464,34 @@ mod tests {
             access.resolve(token_from(&html), "style.css").await,
             Some(ResolvedAsset::File(_))
         ));
+
+        // Paths outside the workspace root never receive a signed URL.
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(outside.path().join("secret.png"), b"png")
+            .await
+            .unwrap();
+        for escape in [
+            "../secret.png".to_owned(),
+            outside
+                .path()
+                .join("secret.png")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert!(
+                access
+                    .issue(AssetIssueRequest {
+                        resource: AssetResource::WorkspaceFile {
+                            thread_id: "thread-1".to_owned(),
+                            path: escape.clone(),
+                        },
+                        workspace_root: Some(root.path().to_path_buf()),
+                    })
+                    .await
+                    .is_err(),
+                "{escape}"
+            );
+        }
 
         let absolute_path = root.path().join("absolute.png");
         tokio::fs::write(&absolute_path, b"png").await.unwrap();

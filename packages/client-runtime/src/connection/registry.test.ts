@@ -207,7 +207,14 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   );
   const shellCache = yield* Ref.make(new Map([[TARGET.environmentId, CACHED_SNAPSHOT]]));
   const threadCache = yield* Ref.make(
-    new Map([[TARGET.environmentId, new Map([[CACHED_THREAD.id, CACHED_THREAD]])]]),
+    new Map([
+      [
+        TARGET.environmentId,
+        new Map<ThreadId, Persistence.CachedThread>([
+          [CACHED_THREAD.id, { thread: CACHED_THREAD, resumeFrom: null }],
+        ]),
+      ],
+    ]),
   );
   const cacheClears = yield* Ref.make<ReadonlyArray<EnvironmentId>>([]);
   const ownedDataClears = yield* Ref.make<ReadonlyArray<EnvironmentId>>([]);
@@ -441,11 +448,11 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       Ref.get(threadCache).pipe(
         Effect.map((cache) => Option.fromUndefinedOr(cache.get(environmentId)?.get(threadId))),
       ),
-    saveThread: (environmentId, thread) =>
+    saveThread: (environmentId, cached) =>
       Ref.update(threadCache, (current) => {
         const next = new Map(current);
         const threads = new Map(next.get(environmentId));
-        threads.set(thread.id, thread);
+        threads.set(cached.thread.id, cached);
         next.set(environmentId, threads);
         return next;
       }),
@@ -2312,7 +2319,7 @@ describe("EnvironmentRegistry", () => {
           );
           expect(
             (yield* Ref.get(harness.threadCache)).get(TARGET.environmentId)?.get(CACHED_THREAD.id),
-          ).toEqual(CACHED_THREAD);
+          ).toEqual({ thread: CACHED_THREAD, resumeFrom: null });
           expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
           expect((yield* Ref.get(harness.storedCredentials)).has("local:wsl:Ubuntu")).toBe(false);
 

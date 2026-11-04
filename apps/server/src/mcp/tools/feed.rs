@@ -1,6 +1,7 @@
 //! The tools of no capability set (#139 slice X3): `server_capabilities`, which describes this
-//! server, this connection and every error a tool returns, and `changes_since`, a durable,
-//! content-free change feed an agent or a webhook receiver (slice X8) catches up with.
+//! server, this connection and every error a tool returns, and `changes_since`, a durable
+//! change feed of ids and states (and an agent's own `purpose`) that an agent or a webhook
+//! receiver (slice X8) catches up with.
 //!
 //! `changes_since` reads two durable sequences, never a new table: the orchestration event log
 //! (`orchestration_events.sequence`), mapped to thread transitions, and the agent activity log
@@ -72,7 +73,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
             object_schema(json!({}), &[]),
         ),
         "changes_since" => (
-            "What changed since a cursor, as ids and states only, never text: threads and chat panels created or archived, turns requested, started, completed, interrupted or failed, session status, approvals and input requested or resolved (with the requestId when it is a plain id; otherwise list_pending_requests names it), and each change outside agents made through MCP (tool, outcome and a target of ids). Without a cursor it returns the current position and no entries: start there. Pass each call's cursor to the next; while more is true, call again at once. One call scans at most 5,000 events (fewer when their payloads are large) and returns its position even when nothing matched. A cursor older than the agent activity BiBCode keeps (7 days, 5,000 rows) sets activityDropped. Use one cursor with one threadId. Not in the feed: Git operations a person ran in the app, worktree and file changes, and profiler findings (profiler_findings has its own cursor).",
+            "What changed since a cursor, as ids and states only, never text other than the purpose an agent gave a thread or panel it created: threads and chat panels created or archived, turns requested, started, completed, interrupted or failed, session status, approvals and input requested or resolved (with the requestId when it is a plain id; otherwise list_pending_requests names it), and each change outside agents made through MCP (tool, outcome and a target of ids). Without a cursor it returns the current position and no entries: start there. Pass each call's cursor to the next; while more is true, call again at once. One call scans at most 5,000 events (fewer when their payloads are large) and returns its position even when nothing matched. A cursor older than the agent activity BiBCode keeps (7 days, 5,000 rows) sets activityDropped. Use one cursor with one threadId. Not in the feed: Git operations a person ran in the app, worktree and file changes, and profiler findings (profiler_findings has its own cursor).",
             object_schema(
                 json!({
                     "cursor": { "type": "string", "description": "The cursor a previous call returned (the page's, or any entry's); omit it to start from now." },
@@ -359,6 +360,14 @@ fn transition(row: &TransitionRow) -> Option<Value> {
     }
     if let Some(actor) = row.actor_json.as_deref().and_then(event_actor) {
         entry["actor"] = actor;
+    }
+    // The agent's own words for why it created the thread or panel (at most 200 characters).
+    if let Some(purpose) = row
+        .purpose
+        .as_deref()
+        .filter(|_| kind.ends_with(".created"))
+    {
+        entry["purpose"] = purpose.into();
     }
     Some(entry)
 }
@@ -660,11 +669,6 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "Retry in a moment.",
     ),
     (
-        "McpPlatformUnsupportedError",
-        "Tools that change files (files_write, files_create, files_rename, files_delete, files_upload) are refused on this server's operating system, where BiBCode cannot hold a folder open while it works in it.",
-        "Read, list, search and download only; ask the person to make the change in BiBCode.",
-    ),
-    (
         "PreviewAutomationNoAvailableHostError",
         "No BiBCode window can show this thread's browser preview.",
         "Ask the person to open BiBCode on the thread, then try again.",
@@ -725,6 +729,7 @@ mod tests {
             activity_kind: None,
             request_id: None,
             actor_json: None,
+            purpose: None,
         }
     }
 

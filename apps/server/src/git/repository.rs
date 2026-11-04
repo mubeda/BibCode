@@ -7550,6 +7550,10 @@ impl ReservedClone {
                     )
                     .into();
                 }
+                // An agent's SSH clone: what to do about ssh's own refusal.
+                if let Some(advice) = plan.and_then(|plan| plan.explain_failure(&error.detail)) {
+                    error.detail = format!("{}\n{advice}", error.detail).into();
+                }
                 error
             })?;
         Ok(self.destination.path().to_path_buf())
@@ -7844,11 +7848,18 @@ where
 }
 
 fn git_boolean_is_true(value: &str) -> bool {
-    if ["true", "yes", "on"]
-        .iter()
-        .any(|word| value.eq_ignore_ascii_case(word))
-    {
-        return true;
+    git_boolean(value) == Some(true)
+}
+
+/// A Git boolean: `true|yes|on`, `false|no|off` or empty, or an integer (nonzero is true).
+/// `None` is a value Git refuses.
+pub(super) fn git_boolean(value: &str) -> Option<bool> {
+    let is = |words: [&str; 3]| words.iter().any(|word| value.eq_ignore_ascii_case(word));
+    if is(["true", "yes", "on"]) {
+        return Some(true);
+    }
+    if value.is_empty() || is(["false", "no", "off"]) {
+        return Some(false);
     }
     // Git also accepts nonzero signed integers (base 0, with optional k/m/g units).
     let value = value.trim_start_matches(|character| matches!(character, ' ' | '\t'..='\r'));
@@ -7880,20 +7891,27 @@ fn git_boolean_is_true(value: &str) -> bool {
     };
     // Reject extra signs: from_str_radix would otherwise accept them after prefix removal.
     if digits.starts_with(['+', '-']) {
-        return false;
+        return None;
     }
     i64::from_str_radix(digits, radix)
         .ok()
         .and_then(|number| number.checked_mul(sign)?.checked_mul(factor))
         .and_then(|number| i32::try_from(number).ok())
-        .is_some_and(|number| number != 0)
+        .map(|number| number != 0)
 }
 
 pub(crate) fn git_environment() -> Vec<(OsString, OsString)> {
+    let mut environment = prompt_guard_environment();
+    environment.insert(2, super::system_line_endings::system_config_variable());
+    environment
+}
+
+/// [`git_environment`] without its system-configuration variable, for the probe that
+/// reads the system configuration ([`super::system_line_endings`]).
+pub(super) fn prompt_guard_environment() -> Vec<(OsString, OsString)> {
     [
         ("GCM_INTERACTIVE", "never"),
         ("GIT_ASKPASS", ""),
-        ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_TERMINAL_PROMPT", "0"),
         ("LC_ALL", "C"),
         ("LANG", "C"),

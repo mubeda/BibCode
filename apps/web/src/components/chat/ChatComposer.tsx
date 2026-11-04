@@ -39,6 +39,7 @@ import {
   detectComposerTrigger,
   expandCollapsedComposerCursor,
   parseStandaloneComposerBiBCodeAction,
+  resolveComposerSideChatSubmit,
   type ComposerBiBCodeAction,
   type ComposerTrigger,
   replaceTextRange,
@@ -637,6 +638,13 @@ export interface ChatComposerProps {
 
   // Callbacks
   onSend: (e?: { preventDefault: () => void }) => void;
+  /**
+   * A whole-message `:btw` or `:side` opens a side chat with its question (`submittedText` is
+   * the draft text it came from); it never reaches `onSend`.
+   */
+  onOpenSideChat: (question: string, submittedText: string) => void;
+  /** Why side chats are unavailable here, or null; a refused `:btw` shows it and keeps the text. */
+  sideChatUnavailableReason: string | null;
   onInterrupt: () => void;
   onSteerQueuedMessage?: () => void;
   onImplementPlanInNewThread: () => void;
@@ -733,6 +741,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     composerTerminalContextsRef,
     composerElementContextsRef,
     onSend,
+    onOpenSideChat,
+    sideChatUnavailableReason,
     onInterrupt,
     onSteerQueuedMessage,
     onImplementPlanInNewThread,
@@ -1042,6 +1052,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerFocused, setIsComposerFocused] = useState(false);
   const [dismissedComposerTrigger, setDismissedComposerTrigger] =
     useState<DismissedComposerTrigger | null>(null);
+  // Why a `:btw` was refused, shown while the draft still holds the text it was refused for.
+  const [sideChatRefusal, setSideChatRefusal] = useState<{
+    readonly prompt: string;
+    readonly reason: string;
+  } | null>(null);
   const isMobileViewport = useMediaQuery("max-sm");
   const isComposerCollapsedMobile = isMobileViewport && !isComposerFocused;
 
@@ -1749,6 +1764,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const executeBiBCodeAction = useCallback(
     (action: ComposerBiBCodeAction) => {
+      // A side chat needs its question; choosing one only types it (see onSelectComposerItem).
+      if (action === "btw" || action === "side") return;
       if (action === "model") {
         setIsComposerModelPickerOpen(true);
         return;
@@ -1785,6 +1802,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     });
     const { snapshot, trigger } = resolveActiveComposerTrigger();
     if (!trigger || !composerItemMatchesTrigger(item, trigger)) return;
+    // `:btw` and `:side` take the rest of the message as the question.
+    if (item.type === "bibcode-action" && (item.action === "btw" || item.action === "side")) {
+      const applied = applyPromptReplacement(
+        trigger.rangeStart,
+        trigger.rangeEnd,
+        `:${item.action} `,
+        {
+          expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
+        },
+      );
+      if (applied) {
+        setComposerHighlightedItemId(null);
+        setComposerHighlightedSearchKey(null);
+      }
+      return;
+    }
     if (item.type === "bibcode-action") {
       const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
         expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
@@ -1871,6 +1904,30 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return;
       }
       const currentPrompt = promptRef.current;
+      const draft = useComposerDraftStore.getState().getComposerDraft(composerDraftTarget);
+      const sideChat = resolveComposerSideChatSubmit({
+        prompt: currentPrompt,
+        unavailableReason: sideChatUnavailableReason,
+        hasNonTextContent:
+          (draft?.attachments.length ?? 0) +
+            (draft?.terminalContexts.length ?? 0) +
+            (draft?.elementContexts.length ?? 0) +
+            (draft?.previewAnnotations.length ?? 0) +
+            (draft?.reviewComments.length ?? 0) >
+          0,
+      });
+      // A side chat question never reaches this thread: it opens the side chat, or the
+      // composer keeps it and says why not.
+      if (sideChat.kind !== "none") {
+        event?.preventDefault();
+        if (sideChat.kind === "refused") {
+          setSideChatRefusal({ prompt: currentPrompt, reason: sideChat.reason });
+          return;
+        }
+        setSideChatRefusal(null);
+        onOpenSideChat(sideChat.question, currentPrompt);
+        return;
+      }
       const bibcodeAction = parseStandaloneComposerBiBCodeAction(currentPrompt);
       // `:` actions (model picker, plan/default mode) only change this draft, so they run in
       // every connection state; anything that reaches the server goes through onSend.
@@ -1895,11 +1952,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [
       applyPromptReplacement,
       blurMobileComposerAfterSend,
+      composerDraftTarget,
       executeBiBCodeAction,
       isProviderBindingConflicted,
+      onOpenSideChat,
       onSend,
       promptRef,
       shouldBlurMobileComposerOnSubmit,
+      sideChatUnavailableReason,
     ],
   );
   const expandMobileComposer = useCallback(() => {
@@ -2564,6 +2624,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 />
               )}
 
+            {sideChatRefusal !== null && sideChatRefusal.prompt === prompt ? (
+              <p role="status" className="mb-3 text-xs text-muted-foreground">
+                {sideChatRefusal.reason}
+              </p>
+            ) : null}
+
             {!isComposerCollapsedMobile &&
               !isComposerApprovalState &&
               pendingUserInputs.length === 0 &&
@@ -2632,6 +2698,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               <img
                                 src={attachment.previewUrl}
                                 alt={attachment.name}
+                                loading="lazy"
+                                decoding="async"
                                 className="h-full w-full object-cover"
                               />
                             </button>

@@ -2097,6 +2097,7 @@ fn registrar_source_contains_every_owned_rpc_name() {
         "server.removeKeybinding",
         "server.signalProcess",
         "server.updateProvider",
+        "server.updateTool",
         "server.updateSettings",
         "server.upsertKeybinding",
         "subscribeServerConfig",
@@ -2299,13 +2300,16 @@ async fn request(socket: &mut TestSocket, id: &str, tag: &str, payload: Value) -
 }
 
 fn assert_success(message: ServerMessage) {
-    assert!(matches!(
-        message,
-        ServerMessage::Exit {
-            exit: RpcExit::Success { .. },
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            message,
+            ServerMessage::Exit {
+                exit: RpcExit::Success { .. },
+                ..
+            }
+        ),
+        "expected a successful response, got {message:?}"
+    );
 }
 
 fn assert_error_tag(message: ServerMessage, expected_tag: &str) {
@@ -2498,7 +2502,9 @@ fn shell_echo_command(token: &str) -> String {
 
 fn long_running_command() -> &'static str {
     if cfg!(windows) {
-        "echo BIBCODE_RPC_LONG_RUNNING_READY & ping 127.0.0.1 -n 31\r\n"
+        // The default Windows shell is PowerShell (`pwsh`, else Windows PowerShell 5.1), where
+        // `&` between commands is a parse error on 5.1; `;` separates them in both.
+        "echo BIBCODE_RPC_LONG_RUNNING_READY; ping 127.0.0.1 -n 31\r\n"
     } else {
         "printf 'BIBCODE_RPC_%s\\n' 'LONG_RUNNING_READY'; sleep 30\n"
     }

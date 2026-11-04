@@ -385,6 +385,17 @@ pub(crate) async fn read_wait_state(
                     turn_state.as_deref(),
                 ),
             };
+            let error = match status {
+                "error" => session_error,
+                // Why the message (or the thread's oldest held one) was not delivered (#273).
+                "delivery_failed" => crate::mcp::tools::threads::oldest_failed_delivery(
+                    connection,
+                    &thread_id,
+                    message_id.as_deref(),
+                )?
+                .and_then(|(_, detail)| detail),
+                _ => None,
+            };
             let reply = match turn.as_ref().and_then(|turn| turn.2.clone()) {
                 Some(assistant) => connection
                     .query_row(
@@ -407,7 +418,7 @@ pub(crate) async fn read_wait_state(
                 queued,
                 queued_ahead,
                 settled,
-                error: (status == "error").then_some(session_error).flatten(),
+                error,
                 reply,
             })
         })

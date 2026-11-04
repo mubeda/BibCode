@@ -550,6 +550,19 @@ fn event_fields(kind: &str) -> &'static [&'static str] {
         "provider.turn-failed" => &["provider", "terminalReason", "errorClass"],
         "provider.compaction" => &["provider", "trigger", "outcome", "reason", "durationMs"],
         "device.lifecycle" => &["platform", "phase", "durationMs", "failureKind", "running"],
+        "storage.compact" => &[
+            "phase",
+            "outcome",
+            "failedStep",
+            "stateKind",
+            "pageSize",
+            "before",
+            "after",
+            "backupMs",
+            "backupBudgetMs",
+            "vacuumMs",
+            "durationMs",
+        ],
         "worktree.removal" => &[
             "mode",
             "ok",
@@ -859,6 +872,7 @@ fn evidence_fields(kind: &str) -> Vec<&'static str> {
             CRASH_RECORD,
         ],
         "provider.turn-failed" => &[&["provider", "terminalReason", "errorClass"]],
+        "delivery.failing" => &[&["provider", "attempts", "errorClass"]],
         "provider.compaction-failed" => {
             &[&["provider", "trigger", "outcome", "reason", "durationMs"]]
         }

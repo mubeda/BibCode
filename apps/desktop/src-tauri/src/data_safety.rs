@@ -5,6 +5,7 @@ use bibcode_server::{ResolvedDataRoot, persistence};
 use serde::{Deserialize, Serialize};
 use std::{process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::backend::{
@@ -14,6 +15,21 @@ use crate::backend::{
 
 const WSL_PROGRAM: &str = "wsl.exe";
 const WSL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Beyond the server's own restore deadline and lock wait, so its deadline and cleanup fire
+/// first. It is still a watchdog: a kill during the commit leaves the journal for
+/// `bibcode storage restore --resume`.
+const WSL_RESTORE_MARGIN: Duration = Duration::from_secs(30);
+
+fn wsl_command_timeout(action: &WslStorageAction<'_>, restore_bytes: u64) -> Duration {
+    match action {
+        WslStorageAction::Restore { .. } => {
+            persistence::StoreIoBudget::LARGE_STORE.for_bytes(restore_bytes)
+                + persistence::RECOVERY_TIMEOUT
+                + WSL_RESTORE_MARGIN
+        }
+        WslStorageAction::Inspect | WslStorageAction::StartEmpty => WSL_COMMAND_TIMEOUT,
+    }
+}
 const WSL_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +330,10 @@ fn wsl_plan_parts(plan: &BackendLaunchPlan) -> Result<(String, String, String), 
     ))
 }
 
-async fn bounded_command(invocation: WslStorageInvocation) -> Result<Vec<u8>, ProjectDataError> {
+async fn bounded_command(
+    invocation: WslStorageInvocation,
+    timeout: Duration,
+) -> Result<Vec<u8>, ProjectDataError> {
     let mut command = Command::new(&invocation.program);
     command
         .args(&invocation.args)
@@ -347,7 +366,7 @@ async fn bounded_command(invocation: WslStorageInvocation) -> Result<Vec<u8>, Pr
             .await
             .map(|_| bytes)
     };
-    let (status, stdout, stderr) = tokio::time::timeout(WSL_COMMAND_TIMEOUT, async {
+    let (status, stdout, stderr) = tokio::time::timeout(timeout, async {
         let (stdout, stderr, status) = tokio::join!(read_stdout, read_stderr, child.wait());
         Ok::<_, std::io::Error>((status?, stdout?, stderr?))
     })
@@ -479,12 +498,10 @@ async fn inspect_target(
             binary,
             root,
         } => {
-            let bytes = bounded_command(wsl_storage_invocation(
-                distro,
-                binary,
-                root,
-                WslStorageAction::Inspect,
-            ))
+            let bytes = bounded_command(
+                wsl_storage_invocation(distro, binary, root, WslStorageAction::Inspect),
+                WSL_COMMAND_TIMEOUT,
+            )
             .await?;
             let document = serde_json::from_slice(&bytes).map_err(|error| {
                 ProjectDataError::Inspection(format!("WSL inspection output was invalid: {error}"))
@@ -519,7 +536,7 @@ async fn recover_native(
         WslStorageAction::Restore { backup_id } => {
             let backup_id =
                 Uuid::parse_str(backup_id).map_err(|_| ProjectDataError::InvalidSelection)?;
-            persistence::restore_backup(root, backup_id).await
+            persistence::restore_backup(root, backup_id, CancellationToken::new()).await
         }
         WslStorageAction::StartEmpty => persistence::preserve_and_start_empty(root).await,
         WslStorageAction::Inspect => return Err(ProjectDataError::InvalidSelection),
@@ -533,8 +550,14 @@ async fn recover_wsl(
     binary: &str,
     root: &str,
     action: WslStorageAction<'_>,
+    restore_bytes: u64,
 ) -> Result<ProjectDataRecoveryCommit, ProjectDataError> {
-    let bytes = bounded_command(wsl_storage_invocation(distro, binary, root, action)).await?;
+    let timeout = wsl_command_timeout(&action, restore_bytes);
+    let bytes = bounded_command(
+        wsl_storage_invocation(distro, binary, root, action),
+        timeout,
+    )
+    .await?;
     let result: WslRecoveryDocument = serde_json::from_slice(&bytes).map_err(|error| {
         ProjectDataError::Recovery(format!("WSL recovery output was invalid: {error}"))
     })?;
@@ -570,13 +593,14 @@ async fn run_recovery(
     let inspection = inspect_target(&target, &resolved)
         .await
         .map_err(|error| error.to_string())?;
-    if let WslStorageAction::Restore { backup_id } = action
-        && !inspection
+    let mut restore_bytes = 0;
+    if let WslStorageAction::Restore { backup_id } = action {
+        let selected = inspection
             .backups
             .iter()
-            .any(|backup| backup.backup_id == backup_id)
-    {
-        return Err(ProjectDataError::InvalidSelection.to_string());
+            .find(|backup| backup.backup_id == backup_id)
+            .ok_or_else(|| ProjectDataError::InvalidSelection.to_string())?;
+        restore_bytes = selected.size_bytes;
     }
     operation
         .stop_selected()
@@ -588,7 +612,7 @@ async fn run_recovery(
             distro,
             binary,
             root,
-        } => recover_wsl(distro, binary, root, action).await,
+        } => recover_wsl(distro, binary, root, action, restore_bytes).await,
     }
     .map_err(|error| error.to_string())?;
     let restart_error = operation
@@ -680,6 +704,31 @@ mod tests {
     use crate::backend::{BackendRunConfig, BackendShutdownConfig, WslBackendLaunchPlanInput};
     use bibcode_server::{DataRootRequest, DataRootSource, resolve_data_root};
     use std::fs;
+
+    #[test]
+    fn wsl_restore_timeout_covers_the_server_restore_budget() {
+        let restore = WslStorageAction::Restore {
+            backup_id: "00000000-0000-0000-0000-000000000000",
+        };
+        let gib = 1024 * 1024 * 1024;
+        for bytes in [0, 8 * gib] {
+            assert_eq!(
+                wsl_command_timeout(&restore, bytes),
+                persistence::StoreIoBudget::LARGE_STORE.for_bytes(bytes)
+                    + persistence::RECOVERY_TIMEOUT
+                    + Duration::from_secs(30)
+            );
+        }
+        assert!(wsl_command_timeout(&restore, 8 * gib) > Duration::from_secs(30 * 60));
+        assert_eq!(
+            wsl_command_timeout(&WslStorageAction::Inspect, 8 * gib),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            wsl_command_timeout(&WslStorageAction::StartEmpty, 8 * gib),
+            Duration::from_secs(30)
+        );
+    }
 
     fn local_config() -> BackendRunConfig {
         BackendRunConfig {
@@ -1171,6 +1220,7 @@ mod tests {
             .finish();
         let inspection = StoreInspection {
             classification: StoreInspectionStatus::Existing,
+            database: None,
             storage_instance_id: None,
             backups: Vec::new(),
             backup_issues: vec![persistence::BackupInventoryIssue {

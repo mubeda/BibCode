@@ -44,6 +44,7 @@
               "path": "a.rs"
             }
           ],
+          "filesTotal": 1,
           "status": "ready",
           "turnId": "turn-1"
         }
@@ -606,6 +607,7 @@
                       "path": "a.rs"
                     }
                   ],
+                  "filesTotal": 1,
                   "status": "ready",
                   "turnId": "turn-1"
                 }
@@ -693,6 +695,7 @@
                       "path": "a.rs"
                     }
                   ],
+                  "filesTotal": 1,
                   "status": "ready",
                   "turnId": "turn-1"
                 }

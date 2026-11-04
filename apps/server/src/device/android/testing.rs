@@ -811,7 +811,6 @@ impl FakeSdk {
     }
 
     pub(crate) fn write(self) -> Self {
-        use std::{fs, os::unix::fs::PermissionsExt};
         let avds = self
             .avds
             .iter()
@@ -830,10 +829,11 @@ impl FakeSdk {
             calls = self.list_avds_calls_file().display(),
             delay = self.list_avds_delay_secs
         );
+        // A child writes each script: an in-process write leaves a writable descriptor that a
+        // sibling test's fork can inherit, and then running the script fails with ETXTBSY.
         let write_script = |path: &Path, body: &str| {
-            fs::create_dir_all(path.parent().expect("script parent")).expect("script dir");
-            fs::write(path, body).expect("write script");
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+            std::fs::create_dir_all(path.parent().expect("script parent")).expect("script dir");
+            crate::test_support::executable_fixture::write_executable(path, body);
         };
         write_script(&self.dir.path().join("emulator/emulator"), &emulator);
         write_script(&launch, &self.launch_script());
@@ -1189,15 +1189,17 @@ impl DeviceFixture {
     }
 }
 
-/// Polls `done` for up to ten seconds.
+/// Polls `done` for up to a minute. It returns the moment `done` holds; the limit only bounds a
+/// failure, and the device tests run pinned to two CPUs, where a fake `adb` or a stopping
+/// helper can wait seconds for a core.
 pub(crate) async fn wait_until(done: impl Fn() -> bool) {
-    for _ in 0..400 {
+    for _ in 0..2_400 {
         if done() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("condition not reached within ten seconds");
+    panic!("condition not reached within a minute");
 }
 
 /// A loopback stand-in for scrcpy-server v4.1 behind `adb forward`: the first connection

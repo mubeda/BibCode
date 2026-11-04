@@ -69,6 +69,23 @@ pub trait ProductionServerControl: std::fmt::Debug + Send + Sync + 'static {
     ) -> JsonFuture;
 
     fn subscribe(&self, method: &'static str, cancellation: CancellationToken) -> JsonStream;
+
+    /// Starts a tool update that outlives its caller; `admission` is the caller's maintenance
+    /// permit, held until the update settles. A control with no tools refuses it.
+    fn update_tool(
+        &self,
+        payload: Value,
+        admission: Option<crate::maintenance::RpcPermit>,
+    ) -> JsonFuture {
+        drop((payload, admission));
+        Box::pin(async {
+            Err(json!({
+                "_tag": "ServerToolUpdateError",
+                "toolId": "unknown",
+                "reason": "This server does not maintain tools.",
+            }))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -504,6 +521,16 @@ fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalSe
         registry.register_unary(method, move |request, cancellation| {
             control.call(method, request.payload, cancellation)
         });
+    }
+    {
+        // A tool update outlives its caller, so it keeps this connection's maintenance permit.
+        let control = services.control.clone();
+        registry.register_unary_with_context(
+            "server.updateTool",
+            move |request, context, _cancellation| {
+                control.update_tool(request.payload, context.admission_permit())
+            },
+        );
     }
     for method in ["subscribeServerConfig", "subscribeServerLifecycle"] {
         let control = services.control.clone();

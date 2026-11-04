@@ -537,9 +537,11 @@ impl PortablePtyBackend {
                     #[cfg(test)]
                     observe_waiter_reservation(reservation.map(|_| ()));
                     loop {
-                        match kill_reserved_unix_process_group_after_root_exit(
+                        match kill_reserved_unix_process_group(
                             process_group,
                             &waiter_process_group_ownership,
+                            kill_unix_process_group,
+                            || true,
                         ) {
                             Ok(()) => break,
                             Err(error) => {
@@ -1113,8 +1115,13 @@ impl PtyProcess for PortablePtyProcess {
     fn kill(&self) -> Result<(), String> {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
-            return kill_reserved_unix_process_group(process_group, &self.process_group_ownership)
-                .map_err(|error| error.to_string());
+            return close_unix_process_group(
+                process_group,
+                &self.process_group_ownership,
+                self.pid,
+                kill_unix_process_group,
+            )
+            .map_err(|error| error.to_string());
         }
         #[cfg(windows)]
         {
@@ -1219,29 +1226,40 @@ fn signal_reserved_unix_process_group_with(
     Ok(())
 }
 
+/// Kills the owned group once. `root_exited` is asked only when the kill is refused: with the
+/// root exited but kept waitable, `EPERM` means the group has no signalable member left (any
+/// live same-user descendant would make the signal succeed), so the group counts as stopped.
 #[cfg(unix)]
 fn kill_reserved_unix_process_group(
     process_group: i32,
     ownership: &Mutex<UnixProcessGroupOwnership>,
-) -> std::io::Result<()> {
-    signal_reserved_unix_process_group_with(process_group, ownership, kill_unix_process_group)
-}
-
-#[cfg(unix)]
-fn kill_reserved_unix_process_group_after_root_exit(
-    process_group: i32,
-    ownership: &Mutex<UnixProcessGroupOwnership>,
+    kill_group: impl FnOnce(i32) -> std::io::Result<()>,
+    root_exited: impl FnOnce() -> bool,
 ) -> std::io::Result<()> {
     signal_reserved_unix_process_group_with(process_group, ownership, |process_group| {
-        match kill_unix_process_group(process_group) {
-            Ok(()) => Ok(()),
-            // Once the owned root is observed exited but kept waitable,
-            // EPERM means the group contains no signalable process. Any live
-            // descendant of this same-user ownership unit would make the
-            // group signal succeed, so there is no owned live member left.
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(()),
-            Err(error) => Err(error),
-        }
+        kill_group(process_group).or_else(|error| {
+            if crate::process::group_kill_refusal_is_stopped(error.raw_os_error(), root_exited()) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+    })
+}
+
+/// The close path's group kill (`PortablePtyProcess::kill`). The root may have exited moments
+/// before the waiter signals its group, so a refusal asks whether `root_pid` has exited, read
+/// without reaping: the waiter still owns the root's status. `kill_group` is the real `killpg`
+/// outside tests.
+#[cfg(unix)]
+fn close_unix_process_group(
+    process_group: i32,
+    ownership: &Mutex<UnixProcessGroupOwnership>,
+    root_pid: u32,
+    kill_group: fn(i32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    kill_reserved_unix_process_group(process_group, ownership, kill_group, || {
+        matches!(probe_unix_child_exit_without_reaping(root_pid), Ok(true))
     })
 }
 
@@ -1843,6 +1861,61 @@ mod tests {
 
         assert!(result.is_err());
         assert!(killed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// macOS refuses (`EPERM`) a group kill once every member has exited unreaped; a close
+    /// that lands then must succeed and leave the root's status for the waiter (#237).
+    #[cfg(unix)]
+    #[test]
+    fn close_counts_a_refused_kill_of_an_exited_roots_group_as_stopped() {
+        fn refused(_: i32) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+        let mut root = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn root");
+        let pid = root.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(probe_unix_child_exit_without_reaping(pid), Ok(true)) {
+            assert!(std::time::Instant::now() < deadline, "root never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ownership = Mutex::new(UnixProcessGroupOwnership::Reserved);
+        close_unix_process_group(pid as i32, &ownership, pid, refused)
+            .expect("a refused kill of an exited root's group is stopped");
+        assert_eq!(
+            *ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            UnixProcessGroupOwnership::Released
+        );
+        assert_eq!(root.wait().expect("root still waitable").code(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_keeps_a_refused_kill_of_a_running_roots_group_a_failure() {
+        fn refused(_: i32) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+        let mut root = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn root");
+        let pid = root.id();
+        let ownership = Mutex::new(UnixProcessGroupOwnership::Reserved);
+        let error = close_unix_process_group(pid as i32, &ownership, pid, refused)
+            .expect_err("EPERM while the root runs is a failure");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            *ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            UnixProcessGroupOwnership::Reserved
+        );
+        root.kill().expect("kill root");
+        root.wait().expect("reap root");
     }
 
     #[cfg(unix)]

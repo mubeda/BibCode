@@ -771,7 +771,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
           label:
             menuItem.disabledReason === null
               ? menuItem.label
-              : `${menuItem.label} — ${menuItem.disabledReason}`,
+              : `${menuItem.label}: ${menuItem.disabledReason}`,
           disabled: !menuItem.enabled,
           destructive: menuItem.id === "reset",
         }));

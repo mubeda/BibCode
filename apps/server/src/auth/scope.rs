@@ -51,7 +51,10 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "pipelines.subscribe"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"
+        | "orchestration.getThreadHistoryPage"
+        | "orchestration.getThreadShells"
         | "orchestration.getTurnDiff"
+        | "orchestration.listOlderThreads"
         | "orchestration.replayEvents"
         | "orchestration.subscribeShell"
         | "orchestration.subscribeThread"
@@ -147,6 +150,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.reportProfilerClientBatch"
         | "server.signalProcess"
         | "server.updateProvider"
+        | "server.updateTool"
         | "server.updateSettings"
         | "server.upsertKeybinding"
         | "updater.check"
@@ -255,6 +259,10 @@ mod tests {
         );
         assert_eq!(
             required_scope("server.getProviderCapabilities"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        assert_eq!(
+            required_scope("orchestration.getThreadHistoryPage"),
             Some(SCOPE_ORCHESTRATION_READ)
         );
         assert_eq!(

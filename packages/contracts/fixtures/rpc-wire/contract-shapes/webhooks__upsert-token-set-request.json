@@ -1,0 +1,14 @@
+{
+  "_tag": "Request",
+  "id": "900719925474099312345",
+  "tag": "webhooks.upsert",
+  "payload": {
+    "id": "endpoint-1",
+    "name": "CI",
+    "url": "https://hooks.example.com/bibcode",
+    "enabled": true,
+    "eventTypes": ["thread.status_changed"],
+    "bearerToken": "fixture-token"
+  },
+  "headers": []
+}

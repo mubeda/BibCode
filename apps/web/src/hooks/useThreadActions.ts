@@ -28,7 +28,7 @@ import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
 import { newCommandId } from "../lib/utils";
 import { readLocalApi } from "../localApi";
-import { readEnvironmentThreadRefs, readThreadShell } from "../state/entities";
+import { readEnvironmentThreadRefs, readThreadShell, resolveThreadShell } from "../state/entities";
 import { useRightPanelStore } from "../rightPanelStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
@@ -45,6 +45,19 @@ export class ThreadArchiveBlockedError extends Schema.TaggedError<ThreadArchiveB
 ) {
   override get message(): string {
     return "Cannot archive a running thread.";
+  }
+}
+
+/** The server reports the thread deleted (#223); nothing was changed. */
+export class ThreadMissingError extends Schema.TaggedError<ThreadMissingError>()(
+  "ThreadMissingError",
+  {
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+  },
+) {
+  override get message(): string {
+    return "This thread no longer exists.";
   }
 }
 
@@ -240,9 +253,22 @@ export function useThreadActions() {
 
   const archiveThread = useCallback(
     async (target: ScopedThreadRef) => {
-      const resolved = resolveThreadTarget(target);
-      if (!resolved) return AsyncResult.success(undefined);
-      const { thread, threadRef } = resolved;
+      // A thread a capped shell left out is resolved through the server (#223): only
+      // `missing` says it is gone, and that is reported instead of a silent success.
+      const resolution = await resolveThreadShell(target);
+      if (resolution.kind === "missing") {
+        return AsyncResult.failure(
+          Cause.fail(
+            new ThreadMissingError({
+              environmentId: target.environmentId,
+              threadId: target.threadId,
+            }),
+          ),
+        );
+      }
+      if (resolution.kind === "unknown") return AsyncResult.success(undefined);
+      const thread = resolution.thread;
+      const threadRef = target;
       if (thread.session?.status === "running" && thread.session.activeTurnId != null) {
         return AsyncResult.failure(
           Cause.fail(
@@ -280,7 +306,7 @@ export function useThreadActions() {
       refreshArchivedThreadsForEnvironment(threadRef.environmentId);
       return archiveResult;
     },
-    [archiveThreadMutation, getCurrentRouteThreadRef, resolveThreadTarget],
+    [archiveThreadMutation, getCurrentRouteThreadRef],
   );
 
   const unarchiveThread = useCallback(

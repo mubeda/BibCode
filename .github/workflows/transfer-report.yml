@@ -1,0 +1,108 @@
+name: Thread Transfer Report
+
+# Measures, on a pull request's base and head, the bytes the server sends for the large-thread
+# fixture (apps/server/tests/transfer_budget.rs) and shows both in the job summary. It reports;
+# the byte-budget test inside CI's Test job is what fails a build. It runs the pull request's own
+# code, so it has read-only permissions and no secrets, and it never posts a comment.
+on:
+  pull_request:
+    paths:
+      - "apps/server/**"
+      - "packages/contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/transfer-report.*"
+      - ".github/workflows/transfer-report.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: Transfer report
+    runs-on: ubuntu-24.04
+    # Two cold compiles of the server's test binary: the base and the head.
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      # Node runs the report script; the repository's pinned version runs TypeScript directly.
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@68f39c78aaf39be468cabd2afb09c162574c84af # v1.21.2
+        with:
+          node-version-file: package.json
+          run-install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            xdg-utils \
+            patchelf
+
+      - name: Measure head
+        id: head
+        continue-on-error: true
+        env:
+          BIBCODE_TRANSFER_REPORT: ${{ runner.temp }}/head.json
+        run: cargo test -p bibcode-server --test transfer_budget -j 2
+
+      # The head's test and fixture run against the base's server, so the two columns measure the
+      # same data. A base that no longer compiles with them reports "n/a".
+      - name: Measure base
+        id: base
+        continue-on-error: true
+        working-directory: base
+        env:
+          BIBCODE_TRANSFER_REPORT: ${{ runner.temp }}/base.json
+        run: |
+          mkdir -p apps/server/tests/support
+          cp ../apps/server/tests/transfer_budget.rs ../apps/server/tests/transfer_budget.json apps/server/tests/
+          cp ../apps/server/tests/support/load_fixture.rs apps/server/tests/support/
+          cargo test -p bibcode-server --test transfer_budget -j 2
+
+      - name: Write the report
+        if: always()
+        run: |
+          node scripts/transfer-report.ts "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json" \
+            apps/server/tests/transfer_budget.json | tee "$RUNNER_TEMP/transfer-report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: transfer-report
+          path: |
+            ${{ runner.temp }}/transfer-report.md
+            ${{ runner.temp }}/base.json
+            ${{ runner.temp }}/head.json
+          if-no-files-found: ignore

@@ -9,6 +9,7 @@
  */
 import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef, scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { threadActivityAgeMs } from "@bibcode/client-runtime/state/models";
 import { type EnvironmentId, type TerminalSummary, ThreadId } from "@bibcode/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
@@ -85,6 +86,18 @@ export function useRecordAgentEvidence(pending: ReadonlyArray<AgentEvidenceStamp
   useEffect(() => {
     if (pending.length > 0) recordAgentEvidence(pending);
   }, [pending]);
+}
+
+/**
+ * The thread's evidence age now, from the time this client received it (#223): an unchanged
+ * thread is not sent again, so its `lastActivityAgeMs` is as old as the item that carried it.
+ * Like `peekAgentEvidenceAt`'s clock, it dates only a first sight.
+ */
+function receivedActivityAgeMs(
+  thread: Parameters<typeof threadActivityAgeMs>[0],
+  now: number = Date.now(),
+): number | undefined {
+  return threadActivityAgeMs(thread, now);
 }
 
 /** Reads and keeps at once, for code outside a render. */
@@ -268,6 +281,7 @@ export function useWorkspaceCardStatus(
         readonly id: string;
         readonly lastActivityAt?: string | undefined;
         readonly lastActivityAgeMs?: number | undefined;
+        readonly lastActivityObservedAt?: number | undefined;
       })
     | null
     | undefined,
@@ -295,7 +309,7 @@ export function useWorkspaceCardStatus(
       evidenceAt: peekAgentEvidenceAt(
         threadKey,
         thread.lastActivityAt,
-        thread.lastActivityAgeMs,
+        receivedActivityAgeMs(thread),
         live,
         pending,
       ),

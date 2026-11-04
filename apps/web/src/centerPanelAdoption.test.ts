@@ -6,12 +6,14 @@ import {
   applyPanelThreadAdoption,
   applyTerminalMetadataAdoption,
   createCenterPanelAdoptionTracker,
+  panelProviderLabel,
 } from "./centerPanelAdoption";
 import {
   HOST_SURFACE_ID,
   selectThreadCenterPanelState,
   useCenterPanelStore,
 } from "./centerPanelStore";
+import { useRightPanelStore } from "./rightPanelStore";
 import { reserveTerminalId } from "./terminalIdReservations";
 
 const release = vi.hoisted(() => vi.fn());
@@ -58,8 +60,44 @@ const activeSurfaceId = () => hostState().groups[0]?.activeSurfaceId;
 
 describe("center panel adoption", () => {
   beforeEach(() => {
-    useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() });
+    useCenterPanelStore.setState({
+      byThreadKey: {},
+      pendingChatPanelThreadKeys: new Set(),
+      closingChatPanels: new Map(),
+      reshowChatPanels: new Set(),
+    });
     release.mockClear();
+  });
+
+  it("leaves a panel this page is closing alone, then shows it again if it is still live", () => {
+    const panelRef = scopeThreadRef(ENV, ThreadId.make("panel-a"));
+    const tracker = createCenterPanelAdoptionTracker();
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
+    expect(surfaceIds()).toContain("chat:panel-a");
+    useCenterPanelStore.getState().closeAllSurfaces(HOST, hostState().groups[0]!.id);
+    useCenterPanelStore.getState().hideClosingChatPanel(panelRef);
+
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
+    expect(surfaceIds()).not.toContain("chat:panel-a");
+
+    // The close ended without archiving it (a lost or refused archive): it comes back, once.
+    useCenterPanelStore.getState().releaseClosingChatPanel(panelRef, true);
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
+    expect(surfaceIds()).toContain("chat:panel-a");
+    expect(useCenterPanelStore.getState().reshowChatPanels.size).toBe(0);
+  });
+
+  it("drops a request to show a panel again once a full list leaves it out", () => {
+    const panelRef = scopeThreadRef(ENV, ThreadId.make("panel-a"));
+    useCenterPanelStore.getState().hideClosingChatPanel(panelRef);
+    useCenterPanelStore.getState().releaseClosingChatPanel(panelRef, true);
+    const tracker = createCenterPanelAdoptionTracker();
+    // A capped list proves nothing, so the request stays.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread], true);
+    expect(useCenterPanelStore.getState().reshowChatPanels.size).toBe(1);
+    applyPanelThreadAdoption(ENV, tracker, [hostThread]);
+    expect(useCenterPanelStore.getState().reshowChatPanels.size).toBe(0);
+    expect(surfaceIds()).not.toContain("chat:panel-a");
   });
 
   it("adopts a center terminal another client opened as an inactive tab with its command", () => {
@@ -268,5 +306,42 @@ describe("center panel adoption", () => {
     applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
     expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-b", "chat:panel-a"]);
     expect(activeSurfaceId()).toBe(HOST_SURFACE_ID);
+  });
+
+  it("keeps a tracked panel's tab when a capped list leaves it out (#223)", () => {
+    const tracker = createCenterPanelAdoptionTracker();
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], true);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+
+    // A reconnect's capped snapshot leaves the finished panel out: it may still exist.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread], true);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+
+    // Back in the list: still one tab.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")], true);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a"]);
+  });
+
+  it("drops the host's Diff on a panel's thread when the panel closes", () => {
+    const tracker = createCenterPanelAdoptionTracker();
+    const panelId = ThreadId.make("panel-a");
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
+    useRightPanelStore.setState({ byThreadKey: {} });
+    useRightPanelStore.getState().openDiff(HOST, panelId);
+
+    // Closed (archived) here or elsewhere: it leaves the live list.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread]);
+
+    expect(useRightPanelStore.getState().byThreadKey[scopedThreadKey(HOST)]?.surfaces).toEqual([
+      { id: "diff", kind: "diff" },
+    ]);
+  });
+});
+
+describe("panelProviderLabel", () => {
+  it("reads the provider label from the colon title and the legacy em dash title", () => {
+    expect(panelProviderLabel("Panel: Claude")).toBe("Claude");
+    expect(panelProviderLabel("Panel — Claude")).toBe("Claude");
+    expect(panelProviderLabel("Panel Claude")).toBeUndefined();
   });
 });

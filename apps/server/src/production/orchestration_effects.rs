@@ -278,6 +278,8 @@ struct ProductionBootstrapEffects {
     repositories: crate::persistence::Repositories,
     repository: Arc<GitRepository>,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
+    #[cfg(test)]
+    test_hooks: crate::orchestration::engine::TestHooks,
 }
 
 impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
@@ -390,6 +392,31 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
             })
         })
     }
+
+    fn capture_first_turn_baseline<'a>(
+        &'a self,
+        thread_id: &'a str,
+        message_id: &'a str,
+        limit: Duration,
+        cancellation: &'a CancellationToken,
+    ) -> BoxBootstrapFuture<'a, Option<String>> {
+        Box::pin(async move {
+            #[cfg(test)]
+            let probe_gate = self.test_hooks.checkout_probe_gate();
+            #[cfg(not(test))]
+            let probe_gate = None;
+            ensure_first_turn_baseline(
+                &self.repositories,
+                self.callbacks.as_ref(),
+                thread_id,
+                message_id,
+                limit,
+                cancellation,
+                probe_gate,
+            )
+            .await
+        })
+    }
 }
 
 async fn fetch_origin_base(
@@ -485,6 +512,8 @@ impl OrchestrationEffects {
             repositories: engine.repositories(),
             repository: repository.clone(),
             callbacks: callbacks.clone(),
+            #[cfg(test)]
+            test_hooks: engine.test_hooks(),
         }));
 
         let identity_tasks = TaskTracker::new();
@@ -519,6 +548,18 @@ impl OrchestrationEffects {
             producer: tokio::sync::Mutex::new(Some(producer)),
             worker: tokio::sync::Mutex::new(Some(worker)),
         })
+    }
+
+    /// Captures a thread's first-turn baseline (ref 0) as turn delivery does before it first
+    /// claims that turn, for a caller that hands the turn to its provider itself.
+    pub async fn capture_first_turn_baseline(&self, thread_id: &str, message_id: &str) {
+        let _ = crate::production::turn_delivery::capture_first_turn_baseline(
+            &self.engine,
+            thread_id,
+            message_id,
+            &self.cancellation,
+        )
+        .await;
     }
 
     pub async fn shutdown(&self) {
@@ -1038,12 +1079,6 @@ async fn process_event(
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     match event.event.event_type.as_str() {
-        "thread.turn-start-requested" => {
-            ensure_baseline(engine, callbacks, event, Baseline::TurnStart, cancellation).await
-        }
-        "thread.message-sent" if needs_turn_baseline(event) => {
-            ensure_baseline(engine, callbacks, event, Baseline::Message, cancellation).await
-        }
         "thread.turn-diff-completed"
             if event.event.payload.get("status").and_then(Value::as_str) == Some("missing") =>
         {
@@ -1112,6 +1147,14 @@ async fn resolve_workspace(
     callbacks: &dyn OrchestrationEffectCallbacks,
     thread_id: &str,
 ) -> Result<Option<PathBuf>, OrchestrationEffectsError> {
+    resolve_thread_workspace(&engine.repositories(), callbacks, thread_id).await
+}
+
+async fn resolve_thread_workspace(
+    repositories: &crate::persistence::Repositories,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    thread_id: &str,
+) -> Result<Option<PathBuf>, OrchestrationEffectsError> {
     if let Some(cwd) = callbacks
         .workspace_for_thread(thread_id)
         .await
@@ -1119,7 +1162,6 @@ async fn resolve_workspace(
     {
         return Ok(Some(cwd));
     }
-    let repositories = engine.repositories();
     let Some(thread) = repositories.get_thread(thread_id.to_owned()).await? else {
         return Ok(None);
     };
@@ -1132,94 +1174,229 @@ async fn resolve_workspace(
         .map(|project| process_compatible_path(PathBuf::from(project.workspace_root))))
 }
 
-/// A user message that starts a turn needs the turn's checkpoint baseline. Imported CLI history
-/// starts no turn, so it must not capture one (or spawn Git once per historical prompt).
-fn needs_turn_baseline(event: &OrchestrationEvent) -> bool {
-    let payload = &event.event.payload;
-    payload.get("role").and_then(Value::as_str) == Some("user")
-        && payload.get("streaming").and_then(Value::as_bool) == Some(false)
-        && payload.get("turnId").is_none_or(Value::is_null)
-        && event
-            .event
-            .metadata
-            .get("historyImport")
-            .and_then(Value::as_bool)
-            != Some(true)
-}
-
-/// What asked for a turn's baseline.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Baseline {
-    /// The turn starts now.
-    TurnStart,
-    /// A user message was sent. A queued one is sent while another turn may still run.
-    Message,
-}
-
-async fn ensure_baseline(
-    engine: &OrchestrationEngine,
+/// Captures `thread_id`'s ref 0 before its first turn, the one `message_id` starts, is first
+/// claimed (#261). Turn delivery calls it and claims the turn only after it returns, so ref 0
+/// is the checkout before that turn: delivery is the only writer of ref 0, and every Git
+/// command whose output ref 0 holds has finished before the claim. Only `update-ref` can
+/// outlive a timeout (a stalled Windows spawn), and it publishes a commit fixed before the
+/// claim.
+///
+/// Every await is bounded by `limit`, then given up: `Ok(Some(reason))` for a failure or a
+/// timeout, which the caller reports; `Ok(None)` when it is captured or not needed; `Err` only
+/// when `cancellation` fires, leaving the turn to try again.
+pub(crate) async fn ensure_first_turn_baseline(
+    repositories: &crate::persistence::Repositories,
     callbacks: &dyn OrchestrationEffectCallbacks,
-    event: &OrchestrationEvent,
-    baseline: Baseline,
+    thread_id: &str,
+    message_id: &str,
+    limit: Duration,
     cancellation: &CancellationToken,
-) -> Result<(), OrchestrationEffectsError> {
-    let Some(thread_id) = event.event.payload.get("threadId").and_then(Value::as_str) else {
-        return Ok(());
+    probe_gate: Option<Arc<tokio::sync::Notify>>,
+) -> Result<Option<String>, String> {
+    let started = std::time::Instant::now();
+    let bounded = cancellation.child_token();
+    let steps = first_turn_baseline_steps(
+        repositories,
+        callbacks,
+        thread_id,
+        message_id,
+        &bounded,
+        probe_gate,
+    );
+    tokio::pin!(steps);
+    let mut timed_out = false;
+    let result = tokio::select! {
+        result = &mut steps => result,
+        () = tokio::time::sleep(limit) => {
+            timed_out = true;
+            bounded.cancel();
+            // Cancelled steps stop their Git children and wait for them, and their cleanup is
+            // bounded too; past this grace they are dropped, which still kills the children.
+            match tokio::time::timeout(CANCELLED_BASELINE_GRACE, steps).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        thread_id,
+                        "a first turn's cancelled checkpoint baseline did not stop in time; it is dropped"
+                    );
+                    Err(OrchestrationEffectsError::Effect("timed out".to_owned()))
+                }
+            }
+        }
     };
-    let Some(cwd) = resolve_workspace(engine, callbacks, thread_id).await? else {
-        return Ok(());
+    if cancellation.is_cancelled() {
+        return Err("the first turn's checkpoint baseline was cancelled".to_owned());
+    }
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(captured) => {
+            if captured {
+                tracing::debug!(
+                    thread_id,
+                    elapsed_ms,
+                    "first turn checkpoint baseline captured"
+                );
+            }
+            Ok(None)
+        }
+        Err(error) => {
+            let reason = if timed_out {
+                format!("timed out after {}", describe_limit(limit))
+            } else {
+                crate::diagnostics::redact_sensitive_text(&error.to_string())
+            };
+            tracing::warn!(
+                thread_id,
+                elapsed_ms,
+                error = %reason,
+                "a first turn's checkpoint baseline was not captured; the turn goes on without one"
+            );
+            Ok(Some(reason))
+        }
+    }
+}
+
+/// How long cancelled baseline steps may take to stop their Git children and clean up.
+const CANCELLED_BASELINE_GRACE: Duration = Duration::from_secs(10);
+/// How long a capture waits to remove its temporary index; past this, the removal is left to
+/// finish on its own (a stalled network filesystem) and logged, so no capture waits on it.
+const TEMPORARY_INDEX_REMOVAL_LIMIT: Duration = Duration::from_secs(5);
+
+/// Removes a capture's temporary index within `TEMPORARY_INDEX_REMOVAL_LIMIT`.
+async fn remove_temporary_index(path: PathBuf) {
+    #[cfg(test)]
+    let gate = temporary_index_removal_gate(&path);
+    let removal = async move {
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        tokio::fs::remove_file(path).await
     };
+    if tokio::time::timeout(TEMPORARY_INDEX_REMOVAL_LIMIT, removal)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "a checkpoint's temporary index was not removed in time; it is left to finish on its own"
+        );
+    }
+}
+
+/// Test gates that hold the removal of temporary indexes under a Git directory.
+#[cfg(test)]
+static TEMPORARY_INDEX_REMOVAL_GATES: std::sync::Mutex<Vec<(PathBuf, Arc<tokio::sync::Notify>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds the removal of every temporary index under `git_dir` until the gate is notified.
+#[cfg(test)]
+pub(crate) fn hold_temporary_index_removal(git_dir: &Path) -> Arc<tokio::sync::Notify> {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    TEMPORARY_INDEX_REMOVAL_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((git_dir.to_path_buf(), gate.clone()));
+    gate
+}
+
+#[cfg(test)]
+fn temporary_index_removal_gate(path: &Path) -> Option<Arc<tokio::sync::Notify>> {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let parent = path.parent().map(canonical)?;
+    TEMPORARY_INDEX_REMOVAL_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(git_dir, _)| canonical(git_dir) == parent)
+        .map(|(_, gate)| gate.clone())
+}
+
+fn describe_limit(limit: Duration) -> String {
+    if limit >= Duration::from_secs(1) {
+        format!("{} seconds", limit.as_secs())
+    } else {
+        format!("{} ms", limit.as_millis())
+    }
+}
+
+/// Whether a turn of the thread other than the one `message_id` starts has a checkpoint number:
+/// the thread then has its checkpoints, and its first turn's baseline is long settled.
+pub(crate) fn an_earlier_turn_is_numbered(
+    turns: &[crate::persistence::ProjectionTurn],
+    message_id: &str,
+) -> bool {
+    turns.iter().any(|turn| {
+        turn.pending_message_id.as_deref() != Some(message_id)
+            && turn.checkpoint_turn_count.is_some_and(|count| count >= 1)
+    })
+}
+
+/// Resolves the token's cancellation as an effect error, for awaits that do not watch it.
+async fn until_cancelled<T>(
+    cancellation: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, OrchestrationEffectsError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(OrchestrationEffectsError::Effect(
+            "the first turn's checkpoint baseline was given up".to_owned(),
+        )),
+        value = future => Ok(value),
+    }
+}
+
+/// Returns whether ref 0 was captured.
+async fn first_turn_baseline_steps(
+    repositories: &crate::persistence::Repositories,
+    callbacks: &dyn OrchestrationEffectCallbacks,
+    thread_id: &str,
+    message_id: &str,
+    cancellation: &CancellationToken,
+    probe_gate: Option<Arc<tokio::sync::Notify>>,
+) -> Result<bool, OrchestrationEffectsError> {
+    let turns = until_cancelled(
+        cancellation,
+        repositories.list_turns_by_thread(thread_id.to_owned()),
+    )
+    .await??;
+    // A baseline writes ref 0 only. Ref `n >= 1` is turn `n`'s end state, written only by that
+    // turn's own capture while its hold keeps later turns out.
+    if an_earlier_turn_is_numbered(&turns, message_id)
+        || is_side_chat(repositories, thread_id, cancellation).await?
+    {
+        return Ok(false);
+    }
+    let Some(cwd) = until_cancelled(
+        cancellation,
+        resolve_thread_workspace(repositories, callbacks, thread_id),
+    )
+    .await??
+    else {
+        return Ok(false);
+    };
+    // The walk cannot be interrupted, but it only reads: a cancelled one is left to finish.
+    let probe = async {
+        if let Some(gate) = probe_gate {
+            gate.notified().await;
+        }
+        in_git_checkout(Some(&cwd)).await
+    };
+    if !until_cancelled(cancellation, probe).await? {
+        return Ok(false);
+    }
     if !is_git_repository(&cwd, Path::new("git"), cancellation).await? {
-        return Ok(());
+        return Ok(false);
     }
-    // One read of the thread's turns, so the number and the history it is judged by agree even
-    // when a turn's end is recorded meanwhile.
-    let turns = engine
-        .repositories()
-        .list_turns_by_thread(thread_id.to_owned())
-        .await?;
-    let starting_message = event.event.payload.get("messageId").and_then(Value::as_str);
-    // The baseline is the checkpoint of the turns before the starting one. That turn may already
-    // have ended and been numbered (it was fast, or the worker is behind); its number is not this
-    // baseline's.
-    let turn_count = turns
-        .iter()
-        .filter(|turn| {
-            starting_message.is_none() || turn.pending_message_id.as_deref() != starting_message
-        })
-        .filter_map(|turn| turn.checkpoint_turn_count)
-        .max()
-        .unwrap_or(0);
-    let stale_first_baseline =
-        baseline == Baseline::TurnStart && had_turns_before_checkpoints(&turns, starting_message);
-    // A latest turn whose capture went stale has no end state: the checkout now may hold the next
-    // turn's edits, so it does not stand in for that turn's checkpoint.
-    // Recorded `error` durably; in memory first, while that record is being written.
-    let latest_went_stale = turns
-        .iter()
-        .filter(|turn| turn.checkpoint_turn_count == Some(turn_count))
-        .any(|turn| {
-            turn.checkpoint_status.as_deref() == Some("error")
-                || turn
-                    .turn_id
-                    .as_deref()
-                    .is_some_and(|turn_id| engine.checkpoint_is_stale(thread_id, turn_id))
-        });
-    if latest_went_stale {
-        return Ok(());
+    let reference = checkpoint_ref(thread_id, 0);
+    if had_turns_before_checkpoints(&turns, Some(message_id))
+        || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await?
+    {
+        capture_checkpoint_with_cancellation(&cwd, Path::new("git"), thread_id, 0, cancellation)
+            .await?;
+        return Ok(true);
     }
-    let reference = checkpoint_ref(thread_id, turn_count);
-    if stale_first_baseline || !has_ref(&cwd, Path::new("git"), &reference, cancellation).await? {
-        capture_checkpoint_with_cancellation(
-            &cwd,
-            Path::new("git"),
-            thread_id,
-            turn_count,
-            cancellation,
-        )
-        .await?;
-    }
-    Ok(())
+    Ok(false)
 }
 
 /// Whether a thread with no recorded checkpoint already ran turns before the one
@@ -1260,7 +1437,8 @@ struct TurnCheckpoint<'a> {
     completed_at: &'a str,
 }
 
-/// Releases a turn's checkpoint hold when dropped.
+/// Releases a turn's checkpoint hold when dropped, unless the hold expired: the expiry's task
+/// then releases it after its own record, so no record of the turn lands after the release.
 struct CheckpointHoldRelease<'a> {
     engine: &'a OrchestrationEngine,
     thread_id: &'a str,
@@ -1270,7 +1448,7 @@ struct CheckpointHoldRelease<'a> {
 impl Drop for CheckpointHoldRelease<'_> {
     fn drop(&mut self) {
         self.engine
-            .release_checkpoint_hold(self.thread_id, self.turn_id);
+            .release_checkpoint_hold_unless_stale(self.thread_id, self.turn_id);
     }
 }
 
@@ -1312,6 +1490,15 @@ pub(crate) async fn record_turn_end(
     {
         return Ok(());
     }
+    // A side chat shares its host's checkout and keeps no checkpoints, so it can never
+    // restore over the host's work (#265).
+    if repositories
+        .get_thread(thread_id.to_owned())
+        .await?
+        .is_some_and(|thread| thread.side_chat)
+    {
+        return Ok(());
+    }
     let latest = repositories
         .list_checkpoints_by_thread(thread_id.to_owned())
         .await?
@@ -1338,13 +1525,26 @@ pub(crate) async fn record_turn_end(
         assistant_message_id: None,
         completed_at,
     };
-    let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new()).await;
+    let recorded = dispatch_turn_checkpoint(engine, &checkpoint, "missing", Vec::new(), true).await;
     match (&recorded, hold) {
         (Err(_), Some(_)) => engine.release_checkpoint_hold(thread_id, turn_id),
         (Ok(()), Some(id)) => expire_stale_hold(engine, &checkpoint, id),
         _ => {}
     }
     recorded
+}
+
+/// Whether `thread_id` is a side chat, which captures no checkpoints (#265).
+async fn is_side_chat(
+    repositories: &crate::persistence::Repositories,
+    thread_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<bool, OrchestrationEffectsError> {
+    Ok(
+        until_cancelled(cancellation, repositories.get_thread(thread_id.to_owned()))
+            .await??
+            .is_some_and(|thread| thread.side_chat),
+    )
 }
 
 /// Whether `checkout` lies in a Git work tree: it or a directory above it has a `.git`.
@@ -1362,9 +1562,10 @@ async fn in_git_checkout(checkout: Option<&Path>) -> bool {
 }
 
 /// Gives up hold `id` of an ended turn once the hold limit passes with its capture still pending:
-/// the turn's checkpoint is marked stale (never recorded `ready`, and the next turn's baseline
-/// does not stand in for it), the stale record is logged and shown, and the thread's turns go.
-/// A hung Git therefore never holds a thread for good.
+/// the turn's checkpoint is marked stale (never recorded `ready`), one attempt records it
+/// `error`, the stale record is logged and shown, and the thread's turns go. A hung Git therefore
+/// never holds a thread for good, and a failing database does not either: a turn left `missing`
+/// is neither a revert target nor a diff baseline, and no baseline writes its ref.
 fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, id: u64) {
     let Some(limit) = engine.checkpoint_hold_limit() else {
         return;
@@ -1390,8 +1591,9 @@ fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, i
             turn_count,
             "a turn's checkpoint was not captured in time; it is recorded stale and the thread's turns go on"
         );
-        // Recorded durably (`error`, which no capture overwrites) before the thread's turns go,
-        // so a restart cannot forget it and let a later checkout stand in for this turn.
+        // Recorded `error` (which no capture overwrites) before the thread's turns go, so the
+        // record lands before any revert. Once: if it fails, the row stays `missing`, which is
+        // just as safe, and the activity below still shows the stale capture.
         let checkpoint = TurnCheckpoint {
             thread_id: &thread_id,
             turn_id: &turn_id,
@@ -1400,9 +1602,9 @@ fn expire_stale_hold(engine: &OrchestrationEngine, ended: &TurnCheckpoint<'_>, i
             completed_at: &completed_at,
         };
         if let Err(error) =
-            dispatch_turn_checkpoint(&engine, &checkpoint, "error", Vec::new()).await
+            dispatch_turn_checkpoint(&engine, &checkpoint, "error", Vec::new(), true).await
         {
-            tracing::warn!(%thread_id, turn_count, %error, "a stale turn checkpoint could not be recorded");
+            tracing::warn!(%thread_id, turn_count, %error, "a stale turn checkpoint could not be recorded; it stays missing");
         }
         engine.release_checkpoint_hold(&thread_id, &turn_id);
         let created_at = now_iso();
@@ -1483,7 +1685,8 @@ async fn capture_missing_checkpoint(
 }
 
 /// Captures the checkout as `checkpoint`'s ref, then records the checkpoint `ready` with the
-/// files changed since the turn before it.
+/// files changed since the turn before it, or without a diff when that turn's checkpoint is not
+/// a trusted baseline.
 async fn record_checkpoint(
     engine: &OrchestrationEngine,
     callbacks: &dyn OrchestrationEffectCallbacks,
@@ -1509,9 +1712,9 @@ async fn record_checkpoint(
     }
     // Always written, replacing whatever ref has this number: only a `missing` row gets here, and
     // a ref already there is a leftover (a reverted turn's ref that Git could not delete), never
-    // this turn's end state. The hold keeps every later turn, and its baseline, behind this
-    // capture. A capture that fails takes such a leftover away, so the next turn's baseline
-    // writes the ref afresh instead of keeping it.
+    // this turn's end state. The hold keeps every later turn behind this capture. A capture that
+    // fails tries to take such a leftover away; one left behind is harmless, because a `missing`
+    // row's ref is never a baseline and no baseline writes a numbered ref.
     if let Err(error) = capture_checkpoint_with_cancellation(
         cwd,
         Path::new("git"),
@@ -1558,35 +1761,49 @@ async fn record_checkpoint(
         );
     }
 
-    // `ready` means the turn's diff can be read. Without the turn before's checkpoint (its
-    // baseline capture failed) it cannot, so the turn stays `missing`; its own ref, kept, is the
-    // next turn's baseline. Nor can it from the ref of a turn given up (`error`): that ref, if
-    // one was left behind, is no turn's end state, and no baseline replaced it.
+    // `ready` means the turn's end state is captured, so it can be reverted to. Its diff also
+    // needs a trusted baseline: ref 0, or the ref of a `ready` turn before it, which only that
+    // turn's own capture wrote while its hold kept every later turn out. The ref of a `missing`
+    // or `error` turn (absent, a leftover, or written from a later checkout) never is one, and
+    // neither is a ref that is gone: the turn is then recorded without a diff.
     let from_ref = checkpoint_ref(thread_id, turn_count.saturating_sub(1));
-    let previous_given_up = turn_count > 1
-        && engine
+    let previous_ready = turn_count <= 1
+        || engine
             .repositories()
             .get_checkpoint(thread_id.to_owned(), turn_count - 1)
             .await?
-            .is_some_and(|previous| previous.status == "error");
-    if previous_given_up || !has_ref(cwd, Path::new("git"), &from_ref, cancellation).await? {
-        return Err(OrchestrationEffectsError::Effect(format!(
-            "The checkpoint before turn {turn_count} is missing, so this turn's changes cannot be shown."
-        )));
-    }
-    let files =
-        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?;
-    dispatch_turn_checkpoint(engine, checkpoint, "ready", files).await?;
+            .is_some_and(|previous| previous.status == "ready");
+    let diff_available =
+        previous_ready && has_ref(cwd, Path::new("git"), &from_ref, cancellation).await?;
+    let files = if diff_available {
+        diff_file_summaries(cwd, Path::new("git"), &from_ref, &target_ref, cancellation).await?
+    } else {
+        Vec::new()
+    };
+    dispatch_turn_checkpoint(engine, checkpoint, "ready", files, diff_available).await?;
+    let (tone, payload) = if diff_available {
+        ("info", json!({"turnCount":turn_count,"status":"ready"}))
+    } else {
+        (
+            "warning",
+            json!({
+                "turnCount": turn_count,
+                "status": "ready",
+                "diffAvailable": false,
+                "detail": format!("The checkpoint before turn {turn_count} is missing, so this turn's changes cannot be shown. You can still revert to it."),
+            }),
+        )
+    };
     engine
         .dispatch(OrchestrationCommand::ThreadActivityAppend {
             command_id: server_id("checkpoint-captured-activity"),
             thread_id: thread_id.to_owned(),
             activity: ActivityInput {
                 id: Uuid::new_v4().to_string(),
-                tone: "info".to_owned(),
+                tone: tone.to_owned(),
                 kind: "checkpoint.captured".to_owned(),
                 summary: "Checkpoint captured".to_owned(),
-                payload: json!({"turnCount":turn_count,"status":"ready"}),
+                payload,
                 turn_id: Some(turn_id.to_owned()),
                 sequence: None,
                 created_at: completed_at.to_owned(),
@@ -1603,6 +1820,7 @@ async fn dispatch_turn_checkpoint(
     checkpoint: &TurnCheckpoint<'_>,
     status: &str,
     files: Vec<Value>,
+    diff_available: bool,
 ) -> Result<(), OrchestrationEffectsError> {
     engine
         .dispatch(OrchestrationCommand::ThreadTurnDiffComplete {
@@ -1613,6 +1831,7 @@ async fn dispatch_turn_checkpoint(
             checkpoint_ref: checkpoint_ref(checkpoint.thread_id, checkpoint.turn_count),
             status: status.to_owned(),
             files: Value::Array(files),
+            diff_available,
             assistant_message_id: checkpoint.assistant_message_id.clone(),
             completed_at: checkpoint.completed_at.to_owned(),
             created_at: checkpoint.completed_at.to_owned(),
@@ -1664,6 +1883,13 @@ async fn plan_revert(
             "Interrupt the current turn before reverting checkpoints.".to_owned(),
         ));
     }
+    // Every record of a turn lands before its hold is released, so a record still on its way
+    // (a stale turn's expiry writing it) cannot bring back a row this revert deletes.
+    if engine.turns_held_for_checkpoint(thread_id) {
+        return Err(OrchestrationEffectsError::Effect(
+            checkpoint_record_pending_detail(),
+        ));
+    }
     let cwd = resolve_workspace(engine, callbacks, thread_id)
         .await?
         .ok_or_else(|| {
@@ -1702,8 +1928,9 @@ async fn plan_revert(
                     "Checkpoint ref for turn {turn_count} is unavailable in read model."
                 ))
             })?;
-        // Only a captured checkpoint is the turn's end state. A ref of a turn not captured
-        // (`missing`) or given up (`error`) may hold a later checkout, so it is never restored.
+        // Only a captured checkpoint is the turn's end state, with or without a diff. A ref of a
+        // turn not captured (`missing`) or given up (`error`) may hold a later checkout, so it is
+        // never restored.
         if target.status != "ready" {
             return Err(uncaptured_checkpoint(turn_count));
         }
@@ -1769,6 +1996,20 @@ pub(crate) fn uncaptured_diff_detail(turn_count: i64) -> String {
     format!(
         "Turn {turn_count} has no captured checkpoint (its capture failed or timed out), so its changes cannot be shown."
     )
+}
+
+/// Why a turn captured without a trusted baseline has no one-turn diff. It is still a revert
+/// target. Shared by the app's turn patch and MCP `get_turn_diff`.
+pub(crate) fn no_baseline_diff_detail(turn_count: i64) -> String {
+    format!(
+        "Turn {turn_count} has no diff: the checkpoint before it is missing. You can still revert to it."
+    )
+}
+
+/// Why a revert waits while a turn's checkpoint record is still being written.
+pub(crate) fn checkpoint_record_pending_detail() -> String {
+    "The last turn's checkpoint is still being recorded. Try the revert again in a moment."
+        .to_owned()
 }
 
 fn missing_checkpoint(turn_count: i64) -> OrchestrationEffectsError {
@@ -2101,7 +2342,7 @@ async fn capture_checkpoint_with_cancellation(
         Ok(())
     }
     .await;
-    let _ = tokio::fs::remove_file(temporary_index).await;
+    remove_temporary_index(temporary_index).await;
     result
 }
 
@@ -2462,48 +2703,6 @@ mod tests {
         engine.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn imported_history_captures_no_turn_baseline() {
-        const AT: &str = "2026-10-08T00:00:00Z";
-        let engine = empty_event_log().await;
-        for value in [
-            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
-            json!({"type":"thread.create","commandId":"thread","threadId":"t","projectId":"p","title":"T","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":AT}),
-            json!({"type":"thread.history.import","commandId":"history","threadId":"t","messages":[
-                {"messageId":"h-0","role":"user","text":"old prompt","createdAt":AT},
-                {"messageId":"h-1","role":"assistant","text":"old answer","createdAt":AT}
-            ]}),
-            json!({"type":"thread.turn.start","commandId":"turn","threadId":"t","message":{"messageId":"live","role":"user","text":"continue","attachments":[]},"createdAt":AT}),
-        ] {
-            engine
-                .dispatch(serde_json::from_value(value).unwrap())
-                .await
-                .expect("command");
-        }
-        let baselines = engine
-            .read_events(0)
-            .await
-            .expect("events")
-            .into_iter()
-            .filter(|event| event.event.event_type == "thread.message-sent")
-            .map(|event| {
-                (
-                    event.event.payload["messageId"].clone(),
-                    needs_turn_baseline(&event),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            baselines,
-            [
-                (json!("h-0"), false),
-                (json!("h-1"), false),
-                (json!("live"), true),
-            ]
-        );
-        engine.shutdown().await;
-    }
-
     /// Ref 0 is captured again only for a thread whose earlier turns predate checkpoints: never
     /// once an earlier turn has a number, never for a new thread's own first turn (it can end and
     /// be numbered before the worker handles its start), and never while another turn runs.
@@ -2637,6 +2836,99 @@ mod tests {
             .unwrap();
         assert!(!engine.turns_held_for_checkpoint("t"));
         assert_eq!(numbers().await.len(), 3);
+        engine.shutdown().await;
+    }
+
+    /// A side chat shares its host's checkout: it is never numbered and writes no baseline,
+    /// so it has nothing to revert to and never restores over the host's work.
+    #[tokio::test]
+    async fn side_chat_turns_capture_no_checkpoints() {
+        const AT: &str = "2026-11-02T00:00:00Z";
+        let engine = empty_event_log().await;
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"host","threadId":"host","projectId":"p","title":"Host","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"side","threadId":"side","projectId":"p","title":"Panel: Side chat · Codex","kind":"panel","hostThreadId":"host","sideChat":true,"modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"approval-required","createdAt":AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap();
+        }
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".git")).unwrap();
+        let repositories = engine.repositories();
+        let numbered = |thread_id: &'static str| {
+            let repositories = repositories.clone();
+            async move {
+                repositories
+                    .list_checkpoints_by_thread(thread_id.to_owned())
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        record_turn_end(
+            &engine,
+            "side",
+            "turn-1",
+            AT,
+            TurnEnd::Live,
+            Some(checkout.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(numbered("side").await, 0);
+        assert!(!engine.turns_held_for_checkpoint("side"));
+        // The same checkout numbers the host's turn.
+        record_turn_end(
+            &engine,
+            "host",
+            "turn-1",
+            AT,
+            TurnEnd::Live,
+            Some(checkout.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(numbered("host").await, 1);
+
+        struct NoWorkspace(AtomicUsize);
+        impl OrchestrationEffectCallbacks for NoWorkspace {
+            fn workspace_for_thread<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxEffectFuture<'a, Option<PathBuf>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(None) })
+            }
+            fn rollback_provider<'a>(
+                &'a self,
+                _: &'a str,
+                _: i64,
+                _: &'a str,
+            ) -> BoxEffectFuture<'a, ProviderRewind> {
+                Box::pin(async { Ok(ProviderRewind::Rewound) })
+            }
+            fn stop_provider<'a>(&'a self, _: &'a str) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn close_terminals<'a>(&'a self, _: &'a str) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn refresh_workspace<'a>(&'a self, _: &'a Path) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let callbacks = NoWorkspace(AtomicUsize::new(0));
+        let cancellation = CancellationToken::new();
+        // The baseline never looks for a side chat's checkout, so it never writes its ref 0.
+        assert!(
+            !first_turn_baseline_steps(&repositories, &callbacks, "side", "m", &cancellation, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(callbacks.0.load(Ordering::SeqCst), 0);
         engine.shutdown().await;
     }
 
@@ -3159,6 +3451,7 @@ mod tests {
             .await
             .expect("setup project fixture");
         let bootstrap = ProductionBootstrapEffects {
+            test_hooks: crate::orchestration::engine::TestHooks::default(),
             repositories,
             repository: Arc::new(GitRepository::default()),
             callbacks: callbacks.clone(),
@@ -3364,6 +3657,7 @@ mod tests {
             launches: AtomicUsize::new(0),
         });
         let bootstrap = ProductionBootstrapEffects {
+            test_hooks: crate::orchestration::engine::TestHooks::default(),
             repositories,
             repository: Arc::new(GitRepository::default()),
             callbacks: callbacks.clone(),

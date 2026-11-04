@@ -14,11 +14,16 @@ const clerkPublishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY as string
 export async function renderApplication(): Promise<void> {
   installFrontendLogCapture();
   await tauriDesktopBridgeReady.catch(() => undefined);
-  const [{ getRouter }, { AppRoot }] = await Promise.all([import("./router"), import("./AppRoot")]);
+  const [{ getRouter }, { AppRoot }, { installShellIncludeHints }] = await Promise.all([
+    import("./router"),
+    import("./AppRoot"),
+    import("./state/shellIncludeHints"),
+  ]);
 
   // Desktop shells load bundled assets from custom/file origins, so hash history avoids path resolution issues.
   const history = isDesktopHost ? createHashHistory() : createBrowserHistory();
   const router = getRouter(history);
+  installShellIncludeHints(router);
   const app = <AppRoot router={router} />;
 
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

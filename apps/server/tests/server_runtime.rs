@@ -1059,7 +1059,8 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         .expect("CSP header")
         .to_owned();
     for directive in [
-        "object-src 'none'",
+        "object-src blob:",
+        "media-src 'self' blob:",
         "base-uri 'self'",
         "frame-ancestors 'none'",
         // Browser mode frames this host's preview gateways, each on its own port.
@@ -1213,6 +1214,127 @@ async fn streams_static_assets_with_security_and_cache_headers() {
             assert_eq!(response.text().await.expect("symlink body"), body, "{path}");
         }
     }
+
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+/// Browsers of a remote server get the web build gzip-compressed (#227); a client that
+/// offers no encoding gets the file as it is, and the WebSocket upgrade is never compressed.
+#[tokio::test]
+async fn compresses_static_assets_for_clients_that_accept_gzip() {
+    use std::io::Read as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let temp = TempDir::new().expect("temporary base directory");
+    write_disabled_provider_settings(&temp);
+    let static_dir = temp.path().join("static");
+    std::fs::create_dir_all(static_dir.join("assets")).expect("build asset directory");
+    std::fs::write(static_dir.join("index.html"), "<main>spa</main>").expect("SPA index");
+    let script = "console.log('a compressible bundle');\n".repeat(64);
+    std::fs::write(static_dir.join("assets/app-AbCd1234.js"), &script).expect("hashed asset");
+    std::fs::write(static_dir.join("app.js"), &script).expect("asset");
+    let handle = ServerRuntime::start(test_config(&temp).with_static_dir(&static_dir))
+        .await
+        .expect("server starts");
+    let client = proxy_free_client();
+    let address = handle.local_addr();
+
+    let compressed = client
+        .get(endpoint(address, "/assets/app-AbCd1234.js"))
+        .header("accept-encoding", "br, gzip")
+        .send()
+        .await
+        .expect("compressed asset response");
+    assert_eq!(compressed.status(), StatusCode::OK);
+    assert_eq!(compressed.headers()["content-encoding"], "gzip");
+    assert_eq!(compressed.headers()["vary"], "accept-encoding");
+    assert_eq!(
+        compressed.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(!compressed.headers().contains_key("etag"));
+    let gzip = compressed.bytes().await.expect("compressed body");
+    assert!(gzip.len() < script.len() / 4, "{} bytes", gzip.len());
+    let mut inflated = String::new();
+    flate2::read::GzDecoder::new(gzip.as_ref())
+        .read_to_string(&mut inflated)
+        .expect("gzip body");
+    assert_eq!(inflated, script);
+
+    let plain = client
+        .get(endpoint(address, "/assets/app-AbCd1234.js"))
+        .send()
+        .await
+        .expect("plain asset response");
+    assert_eq!(plain.status(), StatusCode::OK);
+    assert!(!plain.headers().contains_key("content-encoding"));
+    assert_eq!(plain.headers()["content-length"], script.len().to_string());
+    assert_eq!(
+        plain.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(plain.text().await.expect("plain body"), script);
+
+    let etag = client
+        .get(endpoint(address, "/app.js"))
+        .send()
+        .await
+        .expect("asset response")
+        .headers()["etag"]
+        .clone();
+    for accept_encoding in [None, Some("gzip"), Some("br, gzip")] {
+        let mut request = client
+            .get(endpoint(address, "/app.js"))
+            .header("if-none-match", etag.clone());
+        if let Some(accept_encoding) = accept_encoding {
+            request = request.header("accept-encoding", accept_encoding);
+        }
+        let conditional = request.send().await.expect("conditional asset response");
+        assert_eq!(
+            conditional.status(),
+            StatusCode::NOT_MODIFIED,
+            "{accept_encoding:?}"
+        );
+        assert_eq!(conditional.headers()["etag"], etag);
+        assert!(!conditional.headers().contains_key("content-encoding"));
+        assert_eq!(conditional.headers()["vary"], "accept-encoding");
+        assert!(!conditional.headers().contains_key("content-length"));
+    }
+
+    let credential = handle
+        .startup_access()
+        .expect("authenticated web startup access")
+        .credential
+        .clone();
+    let access_token = exchange_startup_credential(&client, address, &credential).await;
+    let ticket = client
+        .post(endpoint(address, "/api/auth/websocket-ticket"))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .expect("WebSocket ticket response")
+        .json::<Value>()
+        .await
+        .expect("WebSocket ticket JSON")["ticket"]
+        .as_str()
+        .expect("WebSocket ticket")
+        .to_owned();
+    let mut upgrade = format!("ws://{address}/ws?wsTicket={ticket}")
+        .into_client_request()
+        .expect("upgrade request");
+    upgrade.headers_mut().insert(
+        "accept-encoding",
+        "gzip, deflate, br".parse().expect("header value"),
+    );
+    let (mut socket, response) = connect_async(upgrade).await.expect("RPC WebSocket");
+    assert!(!response.headers().contains_key("content-encoding"));
+    send_rpc_request(&mut socket, "1", "server.getConfig").await;
+    assert_eq!(
+        next_rpc_wire(&mut socket, "server.getConfig").await["exit"]["_tag"],
+        "Success"
+    );
+    drop(socket);
 
     handle.shutdown();
     handle.join().await.expect("server joins");

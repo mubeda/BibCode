@@ -604,6 +604,7 @@ fn workspace_thread(path: &Path) -> ProjectionThread {
         pending_user_input_count: 0,
         last_activity_at: None,
         requester: None,
+        side_chat: false,
         has_actionable_proposed_plan: 0,
         unresolved_delivery_state: None,
         unresolved_delivery_detail: None,

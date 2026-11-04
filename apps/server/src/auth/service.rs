@@ -115,6 +115,34 @@ pub struct AuthService {
     dpop: DpopVerifier,
     /// Non-request origins that may use the session cookie for mutations: the dev UI only.
     trusted_cookie_origins: Arc<[String]>,
+    #[cfg(test)]
+    test_hooks: Arc<AuthTestHooks>,
+}
+
+/// Reached, then resumed: where a test holds an exchange.
+#[cfg(test)]
+pub(crate) type TestHold = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AuthTestHooks {
+    pub(crate) after_consume: std::sync::Mutex<Option<TestHold>>,
+    /// After the session row commits, before the cache holds it.
+    pub(crate) after_session_insert: std::sync::Mutex<Option<TestHold>>,
+    /// Gives `mcp-client` sessions random ids, as a server before #281 did.
+    pub(crate) random_mcp_session_ids: AtomicBool,
+}
+
+#[cfg(test)]
+async fn reach_hold(slot: &std::sync::Mutex<Option<TestHold>>) {
+    let hold = slot.lock().unwrap().take();
+    if let Some((reached, resume)) = hold {
+        let _ = reached.send(());
+        let _ = resume.await;
+    }
 }
 
 pub(crate) struct AuthenticatedConnectionGuard {
@@ -291,6 +319,9 @@ struct AuthGrantMetadata {
     off_host: Option<bool>,
     /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
     mcp_access: Option<String>,
+    /// An `mcp-client` grant's pairing link: its session takes this id, so a relay that never
+    /// heard back can revoke it, and a revoked link fences the insert (#281).
+    mcp_link_id: Option<String>,
 }
 
 struct AuthSessionIssuanceMetadata {
@@ -432,6 +463,8 @@ struct Grant {
     off_host: Option<bool>,
     /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
     mcp_access: Option<String>,
+    /// The consumed pairing link's id; `None` for the desktop bootstrap.
+    pairing_id: Option<String>,
     /// The reusable desktop bootstrap credential of this backend process. The
     /// host's own WebView exchanges it on every load and after every backend
     /// restart, so a new exchange supersedes the sessions it minted before.
@@ -646,7 +679,14 @@ impl AuthService {
             redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dpop: DpopVerifier::new(secret_store),
             trusted_cookie_origins,
+            #[cfg(test)]
+            test_hooks: Arc::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_hooks(&self) -> &AuthTestHooks {
+        &self.test_hooks
     }
 
     async fn hydrate_active_state(&self) -> Result<(), AuthError> {
@@ -781,6 +821,9 @@ impl AuthService {
             let mut interval = tokio::time::interval(AUTHORITY_CONVERGENCE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut observed_revision = None;
+            // A local change (issuance publishing into the cache) may land after a reconcile
+            // that already saw a durable revoke of it, so it reloads too (#281).
+            let mut reconciled_generation = None;
             let mut next_expiry_ms = None;
             'watcher: loop {
                 interval.tick().await;
@@ -799,12 +842,13 @@ impl AuthService {
                     break;
                 };
                 let now = now_ms();
+                let generation = state.lock().await.authority_generation;
                 match repositories.auth_authority_revision().await {
                     Ok(revision)
                         if observed_revision != Some(revision)
+                            || reconciled_generation != Some(generation)
                             || next_expiry_ms.is_some_and(|expires_at| expires_at <= now) =>
                     {
-                        let generation = state.lock().await.authority_generation;
                         match repositories
                             .load_auth_authority_snapshot(format_iso(now))
                             .await
@@ -823,6 +867,7 @@ impl AuthService {
                                 ) {
                                     (Ok(snapshot_expiry), Ok(Some(changes))) => {
                                         observed_revision = Some(snapshot_revision);
+                                        reconciled_generation = Some(generation);
                                         next_expiry_ms = snapshot_expiry;
                                         for change in changes {
                                             emit_access_change_on(
@@ -964,6 +1009,8 @@ impl AuthService {
         let grant = self
             .consume_grant(credential, proof_key_thumbprint.as_deref())
             .await?;
+        #[cfg(test)]
+        reach_hold(&self.test_hooks.after_consume).await;
         self.issue_session_from_grant(
             grant,
             requested_scopes,
@@ -996,6 +1043,16 @@ impl AuthService {
         } else {
             "bearer-access-token"
         };
+        let mcp_link_id = grant
+            .pairing_id
+            .filter(|_| grant.subject == MCP_CLIENT_SUBJECT);
+        #[cfg(test)]
+        let mcp_link_id = mcp_link_id.filter(|_| {
+            !self
+                .test_hooks
+                .random_mcp_session_ids
+                .load(Ordering::Acquire)
+        });
         self.issue_session(
             grant.subject,
             scopes,
@@ -1009,6 +1066,7 @@ impl AuthService {
                     reach: grant.reach,
                     off_host: grant.off_host,
                     mcp_access: grant.mcp_access,
+                    mcp_link_id,
                 },
                 delivery_state,
             },
@@ -1247,6 +1305,25 @@ impl AuthService {
             .then_some(session.expires_at_ms)
     }
 
+    /// The live `mcpAccess` of an outside agent's session while it is active: after a Take
+    /// over it is `read-only`. `None` for any other session, and on a repository failure, so
+    /// callers fail closed.
+    pub(crate) async fn mcp_client_access(&self, session_id: &str) -> Option<String> {
+        let observed_at = now_ms();
+        self.refresh_session_from_repository(session_id, observed_at)
+            .await
+            .ok()?;
+        let state = self.state.lock().await;
+        let session = state.sessions.get(session_id)?;
+        if session.revoked_at_ms.is_some()
+            || session.expires_at_ms <= observed_at
+            || session.subject != MCP_CLIENT_SUBJECT
+        {
+            return None;
+        }
+        session.mcp_access.clone()
+    }
+
     async fn refresh_session_from_repository(
         &self,
         session_id: &str,
@@ -1473,6 +1550,7 @@ impl AuthService {
             reach,
             off_host,
             mcp_access,
+            mcp_link_id: _,
         } = metadata;
         let _issuance = self.issuance.lock().await;
         if scopes.is_empty()
@@ -2670,6 +2748,7 @@ impl AuthService {
                     reach,
                     off_host,
                     mcp_access,
+                    mcp_link_id,
                 },
             delivery_state,
         } = metadata;
@@ -2681,7 +2760,9 @@ impl AuthService {
             SESSION_TTL_MS
         };
         let expires_at = issued_at.saturating_add(ttl);
-        let session_id = Uuid::new_v4().to_string();
+        let session_id = mcp_link_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let claims = SessionClaims {
             v: 1,
             kind: "session".to_owned(),
@@ -2747,11 +2828,29 @@ impl AuthService {
             == AuthSessionDeliveryState::PendingPairing)
             .then(|| PendingSessionIssuanceGuard::new(self.clone(), session_id.clone()));
         if let Some(repositories) = &self.repositories {
-            repositories
-                .create_auth_session(persisted_auth_session(&record))
-                .await
-                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            let row = persisted_auth_session(&record);
+            let written = match &mcp_link_id {
+                // A relay or sweep may have revoked the link since its consume.
+                Some(link_id) => repositories
+                    .create_fenced_mcp_auth_session(row, link_id.clone())
+                    .await
+                    .map_err(|error| AuthError::Internal(error.to_string()))?,
+                None => repositories
+                    .create_auth_session(row)
+                    .await
+                    .map(|()| true)
+                    .map_err(|error| AuthError::Internal(error.to_string()))?,
+            };
+            if !written {
+                tracing::warn!(
+                    link_id = mcp_link_id.as_deref(),
+                    "refused an MCP session whose pairing link was revoked after its consume"
+                );
+                return Err(AuthError::InvalidCredential);
+            }
         }
+        #[cfg(test)]
+        reach_hold(&self.test_hooks.after_session_insert).await;
         if desktop_bootstrap {
             self.supersede_desktop_bootstrap_sessions(&session_id, method)
                 .await?;
@@ -2795,6 +2894,7 @@ impl AuthService {
                     reach: None,
                     off_host: None,
                     mcp_access: None,
+                    pairing_id: None,
                     desktop_bootstrap: true,
                 })
             } else {
@@ -2828,6 +2928,7 @@ impl AuthService {
                 reach: pairing.reach,
                 off_host: pairing.off_host,
                 mcp_access: pairing.mcp_access,
+                pairing_id: Some(pairing.id),
                 desktop_bootstrap: false,
             });
         }
@@ -2857,6 +2958,7 @@ impl AuthService {
             reach: pairing.reach.clone(),
             off_host: pairing.off_host,
             mcp_access: pairing.mcp_access.clone(),
+            pairing_id: Some(pairing_id.clone()),
             desktop_bootstrap: false,
         };
         drop(state);
@@ -7115,5 +7217,235 @@ mod tests {
             .cancel_pairing_offer("principal-b", "cancelled-elsewhere".to_owned())
             .await
             .expect("one principal cannot consume another principal's quota");
+    }
+
+    async fn exchange_in_background(
+        service: &AuthService,
+        credential: &str,
+    ) -> tokio::task::JoinHandle<Result<IssuedSession, AuthError>> {
+        let service = service.clone();
+        let credential = credential.to_owned();
+        tokio::spawn(async move {
+            service
+                .exchange_bootstrap(
+                    &credential,
+                    None,
+                    ClientMetadata::default(),
+                    None,
+                    SessionTransport::Plain,
+                )
+                .await
+        })
+    }
+
+    fn test_hold() -> (
+        TestHold,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        ((reached_tx, resume_rx), reached, resume)
+    }
+
+    /// The relay knows its link's id before the exchange, so a lost answer is still revocable
+    /// (#281).
+    #[tokio::test]
+    async fn an_mcp_session_takes_the_id_of_its_pairing_link() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let link = issue_mcp_pairing_link(&repositories, "MCP · id".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let session = exchange_in_background(&service, &link.credential)
+            .await
+            .await
+            .unwrap()
+            .expect("exchange");
+        assert_eq!(session.principal.session_id, link.id);
+        assert!(
+            repositories
+                .get_auth_session(link.id.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_mcp_pairing_exchange_still_gets_a_random_session_id() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let link = issue_administrative_pairing_link(&repositories, None)
+            .await
+            .expect("link issues");
+        let session = exchange_in_background(&service, &link.credential)
+            .await
+            .await
+            .unwrap()
+            .expect("exchange");
+        assert_ne!(session.principal.session_id, link.id);
+    }
+
+    #[tokio::test]
+    async fn a_fenced_link_cannot_be_exchanged() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let link = issue_mcp_pairing_link(&repositories, "MCP · fenced".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        assert!(
+            repositories
+                .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+                .await
+                .unwrap()
+        );
+        let exchanged = exchange_in_background(&service, &link.credential)
+            .await
+            .await
+            .unwrap();
+        assert!(matches!(exchanged, Err(AuthError::InvalidCredential)));
+    }
+
+    /// A sweep fences the link after the exchange consumed it but before the session row
+    /// exists: the fenced insert writes nothing and the exchange fails.
+    #[tokio::test]
+    async fn a_revoke_between_consume_and_insert_leaves_no_session() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let link = issue_mcp_pairing_link(&repositories, "MCP · raced".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let (held, reached, resume) = test_hold();
+        *service.test_hooks().after_consume.lock().unwrap() = Some(held);
+        let exchange = exchange_in_background(&service, &link.credential).await;
+        reached.await.expect("consumed");
+        assert!(
+            repositories
+                .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+                .await
+                .unwrap(),
+            "the consumed link is fenced"
+        );
+        resume.send(()).unwrap();
+        let exchanged = exchange.await.unwrap();
+        assert!(matches!(exchanged, Err(AuthError::InvalidCredential)));
+        assert!(
+            repositories
+                .get_auth_session(link.id.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(service.list_clients("").await.is_empty());
+    }
+
+    /// A revoke the watcher reconciles while issuance has committed the row but not yet
+    /// published it to the cache still reaches Settings, one tick after the publication (R1.4).
+    #[tokio::test]
+    async fn a_revoke_reconciled_before_issuance_publishes_is_removed_from_settings() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let mut events = service.subscribe_access();
+        let link = issue_mcp_pairing_link(&repositories, "MCP · late".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let (held, reached, resume) = test_hold();
+        *service.test_hooks().after_session_insert.lock().unwrap() = Some(held);
+        let exchange = exchange_in_background(&service, &link.credential).await;
+        reached.await.expect("the row committed");
+        repositories
+            .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        // A later link the watcher must list proves it reconciled past the revoke.
+        let marker = issue_mcp_pairing_link(&repositories, "MCP · marker".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let mut wait_for = async |wanted: &dyn Fn(&AuthAccessChange) -> bool| {
+            tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+                while !wanted(&events.recv().await.expect("access events").change) {}
+            })
+            .await
+        };
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::PairingLinkUpserted(view) if view.id == marker.id)
+        })
+        .await
+        .expect("the watcher reconciled the revoke");
+        resume.send(()).unwrap();
+        exchange.await.unwrap().expect("issued");
+        // A tick that cached the row before the revoke queued a ClientRemoved the publication
+        // then undid; only one after the publication's ClientUpserted proves the removal.
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientUpserted(view) if view.session_id == link.id)
+        })
+        .await
+        .expect("the publication upserts the client");
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientRemoved { session_id } if *session_id == link.id)
+        })
+        .await
+        .expect("a ClientRemoved follows the publication");
+        assert!(
+            service
+                .list_clients("")
+                .await
+                .iter()
+                .all(|client| client.session_id != link.id)
+        );
+    }
+
+    /// The same revoke when a watcher tick cached the committed row before it: that tick's
+    /// ClientRemoved comes before the publication, which must still be removed after (R1.4).
+    #[tokio::test]
+    async fn a_revoke_after_a_tick_cached_the_committed_row_is_removed_from_settings() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let mut events = service.subscribe_access();
+        let link = issue_mcp_pairing_link(&repositories, "MCP · late".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let (held, reached, resume) = test_hold();
+        *service.test_hooks().after_session_insert.lock().unwrap() = Some(held);
+        let exchange = exchange_in_background(&service, &link.credential).await;
+        reached.await.expect("the row committed");
+        tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+            while !matches!(&events.recv().await.expect("events").change, AuthAccessChange::ClientUpserted(view) if view.session_id == link.id) {}
+        }).await.expect("a tick cached the committed row");
+        repositories
+            .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        // A later link the watcher must list proves it reconciled past the revoke.
+        let marker = issue_mcp_pairing_link(&repositories, "MCP · marker".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let mut wait_for = async |wanted: &dyn Fn(&AuthAccessChange) -> bool| {
+            tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+                while !wanted(&events.recv().await.expect("access events").change) {}
+            })
+            .await
+        };
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::PairingLinkUpserted(view) if view.id == marker.id)
+        })
+        .await
+        .expect("the watcher reconciled the revoke");
+        resume.send(()).unwrap();
+        exchange.await.unwrap().expect("issued");
+        // A tick that cached the row before the revoke queued a ClientRemoved the publication
+        // then undid; only one after the publication's ClientUpserted proves the removal.
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientUpserted(view) if view.session_id == link.id)
+        })
+        .await
+        .expect("the publication upserts the client");
+        wait_for(&|change| {
+            matches!(change, AuthAccessChange::ClientRemoved { session_id } if *session_id == link.id)
+        })
+        .await
+        .expect("a ClientRemoved follows the publication");
+        assert!(
+            service
+                .list_clients("")
+                .await
+                .iter()
+                .all(|client| client.session_id != link.id)
+        );
     }
 }

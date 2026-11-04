@@ -87,6 +87,7 @@ import {
   stackedActionFailureTitle,
 } from "./GitActionsControl.logic";
 import { SourceControlAgentSuggestion } from "./SourceControlAgentSuggestion";
+import { SourceControlDraftConflict } from "./SourceControlDraftConflict";
 import { SourceControlChangesList } from "./SourceControlChangesList";
 import { SourceControlCommits } from "./SourceControlCommits";
 import {
@@ -443,7 +444,8 @@ export default function SourceControlPanel({
         return;
       }
 
-      const message = draft.message.trim();
+      const submittedDraft = draft.message;
+      const message = submittedDraft.trim();
       // Commit semantics:
       //  - Real staging server (hasAreas): commit the staged index as-is; never
       //    send filePaths (which would trigger the legacy reset+add path).
@@ -515,7 +517,7 @@ export default function SourceControlPanel({
       }
       // Commit succeeded: clear the drafted message.
       if (actionCanCommit) {
-        clearDraft();
+        clearDraft(submittedDraft);
       }
       // Refresh the commits list (and the relative-time clock) after any success.
       reloadCommits();
@@ -1063,6 +1065,9 @@ export default function SourceControlPanel({
             )}
           </button>
         </div>
+        {gitCwd === null ? null : (
+          <SourceControlDraftConflict environmentId={environmentId} cwd={gitCwd} />
+        )}
         <SourceControlAgentSuggestion
           environmentId={environmentId}
           cwd={gitCwd}
@@ -1270,9 +1275,7 @@ export default function SourceControlPanel({
               aria-label="Group by folder"
               aria-pressed={groupByFolder}
               title={
-                groupByFolder
-                  ? "Grouped by folder — show a flat list"
-                  : "Flat list — group by folder"
+                groupByFolder ? "Grouped by folder: show a flat list" : "Flat list: group by folder"
               }
               onClick={() => setGroupByFolder(!groupByFolder)}
               className={cn(groupByFolder && "bg-accent text-foreground")}
@@ -1424,7 +1427,11 @@ export default function SourceControlPanel({
             if (!open) setPendingPullRequest(null);
           }}
           onSettled={(result) => {
-            if (result.commit.status === "created") draft.clear();
+            // Clear only the text this commit sent; with none sent, a draft typed since stays.
+            const submitted = pendingPullRequest.commitInput?.commitMessage;
+            if (result.commit.status === "created" && submitted !== undefined) {
+              draft.clear(submitted);
+            }
             reloadCommits();
           }}
           onDone={(request) => {

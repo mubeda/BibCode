@@ -152,7 +152,7 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
         if authorize || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
             attach_console();
         }
-        return Some(desktop_mcp_dispatch());
+        return Some(desktop_mcp_dispatch(std::env::args_os().skip(1)));
     }
     if command.as_deref() == Some(OsStr::new("diagnostics")) {
         attach_console();
@@ -160,7 +160,7 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
     }
     if command.as_deref() == Some(OsStr::new("thread")) {
         attach_console();
-        return Some(desktop_thread_dispatch());
+        return Some(desktop_thread_dispatch(std::env::args_os().skip(1)));
     }
     if command.as_deref() != Some(OsStr::new("profiler")) {
         return None;
@@ -215,12 +215,12 @@ fn desktop_diagnostics_dispatch() -> i32 {
 
 /// `<desktop exe> mcp …` (#139): the relay to this desktop's own running server, which it
 /// finds through the endpoint record in the desktop's data root.
-fn desktop_mcp_dispatch() -> i32 {
-    let cli = match DesktopMcpCli::try_parse_from(std::env::args_os().skip(1)) {
+fn desktop_mcp_dispatch(args: impl IntoIterator<Item = std::ffi::OsString>) -> i32 {
+    let cli = match DesktopMcpCli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
-            return error.exit_code();
+            return usage_exit_code(&error);
         }
     };
     let action = match crate::config::mcp_action(cli.base_dir, cli.dev_url, cli.args) {
@@ -241,6 +241,12 @@ fn desktop_mcp_dispatch() -> i32 {
                 }
                 crate::config::CliAction::Mcp(options) => {
                     crate::mcp::relay::run_mcp_cli(options).await
+                }
+                crate::config::CliAction::McpCall { options, args } => {
+                    crate::mcp::call_cli::run_mcp_call(options, args).await
+                }
+                crate::config::CliAction::McpTools(options) => {
+                    crate::mcp::call_cli::run_mcp_tools(options).await
                 }
                 _ => 1,
             }
@@ -268,14 +274,20 @@ struct DesktopMcpCli {
     args: crate::config::McpArgs,
 }
 
+/// A parse failure's exit code: 0 for `--help` and `--version`, else 1, never clap's 2, which
+/// means a person must answer in BiBCode.
+fn usage_exit_code(error: &clap::Error) -> i32 {
+    i32::from(error.exit_code() != 0)
+}
+
 /// `<desktop exe> thread …` (#139): `bibcode thread` against this desktop's own running
 /// server. A usage error exits 1, not clap's 2, which means a person must answer in BiBCode.
-fn desktop_thread_dispatch() -> i32 {
-    let cli = match DesktopThreadCli::try_parse_from(std::env::args_os().skip(1)) {
+fn desktop_thread_dispatch(args: impl IntoIterator<Item = std::ffi::OsString>) -> i32 {
+    let cli = match DesktopThreadCli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
-            return i32::from(error.exit_code() != 0);
+            return usage_exit_code(&error);
         }
     };
     let options = match crate::config::relay_options(
@@ -776,6 +788,34 @@ mod tests {
             Some(crate::mcp::control::McpAccess::ReadOnly)
         );
         assert!(DesktopMcpCli::try_parse_from(["mcp", "--access", "everything"]).is_err());
+    }
+
+    /// A usage error exits 1, never clap's 2, which `call` uses for a thread waiting on a
+    /// person; `--help` still exits 0.
+    #[test]
+    fn a_desktop_mcp_usage_error_exits_1_and_help_exits_0() {
+        let code = |argv: &[&str]| {
+            usage_exit_code(&DesktopMcpCli::try_parse_from(argv).expect_err("a parse error"))
+        };
+        assert_eq!(code(&["mcp", "call"]), 1);
+        assert_eq!(code(&["mcp", "--access", "everything"]), 1);
+        assert_eq!(code(&["mcp", "--help"]), 0);
+        assert_eq!(code(&["mcp", "call", "--help"]), 0);
+    }
+
+    /// Through the dispatchers themselves: a usage error exits 1 and `--help` exits 0, before
+    /// anything connects.
+    #[test]
+    fn the_desktop_mcp_and_thread_entries_exit_1_on_a_usage_error() {
+        let args = |argv: &[&str]| {
+            argv.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(desktop_mcp_dispatch(args(&["mcp", "call"])), 1);
+        assert_eq!(desktop_mcp_dispatch(args(&["mcp", "call", "--help"])), 0);
+        assert_eq!(desktop_thread_dispatch(args(&["thread", "send"])), 1);
+        assert_eq!(desktop_thread_dispatch(args(&["thread", "--help"])), 0);
     }
 
     #[test]

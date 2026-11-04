@@ -17,6 +17,15 @@ its process is gone, rather than from the fixture. The server gives Codex one
 second to shut down gracefully and then kills it. A fixture that records
 `shutdown` itself misses that record whenever it gets no CPU in that second.
 
+A terminal closed just as its command exits used to fail its close on macOS
+under load (#237). macOS refuses (`EPERM`) a `killpg` whose members have all
+exited unreaped, and the close could arrive before the PTY waiter signalled
+the group. The close path, the PTY waiter, and the supervised runner share
+`process::group_kill_refusal_is_stopped`: `EPERM` counts as stopped only once
+the root has exited, and stays a failure while it runs. A failed
+`terminal.close` in a test is therefore a product signal, not a reason to wait
+longer.
+
 For an in-flight HTTP body, a client-side stream poll proves only that the
 client produced bytes, not that the server admitted the request. The Claude
 terminal dormant-hook test uses `Expect: 100-continue` and waits for the
@@ -120,6 +129,20 @@ log and retain the strict version/hash/no-installer predicate. Hermetic support
 tests cover exit-before-close, cleanup failure, transient samples, and an
 all-unavailable poll; actual installer qualification remains CI-only.
 
+A test that waits for a Git checkpoint ref, or for a queue to deliver after one, waits on
+`WAKE_WAIT` (`turn_delivery_queue_tests.rs`), not a few seconds: the capture spawns Git, which a
+loaded host leaves waiting for seconds, and a wait that ends when its condition holds costs nothing
+when it passes. Only a deadline the product owns stays short; the hold-limit test sets its own
+limit (15 s) long enough for the capture to finish first and waits it out, because the expiry
+timer cannot be observed. A test must not assert that a queued turn is still promotable while the
+delivery service runs: the service may already have promoted it. The Device tests'
+`wait_until` (`device/android/testing.rs`) polls for up to a minute for the same reason. Their
+cancelled-start test cancels once the adb log shows the server launch, which proves the forward
+exists, never after a fixed delay. A ChatView scroll-spy test waits until the send's own landing
+has scrolled and then stayed quiet for a number of frames, not a fixed few, and models the
+anchored turn the spec names (the sent row alone, ending inside the view). Host load alone did not
+reproduce that test; a 150 ms stall between clearing the spies and the assertions did.
+
 ## Unix recovery-test watchdog
 
 The private `turn_delivery_recovery` child helper uses an exactly selected,
@@ -190,7 +213,22 @@ isolation three times, then compare the complete affected suite:
 In-process write-then-exec fixtures can produce `ETXTBSY` when sibling tests
 fork. Use the existing [hermetic executable fixture rules](./README.md#hermetic-rust-fixtures)
 before attributing that error to the host. Do not label an entire supervisor
-suite flaky based on an old failure rate.
+suite flaky based on an old failure rate. The fake Android SDK in
+`device/android/testing.rs` writes its emulator, launch, and adb scripts that
+way too.
+
+A workspace-watcher test that expects no announcement must not create an
+intermediate entry inside the watched root. A sweep that runs between an
+atomic save's temp write and its rename sees a different entry list and
+announces it correctly. The test then depends on that gap staying shorter than
+a sweep, which load breaks. Stage the temp file outside the root, on the same
+filesystem. A 150 ms pause between the write and the rename is the controlled
+counterexample: the sibling-temp version fails it nearly every run.
+
+On Windows, Node assigns the children it spawns to a kill-on-close job, so a
+grandchild dies when its Node parent exits. A fixture whose writer must outlive
+its parent spawns that writer with `detached: true`. Without it, the scenario
+fails on every Windows run, not just under load.
 
 ## Focused Linux contention loop
 

@@ -40,6 +40,8 @@ import {
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
+import { PanelDiffPendingState } from "./chat/PanelDiffPendingState";
+import { RightPanelThreadContext } from "./chat/rightPanelThread";
 import {
   attachmentUploadFailureCopy,
   type PendingAttachmentUpload,
@@ -96,6 +98,7 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@bibcode/client-runtime/state/runtime";
+import { threadHasMessages } from "@bibcode/client-runtime/state/thread-history";
 import {
   selectWorktreeCatalogCapabilityPolicy,
   selectWorktreeWorkspaceActionsAvailable,
@@ -106,7 +109,14 @@ import { AsyncResult } from "effect/reactivity";
 import { isDesktopHost } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
-import { parseStandaloneComposerBiBCodeAction } from "../composer-logic";
+import {
+  parseComposerSideChatCommand,
+  parseStandaloneComposerBiBCodeAction,
+} from "../composer-logic";
+import { resolveSideChatAvailability } from "../sideChatAvailability";
+import { composeSideChatBringBack } from "../sideChatBringBack";
+import { SideChatBringBack } from "./chat/SideChatBringBack";
+import { buildPanelMenuModel, PROVIDER_NOT_READY_REASON } from "./chat/ChatHeaderPanelMenu.logic";
 import {
   derivePendingApprovals,
   derivePendingUserInputs,
@@ -196,7 +206,8 @@ import {
   type CenterPanelDropRequest,
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
-import { useCenterPanelActions } from "../centerPanelActions";
+import { takeComposerFocusRequest, useCenterPanelActions } from "../centerPanelActions";
+import { markChatPanelSent } from "../centerPanelClose";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -298,7 +309,8 @@ import {
   serverEnvironment,
 } from "../state/server";
 import { terminalEnvironment } from "../state/terminal";
-import { threadEnvironment } from "../state/threads";
+import { runOlderHistoryLoad } from "../state/olderHistoryLoad";
+import { threadEnvironment, useThreadFindLoadState, useThreadOlderHistory } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
@@ -308,7 +320,7 @@ import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/Composer
 import { historyUnavailableReason } from "./chat/ComposerHistoryMenu.logic";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
-import { MessagesTimeline } from "./chat/MessagesTimeline";
+import { MessagesTimeline, type TimelineOlderHistory } from "./chat/MessagesTimeline";
 import { ChatHeaderActions } from "./chat/ChatHeaderActions";
 import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
@@ -1083,7 +1095,17 @@ function ChatViewContent(props: ChatViewProps) {
   const setThreadInteractionMode = useAtomCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
-  const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const startThreadTurnCommand = useAtomCommand(threadEnvironment.startTurn, {
+    reportFailure: false,
+  });
+  // Every send is noted first, so closing an unused side chat while it goes out archives it.
+  const startThreadTurn = useCallback<typeof startThreadTurnCommand>(
+    (value, runOptions) => {
+      markChatPanelSent(scopeThreadRef(value.environmentId, value.input.threadId));
+      return startThreadTurnCommand(value, runOptions);
+    },
+    [startThreadTurnCommand],
+  );
   const stageAttachments = useAtomCommand(threadEnvironment.stageAttachments, {
     reportFailure: false,
   });
@@ -1576,6 +1598,19 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  // A Diff surface can show a chat panel's thread, which has no right panel of its own.
+  const diffSurfaceThreadId =
+    activeRightPanelSurface?.kind === "diff" ? activeRightPanelSurface.threadId : undefined;
+  const diffSurfaceThreadRef = useMemo(
+    () =>
+      diffSurfaceThreadId !== undefined && activeThreadRef !== null
+        ? scopeThreadRef(activeThreadRef.environmentId, diffSurfaceThreadId)
+        : null,
+    [activeThreadRef, diffSurfaceThreadId],
+  );
+  const diffSurfaceThread = useThread(diffSurfaceThreadRef);
+  const diffSurfaceLoad = useThreadFindLoadState(diffSurfaceThreadRef);
+  const diffSurfaceFailed = diffSurfaceLoad.status === "deleted" || diffSurfaceLoad.error !== null;
   // Each chat pane shows its own thread's Activity, inline above its composer.
   const activityScope = useMemo(
     () => resolveActivityScope(activeThreadRef, { _tag: "thread" }),
@@ -2690,8 +2725,27 @@ function ChatViewContent(props: ChatViewProps) {
         timelineMessages.filter((message) => !isQueuedTimelineMessage(message)),
         activeThread?.proposedPlans ?? [],
         workLogEntries,
+        activeThread?.history,
       ),
-    [activeThread?.proposedPlans, timelineMessages, workLogEntries],
+    [activeThread?.history, activeThread?.proposedPlans, timelineMessages, workLogEntries],
+  );
+  // Older history still on the server (#226): the timeline's top row and scroll load its pages.
+  const olderHistoryLoading = useThreadOlderHistory(routeKind === "server" ? routeThreadRef : null);
+  const onLoadOlderHistory = useCallback(() => {
+    if (olderHistoryLoading) runOlderHistoryLoad(olderHistoryLoading.loadOlder);
+  }, [olderHistoryLoading]);
+  const hasOlderHistory = activeThread?.history?.hasOlder === true;
+  const olderHistoryRows = activeThread?.history?.olderRows ?? 0;
+  const timelineOlderHistory = useMemo<TimelineOlderHistory | null>(
+    () =>
+      hasOlderHistory && olderHistoryLoading
+        ? {
+            olderRows: olderHistoryRows,
+            status: olderHistoryLoading.status,
+            onLoadOlder: onLoadOlderHistory,
+          }
+        : null,
+    [hasOlderHistory, olderHistoryLoading, olderHistoryRows, onLoadOlderHistory],
   );
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
@@ -2703,8 +2757,24 @@ function ChatViewContent(props: ChatViewProps) {
     }
     return byMessageId;
   }, [turnDiffSummaries]);
+  const isSideChat = activeThread?.sideChat === true;
+  const sideChatHostThreadId = isSideChat ? (activeThread?.hostThreadId ?? null) : null;
+  const sideChatEnvironmentId = activeThread?.environmentId ?? null;
+  const sideChatHostRef = useMemo(
+    () =>
+      sideChatEnvironmentId !== null && sideChatHostThreadId !== null
+        ? scopeThreadRef(sideChatEnvironmentId, sideChatHostThreadId)
+        : null,
+    [sideChatEnvironmentId, sideChatHostThreadId],
+  );
+  const bringBackSummary = useMemo(
+    () => (isSideChat ? composeSideChatBringBack(activeThread?.messages ?? []) : null),
+    [activeThread?.messages, isSideChat],
+  );
   const revertTurnCountByUserMessageId = useMemo(() => {
     const byUserMessageId = new Map<MessageId, number>();
+    // A side chat shares its host's checkout and cannot restore files (the server refuses).
+    if (isSideChat) return byUserMessageId;
     for (let index = 0; index < timelineEntries.length; index += 1) {
       const entry = timelineEntries[index];
       if (!entry || entry.kind !== "message" || entry.message.role !== "user") {
@@ -2734,7 +2804,12 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     return byUserMessageId;
-  }, [inferredCheckpointTurnCountByTurnId, timelineEntries, turnDiffSummaryByAssistantMessageId]);
+  }, [
+    inferredCheckpointTurnCountByTurnId,
+    isSideChat,
+    timelineEntries,
+    turnDiffSummaryByAssistantMessageId,
+  ]);
 
   const gitCwd = activeProject
     ? projectScriptCwd({
@@ -2815,7 +2890,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   const envLocked = Boolean(
     activeThread &&
-    (activeThread.messages.length > 0 ||
+    (threadHasMessages(activeThread) ||
       (activeThread.session !== null && activeThread.session.status !== "stopped")),
   );
 
@@ -2869,6 +2944,11 @@ function ChatViewContent(props: ChatViewProps) {
       focusComposer();
     });
   }, [focusComposer]);
+  // An empty side chat opened from `:btw` or the menu is ready to type in once it shows.
+  const panelThreadShown = isPanel && activeThread !== undefined;
+  useEffect(() => {
+    if (panelThreadShown && takeComposerFocusRequest(routeThreadRef)) scheduleComposerFocus();
+  }, [panelThreadShown, routeThreadRef, scheduleComposerFocus]);
   const addTerminalContextToDraft = useCallback(
     (selection: TerminalContextSelection) => {
       readComposerHandle(composerRef)?.addTerminalContext(selection);
@@ -4201,7 +4281,17 @@ function ChatViewContent(props: ChatViewProps) {
 
   // Auto-open the plan sidebar when plan/todo steps arrive for the current turn.
   // Don't auto-open for plans carried over from a previous turn (the user can open manually).
+  // Leaving the panel for any other surface dismisses it for the turn, as closing it does, so
+  // View diff or a file link is not taken straight back to the tasks (#275).
+  const planSidebarShownForThreadKeyRef = useRef<string | null>(null);
   useEffect(() => {
+    const leftPlanSidebar =
+      !planSidebarOpen && planSidebarShownForThreadKeyRef.current === activeThreadKey;
+    planSidebarShownForThreadKeyRef.current = planSidebarOpen ? activeThreadKey : null;
+    if (leftPlanSidebar) {
+      dismissPlanSidebarForCurrentTurn();
+      return;
+    }
     if (!autoOpenPlanSidebar) return;
     if (!activePlan) return;
     if (planSidebarOpen) return;
@@ -4215,8 +4305,10 @@ function ChatViewContent(props: ChatViewProps) {
   }, [
     activePlan,
     activeLatestTurn?.turnId,
+    activeThreadKey,
     activeThreadRef,
     autoOpenPlanSidebar,
+    dismissPlanSidebarForCurrentTurn,
     planSidebarOpen,
     sidebarProposedPlan?.turnId,
   ]);
@@ -4283,7 +4375,7 @@ function ChatViewContent(props: ChatViewProps) {
   const canOverrideServerThreadEnvMode = Boolean(
     isServerThread &&
     activeThread &&
-    activeThread.messages.length === 0 &&
+    !threadHasMessages(activeThread) &&
     activeThread.worktreePath === null &&
     !envLocked,
   );
@@ -4353,6 +4445,47 @@ function ChatViewContent(props: ChatViewProps) {
       settings.providerSessionDefaults,
       workspaceUnavailable,
     ],
+  );
+  // A side chat runs on the host's provider and model; the composer's `:btw` and the menu's
+  // **Side chat** share one availability, so both say the same thing when they can't.
+  const hostInstanceId = activeThread?.modelSelection.instanceId ?? null;
+  const hostProviderItem = useMemo(
+    () =>
+      hostInstanceId === null
+        ? undefined
+        : buildPanelMenuModel(providerInstanceEntries).find(
+            (item) => item.entry.instanceId === hostInstanceId,
+          ),
+    [hostInstanceId, providerInstanceEntries],
+  );
+  const sideChatUnavailableReason = resolveSideChatAvailability({
+    capabilities: serverConfig?.environment.capabilities ?? null,
+    isPanel,
+    canCreatePanel: centerPanelLaunchContext !== null,
+    workspaceUnavailableReason: workspaceUnavailable,
+    hostProviderReason: hostProviderItem
+      ? (hostProviderItem.disabledReason ?? null)
+      : PROVIDER_NOT_READY_REASON,
+  });
+  // A latest handler: the thread changes on every streamed update, the composer and menu
+  // keep one callback.
+  const handleOpenSideChat = useLatestHandler((question: string, submittedText?: string) => {
+    if (!activeThread || !activeThreadRef || !hostProviderItem) return;
+    if (sideChatUnavailableReason !== null) return;
+    void centerPanelActions.createSideChat({
+      hostRef: activeThreadRef,
+      projectId: activeThread.projectId,
+      worktreePath: centerPanelLaunchContext?.worktreePath ?? null,
+      branch: activeThread.branch ?? null,
+      modelSelection: activeThread.modelSelection,
+      providerLabel: hostProviderItem.entry.displayName,
+      question,
+      ...(submittedText === undefined ? {} : { submittedText }),
+    });
+  });
+  const handleCreateSideChatFromMenu = useCallback(
+    () => handleOpenSideChat(""),
+    [handleOpenSideChat],
   );
   const reopenCenterChatPanel = centerPanelActions.reopenChatPanel;
   const handleReopenChatPanel = useCallback(
@@ -5298,6 +5431,8 @@ function ChatViewContent(props: ChatViewProps) {
     const sendContext = composerRef.current?.getSendContext();
     const prompt = promptRef.current;
     if (parseStandaloneComposerBiBCodeAction(prompt.trim())) return false;
+    // A side chat question opens a side chat (the composer routes it); it is never sent here.
+    if (parseComposerSideChatCommand(prompt) !== null) return false;
     return deriveComposerSendState({
       prompt,
       imageCount: sendContext?.attachments.length ?? composerAttachmentsRef.current.length,
@@ -5492,6 +5627,8 @@ function ChatViewContent(props: ChatViewProps) {
           composerPreviewAnnotations.length +
           composerReviewComments.length,
       });
+      // `:btw` and `:side` open a side chat through the composer; nothing reaches this thread.
+      if (parseComposerSideChatCommand(trimmed) !== null) return;
       const standaloneColonAction = parseStandaloneComposerBiBCodeAction(trimmed);
       if (standaloneColonAction === "plan" || standaloneColonAction === "default") {
         handleInteractionModeChange(standaloneColonAction);
@@ -5576,7 +5713,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       if (currentQueueThreadKeyRef.current !== routeThreadKey) return;
       const threadIdForSend = activeThread.id;
-      const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
+      const isFirstMessage = !isServerThread || !threadHasMessages(activeThread);
       const baseBranchForWorktree =
         isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath
           ? activeThreadBranch
@@ -6913,10 +7050,13 @@ function ChatViewContent(props: ChatViewProps) {
     (turnId: TurnId, filePath?: string) => {
       if (!isServerThread || !activeThreadRef) return;
       useDiffPanelStore.getState().selectTurn(activeThreadRef, turnId, filePath);
-      useRightPanelStore.getState().open(activeThreadRef, "diff");
+      // A chat panel renders no right panel: its host's shows this thread's diff.
+      useRightPanelStore
+        .getState()
+        .openDiff(activityPaneHostRef ?? activeThreadRef, activeThreadRef.threadId);
       onDiffPanelOpen?.();
     },
-    [activeThreadRef, isServerThread, onDiffPanelOpen],
+    [activeThreadRef, activityPaneHostRef, isServerThread, onDiffPanelOpen],
   );
   // Both the Map and the revert handler are read from refs at call-time so
   // the callback reference is fully stable and never busts context identity.
@@ -6989,14 +7129,21 @@ function ChatViewContent(props: ChatViewProps) {
         workspaceUnavailable={workspaceUnavailable}
       />
     ) : activeRightPanelSurface?.kind === "diff" ? (
-      <Suspense fallback={null}>
-        <DiffPanel
-          mode="embedded"
-          composerDraftTarget={composerDraftTarget}
-          thread={activeThread}
-          workspaceUnavailable={workspaceUnavailable}
+      diffSurfaceThreadRef !== null && diffSurfaceThread === null ? (
+        <PanelDiffPendingState
+          failed={diffSurfaceFailed}
+          onShowOwnDiff={() => useRightPanelStore.getState().open(activeThreadRef, "diff")}
         />
-      </Suspense>
+      ) : (
+        <Suspense fallback={null}>
+          <DiffPanel
+            mode="embedded"
+            composerDraftTarget={diffSurfaceThreadRef ?? composerDraftTarget}
+            thread={diffSurfaceThread ?? activeThread}
+            workspaceUnavailable={workspaceUnavailable}
+          />
+        </Suspense>
+      )
     ) : activeRightPanelSurface?.kind === "sourceControl" ? (
       <Suspense fallback={null}>
         <SourceControlPanel
@@ -7180,6 +7327,7 @@ function ChatViewContent(props: ChatViewProps) {
                       isHostFindSurface={!isPanel}
                       onFindFocusComposer={focusComposer}
                       onReasoningRowToggle={onReasoningRowToggle}
+                      olderHistory={timelineOlderHistory}
                     />
 
                     {/* scroll to end pill — shown when user has scrolled away from the live edge */}
@@ -7235,6 +7383,9 @@ function ChatViewContent(props: ChatViewProps) {
                               onLayoutChange={reportComposerOverlayLayout}
                             />
                           </div>
+                        ) : null}
+                        {sideChatHostRef !== null ? (
+                          <SideChatBringBack hostRef={sideChatHostRef} summary={bringBackSummary} />
                         ) : null}
                         <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
                         <div className="relative z-10">
@@ -7299,6 +7450,8 @@ function ChatViewContent(props: ChatViewProps) {
                             composerTerminalContextsRef={composerTerminalContextsRef}
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
+                            onOpenSideChat={handleOpenSideChat}
+                            sideChatUnavailableReason={sideChatUnavailableReason}
                             onInterrupt={onInterrupt}
                             onSteerQueuedMessage={onSteerHeadQueuedMessage}
                             onImplementPlanInNewThread={onImplementPlanInNewThread}
@@ -7385,6 +7538,8 @@ function ChatViewContent(props: ChatViewProps) {
                   settings={settings}
                   canCreatePanel={centerPanelLaunchContext !== null}
                   onCreateChatPanel={handleCreateChatPanel}
+                  onCreateSideChat={handleCreateSideChatFromMenu}
+                  sideChatUnavailableReason={sideChatUnavailableReason}
                   onReopenChatPanel={handleReopenChatPanel}
                   onOpenTerminalPanel={handleOpenTerminalPanel}
                   onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
@@ -7499,7 +7654,10 @@ function ChatViewContent(props: ChatViewProps) {
 export default function ChatView(props: ChatViewProps) {
   return (
     <DiffWorkerPoolProvider>
-      <ChatViewContent {...props} />
+      {/* A chat panel renders no right panel: what its chat opens goes to its host's. */}
+      <RightPanelThreadContext value={props.activityPaneHostRef ?? null}>
+        <ChatViewContent {...props} />
+      </RightPanelThreadContext>
     </DiffWorkerPoolProvider>
   );
 }

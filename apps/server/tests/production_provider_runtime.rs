@@ -858,6 +858,7 @@ fn launch() -> ProviderLaunchRequest {
         )),
         open_url: None,
         host_thread_id: None,
+        side_chat_host_thread_id: None,
     }
 }
 
@@ -3156,6 +3157,79 @@ async fn restart_recovery_whose_conversation_is_gone_leaves_an_explicit_retry_wo
             .as_deref(),
         Some("new-conversation")
     );
+    fixture.close().await;
+}
+
+/// #273: a restart's reconciliation launch that the provider refuses for its configuration
+/// reports that, not `Unavailable`, so recovery stops relaunching; nothing is sent.
+#[tokio::test]
+async fn restart_recovery_refused_for_provider_configuration_reports_it() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    fixture.state.lock().unwrap().start_results =
+        VecDeque::from([Err(ProviderRuntimeError::ProviderConfiguration {
+            provider: "cursor".to_owned(),
+            detail: "failed to load configuration: bad table".to_owned(),
+            config_path: "~/.codex/config.toml".to_owned(),
+        })]);
+
+    let outcome = reconcile_orchestration_turn(
+        &fixture.supervisor,
+        &fixture.engine,
+        &fixture.settings.path().to_path_buf(),
+        fixture.row.clone(),
+    )
+    .await;
+
+    let ProviderReconciliationOutcome::ProviderConfiguration { detail } = outcome else {
+        panic!("a refused configuration is reported as such: {outcome:?}");
+    };
+    assert!(
+        detail.contains("failed to load configuration: bad table"),
+        "{detail}"
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.launches.len(), 1);
+    assert!(state.sends.is_empty());
+    drop(state);
+    fixture.close().await;
+}
+
+/// A restart's reconciliation launch that fails before reaching the provider (here, a process
+/// that cannot start) is reported as a failed launch, which recovery counts against its budget;
+/// a provider that answers but cannot tell yet stays `Unavailable`.
+#[tokio::test]
+async fn a_failed_restart_reconciliation_launch_is_reported_as_such() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    fixture.state.lock().unwrap().start_results =
+        VecDeque::from([Err(ProviderRuntimeError::Spawn {
+            provider: "cursor".to_owned(),
+            detail: "the app-server exited before initialize".to_owned(),
+        })]);
+
+    let outcome = reconcile_orchestration_turn(
+        &fixture.supervisor,
+        &fixture.engine,
+        &fixture.settings.path().to_path_buf(),
+        fixture.row.clone(),
+    )
+    .await;
+
+    let ProviderReconciliationOutcome::LaunchFailed { detail } = outcome else {
+        panic!("a launch that never reached the provider is reported as such: {outcome:?}");
+    };
+    assert!(
+        detail.contains("could not start: the app-server exited before initialize"),
+        "the user-facing detail: {detail}"
+    );
+    assert!(fixture.state.lock().unwrap().sends.is_empty());
     fixture.close().await;
 }
 
@@ -11747,6 +11821,10 @@ impl CheckpointedSession {
             created_at: NOW.to_owned(),
         };
         self.engine.dispatch(start.clone()).await.unwrap();
+        // Turn delivery captures a first turn's baseline before it hands the turn over.
+        self.effects
+            .capture_first_turn_baseline("t1", &format!("user-{index}"))
+            .await;
         self.supervisor.handle_orchestration(start).await.unwrap();
     }
 
@@ -12031,20 +12109,19 @@ async fn a_turn_diff_of_an_uncaptured_turn_is_refused_even_with_its_ref() {
     session.shutdown().await;
 }
 
-/// A turn that ends before the effects worker has even handled its start (a fast turn, a busy
-/// worker) is still numbered when it ends, from the checkout itself, then captured once the
-/// worker catches up. Its baseline is captured late, which is the turn-start baseline's own
-/// window, so only the numbering and the capture are asserted here.
+/// A turn that ends while the effects worker is busy (a fast turn, a busy worker) is still
+/// numbered when it ends, from the checkout itself, then captured once the worker catches up.
 #[tokio::test]
 async fn a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_captured() {
     let repository = initialize_repository();
     let session = CheckpointedSession::start(repository.path()).await;
+
+    session.start_turn(1).await;
+    // The worker's next workspace lookup, for the turn's capture, waits until released.
     session
         .callbacks
         .hold_workspace
         .store(true, Ordering::SeqCst);
-
-    session.start_turn(1).await;
     let turn_id = session
         .finish_turn(repository.path(), 1, "fast\n", "completed")
         .await;
@@ -12073,10 +12150,11 @@ async fn a_turn_that_ends_before_the_worker_handles_its_start_is_numbered_and_ca
     session.shutdown().await;
 }
 
-/// A turn whose baseline (ref 0) could not be captured is never recorded `ready`: its diff could
-/// not be read. Its own end state is still captured, so the next turn's diff is.
+/// A turn whose baseline (ref 0) could not be captured is recorded `ready` without a diff
+/// (#235): its own end state is captured, so it can be reverted to, and the next turn's diff
+/// is read from it.
 #[tokio::test]
-async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
+async fn a_turn_without_a_baseline_is_ready_without_a_diff_and_revertible() {
     let repository = initialize_repository();
     let session = CheckpointedSession::start(repository.path()).await;
     // Git cannot write ref 0 while its lock file exists.
@@ -12088,36 +12166,28 @@ async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
     std::fs::write(&baseline_lock, "").unwrap();
 
     session.start_turn(1).await;
+    let baseline_failures = load_snapshot(&session.engine.repositories())
+        .await
+        .unwrap()
+        .activities
+        .iter()
+        .filter(|activity| {
+            activity.kind == "checkpoint.capture.failed"
+                && activity.turn_id.is_none()
+                && activity.payload["turnCount"] == 0
+        })
+        .count();
+    assert_eq!(
+        baseline_failures, 1,
+        "the missing baseline is reported once"
+    );
     let turn_id = session
         .finish_turn(repository.path(), 1, "one\n", "completed")
         .await;
-    timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
-        loop {
-            let failed = load_snapshot(&session.engine.repositories())
-                .await
-                .unwrap()
-                .activities
-                .iter()
-                .any(|activity| {
-                    activity.kind == "checkpoint.capture.failed"
-                        && activity.turn_id.as_deref() == Some(turn_id.as_str())
-                });
-            if failed {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the turn's checkpoint is reported unreadable");
-    let checkpoint = session
-        .engine
-        .repositories()
-        .get_checkpoint("t1".to_owned(), 1)
-        .await
-        .unwrap()
-        .expect("checkpoint 1");
-    assert_eq!(checkpoint.status, "missing");
+    let checkpoint = session.ready_checkpoint(1).await;
+    assert_eq!(checkpoint.turn_id, turn_id);
+    assert!(!checkpoint.diff_available);
+    assert_eq!(checkpoint.files, json!([]));
     let reference = |turn_count| orchestration_effects::checkpoint_ref("t1", turn_count);
     assert!(!git_succeeds(
         repository.path(),
@@ -12134,6 +12204,29 @@ async fn a_turn_without_a_baseline_is_never_ready_and_the_next_turn_is() {
         .await;
     let next = session.ready_checkpoint(2).await;
     assert_eq!(next.files[0]["path"], "tracked.txt");
+
+    let mut events = session.engine.subscribe_events();
+    session
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert", "commandId":"revert", "threadId":"t1",
+                "turnCount":1, "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.reverted"
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "one\n"
+    );
     session.shutdown().await;
 }
 

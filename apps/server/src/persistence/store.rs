@@ -82,7 +82,7 @@ pub enum StoreStartupError {
         #[source]
         source: std::io::Error,
     },
-    #[error("an incomplete project-data recovery operation remains at {path}")]
+    #[error("{} ({})", super::backup::interrupted_recovery_message(), path.display())]
     RecoveryIncomplete { path: PathBuf },
     #[error("failed to read storage instance marker {path}")]
     MarkerRead {
@@ -135,14 +135,7 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
     let _operation_guard = StoreOperationGuard::acquire_for_startup(&paths)
         .await
         .map_err(StoreStartupError::Backup)?;
-    if try_exists(&paths.recovery_journal())? {
-        return Err(StoreStartupError::RecoveryIncomplete {
-            path: paths.recovery_journal(),
-        });
-    }
-    if let Some(path) = recovery_staging_entry(&paths)? {
-        return Err(StoreStartupError::RecoveryIncomplete { path });
-    }
+    ensure_no_interrupted_recovery(&paths)?;
     let database_exists = try_exists(&paths.database)?;
     let marker_exists = try_exists(&paths.environment_id)?;
     let marker = marker_exists
@@ -160,6 +153,21 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
             prepare_existing(paths, storage_instance_id, &resolved_config.server_version).await
         }
     }
+}
+
+/// Refuses while a recovery journal or recovery-staging entry exists. Every writable opener calls
+/// it after taking the runtime lock; an interrupted recovery is finished only by
+/// `bibcode storage restore --resume`, which holds that lock exclusively.
+pub fn ensure_no_interrupted_recovery(paths: &StatePaths) -> Result<(), StoreStartupError> {
+    if try_exists(&paths.recovery_journal())? {
+        return Err(StoreStartupError::RecoveryIncomplete {
+            path: paths.recovery_journal(),
+        });
+    }
+    if let Some(path) = recovery_staging_entry(paths)? {
+        return Err(StoreStartupError::RecoveryIncomplete { path });
+    }
+    Ok(())
 }
 
 fn recovery_staging_entry(paths: &StatePaths) -> Result<Option<PathBuf>, StoreStartupError> {
@@ -336,20 +344,52 @@ pub(crate) async fn validate_existing_store(
     .await
 }
 
+/// Who may touch the store's sidecars while inspection runs, from the runtime lock that
+/// inspection holds for classification and its stats read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InspectionOwnership {
+    /// A BiBCode process holds the runtime lock.
+    Owned,
+    /// Inspection holds the runtime lock exclusively.
+    Offline,
+    /// There is no runtime lock file: no BiBCode process has ever owned the root.
+    NeverOwned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InspectionOutcome {
+    /// Validated through SQLite, or reported from files because the owner validated it.
+    Classified,
+    /// SQLite was not opened, because it would have created a sidecar.
+    SidecarsNotOpened,
+}
+
+/// Opens SQLite only where it cannot create or delete files: never while a BiBCode process
+/// owns the root; `immutable=1` without sidecars; the plain read-only path only with both
+/// sidecars under the exclusive lock.
 pub(crate) async fn validate_existing_store_for_inspection(
     path: &std::path::Path,
-) -> Result<(), StoreStartupError> {
-    let wal = sqlite_sidecar(path, "-wal");
-    let shm = sqlite_sidecar(path, "-shm");
-    let has_sidecars = try_exists(&wal)? || try_exists(&shm)?;
+    ownership: InspectionOwnership,
+) -> Result<InspectionOutcome, StoreStartupError> {
+    if ownership == InspectionOwnership::Owned {
+        return Ok(InspectionOutcome::Classified);
+    }
+    let wal = try_exists(&sqlite_sidecar(path, "-wal"))?;
+    let shm = try_exists(&sqlite_sidecar(path, "-shm"))?;
+    let read_only_wal = match (wal, shm, ownership) {
+        (false, false, _) => false,
+        (true, true, InspectionOwnership::Offline) => true,
+        _ => return Ok(InspectionOutcome::SidecarsNotOpened),
+    };
     validate_with_operation(path.to_path_buf(), move |path, cancellation| {
-        if has_sidecars {
+        if read_only_wal {
             validate_existing_bibcode_store(&path, &cancellation)
         } else {
             validate_existing_bibcode_store_immutable(&path, &cancellation)
         }
     })
     .await
+    .map(|()| InspectionOutcome::Classified)
 }
 
 fn sqlite_sidecar(path: &std::path::Path, suffix: &str) -> PathBuf {
@@ -958,6 +998,41 @@ mod tests {
             std::fs::read(&paths.environment_id).expect("marker remains"),
             marker_bytes
         );
+    }
+
+    #[tokio::test]
+    async fn inspection_never_opens_sqlite_where_it_would_create_a_sidecar() {
+        let directory = TempDir::new().expect("inspection fixture root");
+        let database = directory.path().join("state.sqlite");
+        let mut setup = rusqlite::Connection::open(&database).expect("fixture database");
+        crate::persistence::run_migrations(&mut setup, None).expect("fixture schema");
+        drop(setup);
+        // `-shm` alone, even under the exclusive lock.
+        std::fs::write(sqlite_sidecar(&database, "-shm"), b"").expect("stale SHM");
+        let before = directory_snapshot(directory.path());
+        let outcome =
+            validate_existing_store_for_inspection(&database, InspectionOwnership::Offline)
+                .await
+                .expect("inspection outcome");
+        assert_eq!(outcome, InspectionOutcome::SidecarsNotOpened);
+        assert_eq!(directory_snapshot(directory.path()), before);
+
+        // Both sidecars, but no lock file excludes a server that starts now.
+        std::fs::write(sqlite_sidecar(&database, "-wal"), b"").expect("empty WAL");
+        let before = directory_snapshot(directory.path());
+        let outcome =
+            validate_existing_store_for_inspection(&database, InspectionOwnership::NeverOwned)
+                .await
+                .expect("inspection outcome");
+        assert_eq!(outcome, InspectionOutcome::SidecarsNotOpened);
+        assert_eq!(directory_snapshot(directory.path()), before);
+
+        // A BiBCode owner validated the store itself; SQLite is not opened at all.
+        let outcome = validate_existing_store_for_inspection(&database, InspectionOwnership::Owned)
+            .await
+            .expect("inspection outcome");
+        assert_eq!(outcome, InspectionOutcome::Classified);
+        assert_eq!(directory_snapshot(directory.path()), before);
     }
 
     #[test]

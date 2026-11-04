@@ -7,6 +7,7 @@ import {
   GitManagerCommitPage,
   GitManagerConflictState,
   GitManagerDiff,
+  GitManagerDiscardResult,
   GitManagerDiffSource,
   GitManagerMergePreview,
   GitManagerOperationError,
@@ -28,6 +29,7 @@ const decodeGitManagerRefsSnapshot = Schema.decodeUnknownSync(GitManagerRefsSnap
 const decodeGitManagerCommitEntry = Schema.decodeUnknownSync(GitManagerCommitEntry);
 const decodeGitManagerCommitPage = Schema.decodeUnknownSync(GitManagerCommitPage);
 const decodeGitManagerDiffSource = Schema.decodeUnknownSync(GitManagerDiffSource);
+const decodeGitManagerDiscardResult = Schema.decodeUnknownSync(GitManagerDiscardResult);
 const decodeGitManagerDiff = Schema.decodeUnknownSync(GitManagerDiff);
 const decodeGitManagerStashEntry = Schema.decodeUnknownSync(GitManagerStashEntry);
 const decodeGitManagerConflictState = Schema.decodeUnknownSync(GitManagerConflictState);
@@ -148,6 +150,17 @@ describe("Git Manager wire schemas", () => {
     });
     expect(decoded._tag).toBe("stash");
     if (decoded._tag === "stash") expect(decoded.sha).toBe("stash-sha");
+  });
+
+  it("decodes where a discard kept a stranded entry, and an answer from an older server", () => {
+    const answer = { trashed: [], permanentlyDiscarded: [], trashUnavailable: [] };
+    expect(
+      decodeGitManagerDiscardResult({
+        ...answer,
+        keptInStaging: [{ path: "dir/a.txt", stagedAt: "bibcode-discard/0f3a/a.txt" }],
+      }).keptInStaging,
+    ).toEqual([{ path: "dir/a.txt", stagedAt: "bibcode-discard/0f3a/a.txt" }]);
+    expect(decodeGitManagerDiscardResult(answer).keptInStaging).toEqual([]);
   });
 
   it("decodes an explicit large-text diff marker without patch content", () => {

@@ -23,6 +23,13 @@
 //! on again starts from now rather than replaying what happened meanwhile.
 //!
 //! **Pairing.** Revoking the MCP client an endpoint is paired with disables the endpoint.
+//!
+//! **Bearer token.** An endpoint may also send `Authorization: Bearer <token>`. Each token
+//! value is its own secret-store file, `webhook-bearer-<endpoint id>-<32 hex>`, and the
+//! endpoint row's `bearer_secret` names the current one, so the URL and the token change in
+//! one commit. Edits of one endpoint run one at a time (its edit lock, taken before the
+//! endpoint is read), and a file is removed only after the commit that stopped naming it,
+//! under the endpoint's send lock, so a sender never reads a name whose file is then gone.
 
 pub(crate) mod delivery;
 pub(crate) mod events;
@@ -99,6 +106,9 @@ pub(crate) struct WebhooksConfig {
     pub(crate) poll: Duration,
     /// At most this many deliveries wait; past it the oldest are abandoned.
     pub(crate) max_pending: i64,
+    /// A test holds the dispatcher's start here.
+    #[cfg(test)]
+    pub(crate) start_pause: Option<Arc<Pause>>,
 }
 
 impl WebhooksConfig {
@@ -123,6 +133,8 @@ impl WebhooksConfig {
             retry_delays: RETRY_DELAYS.to_vec(),
             poll: POLL,
             max_pending: store::MAX_PENDING,
+            #[cfg(test)]
+            start_pause: None,
         }
     }
 }
@@ -152,6 +164,10 @@ struct Inner {
     /// One lock per endpoint, held for each request: the dispatcher's, a test event's and a
     /// redelivery's all take it, so an endpoint never has two requests open.
     send_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One lock per endpoint, held by each upsert and delete from its read of the endpoint
+    /// through the removal of the token files it replaced, so edits of one endpoint never
+    /// interleave.
+    edit_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The findings file as last read, so an unchanged book is not parsed again.
     findings_version: Mutex<Option<(u64, Option<SystemTime>)>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -160,6 +176,11 @@ struct Inner {
     /// A test holds the next sender here, just after its revision read.
     #[cfg(test)]
     revision_read_pause: Mutex<Option<Arc<Pause>>>,
+    /// A test holds the next edit here, after it wrote its token file and before it commits.
+    #[cfg(test)]
+    token_write_pause: Mutex<Option<Arc<Pause>>>,
+    #[cfg(test)]
+    start_pause: Mutex<Option<Arc<Pause>>>,
 }
 
 /// Where a test holds a sender: it signals `reached`, then waits for `release`.
@@ -193,6 +214,20 @@ fn secret_name(endpoint_id: &str) -> String {
     format!("webhook-{endpoint_id}")
 }
 
+/// The start of every bearer token file name of one endpoint.
+fn bearer_prefix(endpoint_id: &str) -> String {
+    format!("webhook-bearer-{endpoint_id}-")
+}
+
+/// A new bearer token file name: each token value gets its own file.
+fn new_bearer_name(endpoint_id: &str) -> String {
+    format!(
+        "{}{}",
+        bearer_prefix(endpoint_id),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 /// `lastSeen` as an instant for ordering; a value that does not parse sorts first.
 fn seen_at(text: &str) -> time::OffsetDateTime {
     time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
@@ -214,6 +249,8 @@ impl Webhooks {
             retry_delays,
             poll,
             max_pending,
+            #[cfg(test)]
+            start_pause,
         } = config;
         let webhooks = Self {
             inner: Arc::new(Inner {
@@ -231,11 +268,16 @@ impl Webhooks {
                 shutdown: CancellationToken::new(),
                 endpoint_tokens: Mutex::new(HashMap::new()),
                 send_locks: Mutex::new(HashMap::new()),
+                edit_locks: Mutex::new(HashMap::new()),
                 findings_version: Mutex::new(None),
                 task: Mutex::new(None),
                 passes: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
                 revision_read_pause: Mutex::new(None),
+                #[cfg(test)]
+                token_write_pause: Mutex::new(None),
+                #[cfg(test)]
+                start_pause: Mutex::new(start_pause),
             }),
         };
         let task = tokio::spawn(run(webhooks.clone()));
@@ -270,6 +312,30 @@ impl Webhooks {
             let pause = self
                 .inner
                 .revision_read_pause
+                .lock()
+                .expect("pause lock")
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_edit_after_token_write(&self) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        *self.inner.token_write_pause.lock().expect("pause lock") = Some(pause.clone());
+        pause
+    }
+
+    /// An edit wrote its token file and is about to commit (a test may hold it).
+    async fn after_token_write(&self) {
+        #[cfg(test)]
+        {
+            let pause = self
+                .inner
+                .token_write_pause
                 .lock()
                 .expect("pause lock")
                 .take();
@@ -347,6 +413,71 @@ impl Webhooks {
             .drain()
         {
             token.cancel();
+        }
+    }
+
+    /// The `Authorization` value of a bearer token file, marked sensitive so no `Debug` of
+    /// the request shows it; `None` when the file cannot be read or is not a header value.
+    async fn bearer(&self, endpoint_id: &str, name: &str) -> Option<reqwest::header::HeaderValue> {
+        let token = match self.inner.secrets.get(name).await {
+            Ok(Some(bytes)) => String::from_utf8(bytes).ok()?,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(endpoint = endpoint_id, %error, "could not read a webhook bearer token");
+                return None;
+            }
+        };
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+        value.set_sensitive(true);
+        Some(value)
+    }
+
+    fn edit_lock(&self, endpoint_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .edit_locks
+            .lock()
+            .expect("edit lock map")
+            .entry(endpoint_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Writes a new bearer token file for the endpoint and returns its name.
+    async fn write_bearer(
+        &self,
+        endpoint_id: &str,
+        token: &str,
+    ) -> Result<String, crate::auth::SecretStoreError> {
+        let name = new_bearer_name(endpoint_id);
+        self.inner.secrets.set(&name, token.as_bytes()).await?;
+        Ok(name)
+    }
+
+    /// Removes the endpoint's bearer token files other than `keep`: the one an edit just
+    /// replaced, and any a crash left between a file write and its commit. The caller holds
+    /// the endpoint's edit lock, so no other edit is writing one of these files, and the
+    /// removal waits for the send lock (never cancelling the request in flight), so no sender
+    /// still holds a name it read before the commit.
+    async fn prune_bearer_files(&self, endpoint_id: &str, keep: Option<&str>) {
+        let prefix = bearer_prefix(endpoint_id);
+        let stale: Vec<String> = match self.inner.secrets.names().await {
+            Ok(names) => names
+                .into_iter()
+                .filter(|name| name.starts_with(&prefix) && Some(name.as_str()) != keep)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(endpoint = endpoint_id, %error, "could not list webhook bearer tokens");
+                return;
+            }
+        };
+        if stale.is_empty() {
+            return;
+        }
+        let _turn = self.send_lock(endpoint_id).lock_owned().await;
+        for name in stale {
+            if let Err(error) = self.inner.secrets.remove(&name).await {
+                tracing::warn!(endpoint = endpoint_id, %error, "could not remove a webhook bearer token");
+            }
         }
     }
 
@@ -449,6 +580,22 @@ impl Webhooks {
                 latency_ms: 0,
             };
         };
+        // The token the row this sender read names, read under the send lock: an edit removes
+        // a replaced file only under that lock, after its commit.
+        let authorization = match &endpoint.bearer_secret {
+            None => None,
+            Some(name) => match self.bearer(&endpoint.id, name).await {
+                Some(value) => Some(value),
+                // Never sent without its token; Replace sets a new one.
+                None => {
+                    return Attempt {
+                        status: None,
+                        failure: Some(Failure::TokenMissing),
+                        latency_ms: 0,
+                    };
+                }
+            },
+        };
         let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
         let signature = signing::sign(&secret, timestamp, body.as_bytes());
         delivery::send(
@@ -459,6 +606,7 @@ impl Webhooks {
                 delivery_id,
                 timestamp,
                 signature: &signature,
+                authorization: authorization.as_ref(),
             },
             body.as_bytes(),
             cancel,
@@ -795,6 +943,14 @@ impl Webhooks {
                         .project_id
                         .as_ref()
                         .is_none_or(|project| event.project_id.as_ref() == Some(project))
+                    && (event.event_type != events::THREAD_STATUS_CHANGED
+                        || endpoint.status_kinds.as_ref().is_none_or(|kinds| {
+                            event
+                                .fields
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| kinds.iter().any(|chosen| chosen == kind))
+                        }))
             }) {
                 deliveries.push(NewDelivery {
                     delivery_id: uuid::Uuid::new_v4().to_string(),
@@ -918,6 +1074,14 @@ async fn run(webhooks: Webhooks) {
     let mut in_flight: JoinSet<String> = JoinSet::new();
     let mut busy: HashSet<String> = HashSet::new();
     let mut last_prune: Option<tokio::time::Instant> = None;
+    #[cfg(test)]
+    {
+        let pause = inner.start_pause.lock().expect("pause lock").take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
     if let Err(error) = inner.store.ensure_revisions().await {
         tracing::warn!(%error, "could not add the webhook revision columns");
     }

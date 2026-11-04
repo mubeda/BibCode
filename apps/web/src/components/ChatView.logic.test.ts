@@ -13,6 +13,7 @@ import {
 } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DEFAULT_SERVER_SETTINGS } from "@bibcode/contracts/settings";
+import { threadHasMessages } from "@bibcode/client-runtime/state/thread-history";
 import { applyProviderInstanceSettings, deriveProviderInstanceEntries } from "../providerInstances";
 
 import type { ChatMessage, Thread } from "../types";
@@ -610,6 +611,21 @@ describe("readFileAsDataUrl", () => {
 });
 
 describe("thread lifecycle helpers", () => {
+  it("a windowed thread with older history counts as having messages", () => {
+    // Every loaded message can be a page away: the window may hold only tool rows (#226).
+    const windowed = makeThread({
+      history: {
+        floor: "floor",
+        hasOlder: true,
+        olderRows: 12,
+        carried: { activities: [], proposedPlans: [] },
+      },
+    });
+    expect(threadHasMessages(windowed)).toBe(true);
+    expect(threadHasStarted(windowed)).toBe(true);
+    expect(threadHasMessages(makeThread())).toBe(false);
+  });
+
   it("detects every server-start signal and derives the locked provider fallback", () => {
     expect(threadHasStarted(undefined)).toBe(false);
     expect(threadHasStarted(makeThread())).toBe(false);

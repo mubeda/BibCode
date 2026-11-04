@@ -2,10 +2,13 @@ import {
   type EnvironmentId,
   type ServerConfig,
   type ServerProviderCapabilitiesInput,
+  ServerProviderUpdateError,
+  type ServerProviderUpdateInput,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
   WS_METHODS,
 } from "@bibcode/contracts";
+import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -13,6 +16,7 @@ import { AsyncResult, Atom } from "effect/reactivity";
 
 import {
   createAtomCommandScheduler,
+  createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentQueryAtomFamily,
   createEnvironmentRpcQueryAtomFamily,
@@ -21,6 +25,7 @@ import {
 import { request } from "../rpc/client.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { applyServerConfigEvent } from "../rpc/sharedServerConfig.ts";
+import { isToolId, toolsAsProviders } from "./serverTools.ts";
 
 export const PROVIDER_CAPABILITIES_STALE_TIME_MS = 30_000;
 
@@ -217,11 +222,38 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId }) => environmentId,
       },
     }),
-    updateProvider: createEnvironmentRpcCommand(runtime, {
+    // A tool (CodeGraph) updates through its own method but reports like a provider, so every
+    // update surface sends one call shape and reads one result shape. Only a tool the server
+    // reported can be asked for, and a server that reports none is never sent the call.
+    updateProvider: createEnvironmentCommand(runtime, {
       label: "environment-data:server:update-provider",
-      tag: WS_METHODS.serverUpdateProvider,
       scheduler: configScheduler,
       concurrency: configConcurrency,
+      execute: (input: ServerProviderUpdateInput, { environmentId, registry }) =>
+        isToolId(input.provider)
+          ? // The call is made only to a server whose current config reports `tools`, even for an
+            // update confirmed before a reconnect to an older server.
+            registry.get(configValueAtom(environmentId))?.tools === undefined
+            ? Effect.fail(
+                new ServerProviderUpdateError({
+                  provider: input.provider,
+                  reason:
+                    "This server does not report tools, so it cannot update them. Update the server first.",
+                }),
+              )
+            : request(WS_METHODS.serverUpdateTool, { toolId: input.provider }).pipe(
+                Effect.map((result) => ({ providers: toolsAsProviders(result.tools) })),
+                // The same error as a provider's, so callers read one failure shape.
+                Effect.mapError((error) =>
+                  error._tag === "ServerToolUpdateError"
+                    ? new ServerProviderUpdateError({
+                        provider: input.provider,
+                        reason: error.reason,
+                      })
+                    : error,
+                ),
+              )
+          : request(WS_METHODS.serverUpdateProvider, input),
     }),
     upsertKeybinding: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:upsert-keybinding",

@@ -6,6 +6,7 @@ import {
   GitManagerOperationError,
   type EditorId,
   type EnvironmentId,
+  type GitManagerKeptInStaging,
   type GitManagerUndoCommitResult,
   type ScopedProjectRef,
   type VcsStatusResult,
@@ -38,6 +39,11 @@ import {
 } from "~/keybindings";
 import { readLocalApi } from "~/localApi";
 
+import {
+  discardRecoveryKey,
+  NO_DISCARD_RECOVERY_NOTICES,
+  useGitDiscardRecoveryStore,
+} from "../../../gitDiscardRecoveryStore";
 import { DEFAULT_GIT_MANAGER_VIEW_STATE, useGitManagerStore } from "../../../gitManagerStore";
 import { useProject, useServerConfigs } from "../../../state/entities";
 import { gitManagerEnvironment } from "../../../state/gitManager";
@@ -199,6 +205,21 @@ function keptAfterPermanentDiscard(paths: ReadonlyArray<string>): string {
   return `Kept ${named}${more}: ignored files and files in linked folders can't be discarded here. Remove ${pronoun} in your file manager.`;
 }
 
+/** Entries the Trash refused whose name was taken meanwhile: not in the working tree any more. */
+function keptInStagingMessage(kept: ReadonlyArray<GitManagerKeptInStaging>): string {
+  const [first] = kept;
+  if (kept.length === 1 && first !== undefined) {
+    return `${first.path} isn't in your working tree. The Trash refused it and something new took its name, so it's kept in the Git directory at ${first.stagedAt}. Once the name is free, any discard here moves it back, or move it back yourself.`;
+  }
+  const named = kept
+    .slice(0, MAX_KEPT_PATHS_NAMED)
+    .map((entry) => `${entry.path} at ${entry.stagedAt}`)
+    .join("; ");
+  const more =
+    kept.length > MAX_KEPT_PATHS_NAMED ? ` and ${kept.length - MAX_KEPT_PATHS_NAMED} more` : "";
+  return `${kept.length} files aren't in your working tree. The Trash refused them and something new took their names, so they're kept in the Git directory: ${named}${more}. Once the names are free, any discard here moves them back, or move them back yourself.`;
+}
+
 function gitManagerMutationErrorMessage(error: unknown): string {
   if (isGitManagerOperationError(error)) {
     return error.blocked?.message ?? error.message;
@@ -242,6 +263,14 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const [excludedPaths, setExcludedPaths] = useState<ReadonlySet<string>>(() => new Set());
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  // Where discarded files were kept. Held in a store, apart from `mutationError` (which every
+  // action clears), so it survives the permanent-discard confirmation and leaving the tab.
+  const recoveryKey = discardRecoveryKey(environmentId, cwd);
+  const recoveryNotices = useGitDiscardRecoveryStore(
+    (state) => state.noticesByCheckout[recoveryKey] ?? NO_DISCARD_RECOVERY_NOTICES,
+  );
+  const addRecoveryNotice = useGitDiscardRecoveryStore((state) => state.addNotice);
+  const dismissRecoveryNotices = useGitDiscardRecoveryStore((state) => state.dismissNotices);
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
   const project = useProject(stableProjectRef);
@@ -570,6 +599,10 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(message);
         throw new Error(message);
       }
+      if (result.value.keptInStaging.length > 0) {
+        const notice = keptInStagingMessage(result.value.keptInStaging);
+        addRecoveryNotice(recoveryKey, notice);
+      }
       if (requested.disposition === "trash" && result.value.trashUnavailable.length > 0) {
         setPendingDiscard({
           paths: result.value.trashUnavailable,
@@ -581,7 +614,7 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(keptAfterPermanentDiscard(result.value.trashUnavailable));
       }
     });
-  }, [cwd, discard, environmentId, pendingDiscard]);
+  }, [addRecoveryNotice, cwd, discard, environmentId, pendingDiscard, recoveryKey]);
   const handleOpenExternal = useCallback(
     (path: string) => {
       if (availableEditors.length === 0) return;
@@ -840,6 +873,28 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         <p aria-live="polite" className="border-t border-border px-3 py-2 text-xs text-destructive">
           {mutationError}
         </p>
+      )}
+      {recoveryNotices.length === 0 ? null : (
+        <div
+          aria-live="polite"
+          className="flex items-start gap-2 border-t border-border px-3 py-2 text-xs text-foreground"
+          role="status"
+        >
+          <div className="min-w-0 flex-1 space-y-1">
+            {recoveryNotices.map((notice) => (
+              <p key={notice}>{notice}</p>
+            ))}
+          </div>
+          <Button
+            aria-label="Dismiss"
+            size="icon-xs"
+            title="Dismiss"
+            variant="ghost"
+            onClick={() => dismissRecoveryNotices(recoveryKey)}
+          >
+            <XIcon aria-hidden="true" className="size-3.5" />
+          </Button>
+        </div>
       )}
       <GitManagerCommitPane>
         <GitManagerCommitBox

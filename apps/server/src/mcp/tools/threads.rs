@@ -812,6 +812,8 @@ impl ToolCall<'_> {
             "hasPendingApprovals": thread.pending_approval_count > 0,
             "hasPendingUserInput": thread.pending_user_input_count > 0,
             "session": page.session,
+            // The delivery that holds the thread back and why (#273); null when none does.
+            "failedDelivery": page.failed_delivery,
             "messages": page.messages,
             "queuedMessages": page.queued,
             "queuedCount": page.queued_count,
@@ -1359,18 +1361,28 @@ impl ToolCall<'_> {
         let thread_id = self.required("threadId")?.to_owned();
         self.thread(&thread_id).await?;
         let turn_count = match self.integer("turnCount")? {
-            // A turn not captured has no diff, as for revert: refused, typed, before any read.
+            // A turn not captured has no diff, as for revert, and neither has one captured
+            // without a trusted baseline (which is still a revert target): refused, typed,
+            // before any read.
             Some(count) if count >= 1 => {
-                if checkpoint_status(self.control.repositories(), &thread_id, count)
+                let checkpoint = self
+                    .control
+                    .repositories()
+                    .get_checkpoint(thread_id.clone(), count)
                     .await
                     .map_err(storage_failure)?
-                    .as_deref()
-                    != Some("ready")
-                {
-                    return Err(typed_tool_failure(
-                        "McpNoTurnDiffError",
-                        &crate::production::orchestration_effects::uncaptured_diff_detail(count),
-                    ));
+                    .filter(|checkpoint| checkpoint.status == "ready");
+                let refusal = match checkpoint {
+                    None => Some(
+                        crate::production::orchestration_effects::uncaptured_diff_detail(count),
+                    ),
+                    Some(checkpoint) if !checkpoint.diff_available => Some(
+                        crate::production::orchestration_effects::no_baseline_diff_detail(count),
+                    ),
+                    Some(_) => None,
+                };
+                if let Some(detail) = refusal {
+                    return Err(typed_tool_failure("McpNoTurnDiffError", &detail));
                 }
                 count
             }
@@ -1477,7 +1489,7 @@ fn upload_ids(command: &Value) -> impl Iterator<Item = &str> {
 }
 
 /// The highest turn count with a checkpoint on `thread_id`: any recorded one (what a revert
-/// counts from), or only a captured one when `captured` (what has a diff to read).
+/// counts from), or only one captured with its diff when `captured` (what has a diff to read).
 async fn latest_checkpoint(
     repositories: &Repositories,
     thread_id: &str,
@@ -1489,7 +1501,7 @@ async fn latest_checkpoint(
         .call(move |connection| {
             connection
                 .query_row(
-                    "SELECT MAX(checkpoint_turn_count) FROM projection_turns WHERE thread_id = ? AND (? = 0 OR checkpoint_status = 'ready')",
+                    "SELECT MAX(checkpoint_turn_count) FROM projection_turns WHERE thread_id = ? AND (? = 0 OR (checkpoint_status = 'ready' AND checkpoint_diff_available = 1))",
                     params![thread_id, captured],
                     |row| row.get::<_, Option<i64>>(0),
                 )
@@ -1593,7 +1605,7 @@ pub(crate) fn derive_status(
 pub(crate) fn thread_summary(thread: &Value) -> Value {
     let session_status = thread["session"]["status"].as_str();
     let turn_state = thread["latestTurn"]["state"].as_str();
-    json!({
+    let mut summary = json!({
         "threadId": thread["id"],
         "projectId": thread["projectId"],
         "title": thread["title"],
@@ -1617,13 +1629,21 @@ pub(crate) fn thread_summary(thread: &Value) -> Value {
         "interactionMode": thread["interactionMode"],
         "branch": thread["branch"],
         "hostThreadId": thread.get("hostThreadId"),
+        // The agent that created it and why; null for a person's thread.
+        "requester": thread.get("requester").cloned().unwrap_or(Value::Null),
         "archived": !thread["archivedAt"].is_null(),
         "updatedAt": thread["updatedAt"],
-    })
+    });
+    if thread["sideChat"] == true {
+        summary["sideChat"] = json!(true);
+    }
+    summary
 }
 
 pub(crate) struct MessagePage {
     pub(crate) session: Value,
+    /// `{ messageId, detail }` of the thread's oldest failed or uncertain delivery, or null.
+    pub(crate) failed_delivery: Value,
     pub(crate) messages: Vec<Value>,
     pub(crate) queued: Vec<Value>,
     pub(crate) queued_count: i64,
@@ -1644,9 +1664,28 @@ fn message_cursor(message: &Value) -> String {
     )
 }
 
+/// The thread's oldest failed or uncertain delivery, which holds back its later messages, as
+/// `(messageId, detail)`; with `message_id`, only that message's. It is read from the outbox, so
+/// it needs no session row.
+pub(crate) fn oldest_failed_delivery(
+    connection: &rusqlite::Connection,
+    thread_id: &str,
+    message_id: Option<&str>,
+) -> rusqlite::Result<Option<(String, Option<String>)>> {
+    connection
+        .query_row(
+            "SELECT message_id, last_error FROM provider_turn_outbox
+              WHERE thread_id = ?1 AND (?2 IS NULL OR message_id = ?2) AND state IN ('failed', 'uncertain')
+              ORDER BY created_at ASC, command_id ASC LIMIT 1",
+            params![thread_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+}
+
 /// One keyset page of a thread's delivered messages, newest `limit` before `before`, in one
-/// SQLite job, plus the session and at most 20 queued messages. Each text is cut at
-/// [`MESSAGE_TEXT_CHARS`] in SQL.
+/// SQLite job, plus the session, the oldest failed delivery and at most 20 queued messages. Each
+/// text is cut at [`MESSAGE_TEXT_CHARS`] in SQL.
 pub(crate) async fn read_message_page(
     repositories: &Repositories,
     thread_id: &str,
@@ -1728,6 +1767,10 @@ pub(crate) async fn read_message_page(
                 [&thread_id],
                 |row| row.get(0),
             )?;
+            let failed_delivery = oldest_failed_delivery(connection, &thread_id, None)?
+                .map_or(Value::Null, |(message_id, detail)| {
+                    json!({ "messageId": message_id, "detail": detail })
+                });
             let latest_turn_state = connection
                 .query_row(
                     "SELECT turn.state FROM projection_threads AS thread
@@ -1739,6 +1782,7 @@ pub(crate) async fn read_message_page(
                 .optional()?;
             Ok(MessagePage {
                 session,
+                failed_delivery,
                 messages,
                 queued,
                 queued_count,
@@ -1886,6 +1930,16 @@ mod tests {
     fn the_thread_list_does_not_promise_a_queued_status() {
         let (list, _) = tool_text("list_projects_and_threads");
         assert!(!list.contains("queued"), "{list}");
+    }
+
+    /// `list_projects_and_threads` and `list_chat_panels` mark a side chat (#265), and only one.
+    #[test]
+    fn a_thread_summary_marks_only_a_side_chat() {
+        let panel = json!({"id":"p","kind":"panel","hostThreadId":"h"});
+        assert!(thread_summary(&panel).get("sideChat").is_none());
+        let side_chat = json!({"id":"s","kind":"panel","hostThreadId":"h","sideChat":true});
+        assert_eq!(thread_summary(&side_chat)["sideChat"], json!(true));
+        assert_eq!(thread_summary(&side_chat)["hostThreadId"], json!("h"));
     }
 
     #[test]

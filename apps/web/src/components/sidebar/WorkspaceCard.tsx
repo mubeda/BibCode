@@ -456,19 +456,20 @@ export function WorkspaceCardSessionLine(props: {
   );
 }
 
-/** Other chats open in this checkout, until the server links chats to their host thread. */
+/** Other chats open in this checkout: the label of `WorkspaceMoreChats`'s button. */
 export function WorkspaceCardMoreChats(props: {
   readonly count: number;
   readonly status: WorkspaceCardStatus;
 }) {
+  // Spans only: it is the label of the button that lists the chats.
   return (
-    <div className="flex h-5 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+    <span className="flex h-5 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
       <span className="flex w-4 shrink-0 items-center justify-center">
         <WorkspaceCardStatusGlyph status={props.status} />
       </span>
       <span className="truncate">
         {props.count === 1 ? "1 more chat" : `${props.count} more chats`}
       </span>
-    </div>
+    </span>
   );
 }

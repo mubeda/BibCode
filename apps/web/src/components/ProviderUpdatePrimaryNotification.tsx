@@ -4,7 +4,7 @@ import { DownloadIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { type ProviderDriverKind, type ProviderInstanceId } from "@bibcode/contracts";
 
-import { primaryServerProvidersAtom, serverEnvironment } from "../state/server";
+import { primaryUpdateSubjectsAtom, serverEnvironment } from "../state/server";
 import { usePrimaryEnvironment } from "../state/environments";
 import { useDismissedProviderUpdateNotificationKeys } from "../providerUpdateDismissal";
 import { PROVIDER_ICON_BY_PROVIDER } from "./chat/providerIconUtils";
@@ -109,7 +109,7 @@ function isTerminalProviderUpdateToastView(view: ProviderUpdateToastView) {
  */
 export function ProviderUpdatePrimaryNotification() {
   const navigate = useNavigate();
-  const providers = useAtomValue(primaryServerProvidersAtom);
+  const providers = useAtomValue(primaryUpdateSubjectsAtom);
   const primaryEnvironment = usePrimaryEnvironment();
   const updateProvider = useAtomCommand(serverEnvironment.updateProvider, {
     reportFailure: false,

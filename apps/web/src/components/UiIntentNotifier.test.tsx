@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { RegistryContext } from "@effect/atom-react";
+import type { PendingUiIntent } from "@bibcode/client-runtime/state/uiIntents";
 import { EnvironmentId, ThreadId, type UiFocusIntent } from "@bibcode/contracts";
 import { AsyncResult } from "effect/reactivity";
 import { act } from "react";
@@ -21,6 +22,8 @@ const h = vi.hoisted(() => ({
   selectCompareFile: vi.fn(),
   environments: [] as Array<{ environmentId: string }>,
   shells: {} as Record<string, { title: string; hostThreadId?: string }>,
+  // Threads the capped shell left out, which the resolver finds on the server (#223).
+  serverShells: {} as Record<string, { title: string; hostThreadId?: string }>,
 }));
 vi.mock("./ui/toast", () => ({
   stackedThreadToast: (options: unknown) => options,
@@ -34,6 +37,10 @@ vi.mock("./ui/toast", () => ({
 }));
 vi.mock("~/state/entities", () => ({
   readThreadShell: (ref: { threadId: string }) => h.shells[ref.threadId] ?? null,
+  resolveThreadShell: async (ref: { threadId: string }) => {
+    const thread = h.shells[ref.threadId] ?? h.serverShells[ref.threadId];
+    return thread === undefined ? { kind: "unknown" } : { kind: "resolved", thread };
+  },
 }));
 vi.mock("~/state/environments", () => ({
   useEnvironments: () => ({ environments: h.environments }),
@@ -71,8 +78,10 @@ function fakeRegistry() {
   };
 }
 
+type PendingFocusIntent = PendingUiIntent & UiFocusIntent;
+
 let sequence = 0;
-function intent(overrides: Partial<UiFocusIntent> = {}): UiFocusIntent {
+function intent(overrides: Partial<PendingFocusIntent> = {}): PendingFocusIntent {
   sequence += 1;
   return {
     kind: "focus",
@@ -84,6 +93,7 @@ function intent(overrides: Partial<UiFocusIntent> = {}): UiFocusIntent {
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     expiresInMs: 60_000,
+    deadline: Date.now() + 60_000,
     ...overrides,
   };
 }
@@ -104,7 +114,7 @@ async function mount(registry: ReturnType<typeof fakeRegistry>) {
   );
 }
 
-const emit = (registry: ReturnType<typeof fakeRegistry>, intents: UiFocusIntent[]) =>
+const emit = (registry: ReturnType<typeof fakeRegistry>, intents: PendingFocusIntent[]) =>
   act(async () => registry.emit(`intents:${environmentId}`, AsyncResult.success(intents)));
 
 beforeEach(() => {
@@ -166,6 +176,17 @@ describe("UiIntentNotifier", () => {
     );
   });
 
+  it("times the notice from this client's deadline, not the server's clock", async () => {
+    const registry = fakeRegistry();
+    await mount(registry);
+    // The server's clock runs an hour behind this one: its expiresAt is already past here.
+    await emit(registry, [intent({ expiresAt: new Date(Date.now() - 3_600_000).toISOString() })]);
+
+    expect(h.toasts).toHaveLength(1);
+    expect(h.toasts[0]?.timeout).toBeGreaterThan(59_000);
+    expect(h.toasts[0]?.timeout).toBeLessThanOrEqual(60_000);
+  });
+
   it("shows a chat panel's surface on its host, with the panel's tab active", async () => {
     h.shells = { panel: { title: "Review", hostThreadId: "host" } };
     const registry = fakeRegistry();
@@ -182,15 +203,26 @@ describe("UiIntentNotifier", () => {
     expect(h.selectCompareFile).toHaveBeenCalledWith(host, "a.ts");
   });
 
+  it("routes a left-out panel to its host (#223)", async () => {
+    h.shells = {};
+    h.serverShells = { panel: { title: "Older review", hostThreadId: "host" } };
+    const registry = fakeRegistry();
+    await mount(registry);
+    await emit(registry, [intent({ threadId: ThreadId.make("panel"), surface: "thread" })]);
+    await act(async () => h.toasts[0]?.actionProps?.onClick());
+
+    const host = { environmentId, threadId: "host" };
+    expect(navigate).toHaveBeenCalledWith({ to: "/$environmentId/$threadId", params: host });
+    expect(h.openChatPanel).toHaveBeenCalledWith(host, "panel");
+    h.serverShells = {};
+  });
+
   it("skips an expired intent and holds one for a hidden window until it is shown", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
     try {
       const registry = fakeRegistry();
       await mount(registry);
-      await emit(registry, [
-        intent({ expiresAt: new Date(Date.now() - 1).toISOString() }),
-        intent({ surface: "thread" }),
-      ]);
+      await emit(registry, [intent({ deadline: Date.now() - 1 }), intent({ surface: "thread" })]);
       expect(h.toasts).toHaveLength(0);
 
       visibility.mockReturnValue("visible");

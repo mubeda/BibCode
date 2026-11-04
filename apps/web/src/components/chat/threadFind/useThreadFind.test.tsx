@@ -61,6 +61,7 @@ vi.mock("../../../state/threads", async () => {
         },
         () => h.loadState,
       ),
+    useThreadOlderHistory: () => null,
   };
 });
 

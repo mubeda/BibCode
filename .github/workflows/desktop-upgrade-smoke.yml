@@ -35,6 +35,7 @@ jobs:
               arch: arm64,
               bundle: appimage,
               jobTimeoutMinutes: 240,
+              harnessTimeoutMinutes: 225,
             }
           - {
               label: Linux x64 AppImage,
@@ -43,6 +44,7 @@ jobs:
               arch: x64,
               bundle: appimage,
               jobTimeoutMinutes: 240,
+              harnessTimeoutMinutes: 225,
             }
           - {
               label: Windows arm64 NSIS,
@@ -51,6 +53,7 @@ jobs:
               arch: arm64,
               bundle: nsis,
               jobTimeoutMinutes: 240,
+              harnessTimeoutMinutes: 225,
             }
           - {
               label: Windows x64 NSIS,
@@ -59,6 +62,7 @@ jobs:
               arch: x64,
               bundle: nsis,
               jobTimeoutMinutes: 240,
+              harnessTimeoutMinutes: 225,
             }
           - {
               label: macOS arm64,
@@ -67,8 +71,9 @@ jobs:
               arch: arm64,
               bundle: dmg,
               jobTimeoutMinutes: 360,
+              harnessTimeoutMinutes: 345,
             }
-          # Three cold 90-minute builds + three 10-minute installs + setup and all upgrade lanes.
+          # Three 90-minute builds sharing one Cargo target + three 10-minute installs + setup and lanes.
           - {
               label: macOS x64,
               runner: macos-26-intel,
@@ -76,6 +81,7 @@ jobs:
               arch: x64,
               bundle: dmg,
               jobTimeoutMinutes: 360,
+              harnessTimeoutMinutes: 345,
             }
     steps:
       - name: Checkout complete release history
@@ -177,6 +183,8 @@ jobs:
           New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 4 | Out-Null
 
       - name: Run previous-stable, protected-baseline, and remote-install upgrades
+        # Ends the harness before the job deadline so the always-run evidence upload still runs.
+        timeout-minutes: ${{ matrix.harnessTimeoutMinutes }}
         shell: bash
         run: |
           set -euo pipefail

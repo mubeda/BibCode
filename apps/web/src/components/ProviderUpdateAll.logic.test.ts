@@ -26,6 +26,7 @@ import {
   type ProviderUpdateCommandResult,
   type ServerUpdateInput,
 } from "./ProviderUpdateAll.logic";
+import { updateSubjects } from "@bibcode/client-runtime/state/server-tools";
 import type { ProviderUpdateCandidate } from "./ProviderUpdateLaunchNotification.logic";
 
 const codex = ProviderDriverKind.make("codex");
@@ -122,6 +123,50 @@ const manualServer = serverUpdate({
 type Published = [EnvironmentId, ProviderUpdateAllSubject, ProviderUpdateAllStatus, string | null];
 
 describe("planProviderUpdates", () => {
+  it("updates a tool next to the providers of an environment that reports it, and only there", () => {
+    const tool = {
+      toolId: "codegraph",
+      displayName: "CodeGraph",
+      installed: true,
+      version: "1.6.2",
+      checkedAt: "2026-11-02T00:00:00.000Z",
+      versionAdvisory: {
+        status: "behind_latest" as const,
+        currentVersion: "1.6.2",
+        latestVersion: "1.6.3",
+        updateCommand: "codegraph upgrade",
+        canUpdate: true,
+        checkedAt: null,
+        message: null,
+      },
+    };
+    const plan = planProviderUpdates([
+      {
+        environmentId: local,
+        label: "macOS",
+        connected: true,
+        providers: updateSubjects({ providers: [provider({ driver: codex })], tools: [tool] }),
+      },
+      {
+        // An older server reports no tools key, so nothing is ever sent to it for CodeGraph.
+        environmentId: ssh,
+        label: "devbox",
+        connected: true,
+        providers: updateSubjects({ providers: [provider({ driver: codex })] }),
+      },
+    ]);
+
+    expect(
+      plan.environments.map((environment) => ({
+        environmentId: environment.environmentId,
+        updates: environment.updates.map((candidate) => String(candidate.driver)),
+      })),
+    ).toEqual([
+      { environmentId: local, updates: ["codex", "codegraph"] },
+      { environmentId: ssh, updates: ["codex"] },
+    ]);
+  });
+
   it("includes every connected environment with one-click updates, remote ones too", () => {
     const plan = planProviderUpdates([
       {

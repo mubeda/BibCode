@@ -26,6 +26,7 @@ interface WorkflowStep {
   readonly if?: string;
   readonly name?: string;
   readonly run?: string;
+  readonly "timeout-minutes"?: number | string;
   readonly shell?: string;
   readonly uses?: string;
   readonly with?: Record<string, unknown>;
@@ -776,6 +777,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         arch: "arm64",
         bundle: "appimage",
         jobTimeoutMinutes: 240,
+        harnessTimeoutMinutes: 225,
       },
       {
         label: "Linux x64 AppImage",
@@ -784,6 +786,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         arch: "x64",
         bundle: "appimage",
         jobTimeoutMinutes: 240,
+        harnessTimeoutMinutes: 225,
       },
       {
         label: "Windows arm64 NSIS",
@@ -792,6 +795,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         arch: "arm64",
         bundle: "nsis",
         jobTimeoutMinutes: 240,
+        harnessTimeoutMinutes: 225,
       },
       {
         label: "Windows x64 NSIS",
@@ -800,6 +804,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         arch: "x64",
         bundle: "nsis",
         jobTimeoutMinutes: 240,
+        harnessTimeoutMinutes: 225,
       },
       {
         label: "macOS arm64",
@@ -808,6 +813,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         arch: "arm64",
         bundle: "dmg",
         jobTimeoutMinutes: 360,
+        harnessTimeoutMinutes: 345,
       },
       {
         label: "macOS x64",
@@ -816,6 +822,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         arch: "x64",
         bundle: "dmg",
         jobTimeoutMinutes: 360,
+        harnessTimeoutMinutes: 345,
       },
     ]);
   });
@@ -827,9 +834,19 @@ describe("seeded packaged desktop upgrade contract", () => {
     const intel = smoke.strategy?.matrix?.include?.find(
       (row) => row.platform === "mac" && row.arch === "x64",
     );
-    // Three separate Cargo outputs, three bounded frozen installs, plus an hour
+    // Three bounded builds into one shared Cargo target, three bounded frozen installs, plus an hour
     // for setup, runtime verification, evidence retention, and cleanup.
     expect(intel?.jobTimeoutMinutes).toBe(3 * 90 + 3 * 10 + 60);
+    // The harness step ends 15 minutes before the job so setup overruns still leave the
+    // always-run evidence upload time to collect build-timings.txt.
+    const harness = smoke.steps?.find(
+      (step) =>
+        step.name === "Run previous-stable, protected-baseline, and remote-install upgrades",
+    );
+    expect(harness?.["timeout-minutes"]).toBe("${{ matrix.harnessTimeoutMinutes }}");
+    for (const row of smoke.strategy?.matrix?.include ?? []) {
+      expect(row.harnessTimeoutMinutes, String(row.label)).toBe(Number(row.jobTimeoutMinutes) - 15);
+    }
     expect(requireJob(workflow, "windows_wsl_upgrade_smoke")["timeout-minutes"]).toBe(240);
     expect(smoke.steps?.map((step) => step.name)).toEqual([
       "Checkout complete release history",

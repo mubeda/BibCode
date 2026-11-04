@@ -8,6 +8,7 @@ mod process;
 mod repository;
 mod status_owner;
 mod summary;
+pub mod system_line_endings;
 mod version;
 mod watcher;
 mod worktree;

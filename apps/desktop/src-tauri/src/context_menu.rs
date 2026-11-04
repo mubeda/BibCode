@@ -311,7 +311,7 @@ fn normalize_context_menu_entry(
         bool_property(object, "disabled"),
         string_property(object, "description"),
     ) {
-        (true, Some(reason)) if !reason.trim().is_empty() => format!("{base_label} — {reason}"),
+        (true, Some(reason)) if !reason.trim().is_empty() => format!("{base_label}: {reason}"),
         _ => base_label.to_string(),
     };
     let children = object
@@ -457,7 +457,7 @@ mod tests {
         })]);
         assert_eq!(
             item(&disabled.items[0]).label,
-            "Pull — Workspace is unavailable."
+            "Pull: Workspace is unavailable."
         );
     }
 

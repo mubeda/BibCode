@@ -52,7 +52,7 @@ describe("PullRequestsMarkdown", () => {
     );
     expect(html).toContain('href="https://gitlab.example/group/repo/uploads/shot.png"');
     expect(html).toContain('href="https://gitlab.example/group/repo/-/issues/1"');
-    expect(html).toContain("image: raw — open in browser");
+    expect(html).toContain("image: raw (open in browser)");
     expect(html).not.toContain("<img");
     expect(html).not.toContain("onerror");
   });
@@ -71,7 +71,7 @@ describe("PullRequestsMarkdown", () => {
     const html = renderToStaticMarkup(
       <PullRequestsMarkdown text="![shot](https://user-images.githubusercontent.com/x.png)" />,
     );
-    expect(html).toContain("image: shot — open in browser");
+    expect(html).toContain("image: shot (open in browser)");
     expect(html).toContain('href="https://user-images.githubusercontent.com/x.png"');
     expect(html).not.toContain("<img");
   });

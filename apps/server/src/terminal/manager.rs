@@ -41,6 +41,15 @@ use crate::{
 };
 
 const DEFAULT_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// A childless terminal with no input or output is quiet after this many unchanged samples.
+const QUIET_AFTER_UNCHANGED_SAMPLES: u32 = 2;
+/// A quiet terminal is still sampled once per this many ticks, which bounds how late a child
+/// that starts and prints nothing is reported (#232; 10 s chosen by the user on 2026-11-01).
+const QUIET_RESAMPLE_TICKS: u32 = 10;
+/// How long the activity tick waits for one terminal's publication and session locks before
+/// retrying it on the next tick, so a terminal held by a slow close, restart or worktree removal
+/// cannot stall the others.
+const ACTIVITY_PUBLICATION_WAIT: Duration = Duration::from_millis(100);
 const OBSERVER_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// A hard stop for a preparer that asks to be waited for too long. It sits above every provider's
 /// own budget plus the supervisor's slack (a test holds it there), so it never cuts a provider
@@ -70,11 +79,16 @@ pub struct SubprocessInspection {
     pub process_ids: Vec<u32>,
 }
 
+/// One process-table snapshot's answer, keyed by terminal pid. An absent pid has no running
+/// child.
+pub type SubprocessInspections = HashMap<u32, SubprocessInspection>;
+
 pub trait TerminalSubprocessInspector: std::fmt::Debug + Send + Sync {
+    /// Answers every listed terminal from one snapshot of the process table.
     fn inspect(
         &self,
-        terminal_pid: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspection, String>> + Send + '_>>;
+        terminal_pids: Vec<u32>,
+    ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspections, String>> + Send + '_>>;
 }
 
 pub(crate) type TerminalProcessExitCallback =
@@ -88,11 +102,12 @@ struct NativeTerminalSubprocessInspector {
 impl TerminalSubprocessInspector for NativeTerminalSubprocessInspector {
     fn inspect(
         &self,
-        terminal_pid: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspection, String>> + Send + '_>> {
+        terminal_pids: Vec<u32>,
+    ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspections, String>> + Send + '_>> {
         Box::pin(async move {
-            if terminal_pid == 0 {
-                return Ok(SubprocessInspection::default());
+            let mut inspections = SubprocessInspections::new();
+            if terminal_pids.iter().all(|pid| *pid == 0) {
+                return Ok(inspections);
             }
 
             let rows = self
@@ -100,21 +115,27 @@ impl TerminalSubprocessInspector for NativeTerminalSubprocessInspector {
                 .sample()
                 .await
                 .map_err(|error| error.to_string())?;
-            let descendants = build_descendant_entries(&rows, terminal_pid);
-            let Some(first_child) = descendants.iter().find(|entry| entry.depth == 0) else {
-                return Ok(SubprocessInspection::default());
-            };
+            for terminal_pid in terminal_pids.into_iter().filter(|pid| *pid != 0) {
+                let descendants = build_descendant_entries(&rows, terminal_pid);
+                let Some(first_child) = descendants.iter().find(|entry| entry.depth == 0) else {
+                    continue;
+                };
 
-            let mut process_ids = Vec::with_capacity(descendants.len() + 1);
-            process_ids.push(terminal_pid);
-            process_ids.extend(descendants.iter().map(|entry| entry.pid));
+                let mut process_ids = Vec::with_capacity(descendants.len() + 1);
+                process_ids.push(terminal_pid);
+                process_ids.extend(descendants.iter().map(|entry| entry.pid));
 
-            Ok(SubprocessInspection {
-                has_running_subprocess: true,
-                child_command_label: normalize_child_command_name(&first_child.command)
-                    .map(|label| truncate_terminal_label(&label)),
-                process_ids,
-            })
+                inspections.insert(
+                    terminal_pid,
+                    SubprocessInspection {
+                        has_running_subprocess: true,
+                        child_command_label: normalize_child_command_name(&first_child.command)
+                            .map(|label| truncate_terminal_label(&label)),
+                        process_ids,
+                    },
+                );
+            }
+            Ok(inspections)
         })
     }
 }
@@ -399,7 +420,11 @@ impl TerminalSessionIdentity {
             });
         }
         drop(session);
-        self.generation.writer.enqueue(&self.process, data, true)
+        let pending = self.generation.writer.enqueue(&self.process, data, true)?;
+        self.generation
+            .activity_wake
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(pending)
     }
 }
 
@@ -1188,6 +1213,9 @@ struct SessionGeneration {
     output_started: std::sync::atomic::AtomicBool,
     output_stop: CancellationToken,
     output_completed: CancellationToken,
+    /// Input, output, resize or attach since the shared activity tick last looked; the next
+    /// tick samples this terminal even when it is quiet.
+    activity_wake: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     activity_completed: CancellationToken,
     #[cfg(test)]
@@ -1212,6 +1240,7 @@ impl SessionGeneration {
             output_started: std::sync::atomic::AtomicBool::new(false),
             output_stop: CancellationToken::new(),
             output_completed: CancellationToken::new(),
+            activity_wake: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             activity_completed: CancellationToken::new(),
             #[cfg(test)]
@@ -1621,6 +1650,62 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// What one terminal's sample did.
+enum ActivitySample {
+    /// The terminal is no longer the running process its poll was registered for.
+    Ended,
+    /// Its publication lock stayed busy; the terminal is sampled again next tick.
+    Busy,
+    Unchanged,
+    Changed,
+}
+
+/// The running terminals the shared activity tick samples, and whether that tick's task runs.
+#[derive(Default)]
+struct ActivityPolls {
+    terminals: Vec<ActivityPoll>,
+    ticking: bool,
+}
+
+/// One running terminal's place in the shared activity tick (#232).
+struct ActivityPoll {
+    session: SharedSession,
+    generation: Arc<SessionGeneration>,
+    pid: u32,
+    has_child: bool,
+    unchanged: u32,
+    skipped: u32,
+    ended: bool,
+    #[cfg(test)]
+    _completion: CancelOnDrop,
+}
+
+impl ActivityPoll {
+    fn is_live(&self) -> bool {
+        !self.ended && !self.generation.cancellation.is_cancelled()
+    }
+
+    /// Whether this tick samples the terminal: always while a child runs or after input or
+    /// output, otherwise until it has been unchanged twice, then once every 10 ticks.
+    fn take_due(&mut self) -> bool {
+        if self
+            .generation
+            .activity_wake
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.unchanged = 0;
+        }
+        self.skipped += 1;
+        let due = self.has_child
+            || self.unchanged < QUIET_AFTER_UNCHANGED_SAMPLES
+            || self.skipped >= QUIET_RESAMPLE_TICKS;
+        if due {
+            self.skipped = 0;
+        }
+        due
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct PublisherBarrier {
@@ -1743,6 +1828,7 @@ struct Inner {
     attribution: ProcessAttributionRegistry,
     options: TerminalManagerOptions,
     inspector: Arc<dyn TerminalSubprocessInspector>,
+    activity_polls: std::sync::Mutex<ActivityPolls>,
     callback_isolation: ObserverCallbackIsolation,
     lifecycle: Mutex<()>,
     operations: SessionOperationRegistry,
@@ -1805,6 +1891,7 @@ impl TerminalManager {
                 attribution,
                 options,
                 inspector,
+                activity_polls: std::sync::Mutex::default(),
                 callback_isolation: ObserverCallbackIsolation::default(),
                 lifecycle: Mutex::new(()),
                 operations: SessionOperationRegistry::default(),
@@ -2662,6 +2749,9 @@ impl TerminalManager {
                 // Reads already waiting are published together: one lock and one event per
                 // batch instead of per read keeps the publisher ahead of a program that writes
                 // in many small pieces.
+                output_generation
+                    .activity_wake
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let mut data = data;
                 let mut lagged = false;
                 while data.len() < MAX_COALESCED_OUTPUT_BYTES {
@@ -2763,72 +2853,174 @@ impl TerminalManager {
 
         Self::mirror_agent_status(&inner, &session, &generation);
 
-        let activity_cancel = inner.cancellation.child_token();
-        let activity_session = session;
-        let activity_inner = inner.clone();
-        let activity_pid = process.pid();
-        let activity_generation = generation;
-        tokio::spawn(async move {
+        Self::register_activity_poll(&inner, session, process.pid(), generation);
+    }
+
+    /// Adds a started terminal to the shared activity tick, starting the tick's task if none
+    /// runs. A zero poll interval disables activity polling.
+    fn register_activity_poll(
+        inner: &Arc<Inner>,
+        session: SharedSession,
+        pid: u32,
+        generation: Arc<SessionGeneration>,
+    ) {
+        #[cfg(test)]
+        let completion = CancelOnDrop(generation.activity_completed.clone());
+        if inner.options.subprocess_poll_interval.is_zero() {
+            return;
+        }
+        let mut polls = inner
+            .activity_polls
+            .lock()
+            .expect("terminal activity polls");
+        polls.terminals.push(ActivityPoll {
+            session,
+            generation,
+            pid,
+            has_child: false,
+            unchanged: 0,
+            skipped: 0,
+            ended: false,
             #[cfg(test)]
-            let _completion = CancelOnDrop(activity_generation.activity_completed.clone());
-            if activity_inner.options.subprocess_poll_interval.is_zero() {
-                return;
-            }
-            loop {
-                tokio::select! {
-                    () = activity_cancel.cancelled() => return,
-                    () = activity_generation.cancellation.cancelled() => return,
-                    () = tokio::time::sleep(activity_inner.options.subprocess_poll_interval) => {}
-                }
+            _completion: completion,
+        });
+        if !std::mem::replace(&mut polls.ticking, true) {
+            // The first tick is due one interval from now, not from when the task first runs.
+            let interval = inner.options.subprocess_poll_interval;
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tokio::spawn(Self::run_activity_ticks(inner.clone(), ticks));
+        }
+    }
 
-                let inspection = match activity_inner.inspector.inspect(activity_pid).await {
-                    Ok(inspection) => inspection,
-                    Err(error) => {
-                        tracing::debug!(%error, pid = activity_pid, "failed to inspect terminal subprocess state");
-                        continue;
-                    }
-                };
-
-                let _publication = activity_generation.publication.lock().await;
-                if activity_generation.is_invalidated() {
+    /// The shared activity tick: one process-table snapshot per interval answers every terminal
+    /// that needs a sample, and the task ends when no running terminal is left (#232).
+    async fn run_activity_ticks(inner: Arc<Inner>, mut ticks: tokio::time::Interval) {
+        loop {
+            tokio::select! {
+                () = inner.cancellation.cancelled() => {
+                    inner.activity_polls.lock().expect("terminal activity polls").terminals.clear();
                     return;
                 }
-                let activity = {
-                    let mut session = activity_session.lock().await;
-                    if session.status != TerminalStatus::Running
-                        || session.pid != Some(activity_pid)
-                    {
-                        return;
-                    }
-                    if session.has_running_subprocess == inspection.has_running_subprocess
-                        && session.child_command_label == inspection.child_command_label
-                    {
-                        None
-                    } else {
-                        session.has_running_subprocess = inspection.has_running_subprocess;
-                        session.child_command_label = inspection.child_command_label.clone();
-                        let sequence = session.advance();
-                        Some((
-                            TerminalEvent::Activity {
-                                thread_id: session.thread_id.clone(),
-                                terminal_id: session.terminal_id.clone(),
-                                sequence,
-                                has_running_subprocess: session.has_running_subprocess,
-                                label: session.display_label(),
-                            },
-                            session.summary(),
-                        ))
-                    }
-                };
+                _ = ticks.tick() => {}
+            }
+            // Taken out for the tick; terminals started meanwhile are appended after it.
+            let mut terminals = {
+                let mut polls = inner
+                    .activity_polls
+                    .lock()
+                    .expect("terminal activity polls");
+                polls.terminals.retain(ActivityPoll::is_live);
+                if polls.terminals.is_empty() {
+                    polls.ticking = false;
+                    return;
+                }
+                std::mem::take(&mut polls.terminals)
+            };
+            Self::activity_tick(&inner, &mut terminals).await;
+            terminals.retain(ActivityPoll::is_live);
+            let mut polls = inner
+                .activity_polls
+                .lock()
+                .expect("terminal activity polls");
+            terminals.append(&mut polls.terminals);
+            polls.terminals = terminals;
+        }
+    }
 
-                if let Some((event, summary)) = activity {
-                    let _ = activity_inner.events.send(event);
-                    let _ = activity_inner.metadata.send(TerminalMetadataEvent::Upsert {
-                        terminal: Box::new(summary),
-                    });
+    async fn activity_tick(inner: &Arc<Inner>, terminals: &mut [ActivityPoll]) {
+        let due: Vec<usize> = (0..terminals.len())
+            .filter(|&index| terminals[index].take_due())
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let pids = due.iter().map(|&index| terminals[index].pid).collect();
+        let inspections = match inner.inspector.inspect(pids).await {
+            Ok(inspections) => inspections,
+            Err(error) => {
+                tracing::debug!(%error, "failed to inspect terminal subprocess state");
+                // Retried next tick.
+                for index in due {
+                    terminals[index].unchanged = 0;
+                }
+                return;
+            }
+        };
+        for index in due {
+            let terminal = &mut terminals[index];
+            let inspection = inspections.get(&terminal.pid).cloned().unwrap_or_default();
+            let has_child = inspection.has_running_subprocess;
+            match Self::publish_activity(inner, terminal, inspection).await {
+                ActivitySample::Ended => terminal.ended = true,
+                ActivitySample::Busy => terminal.unchanged = 0,
+                ActivitySample::Unchanged => {
+                    terminal.has_child = has_child;
+                    terminal.unchanged = terminal.unchanged.saturating_add(1);
+                }
+                ActivitySample::Changed => {
+                    terminal.has_child = has_child;
+                    terminal.unchanged = 0;
                 }
             }
+        }
+    }
+
+    /// Publishes `Activity` when the sample changed the terminal's subprocess state.
+    async fn publish_activity(
+        inner: &Arc<Inner>,
+        terminal: &ActivityPoll,
+        inspection: SubprocessInspection,
+    ) -> ActivitySample {
+        // Close holds the publication lock through process cleanup after cancelling the
+        // generation, and worktree removal holds the session lock through filesystem checks; one
+        // terminal's locks must not hold up every other terminal's sample.
+        let deadline = tokio::time::sleep(ACTIVITY_PUBLICATION_WAIT);
+        tokio::pin!(deadline);
+        let _publication = tokio::select! {
+            biased;
+            () = terminal.generation.cancellation.cancelled() => return ActivitySample::Ended,
+            guard = terminal.generation.publication.lock() => guard,
+            () = &mut deadline => return ActivitySample::Busy,
+        };
+        if terminal.generation.is_invalidated() {
+            return ActivitySample::Ended;
+        }
+        let (event, summary) = {
+            let mut session = tokio::select! {
+                biased;
+                () = terminal.generation.cancellation.cancelled() => return ActivitySample::Ended,
+                guard = terminal.session.lock() => guard,
+                () = &mut deadline => return ActivitySample::Busy,
+            };
+            if session.status != TerminalStatus::Running || session.pid != Some(terminal.pid) {
+                return ActivitySample::Ended;
+            }
+            if session.has_running_subprocess == inspection.has_running_subprocess
+                && session.child_command_label == inspection.child_command_label
+            {
+                return ActivitySample::Unchanged;
+            }
+            session.has_running_subprocess = inspection.has_running_subprocess;
+            session.child_command_label = inspection.child_command_label;
+            let sequence = session.advance();
+            (
+                TerminalEvent::Activity {
+                    thread_id: session.thread_id.clone(),
+                    terminal_id: session.terminal_id.clone(),
+                    sequence,
+                    has_running_subprocess: session.has_running_subprocess,
+                    label: session.display_label(),
+                },
+                session.summary(),
+            )
+        };
+        let _ = inner.events.send(event);
+        let _ = inner.metadata.send(TerminalMetadataEvent::Upsert {
+            terminal: Box::new(summary),
         });
+        ActivitySample::Changed
     }
 
     /// Mirrors the generation observer's agent status into the terminal's metadata summary, so
@@ -3162,6 +3354,9 @@ impl TerminalManager {
                 terminal_id: input.terminal_id,
             });
         }
+        session_generation
+            .activity_wake
+            .store(true, std::sync::atomic::Ordering::Release);
         let size_claim = input
             .size_claim
             .map(|claim| {
@@ -3386,9 +3581,14 @@ impl TerminalManager {
             }
             // Queued without waiting; the writer's thread writes it outside this lock, after
             // any input queued before it. Dropping this future leaves the write queued.
+            let pending =
+                generation
+                    .writer
+                    .enqueue(&process.ok_or_else(not_running)?, data, false)?;
             generation
-                .writer
-                .enqueue(&process.ok_or_else(not_running)?, data, false)?
+                .activity_wake
+                .store(true, std::sync::atomic::Ordering::Release);
+            pending
         };
         pending.wait().await
     }
@@ -3447,6 +3647,9 @@ impl TerminalManager {
             != size_owner.as_ref().map(|owner| &owner.claim);
         if size_changed {
             process.resize(cols, rows).map_err(TerminalError::Io)?;
+            generation
+                .activity_wake
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         // Applying a claim consumes the grant even if no dimensions changed.
         session.first_attachment_grant_used |= size_owner.is_some();
@@ -4340,6 +4543,15 @@ pub struct TerminalMetadataAttachment {
 }
 
 impl TerminalMetadataAttachment {
+    /// An attachment fed by the caller, for a consumer's tests.
+    #[cfg(test)]
+    pub fn for_test(
+        initial: Vec<TerminalSummary>,
+        events: broadcast::Receiver<TerminalMetadataEvent>,
+    ) -> Self {
+        Self { initial, events }
+    }
+
     pub async fn recv(&mut self) -> Option<TerminalMetadataEvent> {
         loop {
             match self.events.recv().await {
@@ -6977,15 +7189,444 @@ mod tests {
     impl TerminalSubprocessInspector for ControllableSubprocessInspector {
         fn inspect(
             &self,
-            _terminal_pid: u32,
-        ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspection, String>> + Send + '_>>
+            terminal_pids: Vec<u32>,
+        ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspections, String>> + Send + '_>>
         {
             Box::pin(async move {
                 self.started.notify_one();
                 self.release.notified().await;
-                Ok(self.inspection.clone())
+                Ok(terminal_pids
+                    .into_iter()
+                    .map(|pid| (pid, self.inspection.clone()))
+                    .collect())
             })
         }
+    }
+
+    /// Records every snapshot's terminal pids and answers them from a settable child table.
+    #[derive(Debug, Default)]
+    struct CountingSubprocessInspector {
+        scans: std::sync::Mutex<Vec<Vec<u32>>>,
+        children: std::sync::Mutex<HashMap<u32, String>>,
+    }
+
+    impl CountingSubprocessInspector {
+        fn scans(&self) -> Vec<Vec<u32>> {
+            self.scans.lock().expect("scans lock").clone()
+        }
+
+        fn scan_count(&self) -> usize {
+            self.scans.lock().expect("scans lock").len()
+        }
+
+        fn set_child(&self, terminal_pid: u32, label: Option<&str>) {
+            let mut children = self.children.lock().expect("children lock");
+            match label {
+                Some(label) => children.insert(terminal_pid, label.to_owned()),
+                None => children.remove(&terminal_pid),
+            };
+        }
+    }
+
+    impl TerminalSubprocessInspector for CountingSubprocessInspector {
+        fn inspect(
+            &self,
+            mut terminal_pids: Vec<u32>,
+        ) -> Pin<Box<dyn Future<Output = Result<SubprocessInspections, String>> + Send + '_>>
+        {
+            terminal_pids.sort_unstable();
+            self.scans
+                .lock()
+                .expect("scans lock")
+                .push(terminal_pids.clone());
+            let children = self.children.lock().expect("children lock").clone();
+            Box::pin(async move {
+                Ok(terminal_pids
+                    .into_iter()
+                    .filter_map(|pid| {
+                        children.get(&pid).map(|label| {
+                            let inspection = SubprocessInspection {
+                                has_running_subprocess: true,
+                                child_command_label: Some(label.clone()),
+                                process_ids: vec![pid],
+                            };
+                            (pid, inspection)
+                        })
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    /// Opens `count` terminals (pids 1..=count) polled every `interval` by a counting inspector.
+    async fn polled_terminals(
+        count: usize,
+        interval: Duration,
+    ) -> (
+        tempfile::TempDir,
+        Arc<HistoryTestBackend>,
+        Arc<CountingSubprocessInspector>,
+        TerminalManager,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let inspector = Arc::new(CountingSubprocessInspector::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: interval,
+                subprocess_inspector: Some(inspector.clone()),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for index in 0..count {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-poll",
+                    format!("term-{index}"),
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            inspector.scan_count(),
+            0,
+            "a tick ran while terminals opened"
+        );
+        (root, backend, inspector, manager)
+    }
+
+    /// Advances paused time by `ticks` poll intervals, letting each tick finish.
+    async fn poll_ticks(ticks: usize) {
+        for _ in 0..ticks {
+            tokio::time::advance(DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// The `has_running_subprocess` of each `Activity` published since the last call, checking
+    /// that their sequences only grow.
+    fn drain_activity(events: &mut TerminalEventReceiver) -> Vec<bool> {
+        let mut activity = Vec::new();
+        let mut last_sequence = 0;
+        while let Ok(event) = events.try_recv() {
+            if let TerminalEvent::Activity {
+                sequence,
+                has_running_subprocess,
+                ..
+            } = event
+            {
+                assert!(sequence > last_sequence, "activity sequence went backwards");
+                last_sequence = sequence;
+                activity.push(has_running_subprocess);
+            }
+        }
+        activity
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_terminals_share_one_scan_per_tick() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(3, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+
+        poll_ticks(1).await;
+        assert_eq!(inspector.scans(), [vec![1, 2, 3]]);
+        poll_ticks(1).await;
+        assert_eq!(inspector.scans(), [vec![1, 2, 3], vec![1, 2, 3]]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_childless_terminal_stops_sampling_after_two_unchanged_ticks() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+
+        poll_ticks(2).await;
+        assert_eq!(inspector.scan_count(), 2);
+        poll_ticks(9).await;
+        assert_eq!(inspector.scan_count(), 2, "a quiet terminal kept sampling");
+        assert!(drain_activity(&mut events).is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_resumes_sampling_on_next_tick() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        poll_ticks(5).await;
+        assert_eq!(inspector.scan_count(), 2);
+
+        // Not awaited: waiting on the writer's thread would let paused time run ticks.
+        let writer = manager.clone();
+        let write = tokio::spawn(async move { writer.write("thread-poll", "term-0", "x").await });
+        tokio::task::yield_now().await;
+        poll_ticks(1).await;
+        assert_eq!(inspector.scan_count(), 3, "input did not resume sampling");
+        drop(write);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordered_input_resumes_sampling_on_next_tick() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        let connection = uuid::Uuid::new_v4();
+        let input_id = manager
+            .begin_input(
+                connection,
+                CancellationToken::new(),
+                "thread-poll",
+                "term-0",
+                0,
+                None,
+            )
+            .await
+            .unwrap()
+            .input_id;
+        poll_ticks(5).await;
+        assert_eq!(inspector.scan_count(), 2);
+
+        // `sleep 5` with echo off: the child starts and nothing is printed.
+        inspector.set_child(1, Some("sleep"));
+        let writer = manager.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .prepare_input_write(
+                    connection,
+                    "thread-poll",
+                    "term-0",
+                    &input_id,
+                    0,
+                    "sleep 5\r",
+                )?
+                .write()
+                .await
+        });
+        tokio::task::yield_now().await;
+        poll_ticks(1).await;
+        assert_eq!(
+            inspector.scan_count(),
+            3,
+            "ordered input did not resume sampling"
+        );
+        assert_eq!(drain_activity(&mut events), [true]);
+        drop(write);
+        manager.shutdown().await;
+    }
+
+    /// The `term-0` session's generation in a `polled_terminals` fixture.
+    async fn first_generation(manager: &TerminalManager) -> Arc<SessionGeneration> {
+        manager
+            .require_session("thread-poll", "term-0")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .generation
+            .clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closing_terminal_holding_its_publication_lock_does_not_stall_others() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        // Close holds the first terminal's publication lock through its process cleanup.
+        let closing = first_generation(&manager).await;
+        let publication = closing.publication.lock().await;
+        inspector.set_child(2, Some("sleep"));
+
+        poll_ticks(1).await;
+        closing.cancellation.cancel();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            drain_activity(&mut events),
+            [true],
+            "the other terminal waited on the closing terminal's lock"
+        );
+        poll_ticks(1).await;
+        assert_eq!(inspector.scans(), [vec![1, 2], vec![2]]);
+        drop(publication);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_terminal_publication_lock_does_not_stall_others() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        let busy = first_generation(&manager).await;
+        let publication = busy.publication.lock().await;
+        inspector.set_child(2, Some("sleep"));
+
+        poll_ticks(1).await;
+        tokio::time::sleep(DEFAULT_SUBPROCESS_POLL_INTERVAL / 2).await;
+        assert_eq!(
+            drain_activity(&mut events),
+            [true],
+            "the other terminal waited on a held lock"
+        );
+        // The busy terminal is sampled again once its lock is free.
+        drop(publication);
+        inspector.set_child(1, Some("sleep"));
+        poll_ticks(1).await;
+        assert_eq!(drain_activity(&mut events), [true]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_session_lock_does_not_stall_other_terminals() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        // Worktree removal holds a session's lock through filesystem checks.
+        let held = manager
+            .require_session("thread-poll", "term-0")
+            .await
+            .unwrap();
+        let session = held.lock().await;
+        inspector.set_child(2, Some("sleep"));
+
+        poll_ticks(1).await;
+        tokio::time::sleep(DEFAULT_SUBPROCESS_POLL_INTERVAL / 2).await;
+        assert_eq!(
+            drain_activity(&mut events),
+            [true],
+            "the other terminal waited on a held session lock"
+        );
+        // The held terminal is sampled again once its lock is free.
+        drop(session);
+        inspector.set_child(1, Some("sleep"));
+        poll_ticks(1).await;
+        assert_eq!(drain_activity(&mut events), [true]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_resumes_sampling_on_next_tick() {
+        let (_root, backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        poll_ticks(5).await;
+        assert_eq!(inspector.scan_count(), 2);
+
+        backend.latest().emit("$ ");
+        tokio::task::yield_now().await;
+        poll_ticks(1).await;
+        assert_eq!(inspector.scan_count(), 3, "output did not resume sampling");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resize_and_attach_resume_sampling_on_next_tick() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        poll_ticks(5).await;
+        assert_eq!(inspector.scan_count(), 2);
+
+        manager
+            .resize("thread-poll", "term-0", 100, 30, None)
+            .await
+            .unwrap();
+        poll_ticks(1).await;
+        assert_eq!(inspector.scan_count(), 3, "resize did not resume sampling");
+        poll_ticks(5).await;
+        assert_eq!(inspector.scan_count(), 4);
+
+        let _attachment = manager
+            .attach(TerminalAttachInput::existing("thread-poll", "term-0"))
+            .await
+            .unwrap();
+        poll_ticks(1).await;
+        assert_eq!(inspector.scan_count(), 5, "attach did not resume sampling");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_terminal_resamples_every_10_ticks() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        poll_ticks(2).await;
+
+        // A child that starts and prints nothing.
+        inspector.set_child(1, Some("sleep"));
+        poll_ticks(9).await;
+        assert_eq!(inspector.scan_count(), 2);
+        assert!(drain_activity(&mut events).is_empty());
+        poll_ticks(1).await;
+        assert_eq!(inspector.scan_count(), 3);
+        assert_eq!(drain_activity(&mut events), [true]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_child_keeps_one_second_poll_and_clears_on_exit() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(1, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        let mut events = manager.subscribe_events();
+        inspector.set_child(1, Some("sleep"));
+
+        poll_ticks(1).await;
+        assert_eq!(drain_activity(&mut events), [true]);
+        poll_ticks(10).await;
+        assert_eq!(
+            inspector.scan_count(),
+            11,
+            "a running child was not polled every tick"
+        );
+        assert!(
+            drain_activity(&mut events).is_empty(),
+            "unchanged activity was published"
+        );
+
+        inspector.set_child(1, None);
+        poll_ticks(1).await;
+        assert_eq!(drain_activity(&mut events), [false]);
+        let summary = manager
+            .require_session("thread-poll", "term-0")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .summary();
+        assert!(!summary.has_running_subprocess);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_scan_when_no_terminal_needs_a_sample() {
+        let (_root, _backend, inspector, manager) =
+            polled_terminals(2, DEFAULT_SUBPROCESS_POLL_INTERVAL).await;
+        poll_ticks(2).await;
+        assert_eq!(inspector.scan_count(), 2);
+        poll_ticks(9).await;
+        assert_eq!(
+            inspector.scan_count(),
+            2,
+            "a tick scanned for quiet terminals"
+        );
+
+        manager.close("thread-poll", None).await.unwrap();
+        poll_ticks(60).await;
+        assert_eq!(inspector.scan_count(), 2, "a tick scanned with no terminal");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_disables_polling() {
+        let (_root, _backend, inspector, manager) = polled_terminals(2, Duration::ZERO).await;
+        poll_ticks(40).await;
+        assert_eq!(inspector.scan_count(), 0);
+        manager.shutdown().await;
     }
 
     #[tokio::test]
@@ -9423,12 +10064,28 @@ mod tests {
             .await
             .unwrap();
         manager.clear("thread-unit", "term-unit").await.unwrap();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), attachment.recv())
-                .await
-                .unwrap(),
-            Some(AttachmentItem::Event(TerminalEvent::Cleared { .. }))
-        ));
+        // The write and resize above can publish output, resize, or activity events first.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match attachment.recv().await {
+                    Some(AttachmentItem::Event(TerminalEvent::Cleared { .. })) => break,
+                    Some(AttachmentItem::Event(
+                        TerminalEvent::Output { .. }
+                        | TerminalEvent::Resized { .. }
+                        | TerminalEvent::Activity { .. },
+                    )) => {}
+                    Some(AttachmentItem::Event(event)) => {
+                        panic!("expected the clear, got {event:?}")
+                    }
+                    Some(AttachmentItem::Resync { .. }) => {
+                        panic!("expected the clear, got a resync")
+                    }
+                    None => panic!("the attachment ended before the clear"),
+                }
+            }
+        })
+        .await
+        .expect("cleared event");
 
         let restarted = manager.restart(input).await.unwrap();
         assert_eq!(restarted.status, TerminalStatus::Running);

@@ -8,6 +8,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { useGitDiscardRecoveryStore } from "../../../gitDiscardRecoveryStore";
 import { useGitManagerStore } from "../../../gitManagerStore";
 import { useSourceControlPanelStore } from "../../../sourceControlPanelStore";
 import type { ChangeRow } from "./changesList.logic";
@@ -338,9 +339,15 @@ beforeEach(() => {
   );
   h.discard.mockReset();
   h.discard.mockResolvedValue(
-    AsyncResult.success({ trashed: [], permanentlyDiscarded: [], trashUnavailable: [] }),
+    AsyncResult.success({
+      trashed: [],
+      permanentlyDiscarded: [],
+      trashUnavailable: [],
+      keptInStaging: [],
+    }),
   );
   useGitManagerStore.setState({ byProjectKey: {} });
+  useGitDiscardRecoveryStore.setState({ noticesByCheckout: {} });
   useSourceControlPanelStore.setState({ byThreadKey: {}, byCwdKey: {} });
   container = document.createElement("div");
   document.body.append(container);
@@ -938,6 +945,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: [],
           trashUnavailable: ["src/unavailable-trash.ts"],
+          keptInStaging: [],
         }),
       )
       .mockResolvedValueOnce(
@@ -945,6 +953,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: ["src/unavailable-trash.ts"],
           trashUnavailable: [],
+          keptInStaging: [],
         }),
       );
     await renderView();
@@ -980,6 +989,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: [],
           trashUnavailable: ["logs/debug.log"],
+          keptInStaging: [],
         }),
       )
       .mockResolvedValueOnce(
@@ -987,6 +997,7 @@ describe("GitManagerChangesView", () => {
           trashed: [],
           permanentlyDiscarded: [],
           trashUnavailable: ["logs/debug.log"],
+          keptInStaging: [],
         }),
       );
     await renderView();
@@ -1005,6 +1016,106 @@ describe("GitManagerChangesView", () => {
         "Kept logs/debug.log: ignored files and files in linked folders can't be discarded here. Remove it in your file manager.",
       ),
     );
+  });
+
+  it("says where a stranded discard entry is kept and never offers to discard it permanently", async () => {
+    h.status = statusWith("src/stranded.ts");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard.mockResolvedValueOnce(
+      AsyncResult.success({
+        trashed: [],
+        permanentlyDiscarded: [],
+        trashUnavailable: [],
+        keptInStaging: [{ path: "src/stranded.ts", stagedAt: "bibcode-discard/0f3a/stranded.ts" }],
+      }),
+    );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+
+    await act(async () => listProps.onContextMenu("src/stranded.ts", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain(
+        "src/stranded.ts isn't in your working tree. The Trash refused it and something new took its name, so it's kept in the Git directory at bibcode-discard/0f3a/stranded.ts.",
+      ),
+    );
+    expect(document.body.textContent).not.toContain("The trash couldn't take these files");
+    expect(h.discard).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the recovery notice through the permanent-discard confirmation until dismissed", async () => {
+    h.status = statusWith("src/a.ts");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard
+      .mockResolvedValueOnce(
+        AsyncResult.success({
+          trashed: [],
+          permanentlyDiscarded: [],
+          trashUnavailable: ["src/b.ts"],
+          keptInStaging: [{ path: "src/a.ts", stagedAt: "bibcode-discard/0f3a/a.ts" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        AsyncResult.success({
+          trashed: [],
+          permanentlyDiscarded: ["src/b.ts"],
+          trashUnavailable: [],
+          keptInStaging: [],
+        }),
+      );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+
+    await act(async () => listProps.onContextMenu("src/a.ts", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("The trash couldn't take these files"),
+    );
+    expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts");
+
+    await act(async () => buttonWithText("Discard Permanently").click());
+    await vi.waitFor(() => expect(h.discard).toHaveBeenCalledTimes(2));
+    expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="Dismiss"]')?.click();
+    });
+    expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
+  });
+
+  it("keeps the recovery notice when the panel is left and opened again, for its checkout only", async () => {
+    h.status = statusWith("src/a.ts");
+    h.contextMenuShow.mockResolvedValueOnce("discard");
+    h.discard.mockResolvedValueOnce(
+      AsyncResult.success({
+        trashed: [],
+        permanentlyDiscarded: [],
+        trashUnavailable: [],
+        keptInStaging: [{ path: "src/a.ts", stagedAt: "bibcode-discard/0f3a/a.ts" }],
+      }),
+    );
+    await renderView();
+    const listProps = h.listProps as {
+      onContextMenu: (path: string, position: { x: number; y: number }) => void;
+    };
+    await act(async () => listProps.onContextMenu("src/a.ts", { x: 12, y: 24 }));
+    await act(async () => buttonWithText("Move to Trash").click());
+    await vi.waitFor(() => expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts"));
+
+    // Leave the tab (the panel unmounts), then come back.
+    await act(async () => root?.render(null));
+    expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
+    await renderView();
+    expect(container.textContent).toContain("bibcode-discard/0f3a/a.ts");
+
+    // Another checkout does not show it.
+    await renderView("/repo/other");
+    expect(container.textContent).not.toContain("bibcode-discard/0f3a/a.ts");
   });
 
   it("reveals a file through the environment-scoped file-manager command", async () => {

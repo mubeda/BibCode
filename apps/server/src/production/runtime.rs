@@ -171,6 +171,13 @@ impl ProductionRuntime {
         self.mcp_control.clone()
     }
 
+    /// Whether a tool update (CodeGraph) is running. A host that stops this server on a deadline
+    /// of its own extends it by [`crate::TOOL_UPDATE_SHUTDOWN_WAIT`] while this is true.
+    #[must_use]
+    pub fn tool_updates_running(&self) -> bool {
+        self.server_control.tool_updates_running()
+    }
+
     /// The committed `enableProfiler`, which drives a desktop host's crash monitor.
     #[must_use]
     pub fn profiler_enabled_signal(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -282,6 +289,7 @@ impl ProductionRuntime {
         let provider_update_checks = control.start_provider_update_checks();
         // Built before the profiler, whose sampler reads it; it has no dependencies.
         let process_attribution = ProcessAttributionRegistry::new();
+        control.attach_process_attribution(process_attribution.clone());
         let device_env = crate::device::android::sdk::SdkEnv::from_process();
         let android_devices = crate::device::android::AndroidBackend::new(
             crate::device::android::AndroidBackendConfig {
@@ -533,7 +541,8 @@ impl ProductionRuntime {
             provider_hosts,
         )
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
-        .with_availability_registry(workspace_availability.clone());
+        .with_availability_registry(workspace_availability.clone())
+        .with_mcp_settings(control.mcp_server_signal());
         let git_vcs = if let Some(dir) = &config.hosting_executable_dir_for_integration_test {
             git_vcs.with_hosting_executable_dir_for_integration_test(dir.clone())
         } else {
@@ -549,6 +558,8 @@ impl ProductionRuntime {
                 status_broadcaster.notify_local_change(&cwd).await;
             })
         }));
+        // An agent's `gh pr create` (#221) refreshes the thread's own worktree.
+        orchestration.set_pull_request_change_observer(git_vcs.pull_request_change_reporter());
         // One system trash for Source Control's discard and the Files tools' delete (#139 X5).
         let file_trash: Arc<dyn crate::git::FileTrash> =
             Arc::new(crate::git::NativeFileTrash::default());
@@ -611,6 +622,7 @@ impl ProductionRuntime {
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
         let mcp_terminals = terminal_manager.clone();
+        let shell_terminals = terminal_manager.clone();
         let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
@@ -676,6 +688,7 @@ impl ProductionRuntime {
             turn_delivery.clone(),
             workspace_availability.clone(),
             attachment_uploads.clone(),
+            Some(shell_terminals),
         );
         crate::production::uploads_rpc::register_uploads_rpc(
             &mut registry,
@@ -879,7 +892,23 @@ impl ProductionRuntime {
             })?;
         match resolved {
             ResolvedAsset::File(file) => {
+                let too_large = || {
+                    HttpRouteError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        json!({
+                            "_tag": "AssetTooLargeError",
+                            "message": "Asset exceeds the 10 MiB response limit."
+                        }),
+                    )
+                };
                 let file_handle = tokio::fs::File::open(&file).await.map_err(internal_error)?;
+                // Refuse by size before reading, so the Files panel's size probe stays cheap; the
+                // bounded read below still guards a file that grew since.
+                if file_handle.metadata().await.map_err(internal_error)?.len()
+                    > MAX_ATTACHMENT_BYTES as u64
+                {
+                    return Err(too_large());
+                }
                 let mut bytes = Vec::with_capacity(MAX_ATTACHMENT_BYTES.min(4096));
                 file_handle
                     .take((MAX_ATTACHMENT_BYTES + 1) as u64)
@@ -887,13 +916,7 @@ impl ProductionRuntime {
                     .await
                     .map_err(internal_error)?;
                 if bytes.len() > MAX_ATTACHMENT_BYTES {
-                    return Err(HttpRouteError::new(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        json!({
-                            "_tag": "AssetTooLargeError",
-                            "message": "Asset exceeds the 10 MiB response limit."
-                        }),
-                    ));
+                    return Err(too_large());
                 }
                 let content_type = mime_guess::from_path(&file)
                     .first_or_octet_stream()
@@ -947,6 +970,9 @@ impl ProductionRuntime {
         self.webhooks.shutdown().await;
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
+        // Waits for a running tool update, which must not be killed mid-replacement, and
+        // before the profiler's teardown.
+        self.server_control.shutdown_tool_updates().await;
         self.server_control.shutdown_capability_discovery().await;
         self.preview_gateway.shutdown().await;
         // Stops emulators gracefully before ownership teardown, which would only kill them.
@@ -3770,6 +3796,45 @@ mod tests {
                 .await
                 .is_err(),
             "the HTTP boundary must not return an oversized attachment body"
+        );
+
+        // Files-panel previews share the cap: an oversized workspace file answers 413 with the
+        // typed tag the panel keys its "too large" state on.
+        let preview_root = state.path().join("preview-project");
+        tokio::fs::create_dir_all(&preview_root)
+            .await
+            .expect("preview project should create");
+        std::fs::File::create(preview_root.join("big.mp3"))
+            .and_then(|file| file.set_len((10 * 1024 * 1024 + 1) as u64))
+            .expect("oversized workspace audio");
+        let issued = runtime
+            .asset_access
+            .issue(AssetIssueRequest {
+                resource: AssetResource::WorkspaceFile {
+                    thread_id: "runtime-thread".to_owned(),
+                    path: "big.mp3".to_owned(),
+                },
+                workspace_root: Some(preview_root),
+            })
+            .await
+            .expect("oversized workspace audio may receive a capability");
+        let mut asset_parts = issued.relative_url.rsplitn(2, '/');
+        let asset_path = asset_parts.next().expect("asset filename");
+        let asset_token = asset_parts.next().expect("asset token path");
+        let asset_token = asset_token.rsplit('/').next().expect("asset token");
+        let too_large = runtime
+            .asset(asset_token.to_owned(), asset_path.to_owned())
+            .await
+            .err()
+            .expect("oversized workspace file must not be served")
+            .into_response();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(too_large.into_body(), 4096)
+            .await
+            .expect("error body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("AssetTooLargeError"),
+            "{body:?}"
         );
 
         let favicon_root = state.path().join("favicon-project");

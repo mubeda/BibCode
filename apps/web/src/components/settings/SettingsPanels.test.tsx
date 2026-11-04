@@ -142,6 +142,8 @@ vi.mock("../../state/server", () => ({
   },
 }));
 
+vi.mock("./ToolsSection", () => ({ ToolsSection: () => null }));
+
 vi.mock("../../state/query", () => ({
   useEnvironmentQuery: () => ({
     data: null,

@@ -12,7 +12,10 @@ interface FakeEnvironment {
   environmentId: string;
   label: string;
   connection: { phase: string };
-  serverConfig: { mcpLaunch?: { argv: ReadonlyArray<string> } | null } | null;
+  serverConfig: {
+    mcpLaunch?: { argv: ReadonlyArray<string> } | null;
+    environment: { capabilities: Record<string, boolean> };
+  } | null;
 }
 
 const DEFAULT_CAPABILITIES = {
@@ -201,6 +204,7 @@ function environment(overrides: Partial<FakeEnvironment> = {}): FakeEnvironment 
     label: "This Mac",
     connection: { phase: "connected" },
     serverConfig: {
+      environment: { capabilities: {} },
       mcpLaunch: {
         argv: [
           "/Applications/BiBCode.app/Contents/MacOS/BiBCode",
@@ -344,7 +348,7 @@ describe("AgentIntegrationsSection", () => {
   });
 
   it("explains why an older server's rows are disabled", async () => {
-    h.environments = [environment({ serverConfig: {} })];
+    h.environments = [environment({ serverConfig: { environment: { capabilities: {} } } })];
     const container = await render();
     const toggle = container.querySelector<HTMLButtonElement>('[aria-label="MCP server"]')!;
     expect(toggle.disabled).toBe(true);
@@ -671,6 +675,7 @@ describe("AgentIntegrationsSection", () => {
       h.environments = [
         environment({
           serverConfig: {
+            environment: { capabilities: {} },
             mcpLaunch: {
               argv: [
                 "/repo/target/debug/bibcode",

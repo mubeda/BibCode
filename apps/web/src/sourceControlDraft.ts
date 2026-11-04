@@ -16,7 +16,8 @@ export function sourceControlDraftKey({ environmentId, cwd }: SourceControlDraft
 export interface SourceControlDraftBinding {
   readonly message: string;
   readonly setMessage: (message: string) => void;
-  readonly clear: () => void;
+  /** A commit of `submitted` landed: clears the message unless it changed since. */
+  readonly clear: (submitted: string) => void;
 }
 
 export function useSourceControlDraft(scope: SourceControlDraftScope): SourceControlDraftBinding {
@@ -34,7 +35,10 @@ export function useSourceControlDraft(scope: SourceControlDraftScope): SourceCon
     (nextMessage: string) => setCwdMessage(cwdKey, nextMessage),
     [cwdKey, setCwdMessage],
   );
-  const clear = useCallback(() => clearCwdDraft(cwdKey), [clearCwdDraft, cwdKey]);
+  const clear = useCallback(
+    (submitted: string) => clearCwdDraft(cwdKey, submitted),
+    [clearCwdDraft, cwdKey],
+  );
   const legacyThreadKey = scope.legacyThreadKey;
   useEffect(() => {
     if (legacyThreadKey !== undefined) promoteThreadDraft(legacyThreadKey, cwdKey);

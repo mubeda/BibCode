@@ -2,7 +2,8 @@
 
 import { RegistryContext } from "@effect/atom-react";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import type { EnvironmentId, ScopedThreadRef, UiFocusIntent, UiIntent } from "@bibcode/contracts";
+import type { PendingUiIntent } from "@bibcode/client-runtime/state/uiIntents";
+import type { EnvironmentId, ScopedThreadRef, UiFocusIntent } from "@bibcode/contracts";
 import { AsyncResult } from "effect/reactivity";
 import { useContext, useEffect } from "react";
 
@@ -10,7 +11,7 @@ import { useCenterPanelStore } from "~/centerPanelStore";
 import { useDiffPanelStore } from "~/diffPanelStore";
 import { useRightPanelStore } from "~/rightPanelStore";
 import type { AppRouter } from "~/router";
-import { readThreadShell } from "~/state/entities";
+import { readThreadShell, resolveThreadShell } from "~/state/entities";
 import { useEnvironments } from "~/state/environments";
 import { uiIntentsEnvironment } from "~/state/uiIntents";
 import { buildThreadRouteParams } from "~/threadRoutes";
@@ -18,6 +19,7 @@ import { buildThreadRouteParams } from "~/threadRoutes";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
 type IntentRouter = Pick<AppRouter, "navigate">;
+type PendingFocusIntent = PendingUiIntent & UiFocusIntent;
 
 /** Intent ids remembered against replays; intents expire after 60 s anyway. */
 const HANDLED_LIMIT = 256;
@@ -57,7 +59,9 @@ export async function showUiIntent(
   intent: UiFocusIntent,
 ): Promise<void> {
   const ref = scopeThreadRef(environmentId, intent.threadId);
-  const shell = readThreadShell(ref);
+  // A capped shell may have left the panel out (#223): resolve it to find its host.
+  const resolved = await resolveThreadShell(ref);
+  const shell = resolved.kind === "resolved" ? resolved.thread : null;
   const host: ScopedThreadRef = shell?.hostThreadId
     ? scopeThreadRef(environmentId, shell.hostThreadId)
     : ref;
@@ -111,9 +115,10 @@ function EnvironmentUiIntentNotifier(props: {
   const registry = useContext(RegistryContext);
 
   useEffect(() => {
-    const deferred = new Map<string, UiFocusIntent>();
-    const announce = (intent: UiFocusIntent) => {
-      const remaining = Date.parse(intent.expiresAt) - Date.now();
+    const deferred = new Map<string, PendingFocusIntent>();
+    const announce = (intent: PendingFocusIntent) => {
+      // This client's deadline (arrival + expiresInMs), so a skewed clock cannot move it.
+      const remaining = intent.deadline - Date.now();
       if (remaining <= 0) return;
       const title = readThreadShell(scopeThreadRef(environmentId, intent.threadId))?.title ?? null;
       const toastId = toastManager.add(
@@ -132,7 +137,7 @@ function EnvironmentUiIntentNotifier(props: {
         }),
       );
     };
-    const receive = (intents: ReadonlyArray<UiIntent>) => {
+    const receive = (intents: ReadonlyArray<PendingUiIntent>) => {
       for (const intent of intents) {
         // Later kinds (slice X7) have their own surfaces.
         if (intent.kind !== "focus" || handled.has(intent.intentId)) continue;

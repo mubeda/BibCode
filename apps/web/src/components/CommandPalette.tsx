@@ -3,13 +3,14 @@
 /* oxlint-disable react/no-unstable-nested-components */
 
 import { scopeProjectRef, scopeThreadRef } from "@bibcode/client-runtime/environment";
-import { type ProjectId } from "@bibcode/contracts";
+import { type OrchestrationOlderThreadsScope, type ProjectId } from "@bibcode/contracts";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import {
   ArrowDownIcon,
   ArrowLeftIcon,
   ArrowUpIcon,
   FolderPlusIcon,
+  LoaderIcon,
   MessageSquareIcon,
   SearchIcon,
   SettingsIcon,
@@ -35,6 +36,9 @@ import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useClientSettings } from "../hooks/useSettings";
 import { useActiveEnvironmentId, useProjects, useThreadShells } from "../state/entities";
 import { useEnvironments } from "../state/environments";
+import { loadOlderThreads, useOffShellThreadShells } from "../state/offShell";
+import { cappedShellEnvironmentsAtom } from "../state/shell";
+import { mergeOffShellThreads } from "./sidebar/agentsSection.logic";
 import {
   startNewThreadInProjectFromContext,
   startNewThreadFromContext,
@@ -49,7 +53,11 @@ import {
   buildProjectActionItems,
   buildRootGroups,
   buildThreadActionItems,
+  createOlderThreadSearch,
+  olderThreadSearchLines,
   type CommandPaletteActionItem,
+  type OlderThreadSearchLine,
+  type OlderThreadSearchState,
   type CommandPaletteSubmenuItem,
   type CommandPaletteView,
   filterCommandPaletteGroups,
@@ -80,6 +88,8 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import { ComposerHandleContext, useComposerHandleContext } from "../composerHandleContext";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import { resolveAddProjectTargetLabel } from "./sidebar/environmentRail.logic";
+
+const OLDER_SEARCH_SCOPE: OrchestrationOlderThreadsScope = { kind: "search" };
 
 interface CommandPaletteOpenIntent {
   readonly kind: "add-project";
@@ -221,6 +231,8 @@ function OpenCommandPaletteDialog(props: {
     useHandleNewThread();
   const projects = useProjects();
   const threads = useThreadShells();
+  const offShellThreadShells = useOffShellThreadShells();
+  const cappedEnvironments = useAtomValue(cappedShellEnvironmentsAtom);
   const { environments } = useEnvironments();
   const activeEnvironmentId = useActiveEnvironmentId();
   const addProjectTargetLabel = resolveAddProjectTargetLabel({
@@ -340,6 +352,80 @@ function OpenCommandPaletteDialog(props: {
     [activeThreadId, clientSettings.sidebarThreadSortOrder, navigate, projectTitleById, threads],
   );
   const recentThreadItems = allThreadItems.slice(0, RECENT_THREAD_LIMIT);
+  // Matches the capped shells left out (#223), found by a server search, listed after the rest.
+  const olderThreadItems = useMemo(() => {
+    const older = mergeOffShellThreads(threads, offShellThreadShells).slice(threads.length);
+    return older.length === 0
+      ? []
+      : buildThreadActionItems({
+          threads: older,
+          projectTitleById,
+          sortOrder: clientSettings.sidebarThreadSortOrder,
+          icon: <MessageSquareIcon className={ITEM_ICON_CLASS} />,
+          runThread: async (thread) => {
+            await navigate({
+              to: "/$environmentId/$threadId",
+              params: buildThreadRouteParams(scopeThreadRef(thread.environmentId, thread.id)),
+            });
+          },
+        });
+  }, [
+    clientSettings.sidebarThreadSortOrder,
+    navigate,
+    offShellThreadShells,
+    projectTitleById,
+    threads,
+  ]);
+  const [olderSearch, setOlderSearch] = useState<OlderThreadSearchState | null>(null);
+  const olderSearchRef = useRef<ReturnType<typeof createOlderThreadSearch> | null>(null);
+  // A newer query, a retry, or a change of capped environments aborts the search in flight.
+  useEffect(() => {
+    const live = cappedEnvironments.filter((environment) => environment.live);
+    if (live.length === 0) return;
+    const search = createOlderThreadSearch(
+      (searchQuery, signal) => {
+        setOlderSearch({ query: searchQuery, phase: "searching" });
+        void Promise.all(
+          live.map(({ environmentId }) =>
+            loadOlderThreads(environmentId, OLDER_SEARCH_SCOPE, {
+              query: searchQuery,
+              append: false,
+              signal,
+            }),
+          ),
+        ).then((outcomes) => {
+          if (signal.aborted) return;
+          setOlderSearch({
+            query: searchQuery,
+            phase: outcomes.includes("failed") ? "failed" : "done",
+          });
+        });
+      },
+      {
+        set: (callback, delayMs) => window.setTimeout(callback, delayMs),
+        clear: (handle) => window.clearTimeout(handle as number),
+      },
+    );
+    search.update(deferredQuery);
+    olderSearchRef.current = search;
+    return () => {
+      olderSearchRef.current = null;
+      search.dispose();
+    };
+  }, [cappedEnvironments, deferredQuery]);
+  const olderSearchLines = useMemo(() => {
+    const labelById = new Map(
+      environments.map((environment) => [environment.environmentId, environment.label]),
+    );
+    return olderThreadSearchLines({
+      query: deferredQuery,
+      environments: cappedEnvironments.map(({ environmentId, live }) => ({
+        label: labelById.get(environmentId) ?? "its server",
+        live,
+      })),
+      search: olderSearch,
+    });
+  }, [cappedEnvironments, deferredQuery, environments, olderSearch]);
 
   function pushPaletteView(view: CommandPaletteView): void {
     setViewStack((previousViews) => [
@@ -492,6 +578,7 @@ function OpenCommandPaletteDialog(props: {
     isInSubmenu: currentView !== null,
     projectSearchItems: projectSearchItems,
     threadSearchItems: allThreadItems,
+    olderThreadSearchItems: olderThreadItems,
   });
   const displayedGroups: CommandPaletteView["groups"] = filteredGroups;
   const inputPlaceholder = getCommandPaletteInputPlaceholder(paletteMode);
@@ -588,6 +675,12 @@ function OpenCommandPaletteDialog(props: {
             keybindings={keybindings}
             onExecuteItem={executeItem}
           />
+          {isSubmenu || olderSearchLines.length === 0 ? null : (
+            <OlderThreadSearchStatus
+              lines={olderSearchLines}
+              onRetry={() => olderSearchRef.current?.update(deferredQuery)}
+            />
+          )}
         </CommandPanel>
         <CommandFooter className="gap-3 max-sm:flex-col max-sm:items-start">
           <div className="flex items-center gap-3">
@@ -618,5 +711,51 @@ function OpenCommandPaletteDialog(props: {
         </CommandFooter>
       </Command>
     </CommandDialogPopup>
+  );
+}
+
+/** How the search of older threads is going (#223), under the results, which stay usable. */
+function OlderThreadSearchStatus(props: {
+  readonly lines: ReadonlyArray<OlderThreadSearchLine>;
+  readonly onRetry: () => void;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex flex-col gap-1 border-t px-3 py-2 text-xs text-muted-foreground"
+      data-testid="older-thread-search-status"
+    >
+      {props.lines.map((line) => {
+        switch (line.kind) {
+          case "searching":
+            return (
+              <span key="searching" className="flex items-center gap-2">
+                <LoaderIcon className="size-3 animate-spin" aria-hidden />
+                Searching older threads…
+              </span>
+            );
+          case "failed":
+            return (
+              <span key="failed" className="flex items-center gap-2">
+                Couldn&apos;t search older threads.
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:text-foreground"
+                  onClick={props.onRetry}
+                >
+                  Retry
+                </button>
+              </span>
+            );
+          case "offline":
+            return (
+              <span key={`offline:${line.label}`}>
+                Older threads are searched when {line.label} is connected.
+              </span>
+            );
+        }
+      })}
+    </div>
   );
 }

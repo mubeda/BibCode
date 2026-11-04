@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 const harness = vi.hoisted(() => ({
   items: [] as Array<Record<string, unknown>>,
   menuItems: [] as Array<Record<string, unknown>>,
+  sideChatItems: [] as Array<Record<string, unknown>>,
   tooltipReasons: [] as string[],
   providerTerminalActionsAvailable: true,
   providerTerminalActionDisabledReason: null as string | null,
@@ -98,6 +99,7 @@ import { ChatHeaderPanelMenu } from "./ChatHeaderPanelMenu";
 beforeEach(() => {
   harness.items = [];
   harness.menuItems.length = 0;
+  harness.sideChatItems.length = 0;
   harness.tooltipReasons.length = 0;
   harness.providerTerminalActionsAvailable = true;
   harness.providerTerminalActionDisabledReason = null;
@@ -120,7 +122,10 @@ function panelItem(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function render(canCreatePanel: boolean) {
+const isSideChatItem = (item: Record<string, unknown>) =>
+  renderToStaticMarkup(<>{item.children as React.ReactNode}</>).includes("Side chat");
+
+function render(canCreatePanel: boolean, sideChatUnavailableReason: string | null = null) {
   const props = {
     providerStatuses: [],
     settings: { providerInstances: {}, providers: {}, providerSessionDefaults: {} },
@@ -128,15 +133,46 @@ function render(canCreatePanel: boolean) {
     environmentId: "environment-1",
     hostThreadId: "host-1",
     onCreateChatPanel: vi.fn(),
+    onCreateSideChat: vi.fn(),
+    sideChatUnavailableReason,
     onReopenChatPanel: vi.fn(),
     onOpenTerminalPanel: vi.fn(),
     onOpenProviderTerminalPanel: vi.fn(),
     onAddCustomAction: vi.fn(),
   } as unknown as React.ComponentProps<typeof ChatHeaderPanelMenu>;
-  return { markup: renderToStaticMarkup(<ChatHeaderPanelMenu {...props} />), props };
+  const markup = renderToStaticMarkup(<ChatHeaderPanelMenu {...props} />);
+  // **Side chat** leads the menu; the provider items below keep their own indexes.
+  harness.sideChatItems.push(...harness.menuItems.filter(isSideChatItem));
+  const others = harness.menuItems.filter((item) => !isSideChatItem(item));
+  harness.menuItems.length = 0;
+  harness.menuItems.push(...others);
+  return { markup, props };
 }
 
 describe("ChatHeaderPanelMenu", () => {
+  it("offers Side chat first, above the providers, and opens an empty side chat", () => {
+    harness.items = [panelItem()];
+    const { markup, props } = render(true);
+    expect(markup.indexOf("Side chat")).toBeLessThan(markup.indexOf("Codex"));
+    expect(harness.sideChatItems).toHaveLength(1);
+    expect(harness.sideChatItems[0]).not.toMatchObject({ disabled: true });
+    (harness.sideChatItems[0]!.onClick as () => void)();
+    expect(props.onCreateSideChat).toHaveBeenCalledOnce();
+    expect(props.onCreateChatPanel).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "This server doesn't support side chats. Update it to use them.",
+    "Side chats start from the main chat. Use :btw there.",
+    "Available once this thread has started.",
+  ])("shows Side chat disabled with its reason: %s", (reason) => {
+    harness.items = [panelItem()];
+    render(true, reason);
+    expect(harness.sideChatItems).toHaveLength(1);
+    expect(harness.sideChatItems[0]).toMatchObject({ disabled: true });
+    expect(harness.tooltipReasons).toEqual([reason]);
+  });
+
   it("renders enabled providers and terminal/custom actions", () => {
     harness.items = [panelItem()];
     const { markup, props } = render(true);

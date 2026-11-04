@@ -12,6 +12,11 @@ use crate::{ServerConfig, ServerHandle, ServerRuntime, persistence::Repositories
 
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const REDIRECT: &str = "http://127.0.0.1:53682/callback";
+/// The loopback callback the authorization requests name: another port than the registered
+/// one, as a native client picks.
+const LOOPBACK_CALLBACK: &str = "http://127.0.0.1:61000/callback";
+/// A hosted client's callback: an `https` URL, matched exactly.
+const HOSTED_REDIRECT: &str = "https://agent.example.com/oauth/callback";
 
 async fn start_server(root: &Path, overlay: Value) -> ServerHandle {
     let providers = crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS
@@ -119,13 +124,17 @@ async fn client_id(base: &str, forwarded_for: Option<&str>) -> String {
 }
 
 fn authorize_url(base: &str, client_id: &str, extra: &[(&str, &str)]) -> String {
+    authorize_url_to(base, client_id, LOOPBACK_CALLBACK, extra)
+}
+
+fn authorize_url_to(base: &str, client_id: &str, redirect: &str, extra: &[(&str, &str)]) -> String {
     let mut url = url::Url::parse(&format!("{base}/oauth/authorize")).unwrap();
     {
         let mut query = url.query_pairs_mut();
         query
             .append_pair("response_type", "code")
             .append_pair("client_id", client_id)
-            .append_pair("redirect_uri", "http://127.0.0.1:61000/callback")
+            .append_pair("redirect_uri", redirect)
             .append_pair("code_challenge", &s256(VERIFIER))
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", "xyz")
@@ -152,7 +161,11 @@ async fn authorize(url: &str, forwarded_for: Option<&str>) -> reqwest::Response 
 }
 
 async fn pending(base: &str, client_id: &str) -> Pending {
-    let response = authorize(&authorize_url(base, client_id, &[]), None).await;
+    pending_at(&authorize_url(base, client_id, &[])).await
+}
+
+async fn pending_at(url: &str) -> Pending {
+    let response = authorize(url, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY");
     let cookie = response.headers()[header::SET_COOKIE]
@@ -242,6 +255,16 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> (StatusCode, Value) {
+    exchange_code_to(base, client_id, code, verifier, LOOPBACK_CALLBACK).await
+}
+
+async fn exchange_code_to(
+    base: &str,
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+) -> (StatusCode, Value) {
     let resource = format!("{base}/mcp");
     token(
         base,
@@ -249,7 +272,7 @@ async fn exchange_code(
             ("grant_type", "authorization_code"),
             ("code", code),
             ("code_verifier", verifier),
-            ("redirect_uri", "http://127.0.0.1:61000/callback"),
+            ("redirect_uri", redirect),
             ("client_id", client_id),
             ("resource", &resource),
         ],
@@ -490,6 +513,97 @@ async fn the_authorization_code_flow_mints_a_grant_that_works_at_once_and_after_
     .await;
     assert_eq!(dead, StatusCode::BAD_REQUEST);
 
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A client hosted on the web registers an `https` callback, signs in through it and refreshes;
+/// an authorization naming another `https` callback is refused before anything is recorded.
+#[tokio::test]
+async fn a_hosted_client_with_an_https_redirect_signs_in_and_refreshes() {
+    let root = tempfile::tempdir().unwrap();
+    let server = start_server(root.path(), json!({})).await;
+    let base = format!("http://{}", server.local_addr());
+    let admin = administrator(root.path(), &base).await;
+
+    let registered = client()
+        .post(format!("{base}/oauth/register"))
+        .json(&json!({
+            "client_name": "Hosted agent",
+            "redirect_uris": [HOSTED_REDIRECT],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let registered: Value = registered.json().await.unwrap();
+    assert_eq!(registered["redirect_uris"], json!([HOSTED_REDIRECT]));
+    let client_id = registered["client_id"].as_str().unwrap().to_owned();
+
+    // Only the registered https callback: another one gets no consent page.
+    let elsewhere = authorize(
+        &authorize_url_to(&base, &client_id, "https://agent.example.com/other", &[]),
+        None,
+    )
+    .await;
+    assert_eq!(elsewhere.status(), StatusCode::BAD_REQUEST);
+    assert!(elsewhere.headers().get(header::LOCATION).is_none());
+
+    let pending = pending_at(&authorize_url_to(&base, &client_id, HOSTED_REDIRECT, &[])).await;
+    assert_eq!(
+        approve(
+            &base,
+            &admin,
+            json!({ "id": pending.id, "access": "approval-required" })
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let redirected = status(&base, &pending).await;
+    assert_eq!(redirected.status(), StatusCode::SEE_OTHER);
+    let location =
+        url::Url::parse(redirected.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    assert_eq!(
+        format!(
+            "{}://{}{}",
+            location.scheme(),
+            location.host_str().unwrap(),
+            location.path()
+        ),
+        HOSTED_REDIRECT,
+        "the browser returns to the hosted callback"
+    );
+    let query = location
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        (query["state"].as_str(), query["iss"].as_str()),
+        ("xyz", base.as_str())
+    );
+
+    let (ok, tokens) =
+        exchange_code_to(&base, &client_id, &query["code"], VERIFIER, HOSTED_REDIRECT).await;
+    assert_eq!(ok, StatusCode::OK, "{tokens}");
+    let access = tokens["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(list_tools(&base, &access).await, StatusCode::OK);
+    let (ok, refreshed) = refresh(
+        &base,
+        &client_id,
+        tokens["refresh_token"].as_str().unwrap(),
+        None,
+    )
+    .await;
+    assert_eq!(ok, StatusCode::OK, "{refreshed}");
+    assert_eq!(
+        list_tools(&base, refreshed["access_token"].as_str().unwrap()).await,
+        StatusCode::OK,
+        "after a refresh"
+    );
     server.shutdown();
     server.join().await.expect("server joins");
 }

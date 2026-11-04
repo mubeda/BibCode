@@ -253,10 +253,7 @@ async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
         .expect("run unsafe start-empty");
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("project-data store is currently owned by a running server")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("BiBCode is using this data root"));
     assert_eq!(
         std::fs::read(&paths.database).expect("active database remains"),
         database_before
@@ -1021,4 +1018,138 @@ fn service_help_lists_install_uninstall_and_status() {
     for expected in ["--host", "--port", "--base-dir", "--static-dir", "--json"] {
         assert!(stdout.contains(expected), "missing {expected}: {stdout}");
     }
+}
+
+/// The watchdog kill with a real process: `bibcode storage restore` is paused at a commit step
+/// by the debug-only hook, killed with `SIGKILL`, and finished by `storage restore --resume`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_killed_restore_process_is_finished_by_restore_resume() {
+    for step in ["journal-published", "database-moved"] {
+        let root = TempDir::new().expect("temporary storage root");
+        let mut config = ServerConfig::new(root.path());
+        let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+        config.base_dir.clone_from(&resolved.effective);
+        config.resolved_data_root = Some(resolved);
+        let paths = StatePaths::from_config(&config);
+        std::fs::create_dir_all(&paths.state_dir).expect("state directory");
+        let prepared = prepare_store(&config).await.expect("prepare store");
+        let set_title = |title: &'static str| {
+            let database = prepared.database.clone();
+            async move {
+                database
+                    .call(move |connection| {
+                        connection.execute(
+                            "INSERT INTO projection_projects (
+                               project_id, title, workspace_root, default_model_selection_json,
+                               scripts_json, created_at, updated_at, deleted_at
+                             ) VALUES ('killed', ?1, '/tmp/killed', NULL, '{}',
+                                       '2026-11-02T00:00:00Z', '2026-11-02T00:00:00Z', NULL)
+                             ON CONFLICT(project_id) DO UPDATE SET title = excluded.title",
+                            [title],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("set title");
+            }
+        };
+        set_title("Before restore").await;
+        let backup = create_verified_backup(
+            &prepared.database,
+            &prepared,
+            BackupTrigger::PreUpdate,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await
+        .expect("backup");
+        set_title("After backup").await;
+        close_store(prepared).await;
+
+        let marker = root.path().join("paused");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+            .args(["storage", "restore", "--base-dir"])
+            .arg(root.path())
+            .args([
+                "--backup-id",
+                &backup.manifest.backup_id.to_string(),
+                "--json",
+            ])
+            .env("BIBCODE_TEST_PAUSE_RECOVERY", step)
+            .env("BIBCODE_TEST_PAUSE_RECOVERY_MARKER", &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn storage restore");
+        let started = std::time::Instant::now();
+        while !marker.exists() {
+            assert!(
+                child.try_wait().expect("child status").is_none(),
+                "restore exited before {step}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "{step} not reached"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        child.kill().expect("SIGKILL the restore");
+        child.wait().expect("reap the restore");
+
+        let inspect = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+            .args(["storage", "inspect", "--base-dir"])
+            .arg(root.path())
+            .arg("--json")
+            .output()
+            .expect("run storage inspect");
+        let value: Value = serde_json::from_slice(&inspect.stdout).expect("inspect JSON");
+        assert_eq!(value["classification"], "recovery-incomplete", "{step}");
+        assert!(
+            value["issue"]
+                .as_str()
+                .is_some_and(|issue| issue.contains("bibcode storage restore --resume")),
+            "{value}"
+        );
+
+        let resume = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+            .args(["storage", "restore", "--resume", "--base-dir"])
+            .arg(root.path())
+            .arg("--json")
+            .output()
+            .expect("run storage restore --resume");
+        assert!(
+            resume.status.success(),
+            "resume failed: {}",
+            String::from_utf8_lossy(&resume.stderr)
+        );
+        let value: Value = serde_json::from_slice(&resume.stdout).expect("resume JSON");
+        assert_eq!(value["resumed"]["action"], "restore");
+        let title: String = Connection::open(&paths.database)
+            .expect("restored database")
+            .query_row(
+                "SELECT title FROM projection_projects WHERE project_id = 'killed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("restored project");
+        assert_eq!(title, "Before restore", "{step}");
+        let prepared = prepare_store(&config).await.expect("the store opens");
+        close_store(prepared).await;
+    }
+}
+
+/// Closes the store's file connection, so the data root can be recovered offline.
+#[cfg(unix)]
+async fn close_store(prepared: bibcode_server::persistence::PreparedStore) {
+    prepared
+        .database
+        .call(|connection| {
+            let replacement = Connection::open_in_memory()?;
+            let file_connection = std::mem::replace(connection, replacement);
+            file_connection.close().map_err(|(_, error)| error)?;
+            Ok(())
+        })
+        .await
+        .expect("close the store's file connection");
+    drop(prepared);
 }

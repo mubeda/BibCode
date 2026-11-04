@@ -128,6 +128,39 @@ describe("shouldRedirectMissingRouteThread", () => {
     ).toBe(false);
   });
 
+  it("never redirects a capped route before the resolver answers (#223)", () => {
+    expect(
+      missingRouteThreadRedirectDelay({
+        shellStatus: "live",
+        routeThreadExists: false,
+        environmentHasServerThreads: true,
+        shellCapped: true,
+        routeThreadMissing: false,
+      }),
+    ).toBeNull();
+  });
+
+  it("redirects a capped route when the resolver reports missing (#223)", () => {
+    expect(
+      shouldRedirectMissingRouteThread({
+        shellStatus: "live",
+        routeThreadExists: false,
+        environmentHasServerThreads: true,
+        shellCapped: true,
+        routeThreadMissing: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRedirectMissingRouteThread({
+        shellStatus: "degraded",
+        routeThreadExists: false,
+        environmentHasServerThreads: true,
+        shellCapped: true,
+        routeThreadMissing: true,
+      }),
+    ).toBe(false);
+  });
+
   it("never redirects while the route thread exists", () => {
     expect(
       shouldRedirectMissingRouteThread({

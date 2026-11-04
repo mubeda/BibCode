@@ -465,7 +465,7 @@ function RemoteServerRow({
                 }
               />
               <TooltipPopup side="top" className="max-w-80 whitespace-pre-wrap leading-tight">
-                The WSL backend is managed by the WSL setting above — turn it on or off there.
+                The WSL backend is managed by the WSL setting above. Turn it on or off there.
               </TooltipPopup>
             </Tooltip>
           ) : (

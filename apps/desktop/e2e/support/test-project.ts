@@ -27,6 +27,14 @@ const REASONING_TURN_STEPS = Array.from(
 const SLOW_REASONING_STEP_TAIL =
   "It traces how each rule reads its tokens, where a failed match backs off, and which branch takes over next. ";
 const REASONING_ANSWER_LINES = 24;
+/**
+ * A Claude prompt with this marker is answered with paragraphs that render tens of thousands of
+ * pixels tall, so a thread can hold a few very long replies below many short ones (#228).
+ */
+const LONG_REPLY_TURN_MARKER = "[[long-reply]]";
+const LONG_REPLY_LINES = 1_000;
+/** Matches the line the Claude shim writes. */
+const longReplyLine = (line: number) => `Fixture long reply line ${line} fills the timeline.`;
 /** An answer line names its prompt without the marker, so each turn's answer is its own. */
 const reasoningAnswerLine = (variant: string, line: number, label: string) =>
   `Fixture ${variant} answer line ${line} (${label}).`;
@@ -597,6 +605,14 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
+// The long reply streams in ten deltas of 100 paragraphs, about 150 ms apart.
+const longReplyLines = Array.from(
+  { length: ${LONG_REPLY_LINES} },
+  (_, line) => "Fixture long reply line " + (line + 1) + " fills the timeline."
+);
+const longReplyDeltas = Array.from({ length: 10 }, (_, chunk) =>
+  (chunk === 0 ? "" : "\n\n") + longReplyLines.slice(chunk * 100, chunk * 100 + 100).join("\n\n")
+);
 const reasoningSteps = ${JSON.stringify(REASONING_TURN_STEPS)};
 const slowReasoningStepTail = ${JSON.stringify(SLOW_REASONING_STEP_TAIL)};
 const reader = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -762,26 +778,35 @@ reader.on("line", (line) => {
     void streamReasoningTurn(sessionId, slowReasoning, prompt);
     return;
   }
-  send({
-    type: "stream_event",
-    session_id: sessionId,
-    uuid: "bibcode-ui-claude-stream",
-    parent_tool_use_id: null,
-    event: {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text: streamResponse }
+  const deltas = prompt.includes(${JSON.stringify(LONG_REPLY_TURN_MARKER)})
+    ? longReplyDeltas
+    : [streamResponse];
+  // A single delta is sent synchronously, as before; only a long reply waits between deltas.
+  void (async () => {
+    for (const [chunk, text] of deltas.entries()) {
+      if (chunk > 0) await delay(150);
+      send({
+        type: "stream_event",
+        session_id: sessionId,
+        uuid: chunk === 0 ? "bibcode-ui-claude-stream" : "bibcode-ui-claude-stream-" + chunk,
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text }
+        }
+      });
     }
-  });
-  send({
-    type: "result",
-    subtype: "success",
-    is_error: false,
-    errors: [],
-    stop_reason: "end_turn",
-    session_id: sessionId,
-    uuid: "bibcode-ui-claude-result"
-  });
+    send({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      errors: [],
+      stop_reason: "end_turn",
+      session_id: sessionId,
+      uuid: "bibcode-ui-claude-result"
+    });
+  })();
 });
 `.trimStart();
 
@@ -1438,6 +1463,8 @@ export const desktopUiFixture = {
   streamedResponse: STREAMED_RESPONSE,
   reasoningTurnMarker: REASONING_TURN_MARKER,
   slowReasoningTurnMarker: SLOW_REASONING_TURN_MARKER,
+  longReplyTurnMarker: LONG_REPLY_TURN_MARKER,
+  longReplyLastLine: longReplyLine(LONG_REPLY_LINES),
   reasoningThoughtStart: "Fixture thinking step 1 weighs the parser.",
   /** The last line of the answer to a reasoning prompt whose text, markers aside, is `label`. */
   reasoningAnswerLastLine: (label: string, slow = false) =>
