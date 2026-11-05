@@ -72,27 +72,40 @@ pub(crate) fn locate_sdk(env: &SdkEnv) -> Result<AndroidSdk, Availability> {
         .filter_map(|key| env.vars.get(*key).filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .chain(default_sdk_dirs(env));
+    let mut first_partial = None;
     for root in candidates {
-        let emulator = root.join("emulator").join(format!("emulator{exe}"));
-        if !emulator.is_file() {
+        if !["platform-tools", "platforms", "cmdline-tools"]
+            .iter()
+            .any(|directory| root.join(directory).is_dir())
+        {
             continue;
         }
+        let emulator = root.join("emulator").join(format!("emulator{exe}"));
         let adb = root.join("platform-tools").join(format!("adb{exe}"));
-        if !adb.is_file() {
-            return Err(availability(
+        if !emulator.is_file() {
+            first_partial.get_or_insert_with(|| availability(
+                AvailabilityKind::EmulatorMissing,
+                format!(
+                    "Android Emulator is missing from {}. Install the emulator package with the Android SDK Manager (sdkmanager \"emulator\"), then restart the BiBCode server.",
+                    root.display()
+                ),
+            ));
+        } else if !adb.is_file() {
+            first_partial.get_or_insert_with(|| availability(
                 AvailabilityKind::AdbMissing,
                 format!(
                     "Android platform-tools are missing from {}. Install them with the Android SDK Manager, then restart the BiBCode server.",
                     root.display()
                 ),
             ));
+        } else {
+            return Ok(AndroidSdk { emulator, adb });
         }
-        return Ok(AndroidSdk { emulator, adb });
     }
-    Err(availability(
+    Err(first_partial.unwrap_or_else(|| availability(
         AvailabilityKind::SdkMissing,
         "No Android SDK found on this server. Set ANDROID_HOME for the BiBCode server to your SDK folder and restart it.".into(),
-    ))
+    )))
 }
 
 fn default_sdk_dirs(env: &SdkEnv) -> Vec<PathBuf> {
@@ -256,6 +269,92 @@ mod tests {
             ["Pixel_8_API_35", "Tablet API 34"]
         );
         assert_eq!(avds[0].display_name, "Pixel 8 API 35");
+    }
+
+    #[tokio::test]
+    async fn reports_emulator_missing_for_each_sdk_directory() {
+        for directory in ["platform-tools", "platforms", "cmdline-tools"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+            let env = SdkEnv {
+                vars: HashMap::from([("ANDROID_HOME".into(), root.path().into())]),
+                home: None,
+                os: "linux",
+            };
+            let (availability, avds, sdk) = discover(&env).await;
+            assert_eq!(availability.kind, AvailabilityKind::EmulatorMissing);
+            assert!(
+                availability
+                    .message
+                    .contains(&root.path().display().to_string())
+            );
+            assert!(availability.message.contains("SDK Manager"));
+            assert!(availability.message.contains("sdkmanager \"emulator\""));
+            assert!(availability.message.contains("restart the BiBCode server"));
+            assert_eq!(
+                serde_json::to_value(availability.kind).unwrap(),
+                "emulatorMissing"
+            );
+            assert!(avds.is_empty() && sdk.is_none());
+        }
+    }
+
+    #[test]
+    fn skips_absent_roots_and_roots_without_sdk_directories() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("platform-tools"), "not a directory").unwrap();
+        for candidate in [root.path().join("absent"), root.path().to_path_buf()] {
+            let env = SdkEnv {
+                vars: HashMap::from([("ANDROID_HOME".into(), candidate.into())]),
+                home: None,
+                os: "linux",
+            };
+            assert_eq!(
+                locate_sdk(&env).unwrap_err().kind,
+                AvailabilityKind::SdkMissing
+            );
+        }
+    }
+
+    #[test]
+    fn prefers_complete_default_sdk_over_partial_environment_sdks() {
+        let first = FakeSdk::new().write();
+        let second = FakeSdk::new().without_adb().write();
+        let complete = FakeSdk::new().write();
+        std::fs::remove_file(first.root().join("emulator/emulator")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("Android")).unwrap();
+        let default = home.path().join("Android/Sdk");
+        std::fs::rename(complete.root(), &default).unwrap();
+        let mut env = first.env();
+        env.vars
+            .insert("ANDROID_SDK_ROOT".into(), second.root().into());
+        env.home = Some(home.path().to_path_buf());
+        let sdk = locate_sdk(&env).unwrap();
+        assert_eq!(sdk.emulator, default.join("emulator/emulator"));
+        assert_eq!(sdk.adb, default.join("platform-tools/adb"));
+    }
+
+    #[test]
+    fn reports_first_partial_sdk_when_none_is_complete() {
+        let no_emulator = FakeSdk::new().write();
+        std::fs::remove_file(no_emulator.root().join("emulator/emulator")).unwrap();
+        let no_adb = FakeSdk::new().without_adb().write();
+        for (first, second, kind) in [
+            (&no_emulator, &no_adb, AvailabilityKind::EmulatorMissing),
+            (&no_adb, &no_emulator, AvailabilityKind::AdbMissing),
+        ] {
+            let mut env = first.env();
+            env.vars
+                .insert("ANDROID_SDK_ROOT".into(), second.root().into());
+            let availability = locate_sdk(&env).unwrap_err();
+            assert_eq!(availability.kind, kind);
+            assert!(
+                availability
+                    .message
+                    .contains(&first.root().display().to_string())
+            );
+        }
     }
 
     #[tokio::test]

@@ -71,7 +71,7 @@
         {
           "platform": "ios",
           "availability": {
-            "kind": "xcodeSetupIncomplete",
+            "kind": "xcodeMissing",
             "message": "-1"
           },
           "images": []
@@ -120,7 +120,7 @@
         {
           "platform": "android",
           "availability": {
-            "kind": "viewOnlyHeadless",
+            "kind": "xcodeUnsupported",
             "message": "�"
           },
           "images": [
@@ -176,7 +176,7 @@
         {
           "platform": "ios",
           "availability": {
-            "kind": "adbMissing",
+            "kind": "emulatorMissing",
             "message": "�"
           },
           "images": [

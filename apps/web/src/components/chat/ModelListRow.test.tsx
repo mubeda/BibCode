@@ -74,6 +74,13 @@ beforeEach(() => {
 });
 
 describe("ModelListRow", () => {
+  it("renders a model description as secondary text", () => {
+    const markup = renderRow({
+      model: { slug: "opus", name: "Opus 5.5", description: "For your toughest challenges" },
+    });
+    expect(markup).toMatch(/text-muted-foreground[^>]*>For your toughest challenges</);
+  });
+
   it("exposes stable provider instance and model slug ownership attributes", () => {
     const markup = renderRow({
       instanceId: "codex_personal",

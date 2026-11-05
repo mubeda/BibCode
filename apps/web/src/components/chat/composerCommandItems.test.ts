@@ -158,6 +158,39 @@ describe("buildComposerCommandItems", () => {
     ]);
   });
 
+  it("lists plugin skills and matches their namespace prefix", () => {
+    const dollarSkills = [
+      makeSkill("superpowers:systematic-debugging", "dollar", {
+        path: "/home/.codex/plugins/cache/test/superpowers/7.0.1/skills/systematic-debugging/SKILL.md",
+      }),
+      makeSkill("superpowers:test-driven-development", "dollar"),
+      makeSkill("superlite:diagnosis", "dollar"),
+      makeSkill("superpowers:disabled", "dollar", { enabled: false }),
+    ];
+
+    expect(
+      buildComposerCommandItems(inputFor("$", { dollarSkills })).items.map((item) => item.label),
+    ).toEqual([
+      "$superlite:diagnosis",
+      "$superpowers:systematic-debugging",
+      "$superpowers:test-driven-development",
+    ]);
+    expect(
+      buildComposerCommandItems(inputFor("$superp", { dollarSkills })).items.map(
+        ({ label, replacement }) => ({ label, replacement }),
+      ),
+    ).toEqual([
+      {
+        label: "$superpowers:systematic-debugging",
+        replacement: "$superpowers:systematic-debugging ",
+      },
+      {
+        label: "$superpowers:test-driven-development",
+        replacement: "$superpowers:test-driven-development ",
+      },
+    ]);
+  });
+
   it("orders file references before mentionable agents", () => {
     const result = buildComposerCommandItems(
       inputFor("@", {

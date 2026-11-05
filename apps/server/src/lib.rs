@@ -3,6 +3,7 @@
 pub mod activity;
 mod agent_sessions;
 pub mod allocator;
+mod ansi;
 pub mod assets;
 mod auth;
 pub mod checkpointing;

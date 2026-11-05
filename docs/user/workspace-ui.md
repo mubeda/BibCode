@@ -1512,6 +1512,10 @@ two of them, the panel says so instead of showing no changes.
 - **Compare** lists the changed files on the left and shows the selected
   file's previous and current versions side by side, aligned and scrolling
   together. The full files load after the changed lines, which show at once.
+  - Drag the divider beside the file list to resize it. The width is remembered
+    in this browser, with space reserved for the diff. A focused divider also
+    accepts Left, Right, Home and End; double-click resets the width. Hover a
+    truncated file name to see its full path.
   - The list filters by name (**Esc** clears it) and by status, and says
     "N of M files" while a filter is on. Up, Down, Home, End, Page Up and Page
     Down move the selection. In a panel narrower than 640 px, the list becomes

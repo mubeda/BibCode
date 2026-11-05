@@ -136,6 +136,7 @@ export const STILL_IMAGES_REASONS: Readonly<Record<StillImagesReason, string>> =
 const AVAILABILITY_TITLES: Readonly<Record<DeviceAvailabilityKind, string>> = {
   ready: "Devices ready",
   sdkMissing: "Android SDK not found",
+  emulatorMissing: "Android Emulator not installed",
   adbMissing: "Android platform-tools missing",
   noAvds: "No virtual devices",
   accelerationUnavailable: "Hardware acceleration unavailable",

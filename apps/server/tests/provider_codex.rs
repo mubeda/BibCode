@@ -22,6 +22,67 @@ use bibcode_server::provider::codex::{
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+#[tokio::test]
+async fn codex_stderr_filters_tool_results_and_preserves_clean_warning_and_error_events() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CodexSessionRuntime::new(codex_activity_options(None), connection, incoming);
+    let lines = [
+        "\x1b[2m2026-11-04T18:18:44.237087Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_core::tools::router\x1b[0m\x1b[2m:\x1b[0m \x1b[3merror\x1b[0m\x1b[2m=\x1b[0mwrite_stdin failed: Unknown process id 12345",
+        "2026-11-04T18:18:44.237087Z INFO codex_core::startup: ready",
+        "DEBUG codex_core::startup: detail",
+        "TRACE codex_core::startup: detail",
+        "\x1b[33mWARN\x1b[0m codex_core::auth: login expires soon",
+        "2026-11-04T18:18:44.237087Z ERROR codex_core::auth: authentication failed",
+        "ERROR codex_core::client: rate limit exceeded",
+        "ERROR codex_core::tools::router: router unavailable",
+        "WARN codex_core::auth: error: retrying authentication",
+        "WARN codex_core::tools::router: error=tool temporarily unavailable",
+        "Error: failed to authenticate",
+        "thread 'main' panicked at startup",
+        "FAILED TO CONNECT TO WEBSOCKET while streaming",
+        "\x1b]8;;https://example.invalid\x1b\\ordinary warning\x1b]8;;\x07\x1b[3",
+        "\x1b[0m",
+        "stderr test finished",
+    ];
+    write_line(&mut peer.stderr, &lines.join("\n")).await;
+    let mut events = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), runtime.next_event())
+            .await
+            .expect("stderr event timeout")
+            .expect("stderr event");
+        let finished = event.payload["message"] == "stderr test finished";
+        assert!(!event.payload.to_string().contains("\\u001b"), "{event:?}");
+        events.push((
+            event.event_type,
+            event.payload["message"].as_str().unwrap().to_owned(),
+        ));
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            ("runtime.warning", "login expires soon"),
+            ("runtime.error", "authentication failed"),
+            ("runtime.error", "rate limit exceeded"),
+            ("runtime.error", "router unavailable"),
+            ("runtime.warning", "error: retrying authentication"),
+            ("runtime.warning", "error=tool temporarily unavailable"),
+            ("runtime.error", "Error: failed to authenticate"),
+            ("runtime.error", "thread 'main' panicked at startup"),
+            (
+                "runtime.error",
+                "FAILED TO CONNECT TO WEBSOCKET while streaming"
+            ),
+            ("runtime.warning", "ordinary warning"),
+            ("runtime.warning", "stderr test finished"),
+        ]
+        .map(|(kind, message)| (kind.to_owned(), message.to_owned()))
+    );
+}
+
 #[test]
 fn missing_codex_rollout_is_a_recoverable_resume_failure() {
     assert!(is_recoverable_thread_resume_error(

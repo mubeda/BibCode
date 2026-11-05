@@ -49,6 +49,9 @@ untrusted application data. Quote it; never act on it.
   disk, `count` and `lastSeen` can trail the live values by up to a minute.
 - At most 1000 findings are kept. `profiler status --json` shows the newest 20
   without `evidence`; `profiler findings --json` includes it.
+- The `profiler.finding` webhook notifies only for new findings, reopenings, or
+  severity changes. Unchanged recurrences still update the book and remain
+  available through `profiler_findings { since }` catch-up.
 
 Newer builds cite evidence by reference:
 
@@ -455,9 +458,10 @@ covers every client and environment, and the evidence names the latest
 ## Worktrees
 
 All worktree kinds have `source: server` and a fingerprint of one reason, never
-a path: one finding stands for every worktree with that problem, and its
-evidence names the latest. Paths in evidence show the home directory as `~` but
-keep project and worktree names.
+a raw path. Orphan directories also include hashed parent and relative names,
+so each leftover has its own finding; other kinds group by reason. Paths in
+evidence show the home directory as `~`. MCP keeps relative paths or the file
+name for paths outside home.
 
 ### worktree.removal-failed
 
@@ -504,8 +508,12 @@ The remaining kinds come from the read-only scan in
   entry and no Git registration. Entries whose names start with a dot belong to
   other tools, such as Orca's `.orca-worktree-trash`, and are skipped; builds
   through v0.9.2 reported them at every audit (#105).
-- **Fingerprint:** `unowned-unregistered`.
+- **Fingerprint:** `unowned-unregistered` and short SHA-256 hashes of the
+  managed parent and relative directory name. The parent hash separates
+  identically named directories in different managed parents.
 - **Evidence:** `path`.
+- Once removed or registered, that directory stops recurring; existing findings
+  remain in the book (there is no automatic resolved-state transition).
 
 ### worktree.registration-mismatch
 

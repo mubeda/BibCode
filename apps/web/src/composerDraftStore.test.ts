@@ -2684,6 +2684,55 @@ describe("composerDraftStore v3 hydration via merge", () => {
   const hydrateThreadId = ThreadId.make("thread-hydrate");
   const hydrateThreadKey = scopedThreadKey(scopeThreadRef(TEST_ENVIRONMENT_ID, hydrateThreadId));
 
+  it.each(["opus", "claude-opus-5-5"])(
+    "restores saved Claude model %s after hydration",
+    (saved) => {
+      const merged = getPersistOptions().merge(
+        {
+          draftsByThreadKey: {
+            [hydrateThreadKey]: {
+              modelSelectionByProvider: {
+                [CLAUDE_AGENT_INSTANCE]: createModelSelection(CLAUDE_AGENT_INSTANCE, saved),
+              },
+              activeProvider: CLAUDE_AGENT_INSTANCE,
+            },
+          },
+        },
+        useComposerDraftStore.getInitialState(),
+      );
+      const snapshot: ServerProvider = {
+        ...serverProvider({ instanceId: "claudeAgent" }),
+        driver: CLAUDE_AGENT_DRIVER,
+        models: [
+          {
+            slug: "default",
+            name: "Default (recommended)",
+            resolvedModel: "claude-opus-5-5",
+            isCustom: false,
+            capabilities: null,
+          },
+          {
+            slug: "opus",
+            name: "Opus 5.5",
+            resolvedModel: "claude-opus-5-5",
+            isCustom: false,
+            capabilities: null,
+          },
+        ],
+      };
+      const result = deriveEffectiveComposerModelState({
+        draft: merged.draftsByThreadKey[hydrateThreadKey],
+        providers: [snapshot],
+        selectedProvider: CLAUDE_AGENT_DRIVER,
+        selectedInstanceId: CLAUDE_AGENT_INSTANCE,
+        threadModelSelection: null,
+        projectModelSelection: null,
+        settings: DEFAULT_UNIFIED_SETTINGS,
+      });
+      expect(result.selectedModel).toBe("opus");
+    },
+  );
+
   it("hydrates persisted attachments back into usable files", () => {
     const merged = getPersistOptions().merge(
       {

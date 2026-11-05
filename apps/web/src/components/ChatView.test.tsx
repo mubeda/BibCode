@@ -10,7 +10,8 @@ import { attachmentAdmissionOwner } from "../state/attachmentAdmissions";
  * Real zustand stores (composer drafts and right/center panels) are
  * seeded directly so the component's derivation pipeline runs against
  * realistic state. Handler props captured from mocked children are then
- * invoked to exercise the send/interrupt/approval command flows.
+ * invoked to exercise the send/interrupt/approval command flows. The View diff
+ * regression renders the real timeline to exercise its Changed files button.
  */
 import {
   act,
@@ -35,6 +36,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
+  CheckpointRef,
   ApprovalRequestId,
   ActivityError,
   EventId,
@@ -73,6 +75,7 @@ const h = vi.hoisted(() => {
     captured: {} as Record<string, unknown>,
     /** Renders the real ChatComposer and ThreadErrorBanner behind their capturing mocks. */
     realChildren: false,
+    realTimeline: false,
     /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
     timelineList: null as unknown,
     atomValuesByKey: new Map<string, unknown>(),
@@ -509,17 +512,34 @@ vi.mock("./chat/ChatComposer", async (importOriginal) => {
   };
 });
 
-vi.mock("./chat/threadFind/useThreadFind", () => ({
+vi.mock("./chat/threadFind/useThreadFind", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./chat/threadFind/useThreadFind")>()),
   openThreadFindForTarget: (target: EventTarget | null) => {
     h.openThreadFindTargets.push(target);
     return true;
   },
 }));
 
-vi.mock("./chat/MessagesTimeline", async () => {
+// Render all timeline rows without relying on browser layout measurements.
+vi.mock("@legendapp/list/react", () => ({
+  LegendList: ({
+    data,
+    renderItem,
+  }: {
+    data: Array<{ id: string }>;
+    renderItem: (args: { item: { id: string }; index: number }) => ReactNode;
+  }) => data.map((item, index) => <div key={item.id}>{renderItem({ item, index })}</div>),
+}));
+
+vi.mock("./ChatMarkdown", () => ({
+  default: ({ text }: { text: string }) => <div>{text}</div>,
+}));
+
+vi.mock("./chat/MessagesTimeline", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/MessagesTimeline")>();
   const { RightPanelThreadContext } = await import("./chat/rightPanelThread");
   return {
-    MessagesTimeline: (props: Record<string, unknown>) => {
+    MessagesTimeline: (props: ComponentProps<typeof actual.MessagesTimeline>) => {
       h.captured["messagesTimeline"] = props;
       h.captured["rightPanelThread"] = use(RightPanelThreadContext);
       // A new instance is a new find session: its query and selection start over.
@@ -534,6 +554,7 @@ vi.mock("./chat/MessagesTimeline", async () => {
         onListMount?.(h.timelineList);
         return () => onListMount?.(null);
       }, [onListMount]);
+      if (h.realTimeline) return <actual.MessagesTimeline {...props} />;
       return (
         <div
           data-mock="messages-timeline"
@@ -655,7 +676,7 @@ vi.mock("./CenterPanelWorkspace", () => ({
     );
     const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
     return (
-      <div data-mock="center-panel-workspace">
+      <div data-mock="center-panel-workspace" data-center-panel-workspace>
         {state.groups.map((group) => (
           <div key={group.id} data-mock-center-header={group.id}>
             {group.id === state.focusedGroupId
@@ -1124,6 +1145,7 @@ beforeEach(() => {
   h.centerHeaderDensityByGroupId.clear();
   h.chatHeaderActionsInstanceCount = 0;
   h.messagesTimelineInstanceCount = 0;
+  h.realTimeline = false;
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -2088,6 +2110,9 @@ describe("ChatView", () => {
           });
           await reportResize();
           expect(inset()).toBe(140);
+          expect(
+            container.querySelector<HTMLElement>("[data-chat-timeline-viewport]")?.style.clipPath,
+          ).toBe("inset(0 0 140px 0)");
           if (anchored) {
             const composer = capturedProps<Record<string, unknown>>("chatComposer");
             (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
@@ -2154,6 +2179,9 @@ describe("ChatView", () => {
           await openSubagents(container);
           await reportResize();
           expect(inset()).toBe(492);
+          expect(
+            container.querySelector<HTMLElement>("[data-chat-timeline-viewport]")?.style.clipPath,
+          ).toBe("inset(0 0 492px 0)");
 
           const pill = container.querySelector<HTMLButtonElement>(
             '[data-testid="activity-dock"] button',
@@ -2168,6 +2196,58 @@ describe("ChatView", () => {
           expect(listScroll.scrollToOffset).not.toHaveBeenCalled();
         } finally {
           rectSpy.mockRestore();
+          await act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
+
+    it.each([false, true])(
+      "settles the timeline after split resize respecting reader takeover (%s)",
+      async (readerTookOver) => {
+        seedEnvironment(makeEnvironmentPresentation());
+        seedProject(makeProject());
+        seedServerThread(makeThread());
+        seedGitStatus(true);
+        const scrollToEnd = vi.fn();
+        const scrollNode = document.createElement("div");
+        h.timelineList = {
+          getScrollableNode: () => scrollNode,
+          getState: () => ({
+            scroll: 1000,
+            scrollLength: 800,
+            contentLength: 3000,
+            data: [{}, {}],
+            positionAtIndex: (index: number) => index * 1000,
+            sizeAtIndex: () => 1000,
+          }),
+          scrollToEnd,
+        };
+        const { container, root } = await mountActivityRoute();
+        try {
+          await act(
+            () =>
+              new Promise<void>((resolve) =>
+                requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+              ),
+          );
+          if (readerTookOver) {
+            await act(async () =>
+              (
+                capturedProps<Record<string, unknown>>("messagesTimeline")[
+                  "onManualNavigation"
+                ] as () => void
+              )(),
+            );
+          }
+          scrollToEnd.mockClear();
+          container
+            .querySelector("[data-center-panel-workspace]")!
+            .dispatchEvent(new Event("bibcode:center-panel-resize-end"));
+          await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+          if (readerTookOver) expect(scrollToEnd).not.toHaveBeenCalled();
+          else expect(scrollToEnd).toHaveBeenCalledWith({ animated: false });
+        } finally {
           await act(async () => root.unmount());
           container.remove();
         }
@@ -4792,8 +4872,9 @@ describe("ChatView", () => {
     });
 
     // #275: the task panel's auto-open took the panel straight back, so View diff did nothing.
-    it("keeps a turn's diff open over the task panel that opened automatically", async () => {
+    it("keeps a turn's diff open after clicking View diff over the auto-opened task panel", async () => {
       const planTurnId = TurnId.make("turn-275");
+      const assistantMessageId = MessageId.make("assistant-275");
       const planUpdate = (id: string, turn: TurnId) => ({
         id: EventId.make(id),
         createdAt: now,
@@ -4812,12 +4893,35 @@ describe("ChatView", () => {
         assistantMessageId: null,
       });
       h.settings = { ...h.settings, autoOpenPlanSidebar: true };
+      h.realTimeline = true;
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
       seedServerThread(
         makeThread({
           latestTurn: completedTurn(planTurnId),
           activities: [planUpdate("plan-1", planTurnId)],
+          messages: [
+            {
+              id: assistantMessageId,
+              role: "assistant",
+              text: "Updated tasks.",
+              turnId: planTurnId,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+            },
+          ],
+          checkpoints: [
+            {
+              turnId: planTurnId,
+              checkpointTurnCount: 1,
+              checkpointRef: CheckpointRef.make("checkpoint-275"),
+              status: "ready",
+              files: [{ path: "docs/tasks.md", kind: "modified", additions: 2, deletions: 0 }],
+              assistantMessageId,
+              completedAt: now,
+            },
+          ],
         }),
       );
       seedGitStatus(true);
@@ -4839,12 +4943,24 @@ describe("ChatView", () => {
         await render();
         expect(activeSurfaceId()).toBe("plan");
 
-        const timeline = capturedProps<{
-          onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
-        }>("messagesTimeline");
-        await act(async () => timeline.onOpenTurnDiff(planTurnId, "docs/tasks.md"));
+        const clickButton = async (label: string) => {
+          const button = [...container.querySelectorAll("button")].find(
+            (candidate) => candidate.textContent === label,
+          );
+          expect(button, label).toBeDefined();
+          await act(async () => button!.click());
+        };
+        // Changed-files directories default collapsed, so Expand all is the first label.
+        await clickButton("Expand all");
+        await clickButton("Collapse all");
+        await clickButton("View diff");
         expect(activeSurfaceId()).toBe("diff");
         expect(container.querySelector('[data-mock="diff-panel"]')).not.toBeNull();
+        expect(useDiffPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
+          kind: "turn",
+          turnId: planTurnId,
+          filePath: "docs/tasks.md",
+        });
 
         // A later step of the same turn leaves the diff in place.
         h.threadsByKey.set(

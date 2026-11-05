@@ -89,12 +89,8 @@ export const ChangedFilesTree = memo(function ChangedFilesTree(props: {
 }) {
   const { files, allDirectoriesExpanded, onOpenTurnDiff, resolvedTheme, turnId } = props;
   const treeNodes = useMemo(() => buildTurnDiffTree(files), [files]);
-  const directoryPathsKey = useMemo(
-    () => collectDirectoryPaths(treeNodes).join("\u0000"),
-    [treeNodes],
-  );
-  const hasDirectoryNodes = directoryPathsKey.length > 0;
-  const expansionStateKey = `${allDirectoriesExpanded ? "expanded" : "collapsed"}\u0000${directoryPathsKey}`;
+  const hasDirectoryNodes = treeNodes.some((node) => node.kind === "directory");
+  const expansionStateKey = `${turnId}\u0000${allDirectoriesExpanded ? "expanded" : "collapsed"}`;
   const [directoryExpansionState, setDirectoryExpansionState] = useState<{
     key: string;
     overrides: Record<string, boolean>;
@@ -102,6 +98,9 @@ export const ChangedFilesTree = memo(function ChangedFilesTree(props: {
     key: expansionStateKey,
     overrides: {},
   }));
+  if (directoryExpansionState.key !== expansionStateKey) {
+    setDirectoryExpansionState({ key: expansionStateKey, overrides: {} });
+  }
   const expandedDirectories =
     directoryExpansionState.key === expansionStateKey
       ? directoryExpansionState.overrides
@@ -197,13 +196,3 @@ export const ChangedFilesTree = memo(function ChangedFilesTree(props: {
 
   return <div className="space-y-0.5">{treeNodes.map((node) => renderTreeNode(node, 0))}</div>;
 });
-
-function collectDirectoryPaths(nodes: ReadonlyArray<TurnDiffTreeNode>): string[] {
-  const paths: string[] = [];
-  for (const node of nodes) {
-    if (node.kind !== "directory") continue;
-    paths.push(node.path);
-    paths.push(...collectDirectoryPaths(node.children));
-  }
-  return paths;
-}

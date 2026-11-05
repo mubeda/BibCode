@@ -92,6 +92,8 @@ configuration. Cursor filesystem tests must also supply an explicit temporary
 home. Keep cancellation/reaping (including abandoned requests during shutdown),
 configured homes (including Codex shadow homes), local/remote OpenCode directory
 encoding, Claude visibility/aliases, and partial-catalog coverage alongside discovery.
+Codex fixtures must include skills available only after loading the native
+installed-plugin catalog, plus an older App Server without that method.
 
 For packaged visual validation on each available supported provider:
 
@@ -103,7 +105,10 @@ For packaged visual validation on each available supported provider:
 3. Check configured user homes, nested/symlinked Cursor skills, and remote
    OpenCode directory selection where those setups are available. Confirm native
    disabled/non-invocable skills stay hidden and name collisions have one effective
-   entry.
+   entry. For Codex, include an enabled plugin with skills only in its plugin
+   installation, outside the standalone skill roots. Open a fresh picker and
+   verify both `$` and a namespace prefix such as `$superp` list its
+   `superpowers:*` skills.
 4. Refresh providers, change instance settings, and reconnect. Reopen a stale
    menu and confirm the catalog refreshes without losing draft text or inline
    skills. Typing in its search must not launch another discovery per keypress.
@@ -131,6 +136,19 @@ doc comments of `live_opencode_2_round_trip`, `live_opencode_2_local_inventory`
 and `live_opencode_2_terminal_observation` list the environment they need; the
 server's default model must be a scripted local endpoint so no provider credits
 are spent.
+
+For Codex stderr and Work Log changes, run the reader-to-runtime regression and
+Work Log projection checks:
+
+```sh
+cargo test -p bibcode-server --test provider_codex codex_stderr_filters_tool_results_and_preserves_clean_warning_and_error_events
+cargo test -p bibcode-server --lib provider_projection_
+```
+
+In a packaged Codex chat, confirm routine tool-router failures add no Work Log
+warning, real warnings and errors have their respective labels, and diagnostics
+contain no terminal color or hyperlink escapes. Record unavailable live-provider
+or packaged checks separately from the hermetic regression results.
 
 Compaction and retries apply to Codex and OpenCode 2. Send `/compact` and
 confirm a **Conversation compaction** step in the work log, no `/compact` text
@@ -3234,6 +3252,20 @@ second run is required. Verify these remote deltas and no substitutes:
 
 ## Packaged visual validation
 
+For Claude model-picker changes, check both **Settings → AI providers → Default
+model** and the composer picker with current initialization data. Model names
+must remain distinct even when descriptions share a tagline; descriptions stay
+secondary and Default remains identifiable. Select an alias, restart, and verify
+it stays selected. Repeat with a saved full ID that matches a reported
+`resolvedModel`, including when Default resolves to that same ID. Selecting a
+row must still send its reported `value`. Also run the older `·` description
+coverage:
+
+```sh
+cargo test -p bibcode-server --lib provider::claude::model::tests -j 2
+vp test run packages/shared/src/model.test.ts packages/shared/src/providerSessionDefaults.test.ts apps/web/src/modelSelection.test.ts apps/web/src/components/chat/ModelListRow.test.tsx apps/web/src/components/chat/ModelPickerContent.test.tsx apps/web/src/components/settings/ProviderSessionDefaultsControls.test.tsx
+```
+
 Use Codex Computer Use to operate the exact packaged executable. Before launch,
 prove no conflicting BiBCode instance is running. Use disposable application
 data and platform-specific renderer isolation without overwriting a user
@@ -3419,6 +3451,19 @@ sizes. Cover relevant:
 - terminal input/output and panel switching, including each chat and Codex terminal pane's
   own Activity panel in a split: it stays inside its pane, the composer stays usable, and
   the terminal redraws at its new size;
+- center split resizing (#284): with a long chat at its end above a terminal,
+  grab the horizontal divider 3 px off its visible line and drag through several
+  terminal rows before release. The hit target is 8 px, its line remains
+  highlighted throughout capture, and pane sizes follow the latest pointer
+  position once per frame. During the drag, terminal layout fits and PTY resize
+  RPCs wait; after release the terminal fits the final pane dimensions. The
+  last chat row stays outside the composer blur, the composer shadow fits inside
+  the pane, and a reader scrolled into history keeps their position. Repeat with
+  a side-by-side split, pointer cancellation, and keyboard arrows. Focused web
+  coverage is `vp test run --project unit src/components/CenterPanelSplitLayout.test.tsx
+  src/components/CenterPanelSurfaceHosts.test.tsx src/components/CenterPanelWorkspace.surface-hosts.test.tsx
+  src/components/ThreadTerminalPanel.interactions.test.tsx src/components/ChatView.test.tsx`
+  from `apps/web`; happy-dom coverage does not prove native paint or hit testing;
 - stopping a chat whose subagents still run moves them from **Active** to **Done** as
   **Interrupted**, each saying its session ended before it reported (the packaged
   `chat-activity-panel` spec automates this with its Codex fixture);
@@ -3824,7 +3869,17 @@ deliveries; an End keydown and a scroll to the end resume following, and at
 least three later deliveries rest with the end revealed
 (`mermaid-timeline-keyboard-takeover.json`). The key-stage trace is saved before
 its assertion as `mermaid-timeline-keyboard-key.json`, so a failed takeover
-retains its scroll and captured-row geometry. Last, with a long reply at the
+retains its scroll and captured-row geometry. The keyboard sampler resolves the
+visible scroller on each painted read and takes the reply geometry from that
+same list: retaining a scroller across replacement would mix a detached node's
+zero offset with the live reply's geometry (#215). Key counting follows the
+current list through a document listener. Delivery counts belong to the lowest
+keyboard reply, so earlier iterations cannot supply its completion; the final
+check also waits for the working row to disappear. A replacement that actually
+resets the scroll still fails the end-revealed check. The focused sampler
+regressions run with
+`node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/timeline-keyboard-samples.test.ts`.
+Last, with a long reply at the
 end, the reader wheels 40 px up, within LegendList's end threshold, and the
 bottom region (the composer overlay) grows by 120 px; then, back at the end,
 the reply's last row grows and the reader wheels 40 px up in the same frame,
@@ -4095,6 +4150,14 @@ agent turn edit two files so the thread has a turn with checkpoints.
 
 1. Open the Diff panel. **Changes** is selected and matches the stacked view.
    Choose **Split**, then **Compare**.
+   Include a long file path: hover its truncated row to see the full path,
+   then drag the file-list divider wider until the path fits. Check smooth
+   resizing with both diff columns still usable, and drag to both bounds.
+   Focus the divider and test Left, Right, Home and End; double-click resets
+   it. Choose a width, close and reopen the panel, then relaunch the app and
+   confirm the width returns. Narrow the panel: the width clamps to reserve
+   room for the diff, and below 640 px the list becomes a picker without a
+   divider. Widen it again and confirm the chosen width returns.
 2. For **Working tree**, **Branch changes** and the turn, select files from the
    list with the pointer and with Up and Down. Each changed file shows its
    previous and current versions side by side, aligned and scrolling together,
@@ -4274,9 +4337,17 @@ Record each client's OS, app or browser version, and profile type.
    preview**. Turn on **Settings → Mobile emulators → Device previews** for the
    environment; both appear.
 2. **Availability.** Open the Device panel: it lists the AVDs. On a host
-   without the SDK, without platform-tools, without AVDs, or without
-   acceleration (one at a time, where you can arrange it), the panel names
-   the problem and the fix. Record each message. With the panel open, create
+   without the SDK, without the emulator package, without platform-tools,
+   without AVDs, or without acceleration (one at a time, where you can arrange
+   it), the panel names
+   the problem and the fix. For an SDK containing `platform-tools/`,
+   `platforms/`, or `cmdline-tools/` but no emulator binary, expect
+   **Android Emulator not installed**, the SDK root, SDK Manager advice
+   (`sdkmanager "emulator"`), and a server restart instruction. With a partial
+   SDK in `ANDROID_HOME` and a complete SDK at the OS default, verify the
+   complete SDK is used; when none is complete, verify the first partial
+   SDK's missing-component message is shown. Record each message.
+   With the panel open, create
    an AVD in Android Studio's Device Manager (on a host with none, the first
    one), then choose **Refresh devices**, by keyboard as well as by pointer:
    the new AVD is listed without reopening the panel or restarting BiBCode.

@@ -1214,6 +1214,17 @@ a stale rectangle snapshot while WebKit defers paint. Ordinary resize work
 remains frame-batched, and equivalent activation state does not force another
 measurement.
 
+During a center split drag, pointer moves retain only the latest ratio and
+write pane sizes once per animation frame. The body-target ResizeObserver
+synchronizes surface hosts after layout, reading all host rectangles before
+writing any styles. Rectangle publication to React pauses until release, as
+does terminal fitting and its PTY resize RPC. The workspace marks the gesture
+with `data-resizing` and emits `bibcode:center-panel-resize-end` on release or
+cancellation; terminal viewports fit the final dimensions and chats settle
+their live end through the existing follow policy, preserving reader takeover.
+The timeline clips at the measured composer boundary, and the composer shadow
+fits within its lower padding so split-pane clipping does not cut it off.
+
 Center chat-panel creation reserves and activates its client surface before the
 server command settles. A confirmed command failure removes that reservation;
 an interrupted result is ambiguous because durable thread creation may already
@@ -2003,7 +2014,10 @@ it.
 
   Nothing is reported once BiBCode is terminating.
 
-- **Worktree audit.** See [Worktree catalog: Audit](./worktree-catalog.md#audit).
+- **Worktree audit.** Orphan directories have distinct findings keyed by hashes
+  of their managed parent and relative directory name, never a raw path. MCP evidence
+  keeps the file name for paths outside home. See
+  [Worktree catalog: Audit](./worktree-catalog.md#audit).
 - **Git stacked actions (#158).** `git.runStackedAction` reports a failed
   commit, push, or request step as an `action_failed` item inside a stream that
   then ends successfully, so stream timing alone records only `first-item`.
@@ -2249,12 +2263,19 @@ hold it for one call, and a stop waits up to 5 s for those calls to let go.
 
 **Discovery (Android).** The server looks for the SDK in `ANDROID_HOME`, then
 `ANDROID_SDK_ROOT`, then the platform default (`~/Library/Android/sdk`,
-`%LOCALAPPDATA%\Android\Sdk`, or `~/Android/Sdk`), and needs both
-`emulator/emulator` and `platform-tools/adb`. It lists AVDs with
+`%LOCALAPPDATA%\Android\Sdk`, or `~/Android/Sdk`). A root counts as an SDK
+when it contains a `platform-tools/`, `platforms/`, or `cmdline-tools/`
+directory. The first SDK with both `emulator/emulator` and
+`platform-tools/adb` wins; if none is complete, the first partial SDK reports
+`emulatorMissing` when the emulator is absent, otherwise `adbMissing`.
+`sdkMissing` means no candidate looks like an SDK. The missing-emulator
+message names the SDK root and directs the user to install `emulator` with
+the SDK Manager (`sdkmanager "emulator"`), then restart the server.
+It lists AVDs with
 `emulator -list-avds` and checks acceleration with `emulator -accel-check`.
 Each failure becomes the `availability` of the catalog's Android entry
-(`sdkMissing`, `adbMissing`, `noAvds`, or `accelerationUnavailable`) with an
-actionable message. The catalog lists one entry per platform, each with its
+(`sdkMissing`, `emulatorMissing`, `adbMissing`, `noAvds`, or
+`accelerationUnavailable`) with an actionable message. The catalog lists one entry per platform, each with its
 own `availability` and `images` (`{ id, displayName, inUseElsewhere? }`), and
 every device as
 `{ deviceId, platform, imageId, state, orientation, canRotate, threadId? }`, in
@@ -2853,12 +2874,16 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md),
 
 - **Sources, never the broadcast.** The dispatcher reads X3's change feed through
   `mcp::tools::feed::page_after` (the page `changes_since` returns) from a stored
-  cursor, and the profiler's findings book from the `lastSeen` second and the
-  `(id, count)` marks it last delivered. Each read's deliveries and its new position
+  cursor, and the profiler's findings book against stored state and severity for
+  every tracked id. Only new findings, reopenings, and severity changes queue a
+  notification; unchanged recurrences do not. Each read's deliveries and its new position
   are written in one SQLite transaction (migration 61: `webhook_endpoints`,
   `webhook_deliveries`, `webhook_state`), so a restart resumes without loss or
   repeats. The engine's in-process event broadcast, which drops under load, is not a
   source; Authorized-clients changes only wake the dispatcher.
+  The first findings read starts from the current book, including when upgrading a
+  legacy count-based position. Each finding notification gets a distinct event id
+  independent of its count, persisted with its deliveries for retries and redelivery.
 - **Queue.** Delivery rows are the queue and the log: one request open per endpoint
   (a per-endpoint lock that the dispatcher, test events and redeliveries all take),
   oldest first, at most eight endpoints at once; retries after 30 s, 2, 5, 10 and 15
@@ -3203,6 +3228,11 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   `canOpenPullRequestInPanel` (Pull Requests setting on, not Bitbucket or Azure
   DevOps). Persisted `pullRequest` entries are validated on load, so a corrupted
   one drops without losing the thread's other tabs.
+- The Diff panel's Compare file list reuses `useResizableWidth`, persisting its
+  width in `bibcode:diff-compare-file-list-width`. It clamps the painted width
+  to 224–720 px and reserves 384 px for the diff without rewriting the saved
+  preference when the panel shrinks. Below 640 px it becomes a file picker;
+  unmounting the list cancels any active drag.
 - The Git Manager's Changes tab stacks the file list, the selected diff and the
   commit form. `GitManagerChangesPanes` reuses `useResizableWidth` with
   `axis: "y"` for the list height (`bibcode:git-changes-list-height`) and the

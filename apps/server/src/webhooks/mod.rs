@@ -7,7 +7,7 @@
 //! **Sources.** The dispatcher follows durable sources from stored positions, never the
 //! in-process broadcast (which drops events under load): X3's change feed, through the same
 //! page read `changes_since` uses, from its stored cursor; and the profiler's findings book,
-//! from the `lastSeen` second and the `(id, count)` marks it last delivered. Each read's
+//! from the state and severity last observed for each finding id. Each read's
 //! deliveries and its new position are written in one transaction, so a restart neither
 //! loses nor repeats a queued event.
 //!
@@ -191,13 +191,20 @@ pub(crate) struct Pause {
     pub(crate) release: Notify,
 }
 
-/// The dispatcher's position in the findings book: the newest `lastSeen` second it delivered
-/// and the `(id, count)` of each finding of that second, since `lastSeen` has whole seconds.
+/// The dispatcher's position in the findings book, including resolved and dismissed ids
+/// so a later reopening is distinguishable from an unchanged recurrence.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct FindingsPosition {
     last_seen: String,
-    marks: BTreeMap<String, u64>,
+    marks: BTreeMap<String, FindingMark>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum FindingMark {
+    Current { state: String, severity: String },
+    Legacy(u64),
 }
 
 fn now_ms() -> i64 {
@@ -830,7 +837,7 @@ impl Webhooks {
         }
     }
 
-    /// Reads the findings book and queues each finding that appeared or recurred since the
+    /// Reads the findings book and queues new, reopened, or severity-changed findings since the
     /// stored position. While MCP or its Diagnostics set is off nothing is queued (the
     /// receiver's catch-up tool would not exist), but the position still moves.
     async fn follow_findings(&self, endpoints: &[Endpoint]) {
@@ -863,13 +870,17 @@ impl Webhooks {
             Ok(findings) => findings,
             Err(_) => return,
         };
-        let mut book: Vec<(String, u64, String)> = findings
+        let mut book: Vec<(String, u64, String, FindingMark)> = findings
             .iter()
             .filter_map(|finding| {
                 Some((
                     finding.get("id")?.as_str()?.to_owned(),
                     finding.get("count")?.as_u64()?,
                     finding.get("lastSeen")?.as_str()?.to_owned(),
+                    FindingMark::Current {
+                        state: finding.get("state")?.as_str()?.to_owned(),
+                        severity: finding.get("severity")?.as_str()?.to_owned(),
+                    },
                 ))
             })
             .collect();
@@ -878,43 +889,41 @@ impl Webhooks {
                 .cmp(&seen_at(&right.2))
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let newest = book.last().map(|(_, _, seen)| seen.clone());
-        let position_at = |second: &str| FindingsPosition {
-            last_seen: second.to_owned(),
+        let position = FindingsPosition {
+            last_seen: book
+                .last()
+                .map(|(_, _, seen, _)| seen.clone())
+                .unwrap_or_default(),
             marks: book
                 .iter()
-                .filter(|(_, _, seen)| seen_at(seen) == seen_at(second))
-                .map(|(id, count, _)| (id.clone(), *count))
+                .map(|(id, _, _, mark)| (id.clone(), mark.clone()))
                 .collect(),
         };
-        let (fresh, position) = match stored {
-            // The first read only marks what is already there.
-            None => (
-                Vec::new(),
-                newest.as_deref().map(position_at).unwrap_or_default(),
-            ),
-            Some(stored) => {
-                let since = seen_at(&stored.last_seen);
-                let fresh: Vec<&(String, u64, String)> = book
-                    .iter()
-                    .filter(|(id, count, seen)| {
-                        let at = seen_at(seen);
-                        at > since || (at == since && stored.marks.get(id) != Some(count))
-                    })
-                    .collect();
-                let position = match fresh.last() {
-                    Some((_, _, seen)) => position_at(seen),
-                    None => stored,
-                };
-                (fresh, position)
-            }
-        };
+        // First reads and legacy count-based positions seed the entire current book.
+        let previous = stored.as_ref().filter(|stored| {
+            !stored
+                .marks
+                .values()
+                .any(|mark| matches!(mark, FindingMark::Legacy(_)))
+        });
         let settings = *self.inner.mcp.borrow();
         let offered = settings.enabled && settings.capabilities.allows(McpCapability::Diagnostics);
         let events: Vec<Event> = if offered {
-            fresh
-                .iter()
-                .map(|(id, count, seen)| events::from_finding(id, *count, seen))
+            book.iter()
+                .filter(|(id, _, _, mark)| {
+                    previous.is_some_and(|stored| match (stored.marks.get(id), mark) {
+                        (None, _) => true,
+                        (
+                            Some(FindingMark::Current {
+                                state: old_state,
+                                severity: old_severity,
+                            }),
+                            FindingMark::Current { state, severity },
+                        ) => (state == "open" && old_state != "open") || severity != old_severity,
+                        _ => false,
+                    })
+                })
+                .map(|(id, count, seen, _)| events::from_finding(id, *count, seen))
                 .collect()
         } else {
             Vec::new()

@@ -196,25 +196,28 @@ describe("uiStateStore pure functions", () => {
     expect(reorderProjects(state, currentOrder, [], ["env-local:proj-b"])).toBe(state);
   });
 
-  it("stores only collapsed changed-file turns", () => {
+  it("stores only expanded changed-file turns", () => {
     const threadId = ThreadId.make("thread-1");
-    const collapsed = setThreadChangedFilesExpanded(makeUiState(), threadId, "turn-1", false);
+    const initial = makeUiState();
+    expect(setThreadChangedFilesExpanded(initial, threadId, "turn-1", false)).toBe(initial);
+    const expanded = setThreadChangedFilesExpanded(initial, threadId, "turn-1", true);
+    expect(setThreadChangedFilesExpanded(expanded, threadId, "turn-1", true)).toBe(expanded);
 
-    expect(collapsed.threadChangedFilesExpandedById).toEqual({
+    expect(expanded.threadChangedFilesExpandedById).toEqual({
       [threadId]: {
-        "turn-1": false,
+        "turn-1": true,
       },
     });
     expect(
-      setThreadChangedFilesExpanded(collapsed, threadId, "turn-1", true)
+      setThreadChangedFilesExpanded(expanded, threadId, "turn-1", false)
         .threadChangedFilesExpandedById,
     ).toEqual({});
 
-    const twoTurns = setThreadChangedFilesExpanded(collapsed, threadId, "turn-2", false);
+    const twoTurns = setThreadChangedFilesExpanded(expanded, threadId, "turn-2", true);
     expect(
-      setThreadChangedFilesExpanded(twoTurns, threadId, "turn-1", true)
+      setThreadChangedFilesExpanded(twoTurns, threadId, "turn-1", false)
         .threadChangedFilesExpandedById,
-    ).toEqual({ [threadId]: { "turn-2": false } });
+    ).toEqual({ [threadId]: { "turn-2": true } });
   });
 
   it("stores the endpoint preference by stable key", () => {
@@ -272,7 +275,7 @@ describe("parsePersistedState", () => {
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
-          "turn-1": false,
+          "turn-2": true,
         },
       },
     });
@@ -322,7 +325,7 @@ describe("parsePersistedState", () => {
       threadChangedFilesExpandedById: {
         "": { turn: false },
         thread: null as never,
-        empty: { expanded: true, invalid: "no" as never, "": false },
+        empty: { collapsed: false, invalid: "no" as never, "": true },
       },
       defaultAdvertisedEndpointKey: "",
     });
@@ -412,7 +415,7 @@ describe("uiStateStore persistence", () => {
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
-          "turn-1": false,
+          "turn-2": true,
         },
       },
     });
@@ -420,7 +423,7 @@ describe("uiStateStore persistence", () => {
       ...state,
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
-          "turn-1": false,
+          "turn-2": true,
         },
       },
     });
@@ -439,10 +442,10 @@ describe("uiStateStore persistence", () => {
     expect(resolveProjectExpanded(persisted.projectExpandedById ?? {}, ["unknown"])).toBe(true);
   });
 
-  it("omits fully expanded changed-file maps and tolerates missing browser storage", () => {
+  it("omits fully collapsed changed-file maps and tolerates missing browser storage", () => {
     persistState(
       makeUiState({
-        threadChangedFilesExpandedById: { thread: { turn: true } },
+        threadChangedFilesExpandedById: { thread: { turn: false } },
       }),
     );
     const persisted = JSON.parse(

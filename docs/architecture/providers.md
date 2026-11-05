@@ -71,9 +71,12 @@ already re-reads the mounted query, so a reconnect costs one capability read
 rather than one more per reconnect.
 
 The result contains `slashCommands`, `skills`, `agents`, and `issues`. Codex
-initializes an App Server in the requested directory and calls `skills/list`
-without an account/model query, using the session launch's configured Codex
-home and shared/shadow-home preparation. Claude uses hook-disabled native
+initializes an App Server in the requested directory, loads `plugin/installed`
+to populate its installed-plugin catalog, then calls `skills/list` without an
+account/model query, using the session launch's configured Codex home and
+shared/shadow-home preparation. Older App Servers without `plugin/installed`
+use `skills/list` alone; plugin discovery errors mark the catalog incomplete.
+Claude uses hook-disabled native
 initialization and `reload_skills` with user/project/local settings. Its reload
 results are matched to initialization command names and aliases so model-only
 skills stay hidden; manual-only skills remain available as native commands.
@@ -189,6 +192,13 @@ the discovered agents). A launch decides Fast Mode from the model's entry in the
 published provider inventory, which carries what the CLI reported for aliases
 such as `opus`, and uses the static catalog only for a model the inventory does
 not list. Fast Mode off asks for nothing and is never refused.
+
+Discovered Claude models retain `value` as the inventory `slug`, `displayName`
+as the label, and optional `description` and `resolvedModel` metadata through
+the provider RPC schema. Descriptions render only as secondary text. The shared
+model resolver uses `resolvedModel` to restore saved full IDs to reported
+selectors, preferring an exact selector and then a named alias over `default`.
+No identity or label is inferred from a description.
 
 Each driver translates between the common orchestration model and its native
 protocol:
@@ -392,6 +402,16 @@ compaction, and `compactable: false` when the provider said compacting cannot
 help. The event pump passes them on its internal `thread.session.set` as
 `contextLimit`; absent facts mean no automatic recovery. Only Claude reports
 them today.
+
+Codex stderr is cleaned of terminal escape sequences before it becomes a runtime
+activity. Runtime warnings and errors project their message into the Work Log
+detail. Tracing records lose their timestamp and source prefix. `WARN` and
+`ERROR` retain their severity, while `INFO`, `DEBUG`, and `TRACE` are omitted.
+`codex_core::tools::router` errors carrying an `error=` tool result are omitted
+because Codex already delivers that result to the model. Other router diagnostics
+remain visible. Unstructured stderr stays visible as a warning, except explicit
+`Error:` messages, panics, and fatal WebSocket connection failures, which are
+errors. These diagnostics do not themselves complete or fail a turn.
 
 ### Conversation compaction
 

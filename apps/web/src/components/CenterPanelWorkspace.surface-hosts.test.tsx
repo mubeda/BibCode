@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { ThreadId } from "@bibcode/contracts";
-import { act, type ReactNode } from "react";
+import { act, Profiler, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -15,27 +15,12 @@ vi.mock("@dnd-kit/core", () => ({
   pointerWithin: vi.fn(() => []),
   useSensor: (sensor: unknown, options: unknown) => ({ sensor, options }),
   useSensors: (...sensors: unknown[]) => sensors,
-}));
-
-vi.mock("./CenterPanelSplitLayout", () => ({
-  CenterPanelSplitLayout: (props: {
-    readonly state: ThreadCenterPanelState;
-    readonly registerBodyTarget: (groupId: string) => (node: HTMLDivElement | null) => void;
-  }) => (
-    <div data-center-panel-split-layout>
-      {props.state.groups.map((group) => (
-        <div
-          key={group.id}
-          ref={props.registerBodyTarget(group.id)}
-          data-center-panel-body-target={group.id}
-        />
-      ))}
-    </div>
-  ),
+  useDroppable: () => ({ isOver: false, setNodeRef: () => undefined }),
 }));
 
 vi.mock("./CenterPanelTabs", () => ({
   CenterSurfaceIcon: () => null,
+  CenterPanelTabs: () => null,
 }));
 
 import { CenterPanelWorkspace, type CenterPanelWorkspaceProps } from "./CenterPanelWorkspace";
@@ -76,9 +61,17 @@ const chatInRight: ThreadCenterPanelState = {
 let container: HTMLDivElement;
 let root: Root;
 let frameCallbacks: FrameRequestCallback[];
+let observers: FakeResizeObserver[];
+let leftWidth: number;
 
 class FakeResizeObserver {
-  observe(): void {}
+  readonly targets = new Set<Element>();
+  constructor(readonly callback: ResizeObserverCallback) {
+    observers.push(this);
+  }
+  observe(target: Element): void {
+    this.targets.add(target);
+  }
   unobserve(): void {}
   disconnect(): void {}
 }
@@ -119,16 +112,19 @@ async function renderWorkspace(state: ThreadCenterPanelState): Promise<void> {
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   frameCallbacks = [];
+  observers = [];
+  leftWidth = 320;
   vi.stubGlobal("ResizeObserver", FakeResizeObserver);
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
     frameCallbacks.push(callback);
     return frameCallbacks.length;
   });
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(640);
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
     const groupId = this.getAttribute("data-center-panel-body-target");
     if (groupId === "group-left") {
-      return new DOMRect(0, 32, 320, 368);
+      return new DOMRect(0, 32, leftWidth, 368);
     }
     if (groupId === "group-right") {
       return new DOMRect(320, 32, 320, 368);
@@ -148,6 +144,52 @@ afterEach(async () => {
 });
 
 describe("CenterPanelWorkspace surface hosts", () => {
+  it("resizes through the real split without reading dirty layout or rerendering pane headers", async () => {
+    const props = workspaceProps(chatInLeft);
+    const headers = vi.fn(() => null);
+    const commits = vi.fn();
+    await act(async () =>
+      root.render(
+        <Profiler id="workspace" onRender={commits}>
+          <CenterPanelWorkspace {...props} renderFocusedActions={headers} />
+        </Profiler>,
+      ),
+    );
+    await flushFrames();
+    headers.mockClear();
+    commits.mockClear();
+    const separator = container.querySelector<HTMLElement>('[role="separator"]')!;
+    Object.assign(separator, { setPointerCapture: vi.fn(), hasPointerCapture: () => false });
+    const pointer = (type: string, x: number) =>
+      separator.dispatchEvent(
+        new PointerEvent(type, { bubbles: true, button: 0, pointerId: 1, clientX: x }),
+      );
+    const measure = vi.mocked(Element.prototype.getBoundingClientRect);
+    measure.mockClear();
+    pointer("pointerdown", 320);
+    pointer("pointermove", 400);
+    pointer("pointermove", 380);
+    await flushFrames();
+    expect(measure).not.toHaveBeenCalled();
+    leftWidth = 380;
+    const observer = observers.find((entry) =>
+      [...entry.targets].some((element) => element.hasAttribute("data-center-panel-body-target")),
+    )!;
+    await act(async () => observer.callback([], observer as unknown as ResizeObserver));
+    await flushFrames();
+    expect(headers).not.toHaveBeenCalled();
+    expect(commits).not.toHaveBeenCalled();
+    const surface = container.querySelector<HTMLElement>(
+      '[data-center-surface-host="chat:thread-1"]',
+    )!;
+    expect(surface.style.width).toBe("380px");
+    pointer("pointerup", 380);
+    await flushFrames();
+    expect(props.onSetSplitRatio).toHaveBeenCalledWith([], 0.59375);
+    expect(surface.style.width).toBe("380px");
+    expect(commits).toHaveBeenCalledOnce();
+  });
+
   it("gives live surface roots a bounded flex column while preserving their mounted content", async () => {
     await renderWorkspace(chatInLeft);
     const beforeHost = container.querySelector<HTMLElement>(

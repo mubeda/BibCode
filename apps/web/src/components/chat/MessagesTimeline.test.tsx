@@ -8,6 +8,7 @@ import {
 } from "@bibcode/contracts";
 import { act, createRef, type ComponentProps, type ReactNode, type Ref } from "react";
 import type { WorkLogEntry } from "../../session-logic";
+import type { TurnDiffSummary } from "../../types";
 import { formatShortTimestamp } from "../../timestampFormat";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
@@ -181,6 +182,8 @@ beforeEach(async () => {
   vi.stubGlobal("cancelAnimationFrame", domWindow.cancelAnimationFrame.bind(domWindow));
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   MessagesTimelineComponent ??= (await import("./MessagesTimeline")).MessagesTimeline;
+  const { useUiStateStore } = await import("../../uiStateStore");
+  useUiStateStore.setState({ threadChangedFilesExpandedById: {} });
 }, SLOW_MESSAGES_TIMELINE_IMPORT_TIMEOUT_MS);
 
 afterEach(async () => {
@@ -1153,10 +1156,11 @@ describe("MessagesTimeline assistant rows", () => {
     });
 
     expect(markup).toContain("Changed files (2)");
-    expect(markup).toContain("Collapse all");
+    expect(markup).toContain("Expand all");
+    expect(markup).not.toContain("Collapse all");
     expect(markup).toContain("View diff");
-    expect(markup).toContain("alpha.ts");
-    expect(markup).toContain("beta.ts");
+    expect(markup).not.toContain("alpha.ts");
+    expect(markup).not.toContain("beta.ts");
   });
 
   it("says when a captured turn's changes cannot be shown", async () => {
@@ -1191,6 +1195,124 @@ describe("MessagesTimeline assistant rows", () => {
     expect(markup).toContain("for this turn: the checkpoint before it is missing.");
     expect(markup).not.toContain("View diff");
   });
+});
+
+describe("MessagesTimeline changed-file expansion", () => {
+  const initialFiles = [
+    { path: "src/alpha.ts", kind: "modified", additions: 3, deletions: 1 },
+    { path: "packages/shared/beta.ts", kind: "added", additions: 10, deletions: 0 },
+    { path: "packages/contracts/gamma.ts", kind: "added", additions: 1, deletions: 0 },
+  ];
+  const grownFiles = [
+    ...initialFiles,
+    { path: "docs/delta.md", kind: "added", additions: 1, deletions: 0 },
+  ];
+  function changedFilesProps(files: TurnDiffSummary["files"]) {
+    const assistantMessageId = MessageId.make("message-assistant-diff");
+    return {
+      ...buildProps(),
+      timelineEntries: [
+        buildAssistantTimelineEntry({
+          id: "entry-diff",
+          messageId: assistantMessageId,
+          text: "Changed files.",
+          turnId: TURN_ID,
+        }),
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map<MessageId, TurnDiffSummary>([
+        [
+          assistantMessageId,
+          {
+            turnId: TURN_ID,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("checkpoint-1"),
+            status: "ready",
+            files,
+            assistantMessageId,
+            completedAt: LATER_CREATED_AT,
+          },
+        ],
+      ]),
+    };
+  }
+  function button(container: HTMLElement, label: string) {
+    const match = Array.from(container.querySelectorAll("button")).find((element) =>
+      element.textContent?.startsWith(label),
+    );
+    expect(match, `button ${label}`).toBeDefined();
+    return match!;
+  }
+
+  it.each([false, true])(
+    "keeps the global expanded=%s choice through file growth, later turns and remounts",
+    async (expanded) => {
+      const MessagesTimeline = await loadMessagesTimeline();
+      const container = await mountTimeline(changedFilesProps(initialFiles));
+      const { root } = mountedTrees.at(-1)!;
+      expect(container.textContent).toContain("Expand all");
+      expect(container.textContent).not.toContain("alpha.ts");
+      if (expanded) await click(button(container, "Expand all"));
+      else {
+        await click(button(container, "Expand all"));
+        await click(button(container, "Collapse all"));
+      }
+
+      const props = changedFilesProps(grownFiles);
+      const laterMessageId = MessageId.make("message-later-diff");
+      const laterTurnId = TurnId.make("turn-later");
+      props.timelineEntries.push(
+        buildAssistantTimelineEntry({
+          id: "entry-later-diff",
+          messageId: laterMessageId,
+          text: "Later turn.",
+          turnId: laterTurnId,
+        }),
+      );
+      props.turnDiffSummaryByAssistantMessageId.set(laterMessageId, {
+        ...props.turnDiffSummaryByAssistantMessageId.values().next().value!,
+        turnId: laterTurnId,
+        assistantMessageId: laterMessageId,
+        files: [{ path: "later/epsilon.ts", kind: "added", additions: 1, deletions: 0 }],
+      });
+      const assertChoice = () => {
+        for (const name of ["alpha.ts", "beta.ts", "gamma.ts", "delta.md"]) {
+          expect(container.textContent?.includes(name)).toBe(expanded);
+        }
+        expect(container.textContent).not.toContain("epsilon.ts");
+        expect(button(container, expanded ? "Collapse all" : "Expand all")).toBeDefined();
+      };
+      await act(async () => root.render(<MessagesTimeline {...props} />));
+      assertChoice();
+      await act(async () => root.render(null));
+      await act(async () => root.render(<MessagesTimeline {...props} />));
+      assertChoice();
+    },
+  );
+
+  it.each([false, true])(
+    "preserves folder overrides with global expanded=%s across updates until the next global action",
+    async (expanded) => {
+      const MessagesTimeline = await loadMessagesTimeline();
+      const container = await mountTimeline(changedFilesProps(initialFiles));
+      const { root } = mountedTrees.at(-1)!;
+      if (expanded) await click(button(container, "Expand all"));
+      await click(button(container, "src"));
+
+      for (const files of [initialFiles.slice(), grownFiles]) {
+        await act(async () => root.render(<MessagesTimeline {...changedFilesProps(files)} />));
+        expect(container.textContent?.includes("alpha.ts")).toBe(!expanded);
+        expect(container.textContent?.includes("beta.ts")).toBe(expanded);
+        expect(container.textContent?.includes("gamma.ts")).toBe(expanded);
+        expect(container.textContent?.includes("delta.md")).toBe(expanded && files === grownFiles);
+      }
+
+      // Global actions replace folder choices, including after a full toggle cycle.
+      await click(button(container, expanded ? "Collapse all" : "Expand all"));
+      await click(button(container, expanded ? "Expand all" : "Collapse all"));
+      expect(container.textContent?.includes("alpha.ts")).toBe(expanded);
+      expect(container.textContent?.includes("beta.ts")).toBe(expanded);
+    },
+  );
 });
 
 describe("MessagesTimeline turn folds", () => {
@@ -2359,8 +2481,12 @@ describe("MessagesTimeline mounted interactions", () => {
       latestTurn: running,
       runningTurnId: TURN_ID,
       onTurnSettled,
+      isWorking: true,
+      activeTurnInProgress: true,
     });
     const mounted = mountedTrees.at(-1)!;
+    const scroller = mounted.container.querySelector<HTMLElement>('[data-testid="legend-list"]')!;
+    scroller.scrollTop = 8_800;
     const rerender = (props: Partial<MessagesTimelineProps>) =>
       act(async () =>
         mounted.root.render(
@@ -2368,6 +2494,8 @@ describe("MessagesTimeline mounted interactions", () => {
             {...buildProps()}
             timelineEntries={entries}
             onTurnSettled={onTurnSettled}
+            isWorking={props.latestTurn?.state === "running"}
+            activeTurnInProgress={props.latestTurn?.state === "running"}
             {...props}
           />,
         ),
@@ -2376,13 +2504,19 @@ describe("MessagesTimeline mounted interactions", () => {
     // An entry change while the turn runs is followed as an entry, not as a settled turn.
     await rerender({ latestTurn: running, runningTurnId: TURN_ID, timelineEntries: [...entries] });
     expect(onTurnSettled).not.toHaveBeenCalled();
+    expect(scroller.querySelector('[data-timeline-row-kind="working"]')).not.toBeNull();
 
     await rerender({ latestTurn: completed, runningTurnId: null });
     expect(onTurnSettled).toHaveBeenCalledTimes(1);
+    expect(scroller.querySelector('[data-timeline-row-kind="working"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="legend-list"]')).toBe(scroller);
+    expect(scroller.scrollTop).toBe(8_800);
 
     // Still settled: nothing more to report.
     await rerender({ latestTurn: completed, runningTurnId: null, timelineEntries: [...entries] });
     expect(onTurnSettled).toHaveBeenCalledTimes(1);
+    expect(mounted.container.querySelector('[data-testid="legend-list"]')).toBe(scroller);
+    expect(scroller.scrollTop).toBe(8_800);
   });
 
   it("does not report a turn that was already settled when the timeline mounted (#208)", async () => {

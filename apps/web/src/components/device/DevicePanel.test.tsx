@@ -351,6 +351,16 @@ afterEach(async () => {
 });
 
 describe("DevicePanel", () => {
+  it("shows the missing emulator heading and the server's installation advice", async () => {
+    const message =
+      'Android Emulator is missing from /opt/android-sdk. Install the emulator package with the Android SDK Manager (sdkmanager "emulator"), then restart the BiBCode server.';
+    withCatalog(catalog({ availability: { kind: "emulatorMissing", message }, images: [] }));
+    const container = await render();
+    expect(container.querySelector("h3")?.textContent).toBe("Android Emulator not installed");
+    expect(container.textContent).toContain(message);
+    expect(() => button(container, "Start")).toThrow();
+  });
+
   it("shows the server's message and no Start button when the SDK is missing", async () => {
     withCatalog(
       catalog({

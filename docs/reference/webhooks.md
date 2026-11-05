@@ -140,7 +140,7 @@ count.
 | `scm.operation_completed` | `operations`  | An `agent.call` entry of any tool in the Source control set (Git and pull request tools)                    | `kind`, `status`, `tool`, `target` |
 | `transfer.completed`      | `operations`  | An `agent.call` entry of a transfer the `files_download` or `files_upload` URL served, `status: success`    | `kind`, `status`, `tool`, `target` |
 | `transfer.failed`         | `operations`  | The same, with any other `status` (the failure's tag)                                                       | `kind`, `status`, `tool`, `target` |
-| `profiler.finding`        | `diagnostics` | A profiler finding that appeared, or recurred with a higher count                                           | `finding`                          |
+| `profiler.finding`        | `diagnostics` | A finding is new, reopens, or changes severity                                                              | `finding`                          |
 | `webhook.test`            | —             | **Send test event** (`webhooks.sendTest`); only to that endpoint, never chosen                              | none                               |
 
 Notes on the sources:
@@ -403,8 +403,10 @@ the same environment ([MCP reference](./mcp.md)):
   `cursor` while `more` is true. It returns every feed entry after that point, the ones whose
   webhook you missed included; map entries to events as in [Events](#events). Pass the same
   `threadId` filter each time if you use one.
-- **Profiler findings.** Call `profiler_findings { since }` with the `lastSeen` of the last
-  finding you processed (or `dropped.sinceLastSeen`). `since` is inclusive, so a finding
+- **Profiler findings.** Unchanged recurrences send no webhook. Each new, reopened, or
+  severity-changed notification has its own event `id`, independent of the recurrence
+  count; retries and redeliveries retain it. Call `profiler_findings { since }` with the
+  `lastSeen` of the last finding you processed (or `dropped.sinceLastSeen`). `since` is inclusive, so a finding
   recorded in the same second is not missed; results come oldest first, at most 100 a page,
   and you follow `nextCursor` until it is null. Drop repeats by `id` and `count`; a finding
   that recurs comes again with its new `count` and `lastSeen`.
