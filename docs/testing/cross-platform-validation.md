@@ -4337,9 +4337,17 @@ Record each client's OS, app or browser version, and profile type.
    preview**. Turn on **Settings → Mobile emulators → Device previews** for the
    environment; both appear.
 2. **Availability.** Open the Device panel: it lists the AVDs. On a host
-   without the SDK, without platform-tools, without AVDs, or without
-   acceleration (one at a time, where you can arrange it), the panel names
-   the problem and the fix. Record each message. With the panel open, create
+   without the SDK, without the emulator package, without platform-tools,
+   without AVDs, or without acceleration (one at a time, where you can arrange
+   it), the panel names
+   the problem and the fix. For an SDK containing `platform-tools/`,
+   `platforms/`, or `cmdline-tools/` but no emulator binary, expect
+   **Android Emulator not installed**, the SDK root, SDK Manager advice
+   (`sdkmanager "emulator"`), and a server restart instruction. With a partial
+   SDK in `ANDROID_HOME` and a complete SDK at the OS default, verify the
+   complete SDK is used; when none is complete, verify the first partial
+   SDK's missing-component message is shown. Record each message.
+   With the panel open, create
    an AVD in Android Studio's Device Manager (on a host with none, the first
    one), then choose **Refresh devices**, by keyboard as well as by pointer:
    the new AVD is listed without reopening the panel or restarting BiBCode.

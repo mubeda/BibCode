@@ -2525,6 +2525,7 @@ mod platform_tests {
             AvailabilityKind::XcodeSetupIncomplete,
             AvailabilityKind::NoSimulators,
             AvailabilityKind::SdkMissing,
+            AvailabilityKind::EmulatorMissing,
         ] {
             assert!(!opens(kind), "{kind:?}");
         }

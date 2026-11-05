@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum AvailabilityKind {
     Ready,
     SdkMissing,
+    EmulatorMissing,
     AdbMissing,
     NoAvds,
     AccelerationUnavailable,

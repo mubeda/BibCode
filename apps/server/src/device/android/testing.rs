@@ -837,6 +837,7 @@ impl FakeSdk {
         };
         write_script(&self.dir.path().join("emulator/emulator"), &emulator);
         write_script(&launch, &self.launch_script());
+        std::fs::create_dir_all(self.root().join("platform-tools")).expect("platform-tools dir");
         if self.with_adb {
             write_script(
                 &self.dir.path().join("platform-tools/adb"),
