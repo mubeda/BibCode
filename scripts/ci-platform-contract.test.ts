@@ -161,7 +161,7 @@ describe("cross-platform CI contract", () => {
     }
   });
 
-  it("builds test binaries without debug info in CI and release preflight", () => {
+  it("builds test binaries without debug info or symbols in CI and release preflight", () => {
     for (const [path, job] of [
       [CI_WORKFLOW_PATH, "test"],
       [RELEASE_WORKFLOW_PATH, "preflight"],
@@ -169,6 +169,7 @@ describe("cross-platform CI contract", () => {
       const { workflow } = readWorkflow(path);
 
       expect(requireJob(workflow, job).env?.CARGO_PROFILE_TEST_DEBUG).toBe("0");
+      expect(requireJob(workflow, job).env?.CARGO_PROFILE_TEST_STRIP).toBe("symbols");
     }
   });
 

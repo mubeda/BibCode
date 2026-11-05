@@ -52,8 +52,10 @@ jobs:
       actions: read
     # Full debug info in every linked test binary fills the runner disk, as in
     # CI's Test job; the v0.14.0 tag run hit ENOSPC compiling server tests.
+    # Stripping test binaries' symbol tables halves them, as in CI's Test job.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_TEST_STRIP: symbols
     outputs:
       release_channel: ${{ steps.release_meta.outputs.release_channel }}
       version: ${{ steps.release_meta.outputs.version }}
