@@ -1,5 +1,32 @@
 # Changelog
 
+## [v0.15.2] - 2026-11-05
+
+BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308 since v0.15.1.
+
+### Chats and diffs
+
+- The divider between a split chat and terminal is easier to grab, follows dragging smoothly, and keeps chat content within its pane. (#284)
+- Compare mode's file list can be resized to read long file names. (#306)
+- A turn's changed-files tree starts collapsed. (#311)
+
+### Providers
+
+- The Codex skill picker includes skills installed through plugins, including Superpowers. (#298)
+- Codex stderr logs no longer appear as raw **Codex warning** rows with ANSI escapes and incorrect severity. (#299)
+- The Claude model picker shows model names rather than taglines with Claude Code 2.1.318. (#300)
+
+### Diagnostics and device previews
+
+- Orphan worktree directory findings identify each directory separately and retain path evidence outside the home directory. (#309)
+- The `profiler.finding` webhook sends notifications for new findings, reopenings, and severity changes; unchanged recurrences remain available through catch-up. (#310)
+- Android device previews distinguish an installed SDK missing its emulator from a missing SDK and show the appropriate installation advice. (#312)
+
+### Regression coverage
+
+- Changed files coverage now clicks **View diff** through the chat and verifies that the selected diff stays open through same-turn plan updates. (#275)
+- The packaged resume-at-end check follows the active timeline through turn completion, avoiding stale scrollers and replies from history. (#215)
+
 ## [v0.15.1] - 2026-11-04
 
 BiBCode v0.15.1 is an emergency fix for desktop hosts with an Another device pairing.
