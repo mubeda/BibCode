@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -16,7 +20,7 @@ use crate::{
     data_root::{DataRootError, ResolvedDataRoot},
     diagnostics::{
         DesktopUiProcessObserver, NotApplicableUiProcessObserver,
-        UnavailableDesktopUiProcessObserver,
+        UnavailableDesktopUiProcessObserver, profiler::stop_steps::StopSteps,
     },
     http, logging,
     maintenance::{
@@ -548,12 +552,23 @@ impl ServerRuntime {
             let _log_sink = task_log_sink;
             let _relay_endpoint_file = relay_endpoint_file;
             let _mcp_endpoint_record = mcp_endpoint_record;
+            // When the stop was requested, so the HTTP drain that follows is timed (#303).
+            let stop_requested = Arc::new(OnceLock::new());
+            let drain_started = stop_requested.clone();
             let result = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<http::ConnectionAddrs>(),
             )
-            .with_graceful_shutdown(server_shutdown.cancelled_owned())
+            .with_graceful_shutdown(async move {
+                server_shutdown.cancelled_owned().await;
+                let _ = drain_started.set(Instant::now());
+            })
             .await;
+            if let Some(requested) = stop_requested.get() {
+                let mut steps = StopSteps::starting_at("serve", *requested);
+                steps.mark("http-drain");
+                steps.emit();
+            }
             if let Some(runtime) = cleanup_runtime {
                 runtime.shutdown().await;
             }
@@ -889,10 +904,16 @@ impl ServerHandle {
             Ok(result) => result.map_err(ServerError::Serve),
             Err(error) => Err(ServerError::Join(error)),
         };
+        // Timed from the end of the server task, which runs for the server's whole life. The
+        // profiler session has ended by now, so a slow step here is logged only (#303).
+        let mut steps = StopSteps::start("join");
         drop(self.update_maintenance.take());
+        steps.mark("update-maintenance");
         drop(self._production_runtime.take());
+        steps.mark("runtime-drop");
         if let Some(database) = self.database.take() {
             database.close().await;
+            steps.mark("database-close");
         }
         result
     }
@@ -1375,6 +1396,131 @@ mod tests {
         assert!(message.contains("Native server usage is included"));
         assert!(message.contains("local UI/WebView usage"));
         assert!(message.chars().count() <= 160);
+    }
+
+    /// #303: a production stop with a live thread-list subscription and a queued message
+    /// stays well under a second. The stop times its own steps, so a failure here names the
+    /// slow one in the log. In a process of its own, so sibling tests do not share the
+    /// budget. Bound is 3 s (not 1 s): still rejects the known ~5.3 s regression while
+    /// tolerating shared-CI scheduling noise; the budget is the issue's, not a product
+    /// deadline.
+    #[tokio::test]
+    async fn a_stop_with_a_thread_list_subscription_and_a_queued_message_takes_under_three_seconds()
+    {
+        let Some(child) = crate::test_support::in_own_process(
+            "lifecycle::tests::a_stop_with_a_thread_list_subscription_and_a_queued_message_takes_under_three_seconds",
+        ) else {
+            return;
+        };
+        // cfg(test) logging registers a sink only; install a process-wide subscriber
+        // so slow-step warnings reach stderr (the parent reexec prints it on failure),
+        // including from shutdown work that is not on this thread.
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::io::stderr)
+            .try_init();
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        const NOW: &str = "2026-11-04T00:00:00.000Z";
+        let state = tempfile::tempdir().expect("state directory");
+        let workspace = tempfile::tempdir().expect("workspace directory");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let server = ServerRuntime::start(config)
+            .await
+            .expect("production server starts");
+        let engine = server
+            .orchestration_for_test()
+            .expect("production orchestration");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "project.create",
+                    "commandId": "stop-project",
+                    "projectId": "stop-project",
+                    "title": "Stop",
+                    "workspaceRoot": workspace.path(),
+                    "defaultModelSelection": null,
+                    "createdAt": NOW,
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project created");
+        let thread_id = engine
+            .repositories()
+            .list_threads_by_project("stop-project".to_owned())
+            .await
+            .expect("project threads")
+            .into_iter()
+            .next()
+            .expect("the project's thread")
+            .thread_id;
+        // A queued message as the projection holds it; the stop never delivers it.
+        let queued_thread = thread_id.clone();
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at, delivery_state) VALUES ('queued-303', ?, 'user', 'queued', 0, ?, ?, 'queued')",
+                    rusqlite::params![queued_thread, NOW, NOW],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("queued message");
+        drop(engine);
+
+        let (mut socket, _) = connect_async(format!("ws://{}/ws", server.local_addr()))
+            .await
+            .expect("RPC WebSocket");
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "1",
+                    "tag": "orchestration.subscribeShell",
+                    "payload": { "cap": {} },
+                    "headers": [],
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("subscribe to the thread list");
+        let snapshot = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(crate::ServerMessage::Chunk { request_id, values }) =
+                            serde_json::from_str(&text)
+                        {
+                            assert_eq!(request_id.as_str(), "1");
+                            break serde_json::Value::Array(values);
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("the subscription ended before its snapshot: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the thread-list snapshot arrives");
+        assert!(snapshot.to_string().contains(&thread_id), "{snapshot}");
+
+        // The subscription stays open across the stop, as a connected client's does.
+        let started = std::time::Instant::now();
+        server.shutdown();
+        server.join().await.expect("production server joins");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "the stop took {took:?}");
+        drop(socket);
+        child.complete();
     }
 
     #[tokio::test]

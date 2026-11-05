@@ -1672,6 +1672,14 @@ are listed in the
   session clean on an orderly shutdown, and only then releases the lock. A
   runtime dropped without a shutdown, such as one a failed start created, marks
   its session `stopping` too.
+- **Stop timing.** Every server stop times its HTTP drain, each quiesce step and
+  the join's drops and database close with `StopSteps`
+  (`diagnostics/profiler/stop_steps.rs`, #303). A step of 250 ms or more is a
+  `tracing::warn!` naming the stage and step at once, and the `serve` and
+  `quiesce` stages each record one `server.stop` event with their slow steps,
+  the quiesce's just before the profiler's teardown. The teardown itself and the
+  join run after the session ended, so their slow steps are logged only. Fast
+  stops record nothing, and the timer holds only step names and durations.
 
 ### Data layout
 

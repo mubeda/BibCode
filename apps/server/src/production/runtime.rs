@@ -32,6 +32,7 @@ use crate::{
             profiler_dir,
             runtime::{Detector, ProfilerRuntime, SessionHeader},
             sampler::SamplerDetector,
+            stop_steps::StopSteps,
             worktree_audit::{AuditSources, WorktreeAuditDetector},
         },
     },
@@ -958,64 +959,97 @@ impl ProductionRuntime {
         if *quiesced {
             return Ok(());
         }
+        // Each step is timed, so a slow stop names the step that took the time (#303).
+        let mut steps = StopSteps::start("quiesce");
         // First, so a run killed while its services stop (a desktop quit bounds the stop) reads
         // as an incomplete shutdown on the next start, not as a crash.
         let profiler = self.profiler.clone();
         let _ = tokio::task::spawn_blocking(move || profiler.begin_stopping()).await;
+        steps.mark("profiler-begin-stopping");
         // Outside agents' MCP calls: refused from here on, and every wait in flight ends, long
         // before the orchestration engine shuts down.
         self.mcp_control.shutdown();
+        steps.mark("mcp-control");
         // Outbound webhooks: requests in flight end and stay queued for the next start, before
         // the profiler's teardown.
         self.webhooks.shutdown().await;
+        steps.mark("webhooks");
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
+        steps.mark("process-monitor");
         // Waits for a running tool update, which must not be killed mid-replacement, and
         // before the profiler's teardown.
         self.server_control.shutdown_tool_updates().await;
+        steps.mark("tool-updates");
         self.server_control.shutdown_capability_discovery().await;
+        steps.mark("capability-discovery");
         self.preview_gateway.shutdown().await;
+        steps.mark("preview-gateway");
         // Stops emulators gracefully before ownership teardown, which would only kill them.
         self.device_manager.shutdown().await;
+        steps.mark("device-manager");
         // Before ownership is frozen: no launch after this point, and the open diff apps are
         // still registered as survivors, so neither cleanup ends them.
         self.diff_tool_launcher.shutdown().await;
+        steps.mark("diff-tool-launcher");
         self.preview_tunnels.shutdown();
+        steps.mark("preview-tunnels");
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
+        steps.mark("freeze-process-ownership");
         self.managed_endpoint.shutdown().await;
+        steps.mark("managed-endpoint");
         self.workspace.shutdown().await;
+        steps.mark("workspace");
         self.status_broadcaster.shutdown().await;
+        steps.mark("status-broadcaster");
         self.worktree_catalog_operations.shutdown().await;
+        steps.mark("worktree-catalog-operations");
         self._worktree_catalog.shutdown().await;
+        steps.mark("worktree-catalog");
         self.worktree_runtime.shutdown().await;
+        steps.mark("worktree-runtime");
         let mut first_error = None;
         self.worktree_removal_tasks.close_and_drain().await;
+        steps.mark("worktree-removals");
         // Stops every live clone, including detached ones, and waits until each removed the
         // folder it created, before providers and terminals shut down.
         self.clone_operations.close_and_drain().await;
+        steps.mark("clone-operations");
         self.provider_update_checks.shutdown().await;
+        steps.mark("provider-update-checks");
         self.turn_delivery.shutdown().await;
+        steps.mark("turn-delivery");
         self.upload_sweeper.shutdown().await;
+        steps.mark("upload-sweeper");
         self.attachment_uploads.shutdown().await;
+        steps.mark("attachment-uploads");
         self.orchestration_effects.shutdown().await;
+        steps.mark("orchestration-effects");
         if let Err(error) = self.provider_runtime.shutdown().await {
             let error = bound_diagnostic_string(&error.to_string(), 160);
             tracing::warn!(%error, "provider process-owner cleanup completed with failures");
             first_error = Some(error);
         }
+        steps.mark("provider-runtime");
         self.terminal_services
             .shutdown_with_process_ownership(process_ownership)
             .await;
+        steps.mark("terminal-services");
         if let Err(error) = self.operational_logs.shutdown().await {
             tracing::warn!(%error, "failed to shut down operational logs cleanly");
             if first_error.is_none() {
                 first_error = Some(error);
             }
         }
+        steps.mark("operational-logs");
         self.orchestration.shutdown().await;
+        steps.mark("orchestration");
+        // Recorded while the profiler still runs; its own teardown below is logged only.
+        steps.emit();
         // Last, so the events and panics of every other service's shutdown are recorded, and a
         // crash anywhere in the shutdown still reads as a crash on the next start.
         self.profiler.end_session().await;
+        steps.mark("profiler-end-session");
         *quiesced = true;
         match first_error {
             Some(error) => Err(error),
