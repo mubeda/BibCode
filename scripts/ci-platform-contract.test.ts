@@ -173,6 +173,38 @@ describe("cross-platform CI contract", () => {
     }
   });
 
+  // Hosted Ubuntu runners vary: a 72 GB cow-root left Test with about 12 GB free
+  // (run 41968272427), while a 145 GB root was fine. Strip alone still leaves
+  // target near 12 GB. Clear unused preinstalled toolchains before Setup Vite+,
+  // Setup Rust, and the Rust cache restore, and fail early under 30 GiB free.
+  // Neither job uses Android, .NET, GHC, Boost, or CodeQL.
+  it("frees unused runner toolchains before the Rust test build in CI and release preflight", () => {
+    for (const [path, job] of [
+      [CI_WORKFLOW_PATH, "test"],
+      [RELEASE_WORKFLOW_PATH, "preflight"],
+    ] as const) {
+      const { workflow } = readWorkflow(path);
+      const steps = requireJob(workflow, job).steps ?? [];
+      const names = steps.map((step) => step.name);
+      const free = steps.find((step) => step.name === "Free disk space");
+
+      expect(names.indexOf("Free disk space")).toBeGreaterThan(names.indexOf("Checkout"));
+      expect(names.indexOf("Free disk space")).toBeLessThan(names.indexOf("Setup Vite+"));
+      expect(names.indexOf("Setup Vite+")).toBeLessThan(names.indexOf("Setup Rust"));
+      expect(free?.uses).toBeUndefined();
+      expect(free?.run).toContain("df -h /");
+      expect(free?.run).toContain("/usr/local/lib/android");
+      expect(free?.run).toContain("/usr/share/dotnet");
+      expect(free?.run).toContain("/opt/ghc");
+      expect(free?.run).toContain("/usr/local/.ghcup");
+      expect(free?.run).toContain("/usr/local/share/boost");
+      expect(free?.run).toContain('"$AGENT_TOOLSDIRECTORY"/CodeQL');
+      expect(free?.run).toContain("sudo docker image prune -af || true");
+      expect(free?.run).toContain("::error::");
+      expect(free?.run).toMatch(/30 \* 1024 \* 1024/);
+    }
+  });
+
   it("uses default Rust harness threads in standard package and CI commands", () => {
     const serverPackage = JSON.parse(NodeFS.readFileSync(SERVER_PACKAGE_JSON_PATH, "utf8")) as {
       readonly scripts: Record<string, string>;
