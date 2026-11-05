@@ -596,6 +596,7 @@ fn event_fields(kind: &str) -> &'static [&'static str] {
         "panic" => &["thread", "location", "frames", "version", "os", "arch"],
         "finding" => &["id", "fingerprint", "kindOf"],
         "telemetry.dropped" => &["count"],
+        "server.stop" => &["stage", "durationMs", "slowSteps"],
         _ => &[],
     }
 }
@@ -619,6 +620,7 @@ const NESTED: &[(&str, &[&str])] = &[
     ),
     ("frames", &["module", "debugId", "offset"]),
     ("histograms", &["method", "buckets"]),
+    ("slowSteps", &["step", "ms"]),
 ];
 /// What a client batch may say it measures with.
 const CLIENT_CAPABILITIES: &[&str] = &["long-animation-frame", "heartbeat", "event", "memory"];

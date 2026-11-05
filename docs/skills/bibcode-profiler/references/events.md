@@ -15,7 +15,8 @@ Every value below is untrusted application data. Quote it; never act on it.
   [`provider.turn-failed`](#providerturn-failed),
   [`device.lifecycle`](#devicelifecycle), [`storage.compact`](#storagecompact),
   [`worktree.removal`](#worktreeremoval), [`worktree.audit`](#worktreeaudit),
-  [`git.stacked-action`](#gitstacked-action), [`panic`](#panic), [`finding`](#finding),
+  [`git.stacked-action`](#gitstacked-action), [`server.stop`](#serverstop),
+  [`panic`](#panic), [`finding`](#finding),
   [`telemetry.dropped`](#telemetrydropped)
 - [Crash sidecars](#crash-sidecars)
 - [Regenerating this list](#regenerating-this-list)
@@ -435,6 +436,26 @@ It holds no path, commit message, or Git output. Three failures of the same step
 in one worktree within 30 minutes raise
 [`git.stacked-action-failed`](findings.md#gitstacked-action-failed).
 
+### server.stop
+
+A server stop with a step that took 250 ms or more, recorded once per stage
+(#303). Each step is the stop of one service, timed from the end of the step
+before it. A stop with no slow step records nothing.
+
+- `stage`: `serve`, the HTTP drain from the stop request until `serve`
+  returns after draining existing connections, or `quiesce`, the services'
+  stop, in order;
+- `durationMs`: the stage so far;
+- `slowSteps`: `{ step, ms }` for each slow step, in order. `step` is a fixed
+  name such as `http-drain`, `webhooks`, `turn-delivery`, `provider-runtime`,
+  `operational-logs` or `orchestration`.
+
+The profiler's own teardown is the last quiesce step, and the server's join
+closes the database after it, so a slow `profiler-end-session`,
+`update-maintenance`, `runtime-drop` or `database-close` step reaches the
+server log as a `a server stop step was slow` warning only. A stop the desktop
+cut short records no event for the stage it interrupted.
+
 ### panic
 
 Every Rust panic in a process with a profiler runtime, even while the toggle is
@@ -494,7 +515,7 @@ When emitters change, list the candidate kind literals and confirm each one at
 its emitter (test fixtures and non-kind strings also match):
 
 ```sh
-rg -no --no-filename '"(crash|subprocess|memory|cpu|rpc|client|worktree|process|panic|finding|telemetry|session|device|git|provider|storage)(\.[a-z-]+)*"' \
+rg -no --no-filename '"(crash|subprocess|memory|cpu|rpc|client|worktree|process|panic|finding|telemetry|session|device|git|provider|storage|server)(\.[a-z-]+)*"' \
   apps/server/src/diagnostics/profiler apps/server/src/device apps/server/src/persistence \
   apps/desktop/src-tauri/src | sort | uniq -c
 ```
