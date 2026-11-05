@@ -44,6 +44,7 @@ export interface CenterPanelSplitLayoutProps {
   readonly renderFocusedActions: (density: CenterPaneHeaderDensity) => ReactNode;
   readonly registerBodyTarget: (groupId: string) => (node: HTMLDivElement | null) => void;
   readonly onResizeFrame: () => void;
+  readonly onResizeActiveChange?: (active: boolean) => void;
   readonly onFocusGroup: (groupId: string) => void;
   readonly onActivate: (groupId: string, surface: CenterSurface) => void;
   readonly onCloseSurface: (groupId: string, surface: CenterSurface) => void;
@@ -309,9 +310,11 @@ function SplitNode(
   const separatorRef = useRef<HTMLDivElement>(null);
   const activeResizeRef = useRef<ActiveResize | null>(null);
   const pendingRatioRef = useRef<number | null>(null);
+  const resizeFrameRef = useRef<number | null>(null);
   const renderedRatioRef = useRef(props.node.ratio);
   const persistedRatioRef = useRef(props.node.ratio);
   const onResizeFrameRef = useRef(props.rootProps.onResizeFrame);
+  const onResizeActiveChangeRef = useRef(props.rootProps.onResizeActiveChange);
   const onSetSplitRatioRef = useRef(props.rootProps.onSetSplitRatio);
   const horizontal = props.node.direction === "horizontal";
   const minimumPixels = horizontal ? HORIZONTAL_MINIMUM_PIXELS : VERTICAL_MINIMUM_PIXELS;
@@ -336,6 +339,7 @@ function SplitNode(
 
   useLayoutEffect(() => {
     onResizeFrameRef.current = props.rootProps.onResizeFrame;
+    onResizeActiveChangeRef.current = props.rootProps.onResizeActiveChange;
     onSetSplitRatioRef.current = props.rootProps.onSetSplitRatio;
     persistedRatioRef.current = props.node.ratio;
   });
@@ -356,21 +360,40 @@ function SplitNode(
     observer?.observe(split);
     return () => {
       observer?.disconnect();
+      if (resizeFrameRef.current !== null) cancelAnimationFrame(resizeFrameRef.current);
+      resizeFrameRef.current = null;
+      if (activeResizeRef.current) onResizeActiveChangeRef.current?.(false);
       activeResizeRef.current = null;
       pendingRatioRef.current = null;
     };
   }, [applyRenderedRatio, readAxisSize]);
 
-  const commitResize = useCallback((pointerId: number) => {
+  const flushResizeFrame = useCallback(() => {
+    resizeFrameRef.current = null;
     const resize = activeResizeRef.current;
-    if (!resize || resize.pointerId !== pointerId) return;
     const ratio = pendingRatioRef.current;
-    activeResizeRef.current = null;
-    pendingRatioRef.current = null;
-    if (ratio !== null && ratio !== resize.startRatio) {
-      onSetSplitRatioRef.current(resize.path, ratio);
-    }
-  }, []);
+    if (resize && ratio !== null) applyRenderedRatio(ratio, resize.axisSize);
+  }, [applyRenderedRatio]);
+
+  const commitResize = useCallback(
+    (pointerId: number) => {
+      const resize = activeResizeRef.current;
+      if (!resize || resize.pointerId !== pointerId) return;
+      if (resizeFrameRef.current !== null) {
+        cancelAnimationFrame(resizeFrameRef.current);
+        flushResizeFrame();
+      }
+      const ratio = pendingRatioRef.current;
+      activeResizeRef.current = null;
+      pendingRatioRef.current = null;
+      separatorRef.current?.removeAttribute("data-resizing");
+      onResizeActiveChangeRef.current?.(false);
+      if (ratio !== null && ratio !== resize.startRatio) {
+        onSetSplitRatioRef.current(resize.path, ratio);
+      }
+    },
+    [flushResizeFrame],
+  );
 
   const releasePointer = useCallback((element: HTMLDivElement, pointerId: number) => {
     try {
@@ -402,6 +425,8 @@ function SplitNode(
         pendingRatioRef.current = null;
         return;
       }
+      event.currentTarget.setAttribute("data-resizing", "true");
+      onResizeActiveChangeRef.current?.(true);
       event.preventDefault();
     },
     [horizontal, minimumPixels, props.path, readAxisSize],
@@ -414,14 +439,13 @@ function SplitNode(
       const coordinate = horizontal ? event.clientX : event.clientY;
       const rawRatio = resize.startRatio + (coordinate - resize.startCoordinate) / resize.axisSize;
       const ratio = clampRatio(rawRatio, resize.axisSize, resize.minimumPixels);
-      setChildBases(firstRef.current, secondRef.current, ratio);
-      separatorRef.current?.setAttribute("aria-valuenow", String(Math.round(ratio * 100)));
-      renderedRatioRef.current = ratio;
       pendingRatioRef.current = ratio;
-      onResizeFrameRef.current();
+      if (resizeFrameRef.current === null) {
+        resizeFrameRef.current = requestAnimationFrame(flushResizeFrame);
+      }
       event.preventDefault();
     },
-    [horizontal],
+    [flushResizeFrame, horizontal],
   );
 
   const handlePointerEnd = useCallback(
@@ -524,7 +548,7 @@ function SplitNode(
         aria-valuenow={Math.round(props.node.ratio * 100)}
         className={cn(
           "group/separator relative z-40 shrink-0 touch-none select-none outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
-          horizontal ? "-mx-0.75 w-1.5 cursor-col-resize" : "-my-0.75 h-1.5 cursor-row-resize",
+          horizontal ? "-mx-1 w-2 cursor-col-resize" : "-my-1 h-2 cursor-row-resize",
         )}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -536,7 +560,7 @@ function SplitNode(
         <span
           aria-hidden="true"
           className={cn(
-            "pointer-events-none absolute bg-panel-separator transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring",
+            "pointer-events-none absolute bg-panel-separator transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring group-active/separator:bg-ring group-data-[resizing=true]/separator:bg-ring",
             horizontal
               ? "inset-y-0 left-1/2 w-px -translate-x-1/2"
               : "inset-x-0 top-1/2 h-px -translate-y-1/2",

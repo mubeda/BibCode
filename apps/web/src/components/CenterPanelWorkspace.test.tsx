@@ -748,7 +748,7 @@ describe("CenterPanelWorkspace", () => {
     });
   });
 
-  it("keeps the resize-frame callback stable across rerenders and syncs hosts synchronously", async () => {
+  it("keeps resize scheduling stable without measuring immediately after split writes", async () => {
     const props = input();
     await renderWorkspace(props);
     const first = (harness.layoutProps as { readonly onResizeFrame: () => void }).onResizeFrame;
@@ -761,6 +761,6 @@ describe("CenterPanelWorkspace", () => {
     expect(second).toBe(first);
 
     first();
-    expect(harness.syncRects).toHaveBeenCalledOnce();
+    expect(harness.syncRects).not.toHaveBeenCalled();
   });
 });

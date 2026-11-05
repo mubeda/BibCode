@@ -80,6 +80,7 @@ let axisHeight = 1_000;
 let container: HTMLDivElement;
 let root: Root;
 let resizeObservers: FakeResizeObserver[];
+let frames: Map<number, FrameRequestCallback>;
 
 class FakeResizeObserver {
   readonly observed = new Set<Element>();
@@ -153,6 +154,13 @@ beforeEach(() => {
   axisWidth = 1_000;
   axisHeight = 1_000;
   resizeObservers = [];
+  frames = new Map();
+  let frameId = 0;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    frames.set(++frameId, callback);
+    return frameId;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
   harness.useDroppable.mockClear();
   vi.stubGlobal("ResizeObserver", FakeResizeObserver);
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (
@@ -211,6 +219,12 @@ function dispatchPointer(target: Element, type: string, coordinate: number, poin
 
 function dispatchKey(target: Element, key: string): void {
   target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key }));
+}
+
+function flushFrame(): void {
+  const callbacks = [...frames.values()];
+  frames.clear();
+  for (const callback of callbacks) callback(0);
 }
 
 describe("CenterPanelSplitLayout", () => {
@@ -409,16 +423,54 @@ describe("CenterPanelSplitLayout", () => {
     expect(separator.getAttribute("aria-valuenow")).toBe("50");
 
     dispatchPointer(separator, "pointerdown", 500);
+    dispatchPointer(separator, "pointermove", 600);
     dispatchPointer(separator, "pointermove", 650);
+    expect(first.style.flexBasis).toBe("50%");
+    expect(props.onResizeFrame).not.toHaveBeenCalled();
+    flushFrame();
     expect(first.style.flexBasis).toBe("65%");
     expect(second.style.flexBasis).toBe("35%");
-    expect(props.onResizeFrame).toHaveBeenCalled();
+    expect(props.onResizeFrame).toHaveBeenCalledOnce();
     expect(props.onSetSplitRatio).not.toHaveBeenCalled();
 
-    dispatchPointer(separator, "pointerup", 650);
+    dispatchPointer(separator, "pointermove", 700);
+    vi.mocked(props.onSetSplitRatio).mockImplementation(() => {
+      expect(first.style.flexBasis).toBe("70%");
+      expect(separator.getAttribute("aria-valuenow")).toBe("70");
+    });
+    dispatchPointer(separator, "pointerup", 700);
     dispatchPointer(separator, "lostpointercapture", 650);
     expect(props.onSetSplitRatio).toHaveBeenCalledOnce();
-    expect(props.onSetSplitRatio).toHaveBeenCalledWith([], 0.65);
+    expect(props.onSetSplitRatio).toHaveBeenCalledWith([], 0.7);
+    expect(props.onResizeFrame).toHaveBeenCalledTimes(2);
+    flushFrame();
+    expect(props.onResizeFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("matches the other separators' 8px hit targets and active feedback on both axes", async () => {
+    await renderLayout(input());
+    const horizontal = separatorAt("root");
+    const vertical = separatorAt("second");
+    expect(horizontal.className).toContain("-mx-1 w-2");
+    expect(vertical.className).toContain("-my-1 h-2");
+    expect(horizontal.firstElementChild?.className).toContain("w-px");
+    expect(vertical.firstElementChild?.className).toContain("h-px");
+    for (const separator of [horizontal, vertical]) {
+      expect(separator.firstElementChild?.className).toContain("group-active/separator:bg-ring");
+    }
+  });
+
+  it("drops a pending resize frame on unmount", async () => {
+    const props = input();
+    await renderLayout(props);
+    vi.mocked(props.onResizeFrame).mockClear();
+    const separator = separatorAt("second");
+    dispatchPointer(separator, "pointerdown", 500);
+    dispatchPointer(separator, "pointermove", 650);
+    await act(async () => root.render(null));
+    flushFrame();
+    expect(props.onResizeFrame).not.toHaveBeenCalled();
+    expect(props.onSetSplitRatio).not.toHaveBeenCalled();
   });
 
   it("accumulates consecutive keyboard resize steps before a parent rerender", async () => {

@@ -655,7 +655,7 @@ vi.mock("./CenterPanelWorkspace", () => ({
     );
     const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
     return (
-      <div data-mock="center-panel-workspace">
+      <div data-mock="center-panel-workspace" data-center-panel-workspace>
         {state.groups.map((group) => (
           <div key={group.id} data-mock-center-header={group.id}>
             {group.id === state.focusedGroupId
@@ -2088,6 +2088,9 @@ describe("ChatView", () => {
           });
           await reportResize();
           expect(inset()).toBe(140);
+          expect(
+            container.querySelector<HTMLElement>("[data-chat-timeline-viewport]")?.style.clipPath,
+          ).toBe("inset(0 0 140px 0)");
           if (anchored) {
             const composer = capturedProps<Record<string, unknown>>("chatComposer");
             (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
@@ -2154,6 +2157,9 @@ describe("ChatView", () => {
           await openSubagents(container);
           await reportResize();
           expect(inset()).toBe(492);
+          expect(
+            container.querySelector<HTMLElement>("[data-chat-timeline-viewport]")?.style.clipPath,
+          ).toBe("inset(0 0 492px 0)");
 
           const pill = container.querySelector<HTMLButtonElement>(
             '[data-testid="activity-dock"] button',
@@ -2168,6 +2174,58 @@ describe("ChatView", () => {
           expect(listScroll.scrollToOffset).not.toHaveBeenCalled();
         } finally {
           rectSpy.mockRestore();
+          await act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
+
+    it.each([false, true])(
+      "settles the timeline after split resize respecting reader takeover (%s)",
+      async (readerTookOver) => {
+        seedEnvironment(makeEnvironmentPresentation());
+        seedProject(makeProject());
+        seedServerThread(makeThread());
+        seedGitStatus(true);
+        const scrollToEnd = vi.fn();
+        const scrollNode = document.createElement("div");
+        h.timelineList = {
+          getScrollableNode: () => scrollNode,
+          getState: () => ({
+            scroll: 1000,
+            scrollLength: 800,
+            contentLength: 3000,
+            data: [{}, {}],
+            positionAtIndex: (index: number) => index * 1000,
+            sizeAtIndex: () => 1000,
+          }),
+          scrollToEnd,
+        };
+        const { container, root } = await mountActivityRoute();
+        try {
+          await act(
+            () =>
+              new Promise<void>((resolve) =>
+                requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+              ),
+          );
+          if (readerTookOver) {
+            await act(async () =>
+              (
+                capturedProps<Record<string, unknown>>("messagesTimeline")[
+                  "onManualNavigation"
+                ] as () => void
+              )(),
+            );
+          }
+          scrollToEnd.mockClear();
+          container
+            .querySelector("[data-center-panel-workspace]")!
+            .dispatchEvent(new Event("bibcode:center-panel-resize-end"));
+          await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+          if (readerTookOver) expect(scrollToEnd).not.toHaveBeenCalled();
+          else expect(scrollToEnd).toHaveBeenCalledWith({ animated: false });
+        } finally {
           await act(async () => root.unmount());
           container.remove();
         }

@@ -1776,6 +1776,40 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(view.resizeSpy).toHaveBeenCalledOnce();
   });
 
+  it("defers terminal layout resizes until a center split drag ends", async () => {
+    const view = await mountViewport({ visible: true });
+    await view.flushFrame();
+    await view.flushMountFit();
+    const workspace = view.mounted.container;
+    workspace.setAttribute("data-center-panel-workspace", "");
+    // Remount so the viewport binds to its workspace, as it does in the app.
+    await view.setVisible(false);
+    await view.setVisible(true);
+    await view.flushFrame();
+    view.resizeSpy.mockClear();
+    xtermState.fitAddons.at(-1)!.fit.mockImplementation(() => {
+      if (xtermState.proposedDimensions) {
+        view.fakeTerminal!.cols = xtermState.proposedDimensions.cols;
+        view.fakeTerminal!.rows = xtermState.proposedDimensions.rows;
+      }
+    });
+    workspace.setAttribute("data-resizing", "true");
+    for (const rows of [28, 30, 35]) {
+      xtermState.proposedDimensions = { cols: 80, rows };
+      await view.resizeContainer();
+      await view.flushFrame();
+    }
+    expect(view.resizeSpy).not.toHaveBeenCalled();
+    workspace.removeAttribute("data-resizing");
+    workspace.dispatchEvent(new Event("bibcode:center-panel-resize-end"));
+    await view.flushFrame();
+    expect(view.resizeSpy).toHaveBeenCalledOnce();
+    expect(view.resizeSpy).toHaveBeenLastCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { threadId: THREAD_ID, terminalId: "term-1", cols: 80, rows: 35 },
+    });
+  });
+
   it("measures a renderer before attaching and supplies its fitted dimensions", async () => {
     const view = await mountViewport({ publishRuntime: false });
     expect(view.fakeTerminal).not.toBeNull();

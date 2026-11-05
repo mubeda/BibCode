@@ -33,6 +33,7 @@ import {
   type CenterPanelLayoutPath,
   type CenterPanelSplitDirection,
 } from "~/centerPanelLayout";
+import { CENTER_PANEL_RESIZE_END_EVENT } from "~/centerPanelResize";
 import type { CenterSurface, ThreadCenterPanelState } from "~/centerPanelStore";
 
 import {
@@ -271,10 +272,12 @@ export const CenterPanelWorkspace = forwardRef<
   CenterPanelWorkspaceHandle,
   CenterPanelWorkspaceProps
 >(function CenterPanelWorkspace(props, ref) {
-  const { readBodyRect, registerBodyTarget, rects, rootRef } = useCenterPanelBodyTargets(
-    props.state.groups,
-  );
   const surfaceHostsRef = useRef<CenterPanelSurfaceHostsHandle>(null);
+  const syncSurfaceRects = useCallback(() => {
+    surfaceHostsRef.current?.syncRects();
+  }, []);
+  const { readBodyRect, registerBodyTarget, rects, rootRef, scheduleMeasurement, setResizing } =
+    useCenterPanelBodyTargets(props.state.groups, syncSurfaceRects);
   const workspaceElementRef = useRef<HTMLDivElement | null>(null);
   const propsRef = useRef(props);
   useLayoutEffect(() => {
@@ -413,9 +416,22 @@ export const CenterPanelWorkspace = forwardRef<
     },
     [rootRef],
   );
-  const syncSurfaceRects = useCallback(() => {
-    surfaceHostsRef.current?.syncRects();
-  }, []);
+  const handleResizeActiveChange = useCallback(
+    (active: boolean) => {
+      const workspace = workspaceElementRef.current;
+      if (workspace) {
+        if (active) workspace.dataset.resizing = "true";
+        else {
+          // Flush the final host size before consumers schedule their settling work.
+          syncSurfaceRects();
+          workspace.removeAttribute("data-resizing");
+          workspace.dispatchEvent(new Event(CENTER_PANEL_RESIZE_END_EVENT));
+        }
+      }
+      setResizing(active);
+    },
+    [setResizing, syncSurfaceRects],
+  );
   const recaptureDropSnapshot = useCallback(
     (root: HTMLDivElement) => {
       const next = captureDropSnapshot(root);
@@ -575,7 +591,8 @@ export const CenterPanelWorkspace = forwardRef<
           dragInProgress={active !== null}
           renderFocusedActions={props.renderFocusedActions}
           registerBodyTarget={registerBodyTarget}
-          onResizeFrame={syncSurfaceRects}
+          onResizeFrame={scheduleMeasurement}
+          onResizeActiveChange={handleResizeActiveChange}
           onFocusGroup={props.onFocusGroup}
           onActivate={props.onActivate}
           onCloseSurface={props.onCloseSurface}

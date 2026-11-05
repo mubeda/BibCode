@@ -3446,6 +3446,19 @@ sizes. Cover relevant:
 - terminal input/output and panel switching, including each chat and Codex terminal pane's
   own Activity panel in a split: it stays inside its pane, the composer stays usable, and
   the terminal redraws at its new size;
+- center split resizing (#284): with a long chat at its end above a terminal,
+  grab the horizontal divider 3 px off its visible line and drag through several
+  terminal rows before release. The hit target is 8 px, its line remains
+  highlighted throughout capture, and pane sizes follow the latest pointer
+  position once per frame. During the drag, terminal layout fits and PTY resize
+  RPCs wait; after release the terminal fits the final pane dimensions. The
+  last chat row stays outside the composer blur, the composer shadow fits inside
+  the pane, and a reader scrolled into history keeps their position. Repeat with
+  a side-by-side split, pointer cancellation, and keyboard arrows. Focused web
+  coverage is `vp test run --project unit src/components/CenterPanelSplitLayout.test.tsx
+  src/components/CenterPanelSurfaceHosts.test.tsx src/components/CenterPanelWorkspace.surface-hosts.test.tsx
+  src/components/ThreadTerminalPanel.interactions.test.tsx src/components/ChatView.test.tsx`
+  from `apps/web`; happy-dom coverage does not prove native paint or hit testing;
 - stopping a chat whose subagents still run moves them from **Active** to **Done** as
   **Interrupted**, each saying its session ended before it reported (the packaged
   `chat-activity-panel` spec automates this with its Codex fixture);
