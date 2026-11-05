@@ -115,6 +115,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY"/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+          avail_kib=$(df -Pk / | awk 'NR==2 {print $4}')
+          if (( avail_kib < 30 * 1024 * 1024 )); then
+            echo "::error::Less than 30 GiB free on / after cleanup (${avail_kib} KiB available)"
+            exit 1
+          fi
+
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@68f39c78aaf39be468cabd2afb09c162574c84af # v1.21.2
         with:

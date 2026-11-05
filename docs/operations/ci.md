@@ -90,9 +90,14 @@ the merge.
   workspace's unified features: 21-23 more minutes and a third target tree on
   a runner that has run out of disk. Serial tasks keep `rustc` from competing
   with a running server or desktop suite, whose 2-second test deadlines have
-  failed on starved hosted runners. Its 70-minute job budget is the package
-  suites' 42 minutes at p90 over 27 green runs, about 3 minutes for setup, the
-  verifier and SSH, and the 21-minute apt stall seen on pull request 65.
+  failed on starved hosted runners. Right after Checkout it frees unused
+  preinstalled toolchains (Android, .NET, GHC, Boost, CodeQL) and prunes Docker
+  images, then fails if `/` has less than 30 GiB free: hosted runners vary from
+  about 72 GB to 145 GB cow-roots, and a 12 GB `target` still needs that
+  headroom even with `CARGO_PROFILE_TEST_STRIP: symbols`. Its 70-minute job
+  budget is the package suites' 42 minutes at p90 over 27 green runs, about 3
+  minutes for setup, the verifier and SSH, and the 21-minute apt stall seen on
+  pull request 65.
   Test-owned deadlines stay unchanged. The `-j 2` bound limits concurrent Cargo compilation jobs; Rust
   test binaries use the default parallel harness threads. Exact subprocess
   tests may still select `--test-threads=1` inside an isolated child process

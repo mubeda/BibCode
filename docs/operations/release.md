@@ -773,10 +773,14 @@ budgets are timeouts, not expected completion durations:
 Use Actions job timings to plan the tag and approval runs separately.
 
 Preflight, like CI's Test job, builds test binaries without debug information
-(`CARGO_PROFILE_TEST_DEBUG=0`). Full debug information in every linked test
-binary fills the hosted runner's disk, which shows as `No space left on device`
-while compiling. That failure repeats on a rerun, so fix the workflow instead
-of retrying.
+(`CARGO_PROFILE_TEST_DEBUG=0`) and with symbol tables stripped
+(`CARGO_PROFILE_TEST_STRIP: symbols`). Full debug information in every linked
+test binary fills the hosted runner's disk, which shows as
+`No space left on device` while compiling. That failure repeats on a rerun, so
+fix the workflow instead of retrying. Right after Checkout, both jobs also
+remove unused preinstalled toolchains and prune Docker images, then fail if
+`/` has less than 30 GiB free: a 72 GB cow-root left about 12 GB free before
+the Rust test build (CI run 41968272427), while a 145 GB root was enough.
 
 After publication, check latest through the REST endpoint. `isLatest` is not a
 supported `gh release view --json` field:
