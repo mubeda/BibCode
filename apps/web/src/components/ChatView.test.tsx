@@ -4950,8 +4950,9 @@ describe("ChatView", () => {
           expect(button, label).toBeDefined();
           await act(async () => button!.click());
         };
-        await clickButton("Collapse all");
+        // Changed-files directories default collapsed, so Expand all is the first label.
         await clickButton("Expand all");
+        await clickButton("Collapse all");
         await clickButton("View diff");
         expect(activeSurfaceId()).toBe("diff");
         expect(container.querySelector('[data-mock="diff-panel"]')).not.toBeNull();
