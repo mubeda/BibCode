@@ -72,6 +72,8 @@ function readInstanceCustomModels(
 export interface AppModelOption {
   slug: string;
   name: string;
+  description?: string;
+  resolvedModel?: string;
   shortName?: string;
   subProvider?: string;
   isCustom: boolean;
@@ -84,6 +86,8 @@ function toAppModelOption(model: ServerProvider["models"][number]): AppModelOpti
     isCustom: model.isCustom,
   };
   if (model.shortName) option.shortName = model.shortName;
+  if (model.description) option.description = model.description;
+  if (model.resolvedModel) option.resolvedModel = model.resolvedModel;
   if (model.subProvider) option.subProvider = model.subProvider;
   return option;
 }

@@ -332,7 +332,14 @@ const codexModels: ModelEsque[] = [
   { slug: "gpt-5", name: "GPT-5", shortName: "5" },
   { slug: "gpt-5-codex", name: "GPT-5 Codex" },
 ];
-const claudeModels: ModelEsque[] = [{ slug: "opus", name: "Claude Opus", subProvider: "Bedrock" }];
+const claudeModels: ModelEsque[] = [
+  {
+    slug: "opus",
+    name: "Claude Opus",
+    subProvider: "Bedrock",
+    description: "For your toughest challenges",
+  },
+];
 
 const jumpKeybindings = [
   {
@@ -564,6 +571,9 @@ describe("ModelPickerContent", () => {
     const markup = render(buildProps({ lockToActiveInstance: false, lockedProvider: null }));
 
     expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex", "claude:opus"]);
+    expect(captured.rows.find((row) => row.model.slug === "opus")?.model.description).toBe(
+      "For your toughest challenges",
+    );
     expect(markup).not.toContain('data-testid="sidebar"');
   });
 

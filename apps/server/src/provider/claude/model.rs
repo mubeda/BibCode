@@ -51,18 +51,16 @@ fn model_from_initialization(value: &Value) -> Option<Value> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or(slug);
-    let discovered_name = value
-        .get("description")
+    let resolved_model = value
+        .get("resolvedModel")
         .and_then(Value::as_str)
-        .and_then(|description| description.split('·').next())
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    let name = match discovered_name {
-        Some(name) if slug.eq_ignore_ascii_case("default") => {
-            format!("{display_name}: {name}")
+    let name = match resolved_model {
+        Some(resolved) if slug == "default" || display_name.eq_ignore_ascii_case(slug) => {
+            format!("{display_name} ({resolved})")
         }
-        Some(name) => name.to_owned(),
-        None => display_name.to_owned(),
+        _ => display_name.to_owned(),
     };
     let mut descriptors = Vec::new();
     if value.get("supportsEffort").and_then(Value::as_bool) == Some(true) {
@@ -102,7 +100,19 @@ fn model_from_initialization(value: &Value) -> Option<Value> {
     if value.get("supportsFastMode").and_then(Value::as_bool) == Some(true) {
         descriptors.push(boolean_option("fastMode", FAST_MODE_LABEL));
     }
-    Some(model(slug, &name, descriptors))
+    let mut result = model(slug, &name, descriptors);
+    if let Some(resolved) = resolved_model {
+        result["resolvedModel"] = json!(resolved);
+    }
+    if let Some(description) = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        result["description"] = json!(description);
+    }
+    Some(result)
 }
 
 pub(crate) fn supports(version: Option<[u64; 3]>, minimum: [u64; 3]) -> bool {
@@ -349,7 +359,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["opus", "haiku", "custom-model"]
         );
-        assert_eq!(models[0]["name"], "Opus 5");
+        assert_eq!(models[0]["name"], "Opus (claude-opus-5)");
+        assert_eq!(models[0]["resolvedModel"], "claude-opus-5");
+        assert_eq!(
+            models[0]["description"],
+            "Opus 5 · Best for everyday, complex tasks"
+        );
         assert_eq!(
             models[0]["capabilities"]["optionDescriptors"][0]["options"][2],
             json!({ "id": "high", "label": "High", "isDefault": true })
@@ -374,6 +389,21 @@ mod tests {
     }
 
     #[test]
+    fn older_initialization_without_resolved_ids_keeps_display_names() {
+        let models = models_from_initialization(
+            &json!({"models": [
+                {"value": "opus", "displayName": "Opus", "description": "Opus 4.6 · Complex tasks"},
+                {"value": "default", "displayName": "Default (recommended)", "description": "Sonnet 4.6 · Everyday tasks"}
+            ]}),
+            &[],
+        ).unwrap();
+        assert_eq!(models[0]["name"], "Opus");
+        assert_eq!(models[0]["description"], "Opus 4.6 · Complex tasks");
+        assert!(models[0].get("resolvedModel").is_none());
+        assert_eq!(models[1]["name"], "Default (recommended)");
+    }
+
+    #[test]
     fn initialization_keeps_the_default_alias_distinct_from_its_resolved_model() {
         let models = models_from_initialization(
             &json!({
@@ -391,8 +421,45 @@ mod tests {
         assert_eq!(models[0]["slug"], "default");
         assert_eq!(
             models[0]["name"],
-            "Default (recommended): Opus 5 with 1M context"
+            "Default (recommended) (claude-opus-5[1m])"
         );
+    }
+
+    #[test]
+    fn initialization_2_1_318_uses_names_instead_of_shared_taglines() {
+        let models = models_from_initialization(
+            &json!({"models": [
+                {"value": "default", "displayName": "Default (recommended)",
+                 "resolvedModel": "claude-sonnet-5-5", "description": "Sonnet 5.5"},
+                {"value": "opus", "displayName": "Opus", "resolvedModel": "claude-opus-5-5",
+                 "description": "For your toughest challenges"},
+                {"value": "claude-opus-5-5", "displayName": "Opus 5.5",
+                 "resolvedModel": "claude-opus-5-5", "description": "For your toughest challenges"},
+                {"value": "claude-opus-5", "displayName": "Opus 5",
+                 "description": "For your toughest challenges"},
+                {"value": "haiku", "displayName": "Haiku 4.5",
+                 "resolvedModel": "claude-haiku-4-5-20251001", "description": "Fast and efficient"}
+            ]}),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Default (recommended) (claude-sonnet-5-5)",
+                "Opus (claude-opus-5-5)",
+                "Opus 5.5",
+                "Opus 5",
+                "Haiku 4.5"
+            ]
+        );
+        assert_eq!(models[1]["slug"], "opus");
+        assert_eq!(models[1]["resolvedModel"], "claude-opus-5-5");
+        assert_eq!(models[1]["description"], "For your toughest challenges");
     }
 
     #[test]

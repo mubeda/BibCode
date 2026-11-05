@@ -711,6 +711,26 @@ describe("resolveModelSlugForProvider", () => {
 });
 
 describe("resolveSelectableModel", () => {
+  it("matches discovered resolved IDs without selecting the default alias", () => {
+    const discoveredOptions = [
+      { slug: "default", name: "Default", resolvedModel: "claude-opus-5-5" },
+      { slug: "opus", name: "Opus", resolvedModel: "claude-opus-5-5" },
+      { slug: "haiku", name: "Haiku 4.5", resolvedModel: "claude-haiku-4-5-20251001" },
+    ];
+    expect(resolveSelectableModel(CLAUDE, "claude-opus-5-5", discoveredOptions)).toBe("opus");
+    expect(resolveSelectableModel(CLAUDE, "claude-haiku-4-5-20251001", discoveredOptions)).toBe(
+      "haiku",
+    );
+    expect(resolveSelectableModel(CLAUDE, "opus", discoveredOptions)).toBe("opus");
+    expect(resolveSelectableModel(CLAUDE, "default", discoveredOptions)).toBe("default");
+    expect(
+      resolveSelectableModel(CLAUDE, "claude-opus-5-5", [
+        ...discoveredOptions,
+        { slug: "claude-opus-5-5", name: "Opus 5.5" },
+      ]),
+    ).toBe("claude-opus-5-5");
+  });
+
   const options: ReadonlyArray<SelectableModelOption> = [
     { slug: "gpt-5.4", name: "GPT 5.4" },
     { slug: "gpt-5.3-codex", name: "GPT 5.3 Codex" },
