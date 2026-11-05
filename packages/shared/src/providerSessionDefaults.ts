@@ -125,12 +125,6 @@ function getInvariantProviderModel(
   };
 }
 
-function selectableModels(
-  models: ReadonlyArray<ServerProviderModel>,
-): ReadonlyArray<{ readonly slug: string; readonly name: string }> {
-  return models.map(({ slug, name }) => ({ slug, name }));
-}
-
 function getFallbackModel(models: ReadonlyArray<ServerProviderModel>): ServerProviderModel | null {
   return models.find((model) => !model.isCustom) ?? models[0] ?? null;
 }
@@ -144,7 +138,7 @@ function findSelectableModel(
   models: ReadonlyArray<ServerProviderModel>,
   value: string,
 ): ServerProviderModel | null {
-  const slug = resolveSelectableModel(driver, value, selectableModels(models));
+  const slug = resolveSelectableModel(driver, value, models);
   if (!slug) {
     return null;
   }

@@ -190,6 +190,13 @@ published provider inventory, which carries what the CLI reported for aliases
 such as `opus`, and uses the static catalog only for a model the inventory does
 not list. Fast Mode off asks for nothing and is never refused.
 
+Discovered Claude models retain `value` as the inventory `slug`, `displayName`
+as the label, and optional `description` and `resolvedModel` metadata through
+the provider RPC schema. Descriptions render only as secondary text. The shared
+model resolver uses `resolvedModel` to restore saved full IDs to reported
+selectors, preferring an exact selector and then a named alias over `default`.
+No identity or label is inferred from a description.
+
 Each driver translates between the common orchestration model and its native
 protocol:
 

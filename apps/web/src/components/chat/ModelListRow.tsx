@@ -78,6 +78,11 @@ export const ModelListRow = memo(function ModelListRow(props: {
             </span>
           ) : null}
         </div>
+        {props.model.description ? (
+          <div className="mt-1 text-xs font-normal leading-snug text-muted-foreground">
+            {props.model.description}
+          </div>
+        ) : null}
         {props.showProvider && (
           <div className="mt-1 flex items-center gap-1.5">
             {ProviderIcon ? <ProviderIcon className="size-3 shrink-0" /> : null}

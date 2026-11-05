@@ -3234,6 +3234,20 @@ second run is required. Verify these remote deltas and no substitutes:
 
 ## Packaged visual validation
 
+For Claude model-picker changes, check both **Settings → AI providers → Default
+model** and the composer picker with current initialization data. Model names
+must remain distinct even when descriptions share a tagline; descriptions stay
+secondary and Default remains identifiable. Select an alias, restart, and verify
+it stays selected. Repeat with a saved full ID that matches a reported
+`resolvedModel`, including when Default resolves to that same ID. Selecting a
+row must still send its reported `value`. Also run the older `·` description
+coverage:
+
+```sh
+cargo test -p bibcode-server --lib provider::claude::model::tests -j 2
+vp test run packages/shared/src/model.test.ts packages/shared/src/providerSessionDefaults.test.ts apps/web/src/modelSelection.test.ts apps/web/src/components/chat/ModelListRow.test.tsx apps/web/src/components/chat/ModelPickerContent.test.tsx apps/web/src/components/settings/ProviderSessionDefaultsControls.test.tsx
+```
+
 Use Codex Computer Use to operate the exact packaged executable. Before launch,
 prove no conflicting BiBCode instance is running. Use disposable application
 data and platform-specific renderer isolation without overwriting a user

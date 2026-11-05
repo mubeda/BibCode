@@ -29,6 +29,7 @@ const CODEX_REASONING_EFFORT_OPTIONS = [
 export interface SelectableModelOption {
   slug: string;
   name: string;
+  resolvedModel?: string | undefined;
 }
 
 export function createModelCapabilities(input: {
@@ -395,6 +396,13 @@ export function resolveSelectableModel(
   const direct = options.find((option) => option.slug === trimmed);
   if (direct) {
     return direct.slug;
+  }
+
+  // Prefer a named alias over "default", which can resolve to the same model.
+  const resolved = options.filter((option) => option.resolvedModel === trimmed);
+  const resolvedAlias = resolved.find((option) => option.slug !== "default") ?? resolved[0];
+  if (resolvedAlias) {
+    return resolvedAlias.slug;
   }
 
   const normalized = normalizeModelSlug(trimmed, provider);

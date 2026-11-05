@@ -104,8 +104,11 @@ export function ProviderSessionDefaultsControls({
               </SelectItem>
             ) : null}
             {models.map((model) => (
-              <SelectItem key={model.slug} value={model.slug}>
-                {model.name}
+              <SelectItem key={model.slug} value={model.slug} label={model.name}>
+                <span className="block">{model.name}</span>
+                {model.description ? (
+                  <span className="block text-xs text-muted-foreground">{model.description}</span>
+                ) : null}
               </SelectItem>
             ))}
           </SelectPopup>
