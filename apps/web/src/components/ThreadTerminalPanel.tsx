@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { FitAddon } from "@xterm/addon-fit";
+import { CENTER_PANEL_RESIZE_END_EVENT, isCenterPanelResizing } from "~/centerPanelResize";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -1413,6 +1414,7 @@ export function TerminalViewport({
     };
     const handleSizeTrigger = (trigger: TerminalSizeTrigger) => {
       if (disposed || resizeRendererGenerationRef.current !== resizeRendererGeneration) return;
+      if (trigger === "layout" && isCenterPanelResizing(mount)) return;
       if (!sizeOwnership) {
         if (trigger !== "layout") return;
         const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
@@ -2313,24 +2315,28 @@ export function TerminalViewport({
 
     let frame: number | null = null;
     let refreshTimer: number | null = null;
-    const observer = new ResizeObserver(() => {
+    const scheduleResize = () => {
       if (frame !== null) {
         window.cancelAnimationFrame(frame);
+        frame = null;
       }
       if (refreshTimer !== null) {
         window.clearTimeout(refreshTimer);
         refreshTimer = null;
       }
+      if (isCenterPanelResizing(container)) return;
       const terminal = terminalRef.current;
       const fitAddon = fitAddonRef.current;
       if (!terminal || !fitAddon) return;
       const resizeRendererGeneration = resizeRendererGenerationRef.current;
       frame = window.requestAnimationFrame(() => {
         frame = null;
+        if (isCenterPanelResizing(container)) return;
         if (terminalRef.current !== terminal || fitAddonRef.current !== fitAddon) return;
         rendererRef.current?.size("layout");
         refreshTimer = window.setTimeout(() => {
           refreshTimer = null;
+          if (isCenterPanelResizing(container)) return;
           if (
             resizeRendererGenerationRef.current !== resizeRendererGeneration ||
             terminalRef.current !== terminal ||
@@ -2342,11 +2348,15 @@ export function TerminalViewport({
           terminal.refresh(0, terminal.rows - 1);
         }, 50);
       });
-    });
+    };
+    const observer = new ResizeObserver(scheduleResize);
     observer.observe(container);
+    const workspace = container.closest("[data-center-panel-workspace]");
+    workspace?.addEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
 
     return () => {
       observer.disconnect();
+      workspace?.removeEventListener(CENTER_PANEL_RESIZE_END_EVENT, scheduleResize);
       if (frame !== null) {
         window.cancelAnimationFrame(frame);
       }

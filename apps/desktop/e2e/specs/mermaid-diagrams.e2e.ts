@@ -11,6 +11,7 @@ import {
   mermaidFixtureStreamedLastLine,
   prepareMermaidFixtureFiles,
 } from "../support/mermaid-fixture.ts";
+import { startKeyboardSamples, type KeyboardSample } from "../support/timeline-keyboard-samples.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -107,22 +108,6 @@ interface StreamSample {
    */
   readonly sourceHeight: number | null;
   readonly drawnHeight: number | null;
-}
-
-interface KeyboardSample {
-  readonly at: number;
-  readonly scrollTop: number;
-  readonly clientHeight: number;
-  /** How far the list is scrolled from its end. */
-  readonly endGap: number;
-  /** As in `StreamSample`: the reply's end below the usable bottom, zero or less when shown. */
-  readonly endBelow: number | null;
-  /** Streamed paragraphs shown, and the last line as one more. */
-  readonly delivered: number;
-  /** Where the paragraph being read starts, below the visible top, once one is chosen. */
-  readonly readingTop: number | null;
-  /** Keydowns that reached the timeline's scroller so far. */
-  readonly keydowns: number;
 }
 
 interface KeyboardKeyTrace {
@@ -1696,7 +1681,7 @@ describe("packaged Mermaid diagrams", () => {
     }
 
     const nativePageUpSender = isMacDesktopUi() ? await prepareMacPageUpSender() : null;
-    await startKeyboardSamples();
+    await startKeyboardSamples(visibleSurfaceSelector, mermaidFixtureKeyboardLastLine);
     const editor = browser.$(composerEditorSelector);
     await editor.click();
     await editor.addValue(mermaidFixturePrompts.keyboard);
@@ -2022,7 +2007,7 @@ describe("packaged Mermaid diagrams", () => {
       async () => {
         samples = (await readKeyboardSamples()).samples;
         const last = samples.at(-1)!;
-        return last.delivered >= 31 && last.at - endAt > 1_500;
+        return last.finished && last.delivered === 31 && last.at - endAt > 1_500;
       },
       { timeoutMsg: "The keyboard reply never finished after End.", timeout: 30_000 },
     );
@@ -2042,6 +2027,7 @@ describe("packaged Mermaid diagrams", () => {
               index === 0 ||
               entry.scrollTop !== all[index - 1]!.scrollTop ||
               entry.delivered !== all[index - 1]!.delivered ||
+              entry.finished !== all[index - 1]!.finished ||
               entry.readingTop !== all[index - 1]!.readingTop ||
               entry.keydowns !== all[index - 1]!.keydowns,
           ),
@@ -2504,91 +2490,6 @@ async function pressNativePageUpDuringGlide(
     frames: trace.frames,
     sender,
   };
-}
-
-/**
- * Samples the timeline after each painted frame for the keyboard case, and counts the keydowns
- * that reach its scroller.
- */
-async function startKeyboardSamples(): Promise<void> {
-  await browser.execute(
-    (surface: string, lastLine: string) => {
-      const record = window as unknown as {
-        __bibcodeKeyboard?: {
-          samples: KeyboardSample[];
-          keyAt: number | null;
-          reading: HTMLElement | null;
-        };
-        __bibcodeKeyboardStop?: () => void;
-      };
-      record.__bibcodeKeyboardStop?.();
-      const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`);
-      if (!scroller) throw new Error("The timeline scroller is missing.");
-      const state = {
-        samples: [] as KeyboardSample[],
-        keyAt: null as number | null,
-        reading: null as HTMLElement | null,
-      };
-      record.__bibcodeKeyboard = state;
-      const started = performance.now();
-      let keydowns = 0;
-      const onKeyDown = (event: KeyboardEvent) => {
-        keydowns += 1;
-        if (event.key === "PageUp") state.keyAt ??= performance.now() - started;
-      };
-      // Capture, so the count holds whatever the timeline's own listeners do with the key.
-      scroller.addEventListener("keydown", onKeyDown, { capture: true });
-      const read = (): KeyboardSample => {
-        const paragraphs = [
-          ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
-        ];
-        const area = scroller.getBoundingClientRect();
-        const reading = state.reading?.isConnected ? state.reading : null;
-        const blocks = [
-          ...document.querySelectorAll<HTMLElement>(
-            `${surface} .chat-markdown p, ${surface} .chat-markdown-codeblock`,
-          ),
-        ];
-        const end = Math.max(...blocks.map((block) => block.getBoundingClientRect().bottom));
-        const composerTop = document
-          .querySelector(`${surface} [data-chat-composer-form="true"]`)
-          ?.getBoundingClientRect().top;
-        return {
-          at: performance.now() - started,
-          scrollTop: scroller.scrollTop,
-          clientHeight: scroller.clientHeight,
-          endGap: Math.round(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
-          endBelow:
-            blocks.length === 0
-              ? null
-              : Math.round(end - Math.min(area.bottom, composerTop ?? area.bottom)),
-          delivered:
-            paragraphs.filter((element) =>
-              element.textContent?.startsWith("Keyboard streamed paragraph"),
-            ).length + (paragraphs.some((element) => element.textContent === lastLine) ? 1 : 0),
-          readingTop: reading ? reading.getBoundingClientRect().top - area.top : null,
-          keydowns,
-        };
-      };
-      let running = true;
-      // A message posted from a frame callback is handled once that frame has painted.
-      const afterPaint = new MessageChannel();
-      afterPaint.port1.addEventListener("message", () => state.samples.push(read()));
-      afterPaint.port1.start();
-      const onFrame = () => {
-        if (!running || performance.now() - started > 60_000) return;
-        afterPaint.port2.postMessage(null);
-        requestAnimationFrame(onFrame);
-      };
-      requestAnimationFrame(onFrame);
-      record.__bibcodeKeyboardStop = () => {
-        running = false;
-        scroller.removeEventListener("keydown", onKeyDown, { capture: true });
-      };
-    },
-    visibleSurfaceSelector,
-    mermaidFixtureKeyboardLastLine,
-  );
 }
 
 /**

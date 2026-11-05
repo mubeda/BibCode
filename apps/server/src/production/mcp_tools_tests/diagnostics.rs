@@ -492,7 +492,7 @@ fn stdio(dir: &std::path::Path, tool: &str, arguments: Value) -> Value {
 
 /// Over `/mcp` the profiler tools read the server's own store as the stdio server does, with
 /// findings, events and crash records cut to their documented fields, client-chosen strings
-/// replaced or left out, and host paths outside home left out. In a
+/// replaced or left out, and host paths outside home reduced to file names. In a
 /// process of its own: the profiler handle is process-global.
 #[tokio::test]
 async fn the_profiler_tools_read_the_servers_own_store_projected() {
@@ -668,11 +668,7 @@ async fn the_profiler_tools_read_the_servers_own_store_projected() {
     assert_eq!(stall["stalls"]["totalMs"], 1500);
     assert_eq!(stall["eventIds"], json!(["aaaa1111-2"]));
     assert_eq!(findings[3]["evidence"]["reason"], "git-failed");
-    assert!(
-        findings[3]["evidence"].get("worktree").is_none(),
-        "{}",
-        findings[3]
-    );
+    assert_eq!(findings[3]["evidence"]["worktree"], "repo");
     assert_eq!(findings[4]["evidence"]["path"], "~/projects/kept");
     assert_eq!(findings[5]["evidence"]["location"], "main.rs:12");
     // A panic's message is never returned; its kind, location and thread are.

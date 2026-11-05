@@ -36,6 +36,20 @@ const decodeFrame = Schema.decodeUnknownSync(DeviceJpegFrame);
 const decodeError = Schema.decodeUnknownSync(DeviceRpcError);
 
 describe("device preview contracts", () => {
+  it("round-trips the missing emulator availability kind", () => {
+    const catalog = {
+      platforms: [
+        {
+          platform: "android",
+          availability: { kind: "emulatorMissing", message: "Install the emulator package." },
+          images: [],
+        },
+      ],
+      devices: [],
+    };
+    expect(encodeCatalog(decodeCatalog(catalog))).toEqual(catalog);
+  });
+
   it("decodes a two-platform catalog as the server serializes it", () => {
     const catalog = {
       platforms: [

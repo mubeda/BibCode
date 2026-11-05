@@ -90,6 +90,26 @@ async fn the_audit_and_removal_outcomes_reach_the_profiler() {
     let sources = fixture.sources();
     let processes = ProcessAttributionRegistry::new();
 
+    scan_once(&sources, &processes).await;
+    let remaining_id = finding(&runtime, "worktree.orphan-dir")["id"].clone();
+    let other_orphan = fixture.managed.join("other-orphan");
+    fs::create_dir(&other_orphan).expect("second orphan directory");
+    scan_once(&sources, &processes).await;
+    let orphans = runtime.status()["findings"].as_array().unwrap().clone();
+    assert_eq!(orphans.len(), 2, "each orphan has its own finding");
+    assert_ne!(orphans[0]["id"], orphans[1]["id"]);
+    fs::remove_dir(&other_orphan).expect("remove one orphan");
+    scan_once(&sources, &processes).await;
+    let next = runtime.status()["findings"].as_array().unwrap().clone();
+    assert_eq!(next.len(), 2);
+    for finding in next {
+        let expected = if finding["id"] == remaining_id { 3 } else { 1 };
+        assert_eq!(
+            finding["count"], expected,
+            "only the remaining orphan recurs"
+        );
+    }
+
     let thread_id = adopt(&mut fixture).await;
     fs::write(fixture.worktree.join("dirty.txt"), "dirty\n").expect("dirty file");
     remove(&mut fixture, &thread_id, "remove-dirty", false, "2").await;

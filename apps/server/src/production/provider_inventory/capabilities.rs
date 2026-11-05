@@ -213,6 +213,29 @@ async fn read_codex_capabilities(
         .notify_without_params("initialized")
         .await
         .map_err(|error| error.to_string())?;
+    // A fresh App Server has no remote installed-plugin cache until this read.
+    let mut issues = match connection
+        .request("plugin/installed", json!({"cwds":[cwd]}))
+        .await
+    {
+        Ok(response)
+            if response["marketplaceLoadErrors"]
+                .as_array()
+                .is_some_and(|errors| !errors.is_empty()) =>
+        {
+            tracing::warn!("Codex returned an incomplete installed plugin catalog");
+            vec![
+                "Codex could not load some installed plugins. Retry to reload the catalog."
+                    .to_owned(),
+            ]
+        }
+        Ok(_) => Vec::new(),
+        Err(error) if error.is_missing_method() => Vec::new(),
+        Err(error) => {
+            tracing::warn!(%error, "Codex installed plugin discovery failed");
+            vec!["Codex could not load installed plugins. Retry to reload the catalog.".to_owned()]
+        }
+    };
     let response = connection
         .request("skills/list", json!({"cwds":[cwd],"forceReload":true}))
         .await
@@ -227,21 +250,22 @@ async fn read_codex_capabilities(
         })
         .filter(|entry| entry["skills"].is_array())
         .ok_or("Codex returned an incomplete skill catalog")?;
-    let issues = entry
-        .get("errors")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|message| !message.is_empty())
-                .unwrap_or("Codex could not load a skill. Check its SKILL.md and retry.")
-                .to_owned()
-        })
-        .collect();
+    issues.extend(
+        entry
+            .get("errors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|error| {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or("Codex could not load a skill. Check its SKILL.md and retry.")
+                    .to_owned()
+            }),
+    );
     let skills = codex::parse_skills_list_response(&response, cwd)?;
     Ok(ProviderCapabilities {
         skills: codex_skill_inventory(&skills),
@@ -335,6 +359,94 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_skill_catalog_includes_plugin_installs() {
+        let sandbox = TestSandbox::new("codex-plugin-skills");
+        let cwd = sandbox.path("workspace");
+        let home = sandbox.path("home");
+        let codex_home = home.join(".codex");
+        let skill_path = codex_home.join(
+            "plugins/cache/test-marketplace/superpowers/7.0.1/skills/systematic-debugging/SKILL.md",
+        );
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_path,
+            "---\nname: systematic-debugging\ndescription: Debug systematically\n---\n",
+        )
+        .unwrap();
+        let binary = sandbox.executable_script(
+            "codex",
+            r#"
+plugins_loaded=false
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"initialized"'*) ;;
+    *'"method":"plugin/installed"'*)
+      test -f "$CODEX_HOME/plugins/cache/test-marketplace/superpowers/7.0.1/skills/systematic-debugging/SKILL.md" || exit 9
+      case "$PLUGIN_CATALOG" in
+        unsupported) printf '{"id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+        failed) printf '{"id":%s,"error":{"code":-32000,"message":"Plugin discovery failed"}}\n' "$id" ;;
+        partial)
+          plugins_loaded=true
+          printf '{"id":%s,"result":{"marketplaces":[],"marketplaceLoadErrors":[{"message":"Marketplace unavailable"}]}}\n' "$id" ;;
+        *)
+          plugins_loaded=true
+          printf '{"id":%s,"result":{"marketplaces":[],"marketplaceLoadErrors":[]}}\n' "$id" ;;
+      esac ;;
+    *'"method":"skills/list"'*)
+      if $plugins_loaded; then skills=$(cat plugin-skills.json); else skills='[]'; fi
+      printf '{"id":%s,"result":{"data":[{"cwd":"%s","skills":%s,"errors":[]}]}}\n' "$id" "$PWD" "$skills" ;;
+    *) exit 10 ;;
+  esac
+done
+"#,
+            "",
+        );
+        std::fs::write(
+            cwd.join("plugin-skills.json"),
+            json!([{
+                "name":"superpowers:systematic-debugging",
+                "path":skill_path,"enabled":true,"scope":"user",
+                "pluginId":"superpowers@test-marketplace"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        for mode in ["installed", "unsupported", "failed", "partial"] {
+            let settings = json!({"providerInstances":{"codex-plugins":{
+                "driver":"codex","enabled":true,
+                "config":{"binaryPath":binary,"homePath":codex_home},
+                "environment":[{"name":"HOME","value":home},{"name":"USERPROFILE","value":home},
+                    {"name":"PLUGIN_CATALOG","value":mode}]
+            }}});
+            let catalog =
+                discover_capabilities(&settings, "codex-plugins", &cwd, &CancellationToken::new())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                catalog["skills"],
+                if matches!(mode, "installed" | "partial") {
+                    json!([{
+                        "name":"superpowers:systematic-debugging",
+                        "path":skill_path,"enabled":true,"scope":"user","invocation":"dollar"
+                    }])
+                } else {
+                    json!([])
+                },
+                "{mode}"
+            );
+            assert_eq!(
+                catalog["issues"].as_array().unwrap().is_empty(),
+                matches!(mode, "installed" | "unsupported"),
+                "{mode}: {catalog}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_skill_catalogs_use_user_configuration_and_the_selected_workspace() {
         let sandbox = TestSandbox::new("native-skill-catalogs");
         let home = sandbox.path("user");
@@ -348,12 +460,14 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let binary = sandbox.executable_script("catalog", r#"
 while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$request" in
-    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"plugin/installed"'*) printf '{"id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
     *'"method":"skills/list"'*)
       test -f "$CODEX_HOME/skills/personal/SKILL.md" || exit 9
       case "$request" in *"$PWD"*) ;; *) exit 10 ;; esac
-      printf '{"id":2,"result":%s}\n' "$(cat codex-catalog.json)" ;;
+      printf '{"id":%s,"result":%s}\n' "$id" "$(cat codex-catalog.json)" ;;
     *'"subtype":"initialize"'*) printf '{"type":"control_response","response":{"subtype":"success","request_id":"bibcode-inventory","response":%s}}\n' "$(cat claude-commands.json)" ;;
     *'"subtype":"reload_skills"'*)
       test -f "$CLAUDE_CONFIG_DIR/skills/personal/SKILL.md" || exit 11

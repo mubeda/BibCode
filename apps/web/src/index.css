@@ -174,8 +174,8 @@
 
   .chat-composer-glass {
     box-shadow:
-      0 18px 48px -20px rgb(0 0 0 / 28%),
-      0 4px 14px -7px rgb(0 0 0 / 22%);
+      0 2px 8px -4px rgb(0 0 0 / 28%),
+      0 1px 4px -2px rgb(0 0 0 / 22%);
   }
 
   .chat-composer-shared-blur {
@@ -190,8 +190,8 @@
 
   .dark .chat-composer-glass {
     box-shadow:
-      0 18px 48px -20px rgb(0 0 0 / 60%),
-      0 4px 14px -7px rgb(0 0 0 / 40%);
+      0 2px 8px -4px rgb(0 0 0 / 60%),
+      0 1px 4px -2px rgb(0 0 0 / 40%);
   }
 
   .chat-composer-lower-chrome {

@@ -1,4 +1,5 @@
 import { attachmentAdmissionOwner } from "../state/attachmentAdmissions";
+import { CENTER_PANEL_RESIZE_END_EVENT } from "~/centerPanelResize";
 import {
   type AgentSessionOpenMode,
   type ApprovalRequestId,
@@ -3626,6 +3627,23 @@ function ChatViewContent(props: ChatViewProps) {
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
   const timelineGlideFrameRef = useRef<number | null>(null);
   const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    const workspace = chatSurfaceElement?.closest("[data-center-panel-workspace]");
+    if (!workspace) return;
+    let frame: number | null = null;
+    const settle = () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        followTimelineLiveEndRef.current();
+      });
+    };
+    workspace.addEventListener(CENTER_PANEL_RESIZE_END_EVENT, settle);
+    return () => {
+      workspace.removeEventListener(CENTER_PANEL_RESIZE_END_EVENT, settle);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [chatSurfaceElement]);
   // Whether the timeline follows its end, as state so LegendList stops keeping the list at its
   // end once the reader scrolls away: otherwise a change in the bottom region's height (the
   // composer growing, the Activity card opening) moves a list near its end, or a thread
@@ -7266,7 +7284,11 @@ function ChatViewContent(props: ChatViewProps) {
                   data-chat-surface=""
                 >
                   {/* Messages Wrapper */}
-                  <div className="relative flex min-h-0 flex-1 flex-col">
+                  <div
+                    data-chat-timeline-viewport
+                    className="relative flex min-h-0 flex-1 flex-col"
+                    style={{ clipPath: `inset(0 0 ${composerOverlayHeight}px 0)` }}
+                  >
                     {/* Messages — LegendList handles virtualization and scrolling internally */}
                     <MessagesTimeline
                       // Scoped, so the same thread id in another environment starts over,

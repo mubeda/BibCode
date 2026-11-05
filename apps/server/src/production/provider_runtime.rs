@@ -12121,11 +12121,13 @@ async fn project_provider_event(
                 }
             }
             if let Some(object) = payload.as_object_mut() {
-                if event.event_type == "runtime.warning"
-                    && let Some(message) = object
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .filter(|message| !message.trim().is_empty())
+                if matches!(
+                    event.event_type.as_str(),
+                    "runtime.warning" | "runtime.error"
+                ) && let Some(message) = object
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
                 {
                     let detail = object
                         .get("detail")
@@ -34293,6 +34295,10 @@ done
             let activity = snapshot.activities.last().expect("error or turn activity");
             assert_eq!(activity.summary, summary, "{event_type}");
             assert_eq!(activity.kind, kind);
+            if event_type == "runtime.error" {
+                assert_eq!(activity.tone, "error");
+                assert_eq!(activity.payload["detail"], "Connection lost.");
+            }
         }
         engine.shutdown().await;
     }

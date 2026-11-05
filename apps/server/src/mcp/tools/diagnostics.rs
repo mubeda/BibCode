@@ -976,13 +976,14 @@ pub(crate) fn project_finding(finding: &Value) -> Value {
         }
     }
     clean_client_fields(&mut evidence);
-    // A worktree's path is kept only inside home, where it reads `~/…`.
+    // Keep home-relative paths; retain a safe relative path or file name outside home.
     for field in ["worktree", "path"] {
-        let inside_home = evidence
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|path| path == "~" || path.starts_with("~/") || path.starts_with("~\\"));
-        if !inside_home && let Some(fields) = evidence.as_object_mut() {
+        if let Some(path) = evidence.get(field).and_then(Value::as_str) {
+            let inside_home = path == "~" || path.starts_with("~/") || path.starts_with("~\\");
+            if !inside_home {
+                evidence[field] = relative_or_file_name(path).into();
+            }
+        } else if let Some(fields) = evidence.as_object_mut() {
             fields.remove(field);
         }
     }
@@ -1078,6 +1079,76 @@ fn relative_or_file_name(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_findings_keep_their_identity_and_evidence_between_audits() {
+        use crate::diagnostics::profiler::{
+            findings::FindingsBook,
+            store::{ProfilerStore, StoreConfig},
+            worktree_audit::{AuditFacts, audit},
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let store = ProfilerStore::start(StoreConfig::new(state.path().to_owned()));
+        let mut book = FindingsBook::default();
+        let mut facts = AuditFacts {
+            base_dirs: vec![
+                "/srv/worktrees/orphan-a".into(),
+                "/srv/worktrees/orphan-b".into(),
+            ],
+            managed_dirs: vec!["/srv/worktrees".into()],
+            ..AuditFacts::default()
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let first: Vec<_> = audit(&facts)
+            .into_iter()
+            .map(|input| {
+                project_finding(
+                    &serde_json::to_value(book.record(input, now, &store.sender())).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(first.len(), 2);
+        assert_ne!(first[0]["id"], first[1]["id"]);
+        assert_eq!(first[0]["evidence"]["path"], "orphan-a");
+        assert_eq!(first[1]["evidence"]["path"], "orphan-b");
+
+        facts.base_dirs.remove(0);
+        let next = audit(&facts);
+        assert_eq!(next.len(), 1);
+        let remaining = book.record(next.into_iter().next().unwrap(), now, &store.sender());
+        assert_eq!(remaining.id, first[1]["id"]);
+        assert_eq!(remaining.count, 2);
+        let findings = book.newest(2);
+        let removed = findings
+            .iter()
+            .find(|finding| finding.id == first[0]["id"])
+            .unwrap();
+        assert_eq!(removed.count, 1);
+        store.shutdown();
+    }
+
+    #[test]
+    fn worktree_findings_keep_safe_directory_evidence_outside_home() {
+        for (path, expected) in [
+            ("/srv/worktrees/orphan-a", "orphan-a"),
+            ("C:\\worktrees\\orphan-b", "orphan-b"),
+            ("nested/orphan-c", "nested/orphan-c"),
+            ("~/worktrees/orphan-d", "~/worktrees/orphan-d"),
+            ("~\\worktrees\\orphan-e", "~\\worktrees\\orphan-e"),
+        ] {
+            for (kind, field) in [
+                ("worktree.orphan-dir", "path"),
+                ("git.stacked-action-failed", "worktree"),
+            ] {
+                let finding = json!({ "kind": kind, "evidence": { field: path } });
+                assert_eq!(project_finding(&finding)["evidence"][field], expected);
+            }
+        }
+        let finding =
+            json!({ "kind": "worktree.orphan-dir", "evidence": { "path": { "private": "data" } } });
+        assert!(project_finding(&finding)["evidence"].get("path").is_none());
+    }
 
     /// An OS crash record names modules by their paths on this host: a finding keeps their
     /// file names only, in `module`, `faultModule` and each frame (#139, review round 3).

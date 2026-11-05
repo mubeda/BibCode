@@ -27,6 +27,8 @@ export interface CenterPanelBodyTargetRegistry {
   readonly registerBodyTarget: (groupId: string) => (node: HTMLDivElement | null) => void;
   readonly rects: ReadonlyMap<string, CenterPanelBodyRect>;
   readonly readBodyRect: (groupId: string) => CenterPanelBodyRect | null;
+  readonly scheduleMeasurement: () => void;
+  readonly setResizing: (active: boolean) => void;
 }
 
 export interface CenterPanelSurfaceRenderContext {
@@ -112,6 +114,7 @@ function relativeRect(root: Element, target: Element): CenterPanelBodyRect | nul
 /** Tracks structural pane body targets in the coordinate space of their shared workspace root. */
 export function useCenterPanelBodyTargets(
   groups: ThreadCenterPanelState["groups"],
+  onResize?: () => void,
 ): CenterPanelBodyTargetRegistry {
   const activationKey = JSON.stringify(groups.map((group) => [group.id, group.activeSurfaceId]));
   const measuredActivationRef = useRef<string | null>(null);
@@ -120,6 +123,11 @@ export function useCenterPanelBodyTargets(
   const targetRefCallbacks = useRef(new Map<string, (node: HTMLDivElement | null) => void>());
   const observerRef = useRef<ResizeObserver | null>(null);
   const frameRef = useRef<number | null>(null);
+  const resizingRef = useRef(false);
+  const onResizeRef = useRef(onResize);
+  useLayoutEffect(() => {
+    onResizeRef.current = onResize;
+  });
   const [rects, setRects] = useState<ReadonlyMap<string, CenterPanelBodyRect>>(() => new Map());
 
   const readBodyRect = useCallback((groupId: string): CenterPanelBodyRect | null => {
@@ -130,6 +138,7 @@ export function useCenterPanelBodyTargets(
 
   const publishMeasurements = useCallback(() => {
     frameRef.current = null;
+    if (resizingRef.current) return;
     const root = rootElementRef.current;
     if (!root) return;
     const next = new Map<string, CenterPanelBodyRect>();
@@ -141,9 +150,17 @@ export function useCenterPanelBodyTargets(
   }, []);
 
   const scheduleMeasurement = useCallback(() => {
-    if (frameRef.current !== null) return;
+    if (resizingRef.current || frameRef.current !== null) return;
     frameRef.current = requestAnimationFrame(publishMeasurements);
   }, [publishMeasurements]);
+
+  const setResizing = useCallback(
+    (active: boolean) => {
+      resizingRef.current = active;
+      if (!active) scheduleMeasurement();
+    },
+    [scheduleMeasurement],
+  );
 
   const rootRef = useCallback(
     (node: HTMLDivElement | null) => {
@@ -184,7 +201,11 @@ export function useCenterPanelBodyTargets(
   useLayoutEffect(() => {
     const ResizeObserverConstructor = globalThis.ResizeObserver;
     if (ResizeObserverConstructor) {
-      const observer = new ResizeObserverConstructor(scheduleMeasurement);
+      const observer = new ResizeObserverConstructor(() => {
+        // ResizeObserver runs after layout; sync the overlay here, never after split writes.
+        onResizeRef.current?.();
+        scheduleMeasurement();
+      });
       observerRef.current = observer;
       if (rootElementRef.current) observer.observe(rootElementRef.current);
       for (const target of targetElementsRef.current.values()) observer.observe(target);
@@ -212,7 +233,7 @@ export function useCenterPanelBodyTargets(
     publishMeasurements();
   });
 
-  return { rootRef, registerBodyTarget, rects, readBodyRect };
+  return { rootRef, registerBodyTarget, rects, readBodyRect, scheduleMeasurement, setResizing };
 }
 
 export const CenterPanelSurfaceHosts = forwardRef<
@@ -226,9 +247,12 @@ export const CenterPanelSurfaceHosts = forwardRef<
   }, []);
   const { readBodyRect } = props;
   const syncRects = useCallback(() => {
-    for (const element of hostElementsRef.current.values()) {
+    const measurements = Array.from(hostElementsRef.current.values(), (element) => {
       const groupId = element.dataset.centerSurfaceGroupId;
       const rect = groupId ? readBodyRect(groupId) : null;
+      return { element, rect };
+    });
+    for (const { element, rect } of measurements) {
       if (!rect) {
         element.dataset.centerSurfaceGeometry = "invalid";
         element.style.left = "";

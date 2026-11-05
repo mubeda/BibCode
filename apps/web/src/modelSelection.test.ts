@@ -1,4 +1,10 @@
-import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@bibcode/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ServerProviderModel,
+  type ServerProvider,
+} from "@bibcode/contracts";
+import * as Schema from "effect/Schema";
 import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@bibcode/contracts/settings";
 import { describe, expect, it } from "vite-plus/test";
 import { deriveProviderInstanceEntries } from "./providerInstances";
@@ -12,6 +18,8 @@ import {
   resolveAppModelSelectionForInstance,
   resolveAppModelSelectionState,
 } from "./modelSelection";
+
+const decodeModels = Schema.decodeUnknownSync(Schema.Array(ServerProviderModel));
 
 function provider(input: {
   provider?: ProviderDriverKind;
@@ -61,6 +69,42 @@ function settingsWithProviderInstances(): UnifiedSettings {
 }
 
 describe("instance-scoped model selection", () => {
+  it("preserves discovered metadata and restores saved Claude aliases and full IDs", () => {
+    const models = decodeModels([
+      {
+        slug: "default",
+        name: "Default (recommended)",
+        resolvedModel: "claude-opus-5-5",
+        isCustom: false,
+        capabilities: null,
+      },
+      {
+        slug: "opus",
+        name: "Opus (claude-opus-5-5)",
+        description: "For your toughest challenges",
+        resolvedModel: "claude-opus-5-5",
+        isCustom: false,
+        capabilities: null,
+      },
+    ]);
+    const snapshot = {
+      ...provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
+      models,
+    };
+    const settings = settingsWithProviderInstances();
+    const instance = deriveProviderInstanceEntries([snapshot])[0]!;
+    const options = getAppModelOptionsForInstance(settings, instance);
+    expect(options[1]).toMatchObject({
+      description: "For your toughest challenges",
+      resolvedModel: "claude-opus-5-5",
+    });
+    for (const saved of ["opus", "claude-opus-5-5"]) {
+      expect(
+        resolveAppModelSelectionForInstance(instance.instanceId, settings, [snapshot], saved),
+      ).toBe("opus");
+    }
+  });
+
   it("keeps custom models on the provider instance that declared them", () => {
     const providers = [
       provider({

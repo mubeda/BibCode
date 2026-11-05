@@ -21,1171 +21,2144 @@
             "checkedAt": "😀",
             "models": [
               {
-                "slug": "yM",
-                "name": "Z",
-                "subProvider": "I!HhE^c{}h",
-                "isCustom": true,
-                "capabilities": {}
+                "slug": "😀",
+                "name": "4294967295",
+                "shortName": "-1",
+                "isCustom": false,
+                "capabilities": null
               },
               {
-                "slug": "a",
-                "name": "�",
+                "slug": "H",
+                "name": "c",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "prototype",
+                "name": "[",
+                "description": "\u0000",
+                "resolvedModel": "TZ-L'4Z3Vt",
+                "shortName": "VF#M2c:v0",
+                "isCustom": false,
+                "capabilities": {}
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": ": -"
+              },
+              {
+                "name": "+RV8YI"
+              },
+              {
+                "name": "\u0000"
+              },
+              {
+                "name": "-1",
+                "description": "�"
+              },
+              {
+                "name": "mGF-]Y9O+J"
+              },
+              {
+                "name": "-1",
+                "description": "L'm{P!Ll#"
+              },
+              {
+                "name": "0",
+                "input": {
+                  "hint": "0"
+                }
+              },
+              {
+                "name": ">>k%Q<eH"
+              },
+              {
+                "name": "5R"
+              },
+              {
+                "name": "s%bwm!?{~",
+                "input": {
+                  "hint": "�"
+                }
+              }
+            ],
+            "skills": [
+              {
+                "name": "\\pyo4p`",
+                "path": "dvusy['cO",
+                "enabled": false
+              },
+              {
+                "name": "prototype",
+                "path": "A`LQY/*",
+                "enabled": false,
+                "displayName": "C]uy%:BD?,"
+              },
+              {
+                "name": "C}_]cz",
+                "path": "😀",
+                "enabled": false,
+                "invocation": "slash"
+              },
+              {
+                "name": "x",
+                "path": "toString",
+                "enabled": true
+              },
+              {
+                "name": "__proto__",
+                "path": "[/@23n_)>/",
+                "enabled": true
+              }
+            ],
+            "agents": [
+              {
+                "name": "-1",
+                "mode": "prototype",
+                "invocation": "mention"
+              },
+              {
+                "name": "4294967295",
+                "model": "_c8\\{\">bro"
+              },
+              {
+                "name": "�"
+              },
+              {
+                "name": "{=kl"
+              },
+              {
+                "name": "5]_|U",
+                "model": "",
+                "mode": "",
+                "invocation": "mention"
+              },
+              {
+                "name": "#z3h4q/3U",
+                "description": "<Wv@=uSd",
+                "mode": "5"
+              },
+              {
+                "name": "toString"
+              },
+              {
+                "name": "Y",
+                "mode": "=",
+                "invocation": "mention"
+              },
+              {
+                "name": "z+|#ir$R;k",
+                "description": "4294967295",
+                "model": "",
+                "invocation": "mention"
+              },
+              {
+                "name": "",
+                "model": "4294967295"
+              }
+            ]
+          },
+          {
+            "instanceId": "f",
+            "driver": "BSdDuPK8q6",
+            "enabled": false,
+            "installed": false,
+            "version": null,
+            "status": "warning",
+            "auth": {
+              "status": "unknown"
+            },
+            "checkedAt": "[Vz\\}P\\T^l",
+            "models": [
+              {
+                "slug": "9r};|d^{ij",
+                "name": "t.#^I-k",
+                "description": "toString",
+                "resolvedModel": "4294967295",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "vo6;)W&",
+                "name": "-1",
                 "isCustom": false,
                 "capabilities": {}
               },
               {
-                "slug": "VF#M2c:v0",
+                "slug": "H/Hu7nNhGo",
+                "name": "0",
+                "description": "$guLjM",
+                "shortName": "P+(i",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "prototype",
+                "name": "}^",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "�",
+                "name": "0",
+                "resolvedModel": "93?CRSw",
+                "subProvider": "q",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "b",
+                "name": "Z~kM591x",
+                "shortName": "�",
+                "isCustom": true,
+                "capabilities": {}
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": "!",
+                "description": "�",
+                "input": {
+                  "hint": "l2Ge9e9U<S"
+                }
+              },
+              {
+                "name": "\\",
+                "description": "",
+                "input": {
+                  "hint": ""
+                }
+              },
+              {
+                "name": "😀"
+              },
+              {
+                "name": "�"
+              },
+              {
+                "name": "prototype"
+              },
+              {
+                "name": "H[bjY/uqB=",
+                "description": ""
+              },
+              {
+                "name": ""
+              },
+              {
+                "name": "",
+                "input": {
+                  "hint": "�"
+                }
+              },
+              {
+                "name": ""
+              },
+              {
+                "name": "X"
+              }
+            ],
+            "skills": [
+              {
                 "name": "prototype",
+                "path": "fA|~:I^=",
+                "enabled": true,
+                "invocation": "slash"
+              },
+              {
+                "name": "20GA}?HlQ",
+                "path": "prototype",
+                "enabled": true
+              },
+              {
+                "name": "__proto__",
+                "description": ";",
+                "path": "4294967295",
+                "enabled": false
+              },
+              {
+                "name": "wm:b9,[~Mq",
+                "path": "",
+                "scope": "c",
+                "enabled": false
+              },
+              {
+                "name": "aiv`im\"vGm",
+                "path": "prototype",
+                "enabled": true
+              },
+              {
+                "name": "",
+                "path": "ZqAO!Dn)Wb",
+                "enabled": false
+              },
+              {
+                "name": "",
+                "description": "�",
+                "path": "f",
+                "enabled": false,
+                "shortDescription": "😀",
+                "invocation": "prompt"
+              },
+              {
+                "name": "C",
+                "path": "�",
+                "enabled": true,
+                "shortDescription": "\u0000"
+              },
+              {
+                "name": "toString",
+                "description": "q>",
+                "path": "s",
+                "enabled": true
+              },
+              {
+                "name": "",
+                "path": "B",
+                "enabled": false
+              }
+            ],
+            "agents": [
+              {
+                "name": "-1",
+                "description": "",
+                "model": "toString",
+                "invocation": "mention"
+              },
+              {
+                "name": "|D",
+                "model": "SV/Xl:@y7'"
+              },
+              {
+                "name": "P",
+                "model": "__proto__",
+                "mode": ";"
+              },
+              {
+                "name": "UC",
+                "invocation": "mention"
+              }
+            ]
+          },
+          {
+            "instanceId": "A7",
+            "driver": "eZlkY",
+            "enabled": false,
+            "installed": true,
+            "version": "__proto__",
+            "status": "warning",
+            "auth": {
+              "status": "authenticated"
+            },
+            "checkedAt": "😀",
+            "models": [
+              {
+                "slug": "�",
+                "name": "a /",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "😀",
+                "name": "�",
+                "subProvider": "501vi9F@>k",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "�",
+                "name": "__proto__",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "prototype",
+                "name": "prototype",
+                "description": "",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "X",
+                "name": "�",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "-1",
+                "name": "😀",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": ")]]M9{W{f3",
+                "name": "",
+                "description": "�",
+                "resolvedModel": "",
+                "isCustom": false,
+                "capabilities": {
+                  "optionDescriptors": []
+                }
+              },
+              {
+                "slug": "SO0",
+                "name": "4294967295",
+                "subProvider": "y)*Zwc%Lk}",
                 "isCustom": true,
                 "capabilities": null
               }
             ],
             "slashCommands": [
               {
-                "name": "__proto__",
+                "name": "-1",
+                "description": "toString",
                 "input": {
-                  "hint": ")8O|7"
+                  "hint": "UO#H_!q;n"
                 }
+              },
+              {
+                "name": "\u0000",
+                "input": {
+                  "hint": "{>L:AZB~Wh"
+                }
+              },
+              {
+                "name": "-1",
+                "description": "y"
+              },
+              {
+                "name": "toString"
+              },
+              {
+                "name": "�",
+                "description": "M6!dA*?-a:"
               }
             ],
             "skills": [
               {
-                "name": "P+RV8YI}W\"",
-                "path": "\u0000",
-                "enabled": true
-              },
-              {
-                "name": "�",
-                "path": "😀",
-                "enabled": false
-              },
-              {
-                "name": "4294967295",
-                "path": "-1",
+                "name": "F",
+                "path": "!^_wd^x=d",
                 "enabled": true,
-                "shortDescription": "-1"
-              },
-              {
-                "name": "L'm{P!Ll#",
-                "path": ">QH,",
-                "enabled": true
+                "invocation": "dollar"
               },
               {
                 "name": "�",
-                "path": "4294967295",
-                "enabled": true
-              },
-              {
-                "name": "",
-                "path": "]8dVos%",
+                "description": "4294967295",
+                "path": "3GSzz8",
                 "enabled": false
               },
               {
-                "name": "😀",
-                "path": "r",
-                "enabled": false
-              }
-            ],
-            "agents": []
-          },
-          {
-            "instanceId": "gwCfoitw",
-            "driver": "a",
-            "enabled": false,
-            "installed": false,
-            "version": null,
-            "status": "warning",
-            "auth": {
-              "status": "authenticated"
-            },
-            "checkedAt": "prototype",
-            "models": [
-              {
-                "slug": "Y/*-Q3|wzC",
-                "name": "%:BD?,5&Fk",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "z0zpEPS'",
-                "name": "",
-                "shortName": "😀",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "ar5 j:",
-                "name": "",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "23n_)>/:m:",
-                "name": "prototype",
-                "shortName": "",
-                "subProvider": "prototype",
-                "isCustom": false,
-                "capabilities": {}
-              },
-              {
-                "slug": "",
-                "name": "[",
-                "subProvider": "prototype",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": ">",
-                "name": "')j3_o7vO",
-                "shortName": "U<5\"?VHB-G",
-                "subProvider": "tM1ygQI",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "prototype",
-                "name": "z",
-                "subProvider": "U",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "5",
                 "name": "__proto__",
-                "isCustom": false,
-                "capabilities": null
-              }
-            ],
-            "slashCommands": [],
-            "skills": [
+                "description": "HH;}`1CwD2",
+                "path": "\u0000",
+                "enabled": true,
+                "shortDescription": "$ip"
+              },
               {
-                "name": "toString",
-                "path": "0",
+                "name": "3oh_XONmL",
+                "path": "(mpn",
                 "enabled": false
               },
               {
-                "name": "UK?=",
-                "path": "'Tl",
-                "enabled": true
+                "name": "dm<c7",
+                "path": "\u0000",
+                "enabled": false
               },
               {
-                "name": ";",
-                "path": "\"",
-                "scope": "3E0",
+                "name": "�",
+                "path": "toString",
+                "scope": "�",
                 "enabled": true,
-                "displayName": "4294967295",
-                "shortDescription": "@",
+                "invocation": "slash"
+              },
+              {
+                "name": "&+O^h~qS",
+                "path": "�",
+                "enabled": false,
                 "invocation": "slash"
               }
             ],
             "agents": [
               {
-                "name": "-1"
+                "name": "+rP0)t\""
               },
               {
-                "name": "",
-                "mode": ""
-              },
-              {
-                "name": "gJ"
+                "name": ":6YKx"
               },
               {
                 "name": "toString"
               },
               {
-                "name": "lj[wV`'",
-                "mode": "|d^"
+                "name": "*GtPvG",
+                "mode": "klVYBD1ja*"
               },
               {
-                "name": ".#^I-k@xM",
-                "description": "\u0000",
-                "model": "#_q]vo6;",
-                "mode": "GjEo{O<H8j",
+                "name": "4294967295",
+                "model": "J?Nmy~",
+                "mode": "toString",
                 "invocation": "mention"
               },
               {
-                "name": "N",
-                "description": "SlCP",
-                "mode": "n"
+                "name": "�",
+                "invocation": "mention"
               },
               {
-                "name": "toString"
+                "name": "$sgfEMR>W"
               },
               {
-                "name": "$guLjM"
+                "name": "sc,[HgBQ",
+                "model": "zDa?%"
               },
               {
-                "name": "prototype"
+                "name": "@"
+              },
+              {
+                "name": "2\""
               }
             ]
           },
           {
-            "instanceId": "zvQ0-mMAef",
-            "driver": "KMXLqri",
+            "instanceId": "I",
+            "driver": "y2NQH-F3q",
             "enabled": true,
-            "installed": false,
-            "version": "b",
-            "status": "error",
+            "installed": true,
+            "version": "1gCRNuPc",
+            "status": "disabled",
             "auth": {
-              "status": "unknown",
-              "label": "\u0000",
-              "email": "."
+              "status": "authenticated",
+              "type": "0",
+              "label": "�"
             },
-            "checkedAt": " ",
+            "checkedAt": "�",
+            "models": [],
+            "slashCommands": [],
+            "skills": [
+              {
+                "name": "3UDyK{",
+                "path": "OC<eOJ",
+                "enabled": false,
+                "shortDescription": "L<O3V/3q.Y"
+              },
+              {
+                "name": "",
+                "path": "7$u",
+                "scope": "",
+                "enabled": true,
+                "displayName": "k",
+                "shortDescription": ""
+              },
+              {
+                "name": "<;)np P78(",
+                "path": "@S}5<7PA",
+                "enabled": true
+              },
+              {
+                "name": "😀",
+                "path": "VG`$Z}=.8}",
+                "scope": "prototype",
+                "enabled": true,
+                "displayName": "2ySU92PtRx",
+                "shortDescription": "4294967295"
+              },
+              {
+                "name": "\u0000",
+                "path": "%",
+                "scope": "4294967295",
+                "enabled": true,
+                "shortDescription": ""
+              },
+              {
+                "name": "b+8}s",
+                "path": "4",
+                "enabled": false
+              },
+              {
+                "name": "�",
+                "path": "",
+                "enabled": true
+              },
+              {
+                "name": "p gN'[L?|J",
+                "path": "",
+                "enabled": false
+              },
+              {
+                "name": "+",
+                "path": "",
+                "enabled": false
+              },
+              {
+                "name": "`1",
+                "description": "__proto__",
+                "path": "4294967295",
+                "enabled": true,
+                "displayName": "TTEX@*d"
+              }
+            ],
+            "agents": [
+              {
+                "name": "|",
+                "mode": "msE,n]='2Z",
+                "invocation": "mention"
+              },
+              {
+                "name": "7/{=:m=h",
+                "description": "\u0000",
+                "mode": "}8S yD<k'N"
+              },
+              {
+                "name": "-1",
+                "model": "M"
+              }
+            ]
+          },
+          {
+            "instanceId": "aa8OkVyMz-",
+            "driver": "t",
+            "enabled": false,
+            "installed": true,
+            "version": null,
+            "status": "warning",
+            "auth": {
+              "status": "unknown"
+            },
+            "checkedAt": "�",
             "models": [
               {
-                "slug": "😀",
-                "name": "T",
-                "shortName": "l2Ge9e9U<S",
+                "slug": "dOgl+dN",
+                "name": "",
+                "description": "M<Bgb\\<3+#",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "1MTJK REb",
+                "name": "9=",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "CTjTU `U@p",
+                "name": "K",
+                "shortName": "",
+                "isCustom": true,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": "-1",
+                      "label": "l+o",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "-1",
+                          "label": "v_SR/;sko"
+                        },
+                        {
+                          "id": "#&X?",
+                          "label": "0fgy=Oaz"
+                        },
+                        {
+                          "id": "",
+                          "label": "__proto__"
+                        },
+                        {
+                          "id": "\\",
+                          "label": "B/5Qv"
+                        },
+                        {
+                          "id": "p'gVVha5b|",
+                          "label": "�"
+                        },
+                        {
+                          "id": "�",
+                          "label": "a@\\B<J(\"}s"
+                        },
+                        {
+                          "id": "",
+                          "label": "😀"
+                        },
+                        {
+                          "id": "qzJc{",
+                          "label": "3bQ4",
+                          "description": "\u0000"
+                        },
+                        {
+                          "id": "WPC1i5#0s<",
+                          "label": "_0&3"
+                        },
+                        {
+                          "id": "SQ`R&*~%c?",
+                          "label": "PB_",
+                          "isDefault": true
+                        }
+                      ]
+                    },
+                    {
+                      "id": "�",
+                      "label": "prototype",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "prototype",
+                          "label": "y]z9Wj",
+                          "isDefault": true
+                        },
+                        {
+                          "id": "�",
+                          "label": "😀"
+                        },
+                        {
+                          "id": "v%[O`Pzs,",
+                          "label": "G"
+                        },
+                        {
+                          "id": "L",
+                          "label": "Zt*0_f"
+                        },
+                        {
+                          "id": "prototype",
+                          "label": "-1"
+                        },
+                        {
+                          "id": ",@e>:",
+                          "label": "BMl9#0!OfS"
+                        },
+                        {
+                          "id": "�",
+                          "label": ""
+                        },
+                        {
+                          "id": "-",
+                          "label": "�"
+                        },
+                        {
+                          "id": ":",
+                          "label": "\u0000"
+                        },
+                        {
+                          "id": "4294967295",
+                          "label": "-,'*UET"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "Eb]AK@ND!_",
+                      "label": "�",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "l6BeUQ'bfr",
+                      "label": "\u0000",
+                      "description": "0",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "prototype",
+                          "label": "GW;W|W"
+                        },
+                        {
+                          "id": "7",
+                          "label": "D"
+                        },
+                        {
+                          "id": "\"\"-~\\PHoL?",
+                          "label": "�",
+                          "description": "prototype"
+                        },
+                        {
+                          "id": "�",
+                          "label": "",
+                          "isDefault": false
+                        },
+                        {
+                          "id": "MyvjK_/P:B",
+                          "label": "Y$}",
+                          "description": "�",
+                          "isDefault": false
+                        },
+                        {
+                          "id": "|A^htYNOuO",
+                          "label": "0",
+                          "isDefault": false
+                        },
+                        {
+                          "id": "E>o&OHa9LA",
+                          "label": "😀"
+                        },
+                        {
+                          "id": "g9j0",
+                          "label": "1",
+                          "description": "0G i]uBRY."
+                        },
+                        {
+                          "id": "😀",
+                          "label": "JE8=X%@_qp",
+                          "description": "P"
+                        },
+                        {
+                          "id": "1",
+                          "label": "prototype"
+                        }
+                      ],
+                      "currentValue": "I+ng-#vy",
+                      "promptInjectedValues": [
+                        "😀",
+                        "Y",
+                        "-1",
+                        "toString",
+                        "�",
+                        "l-qj&x.&b;",
+                        "__proto__",
+                        "__proto__",
+                        "1AK{",
+                        "😀"
+                      ]
+                    },
+                    {
+                      "id": "",
+                      "label": "prototype",
+                      "description": "toString",
+                      "type": "select",
+                      "options": [],
+                      "currentValue": ""
+                    },
+                    {
+                      "id": "",
+                      "label": ":u(0A,GtB_",
+                      "description": "(",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "😀",
+                          "label": "qqpR~(NUu`",
+                          "isDefault": true
+                        },
+                        {
+                          "id": "&i2o>jPz",
+                          "label": ","
+                        },
+                        {
+                          "id": "",
+                          "label": "�"
+                        },
+                        {
+                          "id": "",
+                          "label": "N"
+                        },
+                        {
+                          "id": "toString",
+                          "label": "__proto__"
+                        },
+                        {
+                          "id": "YJ]'\"KU{5^",
+                          "label": "",
+                          "description": "-1"
+                        },
+                        {
+                          "id": "(C",
+                          "label": "V"
+                        },
+                        {
+                          "id": "o;Sbc!L'9C",
+                          "label": "a"
+                        },
+                        {
+                          "id": "^",
+                          "label": "😀"
+                        },
+                        {
+                          "id": "Kc.Gz;]",
+                          "label": "0",
+                          "isDefault": false
+                        }
+                      ],
+                      "currentValue": "`,Yv3y#vlU"
+                    },
+                    {
+                      "id": "Sx[",
+                      "label": "�",
+                      "type": "boolean",
+                      "currentValue": true
+                    }
+                  ]
+                }
+              },
+              {
+                "slug": "-1",
+                "name": "__proto__",
+                "description": "4294967295",
                 "isCustom": false,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": ":K->K$;-`'",
+                      "label": "prototype",
+                      "description": "yFa",
+                      "type": "select",
+                      "options": [],
+                      "currentValue": "__proto__"
+                    },
+                    {
+                      "id": "-1",
+                      "label": "toString",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "1LPb]t=",
+                      "label": ",j5,&/%fw`",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "s",
+                      "label": "�",
+                      "description": "😀",
+                      "type": "select",
+                      "options": []
+                    },
+                    {
+                      "id": "V",
+                      "label": "P",
+                      "type": "boolean"
+                    }
+                  ]
+                }
+              },
+              {
+                "slug": "__proto__",
+                "name": "5[lHWn-2Zn",
+                "isCustom": true,
                 "capabilities": {}
               },
               {
-                "slug": "\\",
+                "slug": "",
+                "name": "4E4tAQG",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "uXkR3",
                 "name": "",
-                "shortName": "4294967295",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "+8M</i\"Z*d",
+                "name": "",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "",
+                "name": "sx]qQV",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "😀",
+                "name": "5Y45@:H>G\"",
+                "resolvedModel": "",
+                "isCustom": false,
+                "capabilities": {}
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": ""
+              },
+              {
+                "name": "",
+                "input": {
+                  "hint": "&GQN-[4"
+                }
+              },
+              {
+                "name": "",
+                "input": {
+                  "hint": "__proto__"
+                }
+              },
+              {
+                "name": "0"
+              },
+              {
+                "name": "fL;KC^D;eY"
+              },
+              {
+                "name": "__proto__"
+              },
+              {
+                "name": "😀"
+              },
+              {
+                "name": "&"
+              },
+              {
+                "name": "4294967295",
+                "description": "5"
+              },
+              {
+                "name": "+P[*`m,Xo="
+              }
+            ],
+            "skills": [
+              {
+                "name": "lN0:OP\\^I7",
+                "description": "ec",
+                "path": "-1",
+                "scope": ":",
+                "enabled": true,
+                "shortDescription": "�",
+                "invocation": "slash"
+              },
+              {
+                "name": "__proto__",
+                "path": "",
+                "enabled": false
+              }
+            ],
+            "agents": [
+              {
+                "name": "I-%@"
+              },
+              {
+                "name": "=",
+                "model": "YSJr8bJ"
+              },
+              {
+                "name": "\"",
+                "mode": "L"
+              },
+              {
+                "name": "H\\\"^XoBsw;",
+                "model": "-1",
+                "invocation": "mention"
+              },
+              {
+                "name": "x(re#'",
+                "mode": "4294967295"
+              }
+            ]
+          },
+          {
+            "instanceId": "w-G6FL8",
+            "driver": "sjDvm",
+            "enabled": true,
+            "installed": true,
+            "version": "",
+            "status": "warning",
+            "auth": {
+              "status": "unknown",
+              "type": "E",
+              "email": "�"
+            },
+            "checkedAt": "Qn5Af<4XeP",
+            "models": [
+              {
+                "slug": "",
+                "name": "I",
+                "subProvider": "N3",
+                "isCustom": true,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": "!",
+                      "label": "prototype",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "",
+                          "label": ""
+                        },
+                        {
+                          "id": "8K:V_!&i",
+                          "label": "f"
+                        },
+                        {
+                          "id": "4294967295",
+                          "label": "^"
+                        },
+                        {
+                          "id": "prototype",
+                          "label": "\u0000",
+                          "isDefault": false
+                        },
+                        {
+                          "id": "-1",
+                          "label": "4294967295",
+                          "isDefault": true
+                        },
+                        {
+                          "id": "5",
+                          "label": "5>Y%)6\"'St",
+                          "isDefault": true
+                        },
+                        {
+                          "id": "&",
+                          "label": "�"
+                        },
+                        {
+                          "id": "",
+                          "label": "&|cd",
+                          "description": "__proto__"
+                        },
+                        {
+                          "id": "!",
+                          "label": "r"
+                        },
+                        {
+                          "id": "",
+                          "label": "toString"
+                        }
+                      ],
+                      "promptInjectedValues": [
+                        "__proto__",
+                        "g",
+                        "�",
+                        "�",
+                        "toString",
+                        "",
+                        "",
+                        "|",
+                        "jc0K(7",
+                        ".A(l"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "slug": "\u0000",
+                "name": "😀",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "q&>iUWo rw",
+                "name": "-1",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "0",
+                "name": "I7Oz)",
+                "subProvider": "6GG\\'yRu7",
                 "isCustom": true,
                 "capabilities": {}
               },
               {
                 "slug": "�",
-                "name": "[",
+                "name": "",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "v",
+                "name": "p(",
+                "description": "prototype",
+                "isCustom": false,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": "\u0000",
+                      "label": "",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "😀",
+                          "label": "z"
+                        },
+                        {
+                          "id": "__proto__",
+                          "label": "-D-%SRAO=v"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "0",
+                      "label": "@g,\"j0Yy",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "0",
+                      "label": "prototype",
+                      "type": "boolean",
+                      "currentValue": true
+                    },
+                    {
+                      "id": "�",
+                      "label": "u]F.{&oC$w",
+                      "type": "select",
+                      "options": []
+                    },
+                    {
+                      "id": "#JhM",
+                      "label": "😀",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "__proto__",
+                          "label": "__proto__",
+                          "description": "toString"
+                        },
+                        {
+                          "id": "",
+                          "label": "fiP@i,])o7"
+                        }
+                      ],
+                      "currentValue": "f?tuQy%\\8o",
+                      "promptInjectedValues": []
+                    },
+                    {
+                      "id": "�",
+                      "label": "`;2${@q",
+                      "type": "select",
+                      "options": []
+                    },
+                    {
+                      "id": "\"",
+                      "label": ":",
+                      "type": "boolean",
+                      "currentValue": true
+                    },
+                    {
+                      "id": "4294967295",
+                      "label": "4294967295",
+                      "type": "select",
+                      "options": [],
+                      "currentValue": "toString"
+                    },
+                    {
+                      "id": "",
+                      "label": "__proto__",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "1X(Hnfd",
+                      "label": "7",
+                      "type": "boolean"
+                    }
+                  ]
+                }
+              },
+              {
+                "slug": "�",
+                "name": "G0>O%MN6bF",
+                "description": "toString",
+                "subProvider": "-1",
                 "isCustom": false,
                 "capabilities": null
               },
               {
-                "slug": "H[bjY/uqB=",
+                "slug": "!m/MNvl",
+                "name": "😀",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "toString",
+                "name": "amw5KhvSp\"",
+                "resolvedModel": "b",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "-1",
+                "name": "😀",
+                "description": "FD",
+                "isCustom": true,
+                "capabilities": {
+                  "optionDescriptors": []
+                }
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": "-1",
+                "input": {
+                  "hint": "😀"
+                }
+              }
+            ],
+            "skills": [
+              {
+                "name": "__proto__",
+                "path": "__proto__",
+                "enabled": false
+              },
+              {
                 "name": "",
+                "path": "�",
+                "enabled": false
+              },
+              {
+                "name": "x",
+                "path": "",
+                "enabled": false
+              },
+              {
+                "name": "",
+                "description": "toString",
+                "path": "d",
+                "enabled": true,
+                "displayName": "G2aEYI|y@i",
+                "shortDescription": "-1",
+                "invocation": "slash"
+              },
+              {
+                "name": "�",
+                "path": "0",
+                "scope": "4294967295",
+                "enabled": true
+              },
+              {
+                "name": "j",
+                "path": "lRq%$(,V?l",
+                "enabled": false,
+                "displayName": ""
+              },
+              {
+                "name": "0",
+                "description": "tZo:Qv.Ve+",
+                "path": "9~5M0NL]",
+                "enabled": false
+              },
+              {
+                "name": "[",
+                "path": ":%",
+                "enabled": false
+              },
+              {
+                "name": "?:ksmt9Hm",
+                "path": "9",
+                "scope": "-1",
+                "enabled": false,
+                "displayName": "3]-14i=@'d"
+              },
+              {
+                "name": "(wc",
+                "description": "#9\\L]?]o",
+                "path": "prototype",
+                "scope": "A*s:E",
+                "enabled": true
+              }
+            ],
+            "agents": [
+              {
+                "name": "]",
+                "mode": "😀"
+              },
+              {
+                "name": "3\\h"
+              },
+              {
+                "name": "😀",
+                "invocation": "mention"
+              },
+              {
+                "name": "6t?fGc7W]"
+              },
+              {
+                "name": "\u0000",
+                "model": "F"
+              },
+              {
+                "name": "__proto__",
+                "description": "",
+                "model": "]D5\\Dzm7r;",
+                "invocation": "mention"
+              },
+              {
+                "name": "prototype",
+                "mode": ""
+              },
+              {
+                "name": "/{2AY1.Q)9",
+                "invocation": "mention"
+              },
+              {
+                "name": "'",
+                "description": "😀",
+                "invocation": "mention"
+              }
+            ]
+          },
+          {
+            "instanceId": "hty5h0Vb",
+            "driver": "h",
+            "enabled": true,
+            "installed": false,
+            "version": "__proto__",
+            "status": "ready",
+            "auth": {
+              "status": "authenticated",
+              "label": "5"
+            },
+            "checkedAt": "rgZAEy4A",
+            "models": [
+              {
+                "slug": "prototype",
+                "name": "\u0000",
+                "resolvedModel": "?E~Ask",
+                "subProvider": "?R*31-AQ%q",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "LdHf:33'^N",
+                "name": "__proto__",
+                "shortName": "",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "",
+                "name": "\u0000",
+                "subProvider": "eH",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "-1",
+                "name": "",
+                "description": "jr|^*AoMk",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "m",
+                "name": "D",
+                "shortName": "",
                 "isCustom": true,
                 "capabilities": {
                   "optionDescriptors": [
+                    {
+                      "id": "😀",
+                      "label": "l-OJyL(D6X",
+                      "type": "select",
+                      "options": [],
+                      "currentValue": "_+sNw"
+                    },
+                    {
+                      "id": "",
+                      "label": "1WWXBz",
+                      "type": "select",
+                      "options": []
+                    },
+                    {
+                      "id": "",
+                      "label": "�",
+                      "type": "boolean",
+                      "currentValue": true
+                    },
+                    {
+                      "id": "",
+                      "label": "prototype",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "😀",
+                      "label": "CMSvw>a(",
+                      "type": "select",
+                      "options": []
+                    },
+                    {
+                      "id": "😀",
+                      "label": "",
+                      "description": "\u0000",
+                      "type": "boolean",
+                      "currentValue": false
+                    },
+                    {
+                      "id": "l",
+                      "label": "-1",
+                      "type": "boolean"
+                    }
+                  ]
+                }
+              },
+              {
+                "slug": "(",
+                "name": "�",
+                "subProvider": "",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "0",
+                "name": "�",
+                "shortName": "r*8|D[E#f",
+                "subProvider": "-1",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "�",
+                "name": "0",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "x",
+                "name": "?",
+                "isCustom": false,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": "",
+                      "label": "__proto__",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "%5b_ tUP'/",
+                          "label": "�"
+                        },
+                        {
+                          "id": "^",
+                          "label": "`d),Ym/QKZ"
+                        },
+                        {
+                          "id": "9.;T9<(6",
+                          "label": "�",
+                          "description": ""
+                        },
+                        {
+                          "id": "d",
+                          "label": "�"
+                        },
+                        {
+                          "id": ">M",
+                          "label": "'Q"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "/<<O'i$zpR",
+                      "label": "",
+                      "description": "",
+                      "type": "boolean",
+                      "currentValue": true
+                    }
+                  ]
+                }
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": "n#0^!k m3E"
+              },
+              {
+                "name": ""
+              },
+              {
+                "name": ""
+              },
+              {
+                "name": "06Jpv<",
+                "description": "-^zyDpv2I[",
+                "input": {
+                  "hint": "-1"
+                }
+              },
+              {
+                "name": "�",
+                "input": {
+                  "hint": ""
+                }
+              },
+              {
+                "name": "__proto__",
+                "description": ""
+              },
+              {
+                "name": "fd[BnpBFYG"
+              },
+              {
+                "name": "?"
+              },
+              {
+                "name": "V"
+              },
+              {
+                "name": ""
+              }
+            ],
+            "skills": [
+              {
+                "name": "0",
+                "description": "4294967295",
+                "path": "N",
+                "scope": "�",
+                "enabled": false
+              },
+              {
+                "name": "2el",
+                "path": "",
+                "enabled": true
+              },
+              {
+                "name": "",
+                "path": "0",
+                "enabled": true
+              },
+              {
+                "name": ")",
+                "path": "\u0000",
+                "enabled": true,
+                "invocation": "prompt"
+              },
+              {
+                "name": "^gPL$-j/w_",
+                "path": "0YK~x%Z -(",
+                "enabled": false
+              },
+              {
+                "name": "_B-$u/4",
+                "path": "�",
+                "scope": "😀",
+                "enabled": false
+              },
+              {
+                "name": "�",
+                "path": "�",
+                "enabled": true
+              },
+              {
+                "name": "z",
+                "path": "0",
+                "enabled": true
+              },
+              {
+                "name": "^*N[5",
+                "path": "",
+                "enabled": true
+              },
+              {
+                "name": "toString",
+                "path": "0",
+                "enabled": false
+              }
+            ],
+            "agents": [
+              {
+                "name": "toString",
+                "invocation": "mention"
+              },
+              {
+                "name": "-1"
+              },
+              {
+                "name": "Rmv<nef1",
+                "model": "😀"
+              },
+              {
+                "name": "-1"
+              },
+              {
+                "name": "(w-#LKcB1x",
+                "mode": "\u0000"
+              },
+              {
+                "name": "-1"
+              },
+              {
+                "name": "-1"
+              },
+              {
+                "name": "i"
+              },
+              {
+                "name": "toString",
+                "mode": "V+#.1^i"
+              }
+            ]
+          },
+          {
+            "instanceId": "Y95WVaPTRk",
+            "driver": "YEg5",
+            "enabled": false,
+            "installed": true,
+            "version": "q*X6bQFYup",
+            "status": "warning",
+            "auth": {
+              "status": "unauthenticated",
+              "label": "�",
+              "email": "😀"
+            },
+            "checkedAt": " ",
+            "models": [
+              {
+                "slug": "",
+                "name": "__proto__",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "\u0000",
+                "name": "�",
+                "description": "Rb}av-Ahpv",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "%",
+                "name": "[",
+                "shortName": "�",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "?",
+                "name": "�",
+                "shortName": "0",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": ":C_?d7\"+3>",
+                "name": "H",
+                "resolvedModel": "_",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "�",
+                "name": "GUd#/avuS+",
+                "isCustom": true,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": "7i[X>I!]q[",
+                      "label": "^EN",
+                      "description": "8",
+                      "type": "select",
+                      "options": [],
+                      "currentValue": "-1"
+                    },
                     {
                       "id": "",
                       "label": "\u0000",
                       "type": "boolean"
                     },
                     {
-                      "id": "",
-                      "label": "cOX",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "z",
-                      "label": "\\",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "~",
-                      "label": "-1",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "fq20GA}?Hl",
-                      "label": "\\",
-                      "type": "select",
-                      "options": [],
-                      "currentValue": ";",
-                      "promptInjectedValues": ["__proto__", "4294967295", "__proto__"]
-                    },
-                    {
-                      "id": ":",
-                      "label": ":b9,[~Mq>",
-                      "type": "boolean",
-                      "currentValue": false
-                    },
-                    {
-                      "id": "c",
-                      "label": "😀",
-                      "description": "prototype",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "m\"vGm:_.",
-                      "label": "*",
-                      "description": "AO!Dn)WbF",
-                      "type": "select",
-                      "options": []
-                    },
-                    {
-                      "id": "`-\\fB=L~`F",
+                      "id": "B%R",
                       "label": "�",
-                      "type": "boolean",
-                      "currentValue": false
+                      "type": "boolean"
                     },
                     {
-                      "id": "/.CMnAv.K;",
-                      "label": "jA1 MDe",
-                      "description": "XxRB[p)",
+                      "id": "QH]7koY",
+                      "label": "__proto__",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "",
+                          "label": "Y`'y.*"
+                        },
+                        {
+                          "id": "=o",
+                          "label": "\u0000"
+                        },
+                        {
+                          "id": "c:)-F\"4Q0@",
+                          "label": "N./3E.l?h]"
+                        },
+                        {
+                          "id": "d;X7>2g4p#",
+                          "label": "o>Z|N;Yg"
+                        },
+                        {
+                          "id": "0",
+                          "label": "\u0000"
+                        },
+                        {
+                          "id": "",
+                          "label": "�"
+                        },
+                        {
+                          "id": "9c#b7",
+                          "label": "y",
+                          "description": ""
+                        }
+                      ],
+                      "currentValue": "-1"
+                    },
+                    {
+                      "id": "\u0000",
+                      "label": "l{$1_YA",
                       "type": "boolean"
                     }
                   ]
                 }
               },
               {
-                "slug": "😀",
-                "name": "",
-                "isCustom": false,
-                "capabilities": {}
-              },
-              {
-                "slug": "0",
-                "name": "Fu>qr%J&+",
-                "isCustom": true,
-                "capabilities": {
-                  "optionDescriptors": []
-                }
-              },
-              {
-                "slug": "|D",
-                "name": "e",
-                "shortName": "@y7",
+                "slug": "d<@Ih<BE=F",
+                "name": "L",
+                "shortName": "-1",
                 "isCustom": true,
                 "capabilities": {}
               },
               {
-                "slug": "eP",
-                "name": "J",
-                "isCustom": false,
-                "capabilities": {}
-              }
-            ],
-            "slashCommands": [],
-            "skills": [
-              {
-                "name": "UC",
-                "description": "UJhPg",
-                "path": "�",
-                "enabled": true,
-                "displayName": ""
-              },
-              {
-                "name": "__proto__",
-                "path": "__proto__",
-                "enabled": false,
-                "shortDescription": "__proto__"
-              },
-              {
-                "name": "-1",
-                "description": "\u0000",
-                "path": "pXZ:a /<ic",
-                "scope": "😀",
-                "enabled": false,
-                "displayName": "\"J{",
-                "shortDescription": "1vi9F@>k>W",
-                "invocation": "dollar"
-              },
-              {
-                "name": "4294967295",
-                "path": "2",
-                "enabled": true,
-                "displayName": "",
-                "shortDescription": "vQjT"
-              },
-              {
-                "name": "X",
-                "path": "�",
-                "enabled": true
-              },
-              {
+                "slug": "",
                 "name": "",
                 "description": "😀",
-                "path": "",
-                "enabled": true
-              },
-              {
-                "name": ")]]M9{W{f3",
-                "description": "😀",
-                "path": "",
-                "enabled": false,
-                "displayName": "X7SO0-Qei3",
-                "shortDescription": "/`nD2,#Hv|"
-              },
-              {
-                "name": "prototype",
-                "path": "L",
-                "enabled": false
-              },
-              {
-                "name": "AD\"&h&hf",
-                "path": "#H_!q;",
-                "scope": "\u0000",
-                "enabled": true,
-                "displayName": "{>L:AZB~Wh"
-              },
-              {
-                "name": "",
-                "path": "csN7iUNV(",
-                "scope": "8ulYc",
-                "enabled": true,
-                "displayName": "toString",
-                "shortDescription": "0",
-                "invocation": "prompt"
-              }
-            ],
-            "agents": []
-          },
-          {
-            "instanceId": "Bfivix",
-            "driver": "a",
-            "enabled": false,
-            "installed": true,
-            "version": null,
-            "status": "ready",
-            "auth": {
-              "status": "unauthenticated",
-              "type": "__proto__"
-            },
-            "checkedAt": "prototype",
-            "models": [
-              {
-                "slug": "__proto__",
-                "name": "A?.U<",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "HH;}`1CwD2",
-                "name": "h|",
-                "isCustom": false,
-                "capabilities": {}
-              },
-              {
-                "slug": "�",
-                "name": "p3oh_XO",
-                "shortName": "(mpn",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "`",
-                "name": "m<c7C6 qbH",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "5d:Hu$Iq_b",
-                "name": "NXb",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "S4jpP?EY}",
-                "name": "8g.",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": ")t",
-                "name": "4294967295",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "\u0000",
-                "name": ")3e9:L4\\nP",
                 "shortName": "😀",
                 "isCustom": false,
                 "capabilities": {}
-              }
-            ],
-            "slashCommands": [
-              {
-                "name": "D1ja",
-                "description": "T",
-                "input": {
-                  "hint": ""
-                }
               },
               {
-                "name": "4294967295"
-              },
-              {
-                "name": "4294967295"
-              },
-              {
-                "name": "�",
-                "description": "lrO."
-              },
-              {
-                "name": "km$sgf",
-                "input": {
-                  "hint": "4294967295"
-                }
-              },
-              {
-                "name": "R `PWc"
-              },
-              {
+                "slug": "",
                 "name": "prototype",
-                "description": "b",
-                "input": {
-                  "hint": "zDa?%"
-                }
-              },
-              {
-                "name": "Pk"
-              },
-              {
-                "name": "4294967295"
-              },
-              {
-                "name": "c"
-              }
-            ],
-            "skills": [
-              {
-                "name": "",
-                "path": "{-",
-                "enabled": false
-              }
-            ],
-            "agents": [
-              {
-                "name": "\u0000",
-                "model": "p",
-                "mode": "Ti1gCRNuPc"
-              },
-              {
-                "name": "0",
-                "model": "B",
-                "mode": ",",
-                "invocation": "mention"
-              },
-              {
-                "name": "_WV3UDyK{h",
-                "mode": "\u0000"
-              },
-              {
-                "name": "1`1(L<O3V/",
-                "description": "`",
-                "mode": "4294967295",
-                "invocation": "mention"
-              },
-              {
-                "name": "4294967295"
-              },
-              {
-                "name": "v",
-                "invocation": "mention"
-              },
-              {
-                "name": "0",
-                "model": "",
-                "mode": "__proto__"
-              },
-              {
-                "name": "\u0000",
-                "mode": "@S}5<7PA",
-                "invocation": "mention"
-              },
-              {
-                "name": "{VG`",
-                "model": ".8}Y",
-                "invocation": "mention"
-              },
-              {
-                "name": ":"
-              }
-            ]
-          },
-          {
-            "instanceId": "dBsvG7IqSm",
-            "driver": "GgR",
-            "enabled": true,
-            "installed": false,
-            "version": null,
-            "status": "error",
-            "auth": {
-              "status": "authenticated"
-            },
-            "checkedAt": "H4",
-            "models": [
-              {
-                "slug": ".n2'Mf$",
-                "name": "p gN'[L?|J",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "+",
-                "name": "",
+                "resolvedModel": "",
                 "isCustom": false,
                 "capabilities": null
               },
               {
-                "slug": "�",
-                "name": "`1",
+                "slug": "<O.",
+                "name": "",
                 "isCustom": true,
                 "capabilities": null
               }
             ],
             "slashCommands": [
               {
-                "name": "�"
+                "name": ""
               },
               {
-                "name": "@*d[BZ .)e"
-              }
-            ],
-            "skills": [],
-            "agents": [
-              {
-                "name": "n]='2ZJzYc",
-                "description": "7/{=:m=h",
-                "mode": "\u0000"
-              },
-              {
-                "name": "😀",
-                "model": "D",
-                "invocation": "mention"
+                "name": "-1"
               },
               {
                 "name": "😀"
               },
               {
-                "name": "toString"
-              }
-            ]
-          },
-          {
-            "instanceId": "DTYJF7RhLJ",
-            "driver": "j",
-            "enabled": true,
-            "installed": false,
-            "version": "�",
-            "status": "warning",
-            "auth": {
-              "status": "authenticated"
-            },
-            "checkedAt": "�",
-            "models": [
-              {
-                "slug": "__proto__",
-                "name": "\\dOgl+dN",
-                "isCustom": false,
-                "capabilities": {}
-              },
-              {
-                "slug": "4294967295",
-                "name": "\u0000",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "",
                 "name": "",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "__proto__",
-                "name": "-1",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "9=",
-                "name": "__proto__",
-                "isCustom": true,
-                "capabilities": {
-                  "optionDescriptors": [
-                    {
-                      "id": "`U@py",
-                      "label": "0",
-                      "description": "!",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "",
-                      "label": "toString",
-                      "description": "Q",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "-1",
-                      "label": "v_SR/;sko",
-                      "type": "boolean"
-                    }
-                  ]
-                }
-              },
-              {
-                "slug": "&X?SWh0fgy",
-                "name": "4294967295",
-                "subProvider": "",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "\u0000",
-                "name": "\\",
-                "shortName": "",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "$Y1pp'gVVh",
-                "name": "|Ej\"!vQ8ia",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "",
-                "name": "😀",
-                "subProvider": "😀",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "qzJc{",
-                "name": "3bQ4",
-                "subProvider": "toString",
-                "isCustom": false,
-                "capabilities": {}
-              }
-            ],
-            "slashCommands": [
-              {
-                "name": ""
-              },
-              {
-                "name": ""
-              },
-              {
-                "name": "_0&3"
-              },
-              {
-                "name": "SQ`R&*~%c?"
-              },
-              {
-                "name": "4294967295",
-                "description": "%",
                 "input": {
-                  "hint": "�"
+                  "hint": "v"
                 }
               },
               {
-                "name": "t` `aiQy]z"
-              },
-              {
-                "name": "A=<Gp7~\""
-              },
-              {
-                "name": "["
-              },
-              {
-                "name": "5"
-              },
-              {
-                "name": "9",
-                "description": "Zt*0_f"
-              }
-            ],
-            "skills": [
-              {
-                "name": "😀",
-                "description": "l9#0!OfSuW",
-                "path": "{G,@e>",
-                "enabled": true
-              },
-              {
-                "name": "😀",
-                "path": "4{-&jre)m!",
-                "enabled": true,
-                "shortDescription": "0",
-                "invocation": "dollar"
-              },
-              {
-                "name": "",
-                "path": "__proto__",
-                "enabled": true
-              },
-              {
-                "name": "toString",
-                "description": "prototype",
-                "path": "@",
-                "scope": "|Rk{T",
-                "enabled": false
-              },
-              {
-                "name": "frG86~3H[{",
-                "path": "W;W|W",
-                "enabled": true,
-                "shortDescription": "\u0000"
-              },
-              {
-                "name": "😀",
-                "path": "{\"",
-                "enabled": true
-              },
-              {
-                "name": "HoL?&u",
-                "path": "",
-                "enabled": true
-              }
-            ],
-            "agents": [
-              {
-                "name": "�",
-                "model": "j=`M"
-              },
-              {
-                "name": "0"
-              },
-              {
-                "name": "",
-                "invocation": "mention"
-              },
-              {
-                "name": "|A^htYNOuO",
-                "model": ""
-              },
-              {
-                "name": ")"
-              },
-              {
-                "name": "4294967295",
-                "mode": "A"
-              },
-              {
-                "name": "{YEg"
-              },
-              {
-                "name": "n*d$W0G i]"
-              },
-              {
-                "name": "�",
-                "invocation": "mention"
-              },
-              {
-                "name": "-1",
-                "model": "__proto__",
-                "mode": "prototype"
-              }
-            ]
-          },
-          {
-            "instanceId": "c",
-            "driver": "Y",
-            "enabled": true,
-            "installed": false,
-            "version": "@",
-            "status": "ready",
-            "auth": {
-              "status": "authenticated"
-            },
-            "checkedAt": "\u0000",
-            "models": [
-              {
-                "slug": "D3hEr",
-                "name": "l-qj&x.&b;",
-                "subProvider": ">1AK{#",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "+ng-#",
-                "name": "ZcA",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "",
-                "name": "-1",
-                "shortName": "1",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": ":u(0A,GtB_",
-                "name": "�",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "😀",
-                "name": "R~(NUu`5f",
-                "subProvider": ">jPzm9w,#6",
-                "isCustom": false,
-                "capabilities": {}
-              },
-              {
-                "slug": "�",
-                "name": "0",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "",
-                "name": "toString",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "YJ]'\"KU{5^",
-                "name": "",
-                "isCustom": false,
-                "capabilities": {}
-              },
-              {
-                "slug": "/(CX7,V",
-                "name": "*}5)o;",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "",
-                "name": "0",
-                "isCustom": false,
-                "capabilities": {}
-              }
-            ],
-            "slashCommands": [
-              {
-                "name": "^"
-              },
-              {
-                "name": "q{\\Kc.Gz;]"
-              },
-              {
-                "name": "�"
-              },
-              {
-                "name": "�"
-              },
-              {
-                "name": "("
-              },
-              {
-                "name": "`,Yv3y#vlU"
-              }
-            ],
-            "skills": [
-              {
-                "name": "k<S",
-                "path": "",
-                "enabled": true
-              },
-              {
-                "name": "",
-                "path": "x",
-                "enabled": false,
-                "invocation": "prompt"
-              },
-              {
-                "name": "-1",
-                "path": "0",
-                "enabled": false,
-                "displayName": "",
-                "invocation": "dollar"
-              },
-              {
-                "name": "yFa",
-                "path": "-1",
-                "enabled": false,
-                "displayName": "\\",
-                "shortDescription": "-1"
-              },
-              {
-                "name": "=X=),j5,&",
-                "path": "",
-                "scope": "toString",
-                "enabled": false
-              }
-            ],
-            "agents": []
-          },
-          {
-            "instanceId": "Z1x6Q",
-            "driver": "QV3XlYTqnc",
-            "enabled": false,
-            "installed": true,
-            "version": null,
-            "status": "disabled",
-            "auth": {
-              "status": "authenticated"
-            },
-            "checkedAt": "&`yzwO<*QM",
-            "models": [],
-            "slashCommands": [
-              {
-                "name": "",
-                "description": "fx*|rIuXkR"
-              },
-              {
-                "name": ""
-              },
-              {
-                "name": "�",
-                "description": "M"
-              },
-              {
-                "name": "�"
-              },
-              {
-                "name": "3"
-              },
-              {
-                "name": "�"
-              },
-              {
-                "name": "-1",
-                "description": "�"
-              }
-            ],
-            "skills": [
-              {
-                "name": "Qj]6olA(",
-                "description": "0",
-                "path": "[5",
-                "scope": "0",
-                "enabled": true,
-                "displayName": "",
-                "shortDescription": "-1",
-                "invocation": "dollar"
-              },
-              {
-                "name": "",
-                "path": "",
-                "enabled": true
-              },
-              {
-                "name": "",
-                "description": "e",
-                "path": ">/&@Ub;.@",
-                "scope": "-1",
-                "enabled": false,
-                "displayName": "toString",
-                "invocation": "prompt"
-              },
-              {
-                "name": "",
-                "description": "Xo",
-                "path": "3",
-                "scope": "'",
-                "enabled": true,
-                "displayName": "prototype",
-                "shortDescription": "Ja5;SFQ+P[",
-                "invocation": "dollar"
-              },
-              {
-                "name": "",
-                "path": "4294967295",
-                "enabled": false
-              },
-              {
-                "name": "v",
-                "description": "ec",
-                "path": "G",
-                "enabled": false,
-                "invocation": "dollar"
-              }
-            ],
-            "agents": []
-          },
-          {
-            "instanceId": "FF4W0ZQ2vp",
-            "driver": "EjhbfXrgZM",
-            "enabled": true,
-            "installed": false,
-            "version": null,
-            "status": "ready",
-            "auth": {
-              "status": "unauthenticated"
-            },
-            "checkedAt": "",
-            "models": [
-              {
-                "slug": "__proto__",
-                "name": "H\\\"^XoBsw;",
-                "shortName": "XSx(re#'#1",
-                "subProvider": "\u0000",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "@ L9`+b8#A",
-                "name": "J",
-                "shortName": "dxb",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "",
-                "name": "",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "E",
-                "name": "si;pQn5Af<",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "t|N5aq\"I*4",
-                "name": "0",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "!",
-                "name": "prototype",
-                "shortName": "",
-                "subProvider": "4294967295",
-                "isCustom": false,
-                "capabilities": null
-              },
-              {
-                "slug": "d8K:V_!&i",
-                "name": "f",
-                "isCustom": true,
-                "capabilities": {}
-              },
-              {
-                "slug": "D%_7<",
-                "name": "prototype",
-                "isCustom": true,
-                "capabilities": null
-              },
-              {
-                "slug": "4294967295",
-                "name": "😀",
-                "isCustom": false,
-                "capabilities": {
-                  "optionDescriptors": [
-                    {
-                      "id": "5>Y%)6\"'St",
-                      "label": "__proto__",
-                      "type": "boolean"
-                    },
-                    {
-                      "id": "&",
-                      "label": "�",
-                      "type": "boolean"
-                    }
-                  ]
-                }
-              },
-              {
-                "slug": "",
-                "name": "&|cd",
-                "shortName": "!",
-                "isCustom": true,
-                "capabilities": {}
-              }
-            ],
-            "slashCommands": [
-              {
-                "name": "6$LdU]nC/t",
-                "description": "@gNsH"
-              },
-              {
-                "name": ""
+                "name": "lGSv"
               }
             ],
             "skills": [],
             "agents": []
+          },
+          {
+            "instanceId": "XwBzWcDjES",
+            "driver": "IkvFep-",
+            "enabled": false,
+            "installed": false,
+            "version": null,
+            "status": "disabled",
+            "auth": {
+              "status": "authenticated",
+              "type": "4294967295",
+              "label": "prototype"
+            },
+            "checkedAt": "",
+            "models": [
+              {
+                "slug": "\u0000",
+                "name": "toString",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "[",
+                "name": "!",
+                "isCustom": true,
+                "capabilities": {}
+              },
+              {
+                "slug": "=,8~e\\c3<`",
+                "name": "\u0000",
+                "subProvider": "t",
+                "isCustom": false,
+                "capabilities": {}
+              },
+              {
+                "slug": "'qN",
+                "name": "^H",
+                "description": "5",
+                "subProvider": "#(]",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "😀",
+                "name": "VqwR_E",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "4294967295",
+                "name": "😀",
+                "resolvedModel": "3jajo0B(X",
+                "subProvider": "!ogcZYJL1#",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "",
+                "name": "v|l9W",
+                "isCustom": false,
+                "capabilities": null
+              },
+              {
+                "slug": "",
+                "name": "!~q%",
+                "isCustom": true,
+                "capabilities": null
+              },
+              {
+                "slug": "__proto__",
+                "name": "toString",
+                "subProvider": "",
+                "isCustom": true,
+                "capabilities": {
+                  "optionDescriptors": [
+                    {
+                      "id": "-1",
+                      "label": "",
+                      "description": "",
+                      "type": "select",
+                      "options": []
+                    },
+                    {
+                      "id": "u1v#r.M>$",
+                      "label": "4294967295",
+                      "description": "😀",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "",
+                      "label": "-1",
+                      "type": "boolean",
+                      "currentValue": false
+                    },
+                    {
+                      "id": "i",
+                      "label": "",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "`Y1",
+                      "label": "l",
+                      "type": "boolean"
+                    },
+                    {
+                      "id": "g<:",
+                      "label": "0Hrf@JUO!8",
+                      "description": "uK~~~jz>zB",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "",
+                          "label": "-1"
+                        },
+                        {
+                          "id": "-1",
+                          "label": "<"
+                        },
+                        {
+                          "id": "Rli<r{*_qj",
+                          "label": "0"
+                        },
+                        {
+                          "id": "N",
+                          "label": "v}HW}R"
+                        },
+                        {
+                          "id": "2",
+                          "label": "",
+                          "description": "4294967295",
+                          "isDefault": true
+                        },
+                        {
+                          "id": "!",
+                          "label": "z"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "\\",
+                      "label": "toString",
+                      "type": "select",
+                      "options": [
+                        {
+                          "id": "X/^BKIy<a<",
+                          "label": "V)x01u4"
+                        },
+                        {
+                          "id": "__proto__",
+                          "label": "-1",
+                          "isDefault": false
+                        },
+                        {
+                          "id": "\u0000",
+                          "label": "my"
+                        },
+                        {
+                          "id": "0",
+                          "label": "\u0000"
+                        },
+                        {
+                          "id": "�",
+                          "label": ")!V4(%",
+                          "description": "B"
+                        },
+                        {
+                          "id": "0",
+                          "label": "T@xfYYD#E\\",
+                          "isDefault": true
+                        },
+                        {
+                          "id": "0",
+                          "label": "",
+                          "isDefault": false
+                        },
+                        {
+                          "id": "CnkT/-i$r-",
+                          "label": "-1"
+                        },
+                        {
+                          "id": "z_<>.+x>w8",
+                          "label": "�"
+                        }
+                      ],
+                      "promptInjectedValues": [
+                        "�",
+                        "|",
+                        "toString",
+                        "",
+                        "prototype",
+                        "R",
+                        "0",
+                        "4294967295"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "slug": "MO~u",
+                "name": "\u0000",
+                "subProvider": "U^5)S@a",
+                "isCustom": true,
+                "capabilities": null
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": "-1"
+              },
+              {
+                "name": "�",
+                "input": {
+                  "hint": "-1"
+                }
+              },
+              {
+                "name": "TmV1OQs{^",
+                "input": {
+                  "hint": ""
+                }
+              },
+              {
+                "name": ""
+              },
+              {
+                "name": "ey",
+                "input": {
+                  "hint": "__proto__"
+                }
+              },
+              {
+                "name": "[cGcL\"X_57"
+              },
+              {
+                "name": "😀",
+                "input": {
+                  "hint": "pNY"
+                }
+              },
+              {
+                "name": "#9aaFHceJ/",
+                "description": "toString"
+              }
+            ],
+            "skills": [
+              {
+                "name": "�",
+                "description": ".,Glm|L0l7",
+                "path": "W*+xcD<4%H",
+                "scope": "0",
+                "enabled": false,
+                "displayName": "",
+                "shortDescription": "😀"
+              },
+              {
+                "name": "-1",
+                "path": "4<QqI~=Ki#",
+                "enabled": false
+              },
+              {
+                "name": "toString",
+                "path": "-1",
+                "scope": "\u0000",
+                "enabled": false,
+                "displayName": "'F1k`"
+              },
+              {
+                "name": "\u0000",
+                "path": "J?dQ",
+                "enabled": true
+              },
+              {
+                "name": "~",
+                "path": "0",
+                "scope": "\"",
+                "enabled": true,
+                "invocation": "slash"
+              }
+            ],
+            "agents": [
+              {
+                "name": "__proto__",
+                "description": ")"
+              },
+              {
+                "name": "__proto__"
+              },
+              {
+                "name": "r])2__;0"
+              },
+              {
+                "name": "Nl(Y\"",
+                "description": "kJ2:cXj4(b",
+                "mode": "2'M"
+              },
+              {
+                "name": "nncQk:4U\\`"
+              },
+              {
+                "name": "<07KylT("
+              },
+              {
+                "name": ")`?$!r*k\"~"
+              },
+              {
+                "name": "z!&2z(2sp`"
+              },
+              {
+                "name": ";./H 7A:^+",
+                "description": "8_0Dn)9l#u",
+                "mode": "y"
+              },
+              {
+                "name": "r~\\r-4&Kmz",
+                "invocation": "mention"
+              }
+            ]
           }
         ]
       }

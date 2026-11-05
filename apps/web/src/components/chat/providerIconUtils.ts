@@ -23,6 +23,8 @@ export const AVAILABLE_PROVIDER_OPTIONS = PROVIDER_OPTIONS.filter(isAvailablePro
 export type ModelEsque = {
   slug: string;
   name: string;
+  description?: string | undefined;
+  resolvedModel?: string | undefined;
   shortName?: string | undefined;
   subProvider?: string | undefined;
 };

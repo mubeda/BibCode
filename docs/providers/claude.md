@@ -241,6 +241,11 @@ The Claude session applies three model options:
   reports.
 
 Models and their options normally come from Claude's session initialization.
+Model labels use Claude's `displayName`; descriptions appear as secondary text.
+Short alias labels include the resolved model ID so they remain identifiable.
+BiBCode sends the reported `value` when selecting a model. A saved full model ID
+also matches the alias's `resolvedModel` when Claude reports it; an exact
+selector match takes precedence, and a named alias takes precedence over Default.
 When Claude reports no models there, BiBCode offers its built-in catalog, which
 lists only the options above. A turn whose options the session refuses, for
 example one saved while an older catalog offered another option, is not retried:

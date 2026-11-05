@@ -80,6 +80,37 @@ import { ProviderSessionDefaultsControls } from "./ProviderSessionDefaultsContro
 const CODEX = ProviderDriverKind.make("codex");
 const OPENCODE = ProviderDriverKind.make("opencode");
 
+it("restores a saved Claude full ID and separates the label from its description", () => {
+  const markup = renderToStaticMarkup(
+    <ProviderSessionDefaultsControls
+      driver={ProviderDriverKind.make("claudeAgent")}
+      models={[
+        {
+          slug: "default",
+          name: "Default (recommended)",
+          resolvedModel: "claude-opus-5-5",
+          isCustom: false,
+          capabilities: null,
+        },
+        {
+          slug: "opus",
+          name: "Opus 5.5",
+          resolvedModel: "claude-opus-5-5",
+          description: "For your toughest challenges",
+          isCustom: false,
+          capabilities: null,
+        },
+      ]}
+      value={{ model: "claude-opus-5-5" }}
+      disabled={false}
+      onChange={vi.fn()}
+    />,
+  );
+  expect(markup).toContain("<span>Opus 5.5</span>");
+  expect(markup).toMatch(/text-muted-foreground[^>]*>For your toughest challenges</);
+  expect(markup).not.toContain("Unavailable here");
+});
+
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
