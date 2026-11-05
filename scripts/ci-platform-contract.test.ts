@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Workflow contract tests inspect checked-in YAML directly.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { describe, expect, it } from "vite-plus/test";
@@ -16,6 +18,10 @@ const DESKTOP_UPGRADE_WORKFLOW_PATH = NodePath.join(
   REPOSITORY_ROOT,
   ".github/workflows/desktop-upgrade-smoke.yml",
 );
+const LINUX_GIT_WORKFLOW_PATH = NodePath.join(
+  REPOSITORY_ROOT,
+  ".github/workflows/linux-git-compatibility.yml",
+);
 const PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "package.json");
 const SERVER_PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "apps/server/package.json");
 const DESKTOP_PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "apps/desktop/package.json");
@@ -23,6 +29,7 @@ const RELEASE_GUIDE_PATH = NodePath.join(REPOSITORY_ROOT, "docs/operations/relea
 
 interface WorkflowStep {
   readonly env?: Record<string, string>;
+  readonly id?: string;
   readonly if?: string;
   readonly name?: string;
   readonly run?: string;
@@ -34,6 +41,8 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   readonly env?: Record<string, string>;
+  readonly if?: string;
+  readonly permissions?: Record<string, string>;
   readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
   readonly "runs-on"?: string;
@@ -50,7 +59,7 @@ interface WorkflowJob {
 interface Workflow {
   readonly concurrency?: {
     readonly group?: string;
-    readonly "cancel-in-progress"?: boolean;
+    readonly "cancel-in-progress"?: boolean | string;
   };
   readonly on?: Record<string, unknown>;
   readonly jobs?: Record<string, WorkflowJob>;
@@ -67,6 +76,17 @@ function requireJob(workflow: Workflow, name: string): WorkflowJob {
   return job;
 }
 
+/** True on main pushes, manual runs, and pull requests labelled ci:full. */
+const FULL_CI =
+  "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')";
+
+/** CI's native rows: four on every pull request, macOS on main or with ci:full. */
+function nativeDesktopRows(workflow: Workflow): ReadonlyArray<Record<string, string | number>> {
+  return ["native_desktop", "native_desktop_macos"].flatMap(
+    (name) => requireJob(workflow, name).strategy?.matrix?.include ?? [],
+  );
+}
+
 function allStepCommands(job: WorkflowJob): string {
   return (job.steps ?? [])
     .map((step) => [step.name, step.if, step.run, step.uses, JSON.stringify(step.with)].join("\n"))
@@ -74,13 +94,58 @@ function allStepCommands(job: WorkflowJob): string {
 }
 
 describe("cross-platform CI contract", () => {
-  it("cancels superseded CI and seeded-upgrade runs on the same ref", () => {
+  it("cancels superseded pull request runs and lets main runs finish and save caches", () => {
     for (const path of [CI_WORKFLOW_PATH, DESKTOP_UPGRADE_WORKFLOW_PATH]) {
       const { workflow } = readWorkflow(path);
       expect(workflow.concurrency).toEqual({
         group: "${{ github.workflow }}-${{ github.ref }}",
-        "cancel-in-progress": true,
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
       });
+    }
+    const { workflow } = readWorkflow(LINUX_GIT_WORKFLOW_PATH);
+    expect(workflow.concurrency).toEqual({
+      group: "${{ github.workflow }}-${{ github.ref }}",
+      "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+    });
+  });
+
+  it("runs the macOS legs and seeded upgrades on main, manual runs, and ci:full only", () => {
+    for (const path of [CI_WORKFLOW_PATH, DESKTOP_UPGRADE_WORKFLOW_PATH]) {
+      const { workflow } = readWorkflow(path);
+      // No labeled trigger: a label event would add skipped, passing check
+      // runs under the same job names.
+      expect(workflow.on?.pull_request).toBeNull();
+      expect(workflow.on?.push).toEqual({ branches: ["main"] });
+      expect(workflow.on).toHaveProperty("workflow_dispatch");
+    }
+
+    const ci = readWorkflow(CI_WORKFLOW_PATH).workflow;
+    for (const name of ["check", "test", "release_smoke", "native_desktop", "crash-smoke"]) {
+      expect(requireJob(ci, name).if, name).toBeUndefined();
+    }
+    expect(requireJob(ci, "native_desktop_macos").if).toBe(FULL_CI);
+    expect(
+      (requireJob(ci, "native_desktop").strategy?.matrix?.include ?? []).map((row) => row.platform),
+    ).not.toContain("mac");
+    expect(
+      (requireJob(ci, "native_desktop_macos").strategy?.matrix?.include ?? []).map(
+        (row) => row.platform,
+      ),
+    ).toEqual(["mac", "mac"]);
+    // The macOS job reuses the native steps through a YAML alias.
+    expect(requireJob(ci, "native_desktop_macos").steps).toEqual(
+      requireJob(ci, "native_desktop").steps,
+    );
+    const crashOs = String(
+      (requireJob(ci, "crash-smoke").strategy?.matrix as { os?: unknown } | undefined)?.os,
+    );
+    expect(crashOs).toBe(
+      `\${{ fromJSON((${FULL_CI}) && '["ubuntu-24.04", "windows-2025", "macos-26"]' || '["ubuntu-24.04", "windows-2025"]') }}`,
+    );
+
+    const upgrade = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH).workflow;
+    for (const name of ["seeded_upgrade_smoke", "windows_wsl_upgrade_smoke"]) {
+      expect(requireJob(upgrade, name).if, name).toBe(FULL_CI);
     }
   });
 
@@ -96,7 +161,7 @@ describe("cross-platform CI contract", () => {
     }
   });
 
-  it("builds test binaries without debug info in CI and release preflight", () => {
+  it("builds test binaries without debug info or symbols in CI and release preflight", () => {
     for (const [path, job] of [
       [CI_WORKFLOW_PATH, "test"],
       [RELEASE_WORKFLOW_PATH, "preflight"],
@@ -104,6 +169,7 @@ describe("cross-platform CI contract", () => {
       const { workflow } = readWorkflow(path);
 
       expect(requireJob(workflow, job).env?.CARGO_PROFILE_TEST_DEBUG).toBe("0");
+      expect(requireJob(workflow, job).env?.CARGO_PROFILE_TEST_STRIP).toBe("symbols");
     }
   });
 
@@ -115,8 +181,8 @@ describe("cross-platform CI contract", () => {
       readonly scripts: Record<string, string>;
     };
     const { raw: ciWorkflow, workflow } = readWorkflow(CI_WORKFLOW_PATH);
-    const rustWorkspaceTestStep = requireJob(workflow, "test").steps?.find(
-      (step) => step.name === "Rust workspace tests",
+    const updaterVerifierStep = requireJob(workflow, "test").steps?.find(
+      (step) => step.name === "Updater verifier tests",
     );
     const releaseGuide = NodeFS.readFileSync(RELEASE_GUIDE_PATH, "utf8");
 
@@ -126,7 +192,10 @@ describe("cross-platform CI contract", () => {
     expect(desktopPackage.scripts.test).toBe(
       "node ../../scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2",
     );
-    expect(rustWorkspaceTestStep?.run).toBe("cargo test --workspace -j 2");
+    // The package suites cover bibcode-server and bibcode-desktop; a second
+    // `cargo test --workspace` pass rebuilt both under unified features.
+    expect(updaterVerifierStep?.run).toBe("cargo test -p bibcode-updater-verifier -j 2");
+    expect(ciWorkflow).not.toContain("cargo test --workspace");
     expect(ciWorkflow).not.toContain("--test-threads=1");
     expect(releaseGuide).toContain("node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2");
     expect(releaseGuide).not.toContain("cargo test -p bibcode-desktop -j 2 -- --test-threads=1");
@@ -147,7 +216,7 @@ describe("cross-platform CI contract", () => {
     const sshStep = steps.find((step) => step.name === "SSH environment integration");
 
     expect(names.indexOf("SSH environment integration")).toBeGreaterThan(
-      names.indexOf("Rust workspace tests"),
+      names.indexOf("Updater verifier tests"),
     );
     expect(sshStep?.run?.trim().split("\n")).toEqual([
       "cargo test -p bibcode-server --test cli_smoke --no-run -j 2",
@@ -158,17 +227,25 @@ describe("cross-platform CI contract", () => {
   it("budgets Check and Test for a cold Rust cache plus a stalled apt install", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
 
-    // A warm Check takes 34 minutes; the hosted apt mirror has added up to 26.
-    expect(requireJob(workflow, "check")["timeout-minutes"]).toBe(60);
-    // Cold Test finished in 44 minutes. A 21-minute apt stall and 10 minutes
-    // for the unfinished workspace suite plus SSH is 75.
-    expect(requireJob(workflow, "test")["timeout-minutes"]).toBe(75);
+    // Without the desktop bundle build, Check's steps took 15 minutes at p90;
+    // the hosted apt mirror has added up to 26.
+    expect(requireJob(workflow, "check")["timeout-minutes"]).toBe(45);
+    expect(allStepCommands(requireJob(workflow, "check"))).not.toContain("build:desktop");
+    // The package suites took 42 minutes at p90, setup, SSH, and the updater
+    // verifier about 3, and a 21-minute apt stall is 66.
+    expect(requireJob(workflow, "test")["timeout-minutes"]).toBe(70);
   });
 
   it("saves CI Rust build caches from main so pull requests restore them", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
 
-    for (const name of ["check", "test", "native_desktop", "crash-smoke"] as const) {
+    for (const name of [
+      "check",
+      "test",
+      "native_desktop",
+      "native_desktop_macos",
+      "crash-smoke",
+    ] as const) {
       const step = requireJob(workflow, name).steps?.find(
         (candidate) => candidate.name === "Cache Rust build output",
       );
@@ -177,13 +254,47 @@ describe("cross-platform CI contract", () => {
       expect(step?.with?.["cache-on-failure"]).toBe("true");
       expect(String(step?.with?.workspaces)).toContain(". -> target");
     }
+    const linuxGitCache = requireJob(
+      readWorkflow(LINUX_GIT_WORKFLOW_PATH).workflow,
+      "git_appimage_environment",
+    ).steps?.find((candidate) => candidate.name === "Cache Rust build output");
+    expect(linuxGitCache?.with?.["save-if"]).toBe("${{ github.ref == 'refs/heads/main' }}");
+  });
+
+  it("restores CI's native desktop cache in Release and never saves from a tag", () => {
+    const ci = readWorkflow(CI_WORKFLOW_PATH).workflow;
+    const nativeCache = requireJob(ci, "native_desktop").steps?.find(
+      (step) => step.name === "Cache Rust build output",
+    );
+    expect(nativeCache?.with?.["shared-key"]).toBe("native-desktop");
+    // The same --symbols profile as release.yml, so the cached dependencies match.
+    const nativeBuild = requireJob(ci, "native_desktop").steps?.find(
+      (step) => step.name === "Build native bundle without publishing",
+    );
+    expect(nativeBuild?.run).toContain("--symbols");
+    expect(requireJob(ci, "native_desktop").env).toBeUndefined();
+
+    const release = readWorkflow(RELEASE_WORKFLOW_PATH).workflow;
+    for (const name of ["build_desktop", "build_server"]) {
+      const job = requireJob(release, name);
+      const cache = job.steps?.find((step) => step.name === "Cache Rust build output");
+      expect(cache?.with?.["shared-key"], name).toBe("native-desktop");
+      expect(cache?.with?.["save-if"], name).toBe(false);
+      expect(String(cache?.with?.workspaces), name).toBe(". -> target\n");
+      // Job-level CARGO_* or RUST* env would change the cache key.
+      expect(
+        Object.keys(job.env ?? {}).filter((key) => /^(CARGO|RUST)/.test(key)),
+        name,
+      ).toEqual([]);
+    }
   });
 
   it("allows native CI to finish host tests, optimized recovery probes, and bundles", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
-    const job = requireJob(workflow, "native_desktop");
-    expect(job["timeout-minutes"]).toBe("${{ matrix.jobTimeoutMinutes }}");
-    const matrix = job.strategy?.matrix?.include ?? [];
+    for (const name of ["native_desktop", "native_desktop_macos"]) {
+      expect(requireJob(workflow, name)["timeout-minutes"]).toBe("${{ matrix.jobTimeoutMinutes }}");
+    }
+    const matrix = nativeDesktopRows(workflow);
     expect(matrix).toHaveLength(6);
     for (const row of matrix) {
       // Intel's cold optimized probe and native package use distinct dependency
@@ -195,10 +306,11 @@ describe("cross-platform CI contract", () => {
 
   it("builds native desktop bundles on every supported runner and architecture", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
-    const nativeJob = requireJob(workflow, "native_desktop");
-    const matrix = nativeJob.strategy?.matrix?.include ?? [];
+    const matrix = nativeDesktopRows(workflow);
 
-    expect(nativeJob.strategy?.["fail-fast"]).toBe(false);
+    for (const name of ["native_desktop", "native_desktop_macos"]) {
+      expect(requireJob(workflow, name).strategy?.["fail-fast"]).toBe(false);
+    }
     expect(matrix).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -231,8 +343,9 @@ describe("cross-platform CI contract", () => {
           target: "dmg",
           arch: "arm64",
         }),
+        // The release producer's Intel runner, so CI tests what Release builds.
         expect.objectContaining({
-          runner: "macos-26-intel",
+          runner: "macos-15-intel",
           platform: "mac",
           target: "dmg",
           arch: "x64",
@@ -337,7 +450,142 @@ describe("cross-platform CI contract", () => {
   });
 });
 
+const HEAD_SHA = "a".repeat(40);
+const CI_RUN_URL = "https://github.com/o/r/actions/runs/7/job/9";
+
+interface CiLookupFixture {
+  readonly checkRuns?: ReadonlyArray<{ app: string; conclusion: string; url: string }>;
+  readonly run?: { path: string; event: string; head_sha: string };
+}
+
+/**
+ * Runs release.yml's "Find CI Test result" script against a fake `gh` that
+ * answers from fixture JSON through the real `jq` (as `gh --jq` does) and a
+ * fake `git` that reports HEAD_SHA. Returns the step's GITHUB_OUTPUT.
+ */
+function runCiTestLookup(fixture: CiLookupFixture): string {
+  const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+  const script = requireJob(workflow, "preflight").steps?.find(
+    (step) => step.id === "ci_tests",
+  )?.run;
+  if (!script) throw new Error("Find CI Test result step missing");
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ci-lookup-"));
+  try {
+    const bin = NodePath.join(dir, "bin");
+    NodeFS.mkdirSync(bin);
+    if (fixture.checkRuns) {
+      NodeFS.writeFileSync(
+        NodePath.join(dir, "check-runs.json"),
+        JSON.stringify({
+          check_runs: fixture.checkRuns.map((run) => ({
+            app: { slug: run.app },
+            conclusion: run.conclusion,
+            details_url: run.url,
+          })),
+        }),
+      );
+    }
+    if (fixture.run) {
+      NodeFS.writeFileSync(NodePath.join(dir, "run-7.json"), JSON.stringify(fixture.run));
+    }
+    NodeFS.writeFileSync(
+      NodePath.join(bin, "gh"),
+      [
+        "#!/usr/bin/env bash",
+        'case "$2" in',
+        `  "repos/o/r/commits/${HEAD_SHA}/check-runs?"*) file="$FIXTURES/check-runs.json" ;;`,
+        '  repos/o/r/actions/runs/*) file="$FIXTURES/run-${2##*/}.json" ;;',
+        '  *) echo "unexpected gh call: $*" >&2; exit 2 ;;',
+        "esac",
+        '[[ -f "$file" ]] || { echo "HTTP 404" >&2; exit 1; }',
+        'jq -r "$4" "$file"',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    NodeFS.writeFileSync(NodePath.join(bin, "git"), `#!/bin/sh\necho ${HEAD_SHA}\n`, {
+      mode: 0o755,
+    });
+    const output = NodePath.join(dir, "output");
+    NodeFS.writeFileSync(output, "");
+    NodeChildProcess.execFileSync(
+      "bash",
+      ["--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+      {
+        env: {
+          ...process.env,
+          PATH: `${bin}${NodePath.delimiter}${process.env.PATH ?? ""}`,
+          FIXTURES: dir,
+          GITHUB_OUTPUT: output,
+          GITHUB_REPOSITORY: "o/r",
+        },
+        stdio: ["ignore", "ignore", "ignore"],
+      },
+    );
+    return NodeFS.readFileSync(output, "utf8");
+  } finally {
+    NodeFS.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// oxlint-disable-next-line bibcode/no-global-process-runtime -- The fake gh and git stubs need a Unix shell and the host jq.
+const IS_WINDOWS = NodeOS.platform() === "win32";
+const HAS_BASH_AND_JQ =
+  !IS_WINDOWS && NodeChildProcess.spawnSync("jq", ["--version"], { stdio: "ignore" }).status === 0;
+
 describe("cross-platform release contract", () => {
+  it.skipIf(!HAS_BASH_AND_JQ)(
+    "trusts only a successful Test from a push or manual ci.yml run on the same commit",
+    () => {
+      const green = { app: "github-actions", conclusion: "success", url: CI_RUN_URL };
+      const pushRun = { path: ".github/workflows/ci.yml", event: "push", head_sha: HEAD_SHA };
+
+      expect(runCiTestLookup({ checkRuns: [green], run: pushRun })).toBe("green=true\n");
+      expect(
+        runCiTestLookup({ checkRuns: [green], run: { ...pushRun, event: "workflow_dispatch" } }),
+      ).toBe("green=true\n");
+
+      // Everything else runs the tests.
+      for (const fixture of [
+        { checkRuns: [green], run: { ...pushRun, event: "pull_request" } },
+        { checkRuns: [green], run: { ...pushRun, path: ".github/workflows/other.yml" } },
+        { checkRuns: [green], run: { ...pushRun, head_sha: "b".repeat(40) } },
+        { checkRuns: [{ ...green, conclusion: "failure" }], run: pushRun },
+        { checkRuns: [{ ...green, conclusion: "skipped" }], run: pushRun },
+        { checkRuns: [{ ...green, app: "some-app" }], run: pushRun },
+        { checkRuns: [], run: pushRun },
+        { checkRuns: [green] },
+        {},
+      ] satisfies ReadonlyArray<CiLookupFixture>) {
+        expect(runCiTestLookup(fixture), JSON.stringify(fixture)).toBe("");
+      }
+    },
+  );
+
+  it("skips the preflight test run only when CI's Test passed for the same commit", () => {
+    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+    const preflight = requireJob(workflow, "preflight");
+    const steps = preflight.steps ?? [];
+    const names = steps.map((step) => step.name);
+    const lookup = steps.find((step) => step.name === "Find CI Test result");
+    const test = steps.find((step) => step.name === "Test");
+
+    expect(preflight.permissions).toEqual({ contents: "read", checks: "read", actions: "read" });
+    expect(names.indexOf("Find CI Test result")).toBeLessThan(names.indexOf("Test"));
+    expect(lookup?.run).toContain("sha=$(git rev-parse HEAD)");
+    expect(lookup?.run).toContain("check-runs?check_name=Test&filter=latest");
+    expect(lookup?.run).toContain('.conclusion == "success"');
+    // A pull request run uses a workflow file the pull request can edit.
+    expect(lookup?.run).toContain('"$run_info" == ".github/workflows/ci.yml push $sha"');
+    expect(lookup?.run).toContain(
+      '"$run_info" == ".github/workflows/ci.yml workflow_dispatch $sha"',
+    );
+    expect(lookup?.run).not.toContain("pull_request");
+    expect(test?.if).toBe(
+      "steps.release_meta.outputs.validate_only != 'true' && steps.ci_tests.outputs.green != 'true'",
+    );
+  });
+
   it("gives the publication preflight enough time for a cold full test graph", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
 
@@ -451,7 +699,7 @@ describe("cross-platform release contract", () => {
     const server = requireJob(workflow, "build_server");
     const release = requireJob(workflow, "release");
 
-    // Intel x64 needs more than 90 minutes when its Rust cache is cold.
+    // Both macOS builds need more than 90 minutes when their Rust cache is cold.
     expect(desktop["timeout-minutes"]).toBe("${{ matrix.jobTimeoutMinutes }}");
     expect(desktop.strategy?.matrix?.include).toEqual([
       {
@@ -460,7 +708,7 @@ describe("cross-platform release contract", () => {
         platform: "mac",
         target: "dmg",
         arch: "arm64",
-        jobTimeoutMinutes: 90,
+        jobTimeoutMinutes: 150,
       },
       {
         label: "macOS x64",
@@ -852,7 +1100,6 @@ describe("seeded packaged desktop upgrade contract", () => {
       "Checkout complete release history",
       "Setup Vite+",
       "Setup Rust",
-      "Cache Rust build output",
       "Install Linux packaged-updater prerequisites",
       "Install frozen dependencies",
       "Resolve previous stable and isolated candidate versions",
@@ -868,7 +1115,8 @@ describe("seeded packaged desktop upgrade contract", () => {
     expect(dumps?.with?.["retention-days"]).toBe(7);
     const commands = allStepCommands(smoke);
     expect(commands).toContain("--restart-timeout-ms 180000");
-    expect(commands).toContain(". -> target");
+    // The harness builds into its own run-root target, which a cache cannot warm.
+    expect(commands).not.toContain("rust-cache");
   });
 
   it("runs both seeded lanes with ephemeral signing and bounded redacted evidence", () => {
@@ -894,6 +1142,9 @@ describe("seeded packaged desktop upgrade contract", () => {
       (step) => step.name === "Upload bounded seeded-upgrade evidence",
     );
     expect(evidence?.if).toBe("always()");
+    // A harness that fails before writing evidence reports its own error, not
+    // "No files were found".
+    expect(evidence?.with?.["if-no-files-found"]).toBe("warn");
     expect(String(evidence?.with?.path)).toContain("/evidence/");
     expect(String(evidence?.with?.path)).not.toMatch(/state\.sqlite|\/data\//);
   });
@@ -952,11 +1203,8 @@ describe("release symbols and crash smoke contract", () => {
     const upload = stepNamed(job, "Upload crash smoke evidence");
 
     expect(job.strategy?.["fail-fast"]).toBe(false);
-    expect((job.strategy?.matrix as { os?: unknown } | undefined)?.os).toEqual([
-      "ubuntu-24.04",
-      "windows-2025",
-      "macos-26",
-    ]);
+    const os = String((job.strategy?.matrix as { os?: unknown } | undefined)?.os);
+    for (const runner of ["ubuntu-24.04", "windows-2025", "macos-26"]) expect(os).toContain(runner);
     expect(stepIndex(job, "Install pinned symbol tools")).toBeLessThan(
       stepIndex(job, "Crash the smoke binary"),
     );
@@ -968,6 +1216,11 @@ describe("release symbols and crash smoke contract", () => {
     for (const setting of symbolProfile) expect(crash.run).toContain(setting);
     expect(crash.run).toContain('RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1"');
     expect(crash.run).toContain("CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed");
+    // CI-only build speed: the shipped profile in Cargo.toml is unchanged.
+    expect(job["timeout-minutes"]).toBe(60);
+    expect(crash.run).toContain(
+      "export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16",
+    );
     expect(crash.run).toContain(
       "node scripts/run-msvc.mjs cargo test -p bibcode-server --test crash_smoke --release",
     );

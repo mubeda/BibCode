@@ -366,7 +366,7 @@ performing a production install.
   `apps/server/tests/transfer_budget.json`, both after the transport's deflate and decoded. A
   failure prints a table of the measured and budgeted bytes. Raise a budget only by editing that
   file in the same change; `BIBCODE_TRANSFER_REPORT=<path>` also writes the measurements as
-  JSON. `cargo test --workspace` runs it in CI.
+  JSON. The server package's `test` script (`cargo test -p bibcode-server`) runs it in CI's Test job.
 - `node scripts/transfer-report.ts <base.json> <head.json> <budget.json>`: prints the Markdown
   table that the [Thread Transfer Report](../operations/ci.md) workflow writes to its job summary.
 - `node scripts/measure-vcs-runtime.ts`: on Windows, build and run the
