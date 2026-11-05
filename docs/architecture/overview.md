@@ -1214,6 +1214,17 @@ a stale rectangle snapshot while WebKit defers paint. Ordinary resize work
 remains frame-batched, and equivalent activation state does not force another
 measurement.
 
+During a center split drag, pointer moves retain only the latest ratio and
+write pane sizes once per animation frame. The body-target ResizeObserver
+synchronizes surface hosts after layout, reading all host rectangles before
+writing any styles. Rectangle publication to React pauses until release, as
+does terminal fitting and its PTY resize RPC. The workspace marks the gesture
+with `data-resizing` and emits `bibcode:center-panel-resize-end` on release or
+cancellation; terminal viewports fit the final dimensions and chats settle
+their live end through the existing follow policy, preserving reader takeover.
+The timeline clips at the measured composer boundary, and the composer shadow
+fits within its lower padding so split-pane clipping does not cut it off.
+
 Center chat-panel creation reserves and activates its client surface before the
 server command settles. A confirmed command failure removes that reservation;
 an interrupted result is ambiguous because durable thread creation may already

@@ -221,6 +221,47 @@ describe("CenterPanelSurfaceHosts", () => {
     expect(mounted.mock.calls.filter(([id]) => id === "terminal:term-1")).toHaveLength(1);
   });
 
+  it("measures every host before writing any host's new geometry", async () => {
+    const state: ThreadCenterPanelState = {
+      ...stateWithTerminalInRight,
+      groups: [
+        { id: "group-left", surfaceIds: [host.id], activeSurfaceId: host.id },
+        { id: "group-right", surfaceIds: [terminal.id], activeSurfaceId: terminal.id },
+      ],
+    };
+    const hostsRef = { current: null } as RefObject<CenterPanelSurfaceHostsHandle | null>;
+    let nextWidth = 320;
+    let checking = false;
+    const readBodyRect = () => {
+      if (checking) {
+        for (const element of container.querySelectorAll<HTMLElement>(
+          "[data-center-surface-host]",
+        )) {
+          expect(element.style.width).toBe("320px");
+        }
+      }
+      return { left: 0, top: 0, width: nextWidth, height: 360 };
+    };
+    await act(async () =>
+      root.render(
+        <CenterPanelSurfaceHosts
+          ref={hostsRef}
+          state={state}
+          rects={new Map(state.groups.map((group) => [group.id, readBodyRect()]))}
+          readBodyRect={readBodyRect}
+          onFocusGroup={vi.fn()}
+          renderSurface={() => null}
+        />,
+      ),
+    );
+    nextWidth = 400;
+    checking = true;
+    hostsRef.current!.syncRects();
+    for (const element of container.querySelectorAll<HTMLElement>("[data-center-surface-host]")) {
+      expect(element.style.width).toBe("400px");
+    }
+  });
+
   it("hides a host with missing geometry and restores the same mounted host when geometry returns", async () => {
     const mounted = vi.fn<(id: string) => void>();
     const targetRects = new Map<string, RectInput>([
@@ -335,6 +376,35 @@ describe("CenterPanelSurfaceHosts", () => {
       width: 320,
       height: 360,
     });
+  });
+
+  it("holds published geometry during a split drag and publishes the final rectangle once", async () => {
+    const registryRef = { current: null } as RefObject<CenterPanelBodyTargetRegistry | null>;
+    let width = 320;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return rect({
+        left: 0,
+        top: 0,
+        width: this.dataset.target === "root" ? 800 : width,
+        height: 600,
+      });
+    });
+    await act(async () => root.render(<BodyTargetHarness ref={registryRef} />));
+    await act(async () => frameCallbacks.shift()?.(0));
+    const initial = registryRef.current!.rects;
+    registryRef.current!.setResizing(true);
+    for (width of [400, 450, 500]) {
+      resizeObservers[0]!.callback([], resizeObservers[0] as unknown as ResizeObserver);
+      await act(async () => frameCallbacks.shift()?.(0));
+      expect(registryRef.current!.rects).toBe(initial);
+    }
+    registryRef.current!.setResizing(false);
+    expect(frameCallbacks).toHaveLength(1);
+    await act(async () => frameCallbacks.shift()?.(0));
+    expect(registryRef.current!.rects.get("group-left")?.width).toBe(500);
+    expect(frameCallbacks).toHaveLength(0);
   });
 
   it("refreshes geometry on panel activation without waiting for paint", async () => {
