@@ -1,28 +1,37 @@
 name: CI
 
 on:
+  # No `labeled` trigger: a label event would add skipped check runs under the
+  # same job names, and a skipped check counts as passing. The ci:full label
+  # takes effect on the next push; `gh workflow run ci.yml --ref <branch>`
+  # runs everything at once.
   pull_request:
   push:
     branches:
       - main
+  workflow_dispatch:
 
-# One run per branch or pull request. Superseded pushes were keeping full
-# native matrices, including macos-26 and macos-26-intel, queued for hours.
+# One run per branch or pull request. Superseded pull request pushes were
+# keeping full native matrices queued for hours, so they cancel. A running main
+# run is not cancelled: a cancelled run saves no Rust cache, and every pull
+# request restores its cache from main. GitHub still replaces a pending main
+# run with a newer one, so a burst of merges runs the first and the last.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
     name: Check
     runs-on: ubuntu-24.04
-    # Cold Check on b96fe993 finished in 26 minutes with an empty Rust
-    # cache. PR 65's cold release compile projected 33 minutes once the rpm
-    # bundle finished, and a warm main run on c48c647f took 34. On PR 177 the
+    # Check no longer builds the release desktop bundle: Native desktop - Linux
+    # x64 builds the shipped AppImage from the same sources, and that one step
+    # took 23 of Check's 35 minutes (median of 34 green runs, 28 at p90).
+    # The remaining steps took 12 minutes median and 15 at p90. On PR 177 the
     # hosted apt mirror stretched the Tauri dependency install from 30 s to
-    # 20-25 minutes on two runs, cancelling Check mid-build at 40. 34 minutes
-    # plus 26 minutes for a slow mirror is 60.
-    timeout-minutes: 60
+    # 20-25 minutes. 15 + 26 for a slow mirror is 41; 45 leaves a cold-cache
+    # clippy margin.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,16 +95,14 @@ jobs:
       - name: Check production server without dev features
         run: cargo check -p bibcode-server --lib --bins -j 2
 
-      - name: Build desktop pipeline
-        run: vp run build:desktop
-
   test:
     name: Test
     runs-on: ubuntu-24.04
-    # Cold Test on 438136c0 finished in 44 minutes. PR 65's apt stall added
-    # 21 minutes, and the cancelled workspace suite still had SSH left.
-    # 44 + 21 + 10 minutes of margin is 75.
-    timeout-minutes: 75
+    # Over 27 green runs the package suites took 42 minutes at p90 and the
+    # duplicate workspace-wide cargo test pass removed below another 21-23.
+    # Setup, SSH, and the updater verifier add about 3. PR 65's apt stall
+    # added 21 minutes. 42 + 3 + 21 is 66, so 70.
+    timeout-minutes: 70
     # Full debug info in every linked test binary fills the runner disk.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -147,8 +154,13 @@ jobs:
       - name: Test
         run: vp run -r --concurrency-limit 1 test
 
-      - name: Rust workspace tests
-        run: cargo test --workspace -j 2
+      # `vp run -r test` above already runs the bibcode-server and
+      # bibcode-desktop suites. The updater verifier is the only workspace
+      # member without a package test task. A full workspace cargo test
+      # rebuilt and reran both suites under different features: about 21
+      # minutes, and a third target tree that ran the runner out of disk.
+      - name: Updater verifier tests
+        run: cargo test -p bibcode-updater-verifier -j 2
 
       # Ignored by default because it needs a fresh `bibcode`, which
       # `cargo test -p bibcode-desktop` neither builds nor checks. Only the SSH
@@ -211,19 +223,7 @@ jobs:
             target: nsis
             arch: arm64
             jobTimeoutMinutes: 120
-          - label: macOS arm64
-            runner: macos-26
-            platform: mac
-            target: dmg
-            arch: arm64
-            jobTimeoutMinutes: 120
-          - label: macOS x64
-            runner: macos-26-intel
-            platform: mac
-            target: dmg
-            arch: x64
-            jobTimeoutMinutes: 240
-    steps:
+    steps: &native_desktop_steps
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -241,9 +241,13 @@ jobs:
       # 10 GB Actions budget and evicted the Check and Test entries.
       # cache-on-failure publishes a compile that already ran when a later
       # step fails. A timeout cancellation still skips the post step.
+      # The shared key, the symbol build below, and no job-level CARGO_* or
+      # RUST* env make this key identical to release.yml build_desktop's,
+      # which restores it instead of compiling cold and saves nothing.
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: native-desktop
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: "true"
           workspaces: |
@@ -282,8 +286,15 @@ jobs:
       - name: Test desktop Rust host
         run: vp run --filter @bibcode/desktop test
 
+      # The release symbol profile, as the bundle build below uses, so the
+      # dependencies both builds share compile once instead of once per
+      # profile. Strip and debug info do not change the unwinding it probes.
       - name: Verify macOS release exception recovery
         if: matrix.platform == 'mac'
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: none
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: packed
         run: |
           rust_target="$(rustc -Vv | sed -n 's/^host: //p')"
           cargo run --release --target "$rust_target" -p bibcode-desktop --example objc_exception_probe
@@ -296,6 +307,13 @@ jobs:
         if: matrix.platform == 'win'
         run: node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
 
+      # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
+      # keeps ~/.cargo/bin, so a restored runner skips the compile.
+      - name: Install dump_syms
+        run: node scripts/run-msvc.mjs cargo install dump_syms --locked --version 2.3.9
+
+      # --symbols is the release build (release.yml build_desktop): the same
+      # profile, so the cache it saves is the one Release restores.
       - name: Build native bundle without publishing
         run: >
           node scripts/build-desktop-artifact.ts
@@ -303,19 +321,54 @@ jobs:
           --target "${{ matrix.target }}"
           --arch "${{ matrix.arch }}"
           --output-dir native-artifacts
+          --symbols
           --verbose
 
-  # A real native crash under the crash monitor on every OS, symbolicated with symbols dumped
-  # the way the release pipeline dumps them.
-  crash-smoke:
-    name: Crash smoke - ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    # A cold optimized build of the server and two pinned tool compiles.
-    timeout-minutes: 90
+  # The macOS legs take 1-4 hours on a 5-job macOS concurrency cap, so pull
+  # requests skip them unless labelled ci:full. Main pushes and manual runs
+  # always build them. Same steps as native_desktop.
+  native_desktop_macos:
+    name: Native desktop - ${{ matrix.label }}
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-26]
+        include:
+          - label: macOS arm64
+            runner: macos-26
+            platform: mac
+            target: dmg
+            arch: arm64
+            jobTimeoutMinutes: 120
+          # The release producer's runner (release.yml), so the Intel build
+          # this tests and the cache it saves are the ones Release uses.
+          # Seeded upgrade keeps macos-26-intel for newest-OS runtime coverage.
+          - label: macOS x64
+            runner: macos-15-intel
+            platform: mac
+            target: dmg
+            arch: x64
+            jobTimeoutMinutes: 240
+    steps: *native_desktop_steps
+
+  # A real native crash under the crash monitor on every OS, symbolicated with symbols dumped
+  # the way the release pipeline dumps them.
+  # macos-26 runs on main, manual runs, and ci:full pull requests only.
+  crash-smoke:
+    name: Crash smoke - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # With the shipped thin-LTO single-unit profile, macos-26 reached the old
+    # 90-minute limit and ubuntu took 26 minutes with a warm cache. A cold
+    # `cargo test --release --no-run` of crash_smoke on 4 cores took 666 s
+    # with that profile and 293 s with the LTO-off, 16-unit one below (2.3x).
+    # 90 / 2.3 is about 40 for macOS; 60 leaves room for a cold cache.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && '["ubuntu-24.04", "windows-2025", "macos-26"]' || '["ubuntu-24.04", "windows-2025"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -349,6 +402,9 @@ jobs:
 
       # The release symbol profile from release.yml: unstripped, with line tables, a dSYM on
       # macOS and a GNU build-id on Linux. CRASH_SMOKE_OUT keeps the dump after the test.
+      # LTO off and 16 codegen units: the shipped thin-LTO single unit kept macos-26 on one
+      # core until the 90-minute timeout. The planted frames are #[inline(never)], and the
+      # symbol format, debug info, and unwind tables do not depend on either setting.
       - name: Crash the smoke binary
         shell: bash
         env:
@@ -356,6 +412,7 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+          export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
           case "$RUNNER_OS" in
             Linux) export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1" ;;
             macOS) export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed ;;

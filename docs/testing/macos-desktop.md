@@ -198,8 +198,9 @@ check is a failed native build; a check against a different installed bundle
 does not qualify the release DMG.
 
 The release producer hosts are macOS 26 ARM64 and supported macOS 15 Intel for
-both desktop and standalone server artifacts. Native Intel main CI, packaged
-UI, and upgrade validation retain macOS 26. The producer hosts run the same
+both desktop and standalone server artifacts. Native desktop CI's Intel row
+uses the same macOS 15 Intel runner, so it builds what Release ships. Packaged
+UI and upgrade validation retain macOS 26 Intel. The producer hosts run the same
 mounted-application signature and Finder pixel criteria, with all platform
 rows and updater targets intact. macOS 15 Intel evidence cannot establish a
 macOS 26 Intel Finder pass. Record that distinction in execution reports;
