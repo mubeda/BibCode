@@ -2359,8 +2359,12 @@ describe("MessagesTimeline mounted interactions", () => {
       latestTurn: running,
       runningTurnId: TURN_ID,
       onTurnSettled,
+      isWorking: true,
+      activeTurnInProgress: true,
     });
     const mounted = mountedTrees.at(-1)!;
+    const scroller = mounted.container.querySelector<HTMLElement>('[data-testid="legend-list"]')!;
+    scroller.scrollTop = 8_800;
     const rerender = (props: Partial<MessagesTimelineProps>) =>
       act(async () =>
         mounted.root.render(
@@ -2368,6 +2372,8 @@ describe("MessagesTimeline mounted interactions", () => {
             {...buildProps()}
             timelineEntries={entries}
             onTurnSettled={onTurnSettled}
+            isWorking={props.latestTurn?.state === "running"}
+            activeTurnInProgress={props.latestTurn?.state === "running"}
             {...props}
           />,
         ),
@@ -2376,13 +2382,19 @@ describe("MessagesTimeline mounted interactions", () => {
     // An entry change while the turn runs is followed as an entry, not as a settled turn.
     await rerender({ latestTurn: running, runningTurnId: TURN_ID, timelineEntries: [...entries] });
     expect(onTurnSettled).not.toHaveBeenCalled();
+    expect(scroller.querySelector('[data-timeline-row-kind="working"]')).not.toBeNull();
 
     await rerender({ latestTurn: completed, runningTurnId: null });
     expect(onTurnSettled).toHaveBeenCalledTimes(1);
+    expect(scroller.querySelector('[data-timeline-row-kind="working"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="legend-list"]')).toBe(scroller);
+    expect(scroller.scrollTop).toBe(8_800);
 
     // Still settled: nothing more to report.
     await rerender({ latestTurn: completed, runningTurnId: null, timelineEntries: [...entries] });
     expect(onTurnSettled).toHaveBeenCalledTimes(1);
+    expect(mounted.container.querySelector('[data-testid="legend-list"]')).toBe(scroller);
+    expect(scroller.scrollTop).toBe(8_800);
   });
 
   it("does not report a turn that was already settled when the timeline mounted (#208)", async () => {
