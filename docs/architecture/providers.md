@@ -400,6 +400,16 @@ help. The event pump passes them on its internal `thread.session.set` as
 `contextLimit`; absent facts mean no automatic recovery. Only Claude reports
 them today.
 
+Codex stderr is cleaned of terminal escape sequences before it becomes a runtime
+activity. Runtime warnings and errors project their message into the Work Log
+detail. Tracing records lose their timestamp and source prefix. `WARN` and
+`ERROR` retain their severity, while `INFO`, `DEBUG`, and `TRACE` are omitted.
+`codex_core::tools::router` errors carrying an `error=` tool result are omitted
+because Codex already delivers that result to the model. Other router diagnostics
+remain visible. Unstructured stderr stays visible as a warning, except explicit
+`Error:` messages, panics, and fatal WebSocket connection failures, which are
+errors. These diagnostics do not themselves complete or fail a turn.
+
 ### Conversation compaction
 
 `supports_compaction` in `apps/server/src/provider/mod.rs` is the driver-owned

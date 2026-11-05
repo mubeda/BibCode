@@ -132,6 +132,19 @@ and `live_opencode_2_terminal_observation` list the environment they need; the
 server's default model must be a scripted local endpoint so no provider credits
 are spent.
 
+For Codex stderr and Work Log changes, run the reader-to-runtime regression and
+Work Log projection checks:
+
+```sh
+cargo test -p bibcode-server --test provider_codex codex_stderr_filters_tool_results_and_preserves_clean_warning_and_error_events
+cargo test -p bibcode-server --lib provider_projection_
+```
+
+In a packaged Codex chat, confirm routine tool-router failures add no Work Log
+warning, real warnings and errors have their respective labels, and diagnostics
+contain no terminal color or hyperlink escapes. Record unavailable live-provider
+or packaged checks separately from the hermetic regression results.
+
 Compaction and retries apply to Codex and OpenCode 2. Send `/compact` and
 confirm a **Conversation compaction** step in the work log, no `/compact` text
 reaching the model, and the next message continuing the conversation. On

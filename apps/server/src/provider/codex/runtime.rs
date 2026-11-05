@@ -63,6 +63,63 @@ const RECONCILIATION_PENDING_MUTATION_LIMIT: usize =
     MAX_TRACKED_ACTORS * 3 + MAX_TRACKED_WORK_ITEMS * 3 + RECONCILIATION_MUTATION_LIMIT;
 const MCP_STATUS_PRE_ROOT_BUFFER_LIMIT: usize = 64;
 
+fn stderr_activity(raw: &str) -> Option<(&'static str, String)> {
+    let (clean, _) = crate::ansi::strip_escapes(raw);
+    let line = clean.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let line = line
+        .split_once(char::is_whitespace)
+        .filter(|(timestamp, _)| OffsetDateTime::parse(timestamp, &Rfc3339).is_ok())
+        .map_or(line, |(_, rest)| rest.trim_start());
+    let (level, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let (event_type, message) = match level {
+        "INFO" | "DEBUG" | "TRACE" => return None,
+        "WARN" | "ERROR" => {
+            let rest = rest.trim_start();
+            let (source, message) = rest
+                .split_once(": ")
+                .filter(|(source, _)| {
+                    !source.is_empty()
+                        && source
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+                })
+                .unwrap_or(("", rest));
+            // Router error fields are failed tool results already delivered to the model.
+            if level == "ERROR"
+                && source == "codex_core::tools::router"
+                && message.starts_with("error=")
+            {
+                return None;
+            }
+            (
+                if level == "ERROR" {
+                    "runtime.error"
+                } else {
+                    "runtime.warning"
+                },
+                if message.is_empty() { line } else { message },
+            )
+        }
+        _ => ("runtime.warning", line),
+    };
+    let lower = message.to_ascii_lowercase();
+    let event_type = if !matches!(level, "WARN" | "ERROR")
+        && (lower.starts_with("error:")
+            || lower.contains("panicked at")
+            || FATAL_STDERR_SNIPPETS
+                .iter()
+                .any(|snippet| lower.contains(snippet)))
+    {
+        "runtime.error"
+    } else {
+        event_type
+    };
+    Some((event_type, message.trim().to_owned()))
+}
+
 #[derive(Clone, Debug)]
 pub struct CodexSessionOptions {
     pub version: String,
@@ -2488,13 +2545,8 @@ impl CodexSessionRuntime {
                 }
             }
             IncomingEvent::Stderr { message } => {
-                let event_type = if FATAL_STDERR_SNIPPETS
-                    .iter()
-                    .any(|snippet| message.to_ascii_lowercase().contains(snippet))
-                {
-                    "runtime.error"
-                } else {
-                    "runtime.warning"
+                let Some((event_type, message)) = stderr_activity(&message) else {
+                    return;
                 };
                 let payload = if event_type == "runtime.error" {
                     json!({
