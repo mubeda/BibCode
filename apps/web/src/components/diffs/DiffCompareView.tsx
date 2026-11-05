@@ -45,6 +45,7 @@ import {
   type DiffFileRow,
 } from "~/lib/diffCompareModel";
 import { resolveFileDiffPath } from "~/lib/diffRendering";
+import { useResizableWidth } from "~/hooks/useResizableWidth";
 import { cn } from "~/lib/utils";
 import {
   DIFF_FOCUS_CONTEXT,
@@ -140,14 +141,16 @@ export function DiffCompareView(props: DiffCompareViewProps) {
 
   // Below 640 px the list column would squeeze the two versions, so it becomes a picker.
   const rootRef = useRef<HTMLDivElement>(null);
-  const [narrow, setNarrow] = useState(false);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const narrow = containerWidth > 0 && containerWidth < NARROW_COMPARE_WIDTH;
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(([entry]) => {
-      const width = entry?.contentRect.width ?? 0;
-      setNarrow(width > 0 && width < NARROW_COMPARE_WIDTH);
-    });
+    const measure = (width: number) => {
+      if (width > 0) setContainerWidth(width);
+    };
+    measure(root.clientWidth);
+    const observer = new ResizeObserver(([entry]) => measure(entry?.contentRect.width ?? 0));
     observer.observe(root);
     return () => observer.disconnect();
   }, []);
@@ -187,8 +190,11 @@ export function DiffCompareView(props: DiffCompareViewProps) {
           />
         </>
       ) : (
-        <DiffFileList
-          className="w-60 shrink-0 border-r border-border"
+        <CompareFileList
+          maxWidth={Math.max(
+            MIN_FILE_LIST_WIDTH,
+            Math.min(MAX_FILE_LIST_WIDTH, (containerWidth || Infinity) - DIFF_RESERVED_WIDTH),
+          )}
           filters={filters}
           rows={visibleRows}
           selectedKey={selectedRow?.key ?? null}
@@ -219,6 +225,72 @@ export function DiffCompareView(props: DiffCompareViewProps) {
 }
 
 const NARROW_COMPARE_WIDTH = 640;
+const DEFAULT_FILE_LIST_WIDTH = 240;
+const MIN_FILE_LIST_WIDTH = 224;
+const MAX_FILE_LIST_WIDTH = 720;
+const DIFF_RESERVED_WIDTH = 384;
+
+/** Owns drag state so resizing the list does not re-render the file's diff pane. */
+function CompareFileList({
+  maxWidth,
+  ...listProps
+}: Parameters<typeof DiffFileList>[0] & { readonly maxWidth: number }) {
+  const listId = useId();
+  const { width, handlers, commitWidth } = useResizableWidth({
+    storageKey: "bibcode:diff-compare-file-list-width",
+    defaultWidth: DEFAULT_FILE_LIST_WIDTH,
+    minWidth: MIN_FILE_LIST_WIDTH,
+    maxWidth,
+    edge: "right",
+  });
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const next =
+      event.key === "ArrowLeft"
+        ? width - 16
+        : event.key === "ArrowRight"
+          ? width + 16
+          : event.key === "Home"
+            ? MIN_FILE_LIST_WIDTH
+            : event.key === "End"
+              ? maxWidth
+              : null;
+    if (next === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    commitWidth(next);
+  };
+  return (
+    <>
+      <div
+        id={listId}
+        className="flex min-h-0 shrink-0 border-r border-panel-separator"
+        style={{ width }}
+      >
+        <DiffFileList {...listProps} className="min-w-0 flex-1" />
+      </div>
+      <div
+        role="separator"
+        tabIndex={0}
+        aria-controls={listId}
+        aria-label="Resize compare file list"
+        aria-orientation="vertical"
+        aria-valuemin={MIN_FILE_LIST_WIDTH}
+        aria-valuemax={maxWidth}
+        aria-valuenow={width}
+        title="Drag to resize. Double-click to reset."
+        className="group/separator relative z-10 -mx-1 w-2 shrink-0 cursor-col-resize touch-none select-none outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        {...handlers}
+        onKeyDown={onKeyDown}
+        onDoubleClick={() => commitWidth(DEFAULT_FILE_LIST_WIDTH)}
+      >
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors group-hover/separator:bg-ring group-focus-visible/separator:bg-ring group-active/separator:bg-ring"
+        />
+      </div>
+    </>
+  );
+}
 
 /** Moves the diff to the next (+1) or previous (-1) block of changes. */
 interface ComparePaneHandle {

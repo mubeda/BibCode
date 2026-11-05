@@ -4140,6 +4140,14 @@ agent turn edit two files so the thread has a turn with checkpoints.
 
 1. Open the Diff panel. **Changes** is selected and matches the stacked view.
    Choose **Split**, then **Compare**.
+   Include a long file path: hover its truncated row to see the full path,
+   then drag the file-list divider wider until the path fits. Check smooth
+   resizing with both diff columns still usable, and drag to both bounds.
+   Focus the divider and test Left, Right, Home and End; double-click resets
+   it. Choose a width, close and reopen the panel, then relaunch the app and
+   confirm the width returns. Narrow the panel: the width clamps to reserve
+   room for the diff, and below 640 px the list becomes a picker without a
+   divider. Widen it again and confirm the chosen width returns.
 2. For **Working tree**, **Branch changes** and the turn, select files from the
    list with the pointer and with Up and Down. Each changed file shows its
    previous and current versions side by side, aligned and scrolling together,
