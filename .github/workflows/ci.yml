@@ -103,9 +103,14 @@ jobs:
     # Setup, SSH, and the updater verifier add about 3. PR 65's apt stall
     # added 21 minutes. 42 + 3 + 21 is 66, so 70.
     timeout-minutes: 70
-    # Full debug info in every linked test binary fills the runner disk.
+    # The two Rust suites link about 40 test binaries of 250 MB each, 17 GB of
+    # target with debug info already off. Half of each binary is its symbol
+    # table, so stripping it saves about 5 GB; PR 301's Test still hit ENOSPC
+    # without it. Panic locations and the profiler tests' module, offset, and
+    # debug ID checks do not need symbols.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_TEST_STRIP: symbols
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,6 +158,11 @@ jobs:
       # server or desktop suites; see the same step in release.yml.
       - name: Test
         run: vp run -r --concurrency-limit 1 test
+
+      # Headroom record for the next ENOSPC. Skipped if the runner itself dies.
+      - name: Disk usage after Test
+        if: always()
+        run: df -h / && du -sh target 2>/dev/null || true
 
       # `vp run -r test` above already runs the bibcode-server and
       # bibcode-desktop suites. The updater verifier is the only workspace
