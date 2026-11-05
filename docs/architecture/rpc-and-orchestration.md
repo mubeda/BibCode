@@ -2980,6 +2980,13 @@ the total and an "and N more files" row that opens the turn diff, which
 model keeps the full list and no total; an older server sends every file
 without `filesTotal`, and an older client ignores the field.
 
+The chat's changed-files folders start collapsed. Explicit **Expand all** choices
+are stored per environment/thread and turn in `bibcode:ui-state:v1`;
+**Collapse all** removes that preference, and legacy collapsed entries are
+discarded on load. Per-folder overrides stay local to the mounted tree and
+survive changed-file list updates and re-renders. A global expand/collapse
+action resets them.
+
 A resubscribe resumes instead of resending the thread
 ([design](../superpowers/specs/2026-10-17-thread-resubscribe-resume-design.md)).
 For a `patches: true` subscriber, every `snapshot` and `patch` item carries a
