@@ -1,7 +1,14 @@
 name: Seeded Packaged Desktop Upgrade
 
+# Pull requests run this only with the ci:full label (from their next push;
+# see ci.yml for why there is no labeled trigger). Every push to main and every
+# manual run builds all lanes. Six to seven 1.5-6 hour lanes per pull request
+# push were saturating the macOS runner queue.
 on:
   pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       previous_tag:
@@ -13,15 +20,17 @@ on:
 permissions:
   contents: read
 
-# Same ref policy as CI: a new push cancels the previous six-target upgrade
-# matrix instead of leaving 240–360 minute macOS jobs in the runner queue.
+# Same ref policy as CI: a new pull request push cancels the previous
+# six-target upgrade matrix instead of leaving 240–360 minute macOS jobs in the
+# runner queue. A running main run is not cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   seeded_upgrade_smoke:
     name: Seeded upgrade - ${{ matrix.label }}
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
     strategy:
@@ -96,14 +105,11 @@ jobs:
           cache: true
           run-install: false
 
+      # No Rust cache: the harness builds into its own run-root target, which a
+      # cached repository target cannot warm, and each lane saved a pull
+      # request copy of the key into the 10 GB budget.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
-
-      - name: Cache Rust build output
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: |
-            . -> target
 
       - name: Install Linux packaged-updater prerequisites
         if: matrix.platform == 'linux'
@@ -213,7 +219,9 @@ jobs:
         with:
           name: seeded-upgrade-${{ matrix.platform }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/bibcode-seeded-upgrade/evidence/*
-          if-no-files-found: error
+          # warn: when the harness fails before writing evidence, its own
+          # failure is the job's error instead of "No files were found".
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Upload Windows crash dumps
@@ -227,6 +235,7 @@ jobs:
 
   windows_wsl_upgrade_smoke:
     name: Seeded upgrade - Windows WSL primary
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: windows-2025
     timeout-minutes: 240
     steps:
@@ -357,5 +366,5 @@ jobs:
         with:
           name: seeded-upgrade-windows-wsl
           path: ${{ runner.temp }}/bibcode-seeded-wsl-upgrade/evidence/*
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
