@@ -71,9 +71,12 @@ already re-reads the mounted query, so a reconnect costs one capability read
 rather than one more per reconnect.
 
 The result contains `slashCommands`, `skills`, `agents`, and `issues`. Codex
-initializes an App Server in the requested directory and calls `skills/list`
-without an account/model query, using the session launch's configured Codex
-home and shared/shadow-home preparation. Claude uses hook-disabled native
+initializes an App Server in the requested directory, loads `plugin/installed`
+to populate its installed-plugin catalog, then calls `skills/list` without an
+account/model query, using the session launch's configured Codex home and
+shared/shadow-home preparation. Older App Servers without `plugin/installed`
+use `skills/list` alone; plugin discovery errors mark the catalog incomplete.
+Claude uses hook-disabled native
 initialization and `reload_skills` with user/project/local settings. Its reload
 results are matched to initialization command names and aliases so model-only
 skills stay hidden; manual-only skills remain available as native commands.

@@ -92,6 +92,8 @@ configuration. Cursor filesystem tests must also supply an explicit temporary
 home. Keep cancellation/reaping (including abandoned requests during shutdown),
 configured homes (including Codex shadow homes), local/remote OpenCode directory
 encoding, Claude visibility/aliases, and partial-catalog coverage alongside discovery.
+Codex fixtures must include skills available only after loading the native
+installed-plugin catalog, plus an older App Server without that method.
 
 For packaged visual validation on each available supported provider:
 
@@ -103,7 +105,10 @@ For packaged visual validation on each available supported provider:
 3. Check configured user homes, nested/symlinked Cursor skills, and remote
    OpenCode directory selection where those setups are available. Confirm native
    disabled/non-invocable skills stay hidden and name collisions have one effective
-   entry.
+   entry. For Codex, include an enabled plugin with skills only in its plugin
+   installation, outside the standalone skill roots. Open a fresh picker and
+   verify both `$` and a namespace prefix such as `$superp` list its
+   `superpowers:*` skills.
 4. Refresh providers, change instance settings, and reconnect. Reopen a stale
    menu and confirm the catalog refreshes without losing draft text or inline
    skills. Typing in its search must not launch another discovery per keypress.
