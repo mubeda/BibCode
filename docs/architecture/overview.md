@@ -3206,6 +3206,11 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   `canOpenPullRequestInPanel` (Pull Requests setting on, not Bitbucket or Azure
   DevOps). Persisted `pullRequest` entries are validated on load, so a corrupted
   one drops without losing the thread's other tabs.
+- The Diff panel's Compare file list reuses `useResizableWidth`, persisting its
+  width in `bibcode:diff-compare-file-list-width`. It clamps the painted width
+  to 224–720 px and reserves 384 px for the diff without rewriting the saved
+  preference when the panel shrinks. Below 640 px it becomes a file picker;
+  unmounting the list cancels any active drag.
 - The Git Manager's Changes tab stacks the file list, the selected diff and the
   commit form. `GitManagerChangesPanes` reuses `useResizableWidth` with
   `axis: "y"` for the list height (`bibcode:git-changes-list-height`) and the

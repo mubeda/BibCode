@@ -135,6 +135,7 @@ describe("DiffCompareView", () => {
     onRevalidatePatch.mockClear();
     onLinesChange.mockClear();
     onContextLinesChange.mockClear();
+    localStorage.removeItem("bibcode:diff-compare-file-list-width");
     useDiffPanelStore.setState({
       compareFileByThreadKey: {},
       compareFiltersByThreadKey: {},
@@ -175,6 +176,111 @@ describe("DiffCompareView", () => {
 
   const options = () => [...container.querySelectorAll<HTMLElement>('[role="option"]')];
   const listbox = () => container.querySelector<HTMLElement>('[role="listbox"]')!;
+
+  it("drags the file list within bounds, remembers its width, and exposes full paths", async () => {
+    const path = "src/components/a-long-directory/a-long-component-name.tsx";
+    const files = parse(modified(path, OLD_A, NEW_A));
+    await render(files);
+    const divider = () => {
+      const element = container.querySelector<HTMLElement>(
+        '[role="separator"][aria-label="Resize compare file list"]',
+      );
+      expect(element, "Compare offers a draggable file-list divider").not.toBeNull();
+      return element!;
+    };
+    const width = () =>
+      document.getElementById(divider().getAttribute("aria-controls")!)!.style.width;
+    const pointer = async (type: string, clientX: number) => {
+      await act(async () => {
+        divider().dispatchEvent(
+          new PointerEvent(type, { bubbles: true, button: 0, clientX, pointerId: 1 }),
+        );
+      });
+    };
+    expect(width()).toBe("240px");
+    expect(options()[0]!.title).toBe(path);
+    expect(options()[0]!.querySelector(".truncate")).not.toBeNull();
+    await pointer("pointerdown", 240);
+    await pointer("pointermove", 560);
+    // Paint during the drag, before it is persisted at pointerup.
+    await act(async () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    expect(width()).toBe("560px");
+    expect(localStorage.getItem("bibcode:diff-compare-file-list-width")).toBeNull();
+    await pointer("pointerup", 560);
+    expect(localStorage.getItem("bibcode:diff-compare-file-list-width")).toBe("560");
+    await act(async () => root.render(null));
+    await render(files);
+    expect(width()).toBe("560px");
+    await pointer("pointerdown", 560);
+    await pointer("pointermove", 2000);
+    await pointer("pointerup", 2000);
+    expect(width()).toBe("720px");
+    await pointer("pointerdown", 720);
+    await pointer("pointermove", -1000);
+    await pointer("pointerup", -1000);
+    expect(width()).toBe("224px");
+    expect(lastCodeView()["options"]).toMatchObject({ diffStyle: "split" });
+  });
+
+  it("reserves room for the diff, supports keyboard resizing, and cancels when the list becomes a picker", async () => {
+    let resize: (width: number) => void = () => undefined;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(private readonly callback: ResizeObserverCallback) {}
+        observe(element: Element) {
+          if (element.parentElement !== container) return;
+          resize = (width) =>
+            this.callback(
+              [{ contentRect: { width } } as ResizeObserverEntry],
+              this as unknown as ResizeObserver,
+            );
+        }
+        disconnect() {}
+        unobserve() {}
+      },
+    );
+    try {
+      localStorage.setItem("bibcode:diff-compare-file-list-width", "600");
+      await render(parse(modified("src/a.ts", OLD_A, NEW_A)));
+      const divider = () => container.querySelector<HTMLElement>('[role="separator"]')!;
+      const press = async (key: string) =>
+        act(async () =>
+          divider().dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true })),
+        );
+      await act(async () => resize(700));
+      expect(divider().getAttribute("aria-valuenow")).toBe("316");
+      expect(divider().getAttribute("aria-valuemax")).toBe("316");
+      expect(localStorage.getItem("bibcode:diff-compare-file-list-width")).toBe("600");
+      await act(async () => resize(1200));
+      expect(divider().getAttribute("aria-valuenow")).toBe("600");
+      await press("ArrowLeft");
+      expect(divider().getAttribute("aria-valuenow")).toBe("584");
+      await press("ArrowRight");
+      expect(divider().getAttribute("aria-valuenow")).toBe("600");
+      await press("Home");
+      expect(divider().getAttribute("aria-valuenow")).toBe("224");
+      await press("End");
+      expect(divider().getAttribute("aria-valuenow")).toBe("720");
+      await act(async () => divider().dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+      expect(divider().getAttribute("aria-valuenow")).toBe("240");
+      await act(async () => {
+        divider().dispatchEvent(
+          new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 1 }),
+        );
+      });
+      expect(document.body.style.userSelect).toBe("none");
+      await act(async () => resize(500));
+      expect(divider()).toBeNull();
+      expect(listbox()).toBeNull();
+      expect(container.querySelector('[aria-label="File: src/a.ts"]')).not.toBeNull();
+      expect(document.body.style.userSelect).toBe("");
+      expect(document.body.style.cursor).toBe("");
+      expect(localStorage.getItem("bibcode:diff-compare-file-list-width")).toBe("240");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 
   it("puts the selected file's actions in the pane header", async () => {
     const files = parse(modified("src/a.ts", OLD_A, NEW_A), modified("src/b.ts", OLD_B, NEW_B));
