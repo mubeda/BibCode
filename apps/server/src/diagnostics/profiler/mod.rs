@@ -17,6 +17,7 @@ pub mod redact;
 pub mod runtime;
 pub mod sampler;
 pub mod sentinel;
+pub mod stop_steps;
 pub mod store;
 pub mod symbolicate;
 pub mod worktree_audit;
