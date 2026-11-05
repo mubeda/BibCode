@@ -219,12 +219,16 @@ recently used entries above that. Which workflow saves which entry:
   `refs/heads/main`, including when a later step fails (`cache-on-failure`).
   Pull requests read that default-branch cache and save nothing.
 - Native desktop sets `shared-key: native-desktop`, so one entry per runner
-  OS and architecture. Release's `build_desktop` and `build_server` use the
-  same key, the same `. -> target` workspace, and no job-level `CARGO_*` or
-  `RUST*` environment, so they restore the entry CI's `main` run saved and
-  never save (`save-if: false`). A tag run used to save its own entries under
-  `refs/tags/<tag>`, which no later run could restore and which pushed the
-  `main` entries out.
+  OS and architecture. Release's `build_desktop`, and `build_server` on macOS
+  and Windows, use the same key, the same `. -> target` workspace, and no
+  job-level `CARGO_*` or `RUST*` environment, so they restore the entry CI's
+  `main` run saved and never save (`save-if: false`). The Linux server row
+  does not restore it: that binary is compiled inside Ubuntu 20.04, and the
+  cache holds native objects (aws-lc, bundled sqlite) built on the Ubuntu
+  22.04 runner. The container also deletes `/workspace/target` before
+  `cargo build`, so a restored fingerprint cannot raise the glibc floor.
+  A tag run used to save its own entries under `refs/tags/<tag>`, which no
+  later run could restore and which pushed the `main` entries out.
 - Seeded Packaged Desktop Upgrade has no Rust cache step: its harness builds in
   a run-owned target that a repository `target` cache cannot warm.
 - The pnpm store stays on the setup-vp cache.

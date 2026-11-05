@@ -631,8 +631,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
 
-      # Same restore-only policy as the desktop matrix above.
+      # macOS and Windows build on the same runner as CI, so they restore
+      # the native-desktop cache and never save. Linux compiles inside
+      # ubuntu:20.04; that cache holds aws-lc and bundled sqlite objects
+      # built on the Ubuntu 22.04 runner, and Cargo would reuse them.
       - name: Cache Rust build output
+        if: matrix.platform != 'linux'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: native-desktop
@@ -673,6 +677,10 @@ jobs:
               DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates cmake curl perl pkg-config
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
                 sh -s -- -y --profile minimal --default-toolchain 1.98.1
+              # A runner target/ holds native objects compiled against a newer
+              # glibc. Cargo treats a matching fingerprint as fresh, so the
+              # shipped binary would not run on this baseline.
+              rm -rf /workspace/target
               /root/.cargo/bin/cargo build -p bibcode-server --bin bibcode --release --target "$RUST_TARGET"
               chown -R "$HOST_UID:$HOST_GID" /workspace/target
             '

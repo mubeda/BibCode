@@ -274,17 +274,24 @@ describe("cross-platform CI contract", () => {
     expect(requireJob(ci, "native_desktop").env).toBeUndefined();
 
     const release = readWorkflow(RELEASE_WORKFLOW_PATH).workflow;
-    for (const name of ["build_desktop", "build_server"]) {
-      const job = requireJob(release, name);
-      const cache = job.steps?.find((step) => step.name === "Cache Rust build output");
-      expect(cache?.with?.["shared-key"], name).toBe("native-desktop");
-      expect(cache?.with?.["save-if"], name).toBe(false);
-      expect(String(cache?.with?.workspaces), name).toBe(". -> target\n");
+    const desktop = requireJob(release, "build_desktop");
+    const desktopCache = desktop.steps?.find((step) => step.name === "Cache Rust build output");
+    expect(desktopCache?.if).toBeUndefined();
+    expect(desktopCache?.with?.["shared-key"]).toBe("native-desktop");
+    expect(desktopCache?.with?.["save-if"]).toBe(false);
+    expect(String(desktopCache?.with?.workspaces)).toBe(". -> target\n");
+
+    const server = requireJob(release, "build_server");
+    const serverCache = server.steps?.find((step) => step.name === "Cache Rust build output");
+    // Ubuntu 22.04 objects must not be restored into the 20.04 server compile.
+    expect(serverCache?.if).toBe("matrix.platform != 'linux'");
+    expect(serverCache?.with?.["shared-key"]).toBe("native-desktop");
+    expect(serverCache?.with?.["save-if"]).toBe(false);
+    expect(String(serverCache?.with?.workspaces)).toBe(". -> target\n");
+
+    for (const job of [desktop, server]) {
       // Job-level CARGO_* or RUST* env would change the cache key.
-      expect(
-        Object.keys(job.env ?? {}).filter((key) => /^(CARGO|RUST)/.test(key)),
-        name,
-      ).toEqual([]);
+      expect(Object.keys(job.env ?? {}).filter((key) => /^(CARGO|RUST)/.test(key))).toEqual([]);
     }
   });
 
@@ -1269,6 +1276,10 @@ describe("release symbols and crash smoke contract", () => {
 
     for (const setting of symbolProfile) expect(linux.run).toContain(`--env ${setting}`);
     expect(linux.run).toContain('--env "RUSTFLAGS=-C link-arg=-Wl,--build-id=sha1"');
+    const wipeTarget = linux.run?.indexOf("rm -rf /workspace/target") ?? -1;
+    const cargoBuild = linux.run?.indexOf("cargo build -p bibcode-server") ?? -1;
+    expect(wipeTarget).toBeGreaterThan(-1);
+    expect(cargoBuild).toBeGreaterThan(wipeTarget);
     expect(native.env).toEqual({
       CARGO_PROFILE_RELEASE_STRIP: "none",
       CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only",

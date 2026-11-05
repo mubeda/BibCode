@@ -85,7 +85,11 @@ same six targets. macOS and Linux receive `.tar.gz` archives; Windows receives `
 Linux also receives direct-download `.deb` and `.rpm` packages for both architectures.
 The Linux server binary is compiled on an Ubuntu 20.04 compatibility baseline, then its
 packages are installed and exercised on Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky
-Linux 9, and Fedora 44.
+Linux 9, and Fedora 44. That container deletes `/workspace/target` before compiling
+and does not restore CI's `native-desktop` cache. The cache is produced on the
+Ubuntu 22.04 runner; reusing its aws-lc and bundled sqlite objects would ship a
+binary that requires a newer glibc than the baseline. macOS and Windows server
+builds still restore that cache, because they compile on the same runner as CI.
 
 Numeric stable versions are updater candidates and are marked latest only after
 manual publication approval. Stable prerelease versions and manual nightly
@@ -762,10 +766,11 @@ budgets are timeouts, not expected completion durations:
 
 - preflight: 60 minutes;
 - each desktop build: 90 minutes, except macOS arm64 and Intel, which get 150
-  because a cold Rust cache can take them past 90. Desktop and server builds
-  restore CI's `native-desktop` Rust cache from `main` (same key and symbol
-  profile) and never save one, so a release from a commit `main` has built
-  starts warm;
+  because a cold Rust cache can take them past 90. Desktop builds, and the
+  macOS and Windows server builds, restore CI's `native-desktop` Rust cache
+  from `main` (same key and symbol profile) and never save one, so a release
+  from a commit `main` has built starts warm on those runners. The Linux
+  server build compiles cold inside Ubuntu 20.04;
 - each server build: 120 minutes;
 - the release job: 25 minutes. It moves about 440 MB of symbol archives (28 to
   45 MB each).
