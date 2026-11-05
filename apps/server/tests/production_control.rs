@@ -955,7 +955,12 @@ async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
         "Claude initialization models must replace fixed built-ins"
     );
     assert!(!slugs.contains(&"claude-opus-4-8"));
-    assert_eq!(models[0]["name"], "Opus 5");
+    assert_eq!(models[0]["name"], "Opus (claude-opus-5)");
+    assert_eq!(models[0]["resolvedModel"], "claude-opus-5");
+    assert_eq!(
+        models[0]["description"],
+        "Opus 5 · Best for everyday, complex tasks"
+    );
     assert_eq!(
         models[0]["capabilities"]["optionDescriptors"][1]["id"],
         "fastMode"
