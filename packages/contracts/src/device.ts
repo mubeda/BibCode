@@ -13,6 +13,7 @@ export type DevicePlatform = typeof DevicePlatform.Type;
 export const DeviceAvailabilityKind = Schema.Literals([
   "ready",
   "sdkMissing",
+  "emulatorMissing",
   "adbMissing",
   "noAvds",
   "accelerationUnavailable",

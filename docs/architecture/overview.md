@@ -2255,12 +2255,19 @@ hold it for one call, and a stop waits up to 5 s for those calls to let go.
 
 **Discovery (Android).** The server looks for the SDK in `ANDROID_HOME`, then
 `ANDROID_SDK_ROOT`, then the platform default (`~/Library/Android/sdk`,
-`%LOCALAPPDATA%\Android\Sdk`, or `~/Android/Sdk`), and needs both
-`emulator/emulator` and `platform-tools/adb`. It lists AVDs with
+`%LOCALAPPDATA%\Android\Sdk`, or `~/Android/Sdk`). A root counts as an SDK
+when it contains a `platform-tools/`, `platforms/`, or `cmdline-tools/`
+directory. The first SDK with both `emulator/emulator` and
+`platform-tools/adb` wins; if none is complete, the first partial SDK reports
+`emulatorMissing` when the emulator is absent, otherwise `adbMissing`.
+`sdkMissing` means no candidate looks like an SDK. The missing-emulator
+message names the SDK root and directs the user to install `emulator` with
+the SDK Manager (`sdkmanager "emulator"`), then restart the server.
+It lists AVDs with
 `emulator -list-avds` and checks acceleration with `emulator -accel-check`.
 Each failure becomes the `availability` of the catalog's Android entry
-(`sdkMissing`, `adbMissing`, `noAvds`, or `accelerationUnavailable`) with an
-actionable message. The catalog lists one entry per platform, each with its
+(`sdkMissing`, `emulatorMissing`, `adbMissing`, `noAvds`, or
+`accelerationUnavailable`) with an actionable message. The catalog lists one entry per platform, each with its
 own `availability` and `images` (`{ id, displayName, inUseElsewhere? }`), and
 every device as
 `{ deviceId, platform, imageId, state, orientation, canRotate, threadId? }`, in
