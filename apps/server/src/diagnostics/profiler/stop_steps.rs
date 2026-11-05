@@ -124,6 +124,51 @@ mod tests {
         assert!(payload["durationMs"].is_u64());
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// No production hook slows a stop step cleanly, so the warn path is checked
+    /// here with a supplied duration rather than through a real shutdown.
+    #[test]
+    fn a_record_above_the_threshold_warns_with_stage_step_and_ms() {
+        let log = CapturedLog::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let mut steps = StopSteps::start("quiesce");
+        steps.record("orchestration", Duration::from_millis(250));
+
+        let log = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("utf8");
+        assert!(
+            log.contains("a server stop step was slow"),
+            "missing warn message:\n{log}"
+        );
+        assert!(log.contains("stage=\"quiesce\""), "missing stage:\n{log}");
+        assert!(
+            log.contains("step=\"orchestration\""),
+            "missing step:\n{log}"
+        );
+        assert!(log.contains("ms=250"), "missing ms:\n{log}");
+    }
+
     #[test]
     fn a_mark_times_the_step_since_the_previous_mark() {
         // Backdated rather than slept, so a scheduling pause cannot add a slow step.
