@@ -44,6 +44,12 @@ jobs:
     # measured hosted-runner variance; the serialized test graph below trades
     # some wall-clock for tests that no longer share the CPU with rustc.
     timeout-minutes: 60
+    # checks and actions: read let "Find CI Test result" read CI's Test check
+    # for this commit. The job keeps the workflow's read-only contents scope.
+    permissions:
+      contents: read
+      checks: read
+      actions: read
     # Full debug info in every linked test binary fills the runner disk, as in
     # CI's Test job; the v0.14.0 tag run hit ENOSPC compiling server tests.
     env:
@@ -189,12 +195,43 @@ jobs:
       - name: Typecheck
         run: vp run typecheck
 
+      # CI's Test job runs this same command (plus the updater verifier and SSH
+      # suites) on every push to main. When its latest attempt for this exact
+      # commit passed, Test below is skipped instead of rebuilding the
+      # workspace for about 40 minutes. Only a push or manual ci.yml run
+      # counts: those run the ci.yml of this commit, whereas a pull request
+      # run uses the merge commit's, which the pull request itself can edit.
+      # Any other answer (no run, failure, cancelled, API error) leaves green
+      # unset, so Test runs.
+      - id: ci_tests
+        name: Find CI Test result
+        if: steps.release_meta.outputs.validate_only != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?check_name=Test&filter=latest&per_page=100" \
+            --jq '.check_runs[] | select(.app.slug == "github-actions" and .conclusion == "success") | .details_url' \
+            | sed -n 's#.*/actions/runs/\([0-9][0-9]*\)/.*#\1#p' | sort -u) || runs=""
+          for run in $runs; do
+            run_info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" \
+              --jq '[.path, .event, .head_sha] | join(" ")') || continue
+            if [[ "$run_info" == ".github/workflows/ci.yml push $sha" ||
+                  "$run_info" == ".github/workflows/ci.yml workflow_dispatch $sha" ]]; then
+              echo "CI Test passed for $sha in run $run; skipping the repeat."
+              echo "green=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No passing CI Test for $sha; running Test here."
+
       # One package test task at a time: each Cargo invocation finishes
       # compiling before its test binaries run, so rustc never competes with
       # the server and desktop suites (about thirty of them hold 2-second
       # deadlines that starved hosted runners have missed).
       - name: Test
-        if: steps.release_meta.outputs.validate_only != 'true'
+        if: steps.release_meta.outputs.validate_only != 'true' && steps.ci_tests.outputs.green != 'true'
         run: vp run -r --concurrency-limit 1 test
 
       - id: previous_tag
@@ -333,7 +370,7 @@ jobs:
             platform: mac
             target: dmg
             arch: arm64
-            jobTimeoutMinutes: 90
+            jobTimeoutMinutes: 150
           - label: macOS x64
             runner: macos-15-intel
             platform: mac
@@ -384,11 +421,18 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
 
+      # Restore the cache CI's native desktop rows save from main (same
+      # shared key, same --symbols profile, same Cargo workspace target) and
+      # never save: tag-ref caches are only readable by that tag and evicted
+      # main's caches from the 10 GB budget. The Cargo workspace is the
+      # repository root, so the target is ./target, not src-tauri/target.
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: native-desktop
+          save-if: false
           workspaces: |
-            apps/desktop/src-tauri
+            . -> target
 
       - name: Install Tauri Linux dependencies
         if: matrix.platform == 'linux'
@@ -587,9 +631,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
 
+      # Same restore-only policy as the desktop matrix above.
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: native-desktop
+          save-if: false
           workspaces: |
             . -> target
 

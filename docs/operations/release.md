@@ -21,7 +21,18 @@ graph. `validate_only` and `publish` are mutually exclusive.
 
 Publication-capable preflight runs `vp check`, `vp run typecheck`, and
 `vp run -r --concurrency-limit 1 test`; validation-only preflight skips the
-duplicated full test graph after check and typecheck. The test graph runs one
+duplicated full test graph after check and typecheck. Publication-capable
+preflight also skips the test graph when CI's `Test` job already passed for the
+exact commit being released: the `Find CI Test result` step asks the
+check-runs API for the latest `Test` check run on `git rev-parse HEAD`, and
+skips only if a successful one belongs to a `push` or `workflow_dispatch` run
+of `.github/workflows/ci.yml` on that same commit. Another workflow's job named
+`Test` does not count, and neither does a pull request run: it uses the merge
+commit's workflow file, which the pull request can edit. A tag on a commit CI never tested, a failed or missing Test,
+or an API error runs the tests as before. CI's Test runs the same
+`vp run -r --concurrency-limit 1 test` plus the updater verifier, so the skip
+removes a duplicate, not coverage. The job needs `checks: read` and
+`actions: read` for those two lookups. The test graph runs one
 package task at a time so each Cargo invocation finishes compiling before its
 test binaries run: with the default concurrency the server suites ran while
 `rustc` was still building the desktop crate, and tests that hold 2-second
@@ -43,8 +54,12 @@ matrix then creates native Tauri installers on the matching operating system:
 | Windows  | `windows-2025`          | x64          | NSIS executable |
 
 The native Intel release producers use supported macOS 15 for both desktop and
-server packaging. macOS 26 remains the ARM producer and the Intel runtime-test
-environment in main CI, packaged UI, and upgrade validation. Both release
+server packaging. CI's Native desktop macOS x64 row uses the same
+`macos-15-intel` runner, so CI builds and tests the Intel app Release ships.
+Release restores CI's `native-desktop` Rust cache, whose key names only the OS
+family and architecture, so a CI row on `macos-26-intel` would save objects
+built against a different Xcode and SDK into the entry Release restores. macOS 26 remains the ARM producer and the
+Intel runtime-test environment in packaged UI and upgrade validation. Both release
 producer hosts still require the exact mounted DMG's recursive ad-hoc signature
 and the same Finder pixel check before upload. A macOS 15 Intel pass does not
 qualify macOS 26 Intel Finder rendering; that hosted-runner scenario remains
@@ -628,6 +643,13 @@ skip it because they create no release. This is an early diagnostic, not a
 permission grant or transaction with GitHub: a later API failure still fails
 the job and must be diagnosed. It never changes a tag or release target.
 
+Do not land `.github/workflows/` changes on `main` while a publishing release
+run is in flight. The release job's repeat of
+`scripts/check-release-workflow-permission.sh` then finds main's workflow tree
+different from the release commit's and stops before publication. v0.15.1 run
+41912693805 was blocked this way until 7679521b7 reverted the workflow change.
+Merge workflow pull requests before tagging, or after the release publishes.
+
 For manual diagnosis against `main`:
 
 ```sh
@@ -739,8 +761,11 @@ Both runs perform preflight and the native build matrices. The current job
 budgets are timeouts, not expected completion durations:
 
 - preflight: 60 minutes;
-- each desktop build: 90 minutes, except macOS Intel, which gets 150 because a
-  cold Rust cache can take it past 90;
+- each desktop build: 90 minutes, except macOS arm64 and Intel, which get 150
+  because a cold Rust cache can take them past 90. Desktop and server builds
+  restore CI's `native-desktop` Rust cache from `main` (same key and symbol
+  profile) and never save one, so a release from a commit `main` has built
+  starts warm;
 - each server build: 120 minutes;
 - the release job: 25 minutes. It moves about 440 MB of symbol archives (28 to
   45 MB each).

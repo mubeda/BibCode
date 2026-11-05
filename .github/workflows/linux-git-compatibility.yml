@@ -6,6 +6,12 @@ on:
     branches:
       - main
 
+# A new push to the same pull request cancels the superseded run.
+# Main runs finish so their Rust cache is saved.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   git_appimage_environment:
     name: Git subprocesses across Linux distributions
@@ -22,9 +28,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
 
+      # Save only from main, as in CI: every pull request used to save its own
+      # copy of this key, which pushed main's CI caches out of the 10 GB budget.
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             . -> target
 
