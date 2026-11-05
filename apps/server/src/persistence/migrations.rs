@@ -667,6 +667,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(66, "WebhookBearerSecret", migration_066),
     Migration::new(67, "ProjectionThreadSideChat", migration_067),
     Migration::new(68, "WebhookStatusKinds", migration_068),
+    Migration::new(69, "ProjectionThreadMessagesQueuedIndex", migration_069),
 ];
 
 impl Migration {
@@ -2983,6 +2984,24 @@ fn migration_068(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_069(transaction: &Transaction<'_>) -> Result<()> {
+    // The threads with a queued message, which every shell subscription reads (#303): a
+    // partial index holds only the queued rows, so the lookup no longer scans every message
+    // of a long history.
+    if table_exists(transaction, "projection_thread_messages")?
+        && table_has_column(transaction, "projection_thread_messages", "delivery_state")?
+    {
+        transaction.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_projection_thread_messages_queued
+            ON projection_thread_messages(thread_id)
+            WHERE delivery_state = 'queued';
+            "#,
+        )?;
+    }
+    Ok(())
+}
+
 /// The endpoint `revision` and the delivery's `endpoint_revision`, added to migration 61
 /// before it was released. A development store that ran the earlier 61 gets them here: the
 /// webhook dispatcher calls this once when it starts, and it changes nothing when they exist.
@@ -3212,7 +3231,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68]
+            [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]
         );
         let (state, outcome) = connection.query_row(
             "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = 'k'",
@@ -3245,7 +3264,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66, 67, 68]
+            [65, 66, 67, 68, 69]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3281,7 +3300,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [61, 62, 63, 64, 65, 66, 67, 68]
+            [61, 62, 63, 64, 65, 66, 67, 68, 69]
         );
         connection.execute(
             "INSERT INTO webhook_endpoints (endpoint_id, name, url, enabled, event_types_json, created_at, updated_at) VALUES ('w', 'CI', 'https://example.com/hook', 1, '[]', '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
@@ -3323,7 +3342,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66, 67, 68]
+            [66, 67, 68, 69]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3334,6 +3353,54 @@ mod tests {
         let transaction = connection.transaction()?;
         super::migration_066(&transaction)?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_069_indexes_only_queued_messages_for_the_queued_thread_lookup()
+    -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(68))?;
+        connection.execute_batch(
+            "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at, delivery_state) VALUES ('queued', 't1', 'user', 'a', 0, '2026-11-04T00:00:00Z', '2026-11-04T00:00:00Z', 'queued');
+             INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('sent', 't2', 'user', 'b', 0, '2026-11-04T00:00:00Z', '2026-11-04T00:00:00Z');",
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [69]
+        );
+        let index_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_messages_queued'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            index_sql.contains("WHERE delivery_state = 'queued'"),
+            "{index_sql}"
+        );
+        // The shell's queued-thread lookup, as `shell_live_thread_ids` runs it.
+        let lookup = "SELECT DISTINCT thread_id FROM projection_thread_messages WHERE delivery_state = 'queued'";
+        let mut plan = connection.prepare(&format!("EXPLAIN QUERY PLAN {lookup}"))?;
+        let details = plan
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_projection_thread_messages_queued")),
+            "{details:?}"
+        );
+        let threads = connection
+            .prepare(lookup)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(threads, ["t1"]);
         Ok(())
     }
 
@@ -3351,7 +3418,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [68]
+            [68, 69]
         );
         let kinds: Option<String> = connection.query_row(
             "SELECT status_kinds_json FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3379,7 +3446,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [67, 68]
+            [67, 68, 69]
         );
         let side_chat: i64 = connection.query_row(
             "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
@@ -3405,7 +3472,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66, 67, 68]
+            [62, 63, 64, 65, 66, 67, 68, 69]
         );
         for table in [
             "mcp_oauth_clients",
@@ -3460,7 +3527,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [60, 61, 62, 63, 64, 65, 66, 67, 68]
+            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69]
         );
         for (table, column) in [
             ("projection_thread_messages", "actor_json"),
@@ -3505,7 +3572,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68]
+            [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3547,7 +3614,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(68));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(69));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4279,7 +4346,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=68).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=69).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4352,6 +4419,7 @@ mod tests {
                 (66, "WebhookBearerSecret"),
                 (67, "ProjectionThreadSideChat"),
                 (68, "WebhookStatusKinds"),
+                (69, "ProjectionThreadMessagesQueuedIndex"),
             ],
         );
         assert_eq!(
@@ -4502,7 +4570,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 52);
+        assert_eq!(second.len(), 53);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -4622,7 +4690,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63, 64, 65, 66, 67, 68
+                61, 62, 63, 64, 65, 66, 67, 68, 69
             ]
         );
         let policy = connection.query_row(
@@ -4662,7 +4730,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63, 64, 65, 66, 67, 68
+                62, 63, 64, 65, 66, 67, 68, 69
             ]
         );
         let pin = connection.query_row(
@@ -4693,7 +4761,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63, 64, 65, 66, 67, 68
+                63, 64, 65, 66, 67, 68, 69
             ]
         );
         let pin = connection.query_row(
@@ -4835,7 +4903,8 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68
+                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+                69
             ]
         );
         assert_eq!(
@@ -4865,7 +4934,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 35);
+        assert_eq!(applied.len(), 36);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
