@@ -64,7 +64,7 @@ delivery log and secret go with it.
 | `scm.operation_completed` | An outside agent's Git or pull request tool changed something (`tool`, `status`, `target`)            | Agent operations |
 | `transfer.completed`      | An outside agent's file download or upload finished                                                   | Agent operations |
 | `transfer.failed`         | An outside agent's file download or upload failed (`status` names why)                                | Agent operations |
-| `profiler.finding`        | The profiler records a new finding, or one recurs (`finding`)                                         | Diagnostics      |
+| `profiler.finding`        | A finding is new, reopens, or changes severity (`finding`)                                            | Diagnostics      |
 | `webhook.test`            | You clicked **Send test event**; sent only to that endpoint                                           | —                |
 
 `profiler.finding` is sent only while MCP is on and **What agents can use → Diagnostics** is
@@ -111,6 +111,9 @@ durable record of them to send from.
   `changes_since` entry. `actor` is present when an outside agent caused the change: its
   kind and an opaque `clientId`, never the agent's name, which is text the client chose.
 - `profiler.finding` carries `finding: { "id", "count", "lastSeen" }` instead of `cursor`.
+  Unchanged recurrences send no webhook. Each new, reopened, or severity-changed
+  notification has its own event `id`, independent of the recurrence count; retries and
+  redeliveries keep that event `id`.
 - `dropped` appears on the first delivery after BiBCode had to drop deliveries for this
   endpoint because its queue was full: `{ "count", "fromCursor", "toCursor",
   "sinceLastSeen" }` (each range field only when a dropped event had one). Catch up from

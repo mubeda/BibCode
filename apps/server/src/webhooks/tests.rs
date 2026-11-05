@@ -243,6 +243,26 @@ impl Harness {
 
     /// A harness whose findings book already holds `findings` when the dispatcher starts.
     async fn new_full(findings: &[(&str, u64, &str)], timing: Timing) -> Self {
+        Self::new_with_receiver(findings, timing, Receiver::start().await).await
+    }
+
+    /// Queue-only finding audits need no listening socket or HTTP sender.
+    async fn new_for_findings(findings: &[(&str, u64, &str)]) -> Self {
+        let receiver = Receiver {
+            url: "https://localhost/hook".to_owned(),
+            state: ReceiverState::default(),
+            certificates: TestCertificates::generate(),
+        };
+        let harness = Self::new_with_receiver(findings, Timing::default(), receiver).await;
+        harness.webhooks.shutdown().await;
+        harness
+    }
+
+    async fn new_with_receiver(
+        findings: &[(&str, u64, &str)],
+        timing: Timing,
+        receiver: Receiver,
+    ) -> Self {
         let database = Database::open_in_memory().await.unwrap();
         database
             .call(|connection| {
@@ -251,7 +271,6 @@ impl Harness {
             })
             .await
             .unwrap();
-        let receiver = Receiver::start().await;
         let resolver = resolver(&[("localhost", "127.0.0.1")]);
         let profiler_dir = tempfile::tempdir().unwrap();
         if !findings.is_empty() {
@@ -1058,7 +1077,7 @@ async fn a_receiver_that_drops_every_second_delivery_still_sees_everything() {
     for index in 0..4 {
         harness.turn("thread-1", &format!("turn-{index}")).await;
     }
-    // Two findings in the same second, then a later one, then a recurrence.
+    // Two findings in the same second, then later ones and an unchanged recurrence.
     harness.write_findings(&[
         ("old", 1, "2026-10-31T09:00:00Z"),
         ("a", 1, "2026-10-31T10:00:00Z"),
@@ -1079,6 +1098,7 @@ async fn a_receiver_that_drops_every_second_delivery_still_sees_everything() {
         ("a", 2, "2026-10-31T10:00:00Z"),
         ("b", 1, "2026-10-31T10:00:00Z"),
         ("c", 1, "2026-10-31T10:00:01Z"),
+        ("d", 1, "2026-10-31T10:00:02Z"),
     ]);
     eventually("every delivery", async || {
         harness.receiver.received().len() == 8 + 4
@@ -1122,8 +1142,8 @@ async fn a_receiver_that_drops_every_second_delivery_still_sees_everything() {
         [
             ("a".to_owned(), 1),
             ("b".to_owned(), 1),
-            ("a".to_owned(), 2),
-            ("c".to_owned(), 1)
+            ("c".to_owned(), 1),
+            ("d".to_owned(), 1)
         ]
     );
     let reader = Reader::new(harness.profiler_dir.path());
@@ -1150,6 +1170,109 @@ async fn a_receiver_that_drops_every_second_delivery_still_sees_everything() {
             .any(|request| String::from_utf8_lossy(&request.body).contains(MARKER))
     );
     harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finding_webhooks_only_report_new_reopened_or_severity_changed_findings() {
+    let harness = Harness::new_for_findings(&[]).await;
+    let (endpoint, _) = harness.endpoint(&[events::PROFILER_FINDING]).await;
+    // Drive individual audits without a concurrent dispatcher or HTTP sender.
+    harness.webhooks.shutdown().await;
+    let endpoints = harness.webhooks.store().endpoints().await.unwrap();
+    harness.webhooks.follow_findings(&endpoints).await;
+    let mut finding: Value =
+        serde_json::from_str(&findings_text(&[("a", 1, "2026-11-05T10:00:00Z")])).unwrap();
+    let mut lines = String::new();
+    for count in 1..=101 {
+        finding["count"] = count.into();
+        finding["lastSeen"] = format!("2026-11-05T10:{:02}:{:02}Z", count / 60, count % 60).into();
+        lines.push_str(&format!("{finding}\n"));
+        write_file(&harness.profiler_dir.path().join("findings.ndjson"), &lines);
+        harness.webhooks.follow_findings(&endpoints).await;
+        assert_eq!(
+            harness
+                .webhooks
+                .store()
+                .deliveries(&endpoint, 200)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "audit {count} must not send an unchanged recurrence"
+        );
+    }
+    let arguments = serde_json::from_value(json!({"since": "2026-11-05T10:00:00Z"})).unwrap();
+    let (caught_up, _) = crate::diagnostics::profiler::mcp::findings_page(
+        &Reader::new(harness.profiler_dir.path()),
+        &arguments,
+        Value::clone,
+    )
+    .unwrap();
+    assert_eq!(caught_up["findings"][0]["id"], "a");
+    assert_eq!(caught_up["findings"][0]["count"], 101);
+    // Positions survive restart; the existing finding must not be delivered again.
+    let harness = harness.restart().await;
+    harness.webhooks.shutdown().await;
+    harness.webhooks.follow_findings(&endpoints).await;
+    let mut expected = 1;
+    for (state, severity, sends) in [
+        ("resolved", "warn", false),
+        ("open", "warn", true),
+        ("open", "error", true),
+        ("resolved", "error", false),
+        ("open", "error", true),
+    ] {
+        // Neither count nor lastSeen needs to change for a state/severity transition.
+        finding["state"] = state.into();
+        finding["severity"] = severity.into();
+        lines.push_str(&format!("{finding}\n"));
+        write_file(&harness.profiler_dir.path().join("findings.ndjson"), &lines);
+        harness.webhooks.follow_findings(&endpoints).await;
+        expected += usize::from(sends);
+        let deliveries = harness
+            .webhooks
+            .store()
+            .deliveries(&endpoint, 200)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), expected, "{state}/{severity}");
+        let ids: std::collections::HashSet<_> =
+            deliveries.iter().map(|row| &row.event_id).collect();
+        assert_eq!(
+            ids.len(),
+            expected,
+            "each notification has its own event id"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_finding_positions_start_from_the_current_book_without_replaying() {
+    let harness = Harness::new_for_findings(&[("a", 100, "2026-11-05T10:00:00Z")]).await;
+    let (endpoint, _) = harness.endpoint(&[events::PROFILER_FINDING]).await;
+    harness.webhooks.shutdown().await;
+    harness
+        .webhooks
+        .store()
+        .set_position(
+            store::FINDINGS_POSITION,
+            json!({"lastSeen": "2026-11-05T09:00:00Z", "marks": {"a": 99}}).to_string(),
+        )
+        .await
+        .unwrap();
+    harness
+        .webhooks
+        .follow_findings(&harness.webhooks.store().endpoints().await.unwrap())
+        .await;
+    assert!(
+        harness
+            .webhooks
+            .store()
+            .deliveries(&endpoint, 200)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
