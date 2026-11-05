@@ -3869,7 +3869,17 @@ deliveries; an End keydown and a scroll to the end resume following, and at
 least three later deliveries rest with the end revealed
 (`mermaid-timeline-keyboard-takeover.json`). The key-stage trace is saved before
 its assertion as `mermaid-timeline-keyboard-key.json`, so a failed takeover
-retains its scroll and captured-row geometry. Last, with a long reply at the
+retains its scroll and captured-row geometry. The keyboard sampler resolves the
+visible scroller on each painted read and takes the reply geometry from that
+same list: retaining a scroller across replacement would mix a detached node's
+zero offset with the live reply's geometry (#215). Key counting follows the
+current list through a document listener. Delivery counts belong to the lowest
+keyboard reply, so earlier iterations cannot supply its completion; the final
+check also waits for the working row to disappear. A replacement that actually
+resets the scroll still fails the end-revealed check. The focused sampler
+regressions run with
+`node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/timeline-keyboard-samples.test.ts`.
+Last, with a long reply at the
 end, the reader wheels 40 px up, within LegendList's end threshold, and the
 bottom region (the composer overlay) grows by 120 px; then, back at the end,
 the reply's last row grows and the reader wheels 40 px up in the same frame,
