@@ -442,8 +442,9 @@ A server stop with a step that took 250 ms or more, recorded once per stage
 (#303). Each step is the stop of one service, timed from the end of the step
 before it. A stop with no slow step records nothing.
 
-- `stage`: `serve`, the HTTP drain from the stop request until the listener
-  closed, or `quiesce`, the services' stop, in order;
+- `stage`: `serve`, the HTTP drain from the stop request until `serve`
+  returns after draining existing connections, or `quiesce`, the services'
+  stop, in order;
 - `durationMs`: the stage so far;
 - `slowSteps`: `{ step, ms }` for each slow step, in order. `step` is a fixed
   name such as `http-drain`, `webhooks`, `turn-delivery`, `provider-runtime`,
