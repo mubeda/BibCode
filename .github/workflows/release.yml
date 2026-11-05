@@ -333,7 +333,7 @@ jobs:
             platform: mac
             target: dmg
             arch: arm64
-            jobTimeoutMinutes: 90
+            jobTimeoutMinutes: 150
           - label: macOS x64
             runner: macos-15-intel
             platform: mac
