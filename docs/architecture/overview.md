@@ -2859,12 +2859,16 @@ endpoints a person registers per environment ([user guide](../user/webhooks.md),
 
 - **Sources, never the broadcast.** The dispatcher reads X3's change feed through
   `mcp::tools::feed::page_after` (the page `changes_since` returns) from a stored
-  cursor, and the profiler's findings book from the `lastSeen` second and the
-  `(id, count)` marks it last delivered. Each read's deliveries and its new position
+  cursor, and the profiler's findings book against stored state and severity for
+  every tracked id. Only new findings, reopenings, and severity changes queue a
+  notification; unchanged recurrences do not. Each read's deliveries and its new position
   are written in one SQLite transaction (migration 61: `webhook_endpoints`,
   `webhook_deliveries`, `webhook_state`), so a restart resumes without loss or
   repeats. The engine's in-process event broadcast, which drops under load, is not a
   source; Authorized-clients changes only wake the dispatcher.
+  The first findings read starts from the current book, including when upgrading a
+  legacy count-based position. Each finding notification gets a distinct event id
+  independent of its count, persisted with its deliveries for retries and redelivery.
 - **Queue.** Delivery rows are the queue and the log: one request open per endpoint
   (a per-endpoint lock that the dispatcher, test events and redeliveries all take),
   oldest first, at most eight endpoints at once; retries after 30 s, 2, 5, 10 and 15

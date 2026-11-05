@@ -186,7 +186,8 @@ fn redacted_actor(actor: &Value) -> Option<Value> {
     Some(json!({ "kind": kind, "clientId": client_id }))
 }
 
-/// A profiler finding that appeared or recurred: `finding: { id, count, lastSeen }`.
+/// A new, reopened, or severity-changed finding: `finding: { id, count, lastSeen }`.
+/// Each emission gets its own id; queued retries and redeliveries retain that id.
 pub(crate) fn from_finding(id: &str, count: u64, last_seen: &str) -> Event {
     let mut fields = Map::new();
     fields.insert(
@@ -195,7 +196,7 @@ pub(crate) fn from_finding(id: &str, count: u64, last_seen: &str) -> Event {
     );
     Event {
         event_type: PROFILER_FINDING,
-        id: event_id(PROFILER_FINDING, &format!("{id}|{count}")),
+        id: format!("ev_{}", uuid::Uuid::new_v4().simple()),
         occurred_at: last_seen.to_owned(),
         thread_id: None,
         project_id: None,
