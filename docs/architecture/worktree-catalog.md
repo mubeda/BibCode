@@ -422,8 +422,10 @@ the filesystem and Git is abandoned after 30 s, and only managed directories
 whose owners and registrations were all read are compared. The catalog and
 process facts are audited regardless, and the scan's `worktree.audit` event says
 what was covered (`compared`, `processesRead`). Findings are fingerprinted by
-kind and reason, never a path, so each problem is one finding however many
-worktrees show it; the redacted path appears in the summary and evidence.
+kind and reason, never a raw path. Orphan directories also include hashes of
+their managed parent and relative directory name, so each leftover has its own
+finding and stops recurring when removed or registered. The redacted path
+appears in the summary and evidence; MCP keeps the file name outside home.
 
 | Finding                          | Severity | Condition                                                                                                                                          |
 | -------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |

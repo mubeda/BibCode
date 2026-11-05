@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     cite, emit,
-    findings::{FindingInput, Severity},
+    findings::{FindingInput, Severity, fingerprint},
     is_enabled, record_finding,
     redact::redact_path,
     runtime::Detector,
@@ -763,8 +763,8 @@ pub struct AuditFacts {
     pub managed_dirs: Vec<PathBuf>,
 }
 
-/// The findings one scan's facts show. Fingerprints hold only the kind and a reason, never a
-/// path, so each problem is one finding however many worktrees show it.
+/// The findings one scan's facts show. Orphans are keyed by hashed parent and relative
+/// directory names; other findings group by reason. No fingerprint holds a raw path.
 pub fn audit(facts: &AuditFacts) -> Vec<FindingInput> {
     let owned: HashSet<&Path> = facts
         .catalog
@@ -808,7 +808,7 @@ pub fn audit(facts: &AuditFacts) -> Vec<FindingInput> {
             .is_some_and(|name| name.to_string_lossy().starts_with('.'));
         if !hidden && !owned.contains(dir.as_path()) && !facts.git_registrations.contains_key(dir) {
             let path = redact(dir);
-            findings.push(finding(
+            let mut orphan = finding(
                 "worktree.orphan-dir",
                 Severity::Warn,
                 "unowned-unregistered",
@@ -818,7 +818,23 @@ pub fn audit(facts: &AuditFacts) -> Vec<FindingInput> {
                      and Git does not register it."
                 ),
                 json!({ "path": path }),
-            ));
+            );
+            // The scan lists direct children. Namespace their relative names by managed parent.
+            orphan.fingerprint_fields.extend([
+                fingerprint(
+                    "worktree.parent",
+                    &[dir.parent().unwrap_or(dir).to_string_lossy().into_owned()],
+                ),
+                fingerprint(
+                    "worktree.directory",
+                    &[dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()],
+                ),
+            ]);
+            findings.push(orphan);
         }
     }
     for (registered, leftover) in &facts.git_registrations {
@@ -990,10 +1006,8 @@ mod tests {
             ..AuditFacts::default()
         };
         let found = kinds(&facts);
-        assert!(found.contains(&(
-            "worktree.orphan-dir",
-            vec!["unowned-unregistered".to_owned()]
-        )));
+        assert_eq!(found[0].0, "worktree.orphan-dir");
+        assert_eq!(found[0].1[0], "unowned-unregistered");
         // Another tool's hidden entry is not BiBCode's leftover (#105).
         facts
             .base_dirs
@@ -1455,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn summaries_redact_the_home_directory_and_fingerprints_carry_no_paths() {
+    fn summaries_redact_home_and_orphan_fingerprints_hash_relative_paths() {
         let home = dirs::home_dir().expect("home dir");
         let path = home.join("work/wt");
         let facts = AuditFacts {
@@ -1463,11 +1477,29 @@ mod tests {
                 path: path.clone(),
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             }],
-            base_dirs: vec![home.join("work/orphan")],
+            base_dirs: vec![home.join("work/orphan-a"), home.join("work/orphan-b")],
+            managed_dirs: vec![home.join("work")],
             ..AuditFacts::default()
         };
         let findings = audit(&facts);
-        assert_eq!(findings.len(), 2);
+        assert_eq!(findings.len(), 3);
+        assert_ne!(
+            findings[1].fingerprint_fields,
+            findings[2].fingerprint_fields
+        );
+        let relocated = audit(&AuditFacts {
+            base_dirs: vec![PathBuf::from("/outside-home/work/orphan-a")],
+            managed_dirs: vec![PathBuf::from("/outside-home/work")],
+            ..AuditFacts::default()
+        });
+        assert_ne!(
+            findings[1].fingerprint_fields,
+            relocated[0].fingerprint_fields
+        );
+        assert_eq!(
+            findings[1].fingerprint_fields,
+            audit(&facts)[1].fingerprint_fields
+        );
         let home = home.to_string_lossy();
         for finding in findings {
             assert!(
@@ -1481,7 +1513,7 @@ mod tests {
                 finding
                     .fingerprint_fields
                     .iter()
-                    .all(|field| !field.contains('/'))
+                    .all(|field| !field.contains(['/', '\\']) && !field.contains("orphan"))
             );
         }
     }

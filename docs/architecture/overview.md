@@ -2006,7 +2006,10 @@ it.
 
   Nothing is reported once BiBCode is terminating.
 
-- **Worktree audit.** See [Worktree catalog: Audit](./worktree-catalog.md#audit).
+- **Worktree audit.** Orphan directories have distinct findings keyed by hashes
+  of their managed parent and relative directory name, never a raw path. MCP evidence
+  keeps the file name for paths outside home. See
+  [Worktree catalog: Audit](./worktree-catalog.md#audit).
 - **Git stacked actions (#158).** `git.runStackedAction` reports a failed
   commit, push, or request step as an `action_failed` item inside a stream that
   then ends successfully, so stream timing alone records only `first-item`.
