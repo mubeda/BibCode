@@ -329,9 +329,9 @@ describe("cross-platform CI contract", () => {
     const matrix = nativeDesktopRows(workflow);
     expect(matrix).toHaveLength(6);
     for (const row of matrix) {
-      // Intel's cold optimized probe and native package use distinct dependency
+      // macOS's cold optimized probe and native package use distinct dependency
       // feature sets, in addition to the unoptimized host test graph.
-      const minimum = row.platform === "mac" && row.arch === "x64" ? 240 : 120;
+      const minimum = row.platform === "mac" ? 240 : 120;
       expect(row.jobTimeoutMinutes, String(row.label)).toBeGreaterThanOrEqual(minimum);
     }
   });
