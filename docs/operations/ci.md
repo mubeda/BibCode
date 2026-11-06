@@ -130,7 +130,7 @@ the merge.
   Rust Cache keeps the binary in `~/.cargo/bin`. The macOS exception probe uses
   the same symbol profile so the dependencies both builds share compile once.
   Each matrix row declares its complete-job budget:
-  240 minutes for macOS Intel, and 120 minutes for the other five targets.
+  240 minutes for both macOS architectures, and 120 minutes for the other four targets.
   That budget includes setup, host tests, the macOS optimized exception-recovery
   probe, and native packaging without shortening any check or test-owned deadline.
   Debug host tests cannot warm the optimized artifacts; the optimized example
