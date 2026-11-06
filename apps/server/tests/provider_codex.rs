@@ -9629,15 +9629,15 @@ async fn activity_runtime_reconnect_and_shutdown_drop_stale_incoming_work() {
         }));
     let peer_a_task = tokio::spawn(peer_a.run());
     runtime.start().await.expect("initial runtime start");
-    let startup_events = runtime.collect_events(4).await;
+    let startup_events = timeout(Duration::from_secs(2), runtime.collect_events(3))
+        .await
+        .expect("startup publishes status and readiness without catalogue discovery");
     assert_eq!(
-        startup_events.last().map(|event| event.event_type.as_str()),
-        Some("session.ready")
-    );
-    assert!(
         startup_events
             .iter()
-            .any(|event| event.event_type == "mcp.status.updated")
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["session.connecting", "mcp.status.updated", "session.ready"]
     );
     peer_a_task.await.expect("initial peer");
 
@@ -9726,7 +9726,16 @@ async fn activity_runtime_reconnect_and_shutdown_drop_stale_incoming_work() {
         .reconnect(connection_b, new_incoming_rx)
         .await
         .expect("runtime reconnects");
-    runtime.collect_events(2).await;
+    let reconnect_events = timeout(Duration::from_secs(2), runtime.collect_events(3))
+        .await
+        .expect("reconnect publishes status and readiness");
+    assert_eq!(
+        reconnect_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["session.connecting", "mcp.status.updated", "session.ready"]
+    );
     tokio::task::yield_now().await;
     assert!(
         old_incoming_tx

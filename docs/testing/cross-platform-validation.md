@@ -388,6 +388,42 @@ over the guard threshold shows "Waiting for the conversation to be compacted."
 then the compaction, then the answer; Stop during that compaction leaves the
 message failed with Retry.
 
+For transport-size launch failures (#316), the Codex protocol regression feeds
+stdout past the real 8 MiB bound with and without a trailing LF, checks the
+nested Closed detail, and captures only framing counts and pending method names.
+The runtime regression drives that close through the supervisor and durable
+delivery worker: the row must fail with one attempt, one launch, and one
+`delivery.failing` finding of class `transport-line-too-long`. Direct and nested
+ACP errors share the launch classification for Cursor and Grok. Restart recovery
+of a row left sending must stop after one oversized launch, keep the row
+uncertain across delivery-service restart, and record the same profiler class.
+Run:
+
+```sh
+cargo test -p bibcode-server --lib oversized_stdout -j 2
+cargo test -p bibcode-server --lib transport_line_too_long -j 2
+cargo test -p bibcode-server --lib mcp_catalogue -j 2
+cargo test -p bibcode-server --lib mcp_status -j 2
+```
+
+The MCP catalogue fixture answers any `mcpServerStatus/list` request with a
+synthetic response above the stdout bound. Both new-thread startup and
+same-thread resume must reach ready, publish notification-derived status, and
+complete two followup turns on the same provider thread. Refresh must preserve
+the observed status without requesting the catalogue. The actor/runtime tests
+also cover notification filtering, reconnect replacement, cancellation,
+concurrent refresh during opening, and ordered publication. These fixtures
+prove the MCP mechanism; they do not identify a production incident's emitter.
+
+For a native UI check, use a disposable provider home and BiBCode data root
+with synthetic threads and MCP fixtures. Confirm connected statuses and
+actionable authentication failures from startup notifications (an unauthenticated
+OAuth server may show Error with login instructions), refresh retention, and
+continuation in the same thread. A server with no notification may be absent from the status popover;
+model tool availability is independent of that popover. Do not resume live user
+threads to reproduce this failure or collect provider payloads. Pending-method
+logs provide attribution without conversation data.
+
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
 Likewise, end a turn while a provider subagent keeps running: the session must stay
