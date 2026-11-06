@@ -2240,9 +2240,10 @@ command replays as rejected and never deletes. The Rust field is omitted when
 unknown fields, so an older server would ignore `onlyIfUnused` and delete a
 used side chat: the client sends it only to a server that advertises
 `capabilities.threadDeleteOnlyIfUnused`, and only for a side chat whose shell
-shows no turn or user message and that this page has not sent to (every
-`thread.turn.start` from `ChatView` and the `:btw` send note it first). A
-refusal archives the side chat through the normal close (interrupt, then
+shows no turn or user message and that this page has not sent to. A committed
+send in `ChatView` is noted before the title, settings, and attachment round
+trips that precede `thread.turn.start`, and the `:btw` send notes it before its
+turn. A refusal archives the side chat through the normal close (interrupt, then
 `thread.archive`); an interrupted delete is uncertain, as an interrupted
 archive is. A delete settles the close as an archive does: the shell that
 reaches its sequence no longer lists the panel, and it never reaches **Reopen

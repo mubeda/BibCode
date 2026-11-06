@@ -1099,7 +1099,8 @@ function ChatViewContent(props: ChatViewProps) {
   const startThreadTurnCommand = useAtomCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
-  // Every send is noted first, so closing an unused side chat while it goes out archives it.
+  // Noted again at the turn call, including the attachment replay below. onSend and
+  // plan follow-up note earlier: title, settings, and uploads run before this call.
   const startThreadTurn = useCallback<typeof startThreadTurnCommand>(
     (value, runOptions) => {
       markChatPanelSent(scopeThreadRef(value.environmentId, value.input.threadId));
@@ -5748,6 +5749,11 @@ function ChatViewContent(props: ChatViewProps) {
 
       const messageIdForSend = newMessageId();
       sendInFlightRef.current = true;
+      // Before title, settings, and attachment round trips. A close during those
+      // awaits must archive an unused side chat, not delete the question with it.
+      if (isServerThread) {
+        markChatPanelSent(scopeThreadRef(environmentId, threadIdForSend));
+      }
       if (!enqueue && composerAttachments.length === 0)
         beginLocalDispatch({
           preparingWorktree: Boolean(baseBranchForWorktree),
@@ -6543,6 +6549,9 @@ function ChatViewContent(props: ChatViewProps) {
       });
 
       sendInFlightRef.current = true;
+      // Settings are saved before the turn. Note the send first so a close during
+      // that round trip archives an unused side chat instead of deleting it.
+      markChatPanelSent(scopeThreadRef(activeThread.environmentId, threadIdForSend));
       beginLocalDispatch({
         preparingWorktree: false,
         threadId: threadIdForSend,
