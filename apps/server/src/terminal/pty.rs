@@ -2064,6 +2064,7 @@ mod tests {
     fn setup_failure_kills_the_unix_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let child_pid_file = directory.path().join("descendant-pid.txt");
+        std::fs::write(&child_pid_file, "").unwrap();
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -2086,18 +2087,20 @@ mod tests {
         let guard = SpawnedChildGuard::new_with_process_group(child, Some(process_group));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !child_pid_file.is_file() {
+        let descendant_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&child_pid_file)
+                && let Some(pid) = contents
+                    .strip_suffix('\n')
+                    .and_then(|pid| pid.parse::<i32>().ok())
+            {
+                break pid;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "fixture descendant did not publish its process id"
             );
             std::thread::sleep(Duration::from_millis(20));
-        }
-        let descendant_pid = std::fs::read_to_string(&child_pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        };
         assert_ne!(descendant_pid, process_group);
 
         drop(guard);
