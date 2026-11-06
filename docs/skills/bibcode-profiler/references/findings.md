@@ -329,10 +329,13 @@ occurrence.
 - **Raised when:** a message BiBCode was delivering to a provider fails for good
   without reaching it, once per delivery: the provider refused its own
   configuration (`provider-configuration`; Codex answers `thread/start` or
-  `thread/resume` with `-32600` "failed to load configuration"), or the twentieth
+  `thread/resume` with `-32600` "failed to load configuration"), a Codex, Cursor,
+  or Grok launch closed by an oversized stdio line (`transport-line-too-long`,
+  #316), or the twentieth
   attempt in a row ended not sent (`attempts-exhausted`). After a restart, a
   message left sending whose check cannot start the provider raises the same:
-  `provider-configuration` when the provider refuses its configuration, and
+  `provider-configuration` when the provider refuses its configuration,
+  `transport-line-too-long` after one oversized transport close, and
   `attempts-exhausted` after the twentieth failed launch in that run; the
   message is then uncertain and is not sent again by itself. The thread shows the message as not
   delivered, with the provider's reason, until the person retries or dismisses

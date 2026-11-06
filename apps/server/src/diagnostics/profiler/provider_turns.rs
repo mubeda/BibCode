@@ -96,7 +96,8 @@ fn turn_failure_finding(
 
 /// Records a message delivery that failed for good without reaching its provider as a
 /// `delivery.failing` finding: the provider, the delivery's `attempts` and the `error_class`
-/// (`provider-configuration` or `attempts-exhausted`). Never the error text, a path or a title.
+/// (`provider-configuration`, `transport-line-too-long` or `attempts-exhausted`). Never error text,
+/// a path or a title.
 /// Does nothing while the profiler is off.
 pub fn record_delivery_failing(provider: &str, attempts: i64, error_class: &str) {
     #[cfg(test)]

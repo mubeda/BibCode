@@ -10,7 +10,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +28,7 @@ use super::{
     },
     mcp_status::{
         McpOpenCompletion, McpOpenReservation, McpStatusEffect, McpStatusHandle,
-        mcp_server_status_from_notification, refresh_mcp_status_snapshot, run_actor,
+        mcp_server_status_from_notification, run_actor,
     },
     model::{
         BuildTurnStartInput, CODEX_HISTORY_TURNS_PAGE_LIMIT, CODEX_REMOTE_JSON_TOO_LARGE,
@@ -697,11 +697,9 @@ pub async fn probe_provider(
 
 async fn run_mcp_status_effects(
     runtime: Weak<RuntimeInner>,
-    handle: McpStatusHandle,
     mut effects_rx: mpsc::UnboundedReceiver<McpStatusEffect>,
     cancellation: CancellationToken,
 ) {
-    let mut loads = JoinSet::new();
     loop {
         let effect = tokio::select! {
             biased;
@@ -710,25 +708,8 @@ async fn run_mcp_status_effects(
                 Some(effect) => effect,
                 None => break,
             },
-            Some(_) = loads.join_next(), if !loads.is_empty() => continue,
         };
         match effect {
-            McpStatusEffect::Load {
-                epoch,
-                generation,
-                root,
-            } => {
-                let Some(inner) = runtime.upgrade() else {
-                    break;
-                };
-                let connection = inner.connection.lock().await.clone();
-                drop(inner);
-                let handle = handle.clone();
-                loads.spawn(async move {
-                    let result = refresh_mcp_status_snapshot(&connection, &root).await;
-                    let _ = handle.load_finished(epoch, generation, result).await;
-                });
-            }
             McpStatusEffect::Snapshot(servers) => {
                 let Some(inner) = runtime.upgrade() else {
                     break;
@@ -749,14 +730,6 @@ async fn run_mcp_status_effects(
                     )
                     .await;
             }
-            McpStatusEffect::Warning(detail) => {
-                let Some(inner) = runtime.upgrade() else {
-                    break;
-                };
-                CodexSessionRuntime { inner }
-                    .emit("runtime.warning", None, None, json!({ "message": detail }))
-                    .await;
-            }
             McpStatusEffect::Complete(waiters) => {
                 #[cfg(test)]
                 if let Some(inner) = runtime.upgrade()
@@ -772,8 +745,6 @@ async fn run_mcp_status_effects(
             }
         }
     }
-    loads.abort_all();
-    while loads.join_next().await.is_some() {}
 }
 
 fn mcp_status_error(message: String) -> RuntimeError {
@@ -893,7 +864,6 @@ impl CodexSessionRuntime {
         let actor_task = tokio::spawn(run_actor(mcp_status_rx, mcp_status_effects_tx));
         let effect_task = tokio::spawn(run_mcp_status_effects(
             Arc::downgrade(&runtime.inner),
-            mcp_status,
             mcp_status_effects_rx,
             reconciliation_cancellation,
         ));
@@ -4279,10 +4249,7 @@ mod tests {
         },
         persistence::{Database, run_migrations},
         provider::codex::{
-            mcp_status::{
-                MCP_STATUS_PAGE_LIMIT, MCP_STATUS_PAGE_SIZE, MCP_STATUS_REQUEST_TIMEOUT,
-                McpServerState, McpServerStatus,
-            },
+            mcp_status::{McpServerState, McpServerStatus},
             model::ReconciliationThread,
             protocol::ConnectionConfig,
         },
@@ -4380,19 +4347,6 @@ mod tests {
             .await
             .expect("JSON-RPC write");
         writer.flush().await.expect("JSON-RPC flush");
-    }
-
-    fn assert_mcp_status_list_request(request: &Value, thread_id: &str, cursor: Option<&str>) {
-        let mut expected_params = json!({
-            "threadId": thread_id,
-            "limit": MCP_STATUS_PAGE_SIZE,
-            "detail": "toolsAndAuthOnly",
-        });
-        if let Some(cursor) = cursor {
-            expected_params["cursor"] = json!(cursor);
-        }
-        assert_eq!(request["method"], "mcpServerStatus/list");
-        assert_eq!(request["params"], expected_params);
     }
 
     fn reconciliation_test_options() -> CodexSessionOptions {
@@ -5383,145 +5337,135 @@ mod tests {
         assert_ne!(first.request_id, second.request_id);
     }
 
-    async fn assert_mcp_status_discovery_failure(responses: Vec<Value>, expected_warning: &str) {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
-        let peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
+    #[tokio::test]
+    async fn mcp_catalogue_oversize_thread_resumes_and_completes_followup_turns() {
+        // The peer would kill this transport if asked for its synthetic tool catalogue.
+        for resume in [true, false] {
+            let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+                runtime_test_connection();
+            let mut options = reconciliation_test_options();
+            if resume {
+                options.resume_cursor = Some("provider-root".into());
+            }
+            let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
+                options, connection, incoming, false,
             );
-            let start = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
-            )
-            .await;
-            let mut expected_cursor = None;
-            for response in responses {
-                let request = read_runtime_test_json(&mut reader).await;
-                assert_mcp_status_list_request(
-                    &request,
-                    "provider-root",
-                    expected_cursor.as_deref(),
+            let (completed_tx, mut completed_rx) = mpsc::channel(1);
+            let peer = tokio::spawn(async move {
+                let mut reader = BufReader::new(peer_stdin);
+                let mut writer = peer_stdout;
+                let initialize = read_runtime_test_json(&mut reader).await;
+                assert_eq!(initialize["method"], "initialize");
+                write_runtime_test_json(&mut writer, json!({"id":initialize["id"], "result":{}}))
+                    .await;
+                assert_eq!(
+                    read_runtime_test_json(&mut reader).await["method"],
+                    "initialized"
                 );
-                expected_cursor = response
-                    .get("nextCursor")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let response = if response.get("error").is_some() {
-                    json!({ "id": request["id"], "error": response["error"] })
-                } else {
-                    json!({ "id": request["id"], "result": response })
-                };
-                write_runtime_test_json(&mut writer, response).await;
-            }
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        runtime
-            .start()
-            .await
-            .expect("status discovery is best effort");
-        let events = timeout(Duration::from_secs(1), async {
-            let mut events = Vec::new();
-            loop {
-                let event = runtime.next_event().await.expect("runtime event");
-                let ready = event.event_type == "session.ready";
-                events.push(event);
-                if ready {
-                    return events;
+                let open = read_runtime_test_json(&mut reader).await;
+                assert_eq!(
+                    open["method"],
+                    if resume {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    }
+                );
+                if resume {
+                    assert_eq!(open["params"]["threadId"], "provider-root");
                 }
-            }
-        })
-        .await
-        .expect("session becomes ready");
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "session.connecting",
-                "mcp.status.updated",
-                "runtime.warning",
-                "session.ready"
-            ]
-        );
-        assert_eq!(events[0].payload, json!({}));
-        assert_eq!(events[1].payload, json!({ "servers": [] }));
-        assert!(
-            events[2].payload["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(expected_warning))
-        );
-        assert_eq!(events[3].payload, json!({}));
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        peer.await.expect("peer");
-    }
-
-    #[tokio::test]
-    async fn mcp_status_list_remote_errors_do_not_block_session_start() {
-        assert_mcp_status_discovery_failure(
-            vec![json!({
-                "error": { "code": -32000, "message": "MCP unavailable" }
-            })],
-            "MCP unavailable",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn mcp_status_list_malformed_pages_do_not_block_session_start() {
-        assert_mcp_status_discovery_failure(
-            vec![json!({ "data": "invalid", "nextCursor": null })],
-            "missing data array",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn mcp_status_list_repeated_cursors_do_not_block_session_start() {
-        assert_mcp_status_discovery_failure(
-            vec![
-                json!({ "data": [], "nextCursor": "repeat" }),
-                json!({ "data": [], "nextCursor": "repeat" }),
-            ],
-            "repeated nextCursor",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn mcp_status_list_blank_and_non_string_cursors_warn_then_ready() {
-        for next_cursor in [json!("   "), json!(7)] {
-            assert_mcp_status_discovery_failure(
-                vec![json!({ "data": [], "nextCursor": next_cursor })],
-                "response has invalid nextCursor",
-            )
-            .await;
+                write_runtime_test_json(
+                    &mut writer,
+                    json!({"method":"mcpServer/startupStatus/updated",
+                    "params":{"threadId":"provider-root", "name":"docs", "status":"ready"}}),
+                )
+                .await;
+                write_runtime_test_json(
+                    &mut writer,
+                    json!({"id":open["id"], "result":{"thread":{"id":"provider-root"}}}),
+                )
+                .await;
+                let mut turns = 0;
+                loop {
+                    let request = read_runtime_test_json(&mut reader).await;
+                    match request["method"].as_str().unwrap() {
+                        "mcpServerStatus/list" => {
+                            let response = json!({"id":request["id"], "result":{"data":[{
+                                "name":"docs", "authStatus":"unsupported", "tools":{
+                                    "large":{"name":"large", "description":"x".repeat(9_000_000), "inputSchema":{}}
+                                }
+                            }], "nextCursor":null}});
+                            let mut bytes = serde_json::to_vec(&response).unwrap();
+                            bytes.push(b'\n');
+                            assert!(bytes.len() > crate::provider::codex::protocol::CODEX_TRANSPORT_MESSAGE_MAX_BYTES);
+                            let _ = writer.write_all(&bytes).await;
+                            return turns;
+                        }
+                        "turn/start" => {
+                            assert_eq!(request["params"]["threadId"], "provider-root");
+                            turns += 1;
+                            let id = format!("turn-{turns}");
+                            write_runtime_test_json(
+                                &mut writer,
+                                json!({"id":request["id"], "result":{"turn":{"id":id}}}),
+                            )
+                            .await;
+                            completed_rx.recv().await.unwrap();
+                            write_runtime_test_json(&mut writer, json!({"method":"turn/completed", "params":{
+                                "threadId":"provider-root", "turn":{"id":id, "status":"completed"}
+                            }})).await;
+                        }
+                        "shutdown" => {
+                            write_runtime_test_json(
+                                &mut writer,
+                                json!({"id":request["id"], "result":null}),
+                            )
+                            .await;
+                            return turns;
+                        }
+                        method => panic!("unexpected method: {method}"),
+                    }
+                }
+            });
+            timeout(Duration::from_secs(5), async {
+                let session = runtime
+                    .start()
+                    .await
+                    .expect("start/resume survives the MCP catalogue");
+                assert_eq!(session.resume_cursor.as_deref(), Some("provider-root"));
+                let opening_events = drain_runtime_events(&runtime).await;
+                assert!(
+                    opening_events
+                        .iter()
+                        .any(|event| event.event_type == "session.ready")
+                );
+                assert!(opening_events.iter().any(|event| event.event_type
+                    == "mcp.status.updated"
+                    && event.payload == json!({"servers":[{"name":"docs", "state":"connected"}]})));
+                for index in 1..=2 {
+                    runtime.refresh_mcp_status().await;
+                    let result = runtime
+                        .send_turn(Some("synthetic followup".into()), vec![], None, None)
+                        .await
+                        .expect("same-thread followup accepted");
+                    assert_eq!(result.resume_cursor.as_deref(), Some("provider-root"));
+                    assert_eq!(result.turn_id, format!("turn-{index}"));
+                    completed_tx.send(()).await.unwrap();
+                    loop {
+                        let event = runtime.next_event().await.unwrap();
+                        if event.event_type == "turn.completed" {
+                            assert_eq!(event.turn_id.as_deref(), Some(result.turn_id.as_str()));
+                            assert_eq!(event.payload["state"], "completed");
+                            break;
+                        }
+                    }
+                }
+                runtime.shutdown().await.unwrap();
+                assert_eq!(peer.await.unwrap(), 2);
+            })
+            .await
+            .expect("same-thread recovery and continued delivery complete");
         }
-    }
-
-    #[tokio::test]
-    async fn mcp_status_list_ninth_distinct_cursor_is_bounded_before_session_ready() {
-        assert_mcp_status_discovery_failure(
-            (0..MCP_STATUS_PAGE_LIMIT)
-                .map(|index| json!({ "data": [], "nextCursor": format!("cursor-{index}") }))
-                .collect(),
-            "exceeded page limit",
-        )
-        .await;
     }
 
     #[test]
@@ -5632,26 +5576,6 @@ mod tests {
                 json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
             )
             .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "baseline",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
 
             let shutdown = read_runtime_test_json(&mut reader).await;
             assert_eq!(shutdown["method"], "shutdown");
@@ -5674,7 +5598,6 @@ mod tests {
                         "servers": [
                             { "name": "app-missing", "state": "connected" },
                             { "name": "app-null", "state": "connected" },
-                            { "name": "baseline", "state": "starting" },
                             { "name": "matching", "state": "connected" }
                         ]
                     }),
@@ -5711,27 +5634,14 @@ mod tests {
             let start = read_runtime_test_json(&mut reader).await;
             write_runtime_test_json(
                 &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
+                json!({"method":"mcpServer/startupStatus/updated", "params":{
+                    "threadId":"old-root", "name":"old-only", "status":"ready"
+                }}),
             )
             .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "old-root", None);
             write_runtime_test_json(
                 &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "old-only",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
+                json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
             )
             .await;
             let _ = hold_old_peer.await;
@@ -5777,26 +5687,6 @@ mod tests {
                 json!({ "id": resume["id"], "result": { "thread": { "id": "new-root" } } }),
             )
             .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "new-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "baseline",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
 
             let shutdown = read_runtime_test_json(&mut reader).await;
             assert_eq!(shutdown["method"], "shutdown");
@@ -5822,7 +5712,6 @@ mod tests {
                         "servers": [
                             { "name": "app-missing", "state": "connected" },
                             { "name": "app-null", "state": "connected" },
-                            { "name": "baseline", "state": "starting" },
                             { "name": "new-root-update", "state": "connected" }
                         ]
                     }),
@@ -5838,127 +5727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_status_notifications_on_both_open_boundaries_win_and_foreign_root_is_excluded() {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
-            reconciliation_test_options(),
-            connection,
-            incoming,
-            false,
-        );
-        let peer_runtime = runtime.clone();
-        let peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let start = read_runtime_test_json(&mut reader).await;
-            assert_eq!(start["method"], "thread/start");
-
-            for params in [
-                json!({
-                        "threadId": "provider-root",
-                        "name": "before-response",
-                        "status": "ready"
-                }),
-                json!({
-                        "threadId": "foreign-root",
-                        "name": "foreign",
-                        "status": "ready"
-                }),
-            ] {
-                peer_runtime
-                    .handle_notification("mcpServer/startupStatus/updated".to_owned(), params, 0)
-                    .await;
-            }
-
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "provider-root", None);
-            peer_runtime
-                .handle_notification(
-                    "mcpServer/startupStatus/updated".to_owned(),
-                    json!({
-                            "threadId": "provider-root",
-                            "name": "after-response",
-                            "status": "ready"
-                    }),
-                    0,
-                )
-                .await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [
-                            {
-                                "name": "before-response",
-                                "serverInfo": null,
-                                "tools": {},
-                                "resources": [],
-                                "resourceTemplates": [],
-                                "authStatus": "unsupported"
-                            },
-                            {
-                                "name": "after-response",
-                                "serverInfo": null,
-                                "tools": {},
-                                "resources": [],
-                                "resourceTemplates": [],
-                                "authStatus": "unsupported"
-                            }
-                        ],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
-
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        runtime.start().await.expect("runtime starts");
-        let events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("session.connecting", json!({})),
-                (
-                    "mcp.status.updated",
-                    json!({
-                        "servers": [
-                            { "name": "after-response", "state": "connected" },
-                            { "name": "before-response", "state": "connected" }
-                        ]
-                    }),
-                ),
-                ("session.ready", json!({})),
-            ]
-        );
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        peer.await.expect("peer");
-    }
-
-    #[tokio::test]
-    async fn mcp_status_open_and_two_public_refreshes_share_one_request_and_snapshot() {
+    async fn mcp_status_open_and_two_public_refreshes_share_one_snapshot_without_requests() {
         let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
             runtime_test_connection();
         let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
@@ -5985,44 +5754,20 @@ mod tests {
             bind_root_rx.await.expect("release root binding");
             write_runtime_test_json(
                 &mut writer,
+                json!({"method":"mcpServer/startupStatus/updated", "params":{
+                    "threadId":"provider-root", "name":"shared", "status":"starting"
+                }}),
+            )
+            .await;
+            write_runtime_test_json(
+                &mut writer,
                 json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
             )
             .await;
 
-            let mut first_page_requests = 0;
-            loop {
-                let request = read_runtime_test_json(&mut reader).await;
-                if request["method"] == "mcpServerStatus/list" {
-                    first_page_requests += 1;
-                    assert_mcp_status_list_request(&request, "provider-root", None);
-                    write_runtime_test_json(
-                        &mut writer,
-                        json!({
-                            "id": request["id"],
-                            "result": {
-                                "data": [{
-                                    "name": "shared",
-                                    "serverInfo": null,
-                                    "tools": {},
-                                    "resources": [],
-                                    "resourceTemplates": [],
-                                    "authStatus": "unsupported"
-                                }],
-                                "nextCursor": null
-                            }
-                        }),
-                    )
-                    .await;
-                    continue;
-                }
-                assert_eq!(request["method"], "shutdown");
-                write_runtime_test_json(
-                    &mut writer,
-                    json!({ "id": request["id"], "result": null }),
-                )
-                .await;
-                return first_page_requests;
-            }
+            let request = read_runtime_test_json(&mut reader).await;
+            assert_eq!(request["method"], "shutdown");
+            write_runtime_test_json(&mut writer, json!({"id":request["id"], "result":null})).await;
         });
 
         let start_runtime = runtime.clone();
@@ -6085,7 +5830,7 @@ mod tests {
         assert!(drain_runtime_events(&runtime).await.is_empty());
 
         runtime.shutdown().await.expect("runtime shuts down");
-        assert_eq!(peer.await.expect("peer"), 1);
+        peer.await.expect("peer");
     }
 
     #[tokio::test]
@@ -6113,13 +5858,6 @@ mod tests {
             write_runtime_test_json(
                 &mut writer,
                 json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": list["id"], "result": { "data": [], "nextCursor": null } }),
             )
             .await;
 
@@ -6181,6 +5919,11 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(drain_runtime_events(&runtime).await.is_empty());
 
+        runtime.refresh_mcp_status().await;
+        let refreshed = drain_runtime_events(&runtime).await;
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].payload, lifecycle.payload);
+
         runtime.shutdown().await.expect("runtime shuts down");
         peer.await.expect("peer");
     }
@@ -6209,13 +5952,6 @@ mod tests {
             write_runtime_test_json(
                 &mut writer,
                 json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": list["id"], "result": { "data": [], "nextCursor": null } }),
             )
             .await;
 
@@ -6294,171 +6030,6 @@ mod tests {
 
         runtime.shutdown().await.expect("runtime shuts down");
         peer.await.expect("peer");
-    }
-
-    #[tokio::test]
-    async fn mcp_status_actor_orders_reconnect_failure_before_ready_and_drops_old_root() {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
-            reconciliation_test_options(),
-            connection,
-            incoming,
-            false,
-        );
-        let (release_old_peer, hold_old_peer) = oneshot::channel();
-        let old_peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let start = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "old-only",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
-            let _ = hold_old_peer.await;
-        });
-
-        runtime.start().await.expect("initial runtime starts");
-        let initial_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            initial_events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("session.connecting", json!({})),
-                (
-                    "mcp.status.updated",
-                    json!({
-                        "servers": [{ "name": "old-only", "state": "starting" }]
-                    }),
-                ),
-                ("session.ready", json!({})),
-            ]
-        );
-
-        let (replacement, replacement_incoming, new_stdout, new_stdin, _new_stderr) =
-            runtime_test_connection();
-        let peer_runtime = runtime.clone();
-        let new_peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(new_stdin);
-            let mut writer = new_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let resume = read_runtime_test_json(&mut reader).await;
-            assert_eq!(resume["method"], "thread/resume");
-            assert_eq!(resume["params"]["threadId"], "old-root");
-            let incoming_gate = peer_runtime.inner.explicit_close.lock().await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "method": "mcpServer/startupStatus/updated",
-                    "params": {
-                        "threadId": "new-root",
-                        "name": "new-only",
-                        "status": "ready"
-                    }
-                }),
-            )
-            .await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": resume["id"], "result": { "thread": { "id": "new-root" } } }),
-            )
-            .await;
-            assert!(
-                timeout(
-                    Duration::from_millis(50),
-                    read_runtime_test_json(&mut reader)
-                )
-                .await
-                .is_err(),
-                "the thread response must not overtake the earlier wire notification"
-            );
-            drop(incoming_gate);
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "new-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "error": { "code": -32000, "message": "MCP unavailable on reconnect" }
-                }),
-            )
-            .await;
-
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        runtime
-            .reconnect(replacement, replacement_incoming)
-            .await
-            .expect("runtime reconnects despite MCP discovery failure");
-        let reconnect_events = drain_runtime_events(&runtime).await;
-        let event_types = reconnect_events
-            .iter()
-            .skip(1)
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(reconnect_events[0].event_type, "session.connecting");
-        assert_eq!(
-            event_types,
-            vec!["mcp.status.updated", "runtime.warning", "session.ready"]
-        );
-        assert_eq!(reconnect_events[0].payload, json!({}));
-        let snapshot_names = reconnect_events[1].payload["servers"]
-            .as_array()
-            .expect("complete MCP snapshot")
-            .iter()
-            .map(|server| server["name"].as_str().expect("server name"))
-            .collect::<Vec<_>>();
-        assert_eq!(snapshot_names, vec!["new-only"]);
-        assert!(
-            reconnect_events[2].payload["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("MCP unavailable on reconnect"))
-        );
-        assert_eq!(reconnect_events[3].payload, json!({}));
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        new_peer.await.expect("replacement peer");
-        release_old_peer.send(()).expect("release old peer");
-        old_peer.await.expect("old peer");
     }
 
     #[tokio::test]
@@ -6551,13 +6122,6 @@ mod tests {
                 json!({ "id": retry_start["id"], "result": { "thread": { "id": "provider-root" } } }),
             )
             .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": list["id"], "result": { "data": [], "nextCursor": null } }),
-            )
-            .await;
 
             let shutdown = read_runtime_test_json(&mut reader).await;
             assert_eq!(shutdown["method"], "shutdown");
@@ -6611,27 +6175,14 @@ mod tests {
             let start = read_runtime_test_json(&mut reader).await;
             write_runtime_test_json(
                 &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
+                json!({"method":"mcpServer/startupStatus/updated", "params":{
+                    "threadId":"old-root", "name":"old-only", "status":"ready"
+                }}),
             )
             .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "old-root", None);
             write_runtime_test_json(
                 &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "old-only",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
+                json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
             )
             .await;
             let _ = hold_old_peer.await;
@@ -6657,19 +6208,7 @@ mod tests {
             assert_eq!(abandoned_resume["params"]["threadId"], "old-root");
             resume_seen_tx.send(()).expect("report abandoned resume");
 
-            let mut retry_initialize = read_runtime_test_json(&mut reader).await;
-            if retry_initialize["method"] == "mcpServerStatus/list" {
-                assert_mcp_status_list_request(&retry_initialize, "old-root", None);
-                write_runtime_test_json(
-                    &mut writer,
-                    json!({
-                        "id": retry_initialize["id"],
-                        "error": { "code": -32000, "message": "refresh unavailable" }
-                    }),
-                )
-                .await;
-                retry_initialize = read_runtime_test_json(&mut reader).await;
-            }
+            let retry_initialize = read_runtime_test_json(&mut reader).await;
             assert_eq!(retry_initialize["method"], "initialize");
             write_runtime_test_json(
                 &mut writer,
@@ -6686,13 +6225,6 @@ mod tests {
             write_runtime_test_json(
                 &mut writer,
                 json!({ "id": retry_resume["id"], "result": { "thread": { "id": "old-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "old-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": list["id"], "result": { "data": [], "nextCursor": null } }),
             )
             .await;
 
@@ -6767,13 +6299,6 @@ mod tests {
                 json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
             )
             .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "old-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": list["id"], "result": { "data": [], "nextCursor": null } }),
-            )
-            .await;
             let _ = hold_old_peer.await;
         });
         runtime.start().await.expect("initial runtime starts");
@@ -6802,13 +6327,6 @@ mod tests {
             )
             .await;
 
-            let refresh = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&refresh, "old-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": refresh["id"], "result": { "data": [], "nextCursor": null } }),
-            )
-            .await;
             let shutdown = read_runtime_test_json(&mut reader).await;
             write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
                 .await;
@@ -6828,535 +6346,6 @@ mod tests {
         new_peer.await.expect("replacement peer");
         release_old_peer.send(()).expect("release old peer");
         old_peer.await.expect("old peer");
-    }
-
-    #[tokio::test]
-    async fn mcp_status_reconnect_pre_root_update_wins_successful_list_before_ready() {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
-            reconciliation_test_options(),
-            connection,
-            incoming,
-            false,
-        );
-        let (release_old_peer, hold_old_peer) = oneshot::channel();
-        let old_peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let start = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "old-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "old-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "context7",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
-            let _ = hold_old_peer.await;
-        });
-
-        runtime.start().await.expect("initial runtime starts");
-        let initial_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            initial_events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            vec!["session.connecting", "mcp.status.updated", "session.ready"]
-        );
-        assert_eq!(
-            initial_events[1].payload,
-            json!({ "servers": [{ "name": "context7", "state": "starting" }] })
-        );
-
-        let (replacement, replacement_incoming, new_stdout, new_stdin, _new_stderr) =
-            runtime_test_connection();
-        let peer_runtime = runtime.clone();
-        let (send_later_updates, receive_later_updates) = oneshot::channel();
-        let new_peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(new_stdin);
-            let mut writer = new_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let resume = read_runtime_test_json(&mut reader).await;
-            assert_eq!(resume["method"], "thread/resume");
-            assert_eq!(resume["params"]["threadId"], "old-root");
-            peer_runtime
-                .handle_notification(
-                    "mcpServer/startupStatus/updated".to_owned(),
-                    json!({
-                            "threadId": "new-root",
-                            "name": "context7",
-                            "status": "ready"
-                    }),
-                    0,
-                )
-                .await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": resume["id"], "result": { "thread": { "id": "new-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "new-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": list["id"],
-                    "result": {
-                        "data": [{
-                            "name": "context7",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
-
-            receive_later_updates
-                .await
-                .expect("release later lifecycle updates");
-            for (name, status) in [("context7", "ready"), ("barrier", "ready")] {
-                write_runtime_test_json(
-                    &mut writer,
-                    json!({
-                        "method": "mcpServer/startupStatus/updated",
-                        "params": {
-                            "threadId": "new-root",
-                            "name": name,
-                            "status": status
-                        }
-                    }),
-                )
-                .await;
-            }
-
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        runtime
-            .reconnect(replacement, replacement_incoming)
-            .await
-            .expect("runtime reconnects after successful MCP discovery");
-        let reconnect_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            reconnect_events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            vec!["session.connecting", "mcp.status.updated", "session.ready"]
-        );
-        assert_eq!(
-            reconnect_events[1].payload,
-            json!({ "servers": [{ "name": "context7", "state": "connected" }] })
-        );
-
-        send_later_updates
-            .send(())
-            .expect("send later lifecycle updates");
-        let barrier = timeout(Duration::from_secs(1), runtime.next_event())
-            .await
-            .expect("barrier lifecycle event arrives")
-            .expect("runtime event channel remains open");
-        assert_eq!(barrier.event_type, "mcp.status.updated");
-        assert_eq!(
-            barrier.payload,
-            json!({
-                "servers": [
-                    { "name": "barrier", "state": "connected" },
-                    { "name": "context7", "state": "connected" }
-                ]
-            })
-        );
-        tokio::task::yield_now().await;
-        assert!(drain_runtime_events(&runtime).await.is_empty());
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        new_peer.await.expect("replacement peer");
-        release_old_peer.send(()).expect("release old peer");
-        old_peer.await.expect("old peer");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mcp_status_silent_list_times_out_without_leaking_or_blocking_ready() {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let pending_connection = connection.clone();
-        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
-            reconciliation_test_options(),
-            connection,
-            incoming,
-            false,
-        );
-        let (list_seen, wait_for_list) = oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let start = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
-            )
-            .await;
-            let list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&list, "provider-root", None);
-            list_seen.send(()).expect("record silent list request");
-
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        let start_runtime = runtime.clone();
-        let start = tokio::spawn(async move { start_runtime.start().await });
-        wait_for_list.await.expect("silent list request arrives");
-        assert_eq!(pending_connection.pending_request_count().await, 1);
-
-        tokio::time::advance(MCP_STATUS_REQUEST_TIMEOUT + Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        start
-            .await
-            .expect("start task")
-            .expect("MCP timeout is non-fatal");
-
-        assert_eq!(pending_connection.pending_request_count().await, 0);
-        let events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "session.connecting",
-                "mcp.status.updated",
-                "runtime.warning",
-                "session.ready"
-            ]
-        );
-        assert_eq!(events[1].payload, json!({ "servers": [] }));
-        assert!(
-            events[2].payload["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("request timed out"))
-        );
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        peer.await.expect("peer");
-    }
-
-    #[tokio::test]
-    async fn mcp_status_authoritative_empty_and_terminal_eighth_page_succeed() {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
-            reconciliation_test_options(),
-            connection,
-            incoming,
-            false,
-        );
-        let peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let start = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": start["id"], "result": { "thread": { "id": "provider-root" } } }),
-            )
-            .await;
-            let initial_list = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&initial_list, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({ "id": initial_list["id"], "result": { "data": [], "nextCursor": null } }),
-            )
-            .await;
-
-            for page in 0..MCP_STATUS_PAGE_LIMIT {
-                let request = read_runtime_test_json(&mut reader).await;
-                let expected_cursor = (page > 0).then(|| format!("cursor-{page}"));
-                assert_mcp_status_list_request(
-                    &request,
-                    "provider-root",
-                    expected_cursor.as_deref(),
-                );
-                let terminal = page + 1 == MCP_STATUS_PAGE_LIMIT;
-                let data = if terminal {
-                    vec![json!({
-                        "name": "terminal",
-                        "serverInfo": null,
-                        "tools": {},
-                        "resources": [],
-                        "resourceTemplates": [],
-                        "authStatus": "unsupported"
-                    })]
-                } else {
-                    Vec::new()
-                };
-                write_runtime_test_json(
-                    &mut writer,
-                    json!({
-                        "id": request["id"],
-                        "result": {
-                            "data": data,
-                            "nextCursor": if terminal {
-                                Value::Null
-                            } else {
-                                json!(format!("cursor-{}", page + 1))
-                            }
-                        }
-                    }),
-                )
-                .await;
-            }
-
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        runtime.start().await.expect("runtime starts");
-        let initial_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            initial_events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("session.connecting", json!({})),
-                ("mcp.status.updated", json!({ "servers": [] })),
-                ("session.ready", json!({})),
-            ]
-        );
-
-        runtime.refresh_mcp_status().await;
-        let terminal_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            terminal_events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload.clone()))
-                .collect::<Vec<_>>(),
-            vec![(
-                "mcp.status.updated",
-                json!({
-                    "servers": [{ "name": "terminal", "state": "starting" }]
-                }),
-            )]
-        );
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        peer.await.expect("peer");
-    }
-
-    #[tokio::test]
-    async fn mcp_status_official_pages_emit_ordered_replacing_snapshots_without_warnings() {
-        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
-            runtime_test_connection();
-        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
-            reconciliation_test_options(),
-            connection,
-            incoming,
-            false,
-        );
-        let peer = tokio::spawn(async move {
-            let mut reader = BufReader::new(peer_stdin);
-            let mut writer = peer_stdout;
-            let initialize = read_runtime_test_json(&mut reader).await;
-            write_runtime_test_json(&mut writer, json!({ "id": initialize["id"], "result": {} }))
-                .await;
-            assert_eq!(
-                read_runtime_test_json(&mut reader).await["method"],
-                "initialized"
-            );
-            let start = read_runtime_test_json(&mut reader).await;
-            assert_eq!(start["method"], "thread/start");
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": start["id"],
-                    "result": {
-                        "thread": { "id": "provider-root" },
-                        "cwd": "/tmp/project",
-                        "model": "gpt-5.3-codex"
-                    }
-                }),
-            )
-            .await;
-
-            let first_page = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&first_page, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": first_page["id"],
-                    "result": {
-                        "data": [{
-                            "name": "context7",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "unsupported"
-                        }],
-                        "nextCursor": "next-page"
-                    }
-                }),
-            )
-            .await;
-            let second_page = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&second_page, "provider-root", Some("next-page"));
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": second_page["id"],
-                    "result": {
-                        "data": [
-                            {
-                                "name": "atlassian",
-                                "serverInfo": null,
-                                "tools": {},
-                                "resources": [],
-                                "resourceTemplates": [],
-                                "authStatus": "notLoggedIn"
-                            },
-                            {
-                                "name": "oauth",
-                                "serverInfo": null,
-                                "tools": {},
-                                "resources": [],
-                                "resourceTemplates": [],
-                                "authStatus": "oAuth"
-                            }
-                        ],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
-
-            let replacement = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&replacement, "provider-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": replacement["id"],
-                    "result": {
-                        "data": [{
-                            "name": "oauth",
-                            "serverInfo": null,
-                            "tools": {},
-                            "resources": [],
-                            "resourceTemplates": [],
-                            "authStatus": "oAuth"
-                        }],
-                        "nextCursor": null
-                    }
-                }),
-            )
-            .await;
-            let shutdown = read_runtime_test_json(&mut reader).await;
-            assert_eq!(shutdown["method"], "shutdown");
-            write_runtime_test_json(&mut writer, json!({ "id": shutdown["id"], "result": null }))
-                .await;
-        });
-
-        runtime.start().await.expect("runtime starts");
-        let initial_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            initial_events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("session.connecting", json!({})),
-                (
-                    "mcp.status.updated",
-                    json!({
-                        "servers": [
-                            {
-                                "name": "atlassian",
-                                "state": "needs-auth",
-                                "detail": "Authentication required."
-                            },
-                            { "name": "context7", "state": "starting" },
-                            { "name": "oauth", "state": "starting" }
-                        ]
-                    }),
-                ),
-                ("session.ready", json!({})),
-            ]
-        );
-
-        runtime.refresh_mcp_status().await;
-        let replacement_events = drain_runtime_events(&runtime).await;
-        assert_eq!(
-            replacement_events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload.clone()))
-                .collect::<Vec<_>>(),
-            vec![(
-                "mcp.status.updated",
-                json!({
-                    "servers": [{ "name": "oauth", "state": "starting" }]
-                }),
-            )]
-        );
-
-        runtime.shutdown().await.expect("runtime shuts down");
-        peer.await.expect("peer");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7392,16 +6381,6 @@ mod tests {
                         "cwd": "/tmp/project",
                         "model": "gpt-5.3-codex"
                     }
-                }),
-            )
-            .await;
-            let mcp_status = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&mcp_status, "old-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": mcp_status["id"].clone(),
-                    "result": { "data": [], "nextCursor": null }
                 }),
             )
             .await;
@@ -7572,16 +6551,6 @@ mod tests {
                         "cwd": "/tmp/project",
                         "model": "gpt-5.3-codex"
                     }
-                }),
-            )
-            .await;
-            let mcp_status = read_runtime_test_json(&mut reader).await;
-            assert_mcp_status_list_request(&mcp_status, "new-root", None);
-            write_runtime_test_json(
-                &mut writer,
-                json!({
-                    "id": mcp_status["id"].clone(),
-                    "result": { "data": [], "nextCursor": null }
                 }),
             )
             .await;
