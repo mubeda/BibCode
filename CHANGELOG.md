@@ -2,7 +2,7 @@
 
 ## [v0.15.2] - 2026-11-05
 
-BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308 since v0.15.1.
+BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308, PR #314, and issue #316 since v0.15.1.
 
 ### Chats and diffs
 
@@ -11,6 +11,8 @@ BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and di
 - A turn's changed-files tree starts collapsed. (#311)
 
 ### Providers
+
+- Codex no longer requests the MCP catalogue that can exceed its chat transport limit on new or resumed threads. Oversized stdout failures during launch stop automatic retries and preserve Retry/Dismiss recovery. MCP status now reflects startup notifications, so servers without notifications may be absent. (#316)
 
 - The Codex skill picker includes skills installed through plugins, including Superpowers. (#298)
 - Codex stderr logs no longer appear as raw **Codex warning** rows with ANSI escapes and incorrect severity. (#299)
@@ -23,6 +25,8 @@ BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and di
 - Android device previews distinguish an installed SDK missing its emulator from a missing SDK and show the appropriate installation advice. (#312)
 
 ### Regression coverage
+
+- The Unix PTY setup-failure test waits for a complete descendant PID before checking process-group cleanup. The macOS Intel CI build uses the same macOS 15 producer as releases. (#314)
 
 - Changed files coverage now clicks **View diff** through the chat and verifies that the selected diff stays open through same-turn plan updates. (#275)
 - The packaged resume-at-end check follows the active timeline through turn completion, avoiding stale scrollers and replies from history. (#215)
