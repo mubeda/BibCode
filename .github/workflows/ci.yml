@@ -369,7 +369,7 @@ jobs:
             platform: mac
             target: dmg
             arch: arm64
-            jobTimeoutMinutes: 120
+            jobTimeoutMinutes: 240
           # The release producer's runner (release.yml), so the Intel build
           # this tests and the cache it saves are the ones Release uses.
           # Seeded upgrade keeps macos-26-intel for newest-OS runtime coverage.
