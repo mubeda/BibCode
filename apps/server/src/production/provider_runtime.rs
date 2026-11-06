@@ -362,6 +362,10 @@ pub enum ProviderReconciliationOutcome {
     ProviderConfiguration {
         detail: String,
     },
+    /// An oversized transport close prevents reconciliation; the original send stays uncertain.
+    TransportLineTooLong {
+        detail: String,
+    },
     /// The reconciliation launch failed before it reached the provider, such as an app-server
     /// that exits before `initialize`. Restart recovery tries again with backoff, and counts
     /// these against its launch budget so a failure that never clears cannot relaunch forever.
@@ -612,6 +616,9 @@ pub enum ProviderRuntimeError {
     MissingExecutable { provider: String, binary: String },
     #[error("{provider} provider operation failed: {detail}")]
     Provider { provider: String, detail: String },
+    /// Retrying the same launch cannot make an oversized transport line fit.
+    #[error("{provider} provider operation failed: {detail}")]
+    TransportLineTooLong { provider: String, detail: String },
     /// Only absent/cursorless matching runtime state; conflicting identities remain rejected.
     #[error("{provider} provider operation failed: {detail}")]
     FrozenSessionUnavailable { provider: String, detail: String },
@@ -2099,6 +2106,14 @@ async fn deliver_orchestration_turn_with_identity(
                 Err(error) => {
                     let attempts = frozen_delivery.as_ref().map_or(0, |row| row.attempts);
                     note_provider_configuration_refusal(&error, attempts);
+                    if let ProviderRuntimeError::TransportLineTooLong { provider, .. } = &error {
+                        tracing::warn!(%provider, attempts, "transport line too long; failing the message delivery");
+                        crate::diagnostics::profiler::provider_turns::record_delivery_failing(
+                            provider,
+                            attempts,
+                            "transport-line-too-long",
+                        );
+                    }
                     return launch_failure_outcome(&error, &label);
                 }
             }
@@ -2172,15 +2187,15 @@ fn frozen_failure_outcome(
 
 /// A durable turn is replayed unchanged, so a launch refused for the turn's own options fails the
 /// delivery once, and so does a provider this BiBCode cannot drive, whose executable is missing,
-/// or that refuses its own configuration (each is refused again until its settings, installation
-/// or configuration change). Every other launch failure, such as another spawn error, is retried
-/// with backoff.
+/// refuses its own configuration, or exceeds its transport line bound. Every other launch
+/// failure, such as another spawn error, is retried with backoff.
 fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(error, Some(label));
     match error {
         ProviderRuntimeError::InvalidOption { .. } => ProviderDeliveryOutcome::Refused { detail },
         ProviderRuntimeError::IncompatibleProvider { .. }
         | ProviderRuntimeError::MissingExecutable { .. }
+        | ProviderRuntimeError::TransportLineTooLong { .. }
         | ProviderRuntimeError::ProviderConfiguration { .. } => {
             ProviderDeliveryOutcome::Rejected { detail }
         }
@@ -2191,6 +2206,75 @@ fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> Provider
 #[cfg(test)]
 mod delivery_failure_tests {
     use super::*;
+
+    #[test]
+    fn transport_line_too_long_rejects_direct_and_nested_launch_errors() {
+        use crate::provider::{codex::protocol::ProtocolError, cursor::acp::AcpProtocolError};
+
+        for provider in ["codex", "cursor", "grok"] {
+            let detail = if provider == "codex" {
+                ProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 8 * 1024 * 1024,
+                }
+                .to_string()
+            } else {
+                AcpProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 128 * 1024,
+                }
+                .to_string()
+            };
+            let closed = if provider == "codex" {
+                ProtocolError::Closed {
+                    reason: detail.clone(),
+                }
+                .to_string()
+            } else {
+                AcpProtocolError::Closed {
+                    reason: detail.clone(),
+                }
+                .to_string()
+            };
+            for detail in [detail, closed] {
+                let error = provider_error(provider)(detail.clone());
+                assert_eq!(
+                    launch_failure_outcome(&error, "Provider"),
+                    ProviderDeliveryOutcome::Rejected {
+                        detail: detail.clone()
+                    }
+                );
+                assert_eq!(
+                    frozen_failure_outcome(&error, None),
+                    ProviderDeliveryOutcome::Rejected { detail }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transport_size_classification_does_not_scrape_remote_request_messages() {
+        for (provider, detail) in [
+            ("codex", "Codex JSON-RPC connection is closed: stdout ended"),
+            (
+                "codex",
+                "Codex JSON-RPC request thread/resume failed (-32000): read line exceeded a remote limit",
+            ),
+            (
+                "claudeAgent",
+                "Codex JSON-RPC read line exceeded 64 bytes on stdout",
+            ),
+            (
+                "opencode",
+                "ACP JSON-RPC read line exceeded 64 bytes on stdout",
+            ),
+        ] {
+            assert!(matches!(
+                launch_failure_outcome(&provider_error(provider)(detail), "Provider"),
+                ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ));
+        }
+    }
 
     #[test]
     fn invalid_options_are_refused_with_the_same_delivery_detail() {
@@ -2278,6 +2362,7 @@ pub(crate) fn delivery_detail(
         // Drivers and BiBCode's own delivery ordering both raise this one, so its detail, without
         // the "{driver id} provider operation failed:" prefix, is what it says.
         ProviderRuntimeError::Provider { detail, .. }
+        | ProviderRuntimeError::TransportLineTooLong { detail, .. }
         | ProviderRuntimeError::FrozenSessionUnavailable { detail, .. }
         | ProviderRuntimeError::IncompatibleProvider { detail, .. } => detail.clone(),
         ProviderRuntimeError::Spawn { provider, detail } => {
@@ -2530,6 +2615,15 @@ pub async fn reconcile_orchestration_turn(
                     return ProviderReconciliationOutcome::ProviderConfiguration {
                         detail: delivery_detail(&error, Some(&label)),
                     };
+                }
+                Err(ProviderRuntimeError::TransportLineTooLong { provider, detail }) => {
+                    tracing::warn!(%provider, attempts = row.attempts, "transport line too long; stopping delivery recovery");
+                    crate::diagnostics::profiler::provider_turns::record_delivery_failing(
+                        &provider,
+                        row.attempts,
+                        "transport-line-too-long",
+                    );
+                    return ProviderReconciliationOutcome::TransportLineTooLong { detail };
                 }
                 // A launch that fails, such as an app-server that exits before `initialize`,
                 // counts against restart recovery's launch budget.
@@ -3279,6 +3373,172 @@ mod workspace_loss_tests {
             "runtimeMode":"full-access", "interactionMode":"default", "createdAt":BEFORE_LOSS,
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_stdout_delivery_stops_after_one_launch() {
+        assert_oversized_stdout_delivery_stops_after_one_launch(TurnDeliveryState::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_stdout_restart_recovery_stops_after_one_launch() {
+        assert_oversized_stdout_delivery_stops_after_one_launch(TurnDeliveryState::Uncertain).await;
+    }
+
+    async fn assert_oversized_stdout_delivery_stops_after_one_launch(
+        expected_state: TurnDeliveryState,
+    ) {
+        use crate::production::turn_delivery::TurnDeliveryService;
+        use crate::provider::codex::protocol::{
+            ConnectionConfig, IncomingEvent, JsonRpcConnection,
+        };
+
+        struct OversizedLaunch(AtomicUsize);
+        impl ProviderDriverFactory for OversizedLaunch {
+            fn create(
+                &self,
+                _: ProviderLaunchRequest,
+            ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>>
+            {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    let (connection, mut events) = JsonRpcConnection::spawn(
+                        std::io::Cursor::new(vec![b'x'; 65]),
+                        tokio::io::sink(),
+                        tokio::io::empty(),
+                        ConnectionConfig {
+                            max_stdout_line_bytes: 64,
+                            ..ConnectionConfig::default()
+                        },
+                    );
+                    assert!(matches!(
+                        events.recv().await,
+                        Some(IncomingEvent::Closed { .. })
+                    ));
+                    let error = connection
+                        .request("initialize", json!({}))
+                        .await
+                        .unwrap_err();
+                    Err(codex_start_error(error.into(), "unused-config"))
+                })
+            }
+        }
+        let f = Fixture::new(false).await;
+        let factory = Arc::new(OversizedLaunch(AtomicUsize::new(0)));
+        let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+            f.engine.clone(),
+            factory.clone(),
+            ActivityProjection::new(ActivityRepository::new(
+                f.engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ));
+        let command = turn("oversized", false);
+        let mut payload = serde_json::to_value(&command).unwrap();
+        freeze_delivery_route(
+            &f.engine,
+            &f._root.path().to_path_buf(),
+            &command,
+            &mut payload,
+        )
+        .await
+        .unwrap();
+        f.engine
+            .dispatch_with_admission(
+                command.clone(),
+                CommandAdmission {
+                    payload_digest: canonical_command_digest(&command).unwrap(),
+                    attachment_refs: Vec::new(),
+                    provider_turn: Some(NewProviderTurnDelivery {
+                        command_id: "oversized".into(),
+                        thread_id: "t1".into(),
+                        message_id: "oversized".into(),
+                        provider_instance_id: "codex".into(),
+                        provider_kind: "codex".into(),
+                        provider_session_id: None,
+                        delivery_key: "oversized-key".into(),
+                        payload,
+                        state: TurnDeliveryState::Pending,
+                        mode: TurnDeliveryMode::Start,
+                        created_at: BEFORE_LOSS.into(),
+                    }),
+                },
+                || {},
+            )
+            .await
+            .unwrap();
+        if expected_state == TurnDeliveryState::Uncertain {
+            f.engine
+                .repositories()
+                .claim_provider_turn("oversized".into(), BEFORE_LOSS.into())
+                .await
+                .unwrap()
+                .expect("leave the delivery sending before restart recovery");
+        }
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        let service = TurnDeliveryService::start(
+            f.engine.clone(),
+            supervisor.clone(),
+            f._root.path().to_path_buf(),
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let row = f
+                    .engine
+                    .repositories()
+                    .get_provider_turn_delivery("oversized".into())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.state == expected_state {
+                    assert_eq!(row.attempts, 1);
+                    let detail = row.last_error.unwrap();
+                    assert!(detail.contains(
+                        "connection is closed: Codex JSON-RPC read line exceeded 64 bytes on stdout"
+                    ), "{detail}");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deterministic transport failure rejects on its first attempt");
+        service.wake();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        service.shutdown().await;
+        if expected_state == TurnDeliveryState::Uncertain {
+            let recovered = TurnDeliveryService::start(
+                f.engine.clone(),
+                supervisor.clone(),
+                f._root.path().to_path_buf(),
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            recovered.shutdown().await;
+            assert_eq!(
+                f.engine
+                    .repositories()
+                    .get_provider_turn_delivery("oversized".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnDeliveryState::Uncertain,
+            );
+        }
+        assert_eq!(factory.0.load(Ordering::SeqCst), 1);
+        let findings: Vec<_> = crate::diagnostics::profiler::provider_turns::take_recorded()
+            .into_iter()
+            .filter(|(kind, _)| *kind == "delivery.failing")
+            .collect();
+        assert_eq!(
+            findings,
+            [(
+                "delivery.failing",
+                json!({"provider":"codex", "attempts":1, "errorClass":"transport-line-too-long"})
+            )]
+        );
+        supervisor.shutdown().await.unwrap();
+        f.shutdown().await;
     }
 
     /// A manual compaction of the fixture's live Codex conversation.
@@ -8818,6 +9078,7 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         }
         ProviderRuntimeError::Provider { .. }
         | ProviderRuntimeError::InvalidOption { .. }
+        | ProviderRuntimeError::TransportLineTooLong { .. }
         | ProviderRuntimeError::FrozenSessionUnavailable { .. }
         | ProviderRuntimeError::IncompatibleProvider { .. }
         | ProviderRuntimeError::ProviderConfiguration { .. } => "provider operation failure",
@@ -19872,9 +20133,34 @@ fn pipe_error(provider: &str, stream: &str) -> ProviderRuntimeError {
 fn provider_error<E: std::fmt::Display>(
     provider: &str,
 ) -> impl FnOnce(E) -> ProviderRuntimeError + '_ {
-    move |error| ProviderRuntimeError::Provider {
-        provider: provider.to_owned(),
-        detail: error.to_string(),
+    move |error| {
+        let detail = error.to_string();
+        // The protocol nests LineTooLong's Display in Closed before returning a pending request.
+        let line_too_long =
+            match provider {
+                "codex" => detail.starts_with("Codex JSON-RPC read line exceeded ")
+                    || detail.starts_with(
+                        "Codex JSON-RPC connection is closed: Codex JSON-RPC read line exceeded ",
+                    ),
+                "cursor" | "grok" => {
+                    detail.starts_with("ACP JSON-RPC read line exceeded ")
+                        || detail.starts_with(
+                            "ACP JSON-RPC connection is closed: ACP JSON-RPC read line exceeded ",
+                        )
+                }
+                _ => false,
+            };
+        if line_too_long {
+            ProviderRuntimeError::TransportLineTooLong {
+                provider: provider.to_owned(),
+                detail,
+            }
+        } else {
+            ProviderRuntimeError::Provider {
+                provider: provider.to_owned(),
+                detail,
+            }
+        }
     }
 }
 
