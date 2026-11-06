@@ -860,6 +860,11 @@ Disabled providers still show the corresponding control with an unavailable
 tooltip, but the control cannot open a status popover. Stale activity does not
 override the selected provider's capability.
 
+For Codex, the MCP popover shows status notifications from the current provider
+connection. Servers that have not reported a status may be absent, and an empty
+popover shows **Awaiting MCP status**. The popover does not determine which MCP
+tools the model can use.
+
 For Claude, the MCP popover starts with the status reported during session
 initialization and refreshes after successful provider responses. It preserves
 the last valid snapshot if a refresh is unavailable.

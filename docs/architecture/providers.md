@@ -140,7 +140,16 @@ it again."): the delivery fails with the actionable detail instead of
 relaunching the provider in a retry loop. A retry keeps the turn's original
 route, so it launches once the executable exists at that path; a changed
 Binary path takes a new message, sent after dismissing the failed one, which
-holds back the thread's later messages. Every other
+holds back the thread's later messages. A Codex, Cursor, or Grok launch closed
+because a stdout line exceeded its transport bound also fails once
+(`ProviderRuntimeError::TransportLineTooLong`, #316), preserving the nested
+protocol detail. It records `delivery.failing` with class
+`transport-line-too-long`. Restart recovery also stops after one such launch,
+leaving the original delivery uncertain for Retry or Dismiss. The transport
+bounds stay unchanged. Codex logs only
+the stream, maximum, bytes seen, whether LF was observed, and registered pending
+request methods; these methods do not identify which response or notification
+exceeded the bound. No payload or request parameters are logged. Every other
 launch failure, such as another spawn error, a port race, or a server that is
 slow to start, stays definitely not sent and is retried with backoff up to 30
 seconds between attempts.
@@ -723,6 +732,25 @@ provider-event stream, while timeout and shutdown paths remove all pending
 waiters. The response is applied only while that turn remains current, so a
 late response cannot overwrite a newer turn; failures remain nonfatal and the
 last valid stream-derived snapshot stays visible.
+
+Codex MCP status uses `mcpServer/startupStatus/updated` notifications only.
+It never requests `mcpServerStatus/list`: even `toolsAndAuthOnly` embeds tool
+schemas and can exceed the shared chat transport's 8 MiB stdout limit. This
+avoids the lab-proven MCP catalogue startup failure on both new and resumed
+threads without changing the model's access to MCP tools.
+
+The status actor stages at most 64 notifications during initialization and
+thread opening, then binds the returned root and publishes matching-root and
+app-scoped observations before `session.ready`. A successful reconnect starts
+with that connection's observations, including when it resumes the same root;
+a failed or cancelled opening retains the previous committed snapshot and
+releases joined refresh waiters. Foreign roots and malformed root identifiers
+are excluded. Status publication and caller completion remain ordered through
+one effect worker. Refresh republishes observed state without provider I/O or
+erasing it. Servers that emit no startup notification may be absent, and auth
+state is available only when reported by a notification; the list-only auth
+baseline is no longer available. The catalogue loader, paging limits, timeouts,
+and stale-load generations are removed because there is no discovery request.
 
 Claude MCP status uses the CLI's native status surfaces rather than filesystem
 configuration guesses. The adapter normalizes the `system:init` `mcp_servers`
