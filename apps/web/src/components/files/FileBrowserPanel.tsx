@@ -194,7 +194,21 @@ interface FileTreeViewMemory {
   readonly expanded: readonly string[];
   readonly selected: string | null;
 }
+const MAX_REMEMBERED_TREES = 32;
 const fileTreeViewMemory = new Map<string, FileTreeViewMemory>();
+
+function rememberFileTreeView(key: string, memory: FileTreeViewMemory): void {
+  // A Map iterates in insertion order, so the first key is the least recently saved.
+  fileTreeViewMemory.delete(key);
+  fileTreeViewMemory.set(key, memory);
+  if (fileTreeViewMemory.size > MAX_REMEMBERED_TREES) {
+    fileTreeViewMemory.delete(fileTreeViewMemory.keys().next().value!);
+  }
+}
+
+export function fileTreeViewMemorySize(): number {
+  return fileTreeViewMemory.size;
+}
 
 export function resetFileTreeViewMemory(): void {
   fileTreeViewMemory.clear();
@@ -252,8 +266,9 @@ export default function FileBrowserPanel({
   const expandedTreePaths = useMemo(() => expandedDirectoryTreePaths(entries), [entries]);
   const previousTreePathsRef = useRef<readonly string[]>([]);
   const viewKey = `${environmentId}:${cwd}`;
-  // Read once: the remount that follows a StrictMode cleanup must still find the memory.
-  const restoreViewRef = useRef(fileTreeViewMemory.get(viewKey) ?? null);
+  // Read in the first effect, not in render: a keyed replacement renders this panel before the
+  // outgoing panel's cleanup has saved its tree. Read once, so a StrictMode remount keeps it.
+  const restoreViewRef = useRef<FileTreeViewMemory | null | undefined>(undefined);
   const restoringSelectionRef = useRef(false);
   const treeLoadedRef = useRef(false);
   // A selection that just opened its file; the click that caused it must not open it again.
@@ -758,10 +773,11 @@ export default function FileBrowserPanel({
   });
 
   useEffect(() => {
+    restoreViewRef.current ??= fileTreeViewMemory.get(viewKey) ?? null;
     if (previousTreePathsRef.current === treePaths) return;
     entryKindsRef.current = entryKinds;
     previousTreePathsRef.current = treePaths;
-    const restore = treePaths.length > 0 ? restoreViewRef.current : null;
+    const restore = treePaths.length > 0 ? (restoreViewRef.current ?? null) : null;
     const keptExpanded = currentlyExpandedTreePaths(model, expandedTreePaths);
     const knownDirectories = new Set(expandedTreePaths);
     model.resetPaths(treePaths, {
@@ -819,7 +835,7 @@ export default function FileBrowserPanel({
   useEffect(
     () => () => {
       if (!treeLoadedRef.current) return;
-      fileTreeViewMemory.set(viewKey, {
+      rememberFileTreeView(viewKey, {
         expanded: currentlyExpandedTreePaths(model, expandedTreePathsRef.current),
         selected: model.getSelectedPaths().at(-1) ?? null,
       });

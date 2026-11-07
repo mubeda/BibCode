@@ -71,7 +71,10 @@ vi.mock("./projectFilesQueryState", () => ({
   }),
 }));
 
-import FileBrowserPanel, { resetFileTreeViewMemory } from "./FileBrowserPanel";
+import FileBrowserPanel, {
+  fileTreeViewMemorySize,
+  resetFileTreeViewMemory,
+} from "./FileBrowserPanel";
 
 const environmentId = EnvironmentId.make("environment-1");
 const threadRef = { environmentId, threadId: ThreadId.make("thread-1") };
@@ -81,19 +84,20 @@ describe("FileBrowserPanel with the real tree", () => {
   let root: Root;
   const onOpenFile = vi.fn();
 
-  const settle = async () => {
-    for (let i = 0; i < 5; i += 1) {
+  const settle = async (rounds = 5) => {
+    for (let i = 0; i < rounds; i += 1) {
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 20));
       });
     }
   };
-  const mount = async () => {
+  const mount = async (panelKey = "a", cwd = "/repo", waitMs = 5) => {
     await act(async () => {
       root.render(
         <FileBrowserPanel
+          key={panelKey}
           environmentId={environmentId}
-          cwd="/repo"
+          cwd={cwd}
           projectName="repo"
           threadRef={threadRef}
           availableEditors={[]}
@@ -102,7 +106,7 @@ describe("FileBrowserPanel with the real tree", () => {
         />,
       );
     });
-    await settle();
+    await settle(waitMs);
   };
   const row = (path: string): HTMLElement | null => {
     const host = container.querySelector("file-tree-container");
@@ -161,5 +165,24 @@ describe("FileBrowserPanel with the real tree", () => {
     expect(row("docs/readme.md")).toBeNull();
     // Restoring the selection must not reopen the file.
     expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("restores across a keyed replacement committed in one render", async () => {
+    await mount("thread-a");
+    await click("src/");
+    await click("src/b.ts");
+
+    // Two threads on one workspace: the new panel renders before the old one's cleanup saves.
+    await mount("thread-b");
+
+    expect(row("src/b.ts")).not.toBeNull();
+    expect(row("src/b.ts")!.getAttribute("data-item-selected")).not.toBeNull();
+  });
+
+  it("remembers at most 32 workspaces", async () => {
+    for (let i = 0; i < 34; i += 1) await mount(`k${i}`, `/repo-${i}`, 3);
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    expect(fileTreeViewMemorySize()).toBe(32);
   });
 });
