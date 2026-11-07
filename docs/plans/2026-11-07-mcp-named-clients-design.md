@@ -197,9 +197,10 @@ transaction:
 - After the transaction: remove the returned sessions and pairings from the cache, cancel
   their live connections, bump the generation, and emit `ClientRemoved` per session and
   `PairingLinkRemoved` per link that was in the cache.
-- **Emission order follows #294.** That lane (not yet merged, branch
-  `worktree-agent-a4d1e2711fc2d6292`) emits access changes under the `AuthService` state
-  lock: `self.emit_access_change(&state, change)` takes the held guard, so an emit after
+- **Emission order follows #294.** That lane (committed at `f57f63a2ea`, not yet merged)
+  emits access changes under the `AuthService` state lock; the watcher's
+  `reconcile_authority_snapshot` sends its changes under its own lock and returns
+  `Result<bool, AuthError>`, so the named-client fields reconcile through it unchanged: `self.emit_access_change(&state, change)` takes the held guard, so an emit after
   `drop(state)` does not compile. The cascade therefore mutates the cache and emits each
   `ClientRemoved` and `PairingLinkRemoved` inside the same guard, looping over the removed
   ids before dropping it. It adds no emission path of its own. If #294 changes shape
@@ -403,5 +404,5 @@ cascade revokes consumed ones).
 
 ## Not verified
 
-- #294's emit-under-lock helper as merged (reported by that lane, not yet committed).
+- #294's emit-under-lock helper as merged (`f57f63a2ea`, reported by that lane; not read here).
 - Behaviour on native Windows (no platform-specific code is added).
