@@ -419,7 +419,9 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
     }
 }
 
-/// The bootstrap's `fetch origin`, then the commit of `base_branch` on `origin`.
+/// The bootstrap's `fetch origin`, then the commit of `base_branch` on `origin`. Public only
+/// for `tests/git_system_config.rs`.
+#[doc(hidden)]
 pub async fn fetch_origin_base(
     cwd: &Path,
     base_branch: &str,
@@ -2263,6 +2265,11 @@ pub async fn capture_checkpoint(
 
 /// Restores the checkout at `cwd` to checkpoint `reference`, as a revert does. `false` when
 /// the ref is missing.
+///
+/// A test seam for `tests/git_system_config.rs` only: it skips the revert path, so it runs
+/// without the shared-checkout restore guard (#279). Production restores must go through that
+/// guard; wrap this seam in it once the guard lands rather than calling it elsewhere.
+#[doc(hidden)]
 pub async fn restore_checkpoint_ref(
     cwd: &Path,
     reference: &str,
@@ -2277,7 +2284,10 @@ pub async fn restore_checkpoint_ref(
     .await
 }
 
-/// Deletes checkpoint `reference`, as a revert does for the turns it drops.
+/// Deletes checkpoint `reference`, as a revert does for the turns it drops. A test seam for
+/// `tests/git_system_config.rs`, outside the #279 restore guard like
+/// [`restore_checkpoint_ref`].
+#[doc(hidden)]
 pub async fn delete_checkpoint_ref(
     cwd: &Path,
     reference: &str,
