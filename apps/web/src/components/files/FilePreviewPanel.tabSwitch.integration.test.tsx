@@ -125,7 +125,23 @@ vi.mock("~/state/use-atom-command", () => ({
         : vi.fn(),
 }));
 vi.mock("~/state/use-atom-query-runner", () => ({ useAtomQueryRunner: () => vi.fn() }));
-vi.mock("./FileBrowserPanel", () => ({ default: () => null }));
+// A tree with state of its own, so a test can tell a kept tree from a rebuilt one.
+vi.mock("./FileBrowserPanel", async () => {
+  const { useState } = await import("react");
+  return {
+    default: function FakeTree() {
+      const [expanded, setExpanded] = useState(false);
+      return (
+        <button
+          type="button"
+          data-tree
+          data-expanded={expanded}
+          onClick={() => setExpanded(true)}
+        />
+      );
+    },
+  };
+});
 vi.mock("./FileEditorToolbar", () => ({
   FileEditorToolbar: (props: { canUndo?: boolean; savePhase?: string }) => {
     fake.toolbar = props;
@@ -441,6 +457,62 @@ describe("FilePreviewPanel across a right-panel tab switch", () => {
       expect(fake.toolbar).toMatchObject({ canUndo: true, savePhase: "clean" });
       await act(async () => session.undo());
       expect(editorText()).toContain("original packaged text");
+    },
+  );
+
+  it.each([
+    { keep: true, survives: true },
+    { keep: false, survives: false },
+  ])(
+    "keeps the Files tab's tree state across a file tab while a Files tab exists ($keep)",
+    async ({ keep, survives }) => {
+      const registry = new FileEditingSessionRegistry<
+        FileEditingSession<FileCommentAnnotationGroup>
+      >();
+      const render = async (relativePath: string | null) => {
+        await act(async () => {
+          root.render(
+            <WorkerPoolContextProvider
+              poolOptions={{ workerFactory: () => new InThreadDiffsWorker() as never, poolSize: 1 }}
+              highlighterOptions={{
+                theme: "pierre-dark",
+                tokenizeMaxLineLength: 1_000,
+                useTokenTransformer: true,
+              }}
+            >
+              <FilePreviewPanel
+                environmentId={environmentId}
+                cwd="/repo"
+                projectName="repo"
+                relativePath={relativePath}
+                threadRef={threadRef}
+                composerDraftTarget={threadRef}
+                keybindings={[] as ResolvedKeybindingsConfig}
+                availableEditors={[]}
+                revealLine={null}
+                revealRequestId={0}
+                onOpenFile={vi.fn()}
+                onPendingChange={vi.fn()}
+                onConflictChange={vi.fn()}
+                editingSessions={registry}
+                keepExplorerMounted={keep}
+              />
+            </WorkerPoolContextProvider>,
+          );
+        });
+      };
+      const tree = () => container.querySelector<HTMLElement>("[data-tree]");
+
+      // The Files tab, with the file sidebar switched off: expand a folder.
+      await render(null);
+      await act(async () => tree()!.click());
+      expect(tree()?.dataset.expanded).toBe("true");
+
+      // A file opens in its own tab, then the Files tab comes back.
+      await render("pierre-edit.ts");
+      expect(tree() !== null).toBe(survives);
+      await render(null);
+      expect(tree()?.dataset.expanded).toBe(survives ? "true" : "false");
     },
   );
 });

@@ -1651,6 +1651,7 @@ function ChatViewContent(props: ChatViewProps) {
       : HOST_SURFACE_ID;
   const rightPanelSurfaceEligible = !isPanel;
   const renderedRightPanelSurfaces = rightPanelState.surfaces;
+  const hasFilesSurface = renderedRightPanelSurfaces.some((surface) => surface.kind === "files");
   const activeFileSurface =
     activeRightPanelSurface?.kind === "file" ? activeRightPanelSurface : null;
   const activePreviewState = useThreadPreviewState(activeThreadRef);
@@ -7228,6 +7229,7 @@ function ChatViewContent(props: ChatViewProps) {
           editingSessions={fileEditingSessions}
           workspaceUnavailable={workspaceUnavailable}
           diskCheckSignal={fileDiskCheckSignal}
+          keepExplorerMounted={hasFilesSurface}
         />
       </Suspense>
     ) : null
