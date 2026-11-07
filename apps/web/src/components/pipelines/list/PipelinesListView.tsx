@@ -37,6 +37,7 @@ import { Tabs, TabsList, TabsTab } from "../../ui/tabs";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
 import { PipelinesBranchFilter } from "./PipelinesBranchFilter";
 import { PipelineActions } from "../actions/PipelineActions";
+import { PipelinesColumnsRoot, PipelinesListHeader } from "./PipelinesColumns";
 import { PIPELINES_ROW_HEIGHT, PipelinesListRow } from "./PipelinesListRow";
 import { PipelinesWorkflowFilter } from "./PipelinesWorkflowFilter";
 import {
@@ -192,7 +193,7 @@ function PipelinesPages({
       revision={firstQuery.data?.revision ?? null}
       onSettled={onActionSettled}
     >
-      <div className="@container flex min-h-0 flex-1 flex-col">
+      <PipelinesColumnsRoot className="@container flex min-h-0 flex-1 flex-col">
         {message !== null ? (
           <div role="alert" className="space-y-2 border-b border-border p-4 text-sm">
             <p>{message}</p>
@@ -228,21 +229,23 @@ function PipelinesPages({
           </div>
         ) : null}
         {rows.length > 0 ? (
-          <LegendList<PipelinesRow>
-            ref={scrollRef}
-            className="min-h-0 flex-1 overflow-x-hidden"
-            role="list"
-            aria-label="Pipelines"
-            data={rows}
-            estimatedItemSize={PIPELINES_ROW_HEIGHT}
-            getFixedItemSize={getRowSize}
-            keyExtractor={rowKey}
-            initialScrollOffset={savedScrollTop}
-            renderItem={renderRow}
-            onScroll={(event) => {
-              scrollTopRef.current = event.nativeEvent.contentOffset.y;
-            }}
-          />
+          <div role="table" aria-label="Pipelines" className="flex min-h-0 flex-1 flex-col">
+            <PipelinesListHeader />
+            <LegendList<PipelinesRow>
+              ref={scrollRef}
+              className="min-h-0 flex-1 overflow-x-hidden"
+              role="rowgroup"
+              data={rows}
+              estimatedItemSize={PIPELINES_ROW_HEIGHT}
+              getFixedItemSize={getRowSize}
+              keyExtractor={rowKey}
+              initialScrollOffset={savedScrollTop}
+              renderItem={renderRow}
+              onScroll={(event) => {
+                scrollTopRef.current = event.nativeEvent.contentOffset.y;
+              }}
+            />
+          </div>
         ) : null}
         {query.isPending && rows.length === 0 ? (
           <div role="status" className="space-y-2 p-4">
@@ -286,7 +289,7 @@ function PipelinesPages({
             GitHub returns at most 1,000 filtered runs.
           </p>
         ) : null}
-      </div>
+      </PipelinesColumnsRoot>
     </PipelineActions.Provider>
   );
 }

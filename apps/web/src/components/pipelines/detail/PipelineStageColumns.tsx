@@ -1,10 +1,12 @@
 import type { PipelinesDetailStage, PipelinesJob, PipelinesJobGroup } from "@bibcode/contracts";
 import { Link } from "@tanstack/react-router";
 import { ChevronRightIcon, CircleStopIcon, PlayIcon, RotateCcwIcon } from "lucide-react";
-import { memo, useState, type ReactNode } from "react";
+import { memo, useState, type CSSProperties, type ReactNode } from "react";
+import { useResizableWidth } from "~/hooks/useResizableWidth";
 import { cn } from "../../../lib/utils";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
 import { PipelineActions } from "../actions/PipelineActions";
+import { PipelineColumnSeparator } from "../shared/PipelineColumnSeparator";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { formatPipelineDuration, pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { usePipelineLinks } from "./PipelineLinks";
@@ -124,17 +126,30 @@ function jobCountLabel(stage: PipelinesDetailStage): string {
   return `${count.toLocaleString()} ${count === 1 ? "job" : "jobs"}`;
 }
 
-/** One stage: its status, name and job count, then a row per job or parallel group. */
+/** Columns never get narrower than this (`min-w-64`); the row scrolls sideways instead. */
+const STAGE_MIN_WIDTH = 256;
+/** The widest a stage column grows: the user's setting, one value for every column. */
+const STAGE_WIDTH = { default: 480, min: STAGE_MIN_WIDTH, max: 960 } as const;
+const STAGE_WIDTH_KEY = "bibcode:pipelines-stage-width";
+
+/**
+ * One stage: its status, name and job count, then a row per job or parallel group. At
+ * the wide step it grows from 256 px up to the shared `--pipeline-stage-max`.
+ * `separator` is the column-width handle, passed to the first stage only.
+ */
 const PipelineStage = memo(function PipelineStage({
   stage,
   mutationsDisabledReason,
+  separator,
 }: {
   stage: PipelinesDetailStage;
   mutationsDisabledReason: string | null;
+  separator: ReactNode;
 }) {
   const status = pipelineStatusText(stage.status, stage.warnings);
   return (
-    <li className="flex min-w-0 flex-col gap-1 @min-[720px]/pipeline:w-64 @min-[720px]/pipeline:shrink-0">
+    <li className="relative flex min-w-0 flex-col gap-1 @min-[720px]/pipeline:min-w-64 @min-[720px]/pipeline:max-w-(--pipeline-stage-max) @min-[720px]/pipeline:flex-1 @min-[720px]/pipeline:basis-0">
+      {separator}
       <h3 className="flex min-w-0 items-center gap-2 px-2 text-sm font-medium">
         <span role="img" aria-label={status} title={status} className="inline-flex">
           <PipelineStatusIcon status={stage.status} warnings={stage.warnings} />
@@ -164,9 +179,11 @@ const PipelineStage = memo(function PipelineStage({
 });
 
 /**
- * A pipeline's stages in the host's order: side by side and scrolling sideways on a
- * wide panel (the `pipeline` container, 720 px and up), stacked on a narrow one. One
- * tree either way, so a 1,000-job run renders its rows once.
+ * A pipeline's stages in the host's order: side by side on a wide panel (the `pipeline`
+ * container, 720 px and up), stacked on a narrow one. Wide columns share the row, each
+ * between 256 px and the user's width (a separator on the first column sets it), and
+ * the row scrolls sideways only when the stages at 256 px do not fit. One tree either
+ * way, so a 1,000-job run renders its rows once.
  */
 export const PipelineStageColumns = memo(function PipelineStageColumns({
   stages,
@@ -175,18 +192,39 @@ export const PipelineStageColumns = memo(function PipelineStageColumns({
   stages: readonly PipelinesDetailStage[];
   mutationsDisabledReason: string | null;
 }) {
+  const { width, handlers, commitWidth } = useResizableWidth({
+    storageKey: STAGE_WIDTH_KEY,
+    defaultWidth: STAGE_WIDTH.default,
+    minWidth: STAGE_WIDTH.min,
+    maxWidth: STAGE_WIDTH.max,
+    edge: "right",
+  });
+  const separator = (
+    <PipelineColumnSeparator
+      label="Resize stage columns"
+      value={width}
+      min={STAGE_WIDTH.min}
+      max={STAGE_WIDTH.max}
+      handlers={handlers}
+      onResize={commitWidth}
+      onReset={() => commitWidth(STAGE_WIDTH.default)}
+      className="hidden @min-[720px]/pipeline:block"
+    />
+  );
   return (
     <ol
       aria-label="Stages"
       data-text-surface="background"
+      style={{ "--pipeline-stage-max": `${width}px` } as CSSProperties}
       className="flex min-w-0 flex-col gap-4 @min-[720px]/pipeline:flex-row @min-[720px]/pipeline:overflow-x-auto @min-[720px]/pipeline:pb-2"
     >
-      {stages.map((stage) => (
+      {stages.map((stage, index) => (
         // Stage names are unique within a pipeline; GitHub has the one "Jobs" column.
         <PipelineStage
           key={stage.name}
           stage={stage}
           mutationsDisabledReason={mutationsDisabledReason}
+          separator={index === 0 ? separator : null}
         />
       ))}
     </ol>

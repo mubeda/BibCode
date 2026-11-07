@@ -46,7 +46,19 @@ const h = vi.hoisted(() => ({
   reads: vi.fn(),
   // Reads in flight; `settle` answers them in a later turn, as the atom runtime does.
   inflight: [] as (() => void)[],
+  rowRenders: vi.fn(),
 }));
+vi.mock("../usePipelineHoverPrefetch", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../usePipelineHoverPrefetch")>();
+  return {
+    ...actual,
+    // Called once per row render, so it counts them.
+    usePipelineHoverPrefetch: (...args: Parameters<typeof actual.usePipelineHoverPrefetch>) => {
+      h.rowRenders();
+      return actual.usePipelineHoverPrefetch(...args);
+    },
+  };
+});
 vi.mock("../../../state/pipelines", () => ({
   pipelinesEnvironment: {
     list: h.list,
@@ -239,6 +251,7 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   usePipelinesStore.setState({ byProjectKey: {} });
+  localStorage.clear();
   h.first = pipelinesPage([pipelineRow], { nextCursor: "c2" });
   h.second = pipelinesPage([{ ...pipelineRow, id: 4700, label: "#4700", title: "Second page" }]);
   h.error = null;
@@ -271,7 +284,7 @@ describe("PipelinesListView", () => {
       environmentId: "env",
       input: buildPipelinesListInput(DEFAULT_PIPELINES_FILTERS, "/repo"),
     });
-    const row = container.querySelector('[role="listitem"]')!;
+    const row = container.querySelector('[role="row"][aria-label]')!;
     expect(row.getAttribute("aria-label")).toBe("#4821 Failed");
     expect(row.textContent).toContain("Fix connection recovery");
     expect(row.textContent).toContain("main");
@@ -490,5 +503,109 @@ describe("PipelinesListView request budget", () => {
     await render({ provider: "github" });
     await runFor(HOUR);
     expect(h.requestTimerRead).not.toHaveBeenCalled();
+  });
+});
+
+describe("PipelinesListView columns", () => {
+  const rootGrid = () =>
+    container
+      .querySelector<HTMLElement>(".\\@container")!
+      .style.getPropertyValue("--pipelines-grid-full");
+  const separator = (name: string) =>
+    container.querySelector<HTMLElement>(`[role="separator"][aria-label="${name}"]`)!;
+  const press = (element: HTMLElement, key: string) =>
+    act(() =>
+      element.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })),
+    );
+
+  it("names the five columns in a header above the rows, and drops it when the list is empty", async () => {
+    await render();
+    const names = [...container.querySelectorAll('[role="columnheader"]')].map((cell) =>
+      cell.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(names).toEqual(["Status", "Pipeline", "Created by", "Stages", "Actions"]);
+    expect(container.querySelector('[role="table"] [role="rowgroup"] [role="row"]')).not.toBeNull();
+    h.first = pipelinesPage([]);
+    await render();
+    expect(container.querySelector('[role="columnheader"]')).toBeNull();
+  });
+
+  it("resizes with the keyboard, persists, and restores the width after a reload", async () => {
+    await render();
+    const pipeline = separator("Resize Pipeline column");
+    expect(pipeline.getAttribute("aria-valuenow")).toBe("480");
+    expect(rootGrid()).toBe("144px minmax(240px,480px) 160px 160px 104px");
+    press(pipeline, "ArrowRight");
+    expect(rootGrid()).toBe("144px minmax(240px,496px) 160px 160px 104px");
+    press(separator("Resize Stages column"), "End");
+    press(separator("Resize Created by column"), "Home");
+    expect(rootGrid()).toBe("144px minmax(240px,496px) 96px 360px 104px");
+    expect(localStorage.getItem("bibcode:pipelines-list-pipeline-width")).toBe("496");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await render();
+    expect(rootGrid()).toBe("144px minmax(240px,496px) 96px 360px 104px");
+    press(separator("Resize Pipeline column"), "ArrowLeft");
+    press(separator("Resize Pipeline column"), "ArrowLeft");
+    expect(separator("Resize Pipeline column").getAttribute("aria-valuenow")).toBe("464");
+  });
+
+  it("resets a column on double-click and never leaves its bounds", async () => {
+    await render();
+    const stagesSeparator = separator("Resize Stages column");
+    for (let press_ = 0; press_ < 40; press_ += 1) press(stagesSeparator, "ArrowRight");
+    expect(stagesSeparator.getAttribute("aria-valuenow")).toBe("360");
+    act(() => stagesSeparator.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    expect(stagesSeparator.getAttribute("aria-valuenow")).toBe("160");
+  });
+
+  it("clamps stored widths and falls back to the default for a corrupt one", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    localStorage.setItem("bibcode:pipelines-list-pipeline-width", "99999");
+    localStorage.setItem("bibcode:pipelines-list-author-width", "{not json");
+    localStorage.setItem("bibcode:pipelines-list-stages-width", "1");
+    await render();
+    expect(rootGrid()).toBe("144px minmax(240px,960px) 160px 72px 104px");
+    error.mockRestore();
+  });
+
+  it("does not re-render a row while a column is resized", async () => {
+    await render();
+    expect(h.rowRenders).toHaveBeenCalled();
+    h.rowRenders.mockClear();
+    press(separator("Resize Pipeline column"), "ArrowRight");
+    press(separator("Resize Stages column"), "ArrowLeft");
+    expect(rootGrid()).toContain("496px");
+    expect(h.rowRenders).not.toHaveBeenCalled();
+  });
+
+  it("removes a hidden column from the header and every row, and remembers the choice", async () => {
+    localStorage.setItem("bibcode:pipelines-list-hidden-columns", JSON.stringify(["author"]));
+    await render();
+    const headers = [...container.querySelectorAll('[role="columnheader"]')].map((cell) =>
+      cell.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(headers).toEqual(["Status", "Pipeline", "Stages", "Actions"]);
+    expect(container.querySelector('[role="row"][aria-label]')!.textContent).not.toContain(
+      "Ana Rossi",
+    );
+    expect(rootGrid()).toBe("144px minmax(240px,480px) 160px 104px");
+  });
+
+  it("hides a column from the header menu", async () => {
+    await render();
+    await act(async () =>
+      container
+        .querySelector<HTMLElement>('[aria-label="Choose columns"]')!
+        .dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    );
+    const item = [...document.querySelectorAll('[role="menuitemcheckbox"]')].find(
+      (candidate) => candidate.textContent === "Stages",
+    ) as HTMLElement;
+    expect(item.getAttribute("aria-checked")).toBe("true");
+    await act(async () => item.click());
+    expect(localStorage.getItem("bibcode:pipelines-list-hidden-columns")).toBe('["stages"]');
+    expect(rootGrid()).toBe("144px minmax(240px,480px) 160px 104px");
+    expect(container.querySelector('ol[aria-label="Stages"]')).toBeNull();
   });
 });

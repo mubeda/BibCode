@@ -15,7 +15,7 @@ import {
   RotateCcwIcon,
   TagIcon,
 } from "lucide-react";
-import { memo } from "react";
+import { memo, useLayoutEffect, useRef, useState } from "react";
 import { useOpenPrLink } from "../../../lib/openPullRequestLink";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
@@ -31,6 +31,8 @@ import {
   pipelineStatusText,
 } from "../shared/pipelineStatus.logic";
 import { usePipelineHoverPrefetch } from "../usePipelineHoverPrefetch";
+import { AUTHOR_CELL_CLASS, PIPELINES_GRID_CLASS, useShownColumns } from "./PipelinesColumns";
+import { visibleStageCount } from "./pipelinesColumns.logic";
 import { pipelineRowActions } from "./pipelinesList.logic";
 
 /** Every row has the same height, so the list never measures one. */
@@ -66,17 +68,52 @@ function RefLabel({
 }
 
 function StageStrip({ stages }: { stages: NonNullable<PipelinesRow["stages"]> }) {
+  const listRef = useRef<HTMLOListElement>(null);
+  const [shown, setShown] = useState(stages.length);
+  // The column is resizable and folds by breakpoint, so the strip measures itself; only
+  // this strip re-renders when its capacity changes.
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const measure = (width: number) => setShown(visibleStageCount(width, stages.length));
+    measure(list.clientWidth);
+    const observer = new ResizeObserver(([entry]) => measure(entry?.contentRect.width ?? 0));
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [stages.length]);
+  const hidden = stages.slice(shown);
+  const labelOf = (stage: (typeof stages)[number]) =>
+    `${stage.name}: ${pipelineStatusText(stage.status, stage.warnings).toLowerCase()}`;
   return (
-    <ol aria-label="Stages" className="flex min-w-0 items-center gap-0.5 overflow-hidden">
-      {stages.map((stage) => {
-        const label = `${stage.name}: ${pipelineStatusText(stage.status, stage.warnings).toLowerCase()}`;
+    <ol
+      ref={listRef}
+      aria-label="Stages"
+      className="flex min-w-0 items-center gap-0.5 overflow-hidden"
+    >
+      {stages.map((stage, index) => {
+        const label = labelOf(stage);
         return (
-          // GitLab stage names are unique within a pipeline.
-          <li key={stage.name} aria-label={label} title={label} className="inline-flex">
+          // GitLab stage names are unique within a pipeline. Stages that do not fit stay
+          // in the tree for assistive technology and are counted by the "+N" below.
+          <li
+            key={stage.name}
+            aria-label={label}
+            title={label}
+            className={index < shown ? "inline-flex" : "sr-only"}
+          >
             <PipelineStatusIcon status={stage.status} warnings={stage.warnings} />
           </li>
         );
       })}
+      {hidden.length > 0 ? (
+        <li
+          aria-hidden="true"
+          title={hidden.map(labelOf).join("\n")}
+          className="ms-0.5 shrink-0 text-xs text-muted-foreground tabular-nums"
+        >
+          +{hidden.length}
+        </li>
+      ) : null}
     </ol>
   );
 }
@@ -122,30 +159,33 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   const actions = pipelineRowActions(row, mutationsDisabledReason, provider, repositoryPermission);
   const target = { _tag: "pipeline", id: row.id } as const;
   const hostName = HOST_NAMES[provider];
+  const { author, stages } = useShownColumns();
   return (
     <div
-      role="listitem"
+      role="row"
       aria-label={`${row.label} ${status}`}
       data-text-surface="background"
-      className="relative flex min-w-0 items-center gap-3 border-b border-border px-4 hover:bg-accent/40"
+      className={`${PIPELINES_GRID_CLASS} relative min-w-0 border-b border-border hover:bg-accent/40`}
       style={{ height: PIPELINES_ROW_HEIGHT }}
       {...hoverPrefetch}
     >
-      <div className="flex w-6 shrink-0 justify-center @min-[720px]:hidden">
-        <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
-      </div>
-      <div className="hidden w-36 shrink-0 flex-col gap-0.5 @min-[720px]:flex">
-        <span className="flex items-center gap-1.5 text-sm">
+      <div role="cell" className="min-w-0">
+        <span className="flex justify-center @min-[720px]:hidden">
           <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
-          <span className="truncate">{status}</span>
         </span>
-        <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
-          {duration ? <span>{duration}</span> : null}
-          {duration && age ? <span aria-hidden="true">·</span> : null}
-          {age ? <span title={createdTitle}>{age}</span> : null}
+        <span className="hidden flex-col gap-0.5 @min-[720px]:flex">
+          <span className="flex items-center gap-1.5 text-sm">
+            <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
+            <span className="truncate">{status}</span>
+          </span>
+          <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
+            {duration ? <span>{duration}</span> : null}
+            {duration && age ? <span aria-hidden="true">·</span> : null}
+            {age ? <span title={createdTitle}>{age}</span> : null}
+          </span>
         </span>
       </div>
-      <div className="min-w-0 flex-1 space-y-0.5">
+      <div role="cell" className="min-w-0 space-y-0.5">
         <p className="truncate text-sm font-medium">
           {/* The title's hit area covers the row, so the whole row opens the pipeline. */}
           <Link
@@ -173,13 +213,18 @@ export const PipelinesListRow = memo(function PipelinesListRow({
           ))}
         </div>
       </div>
-      <div className="hidden w-40 shrink-0 truncate text-xs @min-[720px]:block">
-        {row.actor ? <PullRequestsActor actor={row.actor} preferName /> : null}
-      </div>
-      <div className="w-16 shrink-0 @min-[720px]:w-40">
-        {row.stages && row.stages.length > 0 ? <StageStrip stages={row.stages} /> : null}
-      </div>
-      <div className="relative z-10 flex shrink-0 items-center gap-1">
+      {author ? (
+        <div role="cell" className={`${AUTHOR_CELL_CLASS} min-w-0 truncate text-xs`}>
+          {row.actor ? <PullRequestsActor actor={row.actor} preferName /> : null}
+        </div>
+      ) : null}
+      {stages ? (
+        <div role="cell" className="min-w-0">
+          {row.stages && row.stages.length > 0 ? <StageStrip stages={row.stages} /> : null}
+        </div>
+      ) : null}
+      {/* The cell has a fixed track, so a row without Retry or Cancel keeps the columns aligned. */}
+      <div role="cell" className="relative z-10 flex items-center justify-end gap-1">
         {actions.retry ? (
           <PipelineActions.Button
             variant="ghost"
