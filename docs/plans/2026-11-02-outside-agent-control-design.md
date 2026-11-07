@@ -257,6 +257,8 @@ test names are proposals. Contract and Rust shapes change together, and
 
 ### P1c: named clients (split to a later release)
 
+Implementation-ready design: [2026-11-07 MCP named clients](./2026-11-07-mcp-named-clients-design.md) (#280).
+
 **Not in this batch.** This is the design the split-off issue starts from. It must be
 re-reviewed before any code. Revision 1 adds the parts the first review found missing
 (findings 2 to 4), and they are why it is split: each touches a separate owner (auth,
