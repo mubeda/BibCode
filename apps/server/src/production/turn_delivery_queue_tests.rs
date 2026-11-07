@@ -853,7 +853,7 @@ impl GatedRewind {
 
     /// Waits until `count` held lookups have started.
     async fn held_lookups(&self, count: usize) {
-        timeout(Duration::from_secs(10), async {
+        timeout(WAKE_WAIT, async {
             loop {
                 let entered = self.held_entered_notify.notified();
                 if self.held_entered.load(std::sync::atomic::Ordering::SeqCst) >= count {
@@ -1121,7 +1121,7 @@ impl RevertFixture {
         event_type: &str,
         matches: impl Fn(&Value) -> bool,
     ) -> crate::persistence::OrchestrationEvent {
-        timeout(Duration::from_secs(10), async {
+        timeout(WAKE_WAIT, async {
             loop {
                 let event = self.events.recv().await.unwrap();
                 if event.event.event_type == event_type && matches(&event.event.payload) {
@@ -1482,7 +1482,7 @@ async fn first_turn_captures_never_hold_back_a_thread_that_has_its_baseline() {
     }
     let mut delivered = HashSet::new();
     while delivered.len() < threads.len() {
-        let id = timeout(Duration::from_secs(10), routes.recv())
+        let id = timeout(WAKE_WAIT, routes.recv())
             .await
             .expect("every first turn is delivered")
             .unwrap();
@@ -1525,7 +1525,7 @@ async fn first_turn_captures_after_a_bootstrap_never_hold_back_a_thread_that_has
     }
     let mut delivered = HashSet::new();
     while delivered.len() < threads.len() {
-        let id = timeout(Duration::from_secs(10), routes.recv())
+        let id = timeout(WAKE_WAIT, routes.recv())
             .await
             .expect("every bootstrapped first turn is delivered")
             .unwrap();
@@ -1876,7 +1876,7 @@ async fn a_retried_first_turn_after_an_uncertain_delivery_never_captures_a_basel
     received_after_baseline(&mut routes, "n-first").await;
     // The provider edited the checkout before the delivery became uncertain.
     std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while row(&engine, "n-first").await.state != TurnDeliveryState::Uncertain {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2068,7 +2068,7 @@ async fn a_reverting_threads_later_effects_run_after_the_revert() {
         "{}:tracked.txt",
         crate::production::orchestration_effects::checkpoint_ref("t", 5)
     );
-    let contents = timeout(Duration::from_secs(10), async {
+    let contents = timeout(WAKE_WAIT, async {
         loop {
             if let Some(contents) = fixture.git_output(&["show", &captured]) {
                 return contents;
@@ -2717,7 +2717,7 @@ async fn a_failed_capture_racing_its_expiry_never_brings_back_a_reverted_turn() 
     assert!(fixture.worker_caught_up("b").await);
     std::fs::remove_file(lock).unwrap();
 
-    let reverted = timeout(Duration::from_secs(10), async {
+    let reverted = timeout(WAKE_WAIT, async {
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -2842,7 +2842,7 @@ async fn captured_in(
     thread: &str,
     turn_count: i64,
 ) -> crate::persistence::ProjectionCheckpoint {
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         loop {
             if let Some(checkpoint) = checkpoint_in(engine, thread, turn_count)
                 .await
@@ -2859,7 +2859,7 @@ async fn captured_in(
 
 /// Waits for a `checkpoint.capture.failed` activity of `turn_id` on thread `t`.
 async fn wait_for_capture_failure(engine: &OrchestrationEngine, turn_id: &str) {
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while capture_failures(engine, turn_id).await == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2938,7 +2938,7 @@ async fn revert_to(
 ) -> Result<(), String> {
     let mut events = engine.subscribe_events();
     engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":command_id, "threadId":"t", "turnCount":turn_count, "createdAt":TIME}))).await.unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         loop {
             let event = events.recv().await.unwrap();
             let payload = &event.event.payload;
@@ -3012,7 +3012,7 @@ async fn an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready(
     // The capture is taken; the hold limit passes while the worker still records it.
     tokio::time::sleep_until(ended + HOLD_LIMIT + Duration::from_millis(500)).await;
     fixture.rewind.refresh_release.notify_one();
-    let ready = timeout(Duration::from_secs(10), async {
+    let ready = timeout(WAKE_WAIT, async {
         loop {
             let checkpoint = engine
                 .repositories()
@@ -3067,7 +3067,7 @@ async fn a_stale_turn_is_never_a_revert_target_after_a_restart() {
     )
     .await
     .unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while engine
             .repositories()
             .get_checkpoint("t".to_owned(), 3)
@@ -3125,7 +3125,7 @@ async fn a_stale_turn_is_never_a_revert_target_after_a_restart() {
         .unwrap();
     engine.dispatch(command(json!({"type":"thread.turn.start", "commandId":"turn-4", "threadId":"t", "message":{"messageId":"m-4", "role":"user", "text":"next", "attachments":[]}, "createdAt":TIME}))).await.unwrap();
     engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":"revert-stale", "threadId":"t", "turnCount":3, "createdAt":TIME}))).await.unwrap();
-    let refused = timeout(Duration::from_secs(10), async {
+    let refused = timeout(WAKE_WAIT, async {
         loop {
             let event = events.recv().await.unwrap();
             if event.event.event_type == "thread.activity-appended"
@@ -3235,7 +3235,7 @@ async fn reverts_past_the_preparation_bound_restore_in_request_order_before_late
         engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":format!("revert-{thread}"), "threadId":thread, "turnCount":1, "createdAt":TIME}))).await.unwrap();
     }
     // Four reverts are being prepared, and the fifth already holds its chat.
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while callbacks.prepared.lock().unwrap().len() < 4 || !engine.thread_turns_reserved("e") {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3247,7 +3247,7 @@ async fn reverts_past_the_preparation_bound_restore_in_request_order_before_late
     quiet(&mut routes).await;
 
     callbacks.release.add_permits(1);
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         let mut reverted = 0;
         while reverted < THREADS.len() {
             let event = events.recv().await.unwrap();
