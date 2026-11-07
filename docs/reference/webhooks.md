@@ -60,9 +60,12 @@ editable fields. Its input rules:
   `webhook.test` is not chosen; it goes only to the endpoint it is sent to.
 - `projectId`: when set, only events of that project's threads are sent. Events that name
   no project, such as `profiler.finding` and agent transfers, are then not sent to it.
-- `pairedClientId`: an outside agent's `mcp-client` session that is still authorized.
-  Revoking that client (or **Stop**) turns the endpoint off with `disabledReason:
-  "client-revoked"`.
+- `pairedClientId`: an outside agent's `mcp-client` session that is still authorized, or a
+  named client's id (`bibcode mcp --client`). A run of a named client is stored as the
+  named client's id, so the endpoint stays on when that run exits and the next run takes
+  over. Revoking that client (or **Stop**) turns the endpoint off with `disabledReason:
+  "client-revoked"`; for a named client that ends the identity. The list returns
+  `pairedClientName`: the named client's name, else the live session's label, else `null`.
 - `enabled`: `false` keeps the endpoint but sends nothing to it.
 - `bearerToken`: sent as `Authorization: Bearer <token>` on every request (see
   [Headers and signature](#headers-and-signature)). Left out, the endpoint keeps its
@@ -344,7 +347,8 @@ and never resent). Finished deliveries are kept 7 days, at most 1,000 per endpoi
 - **Failures.** Ten failed deliveries in a row turn the endpoint off with
   `disabledReason: "failures"`; a success resets the count. A person re-enables it.
 - **Paired client revoked.** When the paired MCP client is revoked or stopped, the endpoint
-  turns off with `disabledReason: "client-revoked"`.
+  turns off with `disabledReason: "client-revoked"`. A named client's endpoint stays on
+  while its runs exit and restart, and turns off when a person ends the identity.
 - Turning an endpoint off, by hand or automatically, cancels its request in flight and
   abandons what was queued for it.
 

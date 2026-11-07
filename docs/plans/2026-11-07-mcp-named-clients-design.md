@@ -3,6 +3,15 @@
 Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #280.
 Verified at `e222d340ff` (`main` after v0.15.2). Line references are to that commit.
 
+**Implemented 2026-11-07 (lane L12).** Corrections to this note, recorded here:
+`--client` with `authorize`, `call` or `tools` exits 1, not 2, because `main.rs` maps every
+usage error to 1 and exit 2 means a person must answer in BiBCode. The named session takes
+its `mcp_named_client_id` from its link inside the fenced insert, so `NewAuthSession` gains
+no field; `revoke_session` uses `Repositories::revoke_auth_session_and_identity`, which runs
+the cascade described under [Ending an identity](#ending-an-identity). The boundary test
+found that a stored request past its 24 hours was still replayed until a later insert pruned
+it; reads of `mcp_tool_requests` now skip rows past the window.
+
 **Revision 1 (2026-11-07)** answers the Codex review (two P2 findings, see
 [Review findings and resolutions](#review-findings-and-resolutions)) and records the maintainer's
 answers to the four open questions as decisions 5, 7, 8 and 9.

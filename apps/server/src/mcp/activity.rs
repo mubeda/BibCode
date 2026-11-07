@@ -31,9 +31,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::control::{
-    Inner, McpControl, REQUEST_ROW_TTL_SECONDS, ToolCall, ToolSpec, invalid_argument, now_iso,
-};
+use super::control::{Inner, McpControl, ToolCall, ToolSpec, invalid_argument, now_iso};
 use crate::{
     auth::{MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome},
     orchestration::engine::MAX_THREAD_PURPOSE_CHARS,
@@ -72,11 +70,20 @@ pub(crate) async fn principal_actor(context: &RpcSessionContext) -> Option<Value
     if principal.subject != MCP_CLIENT_SUBJECT {
         return None;
     }
-    let label = context
-        .current_client_metadata()
-        .await
-        .and_then(|client| client.label);
-    Some(actor(&principal.session_id, label.as_deref()))
+    let session = context.current_client_session().await;
+    let label = session
+        .as_ref()
+        .and_then(|session| session.client.label.as_deref());
+    let mut actor = actor(&principal.session_id, label);
+    // The identity a named client (#280) keeps across runs, so Stop and panel ownership
+    // reach the work of its earlier runs.
+    if let Some(named) = session
+        .as_ref()
+        .and_then(|session| session.mcp_named_client.as_ref())
+    {
+        actor["namedClientId"] = named.id.as_str().into();
+    }
+    Some(actor)
 }
 
 /// An outside agent as an actor.
@@ -416,7 +423,7 @@ impl McpActivity {
         self.shared.turn_queries.fetch_add(1, Ordering::AcqRel);
         self.shared
             .database
-            .call(|connection| attributed_running_turns(connection, None))
+            .call(|connection| attributed_running_turns(connection, None, None))
             .await
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, "MCP activity could not read agents' running turns");
@@ -532,7 +539,7 @@ fn activity_stream(
 /// ran (or runs) under the first call, which has its own row.
 pub(crate) async fn is_retry(
     control: &McpControl,
-    session_id: &str,
+    scope: &str,
     arguments: &Map<String, Value>,
 ) -> bool {
     let Some(client_request_id) = arguments
@@ -542,19 +549,15 @@ pub(crate) async fn is_retry(
     else {
         return false;
     };
-    let session_id = session_id.to_owned();
-    let cutoff = (time::OffsetDateTime::now_utc()
-        - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
-    .format(&time::format_description::well_known::Rfc3339)
-    .unwrap_or_default();
+    let scope = scope.to_owned();
+    let cutoff = super::control::request_row_cutoff();
     control
         .repositories()
         .database()
         .call(move |connection| {
-            // The `bibcode thread` CLI's requests share one scope (see `stored_request`).
             Ok(connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM mcp_tool_requests WHERE client_request_id = ?2 AND created_at >= ?4 AND session_id = COALESCE((SELECT CASE WHEN client_label = ?3 THEN ?3 ELSE session_id END FROM auth_sessions WHERE session_id = ?1), ?1))",
-                params![session_id, client_request_id, super::thread_cli::LABEL, cutoff],
+                "SELECT EXISTS (SELECT 1 FROM mcp_tool_requests WHERE session_id = ?1 AND client_request_id = ?2 AND created_at >= ?3)",
+                params![scope, client_request_id, cutoff],
                 |row| row.get::<_, bool>(0),
             )?)
         })
@@ -570,6 +573,7 @@ pub(crate) async fn is_retry(
 pub(crate) async fn settle(
     control: &McpControl,
     session_id: &str,
+    scope: &str,
     label: Option<String>,
     spec: &ToolSpec,
     arguments: &Map<String, Value>,
@@ -584,17 +588,18 @@ pub(crate) async fn settle(
     if let (Some(client_request_id), "McpCancelledError") = (keyed, outcome_of(result).as_str()) {
         let database = control.repositories().database().clone();
         let session_id = session_id.to_owned();
+        let request_scope = scope.to_owned();
         let arguments = arguments.clone();
         let shutdown = control.shutdown_token();
         tokio::spawn(async move {
             let deadline = Instant::now() + OUTCOME_WAIT;
             while Instant::now() < deadline {
-                let (id, scope) = (client_request_id.clone(), session_id.clone());
+                let (id, scope) = (client_request_id.clone(), request_scope.clone());
                 let stored = database
                     .call(move |connection| {
                         Ok(connection.query_row(
-                            "SELECT state, outcome_json FROM mcp_tool_requests WHERE client_request_id = ?2 AND session_id = COALESCE((SELECT CASE WHEN client_label = ?3 THEN ?3 ELSE session_id END FROM auth_sessions WHERE session_id = ?1), ?1)",
-                            params![scope, id, super::thread_cli::LABEL],
+                            "SELECT state, outcome_json FROM mcp_tool_requests WHERE session_id = ?1 AND client_request_id = ?2",
+                            params![scope, id],
                             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
                         )?)
                     })
@@ -761,15 +766,17 @@ const RUNNING_TURNS_SQL: &str = "SELECT turn.thread_id, turn.turn_id,
    AND thread.deleted_at IS NULL
    AND message.message_id = turn.pending_message_id
    AND message.role = 'user' AND message.actor_json IS NOT NULL
-   AND (?1 IS NULL OR json_extract(message.actor_json, '$.clientId') = ?1)";
+   AND (?1 IS NULL OR json_extract(message.actor_json, '$.clientId') = ?1
+        OR (?2 IS NOT NULL AND json_extract(message.actor_json, '$.namedClientId') = ?2))";
 
 fn attributed_running_turns(
     connection: &rusqlite::Connection,
     client_id: Option<&str>,
+    named_client_id: Option<&str>,
 ) -> crate::persistence::Result<Vec<RunningTurn>> {
     let mut statement = connection.prepare_cached(RUNNING_TURNS_SQL)?;
     let rows = statement
-        .query_map([client_id], |row| {
+        .query_map([client_id, named_client_id], |row| {
             Ok(RunningTurn {
                 thread_id: row.get(0)?,
                 turn_id: row.get(1)?,
@@ -824,13 +831,25 @@ fn merge_active(presence: Vec<Value>, turns: &[RunningTurn]) -> Vec<Value> {
 
 /// Interrupts each running turn `session_id`'s agent started, and counts the turns
 /// interrupted and those whose interrupt failed. Running turns that cannot be read count as
-/// one failure, since Stop cannot say they stopped.
+/// one failure, since Stop cannot say they stopped. For a run of a named client (#280), the
+/// turns of each of its runs, live or exited, are its.
 pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -> McpStopOutcome {
     let client_id = session_id.to_owned();
     let running = control
         .repositories()
         .database()
-        .call(move |connection| attributed_running_turns(connection, Some(&client_id)))
+        .call(move |connection| {
+            use rusqlite::OptionalExtension as _;
+            let named: Option<String> = connection
+                .query_row(
+                    "SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = ?",
+                    [&client_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            attributed_running_turns(connection, Some(&client_id), named.as_deref())
+        })
         .await;
     let running = match running {
         Ok(running) => running,
@@ -1075,7 +1094,9 @@ mod tests {
                 let mut statement =
                     connection.prepare(&format!("EXPLAIN QUERY PLAN {RUNNING_TURNS_SQL}"))?;
                 let details = statement
-                    .query_map([Option::<String>::None], |row| row.get::<_, String>(3))?
+                    .query_map([Option::<String>::None, None], |row| {
+                        row.get::<_, String>(3)
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(details)
             })
