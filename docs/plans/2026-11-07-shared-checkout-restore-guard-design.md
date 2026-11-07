@@ -76,9 +76,23 @@ overwrites what that turn writes.
   `:236-255`). A linked worktree's top level is its own directory, so linked worktrees keep
   distinct keys. A directory outside Git falls back to the directory's own canonical key;
   it has no checkpoints, so nothing restores there.
-  - **Cache.** The engine keeps the key per stored path for the process. A thread's
-    `worktree_path` change or a project's `workspace_root` change (`project.meta-updated`)
-    drops that entry. One Git call per stored path per process, not per delivery.
+  - **No cache (Codex round 3).** A cached key would outlive a repository change that
+    touches no stored path. Example: `/repo/subdir` holds a nested repository whose `.git`
+    is later removed, so Git now resolves `/repo`. The key is therefore resolved fresh
+    every time it is needed:
+    - by the restore, for its own checkout and for **every candidate sibling**, under the
+      gate (step 5) and before any mutation;
+    - by each delivery and compaction, when it takes admission;
+    - by `order`, for the #129 `tails`.
+  - **Resolve failure.** If a candidate sibling's top level cannot be resolved (Git fails,
+    the directory is gone), the restore treats that sibling as sharing the checkout and
+    refuses: "BiBCode can't tell whether Panel, Codex works in this checkout. Try the
+    revert again, or check that chat's folder." It never guesses that a sibling is
+    elsewhere.
+  - **A delivery that keyed before the change.** A sibling delivery in flight may hold
+    admission under the old key. Step 5 therefore also counts any sibling whose thread
+    reservation is held (`thread_turns_reserved`, `engine.rs:2817-2820`) as writing
+    ("is starting a turn"). The restore never relies on the old key alone.
   - The gate, the sibling query and the #129 order (`tails`) all use this one key.
 - **Siblings**: every other non-deleted thread, **in any project**, whose checkout has the
   same key: the host's panels and side chats, plain threads without a worktree on the
@@ -507,10 +521,13 @@ structured content; the agent repeats the call with the token. A writing sibling
   `conversationOnlyRewind: true` in its environment capabilities (`http.rs:752-761`,
   `:781-788`; contract `ExecutionEnvironmentCapabilities`, `environment.ts:30`, default
   `false`).
-- **Performance.** One `canonical_worktree_path_key` per delivery and per compaction (one
-  `canonicalize` call), one uncontended `RwLock` acquisition. Each revert dialog and each
-  guarded restore run one sibling query across projects (one key per thread) and one
-  capture-sized Git read.
+- **Performance.** One `git rev-parse --show-toplevel` plus one `canonicalize` per
+  delivery and per compaction, and one uncontended `RwLock` acquisition. Each revert
+  dialog and each guarded restore run one sibling query across projects, **one
+  `rev-parse` per candidate sibling**, and the capture-sized Git reads. Candidates are the
+  non-deleted threads whose canonical stored directory lies inside the restoring
+  checkout's freshly resolved top level: a directory outside it cannot resolve to it. So
+  unrelated projects cost one `canonicalize` each and no Git call.
 
 ## Tests, mapped to the acceptance
 
@@ -541,7 +558,18 @@ held or refused until the restore completes":
    7b. `a_project_on_a_subdirectory_shares_the_worktree_gate` (Codex #279 round 2 finding 2):
    project P1 at `/repo`, project P2 at `/repo/subdir` of the same worktree. P2's thread is
    a sibling of P1's restore and is held by its gate; a linked worktree of `/repo` is not.
-   The key cache drops an entry when the project's `workspace_root` changes.
+   7c. `removing_a_nested_git_dir_makes_the_subdir_a_sibling_without_metadata_change`
+   (Codex round 3): `/repo/subdir` starts as a nested repository with its own `.git`; a
+   P2 thread there runs turns and is not a sibling of a `/repo` restore. Remove
+   `/repo/subdir/.git` only, with no project or thread metadata change. A `/repo` restore
+   now finds the P2 thread as a sibling, refuses while it is busy, and is held by the same
+   gate for its next delivery.
+   7d. `an_unresolvable_sibling_refuses_the_restore`: a candidate sibling whose folder is
+   gone, or whose `rev-parse` fails (fake `git`), makes the restore refuse with the
+   "can't tell whether" detail.
+   7e. `a_delivery_keyed_before_the_change_still_makes_the_restore_refuse`: a sibling
+   delivery holds its thread reservation under the old key; the restore counts it as
+   writing.
 
 Acceptance 2, "a host restore while a panel is busy is refused, with an actionable
 message":
@@ -618,7 +646,7 @@ Contracts and web:
 
 ## Files to change
 
-- `apps/server/src/orchestration/engine.rs`: `CheckoutTurnFence`, the checkout-key cache,
+- `apps/server/src/orchestration/engine.rs`: `CheckoutTurnFence`, the fresh checkout-key resolver (no cache),
   one mutex over `restore_holds` and `launching`, the command and requested-payload fields.
 - `apps/server/src/production/orchestration_effects.rs`: `ParkedThreads::order` (physical
   key) and `run` (reordered, gate), `plan_revert` (shared-checkout checks), `finish_revert`
@@ -703,7 +731,13 @@ Codex review, round 2, of revision 1. Each finding was checked in source at `e22
 | #     | Finding                                                                                                 | Checked                                                                                                                                                                                          | Resolution                                                                                                                                                                                                                                                                                                                                                                                     |
 | ----- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | P1 #1 | Shutting down an OpenCode session on an external server does not stop the server, which can self-start. | Confirmed: `OpenCodeDriver::shutdown` kills only an owned child (`provider_runtime.rs:15626-15643`); `stop` ends observation only (`opencode/runtime.rs:2134-2164`); self-start at `:2872-2876`. | **Fixed.** An unmanaged sibling (instance with `serverUrl`) refuses every file restore, live or suspended. Quiescence of an external server is not provable today, so no exception. Test 12c.                                                                                                                                                                                                  |
-| P1 #2 | The directory key misses `/repo` and `/repo/subdir` projects on one worktree.                           | Confirmed: project preparation canonicalizes the directory but does not resolve the Git top level (`orchestration_effects.rs:178-193`, `:236-255`).                                              | **Fixed.** The key is the canonicalized `git rev-parse --show-toplevel`, cached per stored path; linked worktrees stay distinct. Test 7b.                                                                                                                                                                                                                                                      |
+| P1 #2 | The directory key misses `/repo` and `/repo/subdir` projects on one worktree.                           | Confirmed: project preparation canonicalizes the directory but does not resolve the Git top level (`orchestration_effects.rs:178-193`, `:236-255`).                                              | **Fixed.** The key is the canonicalized `git rev-parse --show-toplevel`, resolved fresh at admission (revision 3 dropped the cache); linked worktrees stay distinct. Test 7b.                                                                                                                                                                                                                  |
 | P2 #3 | An editor change absorbed into a later own checkpoint shows no warning.                                 | Confirmed against revision 1: neither source covered it.                                                                                                                                         | **Fixed by both remedies.** The dialog always lists every file the restore changes (conservative, unattributed), and the warning's promise is narrowed to changes known to come from outside the thread. Test 20b.                                                                                                                                                                             |
 | P2 #4 | The token hashes paths and event ids only.                                                              | Confirmed against revision 1.                                                                                                                                                                    | **Fixed.** The token hashes the target commit, the current tree id (content) and the event ids; step 7 recomputes the tree id before the rewind. Test 20c.                                                                                                                                                                                                                                     |
 | Gap b | Revision 1's claim that a launch in progress shows `starting` is wrong.                                 | Confirmed: `launch_session` persists `connecting` before `driver.start()` and projects `ready` after (`provider_runtime.rs:9166-9179`, `:9318`).                                                 | **Corrected.** Explicit serialization: one engine mutex over `restore_holds` and `launching`, taken by `launch_session` and by step 5. Start paths checked: the single production `factory.create` (`:9166`) and the three `launch_session` callers; MCP tools, UI intents and automations reach it only through delivery; side chats are threads; self-starts run in live sessions. Test 12b. |
+
+Codex check, round 3, of revision 2: one finding.
+
+| #   | Finding                                                                                                                                                                        | Checked                                                                                                                                                                      | Resolution                                                                                                                                                                                                                       |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1  | The cached key outlives a repository change that touches no stored path (a nested `.git` removed), so a root restore misses the subdirectory sibling and overwrites its files. | Confirmed against revision 2: the cache was dropped only on stored-path changes, and restore runs `restore` and `clean -fd` over `.` (`orchestration_effects.rs:2449-2480`). | **Fixed (revision 3).** No cache. The restore resolves its own and every candidate sibling's top level fresh under the gate, refuses on a resolve failure, and counts a reserved sibling thread as writing. Tests 7c, 7d and 7e. |
