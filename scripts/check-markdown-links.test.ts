@@ -51,6 +51,46 @@ describe("checkMarkdownLinks", () => {
     expect(checkMarkdownLinks(NodePath.join(root, "README.md"))).toHaveLength(4);
   });
 
+  const failuresFor = (files: Record<string, string>) =>
+    checkMarkdownLinks(NodePath.join(fixture(files), "README.md"));
+
+  it("checks reference definitions and every srcset candidate", () => {
+    expect(
+      failuresFor({
+        "README.md": '[bad][ref]\n\n[ref]: missing.md\n<img srcset="a.webp 1x, b.webp 2x" alt="x">',
+        "a.webp": "",
+      }),
+    ).toHaveLength(2);
+  });
+
+  it("decodes paths and fragments and ignores query strings", () => {
+    expect(
+      failuresFor({
+        "README.md": "[a](hello%20world.md) [b](a.md?raw=1#caf%C3%A9)",
+        "hello world.md": "",
+        "a.md": "# Café\n",
+      }),
+    ).toEqual([]);
+  });
+
+  it("derives anchors like GitHub", () => {
+    expect(
+      failuresFor({
+        "README.md": "[a](a.md#hello-world) [b](a.md#foo) [c](a.md#foo-1) [d](a.md#foo-1-1)",
+        "a.md": "# *Hello* _world_\n# Foo\n# Foo\n# Foo-1\n",
+      }),
+    ).toEqual([]);
+  });
+
+  it("handles indented and longer code fences", () => {
+    expect(
+      failuresFor({
+        "README.md":
+          "   ```\n[x](gone.md)\n   ```\n\n````md\n```\n[y](gone.md)\n```\n````\n[z](gone.md)",
+      }),
+    ).toHaveLength(1);
+  });
+
   it("slugs headings like GitHub", () => {
     expect(githubSlug("Files & editor")).toBe("files--editor");
   });

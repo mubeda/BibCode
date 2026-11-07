@@ -75,7 +75,7 @@ List, review, comment on, edit, merge, and check out pull requests on GitHub and
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/pull-requests-dark.webp">
-  <img src="docs/assets/readme/pull-requests.webp" alt="Pull request "Make billing retries safe" of a demo repository, on the Files changed tab with a code diff and reviewer, label, and milestone details" width="100%">
+  <img src="docs/assets/readme/pull-requests.webp" alt="Pull request &quot;Make billing retries safe&quot; of a demo repository, on the Files changed tab with a code diff and reviewer, label, and milestone details" width="100%">
 </picture>
 
 ### Pipelines
