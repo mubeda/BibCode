@@ -454,3 +454,4 @@ this document is kept as it was approved.
 - The module is renamed `git/system_config.rs` and its tests
   `apps/server/tests/git_system_config.rs`. The #282 tests that change are listed in that
   design's "Effect on the #282 tests".
+- Implemented 2026-11-07 with #283.
