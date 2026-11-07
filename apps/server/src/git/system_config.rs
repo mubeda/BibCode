@@ -353,8 +353,11 @@ fn canonical_keys(
     }
     if let Some(value) = last(&records, "http.sslCAInfo") {
         match value.filter(|path| usable_ca_file(path)) {
-            // Git for Windows reads `/` too, and a quoted Git string would read `\` as an escape.
-            Some(path) => keys.push(("http.sslCAInfo", format!("\"{}\"", path.replace('\\', "/")))),
+            // A quoted Git string reads `\` as an escape.
+            Some(path) => keys.push((
+                "http.sslCAInfo",
+                format!("\"{}\"", path.replace('\\', "\\\\")),
+            )),
             None => warnings.push("an unusable system http.sslCAInfo was ignored"),
         }
     }
@@ -770,7 +773,7 @@ mod tests {
             keys(&format!("http.sslcainfo\n{path}\0")),
             kept(&[(
                 "http.sslCAInfo",
-                &format!("\"{}\"", path.replace('\\', "/"))
+                &format!("\"{}\"", path.replace('\\', "\\\\"))
             )])
         );
         for unusable in [
