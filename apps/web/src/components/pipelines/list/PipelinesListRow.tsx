@@ -126,6 +126,8 @@ export interface PipelinesListRowProps {
   readonly mutationsDisabledReason: string | null;
   /** The signed-in role, which tells GitHub's refusal of an action from a missing role. */
   readonly repositoryPermission: RepositoryPermission | null;
+  /** 1-based `aria-rowindex` in the table, which counts the header as row 1. */
+  readonly rowIndex?: number | undefined;
 }
 
 /**
@@ -140,6 +142,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   projectRef,
   mutationsDisabledReason,
   repositoryPermission,
+  rowIndex,
 }: PipelinesListRowProps) {
   const hoverPrefetch = usePipelineHoverPrefetch({
     environmentId: scope.environmentId,
@@ -159,10 +162,11 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   const actions = pipelineRowActions(row, mutationsDisabledReason, provider, repositoryPermission);
   const target = { _tag: "pipeline", id: row.id } as const;
   const hostName = HOST_NAMES[provider];
-  const { author, stages } = useShownColumns();
+  const { author, stages, timing } = useShownColumns();
   return (
     <div
       role="row"
+      aria-rowindex={rowIndex}
       aria-label={`${row.label} ${status}`}
       data-text-surface="background"
       className={`${PIPELINES_GRID_CLASS} relative min-w-0 border-b border-border hover:bg-accent/40`}
@@ -178,11 +182,13 @@ export const PipelinesListRow = memo(function PipelinesListRow({
             <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
             <span className="truncate">{status}</span>
           </span>
-          <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
-            {duration ? <span>{duration}</span> : null}
-            {duration && age ? <span aria-hidden="true">·</span> : null}
-            {age ? <span title={createdTitle}>{age}</span> : null}
-          </span>
+          {timing ? (
+            <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
+              {duration ? <span>{duration}</span> : null}
+              {duration && age ? <span aria-hidden="true">·</span> : null}
+              {age ? <span title={createdTitle}>{age}</span> : null}
+            </span>
+          ) : null}
         </span>
       </div>
       <div role="cell" className="min-w-0 space-y-0.5">
@@ -201,7 +207,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
           <span className="shrink-0 font-medium text-foreground tabular-nums">{row.label}</span>
           <RefLabel value={row.ref} provider={provider} />
           {row.sha ? <span className="shrink-0 font-mono">{row.sha.slice(0, 8)}</span> : null}
-          {age ? (
+          {age && timing ? (
             <span className="shrink-0 @min-[720px]:hidden" title={createdTitle}>
               {age}
             </span>

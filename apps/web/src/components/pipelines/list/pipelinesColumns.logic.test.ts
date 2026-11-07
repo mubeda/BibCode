@@ -6,7 +6,9 @@ const widths = { pipeline: 480, author: 160, stages: 160 };
 describe("pipelinesGridTemplates", () => {
   it("folds columns in a fixed order as the panel narrows", () => {
     const templates = pipelinesGridTemplates(widths, new Set());
-    expect(templates.full).toBe("144px minmax(240px,480px) 160px 160px 104px");
+    expect(templates.full).toBe(
+      "144px minmax(240px,480px) minmax(96px,160px) minmax(72px,160px) 104px",
+    );
     // Created by goes first, then Stages folds short, then Status folds to its icon.
     expect(templates.medium).toBe("144px minmax(0,1fr) 160px 104px");
     expect(templates.compact).toBe("144px minmax(0,1fr) 64px 104px");

@@ -9,7 +9,8 @@
  *   <  720 px   narrow:  Status folds to its icon
  * Pipeline, Created by and Stages are user-resizable at the full step only.
  */
-export type PipelinesColumnId = "author" | "stages";
+/** Hideable parts of a row; "timing" is the duration and age text under Status. */
+export type PipelinesColumnId = "author" | "stages" | "timing";
 
 export const OPTIONAL_COLUMNS: readonly {
   readonly id: PipelinesColumnId;
@@ -17,6 +18,7 @@ export const OPTIONAL_COLUMNS: readonly {
 }[] = [
   { id: "author", label: "Created by" },
   { id: "stages", label: "Stages" },
+  { id: "timing", label: "Duration and age" },
 ];
 
 export const COLUMN_BOUNDS = {
@@ -61,8 +63,10 @@ export function pipelinesGridTemplates(
     full: join([
       `${STATUS_WIDTH}px`,
       `minmax(${COLUMN_BOUNDS.pipeline.min}px,${widths.pipeline}px)`,
-      author ? `${widths.author}px` : null,
-      stagesTrack(widths.stages),
+      // Every resizable track may shrink to its minimum, so Actions stays inside the row
+      // even when the widths a user set add up to more than the panel (at most ~1250 px).
+      author ? `minmax(${COLUMN_BOUNDS.author.min}px,${widths.author}px)` : null,
+      stages ? `minmax(${COLUMN_BOUNDS.stages.min}px,${widths.stages}px)` : null,
       actions,
     ]),
   };

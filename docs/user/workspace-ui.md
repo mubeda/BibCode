@@ -1358,7 +1358,7 @@ host's current page. A header names the columns (Status, Pipeline, Created by,
 Stages, Actions) and stays in place while the rows scroll. On a wide panel
 drag the edge of the Pipeline, Created by or Stages header (or focus it and use
 the arrow keys, Home and End; double-click resets) to resize it; the widths
-are remembered. The columns button in the header hides Created by or Stages.
+are remembered. The columns button in the header hides Created by, Stages or the duration and age under Status.
 As the panel narrows, Created by hides first, then the stage icons shrink to
 as many as fit followed by a "+3" count (hover it for the names), then Status
 shrinks to its icon. Each row shows the status with its duration and age

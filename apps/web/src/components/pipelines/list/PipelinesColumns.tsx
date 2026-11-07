@@ -23,7 +23,7 @@ export const PIPELINES_GRID_CLASS =
 export const AUTHOR_CELL_CLASS = "hidden @min-[1100px]:block";
 
 const HIDDEN_KEY = "bibcode:pipelines-list-hidden-columns";
-const HiddenSchema = Schema.Array(Schema.Literals(["author", "stages"]));
+const HiddenSchema = Schema.Array(Schema.Literals(["author", "stages", "timing"]));
 const NO_HIDDEN: readonly PipelinesColumnId[] = [];
 
 const columnWidth = (
@@ -48,10 +48,11 @@ interface ColumnsLayout {
 }
 
 /** Changes only when a column is shown or hidden, never while one is dragged. */
-const ShownColumnsContext = createContext<{ readonly author: boolean; readonly stages: boolean }>({
-  author: true,
-  stages: true,
-});
+const ShownColumnsContext = createContext<{
+  readonly author: boolean;
+  readonly stages: boolean;
+  readonly timing: boolean;
+}>({ author: true, stages: true, timing: true });
 const ColumnsLayoutContext = createContext<ColumnsLayout | null>(null);
 
 export function useShownColumns() {
@@ -79,7 +80,11 @@ export function PipelinesColumnsRoot({
     hidden,
   );
   const shown = useMemo(
-    () => ({ author: !hidden.has("author"), stages: !hidden.has("stages") }),
+    () => ({
+      author: !hidden.has("author"),
+      stages: !hidden.has("stages"),
+      timing: !hidden.has("timing"),
+    }),
     [hidden],
   );
   const setColumnShown = (id: PipelinesColumnId, isShown: boolean) =>
@@ -149,6 +154,7 @@ export function PipelinesListHeader() {
     <div role="rowgroup">
       <div
         role="row"
+        aria-rowindex={1}
         className={`${PIPELINES_GRID_CLASS} h-9 border-b border-border bg-background`}
       >
         <div role="columnheader" className={HEADER_CELL}>
