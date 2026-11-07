@@ -330,7 +330,8 @@ Fails before the change:
    `.git/hooks/reference-transaction` writes a marker; capture and a reverted turn's ref
    deletion leave none. The same hook still runs for a Git manager branch update. On
    Windows the test also plants `\dev\null\reference-transaction` on the checkout's drive
-   and asserts it does not run.
+   and asserts it does not run. Writing to the drive root needs rights a CI runner usually
+   has; when the root is not writable, that part skips and prints why.
 4. `the_bootstrap_fetch_carries_the_prompt_guards_and_the_policy`. A fake `git` first on
    `PATH` records its environment for `fetch origin`: `GCM_INTERACTIVE=never`,
    `GIT_TERMINAL_PROMPT=0` and the generated `GIT_CONFIG_SYSTEM`.
@@ -470,7 +471,9 @@ passing unchanged: its helper is a `!` command and its filter is not `lfs`.
 
 1. Should user-initiated Git manager fetch, pull and push be allowed to open a Git
    Credential Manager sign-in on a local desktop server? Today they never prompt, and this
-   design keeps that. Allowing it is a separate change.
+   design keeps that. Allowing it is a separate change. Recommended: not now. A remote or
+   WSL server cannot show the window, so the behaviour would differ by where the server
+   runs; the authentication error already tells the person to sign in.
 
 ## Review findings and resolutions
 

@@ -205,9 +205,32 @@ New callbacks on `OrchestrationEffectCallbacks`, answered by the supervisor:
 `thread_writes_checkout(thread_id) -> Option<WritingReason>` and
 `quiet_sibling(thread_id) -> Result<(), WritingReason>`.
 
+**No reopen while the restore holds the checkout.** A suspended sibling must stay
+suspended until the restore ends, whatever would reopen it. The session-reopen paths in
+the supervisor at `e222d340ff` are delivery's launch, `reopen_for_rewind`
+(`provider_runtime.rs:9780`, used by both revert modes through `prepare_provider_rewind`),
+`reopen_for_compaction` (`:10008`) and `launch_for_reconciliation` (`:1306`, delivery
+recovery, called at `:2605`). This list comes from `rg` over the supervisor and is not
+proven complete; the implementer re-checks it. The rule is placed at the supervisor's
+launch, not at each caller: **a launch or reopen for a thread in `restore_holds` is
+refused**, with "Another chat in this checkout is restoring files. Try again in a
+moment." A sibling's conversation-only rewind during the restore therefore fails at its
+reopen and changes nothing. The restoring thread is never in its own `restore_holds`, so
+its own `prepare_provider_rewind` is unaffected. A launch already under way when step 5
+marks the siblings shows its session as `starting`, which `session_holds_a_turn` reads as
+busy, so step 5 refuses. That every launch path sets `starting` before it spawns is not
+verified; test 12 covers delivery, compaction, rewind and reconciliation.
+
 Step 7 repeats checks 2 and 3 on the worker immediately before the irreversible rewind.
-Every sibling is then suspended and no delivery or compaction can reopen it, so no sibling
-turn can start between the check and the end of the restore.
+Every sibling is then suspended and cannot be reopened, so no sibling turn can start
+between the check and the end of the restore.
+
+**Workspace admission under the gate.** `prepare_provider_rewind` takes
+`WorkspaceAdmissionController::acquire_thread` (`runtime.rs:1131-1136`), which deliveries
+also use. That call does not wait for other holders: `acquire_admission_inner`
+(`worktree_catalog/availability.rs:475-523`) awaits only the path canonicalization and
+returns `Unavailable` when the workspace is being removed. Holding the checkout gate while
+calling it therefore adds no wait cycle.
 
 ### Conversation-only rewind
 
@@ -420,8 +443,10 @@ held or refused until the restore completes":
 6. `reverts_of_one_checkout_still_restore_in_request_order_under_the_gate` (the #129 test,
    extended with a panel delivery in between).
 7. `a_symlinked_or_second_project_path_is_the_same_checkout`: a second project registered
-   on a symlink to the first's root, and (on case-insensitive hosts) a differently cased
-   spelling, share one gate; two Git worktrees of one repository do not.
+   on a symlink to the first's root shares one gate; two Git worktrees of one repository
+   do not. The differently cased spelling case runs only when a probe (create `a`, stat
+   `A`) shows the test directory's file system is case-insensitive, and prints why it
+   skipped otherwise.
 
 Acceptance 2, "a host restore while a panel is busy is refused, with an actionable
 message":
@@ -437,7 +462,10 @@ message":
     driver that emits `turn.started` with `providerStarted: true` when released. Release
     it after step 7's check, during `rollback_provider`. The driver is already shut down,
     so no turn starts and the restore completes; then the panel's next message reopens
-    it.
+    it. Plus `no_path_reopens_a_sibling_during_the_restore`: with the restore paused under
+    the gate, a sibling's delivery, compaction, conversation-only rewind and delivery
+    reconciliation each fail to reopen its session (the rewind with the "restoring files"
+    detail), and a launch already `starting` when step 5 runs makes the restore refuse.
 13. `turn_zero_head_fallback_is_refused_on_a_shared_checkout` and
     `turn_zero_head_fallback_still_works_alone`.
 
@@ -483,11 +511,15 @@ Contracts and web:
   command and requested-payload fields.
 - `apps/server/src/production/orchestration_effects.rs`: `ParkedThreads::order` (physical
   key) and `run` (reordered, gate), `plan_revert` (shared-checkout checks), `finish_revert`
-  (re-check, conversation-only branch), compaction's admission, the new callbacks.
+  (re-check, conversation-only branch), compaction's admission, the new callbacks, and a
+  `pub(crate) async fn checkout_changes_since(cwd, reference, cancellation)` that runs the
+  Git read through the private `run_git` (`:2569`), so the preview RPC reaches it without
+  exposing `run_git`.
 - `apps/server/src/production/turn_delivery.rs`: shared admission in
   `prepare_claim_and_deliver`; `restore_holds` skips at `:1095` and `:1495`.
 - `apps/server/src/production/provider_runtime.rs`: `thread_writes_checkout`,
-  `quiet_sibling`; `apps/server/src/provider/mod.rs`: `rewind_keeps_files`.
+  `quiet_sibling`, the `restore_holds` refusal at session launch and reopen;
+  `apps/server/src/provider/mod.rs`: `rewind_keeps_files`.
 - `apps/server/src/persistence/repositories.rs`: the cross-project sibling query and the
   event-log query.
 - `apps/server/src/production/orchestration_rpc.rs` and `rpc/session.rs`: the preview
@@ -533,21 +565,26 @@ Contracts and web:
 
 ## Questions only Mauro can answer
 
-1. Should the sibling-change warning stay a confirmation (this design), or block the file
-   restore until the siblings' work is committed?
-2. Is 15 s the right bound for waiting on a sibling delivery in flight?
-3. Is suspending an idle sibling's session for the restore acceptable, rather than
-   refusing until it idles out on its own (up to 60 s)?
+1. Should the sibling-change warning stay a confirmation that the person can accept, as
+   this design has it? The alternative is to block the file restore until the other work
+   is committed. Recommended: yes, keep the confirmation. It names the files and costs
+   one click, and blocking would push the person to commit work they may not want yet.
+2. Is 15 s the right bound for waiting on a sibling delivery in flight? Recommended: yes.
+   Providers accept a turn in seconds, and the refusal says to try again.
+3. Is it acceptable to suspend an idle sibling's session for the restore, rather than
+   refuse until it idles out on its own (up to 60 s)? Recommended: yes. Idle suspension
+   would happen within a minute anyway, and the cost is one cold start on that chat's
+   next message.
 
 ## Review findings and resolutions
 
 Codex review, round 1, of revision 0. The coordinator verified findings 1, 2 and 4 in
 source; each was checked again here at `e222d340ff`.
 
-| #     | Finding                                                                                | Checked                                                                                                                                                  | Resolution                                                                                                                                                                                                     |
-| ----- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P1 #1 | OpenCode 1's rewind restores files, so a conversation-only rewind would not keep them. | Confirmed: OpenCode 1 posts `/session/{id}/revert` with only `messageID` (`opencode/runtime.rs:2106-2113`); OpenCode 2 sends `"files": false` (`:4191`). | **Fixed.** `rewind_keeps_files` per provider and API version; OpenCode 1 refused before any call. Tests 16 and 17, with a live check in the execution report.                                                  |
-| P1 #2 | Provider-started turns bypass delivery and can begin after the last check.             | Confirmed: `providerStarted` and self-started turns (`provider_runtime.rs:12098-12105`, `opencode/runtime.rs:2871-2877`).                                | **Fixed.** Every sibling is made quiet under the gate: an idle live session is suspended, and a session that cannot be suspended safely refuses the restore. Compaction also takes admission. Tests 11 and 12. |
-| P1 #3 | A sibling's conversation-only rewind deletes the turn rows the warning reads.          | Confirmed: `thread.reverted` deletes newer `projection_turns` (`engine.rs:8310-8318`).                                                                   | **Fixed.** The warning reads Git (changes since this thread's last turn) and the append-only event log, which no sibling action deletes. Test 19.                                                              |
-| P1 #4 | The lexical, project-scoped key misses symlinks, case and other projects.              | Confirmed: `normalize_host_path_lexically` in `order` (`:926-930`); siblings were read per project.                                                      | **Fixed.** One physical key, `canonical_worktree_path_key`, already used by workspace availability, for the gate, siblings (all projects) and `tails`. Test 7.                                                 |
-| P2 #5 | Steps 1 to 3 of revision 1 left admission open during preparation.                     | Confirmed against revision 1.                                                                                                                            | **Fixed by Mauro's decision.** The gate covers the whole planning interval; the #129 order and the lock order are kept. Tests 1 to 3 pause inside planning.                                                    |
+| #     | Finding                                                                                | Checked                                                                                                                                                  | Resolution                                                                                                                                                                                                                                                                                                                                         |
+| ----- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 #1 | OpenCode 1's rewind restores files, so a conversation-only rewind would not keep them. | Confirmed: OpenCode 1 posts `/session/{id}/revert` with only `messageID` (`opencode/runtime.rs:2106-2113`); OpenCode 2 sends `"files": false` (`:4191`). | **Fixed.** `rewind_keeps_files` per provider and API version; OpenCode 1 refused before any call. Tests 16 and 17, with a live check in the execution report.                                                                                                                                                                                      |
+| P1 #2 | Provider-started turns bypass delivery and can begin after the last check.             | Confirmed: `providerStarted` and self-started turns (`provider_runtime.rs:12098-12105`, `opencode/runtime.rs:2871-2877`).                                | **Fixed.** Every sibling is made quiet under the gate: an idle live session is suspended, a session that cannot be suspended safely refuses the restore, and the supervisor refuses to launch or reopen a session for a held sibling by any path (delivery, compaction, rewind, reconciliation). Compaction also takes admission. Tests 11 and 12. |
+| P1 #3 | A sibling's conversation-only rewind deletes the turn rows the warning reads.          | Confirmed: `thread.reverted` deletes newer `projection_turns` (`engine.rs:8310-8318`).                                                                   | **Fixed.** The warning reads Git (changes since this thread's last turn) and the append-only event log, which no sibling action deletes. Test 19.                                                                                                                                                                                                  |
+| P1 #4 | The lexical, project-scoped key misses symlinks, case and other projects.              | Confirmed: `normalize_host_path_lexically` in `order` (`:926-930`); siblings were read per project.                                                      | **Fixed.** One physical key, `canonical_worktree_path_key`, already used by workspace availability, for the gate, siblings (all projects) and `tails`. Test 7.                                                                                                                                                                                     |
+| P2 #5 | Steps 1 to 3 of revision 1 left admission open during preparation.                     | Confirmed against revision 1.                                                                                                                            | **Fixed by Mauro's decision.** The gate covers the whole planning interval; the #129 order and the lock order are kept. Tests 1 to 3 pause inside planning.                                                                                                                                                                                        |
