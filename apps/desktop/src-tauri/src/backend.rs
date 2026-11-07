@@ -2144,8 +2144,7 @@ async fn start_managed_backend(
             }
             // Once per process: a backend restart keeps the first result. Tests keep NOSYSTEM.
             #[cfg(not(test))]
-            bibcode_server::git::system_line_endings::install_once(&server_config.state_dir())
-                .await;
+            bibcode_server::git::system_config::install_once(&server_config.state_dir()).await;
             let handle = match remote_update_delegate {
                 Some(delegate) => {
                     ServerRuntime::start_with_desktop_integration(

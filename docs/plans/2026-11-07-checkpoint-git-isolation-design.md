@@ -1,6 +1,10 @@
 # Checkpoints and Bootstrap: One Git Isolation Policy
 
-Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #283, a follow-up of #282
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor).
+Implemented 2026-11-07 in `apps/server/src/git/system_config.rs`, `git_environment_inheriting_unread()`
+and the checkpoint and bootstrap spawns of `orchestration_effects.rs`, with the test plan in
+`apps/server/tests/git_system_config.rs`; the Windows-only parts and the CI steps are not yet run.
+Issue #283, a follow-up of #282
 ([`2026-11-03-git-system-line-endings-design.md`](./2026-11-03-git-system-line-endings-design.md),
 "Checkpoints are not moved" and "Other production Git spawns"). Verified at `e222d340ff`
 (`main` after v0.15.2), on macOS with Git 2.56.0. Line references are to that commit. No

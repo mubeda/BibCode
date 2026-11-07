@@ -419,7 +419,8 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
     }
 }
 
-async fn fetch_origin_base(
+/// The bootstrap's `fetch origin`, then the commit of `base_branch` on `origin`.
+pub async fn fetch_origin_base(
     cwd: &Path,
     base_branch: &str,
     cancellation: &CancellationToken,
@@ -450,7 +451,8 @@ async fn run_bootstrap_git<const N: usize>(
                 command: PathBuf::from("git"),
                 args: args.into_iter().map(OsString::from).collect(),
                 cwd: cwd.to_path_buf(),
-                env: Vec::new(),
+                // No credential window or prompt: the fetch uses a stored credential or fails.
+                env: crate::git::git_environment(),
                 stdin: None,
                 timeout: GIT_TIMEOUT,
                 max_output_bytes: GIT_OUTPUT_LIMIT,
@@ -2259,6 +2261,30 @@ pub async fn capture_checkpoint(
     .await
 }
 
+/// Restores the checkout at `cwd` to checkpoint `reference`, as a revert does. `false` when
+/// the ref is missing.
+pub async fn restore_checkpoint_ref(
+    cwd: &Path,
+    reference: &str,
+) -> Result<bool, OrchestrationEffectsError> {
+    restore_checkpoint(
+        cwd,
+        Path::new("git"),
+        reference,
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// Deletes checkpoint `reference`, as a revert does for the turns it drops.
+pub async fn delete_checkpoint_ref(
+    cwd: &Path,
+    reference: &str,
+) -> Result<(), OrchestrationEffectsError> {
+    delete_ref(cwd, Path::new("git"), reference, &CancellationToken::new()).await
+}
+
 async fn capture_checkpoint_with_cancellation(
     cwd: &Path,
     git_command: &Path,
@@ -2574,14 +2600,20 @@ async fn run_git(
     allow_non_zero_exit: bool,
     cancellation: &CancellationToken,
 ) -> Result<crate::git::ProcessOutput, OrchestrationEffectsError> {
+    let mut environment = crate::git::git_environment_inheriting_unread();
+    environment.extend_from_slice(env);
+    // No hook runs for BiBCode's own refs, and no fsmonitor starts for a temporary index. On
+    // native Windows `/dev/null` is an ordinary path on the current drive.
+    let hooks = format!("core.hooksPath={}", crate::git::clone_policy::NULL_DEVICE);
+    let overrides = ["-c", hooks.as_str(), "-c", "core.fsmonitor=false"];
     ProcessRunner
         .run(
             ProcessRequest {
                 operation: "OrchestrationEffects.git".to_owned(),
                 command: git_command.to_path_buf(),
-                args: args.iter().map(OsString::from).collect(),
+                args: overrides.iter().chain(args).map(OsString::from).collect(),
                 cwd: cwd.to_path_buf(),
-                env: env.to_vec(),
+                env: environment,
                 stdin: None,
                 timeout: GIT_TIMEOUT,
                 max_output_bytes: GIT_OUTPUT_LIMIT,
