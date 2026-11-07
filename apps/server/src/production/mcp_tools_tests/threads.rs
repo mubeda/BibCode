@@ -1251,3 +1251,133 @@ async fn the_log_never_sees_a_prompt_or_a_reply() {
     }
     child.complete();
 }
+
+/// A run of `bibcode mcp --client <name>` (#280) with ceiling `access`, minted and exchanged as
+/// the relay does.
+pub(super) async fn named_agent(
+    harness: &Harness,
+    name: &str,
+    access: McpAccess,
+) -> ClientPrincipal {
+    let link = crate::auth::issue_named_mcp_pairing_link(
+        &harness.repositories,
+        name,
+        access.as_str(),
+        &[],
+    )
+    .await
+    .expect("named link");
+    let session = harness
+        .auth
+        .exchange_bootstrap(
+            &link.credential,
+            None,
+            ClientMetadata::default(),
+            None,
+            SessionTransport::Plain,
+        )
+        .await
+        .expect("exchange");
+    harness
+        .control
+        .authenticate(&session.token)
+        .await
+        .expect("an MCP credential")
+}
+
+/// The relay's exit: it revokes its own credential, as on EOF, and nothing else.
+pub(super) async fn end_run(harness: &Harness, agent: &ClientPrincipal) {
+    assert!(
+        harness
+            .repositories
+            .revoke_mcp_credential(
+                agent.principal.session_id.clone(),
+                crate::auth::format_iso(crate::auth::now_ms()),
+            )
+            .await
+            .expect("relay revoke")
+    );
+}
+
+#[tokio::test]
+async fn a_named_client_keeps_its_request_ids_across_runs() {
+    let harness = Harness::new().await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("named-1");
+    let first = named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let started = start(&harness, &first, arguments.clone()).await;
+    end_run(&harness, &first).await;
+    let second = named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    assert_ne!(first.principal.session_id, second.principal.session_id);
+    assert_eq!(
+        start(&harness, &second, arguments).await,
+        started,
+        "the next run replays the first run's request"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_named_clients_do_not_share_request_ids() {
+    let harness = Harness::new().await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("named-2");
+    let builder = named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let reviewer = named_agent(&harness, "reviewer", McpAccess::FullAccess).await;
+    assert_ne!(
+        start(&harness, &builder, arguments.clone()).await,
+        start(&harness, &reviewer, arguments).await
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unnamed_relay_with_the_same_client_info_name_does_not_join_a_named_scope() {
+    let harness = Harness::new().await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("named-3");
+    let named = named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let (unnamed, _) = harness
+        .agent_labelled("MCP · builder", McpAccess::FullAccess)
+        .await;
+    assert_ne!(
+        start(&harness, &named, arguments.clone()).await,
+        start(&harness, &unnamed, arguments).await,
+        "a matching label is not the identity"
+    );
+    harness.shutdown().await;
+}
+
+/// The window is 24 hours from the first call: a pruned row's retry is new work.
+#[tokio::test]
+async fn a_named_clients_retry_after_its_request_row_is_pruned_runs_as_new_work() {
+    let harness = Harness::new().await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("named-old");
+    let first = named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let started = start(&harness, &first, arguments.clone()).await;
+    end_run(&harness, &first).await;
+    let aged = (time::OffsetDateTime::now_utc()
+        - time::Duration::seconds(crate::mcp::control::REQUEST_ROW_TTL_SECONDS + 60))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE mcp_tool_requests SET created_at = ? WHERE client_request_id = 'named-old'",
+                [aged],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let second = named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    assert_ne!(
+        start(&harness, &second, arguments).await,
+        started,
+        "past the window, the retry runs as new work"
+    );
+    harness.shutdown().await;
+}

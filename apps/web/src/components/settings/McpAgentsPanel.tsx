@@ -8,6 +8,9 @@ import { SettingsRow } from "./settingsLayout";
 
 const ACTIVITY_SHOWN = 50;
 
+const ENDS_IDENTITY =
+  "Ends this agent's identity. Its paired webhooks turn off, and its next run starts fresh.";
+
 /** The labels Agents may uses for each level. */
 const ACCESS_LABELS: Readonly<Record<string, string>> = {
   "read-only": "Read only",
@@ -116,12 +119,13 @@ function McpAgentList({
       </p>
     );
   }
-  const stopButton = (clientId: string) =>
+  const stopButton = (clientId: string, title?: string) =>
     canManage && (runningTurns.get(clientId) ?? 0) > 0 ? (
       <Button
         size="sm"
         variant="outline"
         disabled={actions.pendingClientId === clientId}
+        title={title}
         onClick={() => void actions.stop(clientId)}
       >
         Stop
@@ -147,6 +151,10 @@ function McpAgentList({
         const busy = actions.pendingClientId === client.sessionId;
         const label = client.client.label?.trim() || "MCP agent";
         const turns = runningTurns.get(client.sessionId) ?? 0;
+        // A named client (`bibcode mcp --client`) is one identity across runs: Revoke and
+        // Stop end all of it, not only this run.
+        const named = client.mcpNamedClient !== undefined;
+        const endsIdentity = named ? ENDS_IDENTITY : undefined;
         return (
           <li key={client.sessionId} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2">
             <div className="min-w-0 flex-1">
@@ -158,11 +166,12 @@ function McpAgentList({
                   ? `Taken over (was ${accessLabel(handBack)})`
                   : accessLabel(client.mcpAccess)}
                 {turns > 0 ? ` · ${turnsText(turns)}` : ""}
+                {named ? " · Keeps its identity across runs" : ""}
               </div>
             </div>
             {canManage ? (
               <div className="flex shrink-0 items-center gap-1.5">
-                {stopButton(client.sessionId)}
+                {stopButton(client.sessionId, endsIdentity)}
                 {handBack !== null ? (
                   <Button
                     size="sm"
@@ -191,6 +200,7 @@ function McpAgentList({
                   size="sm"
                   variant="outline"
                   disabled={busy}
+                  title={endsIdentity}
                   onClick={() => void actions.revoke(client.sessionId)}
                 >
                   Revoke

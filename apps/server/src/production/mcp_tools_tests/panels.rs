@@ -536,3 +536,36 @@ async fn a_panel_message_queued_behind_a_running_turn_is_delivered_once_it_settl
     );
     fixture.shutdown().await;
 }
+
+/// #280: a named agent's next run still speaks as the panel its earlier run opened; another
+/// name still cannot.
+#[tokio::test]
+async fn a_named_client_still_owns_the_panels_it_opened_after_a_restart() {
+    let fixture = Fixture::new().await;
+    let harness = &fixture.harness;
+    let first = super::threads::named_agent(harness, "builder", McpAccess::FullAccess).await;
+    let host = host(harness, &first, "feature-named").await;
+    let opened = panel(harness, &first, &host).await;
+    super::threads::end_run(harness, &first).await;
+
+    let second = super::threads::named_agent(harness, "builder", McpAccess::FullAccess).await;
+    let own = harness
+        .call(
+            &second,
+            "send_panel_message",
+            json!({ "fromThreadId": opened, "toThreadId": host, "text": "Back again" }),
+        )
+        .await;
+    structured(&own);
+
+    let other = super::threads::named_agent(harness, "reviewer", McpAccess::FullAccess).await;
+    let forged = harness
+        .call(
+            &other,
+            "send_panel_message",
+            json!({ "fromThreadId": opened, "toThreadId": host, "text": "Not mine" }),
+        )
+        .await;
+    assert_eq!(error_tag(&forged), "McpSourceThreadNotOwnedError");
+    fixture.shutdown().await;
+}

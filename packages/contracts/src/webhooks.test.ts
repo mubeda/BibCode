@@ -51,6 +51,17 @@ describe("webhook contracts across versions", () => {
     expect(list.endpoints[0]!.eventTypes).toEqual(["input.requested", "future.event"]);
   });
 
+  it("reads a paired client's name, and its absence from an older server", () => {
+    const older = decodeList({ enabled: true, endpoints: [olderEndpoint], maxEndpoints: 20 });
+    expect(older.endpoints[0]!.pairedClientName).toBeUndefined();
+    const named = decodeList({
+      enabled: true,
+      endpoints: [{ ...olderEndpoint, pairedClientId: "nc_1", pairedClientName: "builder" }],
+      maxEndpoints: 20,
+    });
+    expect(named.endpoints[0]!.pairedClientName).toBe("builder");
+  });
+
   it("reads the webhook capabilities as off when an older server leaves them out", () => {
     const capabilities = decodeCapabilities({});
     expect(capabilities.webhookQuestionEvents).toBe(false);
