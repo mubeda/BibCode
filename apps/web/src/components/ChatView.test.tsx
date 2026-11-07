@@ -81,6 +81,8 @@ const h = vi.hoisted(() => {
     atomValuesByKey: new Map<string, unknown>(),
     atomListeners: new Set<() => void>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
+    /** When set, `readPreparedConnection` returns this instead of the live session. */
+    preparedConnection: null as { descriptor: { capabilities: { threadDeleteOnlyIfUnused: boolean } } } | null,
     commandHandlers: new Map<string, (input: unknown) => Promise<unknown>>(),
     commandOptions: [] as Array<{ key: string; options: unknown }>,
     commandResults: {} as Record<string, (input: unknown) => unknown>,
@@ -363,7 +365,17 @@ vi.mock("../state/entities", () => ({
     ref ? (h.threadsByKey.get(`${ref.environmentId}:${ref.threadId}`) ?? null) : null,
   useThreadRefs: () => h.threadRefs,
   useThreadProposedPlans: () => [],
+  readThreadShell: () => null,
 }));
+
+vi.mock("../state/session", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../state/session")>();
+  return {
+    ...actual,
+    readPreparedConnection: (environmentId: EnvironmentId) =>
+      h.preparedConnection ?? actual.readPreparedConnection(environmentId),
+  };
+});
 
 vi.mock("../state/environments", () => ({
   useEnvironments: () => ({
@@ -819,6 +831,7 @@ vi.mock("./activity/ActivityPanel", async (importOriginal) => {
 });
 
 import ChatView from "./ChatView";
+import { closesByUnusedDelete } from "../centerPanelClose";
 import { ActivityPanelBinding } from "./activity/ActivityPaneBinding";
 import type { Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
@@ -1089,6 +1102,7 @@ beforeEach(() => {
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
   h.commandCalls.length = 0;
+  h.preparedConnection = null;
   h.commandHandlers.clear();
   h.commandOptions.length = 0;
   h.commandResults = {
@@ -5774,6 +5788,41 @@ describe("ChatView handlers (captured from mocked children)", () => {
     expect(
       (startCalls[0]!.input as { input: Record<string, unknown> }).input["bootstrap"],
     ).toBeUndefined();
+  });
+
+  it("notes a first send before the title round trip so closing cannot delete it", async () => {
+    const raceThreadId = ThreadId.make("side-send-race");
+    const raceRef = scopeThreadRef(environmentId, raceThreadId);
+    h.preparedConnection = {
+      descriptor: { capabilities: { threadDeleteOnlyIfUnused: true } },
+    };
+    seedConnectedServerThread(makeThread({ id: raceThreadId }));
+    renderToStaticMarkup(
+      <ChatView
+        environmentId={environmentId}
+        threadId={raceThreadId}
+        routeKind="server"
+        reserveTitleBarControlInset
+      />,
+    );
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
+    composerRef.current = composerHandle();
+    const promptRef = composer["promptRef"] as RefObject<string>;
+    promptRef.current = "why that file?";
+    expect(closesByUnusedDelete(raceRef)).toBe(true);
+
+    const title = deferredResult<ReturnType<typeof AsyncResult.success<undefined>>>();
+    h.commandResults["thread.updateMetadata"] = () => title.promise;
+    const sending = (composer["onSend"] as () => Promise<void>)();
+
+    expect(commandCallsFor("thread.updateMetadata").length).toBeGreaterThan(0);
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+    expect(closesByUnusedDelete(raceRef)).toBe(false);
+
+    title.resolve(AsyncResult.success(undefined));
+    await sending;
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
   });
 
   it("keeps an exact session account in the label, picker guard, and outgoing turn", async () => {
