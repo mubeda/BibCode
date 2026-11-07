@@ -16,7 +16,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/fleet-workspace-dark.webp">
-  <img src="docs/assets/readme/fleet-workspace.webp" alt="BiBCode with several coding agents running side by side in one workspace, shown with a demo project" width="100%">
+  <img src="docs/assets/readme/fleet-workspace.webp" alt="BiBCode workspace for the demo project Acme Billing: a Codex chat in the center, a Claude Code terminal on the right, and a test terminal below" width="100%">
 </picture>
 
 </div>
@@ -39,7 +39,7 @@ Stage files, write commits (with an AI-drafted message if you want one), and pul
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/source-control-dark.webp">
-  <img src="docs/assets/readme/source-control.webp" alt="Source Control panel with staged and unstaged changes and a commit box for a demo project" width="100%">
+  <img src="docs/assets/readme/source-control.webp" alt="Source Control and Diff tabs in the right panel showing the changed README.md and src/billing.ts of the demo project Acme Billing next to a Codex chat" width="100%">
 </picture>
 
 ### Files and editor
@@ -48,7 +48,7 @@ Browse, create, rename, and edit project files without leaving the workspace. Sa
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/files-and-editor-dark.webp">
-  <img src="docs/assets/readme/files-and-editor.webp" alt="Files panel beside an open source file in the editor for a demo project" width="100%">
+  <img src="docs/assets/readme/files-and-editor.webp" alt="Editor with the demo file dashboard.tsx open and a file tree on the right marking modified files in the Acme Billing demo project" width="100%">
 </picture>
 
 ### Terminals
@@ -57,16 +57,16 @@ Open terminals in the same worktree as the agent, or run an agent CLI in a termi
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/terminals-dark.webp">
-  <img src="docs/assets/readme/terminals.webp" alt="Split panes with terminals and an agent chat in one worktree of a demo project" width="100%">
+  <img src="docs/assets/readme/terminals.webp" alt="Two terminal panes side by side in the Acme Billing demo project, one showing test results and git status, the other git log and diff output" width="100%">
 </picture>
 
 ### Git Manager
 
-A full Git client for local work: commit history, branches, diffs, and the usual history and branch operations. [Docs](docs/user/workspace-ui.md#git-manager)
+A full Git client for local work: commit history, changes, tags, stashes, and branch operations. [Docs](docs/user/workspace-ui.md#git-manager)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/git-manager-dark.webp">
-  <img src="docs/assets/readme/git-manager.webp" alt="Git Manager with commit history, branch labels, and a code diff for a demo project" width="100%">
+  <img src="docs/assets/readme/git-manager.webp" alt="Git Manager History tab listing two commits of the Acme Billing demo project, with the selected commit's author and the diff of src/dashboard.tsx" width="100%">
 </picture>
 
 ### Pull requests
@@ -75,7 +75,7 @@ List, review, comment on, edit, merge, and check out pull requests on GitHub and
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/pull-requests-dark.webp">
-  <img src="docs/assets/readme/pull-requests.webp" alt="Pull request list and review view for a demo repository" width="100%">
+  <img src="docs/assets/readme/pull-requests.webp" alt="Pull request "Make billing retries safe" of a demo repository, on the Files changed tab with a code diff and reviewer, label, and milestone details" width="100%">
 </picture>
 
 ### Pipelines
@@ -84,7 +84,7 @@ Follow CI pipeline runs, their jobs, and job logs. [Docs](docs/user/workspace-ui
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/pipelines-dark.webp">
-  <img src="docs/assets/readme/pipelines.webp" alt="Pipeline run list with job status for a demo project" width="100%">
+  <img src="docs/assets/readme/pipelines.webp" alt="Pipelines job page for a passed Unit tests job of a demo repository, with its log, steps, artifacts, and related jobs" width="100%">
 </picture>
 
 ### Remote servers
@@ -93,7 +93,7 @@ Run agents on another machine and use them from your desktop or browser. Pair a 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/remote-servers-dark.webp">
-  <img src="docs/assets/readme/remote-servers.webp" alt="Saved remote servers with connection status, shown with a demo build server" width="100%">
+  <img src="docs/assets/readme/remote-servers.webp" alt="Settings, Remote Servers page listing one connected demo server named Acme build server with its version and update options" width="100%">
 </picture>
 
 ### Device previews
@@ -102,7 +102,7 @@ Run an Android emulator, or an iOS simulator on a macOS server, and see its scre
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/device-previews-dark.webp">
-  <img src="docs/assets/readme/device-previews.webp" alt="Device preview panel showing a mobile app next to the agent chat for a demo project" width="100%">
+  <img src="docs/assets/readme/device-previews.webp" alt="Device panel running a simulated phone that shows the demo Acme Billing app, next to the Codex chat" width="100%">
 </picture>
 
 ### MCP and webhooks
