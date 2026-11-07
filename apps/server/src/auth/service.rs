@@ -132,8 +132,8 @@ pub(crate) struct AuthTestHooks {
     pub(crate) after_consume: std::sync::Mutex<Option<TestHold>>,
     /// After the session row commits, before the cache holds it.
     pub(crate) after_session_insert: std::sync::Mutex<Option<TestHold>>,
-    /// After issuance publishes the session to the cache and releases the state lock (#294).
-    pub(crate) after_session_publish: std::sync::Mutex<Option<TestHold>>,
+    /// Immediately before issuance sends its ClientUpserted, wherever that send sits (#294).
+    pub(crate) before_session_upsert_event: std::sync::Mutex<Option<TestHold>>,
     /// Gives `mcp-client` sessions random ids, as a server before #281 did.
     pub(crate) random_mcp_session_ids: AtomicBool,
 }
@@ -2699,7 +2699,7 @@ impl AuthService {
             .entry(session_id.to_owned())
             .or_default()
             .insert(connection_id, shutdown);
-        // Sent before the best-effort persistence below, while the lock still orders it.
+        // Sent under the lock; the persistence below is best-effort and does not gate the event.
         self.emit_access_change(
             &state,
             AuthAccessChange::ClientUpserted(Box::new(view.clone())),
@@ -2873,10 +2873,10 @@ impl AuthService {
         let mut state = self.state.lock().await;
         state.sessions.insert(session_id.clone(), record);
         state.bump_authority_generation();
+        #[cfg(test)]
+        reach_hold(&self.test_hooks.before_session_upsert_event).await;
         self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        #[cfg(test)]
-        reach_hold(&self.test_hooks.after_session_publish).await;
         self.ensure_authority_watcher();
         if let Some(guard) = &mut pending_issuance_guard {
             guard.disarm();
@@ -7482,9 +7482,10 @@ mod tests {
         );
     }
 
-    /// A revoke the watcher reconciles while issuance has released the state lock but not yet
-    /// sent its ClientUpserted must not leave the client in Settings: events go out in state
-    /// order (#294).
+    /// A revoke that lands while issuance is about to send its ClientUpserted must not leave
+    /// the client in Settings: events go out in state order (#294). The hold sits right before
+    /// that send, so if the send ever moves after the unlock, the watcher reconciles inside
+    /// the hold and the late upsert resurrects the client.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_revoke_reconciled_between_publication_and_its_event_is_removed_from_settings() {
         let (service, repositories, _secrets) = mcp_test_service().await;
@@ -7493,7 +7494,11 @@ mod tests {
             .await
             .expect("link issues");
         let (held, reached, resume) = test_hold();
-        *service.test_hooks().after_session_publish.lock().unwrap() = Some(held);
+        *service
+            .test_hooks()
+            .before_session_upsert_event
+            .lock()
+            .unwrap() = Some(held);
         let exchange = exchange_in_background(&service, &link.credential).await;
         reached
             .await
@@ -7512,7 +7517,9 @@ mod tests {
             }
             _ => {}
         };
-        tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+        // Sending under the lock keeps the watcher out until the hold ends; a send after the
+        // unlock lets it reconcile the revoke here. Either way, give it several ticks.
+        let _ = tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 8, async {
             loop {
                 let change = events.recv().await.expect("access events").change;
                 fold(&change);
@@ -7522,8 +7529,7 @@ mod tests {
                 }
             }
         })
-        .await
-        .expect("the watcher reconciled the revoke");
+        .await;
         resume.send(()).unwrap();
         exchange.await.unwrap().expect("issued");
         // Issuance sends before it returns, so everything it sent precedes this marker.
@@ -7542,6 +7548,11 @@ mod tests {
         })
         .await
         .expect("the watcher reconciled the marker");
+        // One reconcile sends its pairing changes before its session changes, all under one
+        // lock, so the rest of the marker's batch is already queued.
+        while let Ok(event) = events.try_recv() {
+            fold(&event.change);
+        }
         assert!(
             !settings.contains(&link.id),
             "the access stream resurrected the revoked client"
