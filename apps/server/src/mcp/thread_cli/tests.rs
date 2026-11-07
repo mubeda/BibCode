@@ -1709,3 +1709,46 @@ async fn answer_and_approve_meet_the_ceiling_and_decline_does_not() {
     server.shutdown();
     server.join().await.expect("server joins");
 }
+
+/// #303: a normal stop with a live, idle Codex session that has finished a turn ends within
+/// 2 s. Every fixed shutdown grace on that path is at least 2 s (turn delivery's task drain,
+/// the provider stream settlement), so a stop that waits one out fails here. In a process of
+/// its own; a failure prints the slow stop step from the warn log.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stop_with_a_live_idle_codex_session_ends_within_two_seconds() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some(child) = crate::test_support::in_own_process(
+        "mcp::thread_cli::tests::a_stop_with_a_live_idle_codex_session_ends_within_two_seconds",
+    ) else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let root = tempfile::tempdir().expect("root");
+    let codex = root.path().join("fake-codex");
+    std::fs::write(&codex, FAKE_CODEX).unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = start_server(root.path(), &codex).await;
+    let cwd = project(&server, root.path()).await;
+    let started = run_in(
+        root.path(),
+        &cwd,
+        &["start", ".", "Say hello", "--wait"],
+        "",
+    )
+    .await;
+    assert_eq!(started.code, 0, "{} {}", started.out, started.err);
+
+    // The session stays live: its app-server is still running when the stop begins.
+    server.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(2), server.join())
+        .await
+        .expect("the stop ends within 2 s")
+        .expect("server joins");
+    child.complete();
+}
