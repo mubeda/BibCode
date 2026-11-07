@@ -397,11 +397,18 @@ delivery worker: the row must fail with one attempt, one launch, and one
 ACP errors share the launch classification for Cursor and Grok. Restart recovery
 of a row left sending must stop after one oversized launch, keep the row
 uncertain across delivery-service restart, and record the same profiler class.
+The ACP regression feeds the real 128 KiB bound through the connection and checks
+the nested Closed detail that the launch classification matches. Two composed
+recovery tests start from a failed oversized launch with a healthy relaunch
+available: Retry must deliver the same row on the second launch, and Dismiss must
+release a later queued message. Both assert exactly two launches and one
+`delivery.failing` finding.
 Run:
 
 ```sh
 cargo test -p bibcode-server --lib oversized_stdout -j 2
 cargo test -p bibcode-server --lib transport_line_too_long -j 2
+cargo test -p bibcode-server --lib an_oversized_stdout_failure -j 2
 cargo test -p bibcode-server --lib mcp_catalogue -j 2
 cargo test -p bibcode-server --lib mcp_status -j 2
 ```
