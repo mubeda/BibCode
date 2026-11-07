@@ -381,7 +381,7 @@ and LFS filter, and a fetch authenticates as the person's does:
     `credential.<url>.*` is not read.
   - `http.sslBackend` is one of `openssl`, `schannel`, `gnutls` and `secure-transport`.
     `http.sslCAInfo` is an absolute path to an existing regular file, without control
-    characters or quotes, written as a quoted Git string with `/` separators.
+    characters or quotes, written as a quoted Git string with each `\` escaped.
 - **The generated file.** The canonical values are written to
   `<state>/git/system-config-<hash>.gitconfig` in the server's own state directory, in the
   sections `[core]`, `[filter "lfs"]`, `[credential]` and `[http]`.

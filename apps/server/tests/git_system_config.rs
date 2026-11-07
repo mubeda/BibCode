@@ -1240,6 +1240,26 @@ async fn the_system_tls_keys_reach_production_git() {
             format!("system\t{canonical}\n")
         );
     }
+    // A `\` in the path survives the quoted Git string (on Windows the separator itself).
+    let backslash = root.path().join(if cfg!(windows) {
+        "backslash.pem"
+    } else {
+        "back\\slash.pem"
+    });
+    fs::write(&backslash, "fixture CA\n").unwrap();
+    let backslash = backslash.to_string_lossy().into_owned();
+    let generated = probe_system(
+        format!(
+            "[http]\n\tsslCAInfo = \"{}\"\n",
+            backslash.replace('\\', "\\\\")
+        ),
+        "backslash",
+    )
+    .await;
+    assert_eq!(
+        scoped(&generated, "http.sslcainfo"),
+        format!("system\t{backslash}\n")
+    );
     for unusable in [
         "ca.pem".to_owned(),
         format!("{ca}.missing"),
