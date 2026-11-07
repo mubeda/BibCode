@@ -3541,6 +3541,192 @@ mod workspace_loss_tests {
         f.shutdown().await;
     }
 
+    /// #316 composed recovery: the first launch dies on an oversized stdout line and every later
+    /// launch is healthy. `resolution` is how the user clears the failed head: "retry" must deliver
+    /// the same row on the next launch; "dismiss" must release a later queued message.
+    async fn assert_oversized_head_recovers(resolution: &str) {
+        use crate::production::turn_delivery::TurnDeliveryService;
+        use crate::provider::codex::protocol::{
+            ConnectionConfig, IncomingEvent, JsonRpcConnection,
+        };
+
+        struct OversizedThenHealthy {
+            launches: AtomicUsize,
+            healthy: Arc<LossDriver>,
+        }
+        impl ProviderDriverFactory for OversizedThenHealthy {
+            fn create(
+                &self,
+                request: ProviderLaunchRequest,
+            ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>>
+            {
+                Box::pin(async move {
+                    if self.launches.fetch_add(1, Ordering::SeqCst) > 0 {
+                        return self.healthy.create(request).await;
+                    }
+                    let (connection, mut events) = JsonRpcConnection::spawn(
+                        std::io::Cursor::new(vec![b'x'; 65]),
+                        tokio::io::sink(),
+                        tokio::io::empty(),
+                        ConnectionConfig {
+                            max_stdout_line_bytes: 64,
+                            ..ConnectionConfig::default()
+                        },
+                    );
+                    assert!(matches!(
+                        events.recv().await,
+                        Some(IncomingEvent::Closed { .. })
+                    ));
+                    let error = connection
+                        .request("initialize", json!({}))
+                        .await
+                        .unwrap_err();
+                    Err(codex_start_error(error.into(), "unused-config"))
+                })
+            }
+        }
+
+        async fn admit(f: &Fixture, id: &str, queued: bool) {
+            let command = turn(id, queued);
+            let mut payload = serde_json::to_value(&command).unwrap();
+            freeze_delivery_route(
+                &f.engine,
+                &f._root.path().to_path_buf(),
+                &command,
+                &mut payload,
+            )
+            .await
+            .unwrap();
+            f.engine
+                .dispatch_with_admission(
+                    command.clone(),
+                    CommandAdmission {
+                        payload_digest: canonical_command_digest(&command).unwrap(),
+                        attachment_refs: Vec::new(),
+                        provider_turn: Some(NewProviderTurnDelivery {
+                            command_id: id.into(),
+                            thread_id: "t1".into(),
+                            message_id: id.into(),
+                            provider_instance_id: "codex".into(),
+                            provider_kind: "codex".into(),
+                            provider_session_id: None,
+                            delivery_key: format!("{id}-key"),
+                            payload,
+                            state: if queued {
+                                TurnDeliveryState::Queued
+                            } else {
+                                TurnDeliveryState::Pending
+                            },
+                            mode: TurnDeliveryMode::Start,
+                            created_at: BEFORE_LOSS.into(),
+                        }),
+                    },
+                    || {},
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn row_of(f: &Fixture, id: &str) -> ProviderTurnDelivery {
+            f.engine
+                .repositories()
+                .get_provider_turn_delivery(id.into())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn wait_for(f: &Fixture, id: &str, state: TurnDeliveryState) -> ProviderTurnDelivery {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let row = row_of(f, id).await;
+                    if row.state == state {
+                        return row;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{id} never became {state:?}"))
+        }
+
+        let f = Fixture::new(false).await;
+        let factory = Arc::new(OversizedThenHealthy {
+            launches: AtomicUsize::new(0),
+            healthy: f.driver.clone(),
+        });
+        let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+            f.engine.clone(),
+            factory.clone(),
+            ActivityProjection::new(ActivityRepository::new(
+                f.engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ));
+        f.project("ready").await;
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        admit(&f, "head", false).await;
+        let service = TurnDeliveryService::start(
+            f.engine.clone(),
+            supervisor.clone(),
+            f._root.path().to_path_buf(),
+        );
+        let failed = wait_for(&f, "head", TurnDeliveryState::Failed).await;
+        assert_eq!(failed.attempts, 1);
+        assert_eq!(factory.launches.load(Ordering::SeqCst), 1);
+
+        let delivered = if resolution == "dismiss" {
+            admit(&f, "later", true).await;
+            service.wake();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                row_of(&f, "later").await.state,
+                TurnDeliveryState::Queued,
+                "a failed head holds later messages until it is resolved"
+            );
+            assert_eq!(factory.launches.load(Ordering::SeqCst), 1);
+            "later"
+        } else {
+            "head"
+        };
+        f.engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.turn-delivery.resolve", "commandId":"resolve",
+                    "threadId":"t1", "messageId":"head", "action":resolution,
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        wait_for(&f, delivered, TurnDeliveryState::Delivered).await;
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            factory.launches.load(Ordering::SeqCst),
+            2,
+            "one oversized launch, one healthy launch, no retry storm"
+        );
+        let findings: Vec<_> = crate::diagnostics::profiler::provider_turns::take_recorded()
+            .into_iter()
+            .filter(|(kind, _)| *kind == "delivery.failing")
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        service.shutdown().await;
+        supervisor.shutdown().await.unwrap();
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retrying_an_oversized_stdout_failure_delivers_on_a_healthy_relaunch() {
+        assert_oversized_head_recovers("retry").await;
+    }
+
+    #[tokio::test]
+    async fn dismissing_an_oversized_stdout_failure_releases_later_queued_messages() {
+        assert_oversized_head_recovers("dismiss").await;
+    }
+
     /// A manual compaction of the fixture's live Codex conversation.
     async fn request_compaction(f: &Fixture) -> String {
         f.project("ready").await;
