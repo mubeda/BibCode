@@ -531,6 +531,19 @@ impl ServerRuntime {
                 gateway.shutdown().await;
             });
         }
+        // The same drain waits for every `/mcp` call in flight, and an outside agent's
+        // `wait_for_thread` holds one for up to 50 s (#303): end those waits when shutdown is
+        // signaled. The quiesce's later call is a no-op.
+        if let Some(mcp_control) = production_runtime
+            .as_ref()
+            .map(|runtime| runtime.mcp_control())
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown.cancelled().await;
+                mcp_control.shutdown();
+            });
+        }
         #[cfg(test)]
         let auth_for_test = auth.clone();
         let app = http::build_router(http::AppState {
