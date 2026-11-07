@@ -511,6 +511,8 @@ describe("FilePreviewPanel across a right-panel tab switch", () => {
       // A file opens in its own tab, then the Files tab comes back.
       await render("pierre-edit.ts");
       expect(tree() !== null).toBe(survives);
+      // Collapsed, the kept tree is out of the tab order and the accessibility tree.
+      if (survives) expect(tree()!.closest("aside")!.hasAttribute("inert")).toBe(true);
       await render(null);
       expect(tree()?.dataset.expanded).toBe(survives ? "true" : "false");
     },
