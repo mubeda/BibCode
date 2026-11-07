@@ -790,10 +790,11 @@ async fn settle_dismissed_once(
                 | ProviderReconciliationOutcome::LaunchFailed { .. } => Ok(true),
                 // A turn this runtime still holds, or a server that cannot report its status:
                 // the marker stays until a later pass finds the session idle.
-                // A relaunch refused for the provider's configuration is refused again: stop asking.
+                // Configuration refusals and oversized transport closes repeat: stop asking.
                 ProviderReconciliationOutcome::Found
                 | ProviderReconciliationOutcome::ConversationLost { .. }
-                | ProviderReconciliationOutcome::ProviderConfiguration { .. } => Ok(false),
+                | ProviderReconciliationOutcome::ProviderConfiguration { .. }
+                | ProviderReconciliationOutcome::TransportLineTooLong { .. } => Ok(false),
             }
         })
         .buffer_unordered(MAX_CONCURRENT_THREADS)
@@ -961,7 +962,8 @@ async fn recover_sending(
             // Whether the original send arrived is unknown, and every relaunch is refused the same
             // way: the user's Retry or Dismiss decides.
             ProviderReconciliationOutcome::ConversationLost { detail }
-            | ProviderReconciliationOutcome::ProviderConfiguration { detail } => {
+            | ProviderReconciliationOutcome::ProviderConfiguration { detail }
+            | ProviderReconciliationOutcome::TransportLineTooLong { detail } => {
                 (TurnDeliveryState::Uncertain, Some(detail))
             }
             // A launch that never reached the provider is tried again, at most

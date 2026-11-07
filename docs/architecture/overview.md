@@ -1752,7 +1752,9 @@ it.
 - `delivery.failing` (#273) is recorded once for a message delivery that fails
   for good without reaching its provider: the provider refused its own
   configuration (`provider-configuration`, also when restart recovery meets
-  it), or the twentieth not-sent attempt or failed restart-recovery launch
+  it), a launch closed by an oversized stdio line (`transport-line-too-long`,
+  #316, also during restart recovery), or the twentieth not-sent attempt or
+  failed restart-recovery launch
   (`attempts-exhausted`; the recovered message then stays uncertain). It keeps the
   provider, the attempt count and that class, never the error text, and cites
   no event; each such failure also logs a `tracing::warn!`.
