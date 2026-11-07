@@ -105,8 +105,6 @@ interface FilePreviewPanelProps {
   workspaceUnavailable?: string | null;
   /** Changes when the thread's turn ends, which often means its agent edited files. */
   diskCheckSignal?: string | null;
-  /** True while a Files tab exists: a hidden sidebar stays mounted so that tab keeps its tree. */
-  keepExplorerMounted?: boolean;
 }
 
 const FILE_EXPLORER_STORAGE_KEY = "bibcode.fileExplorerOpen";
@@ -780,7 +778,6 @@ export default function FilePreviewPanel({
   editingSessions,
   workspaceUnavailable = null,
   diskCheckSignal = null,
-  keepExplorerMounted = false,
 }: FilePreviewPanelProps) {
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);
@@ -1162,17 +1159,12 @@ export default function FilePreviewPanel({
             )
           ) : null}
         </div>
-        {explorerOpen || relativePath === null || keepExplorerMounted ? (
+        {explorerOpen || relativePath === null ? (
           <aside
-            // A hidden sidebar stays mounted while the Files tab exists, so that tab returns to
-            // the same expanded folders, selection and scroll. It is collapsed, not removed.
-            inert={!explorerOpen && relativePath !== null}
             className={cn(
               "flex min-h-0 shrink-0 bg-background",
               relativePath
-                ? explorerOpen
-                  ? "w-[min(22rem,46%)] min-w-64 border-l border-panel-separator"
-                  : "w-0 min-w-0 overflow-hidden"
+                ? "w-[min(22rem,46%)] min-w-64 border-l border-panel-separator"
                 : "min-w-0 flex-1",
             )}
           >
