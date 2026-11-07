@@ -735,6 +735,23 @@ async fn fail_connection(
     }
     *inner.close_reason.lock().await = Some(reason.clone());
     let mut pending = inner.pending.lock().await;
+    if let ProtocolError::LineTooLong { stream, maximum } = &error {
+        let mut pending_methods: Vec<_> = pending
+            .values()
+            .map(|entry| entry.method.as_str())
+            .collect();
+        pending_methods.sort_unstable();
+        pending_methods.dedup();
+        // The bounded reader fails on the first non-LF byte beyond maximum.
+        tracing::warn!(
+            stream,
+            maximum,
+            bytes_seen = maximum.saturating_add(1),
+            lf_observed = false,
+            ?pending_methods,
+            "Codex JSON-RPC line too long"
+        );
+    }
     for (_, entry) in pending.drain() {
         let _ = entry.responder.send(Err(ProtocolError::Closed {
             reason: reason.clone(),
@@ -1084,6 +1101,93 @@ mod tests {
                 maximum: 3
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_stdout_closes_pending_requests_with_private_diagnostics() {
+        let Some(isolated) = crate::test_support::in_own_process(
+            "provider::codex::protocol::tests::oversized_stdout_closes_pending_requests_with_private_diagnostics",
+        ) else {
+            return;
+        };
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        for trailing_lf in [false, true] {
+            let (stdout, mut peer_stdout) = duplex(16 * 1024);
+            let (stdin, peer_stdin) = duplex(1024);
+            let (connection, mut incoming) = JsonRpcConnection::spawn(
+                stdout,
+                stdin,
+                tokio::io::empty(),
+                ConnectionConfig::default(),
+            );
+            let peer = async move {
+                let mut request = String::new();
+                BufReader::new(peer_stdin)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                let mut payload = vec![b'x'; CODEX_TRANSPORT_MESSAGE_MAX_BYTES + 1];
+                payload[..16].copy_from_slice(b"payload-sentinel");
+                if trailing_lf {
+                    payload.push(b'\n');
+                }
+                peer_stdout.write_all(&payload).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(
+                connection.request("thread/resume", json!({"threadId":"request-sentinel"})),
+                peer,
+            );
+            let error = result.unwrap_err();
+            assert_eq!(connection.pending_request_count().await, 0);
+            assert!(matches!(error, ProtocolError::Closed { .. }));
+            assert_eq!(
+                error.to_string(),
+                "Codex JSON-RPC connection is closed: Codex JSON-RPC read line exceeded 8388608 bytes on stdout"
+            );
+            assert!(matches!(
+                incoming.recv().await,
+                Some(IncomingEvent::Closed { .. })
+            ));
+        }
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("Codex JSON-RPC line too long").count(),
+            2,
+            "{log}"
+        );
+        for field in [
+            "stream=\"stdout\"",
+            "maximum=8388608",
+            "bytes_seen=8388609",
+            "lf_observed=false",
+            "pending_methods=[\"thread/resume\"]",
+        ] {
+            assert!(log.contains(field), "missing {field}: {log}");
+        }
+        assert!(!log.contains("payload-sentinel"));
+        assert!(!log.contains("request-sentinel"));
+        isolated.complete();
     }
 
     #[tokio::test]

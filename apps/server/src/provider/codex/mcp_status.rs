@@ -1,10 +1,9 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{Arc, Weak},
     task::{Context, Poll},
-    time::Duration,
 };
 
 use serde::Serialize;
@@ -12,12 +11,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::protocol::JsonRpcConnection;
-
 const PRE_ROOT_LIMIT: usize = 64;
-pub(crate) const MCP_STATUS_PAGE_LIMIT: usize = 8;
-pub(crate) const MCP_STATUS_PAGE_SIZE: u32 = 50;
-pub(crate) const MCP_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -37,8 +31,6 @@ pub(crate) struct McpServerStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
 }
-
-pub(crate) type McpLoadResult = Result<BTreeMap<String, McpServerStatus>, String>;
 
 #[derive(Clone)]
 pub(crate) struct McpStatusHandle {
@@ -94,13 +86,7 @@ impl McpOpenReservation {
 }
 
 pub(crate) enum McpStatusEffect {
-    Load {
-        epoch: u64,
-        generation: u64,
-        root: String,
-    },
     Snapshot(Vec<McpServerStatus>),
-    Warning(String),
     Complete(Vec<oneshot::Sender<Result<(), String>>>),
 }
 
@@ -119,11 +105,6 @@ pub(crate) enum McpStatusCommand {
         root: Option<String>,
         server: McpServerStatus,
     },
-    LoadFinished {
-        epoch: u64,
-        generation: u64,
-        result: McpLoadResult,
-    },
     #[cfg(test)]
     SnapshotForTest {
         done: oneshot::Sender<Vec<McpServerStatus>>,
@@ -135,20 +116,13 @@ pub(crate) enum McpStatusCommand {
 
 struct McpStatusState {
     root: Option<String>,
-    epoch: u64,
-    generation: u64,
-    in_flight: Option<InFlightRefresh>,
+    opening: Option<Opening>,
     servers: BTreeMap<String, McpServerStatus>,
     pre_root: VecDeque<(Option<String>, McpServerStatus)>,
 }
 
-struct InFlightRefresh {
-    epoch: u64,
-    generation: u64,
-    opening: bool,
-    opening_ownership: Option<OpeningOwnership>,
-    root_changed: bool,
-    overlay: BTreeMap<String, McpServerStatus>,
+struct Opening {
+    ownership: OpeningOwnership,
     waiters: Vec<oneshot::Sender<Result<(), String>>>,
 }
 
@@ -212,20 +186,6 @@ impl McpStatusHandle {
             .await
     }
 
-    pub(crate) async fn load_finished(
-        &self,
-        epoch: u64,
-        generation: u64,
-        result: McpLoadResult,
-    ) -> Result<(), String> {
-        self.send(McpStatusCommand::LoadFinished {
-            epoch,
-            generation,
-            result,
-        })
-        .await
-    }
-
     #[cfg(test)]
     pub(crate) async fn snapshot_for_test(&self) -> Result<Vec<McpServerStatus>, String> {
         let (done_tx, done_rx) = oneshot::channel();
@@ -259,19 +219,16 @@ pub(crate) async fn run_actor(
 ) {
     let mut state = McpStatusState {
         root: None,
-        epoch: 0,
-        generation: 0,
-        in_flight: None,
+        opening: None,
         servers: BTreeMap::new(),
         pre_root: VecDeque::new(),
     };
 
     loop {
         let opening_cancellation = state
-            .in_flight
+            .opening
             .as_ref()
-            .and_then(|in_flight| in_flight.opening_ownership.as_ref())
-            .map(|ownership| ownership.cancellation.clone());
+            .map(|opening| opening.ownership.cancellation.clone());
         let command = if let Some(cancellation) = opening_cancellation {
             tokio::select! {
                 biased;
@@ -296,18 +253,13 @@ pub(crate) async fn run_actor(
             McpStatusCommand::Notification { root, server } => {
                 notification(&mut state, root, server, &effects_tx);
             }
-            McpStatusCommand::LoadFinished {
-                epoch,
-                generation,
-                result,
-            } => finish_load(&mut state, epoch, generation, result, &effects_tx),
             #[cfg(test)]
             McpStatusCommand::SnapshotForTest { done } => {
                 let _ = done.send(snapshot(&state.servers));
             }
             McpStatusCommand::Shutdown { done } => {
-                if let Some(in_flight) = state.in_flight.take() {
-                    for waiter in in_flight.waiters {
+                if let Some(opening) = state.opening.take() {
+                    for waiter in opening.waiters {
                         let _ = waiter.send(Err("MCP status actor shut down".to_owned()));
                     }
                 }
@@ -323,62 +275,35 @@ fn begin_open(
     done: oneshot::Sender<Result<(), String>>,
     ownership: oneshot::Sender<Arc<McpOpenOwnership>>,
 ) {
-    if let Some(owner) = state
-        .in_flight
-        .as_ref()
-        .filter(|in_flight| in_flight.opening)
-        .and_then(|in_flight| in_flight.opening_ownership.as_ref())
-        .and_then(|ownership| ownership.owner.upgrade())
+    if let Some(opening) = state.opening.as_mut()
+        && let Some(owner) = opening.ownership.owner.upgrade()
     {
-        state
-            .in_flight
-            .as_mut()
-            .expect("checked above")
-            .waiters
-            .push(done);
+        opening.waiters.push(done);
         let _ = ownership.send(owner);
         return;
     }
-    if state
-        .in_flight
-        .as_ref()
-        .is_some_and(|in_flight| in_flight.opening)
-    {
-        cancel_open(state, "MCP status opening was cancelled".to_owned());
-    }
-
-    let mut waiters = state
-        .in_flight
-        .take()
-        .map_or_else(Vec::new, |in_flight| in_flight.waiters);
-    waiters.push(done);
-    state.generation = state.generation.wrapping_add(1);
+    cancel_open(state, "MCP status opening was cancelled".to_owned());
     state.pre_root.clear();
     let cancellation = CancellationToken::new();
     let owner = Arc::new(McpOpenOwnership {
         cancellation: cancellation.clone(),
     });
-    state.in_flight = Some(InFlightRefresh {
-        epoch: state.epoch,
-        generation: state.generation,
-        opening: true,
-        opening_ownership: Some(OpeningOwnership {
+    state.opening = Some(Opening {
+        ownership: OpeningOwnership {
             owner: Arc::downgrade(&owner),
             cancellation,
-        }),
-        root_changed: false,
-        overlay: BTreeMap::new(),
-        waiters,
+        },
+        waiters: vec![done],
     });
     let _ = ownership.send(owner);
 }
 
 fn cancel_open(state: &mut McpStatusState, error: String) {
-    let Some(in_flight) = state.in_flight.take_if(|in_flight| in_flight.opening) else {
+    let Some(opening) = state.opening.take() else {
         return;
     };
     state.pre_root.clear();
-    for waiter in in_flight.waiters {
+    for waiter in opening.waiters {
         let _ = waiter.send(Err(error.clone()));
     }
 }
@@ -388,72 +313,22 @@ fn bind_root(
     root: String,
     effects_tx: &mpsc::UnboundedSender<McpStatusEffect>,
 ) {
-    let changed = state.root.as_deref() != Some(root.as_str());
-    if changed {
-        state.root = Some(root.clone());
-        state.epoch = state.epoch.wrapping_add(1);
+    if state.opening.is_some() || state.root.as_deref() != Some(root.as_str()) {
         state.servers.clear();
     }
-
-    if changed
-        && state
-            .in_flight
-            .as_ref()
-            .is_some_and(|in_flight| !in_flight.opening)
-    {
-        let waiters = state.in_flight.take().expect("checked above").waiters;
-        state.generation = state.generation.wrapping_add(1);
-        state.pre_root.clear();
-        let epoch = state.epoch;
-        let generation = state.generation;
-        state.in_flight = Some(InFlightRefresh {
-            epoch,
-            generation,
-            opening: false,
-            opening_ownership: None,
-            root_changed: true,
-            overlay: BTreeMap::new(),
-            waiters,
-        });
-        dispatch_load(state, effects_tx, epoch, generation, root);
-        return;
-    }
-
-    if state.in_flight.is_none() {
-        state.generation = state.generation.wrapping_add(1);
-        state.in_flight = Some(InFlightRefresh {
-            epoch: state.epoch,
-            generation: state.generation,
-            opening: true,
-            opening_ownership: None,
-            root_changed: changed,
-            overlay: BTreeMap::new(),
-            waiters: Vec::new(),
-        });
-    }
-
-    let staged = state
+    for (_, server) in state
         .pre_root
         .drain(..)
         .filter(|(notification_root, _)| matches_root(notification_root.as_deref(), &root))
-        .collect::<Vec<_>>();
-    let (epoch, generation) = {
-        let Some(in_flight) = state.in_flight.as_mut() else {
-            return;
-        };
-        if !in_flight.opening {
-            return;
-        }
-        in_flight.epoch = state.epoch;
-        in_flight.root_changed |= changed;
-        for (_, server) in staged {
-            in_flight.overlay.insert(server.name.clone(), server);
-        }
-        in_flight.opening = false;
-        in_flight.opening_ownership = None;
-        (in_flight.epoch, in_flight.generation)
-    };
-    dispatch_load(state, effects_tx, epoch, generation, root);
+    {
+        state.servers.insert(server.name.clone(), server);
+    }
+    state.root = Some(root);
+    let waiters = state
+        .opening
+        .take()
+        .map_or_else(Vec::new, |opening| opening.waiters);
+    publish(state, waiters, effects_tx);
 }
 
 fn refresh(
@@ -461,47 +336,28 @@ fn refresh(
     done: oneshot::Sender<Result<(), String>>,
     effects_tx: &mpsc::UnboundedSender<McpStatusEffect>,
 ) {
-    if let Some(in_flight) = state.in_flight.as_mut() {
-        in_flight.waiters.push(done);
+    if let Some(opening) = state.opening.as_mut() {
+        opening.waiters.push(done);
         return;
     }
-    let Some(root) = state.root.clone() else {
+    if state.root.is_none() {
         let _ = done.send(Err("MCP status root is not bound".to_owned()));
         return;
-    };
-    state.generation = state.generation.wrapping_add(1);
-    let in_flight = InFlightRefresh {
-        epoch: state.epoch,
-        generation: state.generation,
-        opening: false,
-        opening_ownership: None,
-        root_changed: false,
-        overlay: BTreeMap::new(),
-        waiters: vec![done],
-    };
-    let epoch = in_flight.epoch;
-    let generation = in_flight.generation;
-    state.in_flight = Some(in_flight);
-    dispatch_load(state, effects_tx, epoch, generation, root);
+    }
+    publish(state, vec![done], effects_tx);
 }
 
-fn dispatch_load(
-    state: &mut McpStatusState,
+fn publish(
+    state: &McpStatusState,
+    waiters: Vec<oneshot::Sender<Result<(), String>>>,
     effects_tx: &mpsc::UnboundedSender<McpStatusEffect>,
-    epoch: u64,
-    generation: u64,
-    root: String,
 ) {
-    if effects_tx
-        .send(McpStatusEffect::Load {
-            epoch,
-            generation,
-            root,
-        })
-        .is_err()
-        && let Some(in_flight) = state.in_flight.take()
+    // shortcut: status is notification-only; use discovery when Codex offers a bounded auth-only response.
+    let _ = effects_tx.send(McpStatusEffect::Snapshot(snapshot(&state.servers)));
+    if let Err(error) = effects_tx.send(McpStatusEffect::Complete(waiters))
+        && let McpStatusEffect::Complete(waiters) = error.0
     {
-        for waiter in in_flight.waiters {
+        for waiter in waiters {
             let _ = waiter.send(Err("MCP status effect receiver is unavailable".to_owned()));
         }
     }
@@ -513,11 +369,7 @@ fn notification(
     server: McpServerStatus,
     effects_tx: &mpsc::UnboundedSender<McpStatusEffect>,
 ) {
-    if state
-        .in_flight
-        .as_ref()
-        .is_some_and(|in_flight| in_flight.opening)
-    {
+    if state.opening.is_some() {
         if state.pre_root.len() == PRE_ROOT_LIMIT {
             state.pre_root.pop_front();
         }
@@ -527,60 +379,13 @@ fn notification(
     let Some(bound_root) = state.root.as_deref() else {
         return;
     };
-    if !matches_root(root.as_deref(), bound_root) {
-        return;
-    }
-    if let Some(in_flight) = state.in_flight.as_mut() {
-        in_flight.overlay.insert(server.name.clone(), server);
-        return;
-    }
-    if state.servers.get(&server.name) == Some(&server) {
+    if !matches_root(root.as_deref(), bound_root)
+        || state.servers.get(&server.name) == Some(&server)
+    {
         return;
     }
     state.servers.insert(server.name.clone(), server);
     let _ = effects_tx.send(McpStatusEffect::Snapshot(snapshot(&state.servers)));
-}
-
-fn finish_load(
-    state: &mut McpStatusState,
-    epoch: u64,
-    generation: u64,
-    result: McpLoadResult,
-    effects_tx: &mpsc::UnboundedSender<McpStatusEffect>,
-) {
-    if state
-        .in_flight
-        .as_ref()
-        .is_none_or(|in_flight| in_flight.epoch != epoch || in_flight.generation != generation)
-    {
-        return;
-    }
-    let in_flight = state.in_flight.take().expect("checked above");
-    state.pre_root.clear();
-    match result {
-        Ok(mut baseline) => {
-            baseline.extend(in_flight.overlay);
-            state.servers = baseline;
-            let _ = effects_tx.send(McpStatusEffect::Snapshot(snapshot(&state.servers)));
-        }
-        Err(error) => {
-            let mut visible = if in_flight.root_changed {
-                BTreeMap::new()
-            } else {
-                state.servers.clone()
-            };
-            visible.extend(in_flight.overlay);
-            let changed = in_flight.root_changed || visible != state.servers;
-            state.servers = visible;
-            if changed {
-                let _ = effects_tx.send(McpStatusEffect::Snapshot(snapshot(&state.servers)));
-            }
-            let _ = effects_tx.send(McpStatusEffect::Warning(format!(
-                "MCP status discovery failed: {error}"
-            )));
-        }
-    }
-    let _ = effects_tx.send(McpStatusEffect::Complete(in_flight.waiters));
 }
 
 fn matches_root(notification_root: Option<&str>, root: &str) -> bool {
@@ -589,82 +394,6 @@ fn matches_root(notification_root: Option<&str>, root: &str) -> bool {
 
 fn snapshot(servers: &BTreeMap<String, McpServerStatus>) -> Vec<McpServerStatus> {
     servers.values().cloned().collect()
-}
-
-pub(crate) async fn refresh_mcp_status_snapshot(
-    connection: &JsonRpcConnection,
-    root: &str,
-) -> McpLoadResult {
-    let mut servers = BTreeMap::new();
-    let mut cursor = None;
-    let mut seen_cursors = HashSet::new();
-    for _ in 0..MCP_STATUS_PAGE_LIMIT {
-        let mut params = serde_json::json!({
-            "threadId": root,
-            "limit": MCP_STATUS_PAGE_SIZE,
-            "detail": "toolsAndAuthOnly",
-        });
-        if let Some(cursor) = cursor.as_ref() {
-            params["cursor"] = serde_json::json!(cursor);
-        }
-        let cancellation = CancellationToken::new();
-        let request = connection.request_cancellable("mcpServerStatus/list", params, &cancellation);
-        tokio::pin!(request);
-        let response = match tokio::time::timeout(MCP_STATUS_REQUEST_TIMEOUT, &mut request).await {
-            Ok(result) => result.map_err(|error| error.to_string())?,
-            Err(_) => {
-                cancellation.cancel();
-                let _ = request.await;
-                return Err("mcpServerStatus/list request timed out".to_owned());
-            }
-        };
-        let data = response
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "mcpServerStatus/list response missing data array".to_owned())?;
-        for server in data.iter().map(mcp_server_status_from_snapshot) {
-            let server = server?;
-            servers.insert(server.name.clone(), server);
-        }
-        match response.get("nextCursor") {
-            None | Some(Value::Null) => return Ok(servers),
-            Some(Value::String(next_cursor)) if !next_cursor.trim().is_empty() => {
-                if !seen_cursors.insert(next_cursor.clone()) {
-                    return Err("mcpServerStatus/list response repeated nextCursor".to_owned());
-                }
-                cursor = Some(next_cursor.clone());
-            }
-            _ => return Err("mcpServerStatus/list response has invalid nextCursor".to_owned()),
-        }
-    }
-    Err("mcpServerStatus/list response exceeded page limit".to_owned())
-}
-
-pub(crate) fn mcp_server_status_from_snapshot(server: &Value) -> Result<McpServerStatus, String> {
-    let name = server
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| "mcpServerStatus/list row missing a non-empty name".to_owned())?;
-    let (state, detail) = match server.get("authStatus").and_then(Value::as_str) {
-        Some("unsupported" | "bearerToken" | "oAuth") => (McpServerState::Starting, None),
-        Some("notLoggedIn") => (
-            McpServerState::NeedsAuth,
-            Some("Authentication required.".to_owned()),
-        ),
-        Some(other) => {
-            return Err(format!(
-                "mcpServerStatus/list row has unsupported authStatus {other}"
-            ));
-        }
-        None => return Err("mcpServerStatus/list row missing authStatus".to_owned()),
-    };
-    Ok(McpServerStatus {
-        name: name.to_owned(),
-        state,
-        detail,
-    })
 }
 
 pub(crate) fn mcp_server_status_from_notification(params: &Value) -> Option<McpServerStatus> {
@@ -705,82 +434,27 @@ pub(crate) fn mcp_server_status(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use tokio::sync::mpsc;
-
     use super::*;
 
-    fn server(name: &str, state: McpServerState) -> McpServerStatus {
+    fn server(name: &str) -> McpServerStatus {
         McpServerStatus {
             name: name.to_owned(),
-            state,
+            state: McpServerState::Connected,
             detail: None,
         }
     }
 
-    fn map<const N: usize>(servers: [McpServerStatus; N]) -> BTreeMap<String, McpServerStatus> {
-        servers
-            .into_iter()
-            .map(|server| (server.name.clone(), server))
-            .collect()
-    }
-
-    fn names(servers: &[McpServerStatus]) -> Vec<&str> {
-        servers.iter().map(|server| server.name.as_str()).collect()
-    }
-
-    #[tokio::test]
-    async fn stages_notifications_until_the_opening_load_completes() {
-        // Mutation caught: committing an in-flight notification emits an incomplete snapshot.
-        let (handle, receiver) = McpStatusHandle::channel(64);
-        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
-        let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
-        let opening = handle.begin_open().await.unwrap();
-        handle
-            .notification(
-                Some("root-1".into()),
-                server("before", McpServerState::Connected),
-            )
-            .await
-            .unwrap();
-        handle.bind_root("root-1".into()).await.unwrap();
-
-        let McpStatusEffect::Load {
-            epoch,
-            generation,
-            root,
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected list load");
+    async fn published(effects: &mut mpsc::UnboundedReceiver<McpStatusEffect>) -> Vec<String> {
+        let McpStatusEffect::Snapshot(servers) = effects.recv().await.unwrap() else {
+            panic!("snapshot must precede completion");
         };
-        assert_eq!(root, "root-1");
-
-        handle
-            .notification(
-                Some("root-1".into()),
-                server("during", McpServerState::Starting),
-            )
-            .await
-            .unwrap();
-        assert!(effects_rx.try_recv().is_err());
-
-        handle
-            .load_finished(
-                epoch,
-                generation,
-                Ok(map([server("seed", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        let McpStatusEffect::Snapshot(snapshot) = effects_rx.recv().await.unwrap() else {
-            panic!("expected complete snapshot");
+        let McpStatusEffect::Complete(waiters) = effects.recv().await.unwrap() else {
+            panic!("expected completion");
         };
-        assert_eq!(names(&snapshot), vec!["before", "during", "seed"]);
-        drop(opening);
-        handle.shutdown().await.unwrap();
-        actor.await.unwrap();
+        for waiter in waiters {
+            waiter.send(Ok(())).unwrap();
+        }
+        servers.into_iter().map(|server| server.name).collect()
     }
 
     #[tokio::test]
@@ -788,344 +462,113 @@ mod tests {
         let (handle, receiver) = McpStatusHandle::channel(64);
         let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
         let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
         let opening = handle.begin_open().await.unwrap();
         for index in 0..PRE_ROOT_LIMIT + 2 {
             handle
                 .notification(
-                    Some(if index % 2 == 0 {
-                        "matching-root".to_owned()
-                    } else {
-                        "foreign-root".to_owned()
-                    }),
-                    server(&format!("server-{index:02}"), McpServerState::Connected),
+                    Some(
+                        if index % 2 == 0 {
+                            "matching-root"
+                        } else {
+                            "foreign-root"
+                        }
+                        .into(),
+                    ),
+                    server(&format!("server-{index:02}")),
                 )
                 .await
                 .unwrap();
         }
         handle.bind_root("matching-root".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch, generation, ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected list load");
-        };
-        handle
-            .load_finished(epoch, generation, Ok(BTreeMap::new()))
-            .await
-            .unwrap();
-        let McpStatusEffect::Snapshot(snapshot) = effects_rx.recv().await.unwrap() else {
-            panic!("expected complete snapshot");
-        };
         assert_eq!(
-            snapshot
-                .iter()
-                .map(|server| server.name.clone())
-                .collect::<Vec<_>>(),
+            published(&mut effects_rx).await,
             (2..=PRE_ROOT_LIMIT)
                 .step_by(2)
                 .map(|index| format!("server-{index:02}"))
                 .collect::<Vec<_>>()
         );
-
-        drop(opening);
-        handle.shutdown().await.unwrap();
-        actor.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn changed_root_failure_only_publishes_new_root_observations() {
-        // Mutation caught: retaining old-root committed servers after a failed new-root load.
-        let (handle, receiver) = McpStatusHandle::channel(64);
-        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
-        let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
-        let old_opening = handle.begin_open().await.unwrap();
-        handle.bind_root("old-root".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch, generation, ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected old-root load");
-        };
-        handle
-            .load_finished(
-                epoch,
-                generation,
-                Ok(map([server("old-only", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        let _ = effects_rx.recv().await;
-        let _ = effects_rx.recv().await;
-        drop(old_opening);
-
-        let new_opening = handle.begin_open().await.unwrap();
-        handle
-            .notification(
-                Some("old-root".into()),
-                server("late-old", McpServerState::Connected),
-            )
-            .await
-            .unwrap();
-        handle.bind_root("new-root".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch, generation, ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected new-root load");
-        };
-        handle
-            .notification(
-                Some("new-root".into()),
-                server("new-only", McpServerState::Starting),
-            )
-            .await
-            .unwrap();
-        handle
-            .load_finished(epoch, generation, Err("list unavailable".to_owned()))
-            .await
-            .unwrap();
-
-        let McpStatusEffect::Snapshot(new_root_failure_snapshot) = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected new-root snapshot");
-        };
-        assert_eq!(names(&new_root_failure_snapshot), vec!["new-only"]);
-        assert!(!names(&new_root_failure_snapshot).contains(&"old-only"));
-        assert!(!names(&new_root_failure_snapshot).contains(&"late-old"));
-        assert!(matches!(
-            effects_rx.recv().await,
-            Some(McpStatusEffect::Warning(_))
-        ));
-        let _ = effects_rx.recv().await;
-        drop(new_opening);
-        handle.shutdown().await.unwrap();
-        actor.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn overlapping_refreshes_coalesce_and_late_old_epoch_success_is_ignored() {
-        // Mutation caught: a second refresh starts duplicate I/O or applies a stale root result.
-        let (handle, receiver) = McpStatusHandle::channel(64);
-        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
-        let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
-        let opening = handle.begin_open().await.unwrap();
-        let refresh = handle.refresh().await.unwrap();
-        handle.bind_root("root-1".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch: old_epoch,
-            generation: old_generation,
-            ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected first load");
-        };
-        assert!(effects_rx.try_recv().is_err());
-
-        let replacement_opening = handle.begin_open().await.unwrap();
-        handle.bind_root("root-2".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch, generation, ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected replacement load");
-        };
-        handle
-            .load_finished(
-                old_epoch,
-                old_generation,
-                Ok(map([server("old-only", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        assert!(effects_rx.try_recv().is_err());
-
-        handle
-            .load_finished(
-                epoch,
-                generation,
-                Ok(map([server("new-only", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        let McpStatusEffect::Snapshot(snapshot) = effects_rx.recv().await.unwrap() else {
-            panic!("expected replacement snapshot");
-        };
-        assert_eq!(names(&snapshot), vec!["new-only"]);
-        drop((opening, refresh, replacement_opening));
-        handle.shutdown().await.unwrap();
-        actor.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn root_change_during_refresh_replaces_the_old_load() {
-        // Mutation caught: accepting an old-root result after the root has changed.
-        let (handle, receiver) = McpStatusHandle::channel(64);
-        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
-        let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
-        let opening = handle.begin_open().await.unwrap();
-        handle.bind_root("old-root".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch, generation, ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected initial load");
-        };
-        handle
-            .load_finished(
-                epoch,
-                generation,
-                Ok(map([server("old-only", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        let _ = effects_rx.recv().await;
-        let McpStatusEffect::Complete(waiters) = effects_rx.recv().await.unwrap() else {
-            panic!("expected initial completion");
-        };
-        for waiter in waiters {
-            waiter.send(Ok(())).unwrap();
-        }
         assert_eq!(opening.await.unwrap(), Ok(()));
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
 
-        let refresh = handle.refresh().await.unwrap();
-        let McpStatusEffect::Load {
-            epoch: old_epoch,
-            generation: old_generation,
-            root,
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected old-root refresh load");
-        };
-        assert_eq!(root, "old-root");
-        handle.bind_root("new-root".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch,
-            generation,
-            root,
-        } = tokio::time::timeout(std::time::Duration::from_millis(100), effects_rx.recv())
-            .await
-            .expect("expected replacement load")
-            .unwrap()
-        else {
-            panic!("expected replacement load");
-        };
-        assert_eq!(root, "new-root");
-
-        handle
-            .load_finished(
-                old_epoch,
-                old_generation,
-                Ok(map([server("old-only", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        assert!(effects_rx.try_recv().is_err());
-
-        handle
-            .load_finished(
-                epoch,
-                generation,
-                Ok(map([server("new-only", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        let McpStatusEffect::Snapshot(snapshot) = effects_rx.recv().await.unwrap() else {
-            panic!("expected new-root snapshot");
-        };
-        assert_eq!(names(&snapshot), vec!["new-only"]);
-        let McpStatusEffect::Complete(waiters) = effects_rx.recv().await.unwrap() else {
-            panic!("expected refresh completion");
-        };
-        for waiter in waiters {
-            waiter.send(Ok(())).unwrap();
+    #[tokio::test]
+    async fn refresh_retains_observations_and_changed_root_drops_old_status() {
+        let (handle, receiver) = McpStatusHandle::channel(64);
+        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
+        let actor = tokio::spawn(run_actor(receiver, effects_tx));
+        for root in ["old-root", "old-root", "new-root"] {
+            let opening = handle.begin_open().await.unwrap();
+            let first_refresh = handle.refresh().await.unwrap();
+            let second_refresh = handle.refresh().await.unwrap();
+            handle
+                .notification(Some(root.into()), server(root))
+                .await
+                .unwrap();
+            handle
+                .notification(Some("foreign".into()), server("foreign"))
+                .await
+                .unwrap();
+            handle.bind_root(root.into()).await.unwrap();
+            assert_eq!(published(&mut effects_rx).await, [root]);
+            assert_eq!(opening.await.unwrap(), Ok(()));
+            assert_eq!(first_refresh.await.unwrap(), Ok(()));
+            assert_eq!(second_refresh.await.unwrap(), Ok(()));
+            let refresh = handle.refresh().await.unwrap();
+            assert_eq!(published(&mut effects_rx).await, [root]);
+            assert_eq!(refresh.await.unwrap(), Ok(()));
+            handle
+                .notification(Some(root.into()), server(root))
+                .await
+                .unwrap();
+            // Synchronize with the mailbox before testing duplicate suppression.
+            assert_eq!(handle.snapshot_for_test().await.unwrap(), [server(root)]);
+            assert!(effects_rx.try_recv().is_err());
         }
-        assert_eq!(refresh.await.unwrap(), Ok(()));
+        let reopened = handle.begin_open().await.unwrap();
+        handle.bind_root("new-root".into()).await.unwrap();
+        assert!(published(&mut effects_rx).await.is_empty());
+        assert_eq!(reopened.await.unwrap(), Ok(()));
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_opening_releases_joined_refresh_and_discards_staged_notifications() {
+        let (handle, receiver) = McpStatusHandle::channel(64);
+        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
+        let actor = tokio::spawn(run_actor(receiver, effects_tx));
+        let opening = handle.begin_open().await.unwrap();
+        let refresh = handle.refresh().await.unwrap();
+        handle
+            .notification(None, server("abandoned"))
+            .await
+            .unwrap();
+        opening.cancel().await;
+        assert!(refresh.await.unwrap().is_err());
+        let retry = handle.begin_open().await.unwrap();
+        handle.bind_root("root".into()).await.unwrap();
+        assert!(published(&mut effects_rx).await.is_empty());
+        assert_eq!(retry.await.unwrap(), Ok(()));
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
     }
 
     #[tokio::test]
     async fn closed_effect_receiver_fails_opening_waiters() {
-        // Mutation caught: retaining a completion waiter after the effect worker has stopped.
         let (handle, receiver) = McpStatusHandle::channel(64);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         drop(effects_rx);
         let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
         let opening = handle.begin_open().await.unwrap();
-        handle.bind_root("root-1".into()).await.unwrap();
-
-        let completion = tokio::time::timeout(std::time::Duration::from_millis(100), opening)
-            .await
-            .expect("effect failure must resolve the opening waiter")
-            .unwrap();
-        assert!(completion.is_err());
-        handle.shutdown().await.unwrap();
-        actor.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn concurrent_same_root_refreshes_emit_one_load_and_complete_both_waiters() {
-        // Mutation caught: a second post-bind refresh starts I/O or loses a completion waiter.
-        let (handle, receiver) = McpStatusHandle::channel(64);
-        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
-        let actor = tokio::spawn(run_actor(receiver, effects_tx));
-
-        let opening = handle.begin_open().await.unwrap();
-        handle.bind_root("root-1".into()).await.unwrap();
-        let McpStatusEffect::Load {
-            epoch, generation, ..
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected opening load");
-        };
-        handle
-            .load_finished(epoch, generation, Ok(BTreeMap::new()))
-            .await
-            .unwrap();
-        let _ = effects_rx.recv().await;
-        let McpStatusEffect::Complete(waiters) = effects_rx.recv().await.unwrap() else {
-            panic!("expected opening completion");
-        };
-        for waiter in waiters {
-            waiter.send(Ok(())).unwrap();
-        }
-        assert_eq!(opening.await.unwrap(), Ok(()));
-
-        let first = handle.refresh().await.unwrap();
-        let second = handle.refresh().await.unwrap();
-        let McpStatusEffect::Load {
-            epoch,
-            generation,
-            root,
-        } = effects_rx.recv().await.unwrap()
-        else {
-            panic!("expected one refresh load");
-        };
-        assert_eq!(root, "root-1");
-        assert!(effects_rx.try_recv().is_err());
-        handle
-            .load_finished(
-                epoch,
-                generation,
-                Ok(map([server("same-root", McpServerState::Connected)])),
-            )
-            .await
-            .unwrap();
-        let _ = effects_rx.recv().await;
-        let McpStatusEffect::Complete(waiters) = effects_rx.recv().await.unwrap() else {
-            panic!("expected refresh completions");
-        };
-        assert_eq!(waiters.len(), 2);
-        for waiter in waiters {
-            waiter.send(Ok(())).unwrap();
-        }
-        assert_eq!(first.await.unwrap(), Ok(()));
-        assert_eq!(second.await.unwrap(), Ok(()));
+        handle.bind_root("root".into()).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), opening)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
     }

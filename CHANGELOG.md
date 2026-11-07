@@ -2,7 +2,7 @@
 
 ## [v0.15.2] - 2026-11-05
 
-BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308 since v0.15.1.
+BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308, PR #314, and issue #316 since v0.15.1.
 
 ### Chats and diffs
 
@@ -12,6 +12,7 @@ BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and di
 
 ### Providers
 
+- Codex no longer requests the MCP catalogue that can exceed its chat transport limit on new or resumed threads. Oversized stdout failures during launch stop automatic retries and preserve Retry/Dismiss recovery. MCP status now reflects startup notifications, so servers without notifications may be absent. (#316)
 - The Codex skill picker includes skills installed through plugins, including Superpowers. (#298)
 - Codex stderr logs no longer appear as raw **Codex warning** rows with ANSI escapes and incorrect severity. (#299)
 - The Claude model picker shows model names rather than taglines with Claude Code 2.1.318. (#300)
@@ -24,6 +25,7 @@ BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and di
 
 ### Regression coverage
 
+- The Unix PTY setup-failure test waits for a complete descendant PID before checking process-group cleanup. The native macOS arm64 CI build has a four-hour job budget, matching x64. (#314)
 - Changed files coverage now clicks **View diff** through the chat and verifies that the selected diff stays open through same-turn plan updates. (#275)
 - The packaged resume-at-end check follows the active timeline through turn completion, avoiding stale scrollers and replies from history. (#215)
 
