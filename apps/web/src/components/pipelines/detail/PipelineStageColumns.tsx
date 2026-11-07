@@ -13,6 +13,8 @@ import { usePipelineLinks } from "./PipelineLinks";
 import { pipelineJobAction } from "./pipelineDetail.logic";
 
 const ACTION_ICONS = { play: PlayIcon, cancel: CircleStopIcon, retry: RotateCcwIcon } as const;
+/** A name wraps while its stage column has room and truncates only at the 256 px minimum. */
+const NAME_CLASS = "min-w-0 flex-1 break-words @max-[257px]/stage:truncate";
 const ROW_CLASS =
   "flex min-h-9 min-w-0 items-center gap-2 rounded-md px-2 text-sm hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring";
 
@@ -50,7 +52,7 @@ const JobRow = memo(function JobRow({
         <span role="img" aria-label={status} title={status} className="inline-flex">
           <PipelineStatusIcon status={job.status} warnings={job.warnings} />
         </span>
-        <span className="min-w-0 flex-1 truncate" title={job.name}>
+        <span className={NAME_CLASS} title={job.name}>
           {job.name}
         </span>
         {job.durationSeconds !== null ? (
@@ -106,7 +108,7 @@ function JobGroupRow({
         <span role="img" aria-label={status} title={status} className="inline-flex">
           <PipelineStatusIcon status={group.status} warnings={false} />
         </span>
-        <span className="min-w-0 flex-1 truncate">{group.name}</span>
+        <span className={NAME_CLASS}>{group.name}</span>
         <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{group.size}</span>
       </button>
       {expanded ? (
@@ -148,7 +150,7 @@ const PipelineStage = memo(function PipelineStage({
 }) {
   const status = pipelineStatusText(stage.status, stage.warnings);
   return (
-    <li className="relative flex min-w-0 flex-col gap-1 @min-[720px]/pipeline:min-w-64 @min-[720px]/pipeline:max-w-(--pipeline-stage-max) @min-[720px]/pipeline:flex-1 @min-[720px]/pipeline:basis-0">
+    <li className="@container/stage relative flex min-w-0 flex-col gap-1 @min-[720px]/pipeline:min-w-64 @min-[720px]/pipeline:max-w-(--pipeline-stage-max) @min-[720px]/pipeline:flex-1 @min-[720px]/pipeline:basis-0">
       {separator}
       <h3 className="flex min-w-0 items-center gap-2 px-2 text-sm font-medium">
         <span role="img" aria-label={status} title={status} className="inline-flex">

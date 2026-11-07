@@ -1193,10 +1193,14 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   vertical separators in the header (8 px hit area, arrow keys, Home, End,
   double-click reset), each a `useResizableWidth` stored globally under
   `bibcode:pipelines-list-<column>-width` and painted through the custom
-  property, so a drag re-renders no row. A header menu hides Created by or
-  Stages (`bibcode:pipelines-list-hidden-columns`). Not built: sorting (the
-  list input has no sort field and GitLab and GitHub order the pages) and a
-  Duration/age column.
+  property, so a drag re-renders no row. Pipeline, Created by and Stages
+  tracks are `minmax(min, width)`, so widths that add up to more than the
+  panel shrink toward their minimums and Actions always stays inside the row.
+  A header menu hides Created by, Stages or the duration and age text under
+  Status (`bibcode:pipelines-list-hidden-columns`). The table carries
+  `aria-rowcount` (the host's total plus the header, or -1 when capped) and
+  each row `aria-rowindex` (header is 1). Not built: sorting (the list input
+  has no sort field and GitLab and GitHub order the pages).
 - **Row, wide (≥ 720 px panel):** Status (shared icon plus label, duration
   `4m 12s`, and age "2 hours ago" with the absolute time as its title),
   Pipeline (title on the first line; `#4821` link, ref with a branch, tag or
@@ -1250,7 +1254,9 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   one separator on the first column (same primitive as the list's header
   separators, `shared/PipelineColumnSeparator.tsx`), stored globally under
   `bibcode:pipelines-stage-width` and painted as `--pipeline-stage-max`.
-  Wrapping, an inline log panel and a `needs` view are not built. A column has the stage icon, name and
+  A job name wraps while its stage column is wider than the minimum and
+  truncates (with its full name as the tooltip) only at 256 px. Wrapping
+  stages onto more rows, an inline log panel and a `needs` view are not built. A column has the stage icon, name and
   job count; a job row is a full-width link to the job route: icon, name,
   duration, and one trailing action (Retry, Cancel or Play). A parallel group
   (`size > 1`) is one row "rspec 3" that expands to its jobs. A trigger job

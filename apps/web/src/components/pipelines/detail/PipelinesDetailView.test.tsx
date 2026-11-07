@@ -843,8 +843,12 @@ describe("PipelinesDetailView stage columns", () => {
     error.mockRestore();
   });
 
-  it("keeps the full job name in a tooltip", async () => {
+  it("keeps the full job name in a tooltip, wrapped until its column is at the minimum", async () => {
     await render();
-    expect(container.querySelector('[title="rspec"]')).not.toBeNull();
+    const name = container.querySelector('[title="rspec"]')!;
+    expect(name.className).toContain("break-words");
+    expect(name.className).toContain("@max-[257px]/stage:truncate");
+    expect(name.className.split(" ")).not.toContain("truncate");
+    expect(name.closest("ol > li")!.className).toContain("@container/stage");
   });
 });

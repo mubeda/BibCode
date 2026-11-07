@@ -165,9 +165,10 @@ function PipelinesPages({
   };
   const repositoryPermission = context.repositoryPermission;
   const renderRow = useCallback(
-    ({ item }: { item: PipelinesRow }) => (
+    ({ item, index }: { item: PipelinesRow; index: number }) => (
       <PipelinesListRow
         row={item}
+        rowIndex={index + 2}
         provider={context.provider}
         scope={scope}
         projectRef={projectRef}
@@ -229,7 +230,13 @@ function PipelinesPages({
           </div>
         ) : null}
         {rows.length > 0 ? (
-          <div role="table" aria-label="Pipelines" className="flex min-h-0 flex-1 flex-col">
+          <div
+            role="table"
+            aria-label="Pipelines"
+            // The header is row 1; -1 says the host's total is not known (a capped count).
+            aria-rowcount={total !== null && !total.capped ? total.count + 1 : -1}
+            className="flex min-h-0 flex-1 flex-col"
+          >
             <PipelinesListHeader />
             <LegendList<PipelinesRow>
               ref={scrollRef}
