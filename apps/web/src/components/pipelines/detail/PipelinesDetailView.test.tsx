@@ -262,6 +262,7 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   usePipelinesStore.setState({ byProjectKey: {} });
+  localStorage.clear();
   h.detail = pipelineDetail();
   h.onAnswer = null;
   h.error = null;
@@ -778,5 +779,72 @@ describe("PipelinesDetailView request budget", () => {
     h.requestTimerRead.mockClear();
     await runFor(HOUR);
     expect(h.requestTimerRead).not.toHaveBeenCalled();
+  });
+});
+
+describe("PipelinesDetailView stage columns", () => {
+  const stageList = () => container.querySelector<HTMLElement>('ol[aria-label="Stages"]')!;
+  const separator = () =>
+    container.querySelector<HTMLElement>('[role="separator"][aria-label="Resize stage columns"]')!;
+  const press = (key: string) =>
+    act(() =>
+      separator().dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+      ),
+    );
+
+  it("stacks the stages below the wide step and lets them grow to fit above it", async () => {
+    await render();
+    expect(stageList().className).toContain("flex-col");
+    expect(stageList().className).toContain("@min-[720px]/pipeline:flex-row");
+    expect(stageList().className).toContain("@min-[720px]/pipeline:overflow-x-auto");
+    for (const stage of stageList().querySelectorAll(":scope > li")) {
+      // 256 px minimum, the shared maximum, and a share of the leftover width in between.
+      for (const name of [
+        "@min-[720px]/pipeline:min-w-64",
+        "@min-[720px]/pipeline:max-w-(--pipeline-stage-max)",
+        "@min-[720px]/pipeline:flex-1",
+      ])
+        expect(stage.className).toContain(name);
+      expect(stage.className.split(" ")).not.toContain("@min-[720px]/pipeline:w-64");
+    }
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("480px");
+  });
+
+  it("sets every column's width with one separator, persists it and restores it", async () => {
+    await render();
+    expect(container.querySelectorAll('[role="separator"]')).toHaveLength(1);
+    press("ArrowRight");
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("496px");
+    expect(separator().getAttribute("aria-valuenow")).toBe("496");
+    expect(localStorage.getItem("bibcode:pipelines-stage-width")).toBe("496");
+    press("Home");
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("256px");
+    press("End");
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("960px");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await render();
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("960px");
+    act(() => separator().dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("480px");
+  });
+
+  it("clamps an out-of-range stored width and ignores a corrupt one", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    localStorage.setItem("bibcode:pipelines-stage-width", "50");
+    await render();
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("256px");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    localStorage.setItem("bibcode:pipelines-stage-width", "oops");
+    await render();
+    expect(stageList().style.getPropertyValue("--pipeline-stage-max")).toBe("480px");
+    error.mockRestore();
+  });
+
+  it("keeps the full job name in a tooltip", async () => {
+    await render();
+    expect(container.querySelector('[title="rspec"]')).not.toBeNull();
   });
 });

@@ -1354,7 +1354,14 @@ repositories are supported: on GitHub each row is one workflow run, labeled
 like GitHub's Actions page ("CI #312").
 
 The list opens on the copy BiBCode last stored for that filter, then the
-host's current page. Each row shows the status with its duration and age
+host's current page. A header names the columns (Status, Pipeline, Created by,
+Stages, Actions) and stays in place while the rows scroll. On a wide panel
+drag the edge of the Pipeline, Created by or Stages header (or focus it and use
+the arrow keys, Home and End; double-click resets) to resize it; the widths
+are remembered. The columns button in the header hides Created by or Stages.
+As the panel narrows, Created by hides first, then the stage icons shrink to
+as many as fit followed by a "+3" count (hover it for the names), then Status
+shrinks to its icon. Each row shows the status with its duration and age
 (hover for the exact time), the title, the pipeline number, the branch, tag or
 merge request, the short commit, badges such as **latest** or **merge
 request**, who started it, and one icon per stage (each named, for example
@@ -1391,7 +1398,11 @@ BiBCode), the job count, the duration and the queued time, with Retry, Cancel,
 **Retry failed jobs** (GitHub) and **Open on GitLab**. Each job row has one
 action where it applies: **Run** for a manual job, **Cancel** for one still
 running, **Retry** for a finished one. Below it the stages sit side by side in GitLab's order
-on a wide panel, scrolling sideways, and stacked on a narrow one. Each stage
+on a wide panel, stacked on a narrow one. The columns grow to fill the panel up
+to a maximum width, and the row scrolls sideways only when the stages do not
+fit at 256 px each; drag the edge of the first column, or use the arrow keys,
+Home and End on it, to change that maximum for all columns (double-click
+resets); it is remembered. Each stage
 shows its status, name and job count; each job its status, name and
 duration. A parallel group such as `rspec 3` is one row that expands to its
 jobs, a trigger job links to its **Downstream pipeline**, and a job that
