@@ -1,8 +1,11 @@
 # MCP Named Clients: One Identity Across Runs
 
-Status: Proposed — awaiting Codex + advisor review. Issue #280. Verified at `e222d340ff`
-(`main` after v0.15.2). Line references are to that commit. No product code is written
-until this design is approved.
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #280.
+Verified at `e222d340ff` (`main` after v0.15.2). Line references are to that commit.
+
+**Revision 1 (2026-11-07)** answers the Codex review (two P2 findings, see
+[Review findings and resolutions](#review-findings-and-resolutions)) and records the maintainer's
+answers to the four open questions as decisions 5, 7, 8 and 9.
 
 This note makes the
 [P1c section](./2026-11-02-outside-agent-control-design.md#p1c-named-clients-split-to-a-later-release)
@@ -18,8 +21,11 @@ and revokes, but with `--client <name>` a non-secret identity row is stored.
 An outside agent started with `bibcode mcp --client <name>` keeps one identity across
 runs:
 
-- a retry with the same `clientRequestId` after a restart replays the stored request or
-  recorded outcome, and never runs the work twice;
+- a retry with the same `clientRequestId` after a restart, within 24 hours of the first
+  call, replays the stored request or recorded outcome and does not run the work again.
+  The 24 hours are today's window (`REQUEST_ROW_TTL_SECONDS`, `control.rs:50`, pruned by
+  `prune_request_rows`, `:1367-1377`, documented at `docs/reference/mcp.md:781`). A retry
+  after the window is new work, as it is for every client today;
 - it still owns the panels and threads its earlier runs opened;
 - a webhook endpoint paired with it stays on when a run exits.
 
@@ -46,7 +52,7 @@ token is stored. Without `--client`, nothing changes.
 | Panel ownership        | `check_source_is_callers` (`mcp/tools/panels.rs:406-444`): the caller's session is the thread's requester `clientId`, or the latest user message's actor `clientId`.                                                                                                                                                                                  |
 | Webhook pairing        | `pairedClientId` must be a live `mcp-client` session (`webhooks/rpc.rs:328-339`, `store.rs:395-409`) and is stored in `webhook_endpoints.paired_session_id`. The dispatcher runs `reconcile_pairings` (`webhooks/mod.rs:1047-1056`) before each pass and on every Authorized clients notice; `orphaned_pairings` (`store.rs:378-392`) finds enabled endpoints whose session is gone or revoked and disables them as `client-revoked`. |
 | UI joins               | `McpAgentsPanel.tsx:106-111` lists a revoked agent with running turns so Stop stays in reach; rows and the indicator join `sessionId === clientId` (`McpAgentsPanel.tsx:110`, `McpAgentIndicator.tsx:26`). `WebhooksTab.tsx` `PairedClientSelect` (`:1029-1063`) offers sessions and labels the value by session id; the on/off toggle re-sends `pairedClientId` (`:415`). |
-| Store access by relay  | `Database::open_existing` does not migrate. The store validator refuses a ledger that is not a prefix of the binary's (`migrations.rs:183-193`), so a newer relay can open an older store. The newest migration is 69.                                                                                                                                |
+| Store access by relay  | The relay's `open_store` (`relay.rs:899-918`) calls `Database::open_existing`, which neither migrates nor runs the ledger check. That check (`validate_bibcode_schema`, `migrations.rs:146-193`, "not an exact prefix of this binary") runs only at server startup and in offline inspection (`persistence/store.rs:254`, `:270`, `:370`). So a relay of either version opens the other's store, and only its SQL decides whether that works. The newest migration is 69. |
 
 ## Domain terms
 
@@ -77,13 +83,15 @@ token is stored. Without `--client`, nothing changes.
    `auth_pairing_links` row carrying its id, consumed or not, in the same transaction. The
    existing fenced insert (link revoked → no session) then covers both races. P1c's extra
    `WHERE EXISTS (… mcp_named_clients …)` clause is not needed. See
-   [Ordering argument](#ordering-argument).
+   [Ordering argument](#ordering-argument). This holds because pairing links are never
+   deleted (there is no `DELETE FROM auth_pairing_links` at `e222d340ff`), so a consumed
+   link is still there for the cascade to revoke and for the fence to read.
 4. **`clientId` keeps meaning the session; the actor gains optional `namedClientId`.** The
    UI joins stay on `sessionId === clientId`. Ownership and Stop accept either.
 5. **Every person action that removes a named client's row ends the identity.** Revoke,
    Stop (also on the row of an earlier run that exited) and Revoke others. This matches
    `docs/reference/webhooks.md:62-64`, which already says Revoke and Stop turn the paired
-   endpoint off. Open for the maintainer: [question 1](#questions-only-test-user-can-answer).
+   endpoint off. The maintainer confirmed 2026-11-07.
 6. **Webhooks need no new event.** A pairing to a named client stores the named id in
    `paired_session_id`; `orphaned_pairings` treats that id as orphaned only when the named
    client is revoked or missing. Every person revoke already emits `ClientRemoved`, which
@@ -91,8 +99,17 @@ token is stored. Without `--client`, nothing changes.
    "a session id or a named client id".
 7. **No idle row.** A named client with no live run has no Authorized clients row, so it
    cannot be revoked from there. Its paired endpoints stay on until edited in Webhooks,
-   and the next `--client` run brings its row back. Open for the maintainer:
-   [question 2](#questions-only-test-user-can-answer).
+   and the next `--client` run brings its row back. The maintainer confirmed 2026-11-07; an idle
+   row is a follow-up.
+8. **Take over does not carry to the next run.** A restarted agent escapes a Take over
+   today because its new run is a new session; named clients do not make that worse.
+   The maintainer confirmed 2026-11-07: out of scope, a follow-up (the named row would store the
+   hand-back level).
+9. **An earlier run still running a turn keeps its own row.** It is not folded into the
+   live run's row; Stop on it ends the whole identity. The maintainer confirmed 2026-11-07.
+10. **The relay's SQL works on stores one migration apart.** An unnamed relay touches no
+    column or table that migration 70 adds, so it works against a migration-69 store. The
+    named path checks for `mcp_named_clients` first. See [Mixed versions](#mixed-versions).
 
 ## Design
 
@@ -118,6 +135,13 @@ CREATE INDEX idx_auth_sessions_mcp_named_client
 - Revoked rows are kept. Shortcut: never pruned; only a person's revokes create them, which
   bounds their number. Upgrade to a prune with `auth_sessions` if that ever changes.
 - Add `mcp_named_clients` to `CORE_TABLES` for migration 70 so the validator checks it.
+- **The relay's shared queries stay migration-69 compatible** (decision 10). The capacity
+  check in `issue_mcp_pairing_link` (`service.rs:3604-3611`) calls
+  `list_active_auth_pairing_links` (`repositories.rs:2284-2289`), which uses
+  `PAIRING_SELECT`. The relay gets its own `count_active_auth_pairing_links` (`SELECT
+  COUNT(*)` with the same `WHERE`), and `create_auth_pairing_link` names
+  `mcp_named_client_id` in its `INSERT` only when it is set. `revoke_mcp_credential` is
+  unchanged. The server keeps the full selects below.
 - `AUTH_SESSION_SELECT` (`repositories.rs:3723`), the pairing select and
   `PersistedAuthAuthoritySnapshot` read `mcp_named_client_id` and, through a `LEFT JOIN`,
   the name. `SessionRecord`, `PairingRecord` and `Grant` carry
@@ -136,9 +160,10 @@ CREATE INDEX idx_auth_sessions_mcp_named_client
   does, in one `Immediate` transaction: `INSERT … ON CONFLICT(name) WHERE revoked_at IS NULL DO NOTHING`
   (the conflict target must repeat the partial index's `WHERE`) a live row for `name`, `SELECT` the live row's id, insert the link with that `mcp_named_client_id`, bump
   the authority revision. The capacity check stays as in `issue_mcp_pairing_link`.
-- A store whose ledger lacks migration 70 (a newer relay next to an older server) fails the
-  insert with "no such table". The relay maps that, before any link exists, to exit 1 with
-  "Update BiBCode to use --client: this server does not know named clients yet."
+- Before that transaction, the named path checks `sqlite_master` for `mcp_named_clients`.
+  When it is missing (a newer relay next to an older server's store), the relay exits 1
+  before any link exists with "Update BiBCode to use --client: this server does not know
+  named clients yet." It never relies on a "no such table" error.
 - EOF, signals, `forget` and the orphan sweep are unchanged: `revoke_mcp_credential` touches
   the run's link and session only, never `mcp_named_clients`.
 
@@ -232,7 +257,7 @@ cannot re-create the identity; only a new process can.
   client with a live run and an exited run that still has a running turn shows two rows
   with the same label. Stop appears on the row whose session has running turns, which can
   be only the exited run's row; Stop there ends the identity and interrupts both runs'
-  turns. Folding them into one row is [question 4](#questions-only-test-user-can-answer).
+  turns. They stay separate rows (decision 9).
 
 ### Webhook pairing
 
@@ -271,7 +296,7 @@ cannot re-create the identity; only a new process can.
 
 | Case                                                 | Behaviour                                                                                                                                                  |
 | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Server restarts between runs                         | Stored requests and outcomes are keyed by the named id in SQLite; the next run's retry replays them. A `running` row with no claim answers `restarted`.   |
+| Server restarts between runs                         | Stored requests and outcomes are keyed by the named id in SQLite; a retry within 24 hours of the first call replays them. A `running` row with no claim answers `restarted`. After 24 hours the row is pruned and a retry is new work. |
 | Relay exits mid-mutation                             | Live controls fire on the session revoke; outcome `unknown`. The next run's retry reads `unknown`.                                                       |
 | Relay dies; next run sweeps it                       | The sweep revokes the dead run's link and session only. The identity, its pairing and its stored requests survive.                                       |
 | Two runs of one name at once                         | Share scope and claims; each has its own session, slots and presence row. Both are revoked when a person ends the identity.                              |
@@ -280,9 +305,27 @@ cannot re-create the identity; only a new process can.
 | Person revokes during sign-in                        | See [Ordering argument](#ordering-argument).                                                                                                               |
 | Person ends an identity with no live run             | Only through Stop on an exited run's row (it has a running turn). Plain Revoke has no row to act on (decision 7).                                          |
 | Missed `ClientRemoved` notice                        | Webhooks reconcile from SQLite on the next pass; the cache reconciles through the authority revision bump.                                               |
-| Newer relay, older server                            | `--client` exits 1 before any credential; without it, unchanged.                                                                                           |
-| Older relay, newer server                            | No `--client`; unchanged.                                                                                                                                  |
+| Mixed relay and store versions                       | See [Mixed versions](#mixed-versions).                                                                                                                     |
 | Downgrade after migration 70                         | An older binary refuses the store (ledger not a prefix), as for every migration.                                                                           |
+
+## Mixed versions
+
+The relay opens the store directly with no ledger check (see the table above), so its SQL
+alone decides compatibility.
+
+- **Newer relay, migration-69 store, no `--client`.** Works: the capacity count, the link
+  insert and `revoke_mcp_credential` name only migration-69 columns. Test:
+  `an_unnamed_relay_signs_in_and_revokes_against_a_store_before_named_clients`.
+- **Newer relay, migration-69 store, `--client`.** Exits 1 before any link, as above. Test:
+  `a_named_relay_against_a_store_without_named_clients_exits_before_any_credential`.
+- **Older relay, migration-70 store.** Works: an older relay has no `--client`, and its
+  selects and inserts name only older columns. SQLite fills the new nullable columns with
+  `NULL`, so its links and sessions are unnamed. The ledger check never runs on this path,
+  so it does not refuse the store. Test:
+  `an_older_relays_link_and_session_on_a_migrated_store_are_unnamed` (it inserts and
+  revokes through migration-69 SQL against a migrated store).
+- **Older server binary, migration-70 store.** Refused at startup by the ledger check, as
+  for every migration.
 
 Security: the name is untrusted text, shown as text and never sent to webhooks (only the id
 is). Anyone who can run `bibcode mcp` on the data root can attach to a live named identity
@@ -309,6 +352,8 @@ by name; that same person can already mint any MCP credential, so no authority i
 | Person revoke turns it off                                     | `a_person_revoking_a_named_clients_row_disables_its_endpoints_and_ends_every_run`                 | same                                         |
 | Unnamed endpoint unchanged                                     | `an_endpoint_paired_with_an_unnamed_relay_turns_off_when_it_exits`; keep `revoking_a_paired_client_disables_its_endpoints` (`:993`) | same       |
 | Relay label and exit                                           | `the_relay_labels_a_named_client_and_still_revokes_on_eof`, `a_bad_client_name_exits_before_any_credential`, `a_named_relay_against_a_store_without_named_clients_exits_before_any_credential` | `mcp/relay/tests.rs` |
+| Retry window boundary                                          | `a_named_clients_retry_after_its_request_row_is_pruned_runs_as_new_work` (ages the row past `REQUEST_ROW_TTL_SECONDS`, then a second run retries) | `production/mcp_tools_tests/threads.rs`      |
+| Mixed versions                                                 | `an_unnamed_relay_signs_in_and_revokes_against_a_store_before_named_clients`, `an_older_relays_link_and_session_on_a_migrated_store_are_unnamed` | `mcp/relay/tests.rs`, `auth/service.rs` tests |
 | Migration                                                      | `migration_70_adds_named_clients_and_nullable_link_columns`                                       | `persistence/migrations.rs`                  |
 | Contracts                                                      | decode with and without the new keys; Rust parity                                                 | `packages/contracts/src/*.test.ts`           |
 | UI                                                             | named row copy; paired select shows the name of an idle named client and re-saves its id          | `McpAgentsPanel.test.tsx`, `WebhooksTab.test.tsx` |
@@ -318,7 +363,7 @@ by name; that same person can already mint any MCP credential, so no authority i
 - `apps/server/src/config.rs`: `--client`.
 - `apps/server/src/mcp/relay.rs`, `mcp/relay/tests.rs`: name validation, label, named mint, error mapping.
 - `apps/server/src/auth/service.rs`, `auth/model.rs`: `issue_named_mcp_pairing_link`, `Grant`/`PairingRecord`/`SessionRecord`/`ClientSessionView`, revoke cascade, `stop_client`, `authenticate_mcp_client` (named id), tests.
-- `apps/server/src/persistence/migrations.rs`, `persistence/repositories.rs`: migration, selects, `revoke_mcp_named_client`, `revoke_other_auth_sessions` cascade, fenced insert column.
+- `apps/server/src/persistence/migrations.rs`, `persistence/repositories.rs`: migration, selects, `count_active_auth_pairing_links`, the conditional link-insert column, `revoke_mcp_named_client`, `revoke_other_auth_sessions` cascade, fenced insert column.
 - `apps/server/src/mcp/control.rs`: `ClientPrincipal.request_scope`, `RequestKey.scope`, `stored_request`.
 - `apps/server/src/rpc/session.rs`: `current_client_session`.
 - `apps/server/src/mcp/outcome.rs`: claim and row queries on `scope`.
@@ -339,24 +384,22 @@ handler. A refused named sign-in reuses the fenced-insert `tracing::warn!`; a na
 revoke adds one `tracing::info!` with the id only (never the name, which is client text).
 No profiler event or finding changes.
 
-## Questions only the maintainer can answer
+## Follow-ups (recorded, not in this slice)
 
-1. **Does Stop end the identity?** Recommended: yes. Stop is Revoke plus interrupts today,
-   and the webhooks reference already says Stop turns the paired endpoint off. The
-   alternative, Stop ends only the run, would let the agent's next run resume a stopped
-   identity.
-2. **Should an idle named client get its own Authorized clients row?** Recommended: not in
-   this slice. Without one, an identity with no live run cannot be revoked from the UI;
-   its paired endpoints can still be turned off in Webhooks, and its next run brings the
-   row back.
-3. **Should Take over carry to the next run?** Today a restarted agent escapes a Take over
-   because the new run is a new session. Named clients do not make that worse. Recommended:
-   out of scope here; if wanted, the named row would store the hand-back level.
+- An Authorized clients row for an idle named client, so it can be revoked with no run
+  live (decision 7).
+- Take over carrying to the next run of a named client (decision 8).
 
-4. **Should a named client's runs fold into one Authorized clients row?** Recommended: not
-   in this slice. Today an exited run with a running turn gets its own row, and Stop there
-   already ends the whole identity. Folding needs `merge_active` to group by named id and
-   the UI joins to change.
+## Review findings and resolutions
+
+Codex (gpt-6.1-sol, high), round 1. It found no other actionable issue and accepted
+dropping P1c's `EXISTS` clause given decision 3's condition (links stay stored and the
+cascade revokes consumed ones).
+
+| #   | Finding                                                                                                                                                                           | Verified                                                                                                                                                                                                                                                                                                                  | Resolution                                                                                                                                                                                                                                                                                                          |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | P2: "never runs the work twice" is false once `prune_request_rows` deletes the row after 24 h.                                                                                    | Confirmed. `prune_request_rows` (`control.rs:1367-1377`) deletes rows older than `REQUEST_ROW_TTL_SECONDS` (24 h, `:50`), recorded outcomes included.                                                                                                                                                                     | **Fixed.** The outcome and the restart row state the 24-hour window, which is the documented contract (`mcp.md:781`). A boundary test is added. #280 does not require dedup past 24 hours, so none is designed.                                                                                                  |
+| 2   | P2: mixed-version claims conflict with store access. An older relay rejects a migration-70 store (ledger check), and a newer unnamed relay hits new columns in the capacity check. | Second half confirmed: adding the column to `PAIRING_SELECT` would break `list_active_auth_pairing_links` on a migration-69 store. First half not confirmed: the relay's `open_store` calls `Database::open_existing`, which does not run `validate_bibcode_schema`; only server startup and inspection do (`store.rs:254`, `:270`, `:370`). | **Fixed.** Relay queries stay migration-69 compatible (decision 10), the named path checks for the table first, and [Mixed versions](#mixed-versions) covers all four directions with tests, including without `--client`. An older relay works on a migrated store because no ledger check runs on its path. |
 
 ## Not verified
 
