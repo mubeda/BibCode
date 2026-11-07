@@ -38,6 +38,8 @@ const MAX_PUBLICATION_TIME_SKEW: Duration = Duration::from_secs(60);
 pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const JOURNAL_VERSION: u32 = 3;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
+/// The guide section that finishes a version-2 restore journal `--resume` refuses.
+const EARLIER_VERSION_RESTORE_GUIDE: &str = "https://github.com/mubeda/BibCode/blob/main/docs/guides/project-data-recovery.md#finish-a-restore-started-by-an-earlier-version";
 /// The command every "interrupted recovery" refusal names.
 pub const RESUME_COMMAND: &str = "bibcode storage restore --resume";
 
@@ -2109,9 +2111,9 @@ fn read_journal(path: &Path) -> Result<RecoveryJournal, RecoveryError> {
         (JOURNAL_VERSION, Some(journal)) => Ok(journal),
         // Version 2 lacks only the staged files' contents, and a start-empty stages nothing.
         (2, Some(journal)) if journal.action == RecoveryAction::StartEmpty => Ok(journal),
-        (2, _) => Err(refused(
-            "the recovery journal was written by an earlier BiBCode version that did not record the staged files' contents, so they cannot be verified; nothing was changed",
-        )),
+        (2, _) => Err(refused(&format!(
+            "the recovery journal was written by an earlier BiBCode version that did not record the staged files' contents, so they cannot be verified; nothing was changed. Finish the restore by hand as {EARLIER_VERSION_RESTORE_GUIDE} describes"
+        ))),
         (JOURNAL_VERSION, None) => Err(refused("the recovery journal is damaged")),
         _ => Err(refused(
             "the recovery journal was written by another BiBCode version",
@@ -5483,6 +5485,16 @@ mod tests {
                         .contains("did not record the staged files' contents"),
                     "{error}"
                 );
+                assert!(
+                    error.to_string().contains(EARLIER_VERSION_RESTORE_GUIDE),
+                    "{error}"
+                );
+                // The anchor must name a heading the guide still has.
+                let guide = include_str!("../../../../docs/guides/project-data-recovery.md");
+                assert!(guide.contains("\n### Finish a restore started by an earlier version\n"));
+                assert!(EARLIER_VERSION_RESTORE_GUIDE.ends_with(
+                    "/docs/guides/project-data-recovery.md#finish-a-restore-started-by-an-earlier-version"
+                ));
             }
             assert_eq!(entries(&fixture.paths.state_dir), state_before, "{case}");
             assert_eq!(entries(&staging), staging_before, "{case}");
