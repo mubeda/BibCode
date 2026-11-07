@@ -531,11 +531,9 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       openFile: (ref, relativePath, line) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
-            const withoutStandaloneExplorer = current.surfaces.filter(
-              (surface) => surface.kind !== "files",
-            );
+            // The Files tab is a peer: a file opens beside it and never replaces it.
             const surfaceId = `file:${relativePath}` as const;
-            const existing = withoutStandaloneExplorer.find(
+            const existing = current.surfaces.find(
               (surface): surface is Extract<RightPanelSurface, { kind: "file" }> =>
                 surface.id === surfaceId && surface.kind === "file",
             );
@@ -548,10 +546,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               isOpen: true,
               activeSurfaceId: surface.id,
               surfaces: existing
-                ? withoutStandaloneExplorer.map((entry) =>
-                    entry.id === surface.id ? surface : entry,
-                  )
-                : [...withoutStandaloneExplorer, surface],
+                ? current.surfaces.map((entry) => (entry.id === surface.id ? surface : entry))
+                : [...current.surfaces, surface],
             };
           }),
         })),

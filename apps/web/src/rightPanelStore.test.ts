@@ -193,7 +193,7 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("replaces the standalone explorer with peer file surfaces", () => {
+  it("keeps the Files surface beside peer file surfaces", () => {
     useRightPanelStore.getState().open(refA, "files");
     useRightPanelStore.getState().openFile(refA, "src/index.ts");
     useRightPanelStore.getState().openFile(refA, "src/index.ts");
@@ -203,6 +203,7 @@ describe("rightPanelStore", () => {
       isOpen: true,
       activeSurfaceId: "file:README.md",
       surfaces: [
+        { id: "files", kind: "files" },
         {
           id: "file:src/index.ts",
           kind: "file",
@@ -219,6 +220,18 @@ describe("rightPanelStore", () => {
         },
       ],
     });
+  });
+
+  it("reopening a file keeps the Files surface and only bumps the reveal request", () => {
+    useRightPanelStore.getState().open(refA, "files");
+    useRightPanelStore.getState().openFile(refA, "a");
+    const before = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    useRightPanelStore.getState().open(refA, "files");
+    useRightPanelStore.getState().openFile(refA, "a");
+    const after = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(after.surfaces.map((s) => s.id)).toEqual(["files", "file:a"]);
+    expect(after.activeSurfaceId).toBe("file:a");
+    expect(before.surfaces).toHaveLength(2);
   });
 
   it("updates line reveal requests when reopening a file surface", () => {
