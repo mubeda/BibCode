@@ -132,6 +132,8 @@ pub(crate) struct AuthTestHooks {
     pub(crate) after_consume: std::sync::Mutex<Option<TestHold>>,
     /// After the session row commits, before the cache holds it.
     pub(crate) after_session_insert: std::sync::Mutex<Option<TestHold>>,
+    /// After issuance publishes the session to the cache and releases the state lock (#294).
+    pub(crate) after_session_publish: std::sync::Mutex<Option<TestHold>>,
     /// Gives `mcp-client` sessions random ids, as a server before #281 did.
     pub(crate) random_mcp_session_ids: AtomicBool,
 }
@@ -798,8 +800,10 @@ impl AuthService {
         (revision, pairings, sessions, pending)
     }
 
-    fn emit_access_change(&self, change: AuthAccessChange) {
-        emit_access_change_on(&self.access_events, &self.access_revision, change);
+    /// Sends `change` while the caller still holds the state lock that made it, so the
+    /// channel order is the state order (#294). `held` proves the lock is held.
+    fn emit_access_change(&self, held: &AuthState, change: AuthAccessChange) {
+        emit_access_change_on(held, &self.access_events, &self.access_revision, change);
     }
 
     fn ensure_authority_watcher(&self) {
@@ -862,20 +866,19 @@ impl AuthService {
                                     .transpose();
                                 match (
                                     snapshot_expiry,
-                                    reconcile_authority_snapshot(&state, snapshot, generation)
-                                        .await,
+                                    reconcile_authority_snapshot(
+                                        &state,
+                                        &access_events,
+                                        &access_revision,
+                                        snapshot,
+                                        generation,
+                                    )
+                                    .await,
                                 ) {
-                                    (Ok(snapshot_expiry), Ok(Some(changes))) => {
+                                    (Ok(snapshot_expiry), Ok(true)) => {
                                         observed_revision = Some(snapshot_revision);
                                         reconciled_generation = Some(generation);
                                         next_expiry_ms = snapshot_expiry;
-                                        for change in changes {
-                                            emit_access_change_on(
-                                                &access_events,
-                                                &access_revision,
-                                                change,
-                                            );
-                                        }
                                     }
                                     (Err(error), _) | (_, Err(error)) => {
                                         tracing::error!(
@@ -883,7 +886,7 @@ impl AuthService {
                                             "failed to decode durable auth authority snapshot"
                                         );
                                     }
-                                    (Ok(_), Ok(None)) => {}
+                                    (Ok(_), Ok(false)) => {}
                                 }
                             }
                             Err(PersistenceError::WorkerUnavailable) => {
@@ -1364,13 +1367,11 @@ impl AuthService {
             )))
         };
         state.sessions.insert(session_id.to_owned(), refreshed);
-        if change.is_some() {
+        if let Some(change) = change {
             state.bump_authority_generation();
+            self.emit_access_change(&state, change);
         }
         drop(state);
-        if let Some(change) = change {
-            self.emit_access_change(change);
-        }
         self.ensure_authority_watcher();
         Ok(())
     }
@@ -1381,12 +1382,12 @@ impl AuthService {
         cancel_live_connections(&mut state, session_id);
         if removed {
             state.bump_authority_generation();
-        }
-        drop(state);
-        if removed {
-            self.emit_access_change(AuthAccessChange::ClientRemoved {
-                session_id: session_id.to_owned(),
-            });
+            self.emit_access_change(
+                &state,
+                AuthAccessChange::ClientRemoved {
+                    session_id: session_id.to_owned(),
+                },
+            );
         }
     }
 
@@ -1652,10 +1653,10 @@ impl AuthService {
                         None
                     };
                     state.bump_authority_generation();
-                    drop(state);
                     if let Some(change) = access_change {
-                        self.emit_access_change(change);
+                        self.emit_access_change(&state, change);
                     }
+                    drop(state);
                     self.ensure_authority_watcher();
                     return Ok(PairingIssuance::Existing(offer));
                 }
@@ -1680,8 +1681,8 @@ impl AuthService {
             );
         }
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::PairingLinkUpserted(view));
         drop(state);
-        self.emit_access_change(AuthAccessChange::PairingLinkUpserted(view));
         self.ensure_authority_watcher();
         Ok(PairingIssuance::Reserved(PairingCredentialResult {
             id,
@@ -1725,7 +1726,6 @@ impl AuthService {
     ) -> Result<PairingOfferReplay, AuthError> {
         let observed_at = now_ms();
         let lookup_key = (principal_id.to_owned(), key.to_owned());
-        let mut access_change = None;
         if let Some(repositories) = &self.repositories {
             let recovered_pairing_id = repositories
                 .recover_pending_auth_pairing_offer(
@@ -1742,12 +1742,13 @@ impl AuthService {
                 state.pairing_offer_idempotency.remove(&lookup_key);
                 let removed = state.pairings.remove(&pairing_id).is_some();
                 state.bump_authority_generation();
-                drop(state);
                 if removed {
-                    self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
-                        id: pairing_id,
-                    });
+                    self.emit_access_change(
+                        &state,
+                        AuthAccessChange::PairingLinkRemoved { id: pairing_id },
+                    );
                 }
+                drop(state);
                 self.ensure_authority_watcher();
                 return Ok(PairingOfferReplay::Fresh);
             }
@@ -1760,6 +1761,7 @@ impl AuthService {
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
             let mut state = self.state.lock().await;
+            let mut access_change = None;
             match persisted {
                 Some(authority) => {
                     let offer = authority.offer;
@@ -1787,9 +1789,9 @@ impl AuthService {
                 }
             }
             state.bump_authority_generation();
-        }
-        if let Some(change) = access_change {
-            self.emit_access_change(change);
+            if let Some(change) = access_change {
+                self.emit_access_change(&state, change);
+            }
         }
         let mut state = self.state.lock().await;
         state
@@ -1916,7 +1918,7 @@ impl AuthService {
             };
             (cancelled, offer_id)
         };
-        let removed = {
+        {
             let mut state = self.state.lock().await;
             let removed = cancelled_pairing_id
                 .as_ref()
@@ -1931,13 +1933,15 @@ impl AuthService {
                 },
             );
             state.bump_authority_generation();
-            removed
-        };
-        if self.repositories.is_some()
-            && cancelled
-            && let Some(pairing) = removed
-        {
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing.id });
+            if self.repositories.is_some()
+                && cancelled
+                && let Some(pairing) = removed
+            {
+                self.emit_access_change(
+                    &state,
+                    AuthAccessChange::PairingLinkRemoved { id: pairing.id },
+                );
+            }
         }
         Ok(cancelled)
     }
@@ -2004,8 +2008,11 @@ impl AuthService {
             let mut state = self.state.lock().await;
             state.pairings.remove(id);
             state.bump_authority_generation();
+            self.emit_access_change(
+                &state,
+                AuthAccessChange::PairingLinkRemoved { id: id.to_owned() },
+            );
             drop(state);
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: id.to_owned() });
             return Ok(true);
         }
         let mut state = self.state.lock().await;
@@ -2019,8 +2026,8 @@ impl AuthService {
         let id = pairing.id.clone();
         state.pairings.remove(&id);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::PairingLinkRemoved { id });
         drop(state);
-        self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id });
         Ok(true)
     }
 
@@ -2210,8 +2217,8 @@ impl AuthService {
         let mut state = self.state.lock().await;
         state.sessions.insert(record.session_id.clone(), record);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         self.ensure_authority_watcher();
         Ok(McpOAuthMint::Minted(McpOAuthTokens {
             access_token,
@@ -2311,8 +2318,8 @@ impl AuthService {
         }
         state.pending_mcp = pending;
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::PendingMcpAuthorizations);
         drop(state);
-        self.emit_access_change(AuthAccessChange::PendingMcpAuthorizations);
         self.ensure_authority_watcher();
         Ok(())
     }
@@ -2419,8 +2426,8 @@ impl AuthService {
             shutdown.cancel();
         }
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         Ok(McpAccessChange::Changed)
     }
 
@@ -2448,10 +2455,13 @@ impl AuthService {
         state.sessions.remove(session_id);
         cancel_live_connections(&mut state, session_id);
         state.bump_authority_generation();
+        self.emit_access_change(
+            &state,
+            AuthAccessChange::ClientRemoved {
+                session_id: session_id.to_owned(),
+            },
+        );
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientRemoved {
-            session_id: session_id.to_owned(),
-        });
         Ok(true)
     }
 
@@ -2553,10 +2563,13 @@ impl AuthService {
                 state.sessions.remove(target_session_id);
                 cancel_live_connections(&mut state, target_session_id);
                 state.bump_authority_generation();
+                self.emit_access_change(
+                    &state,
+                    AuthAccessChange::ClientRemoved {
+                        session_id: target_session_id.to_owned(),
+                    },
+                );
                 drop(state);
-                self.emit_access_change(AuthAccessChange::ClientRemoved {
-                    session_id: target_session_id.to_owned(),
-                });
             }
             return Ok(revoked);
         }
@@ -2572,8 +2585,8 @@ impl AuthService {
         state.sessions.remove(&session_id);
         cancel_live_connections(&mut state, &session_id);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientRemoved { session_id });
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
         Ok(true)
     }
 
@@ -2590,12 +2603,15 @@ impl AuthService {
                 cancel_live_connections(&mut state, session_id);
             }
             state.bump_authority_generation();
-            drop(state);
             for session_id in &removed_session_ids {
-                self.emit_access_change(AuthAccessChange::ClientRemoved {
-                    session_id: session_id.clone(),
-                });
+                self.emit_access_change(
+                    &state,
+                    AuthAccessChange::ClientRemoved {
+                        session_id: session_id.clone(),
+                    },
+                );
             }
+            drop(state);
             return Ok(removed_session_ids.len());
         }
         let mut state = self.state.lock().await;
@@ -2612,10 +2628,10 @@ impl AuthService {
             cancel_live_connections(&mut state, session_id);
         }
         state.bump_authority_generation();
-        drop(state);
         for session_id in removed_session_ids {
-            self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
+            self.emit_access_change(&state, AuthAccessChange::ClientRemoved { session_id });
         }
+        drop(state);
         Ok(revoked)
     }
 
@@ -2683,6 +2699,11 @@ impl AuthService {
             .entry(session_id.to_owned())
             .or_default()
             .insert(connection_id, shutdown);
+        // Sent before the best-effort persistence below, while the lock still orders it.
+        self.emit_access_change(
+            &state,
+            AuthAccessChange::ClientUpserted(Box::new(view.clone())),
+        );
         drop(state);
         let guard = AuthenticatedConnectionGuard {
             auth: self.clone(),
@@ -2701,7 +2722,6 @@ impl AuthService {
         {
             tracing::error!(%error, %session_id, "failed to persist session connection time");
         }
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         Ok(guard)
     }
 
@@ -2719,15 +2739,10 @@ impl AuthService {
         if !disconnected {
             return;
         }
-        let view = if let Some(session) = state.sessions.get_mut(session_id) {
+        if let Some(session) = state.sessions.get_mut(session_id) {
             session.connected_count = session.connected_count.saturating_sub(1);
-            Some(session.view(false))
-        } else {
-            None
-        };
-        drop(state);
-        if let Some(view) = view {
-            self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
+            let view = session.view(false);
+            self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         }
     }
 
@@ -2858,8 +2873,10 @@ impl AuthService {
         let mut state = self.state.lock().await;
         state.sessions.insert(session_id.clone(), record);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
+        #[cfg(test)]
+        reach_hold(&self.test_hooks.after_session_publish).await;
         self.ensure_authority_watcher();
         if let Some(guard) = &mut pending_issuance_guard {
             guard.disarm();
@@ -2917,10 +2934,13 @@ impl AuthService {
             let mut state = self.state.lock().await;
             state.pairings.remove(&pairing.id);
             state.bump_authority_generation();
+            self.emit_access_change(
+                &state,
+                AuthAccessChange::PairingLinkRemoved {
+                    id: pairing.id.clone(),
+                },
+            );
             drop(state);
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
-                id: pairing.id.clone(),
-            });
             return Ok(Grant {
                 scopes: pairing.scopes,
                 subject: pairing.subject,
@@ -2961,8 +2981,11 @@ impl AuthService {
             pairing_id: Some(pairing_id.clone()),
             desktop_bootstrap: false,
         };
+        self.emit_access_change(
+            &state,
+            AuthAccessChange::PairingLinkRemoved { id: pairing_id },
+        );
         drop(state);
-        self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
         Ok(grant)
     }
 }
@@ -3023,7 +3046,10 @@ fn cancel_live_connections(state: &mut AuthState, session_id: &str) {
     }
 }
 
+// The send is synchronous and never waits on a receiver (a lagging one is overwritten), so
+// sending under the state lock cannot deadlock.
 fn emit_access_change_on(
+    _held: &AuthState,
     events: &broadcast::Sender<AuthAccessEvent>,
     revision: &AtomicU64,
     change: AuthAccessChange,
@@ -3044,11 +3070,15 @@ async fn authority_has_consumers(
         || access_events.receiver_count() > 0
 }
 
+/// Converges the cache to `snapshot` and sends its changes under the same lock. `false` means a
+/// local change since `expected_generation` fenced it.
 async fn reconcile_authority_snapshot(
     state: &Mutex<AuthState>,
+    access_events: &broadcast::Sender<AuthAccessEvent>,
+    access_revision: &AtomicU64,
     snapshot: PersistedAuthAuthoritySnapshot,
     expected_generation: u64,
-) -> Result<Option<Vec<AuthAccessChange>>, AuthError> {
+) -> Result<bool, AuthError> {
     let pairings = snapshot
         .pairings
         .into_iter()
@@ -3073,7 +3103,7 @@ async fn reconcile_authority_snapshot(
         .collect::<Vec<_>>();
     let mut state = state.lock().await;
     if state.authority_generation != expected_generation {
-        return Ok(None);
+        return Ok(false);
     }
 
     let mut changes = Vec::new();
@@ -3132,7 +3162,10 @@ async fn reconcile_authority_snapshot(
     state.sessions = next_sessions;
     state.pairing_offer_idempotency = offers;
     state.pending_mcp = pending_mcp;
-    Ok(Some(changes))
+    for change in changes {
+        emit_access_change_on(&state, access_events, access_revision, change);
+    }
+    Ok(true)
 }
 
 /// A pending remote authorization as BiBCode clients show it: who asks, where it returns,
@@ -7440,6 +7473,79 @@ mod tests {
         })
         .await
         .expect("a ClientRemoved follows the publication");
+        assert!(
+            service
+                .list_clients("")
+                .await
+                .iter()
+                .all(|client| client.session_id != link.id)
+        );
+    }
+
+    /// A revoke the watcher reconciles while issuance has released the state lock but not yet
+    /// sent its ClientUpserted must not leave the client in Settings: events go out in state
+    /// order (#294).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revoke_reconciled_between_publication_and_its_event_is_removed_from_settings() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let mut events = service.subscribe_access();
+        let link = issue_mcp_pairing_link(&repositories, "MCP · gap".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let (held, reached, resume) = test_hold();
+        *service.test_hooks().after_session_publish.lock().unwrap() = Some(held);
+        let exchange = exchange_in_background(&service, &link.credential).await;
+        reached
+            .await
+            .expect("the session is published to the cache");
+        repositories
+            .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        let mut settings = std::collections::HashSet::new();
+        let mut fold = |change: &AuthAccessChange| match change {
+            AuthAccessChange::ClientUpserted(view) => {
+                settings.insert(view.session_id.clone());
+            }
+            AuthAccessChange::ClientRemoved { session_id } => {
+                settings.remove(session_id);
+            }
+            _ => {}
+        };
+        tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+            loop {
+                let change = events.recv().await.expect("access events").change;
+                fold(&change);
+                if matches!(&change, AuthAccessChange::ClientRemoved { session_id } if *session_id == link.id)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the watcher reconciled the revoke");
+        resume.send(()).unwrap();
+        exchange.await.unwrap().expect("issued");
+        // Issuance sends before it returns, so everything it sent precedes this marker.
+        let marker = issue_mcp_pairing_link(&repositories, "MCP · marker".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+            loop {
+                let change = events.recv().await.expect("access events").change;
+                fold(&change);
+                if matches!(&change, AuthAccessChange::PairingLinkUpserted(view) if view.id == marker.id)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the watcher reconciled the marker");
+        assert!(
+            !settings.contains(&link.id),
+            "the access stream resurrected the revoked client"
+        );
         assert!(
             service
                 .list_clients("")
