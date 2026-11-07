@@ -1,6 +1,6 @@
 # Checkpoints: Guard a Shared Checkout's File Restore, and Rewind Only the Conversation
 
-Status: Proposed, awaiting Codex and advisor review. Issue #279, split from #265
+Status: Approved 2026-11-07 (Mauro pre-approval; reviewed by Codex and advisor). Issue #279, split from #265
 ([`2026-11-02-side-chats-design.md`](./2026-11-02-side-chats-design.md), "Review findings
 and resolutions", round 2, finding 7). Verified at `e222d340ff` (`main` after v0.15.2).
 Line references are to that commit. No product code is written until Mauro approves this
@@ -17,6 +17,15 @@ It changes these things:
 - Every sibling session is made quiet before the restore.
 - A conversation-only rewind requires a provider rewind that keeps files.
 - The sibling-change warning reads Git and the event log, not turn rows.
+
+**Revision 2 (2026-11-07)** records Mauro's round 3 answers and answers Codex round 2.
+It changes these things:
+
+- Siblings on an external OpenCode server refuse the restore.
+- The checkout key is the canonical Git top level.
+- The dialog lists every file the restore changes.
+- The token covers content and is revalidated before the rewind.
+- Launches and restores serialize on one mutex.
 
 ## Outcome
 
@@ -57,14 +66,24 @@ overwrites what that turn writes.
 
 - **Checkout**: the directory a thread's Git commands run in, the thread's stored
   `worktree_path` or, without one, its project's `workspace_root` (the stored half of
-  `resolve_thread_workspace`, `:1153-1175`). Its **key** is the physical one the workspace
-  availability registry already uses: `canonical_worktree_path_key`
-  (`git/worktree.rs:182-207`), which canonicalizes symlinks and normalizes the path for
-  the host platform. The gate, the sibling query and the #129 order (`tails`) all use this
-  one key. Two Git worktrees are two directories, so they keep two keys.
+  `resolve_thread_workspace`, `:1153-1175`).
+- **Checkout key**: the Git worktree that directory belongs to. The key is
+  `git rev-parse --show-toplevel` run in the directory, passed through
+  `canonical_worktree_path_key` (`git/worktree.rs:182-207`, the physical key the workspace
+  availability registry uses: symlinks resolved, path normalized for the host). A project
+  at `/repo` and one at `/repo/subdir` therefore share one key, because project
+  preparation does not resolve the Git top level (`orchestration_effects.rs:178-193`,
+  `:236-255`). A linked worktree's top level is its own directory, so linked worktrees keep
+  distinct keys. A directory outside Git falls back to the directory's own canonical key;
+  it has no checkpoints, so nothing restores there.
+  - **Cache.** The engine keeps the key per stored path for the process. A thread's
+    `worktree_path` change or a project's `workspace_root` change (`project.meta-updated`)
+    drops that entry. One Git call per stored path per process, not per delivery.
+  - The gate, the sibling query and the #129 order (`tails`) all use this one key.
 - **Siblings**: every other non-deleted thread, **in any project**, whose checkout has the
   same key: the host's panels and side chats, plain threads without a worktree on the
-  project root, and a thread of a second project registered on the same directory.
+  project root, a thread of a second project on the same directory, and a thread of a
+  project registered on a subdirectory of the same worktree.
 - **File restore**: any revert that runs `restore_checkpoint`, including a `FilesOnly`
   provider's.
 - **Writing sibling**: a sibling whose session holds a turn (`session_holds_a_turn`), whose
@@ -75,7 +94,15 @@ overwrites what that turn writes.
   turn of its own without any delivery (a Codex goal continuation, Claude answering a
   finished background task, OpenCode delivering a subagent's result;
   `provider_runtime.rs:12098-12105`, `provider/opencode/runtime.rs:2871-2877`). Only a
-  suspended or stopped session cannot.
+  suspended or stopped session whose provider process BiBCode owns cannot.
+- **Unmanaged sibling**: a sibling whose provider instance names an external OpenCode
+  server (`serverUrl`, carried into the launch as `endpoint`, `provider_runtime.rs:6221-6222`).
+  BiBCode does not own that server: `OpenCodeDriver::shutdown`
+  (`provider_runtime.rs:15626-15643`) kills only an owned child, and the runtime's `stop`
+  (`provider/opencode/runtime.rs:2134-2164`) only ends BiBCode's observation. The server
+  can keep running and self-start the session's work (`:2872-2876`) whether BiBCode's
+  session is live or suspended. BiBCode has no verified way to prove that server quiet, so
+  an unmanaged sibling is never quiet.
 
 ## Alternatives
 
@@ -94,6 +121,12 @@ overwrites what that turn writes.
 - **Mauro, on Codex #279 finding 5:** the gate covers the whole planning interval. Other
   chats in the checkout may wait a few seconds while the reverting chat's provider cold
   starts.
+- **Mauro, round 3:**
+  - (a) Git manager actions keep today's no-prompt behaviour; interactive sign-in is a
+    follow-up (recorded in #283).
+  - (b) The sibling-change warning stays warn and confirm.
+  - (c) The lock wait is capped at 15 s.
+  - (d) Idle sibling sessions are suspended for the restore.
 
 ## Decision: option (D)
 
@@ -197,7 +230,10 @@ turn admission only; it does not serialize Git.
    safely: it runs background work, or BiBCode cannot see its work at all
    (`session_reports_its_work` false: Cursor, Grok, or Chat Activity off;
    `provider_runtime.rs:12964-12967`). The refusal names it: "BiBCode can't tell whether
-   Panel, Grok is still working. Stop its session, then revert."
+   Panel, Grok is still working. Stop its session, then revert." An unmanaged sibling
+   (external OpenCode server) always refuses the restore, live or suspended: "Panel,
+   OpenCode runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure
+   it has stopped working in this checkout. Rewind only the conversation instead."
 4. Compute sibling changes and compare the caller's token (below).
 5. Refuse turn 0's `HEAD` fallback (below).
 
@@ -205,21 +241,41 @@ New callbacks on `OrchestrationEffectCallbacks`, answered by the supervisor:
 `thread_writes_checkout(thread_id) -> Option<WritingReason>` and
 `quiet_sibling(thread_id) -> Result<(), WritingReason>`.
 
-**No reopen while the restore holds the checkout.** A suspended sibling must stay
-suspended until the restore ends, whatever would reopen it. The session-reopen paths in
-the supervisor at `e222d340ff` are delivery's launch, `reopen_for_rewind`
-(`provider_runtime.rs:9780`, used by both revert modes through `prepare_provider_rewind`),
-`reopen_for_compaction` (`:10008`) and `launch_for_reconciliation` (`:1306`, delivery
-recovery, called at `:2605`). This list comes from `rg` over the supervisor and is not
-proven complete; the implementer re-checks it. The rule is placed at the supervisor's
-launch, not at each caller: **a launch or reopen for a thread in `restore_holds` is
-refused**, with "Another chat in this checkout is restoring files. Try again in a
-moment." A sibling's conversation-only rewind during the restore therefore fails at its
-reopen and changes nothing. The restoring thread is never in its own `restore_holds`, so
-its own `prepare_provider_rewind` is unaffected. A launch already under way when step 5
-marks the siblings shows its session as `starting`, which `session_holds_a_turn` reads as
-busy, so step 5 refuses. That every launch path sets `starting` before it spawns is not
-verified; test 12 covers delivery, compaction, rewind and reconciliation.
+**No launch while the restore holds the checkout.** A suspended sibling must stay
+suspended until the restore ends, whatever would start it again.
+
+- **One choke point.** Every production provider driver is created at one line,
+  `factory.create(request)` inside `launch_session` (`provider_runtime.rs:9166`; the other
+  `factory.create` calls, from `:29262` on, are in `#[cfg(test)]` modules).
+  `launch_session` (`:9095`) has three callers: `direct_session_with_terminal_events`
+  (`:5320`), the supervisor loop `run_supervisor` (`:6640`), and `restart_session`
+  (`:10777`).
+- **What reaches it.** Delivery's launch, `reopen_for_rewind` (`:9780`, both revert modes
+  through `prepare_provider_rewind`), `reopen_for_compaction` (`:10008`) and
+  `launch_for_reconciliation` (`:1306`) all go through the supervisor's
+  `launch_with_context_handoff`. MCP tools, UI intents and automations start turns as
+  orchestration commands, so they reach a launch only through delivery. Side chats are
+  threads and take the same path. A provider's self-started turn runs inside an already
+  live session, which step 3 suspends, or on an unmanaged server, which refuses.
+- **Explicit serialization.** Revision 1 said a launch in progress shows its session as
+  `starting`. That is wrong. `launch_session` persists the runtime as `connecting` before
+  `driver.start()` and projects `ready` only afterwards (`:9166-9179`, `:9318`); nothing
+  marks the thread session busy in between. The engine therefore keeps one mutex over two
+  sets, `restore_holds` and `launching` (thread id to count):
+  - `launch_session` takes the mutex first. A thread in `restore_holds` is refused with
+    "Another chat in this checkout is restoring files. Try again in a moment." Otherwise
+    the thread's count in `launching` goes up. A guard lowers it when the launch ends,
+    with success or failure.
+  - Step 5 takes the same mutex to mark the siblings. A sibling in `launching` refuses the
+    restore ("Another chat in this checkout is starting its session. Try the revert again
+    in a moment."); otherwise the siblings are inserted into `restore_holds` while the
+    mutex is still held.
+  - So a launch either finishes registering before the restore marks, and the restore
+    refuses, or it starts after, and the launch is refused. No interleaving lets both
+    proceed.
+- The restoring thread is never in its own `restore_holds`, so its own
+  `prepare_provider_rewind` launches normally. A sibling's conversation-only rewind during
+  the restore fails at its reopen and changes nothing.
 
 Step 7 repeats checks 2 and 3 on the worker immediately before the irreversible rewind.
 Every sibling is then suspended and cannot be reopened, so no sibling turn can start
@@ -269,20 +325,26 @@ MCP wait loop are shared:
   kept. Diffs in a shared checkout already include whatever changed between two turns, so
   this is consistent; the activity says the files were kept.
 
-### The sibling-change warning
+### What the restore changes, and the sibling-change warning
 
 The evidence must survive what siblings do to their own threads (Codex #279 finding 3).
 `thread.reverted` deletes a thread's newer `projection_turns` rows (`engine.rs:8310-8318`),
 so a sibling's conversation-only rewind would erase the turns whose files it kept, and a
-deleted sibling's rows go with it. The warning therefore reads two sources that no
-sibling action removes:
+deleted sibling's rows go with it. The dialog therefore reads three things that no sibling
+action removes. All Git reads use one temporary index, as capture does, in the #283
+checkpoint environment.
 
-1. **Git, for everything since this thread's last turn.** With a temporary index, as
-   capture does: `read-tree <this thread's newest ready checkpoint ref>`, `add -A`, then
-   `diff --cached --name-only <that ref>`. The thread is idle (a busy thread is refused),
-   so every path listed was changed by someone else: a sibling, a terminal or an editor.
-   It runs in the #283 checkpoint environment.
-2. **The event log, for sibling turns between the target and this thread's last turn.**
+1. **Every file the restore will change.** `read-tree <newest ready checkpoint ref>`, then
+   `add -A`, then `write-tree` gives the **current tree**, the content of every tracked and
+   untracked, non-ignored file now. `diff --name-only <target ref> <current tree>` lists
+   every path the restore will rewrite or delete. This list is always shown. It is the
+   conservative evidence for changes whose author BiBCode cannot know: an editor change
+   absorbed into this thread's own later checkpoint is in it, unattributed (Codex #279
+   round 2 finding 3).
+2. **Changes since this thread's last turn.** `diff --name-only <newest ready checkpoint
+   ref> <current tree>`. The thread is idle (a busy thread is refused), so each path was
+   changed by someone else: a sibling, a terminal or an editor.
+3. **Sibling turns between the target and this thread's last turn**, from the event log.
    `orchestration_events` is append-only; nothing deletes from it (`rg "DELETE FROM
    orchestration_events"` finds nothing). The query reads, for every thread whose stored
    checkout has the key, deleted threads included, the `thread.turn-diff-completed` events
@@ -294,10 +356,29 @@ The target's time is the target checkpoint row's `completed_at`; for turn 0 it i
 `started_at`, or `requested_at` when that is null. The reverting thread's own rows are
 intact, because only this revert would delete them.
 
-`siblingChangesToken` is the hex SHA-256 of the sorted Git paths and the sorted event ids,
-absent when both are empty. The restore proceeds only when both are empty or the token
-matches. Otherwise it refuses, and the refusal carries the new token. A change made after
-the person confirmed changes the token, so a stale confirmation never discards it.
+**What the warning promises.** It names changes known to come from outside this thread:
+items 2 and 3. A change made outside BiBCode between two of this thread's turns, and
+captured into its later checkpoint, cannot be told apart from the thread's own work. It
+appears only in item 1's list of files the restore changes. The dialog says so plainly
+("Files this revert restores") instead of claiming all outside changes are flagged.
+
+**Token with content identity** (Codex #279 round 2 finding 4).
+`siblingChangesToken` is the hex SHA-256 of:
+
+- the target ref's commit id;
+- the current tree id from item 1, which changes when any file's bytes change, even with
+  the same path list;
+- the sorted event ids from item 3.
+
+It is always present for a shared checkout. The restore proceeds only when the command's
+token equals the one recomputed under the gate.
+
+**Revalidated before mutation.** Step 7 on the worker recomputes the current tree id
+immediately before `rollback_provider`, with the siblings quiet and the gate held, and
+refuses when it differs from the token. Detail: "Files in this checkout changed after you
+confirmed. Review them and revert again." This adds one capture-sized Git read to the
+restore. What remains is a terminal or editor writing in the moments between that read
+and `git restore`, outside anything BiBCode can hold.
 
 ### Turn 0 on a shared checkout (Mauro, decision D)
 
@@ -319,15 +400,16 @@ read before the dialog:
 previewCheckpointRevert: "orchestration.previewCheckpointRevert"
 input:  { threadId, turnCount }
 output: {
-  writingSiblings: Array<{ threadId, title, reason: "turn" | "backgroundWork" | "checkpointPending" | "unobservable" }>,
+  writingSiblings: Array<{ threadId, title, reason: "turn" | "backgroundWork" | "checkpointPending" | "unobservable" | "unmanagedServer" | "startingSession" }>,
+  restoredPaths: string[],                 // item 1: every file the restore changes
   siblingChanges: { paths: string[], turns: Array<{ threadId, title, turns: number, files: string[] | null }> },
-  siblingChangesToken: string | null,
+  siblingChangesToken: string | null,      // null only when no other thread shares the checkout
   conversationRewind: "available" | "filesOnlyProvider" | "rewindRestoresFiles",
   headFallbackRefused: boolean,
 }
 ```
 
-It runs Git (source 1), so it joins `is_long_running` in
+It runs Git (items 1 and 2), so it joins `is_long_running` in
 `diagnostics/profiler/latency.rs` like the other Git-backed reads. It is advisory: the
 worker repeats every check under the gate. Its conversation-rewind answer comes from the
 session's last launch and is confirmed by the worker.
@@ -345,7 +427,13 @@ Normal revert, provider can rewind:
 > removed. This can't be undone.
 > [**Revert files and conversation**] (destructive, primary) [Rewind conversation only] [Cancel]
 
-With sibling changes (at most three files per line, then "and N more"):
+On a shared checkout the dialog always lists the files the revert restores (at most five,
+then "and N more", expandable):
+
+> Files this revert restores: `src/app.ts`, `README.md`, `package.json`
+
+With changes known to come from outside this chat (at most three files per line, then
+"and N more"):
 
 > Other chats in this checkout changed files since then. Reverting files undoes these too:
 > Panel, Codex: 2 turns, `src/app.ts`, `README.md`
@@ -378,15 +466,18 @@ disabled button that cannot.
 
 Worker refusals (`checkpoint.revert.failed` detail, and MCP `McpCheckpointRevertError`):
 
-| Case                           | Detail                                                                                                                                            |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Writing sibling                | "Another chat in this checkout (Panel, Codex) is running a turn. Stop it or wait for it to finish, then revert, or rewind only the conversation." |
-| Sibling work not observable    | "BiBCode can't tell whether Panel, Grok is still working. Stop its session, then revert, or rewind only the conversation."                        |
-| Gate wait expired              | "Another chat in this checkout is starting a turn. Try the revert again in a moment."                                                             |
-| Unacknowledged changes         | "Files in this checkout changed since turn 3, outside this chat. Review them and revert again." (carries the token)                               |
-| `HEAD` fallback refused        | as above                                                                                                                                          |
-| Conversation-only, `FilesOnly` | "Claude can't rewind its conversation, so only a file restore is possible."                                                                       |
-| Conversation-only, OpenCode 1  | "OpenCode 1 can't rewind its conversation without restoring files. Revert files and conversation instead."                                        |
+| Case                           | Detail                                                                                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Writing sibling                | "Another chat in this checkout (Panel, Codex) is running a turn. Stop it or wait for it to finish, then revert, or rewind only the conversation."                              |
+| Sibling work not observable    | "BiBCode can't tell whether Panel, Grok is still working. Stop its session, then revert, or rewind only the conversation."                                                     |
+| Gate wait expired              | "Another chat in this checkout is starting a turn. Try the revert again in a moment."                                                                                          |
+| Unacknowledged changes         | "Files in this checkout changed since turn 3, outside this chat. Review them and revert again." (carries the token)                                                            |
+| Changed after confirming       | "Files in this checkout changed after you confirmed. Review them and revert again." (carries the new token)                                                                    |
+| Unmanaged sibling              | "Panel, OpenCode runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead." |
+| Sibling session starting       | "Another chat in this checkout is starting its session. Try the revert again in a moment."                                                                                     |
+| `HEAD` fallback refused        | as above                                                                                                                                                                       |
+| Conversation-only, `FilesOnly` | "Claude can't rewind its conversation, so only a file restore is possible."                                                                                                    |
+| Conversation-only, OpenCode 1  | "OpenCode 1 can't rewind its conversation without restoring files. Revert files and conversation instead."                                                                     |
 
 ### MCP
 
@@ -447,6 +538,10 @@ held or refused until the restore completes":
    do not. The differently cased spelling case runs only when a probe (create `a`, stat
    `A`) shows the test directory's file system is case-insensitive, and prints why it
    skipped otherwise.
+   7b. `a_project_on_a_subdirectory_shares_the_worktree_gate` (Codex #279 round 2 finding 2):
+   project P1 at `/repo`, project P2 at `/repo/subdir` of the same worktree. P2's thread is
+   a sibling of P1's restore and is held by its gate; a linked worktree of `/repo` is not.
+   The key cache drops an entry when the project's `workspace_root` changes.
 
 Acceptance 2, "a host restore while a panel is busy is refused, with an actionable
 message":
@@ -464,8 +559,16 @@ message":
     so no turn starts and the restore completes; then the panel's next message reopens
     it. Plus `no_path_reopens_a_sibling_during_the_restore`: with the restore paused under
     the gate, a sibling's delivery, compaction, conversation-only rewind and delivery
-    reconciliation each fail to reopen its session (the rewind with the "restoring files"
-    detail), and a launch already `starting` when step 5 runs makes the restore refuse.
+    reconciliation each fail at `launch_session` (the rewind with the "restoring files"
+    detail).
+    12b. `a_launch_in_flight_makes_the_restore_refuse` (Codex #279 round 2 gap b): a fake
+    factory pauses a sibling's `launch_session` after it registered in `launching` and
+    before `driver.start()`; the restore refuses with "starting its session". The reverse
+    order (restore marks first, then the launch) refuses the launch.
+    12c. `an_unmanaged_opencode_sibling_refuses_the_restore` (Codex #279 round 2 finding 1): a
+    sibling on an OpenCode instance with `serverUrl` refuses the restore both with its
+    BiBCode session live and after it is suspended; a sibling on a BiBCode-started
+    OpenCode server is suspended and does not refuse.
 13. `turn_zero_head_fallback_is_refused_on_a_shared_checkout` and
     `turn_zero_head_fallback_still_works_alone`.
 
@@ -496,6 +599,14 @@ Warning:
     only; A's restore to turn 1 without a token is refused and lists `x`. The same with B
     deleted instead.
 20. `a_terminal_edit_since_the_last_turn_is_listed`.
+    20b. `an_edit_absorbed_into_a_later_checkpoint_is_listed_as_restored` (Codex #279 round 2
+    finding 3): A's turn 1; an editor changes `x`; A's turn 2 captures `x`; the preview of a
+    restore to turn 1 lists `x` under "Files this revert restores" and not as an outside
+    change.
+    20c. `a_content_change_with_the_same_paths_changes_the_token` and
+    `a_change_after_confirming_is_caught_before_the_rewind` (Codex #279 round 2 finding 4):
+    the same path list with different bytes gives a different token; a file written after
+    the plan and before step 7 makes the restore refuse with the provider not rewound.
 21. Preview RPC: `preview_reports_writing_siblings_changes_and_rewind_support`.
 
 Contracts and web:
@@ -507,8 +618,8 @@ Contracts and web:
 
 ## Files to change
 
-- `apps/server/src/orchestration/engine.rs`: `CheckoutTurnFence`, `restore_holds`, the
-  command and requested-payload fields.
+- `apps/server/src/orchestration/engine.rs`: `CheckoutTurnFence`, the checkout-key cache,
+  one mutex over `restore_holds` and `launching`, the command and requested-payload fields.
 - `apps/server/src/production/orchestration_effects.rs`: `ParkedThreads::order` (physical
   key) and `run` (reordered, gate), `plan_revert` (shared-checkout checks), `finish_revert`
   (re-check, conversation-only branch), compaction's admission, the new callbacks, and a
@@ -518,7 +629,9 @@ Contracts and web:
 - `apps/server/src/production/turn_delivery.rs`: shared admission in
   `prepare_claim_and_deliver`; `restore_holds` skips at `:1095` and `:1495`.
 - `apps/server/src/production/provider_runtime.rs`: `thread_writes_checkout`,
-  `quiet_sibling`, the `restore_holds` refusal at session launch and reopen;
+  `quiet_sibling` (including the unmanaged-server refusal from the thread's provider
+  instance `serverUrl`), and the `restore_holds`/`launching` check at the start of
+  `launch_session` (`:9095`);
   `apps/server/src/provider/mod.rs`: `rewind_keeps_files`.
 - `apps/server/src/persistence/repositories.rs`: the cross-project sibling query and the
   event-log query.
@@ -556,8 +669,13 @@ Contracts and web:
 - **Unobservable providers** (Cursor, Grok, or Chat Activity off) refuse every shared
   restore while their session is live, until idle suspension or a stop.
 - **The 15 s admission wait** is a judgement; the test uses a paused clock.
-- **The Git read** in preview and under the gate costs as much as a capture on a large
-  checkout, and it holds the gate.
+- **The Git read** in preview, under the gate and again in step 7 costs as much as a
+  capture on a large checkout each time, and the last two hold the gate.
+- **External OpenCode servers** block every file restore on a shared checkout. A
+  verified way to prove such a server quiet (for example a session status read) would lift
+  this; it is a follow-up, not designed here.
+- **Terminals and editors** can still write between step 7's revalidation and
+  `git restore`. Nothing BiBCode runs can hold them.
 - **Provider rewind behaviour** is known from BiBCode's source and replay fixtures; the
   live check in test 17 confirms it.
 - Replacing the native confirm changes a desktop dialog into an in-app one. The in-app
@@ -565,16 +683,7 @@ Contracts and web:
 
 ## Questions only Mauro can answer
 
-1. Should the sibling-change warning stay a confirmation that the person can accept, as
-   this design has it? The alternative is to block the file restore until the other work
-   is committed. Recommended: yes, keep the confirmation. It names the files and costs
-   one click, and blocking would push the person to commit work they may not want yet.
-2. Is 15 s the right bound for waiting on a sibling delivery in flight? Recommended: yes.
-   Providers accept a turn in seconds, and the refusal says to try again.
-3. Is it acceptable to suspend an idle sibling's session for the restore, rather than
-   refuse until it idles out on its own (up to 60 s)? Recommended: yes. Idle suspension
-   would happen within a minute anyway, and the cost is one cold start on that chat's
-   next message.
+None open. Mauro answered round 3's questions (see "Decisions recorded").
 
 ## Review findings and resolutions
 
@@ -588,3 +697,13 @@ source; each was checked again here at `e222d340ff`.
 | P1 #3 | A sibling's conversation-only rewind deletes the turn rows the warning reads.          | Confirmed: `thread.reverted` deletes newer `projection_turns` (`engine.rs:8310-8318`).                                                                   | **Fixed.** The warning reads Git (changes since this thread's last turn) and the append-only event log, which no sibling action deletes. Test 19.                                                                                                                                                                                                  |
 | P1 #4 | The lexical, project-scoped key misses symlinks, case and other projects.              | Confirmed: `normalize_host_path_lexically` in `order` (`:926-930`); siblings were read per project.                                                      | **Fixed.** One physical key, `canonical_worktree_path_key`, already used by workspace availability, for the gate, siblings (all projects) and `tails`. Test 7.                                                                                                                                                                                     |
 | P2 #5 | Steps 1 to 3 of revision 1 left admission open during preparation.                     | Confirmed against revision 1.                                                                                                                            | **Fixed by Mauro's decision.** The gate covers the whole planning interval; the #129 order and the lock order are kept. Tests 1 to 3 pause inside planning.                                                                                                                                                                                        |
+
+Codex review, round 2, of revision 1. Each finding was checked in source at `e222d340ff`.
+
+| #     | Finding                                                                                                 | Checked                                                                                                                                                                                          | Resolution                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 #1 | Shutting down an OpenCode session on an external server does not stop the server, which can self-start. | Confirmed: `OpenCodeDriver::shutdown` kills only an owned child (`provider_runtime.rs:15626-15643`); `stop` ends observation only (`opencode/runtime.rs:2134-2164`); self-start at `:2872-2876`. | **Fixed.** An unmanaged sibling (instance with `serverUrl`) refuses every file restore, live or suspended. Quiescence of an external server is not provable today, so no exception. Test 12c.                                                                                                                                                                                                  |
+| P1 #2 | The directory key misses `/repo` and `/repo/subdir` projects on one worktree.                           | Confirmed: project preparation canonicalizes the directory but does not resolve the Git top level (`orchestration_effects.rs:178-193`, `:236-255`).                                              | **Fixed.** The key is the canonicalized `git rev-parse --show-toplevel`, cached per stored path; linked worktrees stay distinct. Test 7b.                                                                                                                                                                                                                                                      |
+| P2 #3 | An editor change absorbed into a later own checkpoint shows no warning.                                 | Confirmed against revision 1: neither source covered it.                                                                                                                                         | **Fixed by both remedies.** The dialog always lists every file the restore changes (conservative, unattributed), and the warning's promise is narrowed to changes known to come from outside the thread. Test 20b.                                                                                                                                                                             |
+| P2 #4 | The token hashes paths and event ids only.                                                              | Confirmed against revision 1.                                                                                                                                                                    | **Fixed.** The token hashes the target commit, the current tree id (content) and the event ids; step 7 recomputes the tree id before the rewind. Test 20c.                                                                                                                                                                                                                                     |
+| Gap b | Revision 1's claim that a launch in progress shows `starting` is wrong.                                 | Confirmed: `launch_session` persists `connecting` before `driver.start()` and projects `ready` after (`provider_runtime.rs:9166-9179`, `:9318`).                                                 | **Corrected.** Explicit serialization: one engine mutex over `restore_holds` and `launching`, taken by `launch_session` and by step 5. Start paths checked: the single production `factory.create` (`:9166`) and the three `launch_session` callers; MCP tools, UI intents and automations reach it only through delivery; side chats are threads; self-starts run in live sessions. Test 12b. |
