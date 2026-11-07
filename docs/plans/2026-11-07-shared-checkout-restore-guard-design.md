@@ -97,9 +97,12 @@ of sibling deliveries cannot starve a restore.
 Every holder takes the thread gate first and the checkout gate second, and nothing holds a
 checkout gate while waiting for a thread gate.
 
-**Delivery** (`prepare_claim_and_deliver`): bootstrap (the worktree may not exist before
-it) → thread reservation (`:1673`) → checkout admission (shared) → claim → deliver. Both
-guards drop when the provider has the turn, as today.
+**Delivery** (`prepare_claim_and_deliver`) runs bootstrap first, because the worktree may
+not exist before it. It then takes the thread reservation (`:1673`), then checkout
+admission (shared), then claims and delivers. Both guards drop when the provider has the
+turn, as today. Bootstrap dispatches the new worktree path as thread metadata and awaits
+it (`turn_delivery.rs:1734-1750`) before the reservation, so the first delivery of a new
+worktree thread already keys on the worktree.
 
 **File restore** (`ParkedThreads::run`, reordered):
 
@@ -117,6 +120,16 @@ guards drop when the provider has the turn, as today.
    outside delivery), then `rollback_provider`, `restore_checkpoint`, refs, outcome.
 8. `revert` (`:764-780`) drops the reservation and the `CheckoutRestore`, then `resume`
    drops `done` (`:1009-1010`) so the checkout's next revert may proceed.
+
+**What the gate covers.** The issue asks that admission be coordinated "from the moment
+the restore is planned". This design holds the gate from the shared-checkout checks
+(step 5) through completion (step 8), and not during steps 1 to 3. Step 2 can include a
+cold provider start, and holding the gate there would stall every sibling's delivery for
+that long. A sibling turn that starts during steps 1 to 3 is still safe: step 5 sees it
+as a writing sibling and refuses, before anything is rewound or restored. So no sibling
+turn starts between the checks that decide the restore and the restore's end, and a
+sibling turn that started earlier makes the restore refuse. The maintainer should confirm this
+reading (question 5).
 
 Why there is no deadlock:
 
@@ -309,11 +322,17 @@ content; the agent repeats the call with the token. A writing sibling returns
 Acceptance 1, "pauses revert preparation, attempts a sibling turn, and shows the turn is
 held or refused until the restore completes":
 
-1. `a_sibling_turn_waits_until_the_shared_checkout_restore_completes`
-   (`turn_delivery_queue_tests.rs`, using its existing `entered`/`release` hooks at
-   `:911-938`): pause the host's `rollback_provider`; send a panel message on the same
-   worktree; assert the panel's delivery is not claimed; release; assert the restore
-   finished before the panel's claim.
+1. `a_sibling_turn_waits_while_restore_preparation_holds_the_checkout`: a new test hook
+   pauses preparation inside the gate, after `plan_shared_checkout` starts (step 5) and
+   before the handback (step 6). Send a panel message on the same worktree; assert the
+   panel's delivery is not claimed; release; assert the restore finished before the
+   panel's claim.
+   1b. `a_sibling_turn_waits_until_the_restore_itself_completes`: the same, paused in the
+   host's `rollback_provider` (step 7) with the existing `entered`/`release` hooks
+   (`turn_delivery_queue_tests.rs:911-938`).
+   1c. `a_sibling_turn_started_before_the_gate_makes_the_restore_refuse`: pause in
+   `prepare_provider_rewind` (step 2), start a panel turn, release; the restore is refused
+   naming the panel, files unchanged, provider not rewound.
 2. `a_sibling_turn_already_claimed_makes_the_restore_wait_then_refuse`: hold a panel
    delivery before its provider accepts; request the host restore; release; the restore is
    refused naming the panel, and the files are unchanged.
@@ -415,3 +434,6 @@ Contracts and web:
 3. Is refusing turn 0's `HEAD` fallback on a shared checkout acceptable, or should it warn
    and proceed?
 4. Is 15 s the right bound for waiting on a sibling delivery in flight?
+5. Does "coordinated from the moment the restore is planned" accept a gate that starts at
+   the shared-checkout checks, with a refusal for any sibling turn that started during the
+   thread's own preparation (see "What the gate covers")?
