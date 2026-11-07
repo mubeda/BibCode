@@ -783,8 +783,9 @@ Every `tools/call` is checked in this order, and the first refusal is the answer
 | Owned mutation's stream budget                                         | 30 minutes                    | `McpOutcomeUnknownError`      |
 
 Codex stops a tool call after 60 seconds by default, which is why one wait lasts at most
-50 seconds. Call the wait again to keep waiting. A server stop ends every wait in flight
-at once with `McpServerStoppingError`, so a wait never holds the stop.
+50 seconds. Call the wait again to keep waiting. When the server stops, a
+`wait_for_thread` in flight ends at once with `McpServerStoppingError` and does not hold up
+the stop.
 
 ### Retries and `clientRequestId`
 

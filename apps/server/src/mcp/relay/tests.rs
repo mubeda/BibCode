@@ -1726,9 +1726,14 @@ async fn a_stop_ends_a_wait_in_flight_instead_of_draining_it() {
         answer.to_string().contains("McpServerStoppingError"),
         "the wait must end because the server stops: {answer}"
     );
-    join.await.expect("join task").expect("server joins");
     // Headroom for a loaded host; the bug held the stop for the whole 50 s wait.
-    let took = began.elapsed();
-    assert!(took < Duration::from_secs(10), "the stop took {took:?}");
+    tokio::time::timeout(
+        Duration::from_secs(10).saturating_sub(began.elapsed()),
+        join,
+    )
+    .await
+    .expect("the stop ends well before the wait's deadline")
+    .expect("join task")
+    .expect("server joins");
     let _ = relay.close().await;
 }
