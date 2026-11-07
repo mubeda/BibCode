@@ -133,8 +133,8 @@ CREATE INDEX idx_auth_sessions_mcp_named_client
   name of 1 to 60 characters with no control characters."
 - The label is `MCP · <name>` and replaces `agent_label` for this run.
 - `mint` calls a new `issue_named_mcp_pairing_link(repositories, name, access, extra)` that
-  does, in one `Immediate` transaction: `INSERT … ON CONFLICT DO NOTHING` a live row for
-  `name`, `SELECT` the live row's id, insert the link with that `mcp_named_client_id`, bump
+  does, in one `Immediate` transaction: `INSERT … ON CONFLICT(name) WHERE revoked_at IS NULL DO NOTHING`
+  (the conflict target must repeat the partial index's `WHERE`) a live row for `name`, `SELECT` the live row's id, insert the link with that `mcp_named_client_id`, bump
   the authority revision. The capacity check stays as in `issue_mcp_pairing_link`.
 - A store whose ledger lacks migration 70 (a newer relay next to an older server) fails the
   insert with "no such table". The relay maps that, before any link exists, to exit 1 with
@@ -214,7 +214,10 @@ cannot re-create the identity; only a new process can.
 ### Actor, Stop and ownership
 
 - `principal_actor` writes `namedClientId` when the current session has one;
-  `actor(client_id, label, named_client_id)`.
+  `actor(client_id, label, named_client_id)`. It reads it through a new
+  `RpcSessionContext::current_client_session()` (`rpc/session.rs`, beside
+  `current_client_metadata` at `:431-440`), which returns the current `ClientSessionView`;
+  `current_client_metadata` becomes a projection of it.
 - The feed's `agent.call` reads it through `LEFT JOIN auth_sessions ON session_id` (rows are
   never deleted). `event_actor` keeps it. `redacted_actor` passes an id-shaped
   `namedClientId` (`nc_` plus a UUID passes `is_id`).
@@ -225,9 +228,11 @@ cannot re-create the identity; only a new process can.
   row of a named client therefore interrupts the turns of every run, live or exited.
 - `check_source_is_callers` accepts `clientId == session` or, when the caller has a named
   client, `namedClientId == its id`, for both the requester and the latest sender.
-- Presence and `merge_active` stay keyed by session. A named client with a live run and an
-  exited run that still has a running turn shows two rows with the same label; Stop on
-  either ends the identity and interrupts both runs' turns.
+- Presence and `merge_active` stay keyed by session, so the UI joins are unchanged. A named
+  client with a live run and an exited run that still has a running turn shows two rows
+  with the same label. Stop appears on the row whose session has running turns, which can
+  be only the exited run's row; Stop there ends the identity and interrupts both runs'
+  turns. Folding them into one row is [question 4](#questions-only-mauro-can-answer).
 
 ### Webhook pairing
 
@@ -273,7 +278,7 @@ cannot re-create the identity; only a new process can.
 | Two names                                            | Different ids, different scopes.                                                                                                                           |
 | Unnamed relay with the same `clientInfo.name`        | Its scope is its session; it never joins a named scope.                                                                                                   |
 | Person revokes during sign-in                        | See [Ordering argument](#ordering-argument).                                                                                                               |
-| Person revokes while no run is live                  | Not possible from the UI (decision 7).                                                                                                                     |
+| Person ends an identity with no live run             | Only through Stop on an exited run's row (it has a running turn). Plain Revoke has no row to act on (decision 7).                                          |
 | Missed `ClientRemoved` notice                        | Webhooks reconcile from SQLite on the next pass; the cache reconciles through the authority revision bump.                                               |
 | Newer relay, older server                            | `--client` exits 1 before any credential; without it, unchanged.                                                                                           |
 | Older relay, newer server                            | No `--client`; unchanged.                                                                                                                                  |
@@ -296,7 +301,7 @@ by name; that same person can already mint any MCP credential, so no authority i
 | Stop after relay exit                                          | `stop_on_a_named_clients_row_interrupts_turns_of_its_earlier_run_after_the_relay_exited`          | `production/mcp_tools_tests/attribution.rs`  |
 | Stop unchanged for unnamed                                     | `stop_on_an_unnamed_session_is_unchanged`; keep `stop_after_revoke_still_interrupts_the_agents_running_turn` | same                              |
 | Panel ownership across runs                                    | `a_named_client_still_owns_the_panels_it_opened_after_a_restart`                                  | `production/mcp_tools_tests/panels.rs`       |
-| Revoke before consumption                                      | `a_named_client_revoked_before_its_link_is_consumed_gets_no_session` (`after_consume` hook unused; revoke before exchange) | `auth/service.rs` tests      |
+| Revoke before consumption                                      | `a_named_client_revoked_before_its_link_is_consumed_gets_no_session` (revoke, then exchange) | `auth/service.rs` tests      |
 | Revoke after consumption                                       | `a_named_client_revoked_after_consumption_but_before_the_session_insert_gets_no_session` (`after_consume` hook) | same                         |
 | Revoke ends every run and every link                           | `revoking_a_named_client_revokes_its_live_sessions_and_unconsumed_links`                          | same                                         |
 | Relay exit keeps the identity                                  | `a_relay_revoke_never_ends_its_named_client`                                                      | same                                         |
@@ -315,11 +320,13 @@ by name; that same person can already mint any MCP credential, so no authority i
 - `apps/server/src/auth/service.rs`, `auth/model.rs`: `issue_named_mcp_pairing_link`, `Grant`/`PairingRecord`/`SessionRecord`/`ClientSessionView`, revoke cascade, `stop_client`, `authenticate_mcp_client` (named id), tests.
 - `apps/server/src/persistence/migrations.rs`, `persistence/repositories.rs`: migration, selects, `revoke_mcp_named_client`, `revoke_other_auth_sessions` cascade, fenced insert column.
 - `apps/server/src/mcp/control.rs`: `ClientPrincipal.request_scope`, `RequestKey.scope`, `stored_request`.
+- `apps/server/src/rpc/session.rs`: `current_client_session`.
 - `apps/server/src/mcp/outcome.rs`: claim and row queries on `scope`.
 - `apps/server/src/mcp/activity.rs`: `actor`, `principal_actor`, `is_retry`, `settle`, `RUNNING_TURNS_SQL`, `interrupt_turns_of`.
 - `apps/server/src/mcp/tools/panels.rs`, `mcp/tools/feed.rs`: ownership, `agent.call` actor.
 - `apps/server/src/webhooks/{rpc,store,events}.rs`, `webhooks/tests.rs`: pairing target, orphan query, view name, redacted actor.
-- `apps/server/src/production/mcp_tools_tests/{threads,git,attribution,panels}.rs`.
+- `apps/server/src/production/mcp_tools_tests/{threads,git,attribution,panels}.rs`, and
+  `terminals.rs:261` and `clone.rs:439`, which build `ClientPrincipal` by hand.
 - `packages/contracts/src/{auth,orchestration,webhooks}.ts` and tests.
 - `apps/web/src/components/settings/McpAgentsPanel.tsx`, `WebhooksTab.tsx` and tests.
 - Docs: `docs/reference/mcp.md` (retries "per MCP connection" at `:1376` and the Retries section `:788-840`, the relay section `:98-113`, `:172-202`, revocation `:515`, `:623`), `docs/reference/webhooks.md:62-64`, `docs/user/mcp.md`, the `bibcode-mcp` skill, and the 2026-10-24 design's `:634-637` answer (a pointer to this note).
@@ -345,6 +352,11 @@ No profiler event or finding changes.
 3. **Should Take over carry to the next run?** Today a restarted agent escapes a Take over
    because the new run is a new session. Named clients do not make that worse. Recommended:
    out of scope here; if wanted, the named row would store the hand-back level.
+
+4. **Should a named client's runs fold into one Authorized clients row?** Recommended: not
+   in this slice. Today an exited run with a running turn gets its own row, and Stop there
+   already ends the whole identity. Folding needs `merge_active` to group by named id and
+   the UI joins to change.
 
 ## Not verified
 
