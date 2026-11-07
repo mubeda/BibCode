@@ -8,16 +8,26 @@ design (the issue's design gate). Companion: #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md))
 changes the Git environment of the same checkpoint commands and lands first.
 
+**Revision 1 (2026-11-07)** records Mauro's decisions (C, D, and the gate's scope) and
+answers the first Codex review. See [Review findings and resolutions](#review-findings-and-resolutions).
+It changes these things:
+
+- The gate covers the whole planning interval.
+- Siblings are found by physical checkout key, across projects.
+- Every sibling session is made quiet before the restore.
+- A conversation-only rewind requires a provider rewind that keeps files.
+- The sibling-change warning reads Git and the event log, not turn rows.
+
 ## Outcome
 
 1. A file restore (a checkpoint revert that restores files) is refused while any other
-   thread sharing the checkout is running a turn: a chat panel, a side chat, or another
-   thread on the project root. The refusal names that thread and offers a
-   conversation-only rewind.
-2. If other threads in the checkout ran turns since the target checkpoint, the dialog
-   says so and lists the files they changed before anything happens.
-3. From the moment the restore's checks start until the restore finishes, no turn of any
-   thread in that checkout starts. A message sent meanwhile waits and is delivered after.
+   thread sharing the checkout is running a turn: a chat panel, a side chat, another
+   thread on the project root, or a thread of another project on the same directory. The
+   refusal names that thread and offers a conversation-only rewind.
+2. If files in the checkout changed outside this thread since the target checkpoint, the
+   dialog says so and lists them before anything happens.
+3. From the moment the restore is planned until it finishes, no turn of any thread in
+   that checkout starts. A message sent meanwhile waits and is delivered after.
 4. **Rewind conversation only** drops the thread's newer messages and turns and leaves
    the working tree byte for byte unchanged.
 
@@ -45,38 +55,56 @@ overwrites what that turn writes.
 
 ## Domain terms
 
-- **Checkout**: the directory a thread's Git commands run in. Its key is the lexically
-  normalized `worktree_path` of the thread, or the project's `workspace_root` when the
-  thread has none (the stored half of `resolve_thread_workspace`, `:1153-1175`). Both the
-  fence and the sibling query use this stored key, so they always agree.
-- **Siblings**: every other non-deleted thread of the project with the same checkout key:
-  the host's panels and side chats, and plain threads without a worktree on the project
-  root.
+- **Checkout**: the directory a thread's Git commands run in, the thread's stored
+  `worktree_path` or, without one, its project's `workspace_root` (the stored half of
+  `resolve_thread_workspace`, `:1153-1175`). Its **key** is the physical one the workspace
+  availability registry already uses: `canonical_worktree_path_key`
+  (`git/worktree.rs:182-207`), which canonicalizes symlinks and normalizes the path for
+  the host platform. The gate, the sibling query and the #129 order (`tails`) all use this
+  one key. Two Git worktrees are two directories, so they keep two keys.
+- **Siblings**: every other non-deleted thread, **in any project**, whose checkout has the
+  same key: the host's panels and side chats, plain threads without a worktree on the
+  project root, and a thread of a second project registered on the same directory.
 - **File restore**: any revert that runs `restore_checkpoint`, including a `FilesOnly`
   provider's.
 - **Writing sibling**: a sibling whose session holds a turn (`session_holds_a_turn`), whose
-  live session runs recent background work (the supervisor's `has_recent_live_activity`),
-  or whose last turn still has a checkpoint hold (its capture would record restored files
-  as its own end state).
+  live session runs recent background work (`has_recent_live_activity`), or whose last
+  turn still has a checkpoint hold (its capture would record restored files as its own end
+  state).
+- **Quiet sibling**: a sibling with no live provider session. A live session can start a
+  turn of its own without any delivery (a Codex goal continuation, Claude answering a
+  finished background task, OpenCode delivering a subagent's result;
+  `provider_runtime.rs:12098-12105`, `provider/opencode/runtime.rs:2871-2877`). Only a
+  suspended or stopped session cannot.
 
 ## Alternatives
 
-| Option                                                                                                                                                              | For                                                                                                                                             | Against                                                                                                                                                                       |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| (A) Sibling-busy check in `plan_revert` only                                                                                                                        | Small.                                                                                                                                          | The race above.                                                                                                                                                               |
-| (B) The revert also takes every sibling's `ThreadTurnFence`, in thread-id order                                                                                     | Reuses one fence.                                                                                                                               | The sibling set is read before locking, so a panel created meanwhile is not covered. Locking N mutexes needs a global order against deliveries and compactions that take one. |
-| (C) Wait for running sibling turns to finish                                                                                                                        | No refusal.                                                                                                                                     | A turn can run for an hour. Holding admission that long stalls every chat in the checkout, and the issue asks for a refusal.                                                  |
-| **(D) recommended:** a per-checkout read/write gate. Deliveries hold it shared; a file restore holds it exclusive, and refuses (does not wait for) writing siblings | Covers threads created later, because the key is the path. No lock order between threads. Waits only for deliveries in flight, which are short. | One more fence and one stored-key lookup per delivery.                                                                                                                        |
+| Option                                                                                                                                             | For                                                                                                                      | Against                                                                                                                                                                       |
+| -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (A) Sibling-busy check in `plan_revert` only                                                                                                       | Small.                                                                                                                   | The race above.                                                                                                                                                               |
+| (B) The revert also takes every sibling's `ThreadTurnFence`, in thread-id order                                                                    | Reuses one fence.                                                                                                        | The sibling set is read before locking, so a panel created meanwhile is not covered. Locking N mutexes needs a global order against deliveries and compactions that take one. |
+| (C) Wait for running sibling turns to finish                                                                                                       | No refusal.                                                                                                              | A turn can run for an hour. Holding admission that long stalls every chat in the checkout, and the issue asks for a refusal.                                                  |
+| **(D) chosen:** a per-checkout read/write gate held from planning to completion; siblings made quiet under it; writing siblings refuse the restore | Covers threads created later, because the key is the path. No lock order between threads. Closes provider-started turns. | One more gate, one path key per delivery, and an idle sibling session is suspended early.                                                                                     |
+
+## Decisions recorded
+
+- **Mauro, decision C:** **Rewind conversation only** is a secondary action in every revert
+  dialog, and every file-restore refusal points to it.
+- **Mauro, decision D:** turn 0's `HEAD` fallback is refused on a shared checkout.
+- **Mauro, on Codex #279 finding 5:** the gate covers the whole planning interval. Other
+  chats in the checkout may wait a few seconds while the reverting chat's provider cold
+  starts.
 
 ## Decision: option (D)
 
 ### Data shapes and state owner
 
 `OrchestrationEngine` owns a `CheckoutTurnFence`, beside `ThreadTurnFence` and like it in
-memory only: `StdMutex<HashMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>`.
+memory only: `StdMutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>`, keyed by the
+checkout key.
 
 ```rust
-pub(crate) struct CheckoutTurnAdmission { _guard: OwnedRwLockReadGuard<()> }   // a delivery
+pub(crate) struct CheckoutTurnAdmission { _guard: OwnedRwLockReadGuard<()> }   // a delivery or compaction
 pub(crate) struct CheckoutRestore {                                             // a file restore
     _guard: OwnedRwLockWriteGuard<()>,
     held_threads: Vec<String>, // siblings marked for delivery's skip; cleared and woken on drop
@@ -94,67 +122,92 @@ of sibling deliveries cannot starve a restore.
 
 ### Lock order (the design gate's deadlock question)
 
-Every holder takes the thread gate first and the checkout gate second, and nothing holds a
+Every holder takes the thread gate first and the checkout gate second. Nothing holds a
 checkout gate while waiting for a thread gate.
 
 **Delivery** (`prepare_claim_and_deliver`) runs bootstrap first, because the worktree may
-not exist before it. It then takes the thread reservation (`:1673`), then checkout
-admission (shared), then claims and delivers. Both guards drop when the provider has the
-turn, as today. Bootstrap dispatches the new worktree path as thread metadata and awaits
-it (`turn_delivery.rs:1734-1750`) before the reservation, so the first delivery of a new
-worktree thread already keys on the worktree.
+not exist before it. Bootstrap dispatches the new worktree path as thread metadata and
+awaits it (`turn_delivery.rs:1734-1750`), so the path is stored by then. Delivery then
+takes the thread reservation (`:1673`), then checkout admission (shared), then claims and
+delivers. Both guards drop when the provider has the turn, as today.
+
+**Compaction** (`orchestration_effects.rs:733-737`) also takes checkout admission (shared)
+after its thread gate. A compaction can reopen a suspended session, and a reopened session
+could start a turn of its own during a restore.
 
 **File restore** (`ParkedThreads::run`, reordered):
 
 1. Thread reservation (`:975`, unchanged, taken first so a later message cannot overtake).
-2. Preparation permit, then `plan_own_revert`: today's own-thread checks, target
-   resolution and `prepare_provider_rewind` (`:1868-1967`). Nothing here depends on
-   siblings, so a cold provider start stays outside the checkout gate.
-3. Release the permit, then `previous.await` (the #129 order).
-4. Checkout gate, exclusive, waiting at most `CHECKOUT_RESTORE_ADMISSION_WAIT` (15 s).
-5. `plan_shared_checkout` under the gate: list siblings, refuse writing siblings, compute
-   sibling changes and compare the caller's acknowledgement, refuse the `HEAD` fallback on
-   a shared checkout (below).
+2. `previous.await`: the checkout's previous revert has restored (the #129 order).
+3. Checkout gate, exclusive. The wait is bounded by `CHECKOUT_RESTORE_ADMISSION_WAIT`
+   (15 s). On timeout the request to lock is dropped, deliveries queued behind it proceed,
+   and the revert is refused: "Another chat in this checkout is starting a turn. Try the
+   revert again in a moment." Nothing has changed at that point.
+4. Preparation permit.
+5. `plan_revert`, under the gate: today's own-thread checks and target resolution, then
+   the shared-checkout checks (below), then `prepare_provider_rewind` (possibly a cold
+   start).
 6. Hand back to the worker with the plan, the reservation and the `CheckoutRestore`.
-7. Worker, `finish_revert`: re-check writing siblings (a provider can start a turn itself,
-   outside delivery), then `rollback_provider`, `restore_checkpoint`, refs, outcome.
+7. Worker, `finish_revert`: re-check the siblings, then `rollback_provider`,
+   `restore_checkpoint`, refs, outcome.
 8. `revert` (`:764-780`) drops the reservation and the `CheckoutRestore`, then `resume`
    drops `done` (`:1009-1010`) so the checkout's next revert may proceed.
 
-**What the gate covers.** The issue asks that admission be coordinated "from the moment
-the restore is planned". This design holds the gate from the shared-checkout checks
-(step 5) through completion (step 8), and not during steps 1 to 3. Step 2 can include a
-cold provider start, and holding the gate there would stall every sibling's delivery for
-that long. A sibling turn that starts during steps 1 to 3 is still safe: step 5 sees it
-as a writing sibling and refuses, before anything is rewound or restored. So no sibling
-turn starts between the checks that decide the restore and the restore's end, and a
-sibling turn that started earlier makes the restore refuse. Mauro should confirm this
-reading (question 5).
+The gate is therefore held from the moment the restore is planned (step 5 begins under
+it) until the restore is recorded. A sibling turn sent at any point in steps 3 to 8 waits;
+one already running when step 5 checks makes the restore refuse.
+
+**How long siblings may wait.** Steps 4 to 8 hold the gate. The permit wait (step 4) is
+bounded by the four preparations of other checkouts. The cold start in step 5 is bounded
+by the provider's own launch and reopen failure paths, which fail the revert today. The
+provider rewind and Git restore are today's work. A delivery waiting behind the gate shows
+its message as pending, as a message behind a revert of its own thread does today.
 
 Why there is no deadlock:
 
 - **Previous revert before the gate.** If revert R2 took the exclusive gate before
-  awaiting R1's `done`, R1 could never take it. Step 3 precedes step 4, and R1 drops the
+  awaiting R1's `done`, R1 could never take it. Step 2 precedes step 3, and R1 drops the
   gate (step 8) before its `done`.
-- **No thread gate under a checkout gate.** A delivery waiting at step "checkout
-  admission" holds its own thread gate. The restore holding the checkout gate never wants
-  that thread's gate, only its own, taken at step 1.
+- **No thread gate under a checkout gate.** A delivery waiting for checkout admission
+  holds its own thread gate. The restore holding the checkout gate never wants that
+  thread's gate, only its own, taken at step 1.
+- **Permits under a gate.** A preparation permit is held only by step 5 of a revert that
+  already holds its own checkout's gate. No permit holder waits for another checkout's
+  gate, so there is no cycle.
 - **Long turns are never waited for.** A running sibling turn holds no gate (a delivery's
   hold ends when the provider has the turn). The restore sees it as a writing sibling and
   refuses.
-- **Deliveries in flight are bounded by the wait.** A delivery stuck before its provider
-  accepts would otherwise hold the gate shared forever, and the queued writer would then
-  block every other sibling's delivery. After 15 s the restore gives up (the queued write
-  request is dropped, and waiting readers proceed) and refuses: "Another chat in this
-  checkout is starting a turn."
-- **Compaction** takes only its thread gate (`orchestration_effects.rs:733-737`) and writes no files; it is
-  unaffected.
+- **Deliveries in flight are bounded by the wait** in step 3.
 - **A refused restore still releases everything.** Refusals return `Err` in the plan,
   which goes through the same `revert` and `resume` path, so `done` drops and the next
   revert runs.
 
-Capture and restore still run on the effects worker one at a time. The new gate
-coordinates turn admission only; it does not serialize Git.
+Capture and restore still run on the effects worker one at a time. The gate coordinates
+turn admission only; it does not serialize Git.
+
+### Shared-checkout checks (step 5, repeated in step 7)
+
+1. List siblings by key. With none, the restore is unguarded, as today.
+2. Refuse when any sibling is writing.
+3. **Make every sibling quiet** (Codex #279 finding 2). For a sibling with a live, idle
+   session, the supervisor suspends it now through the idle-suspension path
+   (`suspend_idle_session`, `provider_runtime.rs:13015-13030`), which shuts the driver
+   down and persists `suspended`. Its next message reopens it through delivery, which the
+   gate holds. The restore refuses when a sibling's live session cannot be suspended
+   safely: it runs background work, or BiBCode cannot see its work at all
+   (`session_reports_its_work` false: Cursor, Grok, or Chat Activity off;
+   `provider_runtime.rs:12964-12967`). The refusal names it: "BiBCode can't tell whether
+   Panel, Grok is still working. Stop its session, then revert."
+4. Compute sibling changes and compare the caller's token (below).
+5. Refuse turn 0's `HEAD` fallback (below).
+
+New callbacks on `OrchestrationEffectCallbacks`, answered by the supervisor:
+`thread_writes_checkout(thread_id) -> Option<WritingReason>` and
+`quiet_sibling(thread_id) -> Result<(), WritingReason>`.
+
+Step 7 repeats checks 2 and 3 on the worker immediately before the irreversible rewind.
+Every sibling is then suspended and no delivery or compaction can reopen it, so no sibling
+turn can start between the check and the end of the restore.
 
 ### Conversation-only rewind
 
@@ -166,45 +219,71 @@ MCP wait loop are shared:
   `siblingChangesToken: string`, optional. The Rust enum gains the same fields with
   `#[serde(default)]`. Replaying an older event yields `full`, so a projection rebuild is
   unchanged. No migration.
-- A conversation-only rewind takes the thread reservation only: no checkout gate, no
-  `tails` place (`order` skips it), because it writes no file. It runs today's own-thread
-  checks, then `rollback_provider`. A `FilesOnly` answer refuses with nothing changed:
-  "Claude can't rewind its conversation, so only a file restore is possible." Then it
-  deletes the newer checkpoint refs and dispatches `thread.revert.complete`, as a full
-  revert does, plus an info activity `checkpoint.revert.conversation-only`, "Conversation
-  rewound, files kept". It never runs `restore`, `clean` or `reset`.
-- Side chats stay refused by the engine (`engine.rs:5290-5302`) in both modes; a side
-  chat has no checkpoints to rewind to.
-- The next turn's diff runs from the target's ref, so it also shows the changes the rewind
+- **It needs a rewind that leaves files alone** (Codex #279 finding 1). The provider
+  layer gains `rewind_keeps_files(provider, api_version) -> bool`:
+
+  | Provider and API     | Rewind call                                                | Keeps files    | Evidence                                                                                                                                  |
+  | -------------------- | ---------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+  | Codex                | `thread/revert` with `beforeTurnId`                        | yes            | `provider/codex/runtime.rs:1530-1532` ("Codex does not touch files")                                                                      |
+  | OpenCode 2           | `revert/stage` with `"files": false`, then `revert/commit` | yes            | `provider/opencode/runtime.rs:4191`; test `rollback_reverts_from_the_start_of_the_nth_most_recent_turn` (`v2_runtime_tests.rs:1870-1892`) |
+  | OpenCode 1           | `POST /session/{id}/revert` with only `messageID`          | **no**         | `provider/opencode/runtime.rs:2106-2113`; OpenCode 1 reverts its file snapshots in that call                                              |
+  | Claude, Cursor, Grok | none (`FilesOnly`)                                         | not applicable | `rpc-and-orchestration.md:3700-3706`                                                                                                      |
+
+  A conversation-only rewind on a provider without it is refused before any provider call:
+  "OpenCode 1 can't rewind its conversation without restoring files. Revert files and
+  conversation instead." For `FilesOnly` providers: "Claude can't rewind its conversation,
+  so only a file restore is possible." The supervisor answers from the live session's
+  launch, after `prepare_provider_rewind` reopened it, so the API version is known.
+
+- It takes the thread reservation only: no checkout gate, no `tails` place (`order` skips
+  it), because it writes no file. It runs today's own-thread checks, then
+  `rollback_provider`, deletes the newer checkpoint refs and dispatches
+  `thread.revert.complete`, as a full revert does, plus an info activity
+  `checkpoint.revert.conversation-only`, "Conversation rewound, files kept". It never runs
+  `restore`, `clean` or `reset`.
+- Side chats stay refused by the engine (`engine.rs:5290-5302`) in both modes.
+- The next turn's diff runs from the target's ref, so it also shows the files the rewind
   kept. Diffs in a shared checkout already include whatever changed between two turns, so
   this is consistent; the activity says the files were kept.
 
 ### The sibling-change warning
 
-Under the gate the restore lists **sibling turns since the target**:
+The evidence must survive what siblings do to their own threads (Codex #279 finding 3).
+`thread.reverted` deletes a thread's newer `projection_turns` rows (`engine.rs:8310-8318`),
+so a sibling's conversation-only rewind would erase the turns whose files it kept, and a
+deleted sibling's rows go with it. The warning therefore reads two sources that no
+sibling action removes:
 
-- the target's time is the target checkpoint row's `completed_at`; for turn 0 (ref 0,
-  captured just before the first turn was claimed) it is turn 1's `started_at`, or its
-  `requested_at` when that is null;
-- every `projection_turns` row of a sibling with `completed_at` after that time counts;
-- a row with a `ready` checkpoint, `diffAvailable`, and an empty file list is left out (it
-  changed nothing); its file list is shown otherwise. A side chat's turns have no
-  checkpoint, so they count with "files not known".
+1. **Git, for everything since this thread's last turn.** With a temporary index, as
+   capture does: `read-tree <this thread's newest ready checkpoint ref>`, `add -A`, then
+   `diff --cached --name-only <that ref>`. The thread is idle (a busy thread is refused),
+   so every path listed was changed by someone else: a sibling, a terminal or an editor.
+   It runs in the #283 checkpoint environment.
+2. **The event log, for sibling turns between the target and this thread's last turn.**
+   `orchestration_events` is append-only; nothing deletes from it (`rg "DELETE FROM
+   orchestration_events"` finds nothing). The query reads, for every thread whose stored
+   checkout has the key, deleted threads included, the `thread.turn-diff-completed` events
+   (with their file lists) and the `thread.session-set` events that start a turn, with
+   `occurred_at` after the target's time and up to this thread's newest checkpoint. A turn
+   without a file list (a side chat) shows "files not known".
 
-`siblingChangesToken` is the hex SHA-256 of the sorted `threadId/turnId` list, or absent
-when the list is empty. The restore proceeds only if the list is empty or the command's
-token equals it. Otherwise it refuses, and the refusal carries the token. A sibling turn
-that finishes after the person confirmed changes the token, so a stale confirmation never
-discards it.
+The target's time is the target checkpoint row's `completed_at`; for turn 0 it is turn 1's
+`started_at`, or `requested_at` when that is null. The reverting thread's own rows are
+intact, because only this revert would delete them.
 
-### Turn 0 on a shared checkout
+`siblingChangesToken` is the hex SHA-256 of the sorted Git paths and the sorted event ids,
+absent when both are empty. The restore proceeds only when both are empty or the token
+matches. Otherwise it refuses, and the refusal carries the new token. A change made after
+the person confirmed changes the token, so a stale confirmation never discards it.
+
+### Turn 0 on a shared checkout (Mauro, decision D)
 
 When ref 0 is missing, turn 0 falls back to `HEAD` (`:1920-1922`). With `clean -fd` that
-discards every uncommitted change in the checkout, including idle siblings' work the guard
-does not otherwise see. With at least one sibling, the fallback is refused: "This thread
-has no starting checkpoint, and other chats share this checkout, so restoring files would
-discard their work. Rewind only the conversation, or revert to a later turn." A thread
-alone in its checkout keeps today's fallback.
+discards every uncommitted change in the checkout, including idle siblings' work. With at
+least one sibling, the fallback is refused: "This thread has no starting checkpoint, and
+other chats share this checkout, so restoring files would discard their work. Rewind only
+the conversation, or revert to a later turn." A thread alone in its checkout keeps
+today's fallback.
 
 ### Pre-dispatch read: `orchestration.previewCheckpointRevert`
 
@@ -217,22 +296,20 @@ read before the dialog:
 previewCheckpointRevert: "orchestration.previewCheckpointRevert"
 input:  { threadId, turnCount }
 output: {
-  writingSiblings: Array<{ threadId, title, reason: "turn" | "backgroundWork" | "checkpointPending" }>,
-  siblingChanges: Array<{ threadId, title, turns: number, files: string[] | null }>,
+  writingSiblings: Array<{ threadId, title, reason: "turn" | "backgroundWork" | "checkpointPending" | "unobservable" }>,
+  siblingChanges: { paths: string[], turns: Array<{ threadId, title, turns: number, files: string[] | null }> },
   siblingChangesToken: string | null,
-  conversationRewind: boolean,      // the thread's provider supports it
+  conversationRewind: "available" | "filesOnlyProvider" | "rewindRestoresFiles",
   headFallbackRefused: boolean,
 }
 ```
 
-It reads the database and the supervisor's in-memory sessions, no Git, so it is not
-long-running. It is advisory: the worker repeats every check under the gate.
+It runs Git (source 1), so it joins `is_long_running` in
+`diagnostics/profiler/latency.rs` like the other Git-backed reads. It is advisory: the
+worker repeats every check under the gate. Its conversation-rewind answer comes from the
+session's last launch and is confirmed by the worker.
 
-`OrchestrationEffectCallbacks` gains `thread_writes_checkout(thread_id) -> bool`, which
-the supervisor answers from `session_holds_a_turn` and `has_recent_live_activity`. Both
-the preview and the worker use it.
-
-### UI copy (checked against `UI.md`)
+### UI copy (checked against `UI.md` and Impeccable's clarify guidance)
 
 The native confirm is replaced by the app's alert dialog (`AlertDialog`, already used in
 `ProjectScriptsControl.tsx` and `settings/WebhooksTab.tsx`) with named buttons. No em
@@ -245,11 +322,12 @@ Normal revert, provider can rewind:
 > removed. This can't be undone.
 > [**Revert files and conversation**] (destructive, primary) [Rewind conversation only] [Cancel]
 
-With sibling changes (one line per thread, at most three files each, then "and N more"):
+With sibling changes (at most three files per line, then "and N more"):
 
 > Other chats in this checkout changed files since then. Reverting files undoes these too:
 > Panel, Codex: 2 turns, `src/app.ts`, `README.md`
 > Side chat: 1 turn, files not known
+> Changed since this chat's last turn: `package.json`
 
 A sibling is writing:
 
@@ -258,9 +336,10 @@ A sibling is writing:
 > revert. You can rewind only this conversation now; files stay as they are.
 > [**Rewind conversation only**] [Cancel]
 
-The reason line varies: "is running background work", "is still saving its checkpoint".
-When the provider cannot rewind, the second sentence and that button are left out, and
-the only button is [Close].
+The reason line varies: "is running background work", "is still saving its checkpoint",
+"BiBCode can't tell whether Panel, Grok is still working. Stop its session, then revert."
+When conversation-only is unavailable, the second sentence and that button are left out,
+and the only button is [Close].
 
 Provider cannot rewind (today's text, now with named buttons):
 
@@ -268,26 +347,30 @@ Provider cannot rewind (today's text, now with named buttons):
 > Claude can't rewind its conversation, so the newer messages stay. This can't be undone.
 > [**Restore files**] [Cancel]
 
+OpenCode 1: the normal dialog without [Rewind conversation only].
+
 The **Revert to this message** control stays enabled while a sibling is busy: the dialog
 explains why the file restore is unavailable and offers the alternative, instead of a
 disabled button that cannot.
 
 Worker refusals (`checkpoint.revert.failed` detail, and MCP `McpCheckpointRevertError`):
 
-| Case                         | Detail                                                                                                                                            |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Writing sibling              | "Another chat in this checkout (Panel, Codex) is running a turn. Stop it or wait for it to finish, then revert, or rewind only the conversation." |
-| Gate wait expired            | "Another chat in this checkout is starting a turn. Try the revert again in a moment."                                                             |
-| Unacknowledged changes       | "Other chats in this checkout changed files since turn 3. Review them and revert again." (carries the token)                                      |
-| `HEAD` fallback refused      | as above                                                                                                                                          |
-| Conversation-only, no rewind | "Claude can't rewind its conversation, so only a file restore is possible."                                                                       |
+| Case                           | Detail                                                                                                                                            |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Writing sibling                | "Another chat in this checkout (Panel, Codex) is running a turn. Stop it or wait for it to finish, then revert, or rewind only the conversation." |
+| Sibling work not observable    | "BiBCode can't tell whether Panel, Grok is still working. Stop its session, then revert, or rewind only the conversation."                        |
+| Gate wait expired              | "Another chat in this checkout is starting a turn. Try the revert again in a moment."                                                             |
+| Unacknowledged changes         | "Files in this checkout changed since turn 3, outside this chat. Review them and revert again." (carries the token)                               |
+| `HEAD` fallback refused        | as above                                                                                                                                          |
+| Conversation-only, `FilesOnly` | "Claude can't rewind its conversation, so only a file restore is possible."                                                                       |
+| Conversation-only, OpenCode 1  | "OpenCode 1 can't rewind its conversation without restoring files. Revert files and conversation instead."                                        |
 
 ### MCP
 
 `revert_thread_to_turn` gains `mode` (`"full"` default, `"conversationOnly"`) and
 `siblingChangesToken`. Its pre-check calls the same preview. An unacknowledged change
-returns `McpSharedCheckoutChangedError` with the sibling list and the token in structured
-content; the agent repeats the call with the token. A writing sibling returns
+returns `McpSharedCheckoutChangedError` with the paths, sibling turns and the token in
+structured content; the agent repeats the call with the token. A writing sibling returns
 `McpTurnRunningError` naming the sibling.
 
 ## Failure, restart and concurrency
@@ -295,103 +378,120 @@ content; the agent repeats the call with the token. A writing sibling returns
 - **Restart.** Both gates and `restore_holds` are in memory. That is sound for the reason
   `ThreadTurnFence` gives (`engine.rs:1793-1796`): the worker never replays a revert
   requested before a restart. A restore interrupted by a crash leaves the checkout part
-  restored, as today; the person reverts again.
+  restored, as today; the person reverts again. A sibling suspended by step 5 stays
+  suspended and reopens on its next message, as after idle suspension.
 - **Shutdown.** The waiter's `select!` on cancellation (`:971-987`) drops the guards. Once
   the provider has rewound, the restore is uninterruptible (`:2093-2098`) and holds the
   gate until it is recorded.
-- **Provider-started turns.** Claude, Cursor, OpenCode and Grok can start a turn without a
-  delivery (`provider_runtime.rs:12950-12957` describes `providerStarted`). The gate cannot
-  stop those. Step 7's re-check just before the irreversible rewind narrows the window to
-  the rewind's own duration, which remains a known residual.
 - **What the guard does not cover.** The person's terminals, editors and agents outside
-  BiBCode; a second project registered on the same directory; two spellings of one path
-  through a symlink (the key is lexical, as `tails` is today).
+  BiBCode. Their changes since this thread's last turn do appear in the warning (Git
+  source).
 - **Mixed versions.** An older client sends no `mode` (full) and no token. It still works
-  unless siblings changed files since the target, when the worker refuses with the detail
-  above; the work log shows it. An older server ignores the new fields: a newer client
-  must not offer **Rewind conversation only** unless the server advertises it, so the
-  server adds `conversationOnlyRewind: true` to its environment capabilities
-  (`http.rs:752-761`, `:781-788`; contract `ExecutionEnvironmentCapabilities`,
-  `environment.ts:30`, default `false`).
-- **Performance.** One stored-key lookup per delivery (thread row, project row when the
-  thread has no worktree), one `RwLock` acquisition uncontended in the common case. The
-  preview runs one sibling query and one turns query per revert dialog.
+  unless files changed outside the thread since the target, when the worker refuses with
+  the detail above; the work log shows it. An older server ignores the new fields, so a
+  newer client offers **Rewind conversation only** only when the server advertises
+  `conversationOnlyRewind: true` in its environment capabilities (`http.rs:752-761`,
+  `:781-788`; contract `ExecutionEnvironmentCapabilities`, `environment.ts:30`, default
+  `false`).
+- **Performance.** One `canonical_worktree_path_key` per delivery and per compaction (one
+  `canonicalize` call), one uncontended `RwLock` acquisition. Each revert dialog and each
+  guarded restore run one sibling query across projects (one key per thread) and one
+  capture-sized Git read.
 
 ## Tests, mapped to the acceptance
 
 Acceptance 1, "pauses revert preparation, attempts a sibling turn, and shows the turn is
 held or refused until the restore completes":
 
-1. `a_sibling_turn_waits_while_restore_preparation_holds_the_checkout`: a new test hook
-   pauses preparation inside the gate, after `plan_shared_checkout` starts (step 5) and
-   before the handback (step 6). Send a panel message on the same worktree; assert the
-   panel's delivery is not claimed; release; assert the restore finished before the
-   panel's claim.
-   1b. `a_sibling_turn_waits_until_the_restore_itself_completes`: the same, paused in the
-   host's `rollback_provider` (step 7) with the existing `entered`/`release` hooks
-   (`turn_delivery_queue_tests.rs:911-938`).
-   1c. `a_sibling_turn_started_before_the_gate_makes_the_restore_refuse`: pause in
-   `prepare_provider_rewind` (step 2), start a panel turn, release; the restore is refused
-   naming the panel, files unchanged, provider not rewound.
-2. `a_sibling_turn_already_claimed_makes_the_restore_wait_then_refuse`: hold a panel
+1. `a_sibling_turn_waits_while_restore_planning_holds_the_checkout`: a test hook pauses
+   `plan_revert` at its start (step 5, under the gate). Send a panel message on the same
+   worktree; assert the panel's delivery is not claimed; release; assert the restore
+   finished before the panel's claim.
+2. `a_sibling_turn_waits_during_the_cold_start`: the same, paused in
+   `prepare_provider_rewind` (`turn_delivery_queue_tests.rs:930-938` hook).
+3. `a_sibling_turn_waits_until_the_restore_itself_completes`: paused in the host's
+   `rollback_provider` (`:911-928` hooks).
+4. `a_sibling_delivery_in_flight_makes_the_restore_wait_then_refuse`: hold a panel
    delivery before its provider accepts; request the host restore; release; the restore is
    refused naming the panel, and the files are unchanged.
-3. `a_restore_gives_up_after_the_admission_wait`: a delivery that never accepts; the
-   restore is refused after the wait (paused clock), and the panel's next delivery is then
-   not blocked.
-4. `reverts_of_one_checkout_still_restore_in_request_order_under_the_gate` (the #129
-   test, extended with a panel delivery in between).
-5. `a_thread_on_the_project_root_is_a_sibling_of_another_root_thread`.
+5. `a_restore_gives_up_after_the_admission_wait`: a delivery that never accepts; the
+   restore is refused after 15 s (paused clock), and the panel's next delivery is not
+   blocked.
+6. `reverts_of_one_checkout_still_restore_in_request_order_under_the_gate` (the #129 test,
+   extended with a panel delivery in between).
+7. `a_symlinked_or_second_project_path_is_the_same_checkout`: a second project registered
+   on a symlink to the first's root, and (on case-insensitive hosts) a differently cased
+   spelling, share one gate; two Git worktrees of one repository do not.
 
 Acceptance 2, "a host restore while a panel is busy is refused, with an actionable
 message":
 
-6. `a_restore_is_refused_while_a_panel_runs_a_turn`: detail names the panel and the
+8. `a_restore_is_refused_while_a_panel_runs_a_turn`: detail names the panel and the
    conversation-only alternative; files and conversation unchanged; provider not rewound.
-7. `a_restore_is_refused_while_a_sibling_runs_background_work`.
-8. `a_restore_is_refused_while_a_sibling_checkpoint_is_pending`.
-9. `a_provider_started_sibling_turn_after_planning_is_caught_before_the_rewind`.
-10. `turn_zero_head_fallback_is_refused_on_a_shared_checkout` and
+9. `a_restore_is_refused_while_a_sibling_runs_background_work`.
+10. `a_restore_is_refused_while_a_sibling_checkpoint_is_pending`.
+11. `a_restore_is_refused_when_a_sibling_session_is_unobservable` (a Cursor-like fake with
+    `session_reports_its_work` false).
+12. `an_idle_sibling_session_is_suspended_before_the_restore`, and
+    `a_provider_started_sibling_turn_cannot_begin_after_the_last_check`: a fake sibling
+    driver that emits `turn.started` with `providerStarted: true` when released. Release
+    it after step 7's check, during `rollback_provider`. The driver is already shut down,
+    so no turn starts and the restore completes; then the panel's next message reopens
+    it.
+13. `turn_zero_head_fallback_is_refused_on_a_shared_checkout` and
     `turn_zero_head_fallback_still_works_alone`.
 
 Acceptance 3, "a conversation-only rewind leaves the working tree byte for byte
 unchanged":
 
-11. `a_conversation_only_rewind_leaves_the_working_tree_unchanged`: before and after,
+14. `a_conversation_only_rewind_leaves_the_working_tree_unchanged`: before and after,
     compare every path under the checkout except `.git` (tracked, modified, untracked and
     ignored files, and an empty directory) by bytes, plus `git status --porcelain=v2
     --ignored`. Assert the provider rewound, newer messages and turns are gone, newer refs
     deleted, target ref kept.
-12. `a_conversation_only_rewind_runs_while_a_sibling_is_busy`.
-13. `a_conversation_only_rewind_is_refused_for_a_files_only_provider`: nothing changes.
+15. `a_conversation_only_rewind_runs_while_a_sibling_is_busy`.
+16. `a_conversation_only_rewind_is_refused_for_a_files_only_provider` and
+    `…_for_opencode_1`: nothing changes, and the OpenCode 1 replay server records no
+    `/revert` request.
+17. Provider behaviour, against the existing replay fixtures: OpenCode 2's rewind sends
+    `"files": false` (`v2_runtime_tests.rs:1870-1892`, kept), and Codex's rewind sends
+    only `thread/revert`. A live check against real OpenCode 1 and 2 and Codex, rewinding a
+    turn that edited a file and asserting the file is unchanged, goes in the execution
+    report: the replay fixtures prove what BiBCode sends, not what the provider does.
 
 Warning:
 
-14. `sibling_changes_need_the_matching_token`: no token refuses with the token; the token
+18. `sibling_changes_need_the_matching_token`: no token refuses with the token; the token
     restores; a sibling turn finishing after the preview changes the token and refuses.
-15. `a_sibling_turn_that_changed_nothing_is_not_listed`.
-16. Preview RPC: `preview_reports_writing_siblings_changes_and_rewind_support`.
+19. `a_sibling_conversation_only_rewind_keeps_its_changes_in_the_warning` (Codex #279
+    finding 3): A finishes turn 1; panel B edits `x` in a turn; B rewinds conversation
+    only; A's restore to turn 1 without a token is refused and lists `x`. The same with B
+    deleted instead.
+20. `a_terminal_edit_since_the_last_turn_is_listed`.
+21. Preview RPC: `preview_reports_writing_siblings_changes_and_rewind_support`.
 
 Contracts and web:
 
-17. Contracts: `mode` defaults to `full`; an event without it decodes.
-18. `ChatView.logic` tests: dialog model for each case (normal, sibling changes, writing
-    sibling with and without rewind support, files-only provider).
-19. MCP: `revert_thread_to_turn` with `conversationOnly`, and the token round trip.
+22. Contracts: `mode` defaults to `full`; an event without it decodes.
+23. `ChatView.logic` tests: dialog model for each case (normal, sibling changes, writing
+    sibling with and without conversation-only, files-only provider, OpenCode 1).
+24. MCP: `revert_thread_to_turn` with `conversationOnly`, and the token round trip.
 
 ## Files to change
 
 - `apps/server/src/orchestration/engine.rs`: `CheckoutTurnFence`, `restore_holds`, the
   command and requested-payload fields.
-- `apps/server/src/production/orchestration_effects.rs`: `ParkedThreads::order` and `run`
-  (reorder, gate), `plan_revert` split into own and shared parts, `finish_revert`
-  (re-check, conversation-only branch), `OrchestrationEffectCallbacks::thread_writes_checkout`.
+- `apps/server/src/production/orchestration_effects.rs`: `ParkedThreads::order` (physical
+  key) and `run` (reordered, gate), `plan_revert` (shared-checkout checks), `finish_revert`
+  (re-check, conversation-only branch), compaction's admission, the new callbacks.
 - `apps/server/src/production/turn_delivery.rs`: shared admission in
   `prepare_claim_and_deliver`; `restore_holds` skips at `:1095` and `:1495`.
-- `apps/server/src/production/provider_runtime.rs`: `thread_writes_checkout`.
-- `apps/server/src/persistence/repositories.rs`: sibling and sibling-turn queries.
+- `apps/server/src/production/provider_runtime.rs`: `thread_writes_checkout`,
+  `quiet_sibling`; `apps/server/src/provider/mod.rs`: `rewind_keeps_files`.
+- `apps/server/src/persistence/repositories.rs`: the cross-project sibling query and the
+  event-log query.
 - `apps/server/src/production/orchestration_rpc.rs` and `rpc/session.rs`: the preview
-  method through the timing wrapper.
+  method; `diagnostics/profiler/latency.rs`: `is_long_running`.
 - `apps/server/src/mcp/tools/threads.rs`: `mode`, token, errors.
 - `apps/server/src/http.rs`: `conversationOnlyRewind` capability.
 - `packages/contracts/src/orchestration.ts`, `environment.ts`; `packages/client-runtime`
@@ -399,41 +499,55 @@ Contracts and web:
 - `apps/web/src/components/ChatView.tsx`, `ChatView.logic.ts`: the dialog.
 - Living docs: `docs/architecture/rpc-and-orchestration.md` "Checkpoint revert" and the
   MCP section (`:3834-3839`), `docs/user/workspace-ui.md` (revert dialog), the MCP tool
-  description. `docs/architecture/overview.md` is coordinator-reserved: one line under
-  checkpoints, "A file restore holds its checkout's turn admission and refuses while
-  another chat there is writing."
+  description, `docs/skills/bibcode-profiler/references/` if `is_long_running` is listed
+  there. `docs/architecture/overview.md` is coordinator-reserved: one line under
+  checkpoints, "A file restore holds its checkout's turn admission from planning to
+  completion and refuses while another chat there is writing."
 
 ## Profiler, crash and trace coverage
 
 - **RPC methods.** `orchestration.previewCheckpointRevert` is registered through the
-  `rpc/session.rs` wrappers, so it is timed. It waits on nothing external, so it is not
-  added to `is_long_running`.
+  `rpc/session.rs` wrappers, so it is timed, and added to `is_long_running` because it
+  runs a capture-sized Git read.
 - **Logs.** A refused restore already becomes `checkpoint.revert.failed` through
   `append_failure_activity` and `tracing::warn!` (`:782-791`). A gate wait that expires
-  logs `tracing::warn!` with the thread id and no path.
-- **Not applicable.** Child processes (no new spawn), worktree removal, binaries,
-  shutdown order, profiler events.
+  and a sibling suspension each log one `tracing::warn!` or `tracing::info!` with thread
+  ids and no path.
+- **Child processes.** None new: the Git read runs through `ProcessRunner`, and suspension
+  uses the supervisor's existing shutdown path.
+- **Not applicable.** Worktree removal, binaries, shutdown order, profiler events.
 
 ## Risks
 
-- Delivery gains a dependency on the stored checkout key. A thread whose stored path
-  differs from its live session's cwd would be fenced under the stored one. The live cwd
-  comes from the same stored path today.
-- The 15 s wait is a judgement: long enough for a provider to accept a turn on a loaded
-  machine, short enough that a stuck delivery does not freeze the checkout. The test
-  uses a paused clock.
+- **Suspending an idle sibling early** costs its next message a cold start. Idle sessions
+  suspend after 60 s anyway (`DEFAULT_SESSION_IDLE_TIMEOUT`, `provider_runtime.rs:136`).
+- **Unobservable providers** (Cursor, Grok, or Chat Activity off) refuse every shared
+  restore while their session is live, until idle suspension or a stop.
+- **The 15 s admission wait** is a judgement; the test uses a paused clock.
+- **The Git read** in preview and under the gate costs as much as a capture on a large
+  checkout, and it holds the gate.
+- **Provider rewind behaviour** is known from BiBCode's source and replay fixtures; the
+  live check in test 17 confirms it.
 - Replacing the native confirm changes a desktop dialog into an in-app one. The in-app
   dialog must keep keyboard focus and Escape behaviour (`AlertDialog` does).
 
 ## Questions only Mauro can answer
 
-1. Should **Rewind conversation only** be offered in every revert dialog (this design), or
-   only as the fallback when a file restore is refused?
-2. Should the sibling-change warning stay a confirmation (this design: the person sees it
-   and confirms), or block the file restore until the siblings' work is committed?
-3. Is refusing turn 0's `HEAD` fallback on a shared checkout acceptable, or should it warn
-   and proceed?
-4. Is 15 s the right bound for waiting on a sibling delivery in flight?
-5. Does "coordinated from the moment the restore is planned" accept a gate that starts at
-   the shared-checkout checks, with a refusal for any sibling turn that started during the
-   thread's own preparation (see "What the gate covers")?
+1. Should the sibling-change warning stay a confirmation (this design), or block the file
+   restore until the siblings' work is committed?
+2. Is 15 s the right bound for waiting on a sibling delivery in flight?
+3. Is suspending an idle sibling's session for the restore acceptable, rather than
+   refusing until it idles out on its own (up to 60 s)?
+
+## Review findings and resolutions
+
+Codex review, round 1, of revision 0. The coordinator verified findings 1, 2 and 4 in
+source; each was checked again here at `e222d340ff`.
+
+| #     | Finding                                                                                | Checked                                                                                                                                                  | Resolution                                                                                                                                                                                                     |
+| ----- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 #1 | OpenCode 1's rewind restores files, so a conversation-only rewind would not keep them. | Confirmed: OpenCode 1 posts `/session/{id}/revert` with only `messageID` (`opencode/runtime.rs:2106-2113`); OpenCode 2 sends `"files": false` (`:4191`). | **Fixed.** `rewind_keeps_files` per provider and API version; OpenCode 1 refused before any call. Tests 16 and 17, with a live check in the execution report.                                                  |
+| P1 #2 | Provider-started turns bypass delivery and can begin after the last check.             | Confirmed: `providerStarted` and self-started turns (`provider_runtime.rs:12098-12105`, `opencode/runtime.rs:2871-2877`).                                | **Fixed.** Every sibling is made quiet under the gate: an idle live session is suspended, and a session that cannot be suspended safely refuses the restore. Compaction also takes admission. Tests 11 and 12. |
+| P1 #3 | A sibling's conversation-only rewind deletes the turn rows the warning reads.          | Confirmed: `thread.reverted` deletes newer `projection_turns` (`engine.rs:8310-8318`).                                                                   | **Fixed.** The warning reads Git (changes since this thread's last turn) and the append-only event log, which no sibling action deletes. Test 19.                                                              |
+| P1 #4 | The lexical, project-scoped key misses symlinks, case and other projects.              | Confirmed: `normalize_host_path_lexically` in `order` (`:926-930`); siblings were read per project.                                                      | **Fixed.** One physical key, `canonical_worktree_path_key`, already used by workspace availability, for the gate, siblings (all projects) and `tails`. Test 7.                                                 |
+| P2 #5 | Steps 1 to 3 of revision 1 left admission open during preparation.                     | Confirmed against revision 1.                                                                                                                            | **Fixed by Mauro's decision.** The gate covers the whole planning interval; the #129 order and the lock order are kept. Tests 1 to 3 pause inside planning.                                                    |

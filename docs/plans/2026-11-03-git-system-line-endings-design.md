@@ -434,3 +434,23 @@ Implemented in `apps/server/src/git/system_line_endings.rs`, with the integratio
     group- or other-writable gives `NoSystem`. Ancestors and Windows ACLs are not checked,
     because the state directory, which holds the database, is the trust boundary. Test:
     `a_group_or_other_writable_state_is_refused` (Unix, CI only).
+
+## Amendment (2026-11-07, issue #283)
+
+Mauro decided on 2026-11-07 that the curated system configuration of
+[`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md)
+applies to every BiBCode Git call. This partly reverses the Outcome above. The rest of
+this document is kept as it was approved.
+
+- The generated file is no longer line-endings only. It also holds recognized git-lfs
+  filter values, well-known credential-helper names, `core.symlinks`, `core.fscache`,
+  `core.longpaths`, `http.sslBackend` and `http.sslCAInfo`, each validated as that design
+  describes. Hooks, includes, other filters, textconv and the other `http.*` keys stay out.
+- A probe that could not read the system configuration now gives a new `Unread` state
+  instead of `NoSystem`. `git_environment()` callers still get `GIT_CONFIG_NOSYSTEM=1`
+  there; checkpoints inherit the system file with hooks turned off.
+- "Checkpoints are not moved" and the bootstrap row of "Other production Git spawns" are
+  superseded: both now use the shared policy.
+- The module is renamed `git/system_config.rs` and its tests
+  `apps/server/tests/git_system_config.rs`. The #282 tests that change are listed in that
+  design's "Effect on the #282 tests".
