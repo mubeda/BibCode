@@ -279,7 +279,9 @@ Guards:
 
 6. `a_new_capture_stores_an_lfs_pointer`.
 7. `a_full_content_blob_restores_unchanged_with_lfs_configured`: a checkpoint captured with
-   no filter, restored under the policy.
+   no filter, restored under the policy. The fake runs no `filter-process`, so this test
+   proves the configuration reaches restore. It does not prove git-lfs's own pass-through,
+   which rests on the source citations above and on the native Windows check.
 8. `a_worktree_created_under_system_lfs_checks_out_real_content`.
 9. `an_unread_policy_keeps_checkpoints_on_the_inherited_system_file`: fake `git` reporting
    2.31 first on `PATH`; capture still stores a pointer.
@@ -310,7 +312,7 @@ Manager), recorded in the execution report:
 
 ## Files to change
 
-- `apps/server/src/git/system_line_endings.rs` → `apps/server/src/git/system_config.rs`:
+- `apps/server/src/git/system_line_endings.rs`, renamed `apps/server/src/git/system_config.rs`:
   keys, canonicalizer, `Policy::Unread`, the inheriting variant of the variable.
 - `apps/server/src/git/mod.rs:11`, `apps/server/src/lib.rs:187`,
   `apps/server/src/lifecycle.rs:238`, `apps/desktop/src-tauri/src/backend.rs:2147`: the
@@ -319,7 +321,7 @@ Manager), recorded in the execution report:
   `git_environment()`.
 - `apps/server/src/production/orchestration_effects.rs`: `run_git` (`:2569-2596`) and
   `run_bootstrap_git` (`:441-466`); the `-c` overrides.
-- `apps/server/tests/git_system_line_endings.rs` → `apps/server/tests/git_system_config.rs`.
+- `apps/server/tests/git_system_line_endings.rs`, renamed `apps/server/tests/git_system_config.rs`.
 - Living docs: `docs/architecture/rpc-and-orchestration.md` ("Git environment" paragraph
   and the checkpoint section), `docs/testing/windows-desktop.md` (system LFS and
   credentials now reach BiBCode's Git), `docs/user/workspace-ui.md` (one sentence: LFS files
