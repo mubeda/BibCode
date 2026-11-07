@@ -2124,10 +2124,11 @@ The Files surface is a full file manager for the active workspace:
   tree, in a diff, in a chat link or through a UI suggestion. A file that
   already has a tab is focused, not duplicated. The Files tab stays in the
   strip, so one click returns to the full-width tree with its expanded folders,
-  selection and scroll as you left them. Each file tab also shows the tree in a
-  sidebar; its **Show/Hide file explorer** switch is remembered for all file
-  tabs. Hiding the sidebar keeps the tree alive while a Files tab exists. If you
-  close the Files tab, reopen it from the **+** menu or the sidebar.
+  selected row as you left them, even after a visit to another tab such as Diff,
+  and scrolled to the selected row. Clicking the already selected row opens its
+  file again. Each file tab also shows the tree in a sidebar; its **Show/Hide
+  file explorer** switch is remembered for all file tabs. If you close the Files
+  tab, reopen it from the **+** menu or the sidebar.
 - Opening a file shows it in the panel by its extension, before any text read.
   Text and code open in the editor. Images (PNG, JPEG, GIF, WebP, AVIF, ICO)
   show as pictures, with their pixel size and a **Fit** / **Actual size**
