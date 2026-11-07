@@ -433,13 +433,15 @@ Filters from global and repository configuration stay on. The bootstrap fetch ta
 `git_environment()` with no override: it updates real remote-tracking refs, so repository
 and global hooks run, as for the person's fetch.
 
-These spawns keep their own configuration:
+The streamed review diff and its untracked listing, workspace search's `git ls-files`
+and the pull-request service's Bitbucket remote read use `git_read_environment()`. The
+external difftool launch takes only the policy's system-configuration variable, the same
+policy its `--tool-help` listing runs under: the prompt guards and the C locale would reach
+the diff app. These spawns keep their own configuration:
 
 - The clone tools' fully isolated configuration ([Clone tools](#clone-tools)). A clone's
   LF checkout is clean for both Gits under `autocrlf=true`.
-- The streamed review diff, workspace search's `git ls-files` and the pull-request
-  discovery default.
-- The external difftool, whose tool definitions can live in the system configuration.
+- Source-control discovery's `git --version` probe, which reads no configuration.
 
 ## VCS status and mutation coordination
 
@@ -1210,6 +1212,8 @@ its temporary pre-image files and the user's `difftool.<tool>.cmd`.
   Paths are checked lexically by `resolve_relative` and never against the
   disk, so a deleted file, a rename's old path and a file only a base or a
   checkpoint holds are valid; they follow `--` with `GIT_LITERAL_PATHSPECS=1`.
+  The launch also takes the shared system-configuration variable
+  ([Git process environment](#git-process-environment)).
   The tool ID matches `[A-Za-z0-9][A-Za-z0-9._-]*` and is passed only as the
   value of `--tool=`. The environment adds `GIT_TERMINAL_PROMPT=0`, and the
   AppImage environment is isolated.
@@ -4519,7 +4523,8 @@ server-owned entry index per canonical workspace root, built on first use and
 retained for later requests. Concurrent cold callers share one build, and an
 invalidation generation prevents an older in-flight scan from becoming current.
 
-A Git build starts one concurrent wave of two reads with `GIT_OPTIONAL_LOCKS=0`,
+A Git build starts one concurrent wave of two reads with `git_read_environment()`
+([Git process environment](#git-process-environment)),
 request cancellation, and a workspace-index-specific ten-second post-spawn
 execution bound:
 
