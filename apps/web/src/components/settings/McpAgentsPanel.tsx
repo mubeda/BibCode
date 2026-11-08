@@ -1,7 +1,17 @@
-import type { AuthClientSession, McpActiveClient, McpActivityRow } from "@bibcode/contracts";
+import type {
+  AuthClientSession,
+  AuthMcpNamedClient,
+  McpActiveClient,
+  McpActivityRow,
+} from "@bibcode/contracts";
 import { useMemo } from "react";
 
-import { takenOverLevel, usePrimaryMcpActivity, usePrimaryMcpClients } from "~/state/mcpActivity";
+import {
+  takenOverLevel,
+  usePrimaryIdleNamedClients,
+  usePrimaryMcpActivity,
+  usePrimaryMcpClients,
+} from "~/state/mcpActivity";
 import { Button } from "../ui/button";
 import { useMcpAgentActions } from "./useMcpAgentActions";
 import { SettingsRow } from "./settingsLayout";
@@ -65,13 +75,20 @@ function timeText(iso: string | null | undefined): string {
 export function McpAgentsPanel() {
   const { rows, active, canManage } = usePrimaryMcpActivity();
   const clients = usePrimaryMcpClients();
+  const idle = usePrimaryIdleNamedClients();
   return (
     <>
       <SettingsRow
         title="Agents"
         description="Outside agents authorized to use this environment's MCP server. Revoke ends an agent's access; Take over leaves it read only until you hand it back."
       >
-        <McpAgentList clients={clients} active={active} rows={rows} canManage={canManage} />
+        <McpAgentList
+          clients={clients}
+          idle={idle}
+          active={active}
+          rows={rows}
+          canManage={canManage}
+        />
       </SettingsRow>
       <SettingsRow title="Agent activity" description="What agents changed here, newest first.">
         <McpActivityList rows={rows} />
@@ -82,11 +99,13 @@ export function McpAgentsPanel() {
 
 function McpAgentList({
   clients,
+  idle,
   active,
   rows,
   canManage,
 }: {
   readonly clients: ReadonlyArray<AuthClientSession>;
+  readonly idle: ReadonlyArray<AuthMcpNamedClient>;
   readonly active: ReadonlyArray<McpActiveClient>;
   readonly rows: ReadonlyArray<McpActivityRow>;
   readonly canManage: boolean;
@@ -112,7 +131,7 @@ function McpAgentList({
     (entry) =>
       entry.runningTurns > 0 && !clients.some((client) => client.sessionId === entry.clientId),
   );
-  if (clients.length === 0 && revokedRunning.length === 0) {
+  if (clients.length === 0 && idle.length === 0 && revokedRunning.length === 0) {
     return (
       <p className="pb-3.5 text-xs text-muted-foreground">
         No agent is authorized. Copy a command above into your agent to connect one.
@@ -213,6 +232,30 @@ function McpAgentList({
           </li>
         );
       })}
+      {idle.map((named) => (
+        // A named client with no run live (#324): its identity stays until a person revokes it.
+        <li key={named.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2">
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[13px] text-foreground">
+              {named.name.trim() ? `MCP · ${named.name}` : "MCP agent"}
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Not running · Keeps its identity across runs
+            </div>
+          </div>
+          {canManage ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={actions.pendingClientId === named.id}
+              title={ENDS_IDENTITY}
+              onClick={() => void actions.revoke(named.id)}
+            >
+              Revoke
+            </Button>
+          ) : null}
+        </li>
+      ))}
     </ul>
   );
 }

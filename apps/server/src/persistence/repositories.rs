@@ -2136,6 +2136,25 @@ impl Repositories {
                     (_, Some(pending)) => Some(format_epoch_ms(pending)),
                     (next, None) => next,
                 };
+                let mcp_named_clients = if table_has_named_clients(&transaction)? {
+                    collect(
+                        &transaction,
+                        "SELECT client_id, name, created_at, taken_over_at IS NOT NULL \
+                         FROM mcp_named_clients WHERE revoked_at IS NULL \
+                         ORDER BY created_at, client_id",
+                        [],
+                        |row| {
+                            Ok(LiveMcpNamedClient {
+                                id: row.get(0)?,
+                                name: row.get(1)?,
+                                created_at: row.get(2)?,
+                                taken_over: row.get(3)?,
+                            })
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
                 transaction.commit()?;
                 Ok(AuthAuthoritySnapshot {
                     revision,
@@ -2144,6 +2163,7 @@ impl Repositories {
                     offers,
                     sessions,
                     pending_mcp_authorizations,
+                    mcp_named_clients,
                 })
             })
             .await
@@ -2393,7 +2413,7 @@ impl Repositories {
                 transaction.execute(
                     "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES (?1, ?2, ?3) \
                      ON CONFLICT(name) WHERE revoked_at IS NULL DO NOTHING",
-                    params![format!("nc_{}", uuid::Uuid::new_v4()), name, row.created_at],
+                    params![format!("{NAMED_CLIENT_ID_PREFIX}{}", uuid::Uuid::new_v4()), name, row.created_at],
                 )?;
                 let id: String = transaction.query_row(
                     "SELECT client_id FROM mcp_named_clients WHERE name = ? AND revoked_at IS NULL",
@@ -2467,12 +2487,13 @@ impl Repositories {
             .await
     }
     /// Inserts an `mcp-client` session unless its pairing link `link_id` was revoked since its
-    /// consume; `false` when the fence wrote nothing (#281).
+    /// consume; `None` when the fence wrote nothing (#281). Otherwise the session's access as
+    /// written, which is read-only for a run of a taken-over named client (#324).
     pub async fn create_fenced_mcp_auth_session(
         &self,
         row: NewAuthSession,
         link_id: String,
-    ) -> Result<bool> {
+    ) -> Result<Option<McpSessionAccess>> {
         self.database
             .call(move |connection| {
                 let transaction =
@@ -2484,9 +2505,10 @@ impl Repositories {
                     |row| row.get(0),
                 )?;
                 if fenced {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 insert_auth_session_on(&transaction, &row, None)?;
+                let mut access = (row.session_id.clone(), row.mcp_access.clone(), None);
                 // The run of a named client (#280) takes its link's identity. Ending an
                 // identity revokes its links, so the fence above refuses a run of an ended one.
                 if table_has_named_clients(&transaction)? {
@@ -2496,10 +2518,27 @@ impl Repositories {
                          WHERE session_id = ?2",
                         params![link_id, row.session_id],
                     )?;
+                    // A run of a taken-over identity starts read-only; Hand back restores the
+                    // level its own link carried (#324).
+                    if let Some(clamped) = transaction
+                        .query_row(
+                            "UPDATE auth_sessions SET mcp_access_hand_back = mcp_access, \
+                             mcp_access = 'read-only' \
+                             WHERE session_id = ?1 AND COALESCE(mcp_access, 'read-only') <> 'read-only' \
+                             AND (SELECT taken_over_at FROM mcp_named_clients \
+                                  WHERE client_id = auth_sessions.mcp_named_client_id) IS NOT NULL \
+                             RETURNING session_id, mcp_access, mcp_access_hand_back",
+                            [&row.session_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?
+                    {
+                        access = clamped;
+                    }
                 }
                 bump_auth_authority_revision_on(&transaction)?;
                 transaction.commit()?;
-                Ok(true)
+                Ok(Some(access))
             })
             .await
     }
@@ -2546,26 +2585,91 @@ impl Repositories {
     }
     /// Sets a live session's MCP access and the level Hand back restores (#139, slice X1);
     /// `false` when the session is gone.
-    pub async fn set_auth_session_mcp_access(
+    /// **Take over** (`access` is `read-only`) or **Hand back** (`access` is the session's
+    /// remembered level) of the live `mcp-client` session `session_id`, in one transaction.
+    /// Take over keeps a remembered level, else remembers the current one unless it is
+    /// read-only. When the session is a run of a live named client (#324), both apply to the
+    /// identity: its flag and every live run of it. Returns each changed session; empty when
+    /// nothing matched, which includes a Hand back to a level the session does not remember.
+    pub async fn set_mcp_session_access(
         &self,
         session_id: String,
         access: String,
-        hand_back: Option<String>,
-    ) -> Result<bool> {
+        at: Timestamp,
+    ) -> Result<Vec<McpSessionAccess>> {
         self.database
             .call(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let updated = transaction.execute(
-                    "UPDATE auth_sessions SET mcp_access = ?, mcp_access_hand_back = ? \
-                     WHERE session_id = ? AND revoked_at IS NULL",
-                    params![access, hand_back, session_id],
-                )? == 1;
-                if updated {
+                let named: Option<String> = if table_has_named_clients(&transaction)? {
+                    transaction
+                        .query_row(
+                            "SELECT s.mcp_named_client_id FROM auth_sessions s \
+                             JOIN mcp_named_clients n ON n.client_id = s.mcp_named_client_id \
+                             WHERE s.session_id = ? AND n.revoked_at IS NULL",
+                            [&session_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                } else {
+                    None
+                };
+                let take_over = access == "read-only";
+                if !take_over {
+                    let remembered: Option<String> = transaction
+                        .query_row(
+                            "SELECT mcp_access_hand_back FROM auth_sessions \
+                             WHERE session_id = ? AND revoked_at IS NULL",
+                            [&session_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    if remembered.as_deref() != Some(access.as_str()) {
+                        return Ok(Vec::new());
+                    }
+                }
+                if let Some(named) = &named {
+                    transaction.execute(
+                        "UPDATE mcp_named_clients SET taken_over_at = ? WHERE client_id = ?",
+                        params![take_over.then_some(&at), named],
+                    )?;
+                }
+                let set = if take_over {
+                    "UPDATE auth_sessions SET mcp_access_hand_back = COALESCE(mcp_access_hand_back, \
+                     CASE WHEN COALESCE(mcp_access, 'read-only') <> 'read-only' THEN mcp_access END), \
+                     mcp_access = 'read-only'"
+                } else {
+                    "UPDATE auth_sessions SET mcp_access = mcp_access_hand_back, \
+                     mcp_access_hand_back = NULL"
+                };
+                let filter = if named.is_some() {
+                    " WHERE mcp_named_client_id = ?1"
+                } else {
+                    " WHERE session_id = ?1"
+                };
+                let remembering = if take_over {
+                    ""
+                } else {
+                    " AND mcp_access_hand_back IS NOT NULL"
+                };
+                let sql = format!(
+                    "{set}{filter} AND subject = 'mcp-client' AND revoked_at IS NULL{remembering} \
+                     RETURNING session_id, mcp_access, mcp_access_hand_back"
+                );
+                let changed = {
+                    let mut statement = transaction.prepare(&sql)?;
+                    statement
+                        .query_map([named.as_ref().unwrap_or(&session_id)], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<McpSessionAccess>>>()?
+                };
+                if !changed.is_empty() {
                     bump_auth_authority_revision_on(&transaction)?;
                 }
                 transaction.commit()?;
-                Ok(updated)
+                Ok(changed)
             })
             .await
     }
@@ -2601,7 +2705,8 @@ impl Repositories {
     }
     /// A person's revoke of session `session_id`. When it is a run of a named client (#280),
     /// revoked or not, it ends that identity instead, with every run and link of it, in the
-    /// same transaction.
+    /// same transaction. `session_id` may also be a named client's own id, to end an idle
+    /// identity that has no live run (#324).
     pub async fn revoke_auth_session_and_identity(
         &self,
         session_id: String,
@@ -2611,7 +2716,11 @@ impl Repositories {
             .call(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let named: Option<String> = if table_has_named_clients(&transaction)? {
+                let named: Option<String> = if !table_has_named_clients(&transaction)? {
+                    None
+                } else if session_id.starts_with(NAMED_CLIENT_ID_PREFIX) {
+                    Some(session_id.clone())
+                } else {
                     transaction
                         .query_row(
                             "SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = ?",
@@ -2620,8 +2729,6 @@ impl Repositories {
                         )
                         .optional()?
                         .flatten()
-                } else {
-                    None
                 };
                 let mut revoked = RevokedAccess::default();
                 match &named {
@@ -2647,6 +2754,24 @@ impl Repositories {
                 }
                 transaction.commit()?;
                 Ok(revoked)
+            })
+            .await
+    }
+    /// Whether the named client `client_id` exists and a person ended it (#324).
+    pub async fn mcp_named_client_is_revoked(&self, client_id: String) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                if !table_has_named_clients(connection)? {
+                    return Ok(false);
+                }
+                Ok(connection
+                    .query_row(
+                        "SELECT revoked_at IS NOT NULL FROM mcp_named_clients WHERE client_id = ?",
+                        [&client_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false))
             })
             .await
     }
@@ -2789,6 +2914,19 @@ impl Repositories {
                 revoked.sessions.push(session_id);
                 if let Some(identity) = identity && !identities.contains(&identity) {
                     identities.push(identity);
+                }
+            }
+            // Idle identities have no session to revoke but are rows of their own (#324).
+            if table_has_named_clients(&transaction)? {
+                let mut idle = transaction.prepare(
+                    "SELECT client_id FROM mcp_named_clients WHERE revoked_at IS NULL \
+                     AND client_id IS NOT (SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = ?)",
+                )?;
+                for identity in idle.query_map([&current_session_id], |row| row.get::<_, String>(0))? {
+                    let identity = identity?;
+                    if !identities.contains(&identity) {
+                        identities.push(identity);
+                    }
                 }
             }
             for identity in identities {
@@ -3674,6 +3812,19 @@ pub struct McpNamedClient {
     pub id: String,
     pub name: String,
 }
+/// The prefix of every named client id (#280).
+pub const NAMED_CLIENT_ID_PREFIX: &str = "nc_";
+/// A named client that has not been ended, as the authority snapshot carries it (#324).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveMcpNamedClient {
+    pub id: String,
+    pub name: String,
+    pub created_at: Timestamp,
+    /// A person took this identity over: each new run starts read-only until Hand back.
+    pub taken_over: bool,
+}
+/// One session's MCP access after Take over or Hand back: `(session_id, access, hand_back)`.
+pub type McpSessionAccess = (String, Option<String>, Option<String>);
 /// What a person's revoke ended, ids only.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RevokedAccess {
@@ -3715,6 +3866,9 @@ pub struct AuthAuthoritySnapshot {
     /// Remote MCP authorizations waiting for a person (#139, slice R).
     #[serde(skip)]
     pub pending_mcp_authorizations: Vec<McpOAuthAuthorization>,
+    /// Named clients not yet ended, oldest first (#324).
+    #[serde(skip)]
+    pub mcp_named_clients: Vec<LiveMcpNamedClient>,
 }
 /// A dynamically registered public OAuth client of remote MCP (#139, slice R).
 #[derive(Clone, Debug, Eq, PartialEq)]

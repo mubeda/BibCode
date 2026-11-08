@@ -2883,6 +2883,44 @@ async fn a_person_revoking_a_named_clients_row_disables_its_endpoints_and_ends_e
     harness.webhooks.shutdown().await;
 }
 
+/// Revoke on an idle named client's row passes the identity's own id (#324). The identity has
+/// no session, so no `ClientRemoved`: the access event that ending it sends is what wakes the
+/// dispatcher. Its poll is an hour, so a periodic pass cannot be what turns the endpoint off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_an_idle_named_client_disables_its_paired_endpoints() {
+    let harness = Harness::new_timed(Timing {
+        poll: Duration::from_secs(3_600),
+        ..Timing::default()
+    })
+    .await;
+    let secrets = tempfile::tempdir().unwrap();
+    let auth = crate::auth::AuthService::new_with_persistence(
+        &crate::ServerConfig::new(".").with_bind("127.0.0.1", 3773),
+        vec![7_u8; 32],
+        SecretStore::new(secrets.path()).await.unwrap(),
+        harness.repositories.clone(),
+    )
+    .await
+    .unwrap();
+    harness.webhooks.wake_on(auth.subscribe_access());
+    seed_named_runs(&harness, &["run-1"]).await;
+    let named = paired_endpoint(&harness, "Named", "run-1").await;
+    relay_exits(&harness, "run-1").await;
+    assert_eq!(
+        endpoint_state(&harness, &named["id"]).await["enabled"],
+        true,
+        "a relay exit leaves it on"
+    );
+
+    assert!(auth.revoke_client("person", "nc_builder").await.unwrap());
+
+    eventually("the named endpoint to turn off", async || {
+        endpoint_state(&harness, &named["id"]).await["disabledReason"] == "client-revoked"
+    })
+    .await;
+    harness.webhooks.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_endpoint_paired_with_an_unnamed_relay_turns_off_when_it_exits() {
     let harness = Harness::new().await;

@@ -296,11 +296,25 @@ export const AuthPendingMcpAuthorization = Schema.Struct({
 });
 export type AuthPendingMcpAuthorization = typeof AuthPendingMcpAuthorization.Type;
 
+/**
+ * A named MCP client not yet ended (`bibcode mcp --client`, #324). One with no live session in
+ * `clientSessions` is idle: Settings lists it so a person can revoke it. `name` is the agent's
+ * text.
+ */
+export const AuthMcpNamedClient = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  name: Schema.String,
+  createdAt: Schema.DateTimeUtc,
+});
+export type AuthMcpNamedClient = typeof AuthMcpNamedClient.Type;
+
 export const AuthAccessSnapshot = Schema.Struct({
   pairingLinks: Schema.Array(AuthPairingLink),
   clientSessions: Schema.Array(AuthClientSession),
   /** Remote MCP requests to connect (slice R). Absent from servers that predate them. */
   pendingMcpAuthorizations: Schema.optionalKey(Schema.Array(AuthPendingMcpAuthorization)),
+  /** Named MCP clients not yet ended (#324). Absent from servers that predate them. */
+  mcpNamedClients: Schema.optionalKey(Schema.Array(AuthMcpNamedClient)),
 });
 export type AuthAccessSnapshot = typeof AuthAccessSnapshot.Type;
 
@@ -392,6 +406,7 @@ export const AuthRevokePairingLinkInput = Schema.Struct({
 export type AuthRevokePairingLinkInput = typeof AuthRevokePairingLinkInput.Type;
 
 export const AuthRevokeClientSessionInput = Schema.Struct({
+  /** A session, or a named MCP client's id (`nc_…`) to end that identity with no run live (#324). */
   sessionId: AuthSessionId,
   /**
    * **Stop** an outside agent (#139, slice X1): also interrupt each running turn whose latest
