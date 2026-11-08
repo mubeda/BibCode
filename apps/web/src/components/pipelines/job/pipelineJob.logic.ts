@@ -13,6 +13,7 @@ import {
   type RepositoryPermission,
 } from "../actions/pipelineActions.logic";
 import { buildPipelinesListInput, listSnapshotInput } from "../list/pipelinesList.logic";
+import type { JobLogSource } from "../log/useJobLogController";
 
 /**
  * The job route's `readSnapshot` and `subscribe` input: the project's remembered list
@@ -64,6 +65,47 @@ export function shownJob(
   if (jobDetail === null || detail === null || jobDetail.revision <= detail.revision)
     return fromPipeline;
   return { ...jobDetail.job, permissions: fromPipeline.permissions };
+}
+
+export type JobLogSourceKind = "erased" | "complete" | "live" | "on_host" | "not_started";
+
+/**
+ * Where a job's log comes from, for the job page and the pipeline page's log panel.
+ * GitHub serves a job's log only once it completes; until then its own page has it.
+ * The log is keyed by the job's attempt, which GitHub's job read names: `source` stays
+ * `null` until that read answers, so the log is read once.
+ */
+export function jobLogSource(
+  job: PipelinesJob | null,
+  jobDetail: PipelinesJobDetail | null,
+  isGitlab: boolean,
+): { readonly kind: JobLogSourceKind | null; readonly source: JobLogSource | null } {
+  if (job === null) return { kind: null, source: null };
+  const started = job.startedAt !== null || job.status === "running";
+  const kind: JobLogSourceKind = jobDetail?.erased
+    ? "erased"
+    : job.terminal
+      ? "complete"
+      : isGitlab
+        ? "live"
+        : started
+          ? "on_host"
+          : "not_started";
+  if (kind === "erased")
+    return { kind, source: { _tag: "unavailable", reason: "erased", url: null } };
+  if (kind === "on_host")
+    return { kind, source: { _tag: "unavailable", reason: "live_on_host", url: job.url } };
+  if (kind === "not_started")
+    return { kind, source: { _tag: "unavailable", reason: "not_started", url: null } };
+  if (!isGitlab && jobDetail === null) return { kind, source: null };
+  const attempt = jobDetail?.attempt ?? null;
+  return {
+    kind,
+    source:
+      kind === "live"
+        ? { _tag: "live", jobId: job.id, attempt, started }
+        : { _tag: "complete", jobId: job.id, attempt },
+  };
 }
 
 /** Seconds a finished step took, or `null` while it runs or without both times. */
