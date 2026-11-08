@@ -317,6 +317,18 @@ pub(crate) enum AuthAccessChange {
     },
     /// The pending remote MCP authorizations changed; the list is the new whole.
     PendingMcpAuthorizations,
+    /// The live named MCP clients changed (#324); the list is the new whole.
+    McpNamedClients,
+}
+
+/// A named MCP client not yet ended (#324), so a client can list the idle ones. `name` is
+/// the agent's own, untrusted, text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpNamedClientView {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug)]

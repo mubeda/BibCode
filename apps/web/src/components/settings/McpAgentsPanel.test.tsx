@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
   rows: [] as unknown[],
   active: [] as unknown[],
   clients: [] as unknown[],
+  idle: [] as unknown[],
   canManage: true,
   revoke: vi.fn(async () => {}),
   setAccess: vi.fn(async () => {}),
@@ -22,6 +23,7 @@ vi.mock("~/state/mcpActivity", () => ({
     environmentId: "env-1",
   }),
   usePrimaryMcpClients: () => h.clients,
+  usePrimaryIdleNamedClients: () => h.idle,
   takenOverLevel: (client: { mcpAccessHandBack?: string } | undefined) =>
     client?.mcpAccessHandBack ?? null,
   stopMcpAgent: h.stop,
@@ -76,6 +78,7 @@ afterEach(() => {
   h.rows = [];
   h.active = [];
   h.clients = [];
+  h.idle = [];
   h.canManage = true;
   vi.clearAllMocks();
 });
@@ -139,6 +142,30 @@ describe("McpAgentsPanel", () => {
     expect(button(named, "Revoke").title).toBe(ends);
     expect(button(named, "Stop").title).toBe(ends);
     expect(button(unnamed, "Revoke").title).toBe("");
+  });
+
+  it("lists a named agent with no run live, whose Revoke ends its identity", async () => {
+    h.idle = [{ id: "nc_1", name: "builder", createdAt: "2026-11-07T00:00:00.000Z" }];
+    const container = await render();
+    expect(container.textContent).not.toContain("No agent is authorized");
+    const row = [...container.querySelectorAll("li")].find((entry) =>
+      entry.textContent?.includes("MCP · builder"),
+    )!;
+    expect(row.textContent).toContain("Not running · Keeps its identity across runs");
+    expect(button(row, "Revoke").title).toBe(
+      "Ends this agent's identity. Its paired webhooks turn off, and its next run starts fresh.",
+    );
+    expect(row.textContent).not.toContain("Take over");
+    await act(async () => button(row, "Revoke").click());
+    expect(h.revoke).toHaveBeenCalledWith("nc_1");
+  });
+
+  it("offers no Revoke on an idle named agent without access:write", async () => {
+    h.idle = [{ id: "nc_1", name: "builder", createdAt: "2026-11-07T00:00:00.000Z" }];
+    h.canManage = false;
+    const container = await render();
+    expect(container.textContent).toContain("MCP · builder");
+    expect(container.querySelectorAll("button")).toHaveLength(0);
   });
 
   it("warns that Stop on a revoked named run ends its identity", async () => {
