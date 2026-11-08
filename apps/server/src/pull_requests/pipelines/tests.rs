@@ -72,6 +72,8 @@ pub(super) fn job(id: u64, status: PipelineStatus) -> Job {
         },
         url: None,
         downstream_url: None,
+        scheduling: None,
+        needs: None,
     }
 }
 

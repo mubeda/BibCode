@@ -63,6 +63,15 @@ pub struct GitLabHost {
     /// Lowercased hosts whose GraphQL lacks a newer pipeline field, for the
     /// process lifetime: their pipelines reads use the baseline documents.
     pipelines_baseline: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Pipelines' needs, newest last, at most `NEEDS_CACHE_SIZE`.
+    needs: std::sync::Mutex<
+        std::collections::VecDeque<(
+            pipelines::NeedsKey,
+            std::sync::Arc<pipelines::PipelineNeeds>,
+        )>,
+    >,
+    /// Lowercased hosts whose GraphQL lacks the needs fields.
+    needs_unsupported: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl GitLabHost {
@@ -72,6 +81,8 @@ impl GitLabHost {
             contexts: Default::default(),
             totals: Default::default(),
             pipelines_baseline: Default::default(),
+            needs: Default::default(),
+            needs_unsupported: Default::default(),
         }
     }
 

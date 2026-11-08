@@ -82,6 +82,11 @@ const JobRow = memo(function JobRow({
         </span>
         <span className={NAME_CLASS} title={job.name}>
           {job.name}
+          {job.needs != null && job.needs.length > 0 ? (
+            <span className="block text-xs text-muted-foreground">
+              Needs: {job.needs.join(", ")}
+            </span>
+          ) : null}
         </span>
         {job.durationSeconds !== null ? (
           <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
@@ -220,9 +225,12 @@ const PipelineStage = memo(function PipelineStage({
 export const PipelineStageColumns = memo(function PipelineStageColumns({
   stages,
   mutationsDisabledReason,
+  controls = null,
 }: {
   stages: readonly PipelinesDetailStage[];
   mutationsDisabledReason: string | null;
+  /** More view controls, shown before Wrap stages. */
+  controls?: ReactNode;
 }) {
   const { width, handlers, commitWidth } = useResizableWidth({
     storageKey: STAGE_WIDTH_KEY,
@@ -246,9 +254,16 @@ export const PipelineStageColumns = memo(function PipelineStageColumns({
   );
   return (
     <>
-      {/* Stacked stages (below 720 px) never scroll sideways, so the switch shows only beside them. */}
-      <div className="hidden justify-end @min-[720px]/pipeline:flex">
-        <Toggle size="xs" variant="outline" pressed={wrap} onPressedChange={setWrap}>
+      <div className="flex flex-wrap items-center justify-end gap-2 empty:hidden">
+        {controls}
+        {/* Stacked stages (below 720 px) never scroll sideways, so the switch shows only beside them. */}
+        <Toggle
+          size="xs"
+          variant="outline"
+          pressed={wrap}
+          onPressedChange={setWrap}
+          className="hidden @min-[720px]/pipeline:inline-flex"
+        >
           <WrapTextIcon aria-hidden="true" />
           Wrap stages
         </Toggle>

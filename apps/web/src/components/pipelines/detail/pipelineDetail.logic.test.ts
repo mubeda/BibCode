@@ -1,3 +1,4 @@
+import type { PipelinesDetailStage } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import { DEFAULT_PIPELINES_FILTERS } from "../../../pipelinesStore";
 import { buildPipelinesListInput } from "../list/pipelinesList.logic";
@@ -11,7 +12,9 @@ import {
   pipelineHostUrl,
   pipelineJobAction,
   pipelineJobCount,
+  pipelineNeedsColumns,
   pipelineStageColumns,
+  hasJobDependencies,
 } from "./pipelineDetail.logic";
 
 const SERVER_TOO_OLD = "Update the server to retry and cancel pipelines.";
@@ -190,4 +193,91 @@ describe("pipelineAttemptOptions", () => {
       ],
     });
   });
+});
+
+describe("pipelineNeedsColumns", () => {
+  type Spec = readonly [name: string, scheduling: "dag" | "stage" | null, needs: string[] | null];
+  const stage = (name: string, ...jobs: Spec[]): PipelinesDetailStage => ({
+    name,
+    status: "success",
+    warnings: false,
+    groups: jobs.map(([job, scheduling, needs], index) => ({
+      name: job,
+      size: 1,
+      status: index === 0 && name === "test" ? "failed" : "success",
+      jobs: [
+        { ...pipelineJob, id: job.length * 100 + index, name: job, stage: name, scheduling, needs },
+      ],
+    })),
+  });
+  const layout = (stages: readonly PipelinesDetailStage[]) =>
+    pipelineNeedsColumns(stages).map((column) => [
+      column.name,
+      column.groups.map((group) => group.name),
+    ]);
+
+  it("puts a dag job after what it needs and a needs-free dag job first", () => {
+    expect(
+      layout([
+        stage("build", ["compile", "dag", []], ["docs", "dag", []]),
+        stage("test", ["unit", "dag", ["compile"]], ["e2e", "dag", ["unit", "docs"]]),
+      ]),
+    ).toEqual([
+      ["Layer 1", ["compile", "docs"]],
+      ["Layer 2", ["unit"]],
+      ["Layer 3", ["e2e"]],
+    ]);
+  });
+
+  it("keeps a stage or unknown job after every job of the earlier stages", () => {
+    expect(
+      layout([
+        stage("build", ["compile", "stage", []], ["quick", "dag", []]),
+        stage("test", ["unit", "dag", ["compile"]], ["lint", "stage", []]),
+        stage("deploy", ["ship", null, null]),
+      ]),
+    ).toEqual([
+      ["Layer 1", ["compile", "quick"]],
+      ["Layer 2", ["unit", "lint"]],
+      ["Layer 3", ["ship"]],
+    ]);
+  });
+
+  it("ignores a need that is not shown and breaks a cycle", () => {
+    const columns = layout([stage("test", ["a", "dag", ["b", "elsewhere"]], ["b", "dag", ["a"]])]);
+    expect(columns.flatMap(([, names]) => names).toSorted()).toEqual(["a", "b"]);
+  });
+
+  it("titles each layer with the status that needs attention first", () => {
+    const [first] = pipelineNeedsColumns([stage("test", ["a", "dag", []], ["b", "dag", []])]);
+    expect(first!.status).toBe("failed");
+  });
+});
+
+describe("hasJobDependencies", () => {
+  it("is true only for a needs pipeline whose jobs say how they are scheduled", () => {
+    const known = pipelineDetail({ usesNeeds: true, stages: [stage("test", ["a", "dag", []])] });
+    expect(hasJobDependencies(known)).toBe(true);
+    expect(hasJobDependencies({ ...known, usesNeeds: false })).toBe(false);
+    // An older server or stored row leaves the fields out entirely.
+    expect(hasJobDependencies(pipelineDetail({ usesNeeds: true }))).toBe(false);
+    expect(
+      hasJobDependencies(
+        pipelineDetail({ usesNeeds: true, stages: [stage("test", ["a", null, null])] }),
+      ),
+    ).toBe(false);
+  });
+  function stage(name: string, ...jobs: (readonly [string, "dag" | null, string[] | null])[]) {
+    return {
+      name,
+      status: "success" as const,
+      warnings: false,
+      groups: jobs.map(([job, scheduling, needs]) => ({
+        name: job,
+        size: 1,
+        status: "success" as const,
+        jobs: [{ ...pipelineJob, name: job, scheduling, needs }],
+      })),
+    };
+  }
 });
