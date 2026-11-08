@@ -610,6 +610,82 @@ async fn a_hosted_client_with_an_https_redirect_signs_in_and_refreshes() {
 
 /// A second use of a code revokes the grant it minted; a denied request redirects with
 /// `access_denied`; revoking the client in Authorized clients ends its refresh.
+/// #324: Stop on an idle named client's row posts the identity's id. It ends the identity and
+/// interrupts the turn an exited run left running; a second Stop on the ended identity is
+/// still a stop.
+#[tokio::test]
+async fn stop_by_a_named_clients_id_over_http_interrupts_its_exited_runs_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let server = start_server(root.path(), json!({})).await;
+    let base = format!("http://{}", server.local_addr());
+    let admin = administrator(root.path(), &base).await;
+    let (repositories, database) = repositories(root.path()).await;
+    let link = super::issue_named_mcp_pairing_link(&repositories, "builder", "full-access", &[])
+        .await
+        .unwrap();
+    exchange(&base, &link.credential, None).await;
+    let session_id = link.id.clone();
+    let identity = repositories
+        .get_auth_session(session_id.clone())
+        .await
+        .unwrap()
+        .and_then(|session| session.mcp_named_client)
+        .expect("a named run")
+        .id;
+    let actor = json!({
+        "kind": "mcp-client", "clientId": session_id, "label": "MCP · builder",
+        "namedClientId": identity,
+    })
+    .to_string();
+    database
+        .call(move |connection| {
+            connection.execute_batch(
+                "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t-named', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, 'turn-named', '2026-11-07T00:00:00Z', '2026-11-07T00:00:00Z', NULL, NULL);
+                 INSERT INTO projection_turns (thread_id, turn_id, state, requested_at, checkpoint_files_json, pending_message_id) VALUES ('t-named', 'turn-named', 'running', '2026-11-07T00:00:00Z', '[]', 'm-named');",
+            )?;
+            connection.execute(
+                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, is_streaming, created_at, updated_at, actor_json) VALUES ('m-named', 't-named', 'turn-named', 'user', 'go', 0, '2026-11-07T00:00:00Z', '2026-11-07T00:00:00Z', ?)",
+                [actor],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // The relay exits: its run is revoked, the identity is idle.
+    repositories
+        .revoke_mcp_credential(session_id, super::format_iso(super::now_ms()))
+        .await
+        .unwrap();
+    database.close().await;
+
+    let stop = async || -> Value {
+        let answer = client()
+            .post(format!("{base}/api/auth/clients/revoke"))
+            .bearer_auth(&admin)
+            .json(&json!({ "sessionId": identity, "interruptTurns": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), StatusCode::OK);
+        answer.json().await.unwrap()
+    };
+    let stopped = stop().await;
+    assert_eq!(stopped["revoked"], true, "{stopped}");
+    assert_eq!(
+        stopped["interrupted"].as_u64().unwrap() + stopped["failed"].as_u64().unwrap(),
+        1,
+        "the exited run's turn is found by the identity: {stopped}"
+    );
+    let again = stop().await;
+    assert_eq!(
+        again["revoked"], true,
+        "an ended identity stays stoppable: {again}"
+    );
+
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
 #[tokio::test]
 async fn replayed_codes_denials_and_revocation_end_the_grant() {
     let root = tempfile::tempdir().unwrap();

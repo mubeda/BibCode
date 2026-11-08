@@ -854,14 +854,20 @@ pub(crate) async fn interrupt_turns_of(control: &McpControl, session_id: &str) -
         .database()
         .call(move |connection| {
             use rusqlite::OptionalExtension as _;
-            let named: Option<String> = connection
-                .query_row(
-                    "SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = ?",
-                    [&client_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
+            // Stop on an idle named client's row names the identity itself (#324).
+            let named: Option<String> =
+                if client_id.starts_with(crate::persistence::NAMED_CLIENT_ID_PREFIX) {
+                    Some(client_id.clone())
+                } else {
+                    connection
+                        .query_row(
+                            "SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = ?",
+                            [&client_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten()
+                };
             attributed_running_turns(connection, Some(&client_id), named.as_deref())
         })
         .await;
