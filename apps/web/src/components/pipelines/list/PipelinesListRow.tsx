@@ -180,9 +180,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
         <span className="hidden flex-col gap-0.5 @min-[720px]:flex">
           <span className="flex items-center gap-1.5 text-sm">
             <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
-            <span className="truncate" title={status}>
-              {status}
-            </span>
+            <span className="truncate">{status}</span>
           </span>
           {timing ? (
             <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
@@ -199,7 +197,8 @@ export const PipelinesListRow = memo(function PipelinesListRow({
           <Link
             to="/project/$environmentId/$projectId/pipelines/$pipelineId"
             params={{ ...projectRef, pipelineId: String(row.id) }}
-            title={title}
+            // The overlay covers the status cell, so its full text rides on the row's tooltip.
+            title={`${title}\n${status}`}
             className="underline-offset-2 after:absolute after:inset-0 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
           >
             {title}
