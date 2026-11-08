@@ -55,7 +55,7 @@ workflows do not listen for `merge_group`.
 `main` has no branch protection rule. Repository ruleset 20454382 blocks only
 branch deletion and non-fast-forward pushes; it requires no status checks. If
 required checks are added, require the job names that run on every pull
-request: `Check`, `Test`, `Release Smoke`, the four `Native desktop - Linux
+request: `Secrets`, `Check`, `Test`, `Release Smoke`, the four `Native desktop - Linux
 …`/`Windows …` rows, and `Crash smoke - ubuntu-24.04` and `- windows-2025`.
 Do not require the macOS rows or the seeded upgrade jobs: on pull requests
 without `ci:full` they do not report under their row names (`macos-26` is not
@@ -64,6 +64,12 @@ the merge.
 
 ## Jobs
 
+- **Secrets** runs gitleaks 8.30.1 (`gitleaks/gitleaks-action`, pinned) over the
+  commits a pull request or push adds, with `.gitleaks.toml`. It allowlists
+  `.repos/` and the fixture hash manifests, posts no comments and uploads no
+  artifact. The repository is public; see AGENTS.md, Sensitive Data.
+- **Check** also runs `vp run check:markdown-links` on `README.md` and the living
+  docs (relative links, images and anchors; no network).
 - **Check** runs `vp check` (which fails on any lint warning), workspace
   typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, and Clippy with warnings denied on Ubuntu 24.04.

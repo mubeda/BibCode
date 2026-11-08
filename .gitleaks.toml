@@ -1,0 +1,13 @@
+# Gitleaks configuration for CI (see .github/workflows/ci.yml, job "Secrets").
+# Extends the default rules. Allowlisted paths hold no secrets:
+# - .repos/ is vendored upstream reference code with fake test certificates.
+# - fixture manifests list SHA-256 content hashes that look like API keys.
+# Mark a deliberate fake value in a test with an inline `gitleaks:allow` comment.
+title = "BiBCode gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Vendored reference repositories and generated fixture hash manifests"
+paths = ['''^\.repos/''', '''^packages/contracts/fixtures/.*/manifest\.json$''']
