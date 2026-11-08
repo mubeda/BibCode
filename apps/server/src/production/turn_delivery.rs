@@ -1095,6 +1095,11 @@ async fn fill_available_slots(
         if engine.thread_turns_reserved(&row.thread_id) {
             continue;
         }
+        // A file restore of another chat in this thread's checkout runs; its end wakes delivery.
+        // The checkout admission is the exclusion; this only keeps a waiting task from a slot.
+        if engine.thread_held_for_restore(&row.thread_id) {
+            continue;
+        }
         // The thread's last turn ended and the effects worker has yet to checkpoint it: no turn
         // of the thread (a direct start, Send now, a promoted follow-up, a steer) may edit the
         // checkout first. The capture, or its expiry, wakes delivery. The claim repeats this check.
@@ -1493,6 +1498,8 @@ async fn promote_settled_threads(
         // that cannot start yet.
         if head.held
             || engine.thread_turns_reserved(&head.thread_id)
+            // A file restore of another chat in the thread's checkout runs (#279).
+            || engine.thread_held_for_restore(&head.thread_id)
             // A resumed session still reading the asks its provider kept (#187).
             || engine.promotion_held_for_ask_recovery(&head.thread_id)
             // The effects worker has yet to checkpoint the turn that just ended.
@@ -1682,6 +1689,18 @@ async fn prepare_claim_and_deliver(
         if engine.turns_held_for_checkpoint(&row.thread_id) {
             return Ok(DeliveryTaskOutcome::Finished);
         }
+        // Shared admission to the thread's checkout, held with the reservation: a file restore
+        // there waits for it, and one running finishes before this turn can start (#279). A
+        // restore that holds this thread though it keyed the checkout elsewhere ends with a wake.
+        let admission = tokio::select! {
+            admission = crate::production::orchestration_effects::admit_thread_turn(&engine, &row.thread_id) => admission,
+            () = stop_claiming.cancelled() => {
+                return Err("provider delivery claim cancelled".to_owned());
+            }
+        };
+        let Some(_admission) = admission else {
+            return Ok(DeliveryTaskOutcome::Finished);
+        };
         let claimed = engine
             .repositories()
             .claim_provider_turn(row.command_id, now())

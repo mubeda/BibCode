@@ -140,6 +140,7 @@ fn register_orchestration_rpc_inner(
     let availability = availability
         .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
     let query_availability = availability.clone();
+    let preview_provider = provider.clone();
     let dispatch = engine.clone();
     registry.register_unary_with_context(
         "orchestration.dispatchCommand",
@@ -264,6 +265,16 @@ fn register_orchestration_rpc_inner(
             async move { handle_query(&engine, availability.as_ref(), request, cancellation).await }
         });
     }
+
+    // Runs capture-sized Git reads and asks the supervisor, so it is in `is_long_running`.
+    let preview = (engine.clone(), preview_provider);
+    registry.register_unary(
+        "orchestration.previewCheckpointRevert",
+        move |request, cancellation| {
+            let (engine, provider) = preview.clone();
+            async move { preview_checkpoint_revert(&engine, provider.as_ref(), request, &cancellation).await }
+        },
+    );
 
     // A local database read, like `replayEvents`: not in `is_long_running`.
     let pages = engine.clone();
@@ -3063,6 +3074,43 @@ async fn read_replay(
         events,
         exhausted: true,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewCheckpointRevertInput {
+    thread_id: String,
+    turn_count: i64,
+}
+
+/// `orchestration.previewCheckpointRevert` (#279): what a revert would do in a checkout other
+/// chats may share, read before the dialog. Advisory; the effects worker checks again.
+async fn preview_checkpoint_revert(
+    engine: &OrchestrationEngine,
+    provider: Option<&ProviderRegistration>,
+    request: RpcRequest,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Value, Value> {
+    let input = decode::<PreviewCheckpointRevertInput>(request)?;
+    let probe =
+        provider.map(
+            |provider| crate::production::provider_runtime::SupervisorRevertProbe {
+                supervisor: &provider.provider,
+                settings_root: &provider.settings_root,
+                engine,
+            },
+        );
+    crate::production::orchestration_effects::preview_checkpoint_revert(
+        engine,
+        probe
+            .as_ref()
+            .map(|probe| probe as &dyn crate::production::orchestration_effects::RevertProbe),
+        &input.thread_id,
+        input.turn_count,
+        cancellation,
+    )
+    .await
+    .map_err(|error| orchestration_error("OrchestrationPreviewCheckpointRevertError", error))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(request: RpcRequest) -> Result<T, Value> {
