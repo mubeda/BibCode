@@ -7,6 +7,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 
 use super::{GitLabHost, encoded, parse, project_path};
+use crate::git::ProcessError;
 use crate::pull_requests::{
     backoff,
     error::PullRequestsOperationError,
@@ -632,6 +633,47 @@ fn missing_field(value: &Value) -> bool {
     })
 }
 
+/// `glab` exits nonzero when GraphQL answers with errors. An unknown-field
+/// answer is still an answer (an older GitLab), so its body, or failing that
+/// `glab`'s stderr, is kept for the caller's fallback.
+fn unknown_field_answer(failure: &ProcessFailure) -> Option<Value> {
+    let ProcessError::NonZeroExit { stdout, .. } = &failure.error else {
+        return None;
+    };
+    let (_, body) = backoff::split_response(stdout.as_bytes());
+    let value = serde_json::from_slice::<Value>(body)
+        .ok()
+        .filter(missing_field)
+        .or_else(|| {
+            failure
+                .stderr
+                .contains("doesn't exist")
+                .then(|| json!({"errors": [{"message": failure.stderr}]}))
+        })?;
+    Some(value)
+}
+
+pub(super) type NeedsCache = std::collections::VecDeque<(NeedsKey, std::sync::Arc<PipelineNeeds>)>;
+
+/// A hit moves to the newest end, so eviction drops the least recently used.
+fn needs_cache_hit(
+    cache: &mut NeedsCache,
+    key: &NeedsKey,
+) -> Option<std::sync::Arc<PipelineNeeds>> {
+    let index = cache.iter().position(|(cached, _)| cached == key)?;
+    let entry = cache.remove(index)?;
+    let needs = entry.1.clone();
+    cache.push_back(entry);
+    Some(needs)
+}
+
+fn needs_cache_insert(cache: &mut NeedsCache, key: NeedsKey, needs: std::sync::Arc<PipelineNeeds>) {
+    if cache.len() >= NEEDS_CACHE_SIZE {
+        cache.pop_front();
+    }
+    cache.push_back((key, needs));
+}
+
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -663,7 +705,13 @@ impl GitLabHost {
             .glab_api_raw(scope, "graphql", Some(&input), true, budget, c)
             .await;
         super::trace_gitlab_read(operation, "graphql", started);
-        let output = output.map_err(|failure| read_failure(operation, "glab", &failure))?;
+        let output = match output {
+            Ok(output) => output,
+            Err(failure) => {
+                return unknown_field_answer(&failure)
+                    .ok_or_else(|| read_failure(operation, "glab", &failure));
+            }
+        };
         let (_, body) = backoff::split_response(&output.stdout);
         serde_json::from_slice(body).map_err(|_| invalid(operation))
     }
@@ -719,8 +767,8 @@ impl GitLabHost {
             return Ok(None);
         }
         let key: NeedsKey = (host.clone(), repository, detail.pipeline.id);
-        if let Some((_, needs)) = lock(&self.needs).iter().find(|(cached, _)| *cached == key) {
-            return Ok(Some(needs.clone()));
+        if let Some(needs) = needs_cache_hit(&mut lock(&self.needs), &key) {
+            return Ok(Some(needs));
         }
         let wanted = displayed_job_names(detail);
         let mut needs = PipelineNeeds::new();
@@ -772,11 +820,7 @@ impl GitLabHost {
             tracing::warn!(operation, "GitLab needs read stopped at its page cap");
         }
         let needs = std::sync::Arc::new(needs);
-        let mut cache = lock(&self.needs);
-        if cache.len() >= NEEDS_CACHE_SIZE {
-            cache.pop_front();
-        }
-        cache.push_back((key, needs.clone()));
+        needs_cache_insert(&mut lock(&self.needs), key, needs.clone());
         Ok(Some(needs))
     }
 
@@ -1419,6 +1463,21 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_needs_cache_evicts_the_least_recently_used_pipeline() {
+        let key = |id: u64| ("gitlab.example".to_owned(), "team/repo".to_owned(), id);
+        let mut cache = NeedsCache::new();
+        for id in 0..NEEDS_CACHE_SIZE as u64 {
+            needs_cache_insert(&mut cache, key(id), Default::default());
+        }
+        // Reading pipeline 0 keeps it; the next insert drops pipeline 1 instead.
+        assert!(needs_cache_hit(&mut cache, &key(0)).is_some());
+        needs_cache_insert(&mut cache, key(999), Default::default());
+        assert_eq!(cache.len(), NEEDS_CACHE_SIZE);
+        assert!(needs_cache_hit(&mut cache, &key(0)).is_some());
+        assert!(needs_cache_hit(&mut cache, &key(1)).is_none());
+    }
+
+    #[test]
     fn a_stored_job_without_scheduling_or_needs_still_decodes_and_writes_neither() {
         let mut detail = parse_detail(&detail_fixture(), &test_context(), "pipelines.get").unwrap();
         let job = detail.stages.as_mut().unwrap()[0].groups[0].jobs[0].clone();
@@ -1738,7 +1797,7 @@ cp "$2" q.json
 if grep -q PipelinesGitLabNeeds q.json; then
   echo "needs $(grep -o '"after":[^,}]*' q.json)" >> calls
   if [ -f fail_once ]; then rm fail_once; printf 'HTTP/2 200 OK\r\n\r\nnot json'; exit 0; fi
-  if [ -f missing ]; then printf 'HTTP/2 200 OK\r\n\r\n{"errors":[{"message":"Field schedulingType doesn'"'"'t exist on type CiJob"}]}'; exit 0; fi
+  if [ -f missing ]; then printf 'HTTP/2 200 OK\r\n\r\n{"errors":[{"message":"Field schedulingType doesn'"'"'t exist on type CiJob"}]}'; echo "glab: Field schedulingType doesn't exist on type CiJob" >&2; exit 1; fi
   if grep -q '"after":null' q.json; then page=1; elif grep -q '"after":"p2"' q.json; then page=2; else page=3; fi
   printf 'HTTP/2 200 OK\r\n\r\n'; cat needs$page.json
 else

@@ -243,6 +243,41 @@ describe("pipelineNeedsColumns", () => {
     ]);
   });
 
+  it("splits a parallel group across layers by each job's own needs", () => {
+    const parallel: PipelinesDetailStage = {
+      name: "test",
+      status: "success",
+      warnings: false,
+      groups: [
+        {
+          name: "tests",
+          size: 2,
+          status: "success",
+          jobs: [
+            { ...pipelineJob, id: 1, name: "tests 1/2", scheduling: "dag", needs: ["fast"] },
+            { ...pipelineJob, id: 2, name: "tests 2/2", scheduling: "dag", needs: ["slow"] },
+          ],
+        },
+      ],
+    };
+    const columns = pipelineNeedsColumns([
+      stage("build", ["fast", "dag", []], ["slow", "dag", ["fast"]]),
+      parallel,
+    ]);
+    expect(
+      columns.map((column) => [
+        column.name,
+        column.groups.flatMap((group) => group.jobs.map((job) => job.name)),
+      ]),
+    ).toEqual([
+      ["Layer 1", ["fast"]],
+      ["Layer 2", ["slow", "tests 1/2"]],
+      ["Layer 3", ["tests 2/2"]],
+    ]);
+    // Each part keeps the group's name, with its own size.
+    expect(columns[1]!.groups[1]).toMatchObject({ name: "tests", size: 1 });
+  });
+
   it("ignores a need that is not shown and breaks a cycle", () => {
     const columns = layout([stage("test", ["a", "dag", ["b", "elsewhere"]], ["b", "dag", ["a"]])]);
     expect(columns.flatMap(([, names]) => names).toSorted()).toEqual(["a", "b"]);
