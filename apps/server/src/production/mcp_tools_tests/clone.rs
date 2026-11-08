@@ -1617,10 +1617,10 @@ async fn an_ssh_url_is_cloned_as_written_and_a_rewrite_of_it_is_refused() {
         command
             .args(args)
             .current_dir(&fixture.projects)
-            .env("HOME", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env("HOME", if cfg!(windows) { "nul" } else { "/dev/null" })
             .env(
                 "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
+                if cfg!(windows) { "nul" } else { "/dev/null" },
             )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
