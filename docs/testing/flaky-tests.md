@@ -132,7 +132,8 @@ all-unavailable poll; actual installer qualification remains CI-only.
 A test that waits for a Git checkpoint ref, or for a queue to deliver after one, waits on
 `WAKE_WAIT` (`turn_delivery_queue_tests.rs`), not a few seconds: the capture spawns Git, which a
 loaded host leaves waiting for seconds, and a wait that ends when its condition holds costs nothing
-when it passes. Only a deadline the product owns stays short; the hold-limit test sets its own
+when it passes. A wait for several such events, such as five reverts, bounds each step by
+`WAKE_WAIT`, not the total. Only a deadline the product owns stays short; the hold-limit test sets its own
 limit (15 s) long enough for the capture to finish first and waits it out, because the expiry
 timer cannot be observed. A test must not assert that a queued turn is still promotable while the
 delivery service runs: the service may already have promoted it. The Device tests'
