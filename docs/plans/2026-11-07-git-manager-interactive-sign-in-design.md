@@ -1,7 +1,7 @@
 # Git Manager Sign-In on a Local Desktop
 
-Status: Approved 2026-11-07 (Mauro pre-approval; Codex reviewed revisions 0 and 1,
-advisor reviewed revision 2).
+Status: Approved 2026-11-07 (Mauro pre-approval; Codex reviewed revisions 0–2, advisor
+reviewed).
 
 Issue #325, a follow-up of #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md),
@@ -273,6 +273,14 @@ all of these hold:
    case after stripping a trailing `\r`.
 3. The remote's effective URL in the operation's direction (below) is an `https://` URL.
    Any other scheme, including SSH and `http://`, reports today's authentication error.
+4. The remote has exactly one URL in that direction, counted with
+   `git remote get-url --all <remote>` (fetch) or `git remote get-url --all --push <remote>`
+   (push). `get-url` without `--all` prints only the first, while `git push <remote>`
+   pushes to every push URL
+   ([`builtin/push.c` L435-444](https://github.com/git/git/blob/v2.51.0/builtin/push.c#L435-L444)),
+   so one approval could not cover them all. A remote with several reports today's
+   authentication error followed by "BiBCode offers a sign-in only for a remote with one
+   {fetch | push} URL. Sign in with your own Git."
 
 A remote can forge the line. Band-2 sideband text gets a `remote: ` prefix on every line,
 but Git's band-3 error path adds the prefix only once before the whole payload
@@ -324,9 +332,21 @@ destination this way:
 3. **HTTPS only, enforced by Git.** The probe sets `GIT_ALLOW_PROTOCOL=https`, which Git
    checks against the transport of the final URL
    ([`transport.c` L1114-1131](https://github.com/git/git/blob/v2.51.0/transport.c#L1114-L1131)).
-4. **No redirects.** The probe adds `-c http.followRedirects=false`, so a server at the
-   destination cannot send the request, and the credential prompt, to another host
+4. **No redirects.** The probe adds `-c http.followRedirects=false` and
+   `-c http.<destination>.followRedirects=false`, so a server at the destination cannot
+   send the request, and the credential prompt, to another host
    ([git-config `http.followRedirects`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpfollowRedirects)).
+   Git picks each `http.*` setting by how closely its URL matches
+   ([`http.c` L1305-1321](https://github.com/git/git/blob/v2.51.0/http.c#L1305-L1321)), so a
+   global `http.https://host.followRedirects=true` would beat the generic key. The
+   destination's own key matches with the longest host and path. A config URL with a user
+   name matches only a URL with that user
+   ([`urlmatch.c` L507-515](https://github.com/git/git/blob/v2.51.0/urlmatch.c#L507-L515)),
+   and the destination has none, so nothing matches more closely. On an equal match the
+   later entry replaces the earlier one (`cmp_matches` returns 0 and
+   `urlmatch_config_entry` replaces the stored value,
+   [`urlmatch.c` L544-554 and L598-611](https://github.com/git/git/blob/v2.51.0/urlmatch.c#L544-L611)),
+   and `-c` entries are read after every file, so BiBCode's value wins.
 
 What stays open: the person's global configuration (or a file it includes) could change
 between step 2 and the probe. Whoever can write that file can already set
@@ -367,9 +387,10 @@ the person approved. Steps:
 1. Refuse unless `sign_in_eligible`. The error is `GitSignInUnavailableError`.
 2. Validate `cwd` as `gitManager.runOperation` does (project ownership, workspace
    admission).
-3. Resolve the remote's effective URL again in `cwd`. If it differs from `destination`,
-   refuse with `GitSignInDestinationChangedError` carrying the new one; the panel asks
-   again.
+3. Resolve the remote's effective URLs again in `cwd` with `--all`. If there is more than
+   one, refuse with the several-URLs message above. If the one differs from
+   `destination`, refuse with `GitSignInDestinationChangedError` carrying the new one; the
+   panel asks again.
 4. Take the server's single sign-in slot. If another sign-in is pending, refuse with
    `GitSignInBusyError` ("Another sign-in is open. Finish or cancel it first.").
 5. Create the neutral repository and run the rewrite check
@@ -383,7 +404,8 @@ the person approved. Steps:
      not exist authenticates and changes nothing. It needs no local commits, so it works in
      the empty repository. `--no-verify` keeps hooks out.
      It runs with `git_environment()` minus its `GCM_INTERACTIVE` entry, plus
-     `GIT_ALLOW_PROTOCOL=https` and `http.followRedirects=false`, the
+     `GIT_ALLOW_PROTOCOL=https`, `http.followRedirects=false` and
+     `http.<destination>.followRedirects=false`, the
      `for_network_transfer()` configuration, and a 10-minute timeout instead of 24 hours.
 7. Answer `signedIn` when the command authenticated: exit 0, or a push that failed only
    because the probe branch does not exist on the remote. Answer `failed` with the
@@ -425,9 +447,9 @@ itself:
   `create_pr` as `create_pr` (push, then pull request).
 
 Every resume request carries `expectedDestination`, the approved destination. Right before
-its network step, the operation resolves the remote's effective URL in its direction, under
-the project lock and status guard it already holds, and fails with
-`destination-changed` if it differs. The field can only add a refusal, so any caller may
+its network step, the operation resolves the remote's effective URLs in its direction
+with `--all`, under the project lock and status guard it already holds, and fails with
+`destination-changed` unless there is exactly one and it equals the approved one. The field can only add a refusal, so any caller may
 send it. The resumed call is an ordinary non-interactive call, so a configuration change
 racing that check can only send a non-interactive request elsewhere, as any operation
 can today; it can never open a prompt.
@@ -592,7 +614,8 @@ Rust, `apps/server`:
    and its destination is the frozen effective URL, never text from stderr.
 4. `git.signIn` environment: no `GCM_INTERACTIVE`, and `GIT_TERMINAL_PROMPT=0`,
    `GIT_ASKPASS=`, `SSH_ASKPASS=`, `SSH_ASKPASS_REQUIRE=never`, `GIT_ALLOW_PROTOCOL=https`,
-   `http.followRedirects=false`; the working directory is the neutral repository; the
+   `http.followRedirects=false` and `http.<destination>.followRedirects=false`; the
+   working directory is the neutral repository; the
    arguments are `ls-remote <destination> HEAD` or
    `push --dry-run --no-verify --porcelain <destination> :refs/heads/bibcode-sign-in-<uuid>`,
    never the remote name. The neutral repository is removed after every outcome.
@@ -601,7 +624,13 @@ Rust, `apps/server`:
    since the approval; a second concurrent sign-in; a global `insteadOf` or
    `pushInsteadOf` value that prefixes the destination (the A to B, B to C chain), and the
    same value in the checkout's own `.git/config`, which the neutral repository ignores
-   and so does not refuse.
+   and so does not refuse; a remote with two fetch URLs (fetch direction) or two push
+   URLs (push direction), refused before any network spawn, while detection on such a
+   remote reports the authentication error with the several-URLs message and no
+   `sign-in-required`.
+   Redirects: with a global `http.https://<host>.followRedirects=true` and a destination
+   that answers with a redirect to another host, the probe does not follow it and makes
+   no request to that host.
 6. `git.signIn` outcomes: exit 0 and a dry-run delete refused because the probe branch does
    not exist answer `signedIn`; an
    authentication failure answers `failed`; a runner that never exits answers `timedOut`
@@ -709,6 +738,13 @@ against Git's source at v2.51.0 and BiBCode at `c079af0048`.
 | P2 5 | Passing the URL to `git.signIn` does not pin the destination: Git rewrites an explicit URL argument again, so A to B and B to C contacts C and can defeat HTTPS-only. | Confirmed: `remote.c` L799 sends an unknown name through `add_url_alias` (L93-100), which applies `insteadOf` and `pushInsteadOf` once with the longest prefix (L42-66). | **Fixed.** [Freezing the destination](#freezing-the-destination): the probe runs in an empty BiBCode-owned repository, refuses when any `insteadOf` or `pushInsteadOf` value prefixes the destination, sets `GIT_ALLOW_PROTOCOL=https` (`transport.c` L1114-1131) and `http.followRedirects=false`. The remaining window needs write access to the person's global Git configuration, which already allows running any program as `credential.helper`. Tests 4, 5. |
 | P2 6 | Replaying a branch delete cannot finish the remote deletion, because the local branch is already gone.                                                                | Confirmed: `operations.rs:1299-1329` deletes the local branch before the remote step.                                                                                    | **Fixed.** The failure carries `resume: remote-branch-delete` for the failed remote step. Tests 2, 13.                                                                                                                                                                                                                                                                                                                                                             |
 | P2 7 | The automatic rerun is not bound to the approved destination.                                                                                                         | Accepted: revision 1 rebuilt the request without the destination.                                                                                                        | **Fixed.** The panel sends the server-provided `resume` request with `expectedDestination`; the operation re-resolves its effective URL under its lock right before the network step and fails with `destination-changed` on any difference. Test 9.                                                                                                                                                                                                               |
+
+Codex narrow check of revision 2. Two findings, both checked against Git v2.51.0.
+
+| #    | Finding                                                                                      | Checked                                                                                                                                               | Resolution                                                                                                                                                                     |
+| ---- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P2 8 | A URL-specific global `http.<url>.followRedirects=true` beats the generic `-c` key.          | Confirmed: `http.c` L1305-1321 collects `http.*` through `urlmatch_config_entry`, and `cmp_matches` (`urlmatch.c` L544-554) prefers the closer match. | **Fixed.** The probe also sets `http.<destination>.followRedirects=false`; it matches most closely and wins ties as the last entry. Test 5.                                    |
+| P2 9 | `get-url --push` prints only the first push URL, but `git push <remote>` visits all of them. | Confirmed: `builtin/push.c` L435-444 loops over every push URL.                                                                                       | **Fixed.** Detection, `git.signIn` and the resume check count URLs with `--all` and offer or accept a sign-in only for a remote with exactly one URL in the direction. Test 5. |
 
 ## Questions only Mauro can answer
 
