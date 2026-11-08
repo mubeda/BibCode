@@ -3841,7 +3841,31 @@ work, so it is guarded (#279).
   (Cursor, Grok, or Chat Activity off), an OpenCode instance with a
   `serverUrl`, live or suspended, because BiBCode cannot prove an external
   server quiet, and a suspended session whose provider instance no longer
-  resolves (it may have named such a server).
+  resolves (it may have named such a server). The refusal names the
+  `exclusiveServer` setting below.
+- **Marked external OpenCode servers (#326).** An OpenCode instance with a
+  `serverUrl` and `exclusiveServer` on ("Only BiBCode uses this server") is
+  judged as a managed sibling: its live session must be idle and is suspended.
+  The person's statement that nothing else starts work on that server is the
+  guarantee. BiBCode then probes the server (`provider/opencode/quiet.rs`),
+  which is best-effort detection: `GET /api/info` (OpenCode 1 refuses), the
+  event stream opened before any read, the sibling's session tree from its
+  persisted resume cursor, `/api/session/active`, the tree's background jobs,
+  each tree session's inbox, forms, `time.busy` after `time.idle` and active
+  schedules (the schedules-disabled `ForbiddenError` counts as none), and the
+  checkout location's running shells and PTYs. Anything it cannot read refuses.
+  One 10 s budget covers every probe of one restore. The probe returns a fence
+  that rides with the plan and closes when the revert ends, on success and on
+  every refusal. The fence trips on a start event (`session.execution.started`,
+  `inbox.enqueued`, `synthetic`, `shell.started`, `revert.staged`) for a tree
+  session, or for any session located in the checkout or with no location,
+  except the reverting thread's own `session.revert.*` on the same server. A
+  second `server.connected`, a stream that ends, 20 s without a byte, or a
+  changed server `pid` also trip it. Step 7 checks the fence instead of probing
+  again; a trip refuses with nothing changed. A trip after the provider rewind
+  skips the Git restore and ends through the unrestored completion; a trip
+  during the restore adds a `checkpoint.revert.sibling-started` warning. The
+  preview leaves a marked sibling out of `writingSiblings`.
 - **Quiet siblings.** Under the gate the restore marks every sibling, then the
   supervisor suspends each live, idle sibling session through the idle
   suspension path. `launch_session`, where every provider driver is created,
@@ -3851,7 +3875,8 @@ work, so it is guarded (#279).
   admission either registers before the marks and the restore refuses, or comes
   after and is refused. The restoring thread's own reopen is not held.
 - **Checked again.** On the worker, immediately before the irreversible rewind,
-  the restore repeats the sibling checks and recomputes the checkout's current
+  the restore repeats the sibling checks (a fenced sibling's fence is checked,
+  not probed again) and recomputes the checkout's current
   tree; a change refuses it ("Files in this checkout changed after you
   confirmed").
 - **Turn 0.** The `HEAD` fallback for a missing ref 0 is refused when siblings

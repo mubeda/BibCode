@@ -32,6 +32,7 @@ use crate::{
         ThreadTurnReservation, ThreadTurnStartBootstrapPrepareWorktree,
     },
     persistence::{OrchestrationEvent, PersistenceError},
+    provider::opencode::quiet::QuietFence,
 };
 
 pub use super::host_paths::process_compatible_path;
@@ -153,11 +154,18 @@ pub enum WritingReason {
     CheckpointPending,
     /// BiBCode can't see its work: Cursor, Grok, or Chat Activity off.
     Unobservable,
-    /// It runs on an OpenCode server BiBCode doesn't manage.
+    /// It runs on an OpenCode server BiBCode doesn't manage, not marked "Only BiBCode uses this
+    /// server".
     UnmanagedServer,
     StartingSession,
     /// Its folder's Git checkout could not be resolved.
     UnresolvableCheckout,
+    /// Its marked external server speaks OpenCode 1, which cannot report its work (#326).
+    OpenCode1Server,
+    /// Its marked external OpenCode server shows work running, pending or scheduled (#326).
+    ServerWorking,
+    /// Its marked external OpenCode server could not be read in time (#326).
+    ServerUnreadable,
 }
 
 impl WritingReason {
@@ -180,13 +188,22 @@ impl WritingReason {
                 "BiBCode can't tell whether {title} is still working. Stop its session, then revert, or rewind only the conversation."
             ),
             Self::UnmanagedServer => format!(
-                "{title} runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead."
+                "\"{title}\" uses an OpenCode server that other apps may also use, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead. If only BiBCode uses that server, turn on \"Only BiBCode uses this server\" in Settings → Providers → OpenCode."
             ),
             Self::StartingSession => {
                 "Another chat in this checkout is starting its session. Try the revert again in a moment.".to_owned()
             }
             Self::UnresolvableCheckout => format!(
                 "BiBCode can't tell whether {title} works in this checkout. Try the revert again, or check that chat's folder."
+            ),
+            Self::OpenCode1Server => format!(
+                "The OpenCode 1 server that \"{title}\" uses can't report whether it's idle. Rewind only the conversation instead."
+            ),
+            Self::ServerWorking => format!(
+                "The OpenCode server that \"{title}\" uses is still working in this checkout. Try the revert again when it finishes."
+            ),
+            Self::ServerUnreadable => format!(
+                "BiBCode can't read whether the OpenCode server that \"{title}\" uses is idle. Rewind only the conversation instead."
             ),
         }
     }
@@ -238,12 +255,15 @@ pub trait RevertProbe: Send + Sync {
         thread_id: &'a str,
     ) -> BoxEffectFuture<'a, Option<WritingReason>>;
 
-    /// Makes the thread quiet for a restore: suspends its live, idle session. `Some` names why
-    /// it cannot be made quiet, and nothing is suspended then.
+    /// Makes the thread quiet for a restore: suspends its live, idle session. `Err` names why it
+    /// cannot be made quiet. A sibling on an external OpenCode 2 server marked "Only BiBCode uses
+    /// this server" is then probed, and its fence returned to watch the server through the
+    /// restore (#326).
     fn quiet_sibling<'a>(
         &'a self,
         thread_id: &'a str,
-    ) -> BoxEffectFuture<'a, Option<WritingReason>>;
+        restore: &'a QuietRestore<'a>,
+    ) -> BoxEffectFuture<'a, Result<Option<QuietFence>, WritingReason>>;
 
     /// Whether the thread's provider can rewind its conversation and keep the files. Answered
     /// from the live session once `prepare_provider_rewind` reopened it.
@@ -251,6 +271,15 @@ pub trait RevertProbe: Send + Sync {
         &'a self,
         thread_id: &'a str,
     ) -> BoxEffectFuture<'a, ConversationRewind>;
+}
+
+/// The file restore a sibling is made quiet for (#326).
+pub struct QuietRestore<'a> {
+    pub reverting_thread_id: &'a str,
+    /// The checkout the restore writes.
+    pub checkout: &'a Path,
+    /// Ends every external-server probe of this restore, across siblings.
+    pub deadline: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2337,22 +2366,23 @@ async fn checkout_siblings(
     Ok(scan)
 }
 
-/// Whether the sibling writes in the checkout now. With `quiet`, a live idle session of its is
-/// suspended, so only a message (which delivery holds) can start it again.
+/// Whether the sibling writes in the checkout now (`Err`). With `quiet`, a live idle session of
+/// its is suspended, so only a message (which delivery holds) can start it again, and a sibling
+/// on a marked external OpenCode server answers with its fence (#326).
 async fn sibling_writing(
     engine: &OrchestrationEngine,
     probe: Option<&dyn RevertProbe>,
     thread_id: &str,
-    quiet: bool,
-) -> Result<Option<WritingReason>, OrchestrationEffectsError> {
+    quiet: Option<&QuietRestore<'_>>,
+) -> Result<Result<Option<QuietFence>, WritingReason>, OrchestrationEffectsError> {
     if engine.thread_session_launching(thread_id) {
-        return Ok(Some(WritingReason::StartingSession));
+        return Ok(Err(WritingReason::StartingSession));
     }
     if engine.thread_turn_admitted(thread_id) {
-        return Ok(Some(WritingReason::StartingTurn));
+        return Ok(Err(WritingReason::StartingTurn));
     }
     if engine.turns_held_for_checkpoint(thread_id) {
-        return Ok(Some(WritingReason::CheckpointPending));
+        return Ok(Err(WritingReason::CheckpointPending));
     }
     if engine
         .repositories()
@@ -2360,41 +2390,83 @@ async fn sibling_writing(
         .await?
         .is_some_and(|session| super::provider_runtime::session_holds_a_turn(&session))
     {
-        return Ok(Some(WritingReason::Turn));
+        return Ok(Err(WritingReason::Turn));
     }
     let Some(probe) = probe else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
-    if quiet {
-        probe.quiet_sibling(thread_id).await
-    } else {
-        probe.thread_writes_checkout(thread_id).await
+    match quiet {
+        Some(restore) => probe.quiet_sibling(thread_id, restore).await,
+        None => probe
+            .thread_writes_checkout(thread_id)
+            .await
+            .map(|reason| reason.map_or(Ok(None), Err)),
     }
     .map_err(OrchestrationEffectsError::Effect)
 }
 
-/// Refuses the restore while a sibling writes; with `quiet`, makes every sibling quiet.
+/// A sibling's open quiet fence on its external OpenCode server (#326).
+struct SiblingFence {
+    thread_id: String,
+    title: String,
+    fence: QuietFence,
+}
+
+/// The first tripped fence's sibling title and trip reason.
+async fn tripped_fence(fences: &[SiblingFence]) -> Option<(&str, String)> {
+    for fence in fences {
+        if let Err(reason) = fence.fence.check().await {
+            return Some((&fence.title, reason));
+        }
+    }
+    None
+}
+
+/// Refuses the restore while a sibling writes; with `quiet`, makes every sibling quiet and
+/// returns the fences of the siblings on marked external servers. A sibling already `fenced`
+/// is not probed again: its fence is checked.
 async fn refuse_writing_siblings(
     engine: &OrchestrationEngine,
     probe: Option<&dyn RevertProbe>,
     thread_id: &str,
     siblings: &[Sibling],
-    quiet: bool,
-) -> Result<(), OrchestrationEffectsError> {
+    quiet: Option<&QuietRestore<'_>>,
+    fenced: &[SiblingFence],
+) -> Result<Vec<SiblingFence>, OrchestrationEffectsError> {
+    let mut fences = Vec::new();
     for sibling in siblings {
-        if let Some(reason) = sibling_writing(engine, probe, &sibling.thread_id, quiet).await? {
-            tracing::warn!(
-                thread_id,
-                sibling_thread_id = %sibling.thread_id,
-                ?reason,
-                "a file restore was refused: another chat in its checkout is writing"
-            );
-            return Err(OrchestrationEffectsError::Effect(
-                reason.detail(&sibling.title),
-            ));
+        let fence = fenced
+            .iter()
+            .find(|fence| fence.thread_id == sibling.thread_id);
+        let probe = if fence.is_some() { None } else { probe };
+        let mut answer = sibling_writing(engine, probe, &sibling.thread_id, quiet).await?;
+        if let (Ok(_), Some(fence)) = (&answer, fence)
+            && let Err(trip) = fence.fence.check().await
+        {
+            tracing::warn!(thread_id, sibling_thread_id = %sibling.thread_id, %trip, "a file restore was refused: another chat's external OpenCode server started working");
+            answer = Err(WritingReason::ServerWorking);
+        }
+        match answer {
+            Ok(Some(fence)) => fences.push(SiblingFence {
+                thread_id: sibling.thread_id.clone(),
+                title: sibling.title.clone(),
+                fence,
+            }),
+            Ok(None) => {}
+            Err(reason) => {
+                tracing::warn!(
+                    thread_id,
+                    sibling_thread_id = %sibling.thread_id,
+                    ?reason,
+                    "a file restore was refused: another chat in its checkout is writing"
+                );
+                return Err(OrchestrationEffectsError::Effect(
+                    reason.detail(&sibling.title),
+                ));
+            }
         }
     }
-    Ok(())
+    Ok(fences)
 }
 
 /// What a file restore of a shared checkout changes, and what other chats changed (#279).
@@ -2673,6 +2745,9 @@ struct SharedRestore {
     current_tree: String,
     tree_start: Option<String>,
     event_ids: Vec<String>,
+    /// The fences of siblings on marked external OpenCode servers (#326), open until the revert
+    /// ends: they close when the plan drops, on success and on every refusal.
+    fences: Vec<SiblingFence>,
 }
 
 /// Step 5 of the guard, under the checkout gate: the siblings, their quiet, the `HEAD`
@@ -2744,6 +2819,7 @@ async fn plan_shared_restore(
                         current_tree: changes.current_tree,
                         tree_start: changes.tree_start,
                         event_ids: changes.event_ids,
+                        fences: Vec::new(),
                     }),
                 ));
             }
@@ -2767,7 +2843,14 @@ async fn plan_shared_restore(
     if let Err(conflict) = restore.hold_threads(&held) {
         return Err(hold_conflict(thread_id, &scan, conflict));
     }
-    refuse_writing_siblings(engine, probe, thread_id, &scan.siblings, true).await?;
+    let quiet = QuietRestore {
+        reverting_thread_id: thread_id,
+        checkout: cwd,
+        deadline: tokio::time::Instant::now() + crate::provider::opencode::quiet::PROBE_BUDGET,
+    };
+    let fences =
+        refuse_writing_siblings(engine, probe, thread_id, &scan.siblings, Some(&quiet), &[])
+            .await?;
     let changes = sibling_changes(
         engine,
         cwd,
@@ -2788,6 +2871,7 @@ async fn plan_shared_restore(
             current_tree: changes.current_tree,
             tree_start: changes.tree_start,
             event_ids: changes.event_ids,
+            fences,
         }),
     ))
 }
@@ -2853,10 +2937,24 @@ async fn recheck_shared_restore(
     probe: Option<&dyn RevertProbe>,
     thread_id: &str,
     cwd: &Path,
-    shared: &SharedRestore,
+    shared: &mut SharedRestore,
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
-    refuse_writing_siblings(engine, probe, thread_id, &shared.siblings, true).await?;
+    let quiet = QuietRestore {
+        reverting_thread_id: thread_id,
+        checkout: cwd,
+        deadline: tokio::time::Instant::now() + crate::provider::opencode::quiet::PROBE_BUDGET,
+    };
+    let fences = refuse_writing_siblings(
+        engine,
+        probe,
+        thread_id,
+        &shared.siblings,
+        Some(&quiet),
+        &shared.fences,
+    )
+    .await?;
+    shared.fences.extend(fences);
     let tree = current_tree(
         cwd,
         Path::new("git"),
@@ -2879,6 +2977,14 @@ async fn recheck_shared_restore(
                 &shared.event_ids,
             ),
         });
+    }
+    // The last look before the irreversible rewind: a fence can trip while the checks above
+    // await.
+    if let Some((title, trip)) = tripped_fence(&shared.fences).await {
+        tracing::warn!(thread_id, %trip, "a file restore was refused: another chat's external OpenCode server started working");
+        return Err(OrchestrationEffectsError::Effect(
+            WritingReason::ServerWorking.detail(title),
+        ));
     }
     Ok(())
 }
@@ -2952,7 +3058,7 @@ pub(crate) async fn preview_checkpoint_revert(
         writing.push(json!({"threadId": sibling.thread_id, "title": sibling.title, "reason": WritingReason::UnresolvableCheckout}));
     }
     for sibling in &scan.siblings {
-        if let Some(reason) = sibling_writing(engine, probe, &sibling.thread_id, false).await? {
+        if let Err(reason) = sibling_writing(engine, probe, &sibling.thread_id, None).await? {
             writing.push(
                 json!({"threadId": sibling.thread_id, "title": sibling.title, "reason": reason}),
             );
@@ -3208,7 +3314,7 @@ async fn finish_revert(
         request,
         conversation_only,
         fallback_to_head,
-        shared,
+        mut shared,
     } = plan;
     let thread_id = thread_id.as_str();
     let missing_checkpoint = || missing_checkpoint(turn_count);
@@ -3226,7 +3332,7 @@ async fn finish_revert(
         )
         .await;
     }
-    if let Some(shared) = &shared {
+    if let Some(shared) = &mut shared {
         let probe = callbacks.revert_probe();
         recheck_shared_restore(
             engine,
@@ -3238,6 +3344,7 @@ async fn finish_revert(
         )
         .await?;
     }
+    let fences = shared.as_ref().map_or(&[][..], |shared| &shared.fences[..]);
     if rolled_back_turns > 0
         && let ProviderRewind::FilesOnly { provider_label } = callbacks
             .rollback_provider(thread_id, rolled_back_turns, &rewind_key)
@@ -3246,6 +3353,9 @@ async fn finish_revert(
     {
         // The provider keeps its conversation, so the thread keeps its messages, checkpoints and
         // turn count too. Only the files go back, and the work log says so.
+        if let Some(detail) = sibling_started_before_restore(thread_id, fences).await {
+            return Err(OrchestrationEffectsError::Effect(detail));
+        }
         if !restore_checkpoint(
             &cwd,
             Path::new("git"),
@@ -3261,6 +3371,14 @@ async fn finish_revert(
             .refresh_workspace(&cwd)
             .await
             .map_err(OrchestrationEffectsError::Effect)?;
+        report_sibling_started_during_restore(
+            engine,
+            thread_id,
+            turn_count,
+            fences,
+            request.as_deref(),
+        )
+        .await;
         let created_at = now_iso();
         return engine
             .dispatch(OrchestrationCommand::ThreadActivityAppend {
@@ -3296,18 +3414,24 @@ async fn finish_revert(
     } else {
         cancellation
     };
-    let restored = match restore_checkpoint(
-        &cwd,
-        Path::new("git"),
-        &target_ref,
-        fallback_to_head,
-        cancellation,
-    )
-    .await
-    {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(missing_checkpoint()),
-        Err(error) => Err(error),
+    // A sibling's server that started working skips the restore, which would overwrite its work;
+    // a rewound revert is still recorded, unrestored.
+    let started = sibling_started_before_restore(thread_id, fences).await;
+    let restored = match &started {
+        Some(detail) => Err(OrchestrationEffectsError::Effect(detail.clone())),
+        None => match restore_checkpoint(
+            &cwd,
+            Path::new("git"),
+            &target_ref,
+            fallback_to_head,
+            cancellation,
+        )
+        .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(missing_checkpoint()),
+            Err(error) => Err(error),
+        },
     };
     if restored.is_ok() {
         callbacks
@@ -3357,11 +3481,76 @@ async fn finish_revert(
         })
         .await
         .map_err(|error| OrchestrationEffectsError::Effect(error.to_string()))?;
+    if restored.is_ok() {
+        report_sibling_started_during_restore(
+            engine,
+            thread_id,
+            turn_count,
+            fences,
+            request.as_deref(),
+        )
+        .await;
+    }
     restored.map_err(|error| {
+        let cause = started.unwrap_or_else(|| error.to_string());
         OrchestrationEffectsError::Effect(format!(
-            "The conversation was rewound, but the files could not be restored: {error}"
+            "The conversation was rewound, but the files could not be restored: {cause}"
         ))
     })
+}
+
+/// The refusal when a sibling's external OpenCode server started working before the Git
+/// restore (#326).
+async fn sibling_started_before_restore(
+    thread_id: &str,
+    fences: &[SiblingFence],
+) -> Option<String> {
+    let (title, trip) = tripped_fence(fences).await?;
+    tracing::warn!(thread_id, %trip, "a file restore was skipped: another chat's external OpenCode server started working");
+    Some(format!(
+        "The OpenCode server that \"{title}\" uses started working. Revert again when it finishes."
+    ))
+}
+
+/// After a restore, reports a sibling's external OpenCode server that started working while Git
+/// ran (#326). The restore stands.
+async fn report_sibling_started_during_restore(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    turn_count: i64,
+    fences: &[SiblingFence],
+    request: Option<&str>,
+) {
+    let Some((title, trip)) = tripped_fence(fences).await else {
+        return;
+    };
+    tracing::warn!(thread_id, %trip, "another chat's external OpenCode server started working during a file restore");
+    let created_at = now_iso();
+    if let Err(error) = engine
+        .dispatch(OrchestrationCommand::ThreadActivityAppend {
+            command_id: outcome_id("checkpoint-revert-sibling-started", request),
+            thread_id: thread_id.to_owned(),
+            activity: ActivityInput {
+                id: Uuid::new_v4().to_string(),
+                tone: "warning".to_owned(),
+                kind: "checkpoint.revert.sibling-started".to_owned(),
+                summary: "Another chat started working during the restore".to_owned(),
+                payload: json!({
+                    "turnCount": turn_count,
+                    "detail": format!(
+                        "Files were restored, but the OpenCode server that \"{title}\" uses started working during the restore. Check that chat's changes."
+                    ),
+                }),
+                turn_id: None,
+                sequence: None,
+                created_at: created_at.clone(),
+            },
+            created_at,
+        })
+        .await
+    {
+        tracing::warn!(thread_id, %error, "the warning that another chat started working during a file restore was not recorded");
+    }
 }
 
 /// Rewinds only the conversation (#279): the provider drops the newer turns, the thread drops

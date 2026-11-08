@@ -228,6 +228,12 @@ the server's global request projection.
 
 See [Checkpoint revert](./rpc-and-orchestration.md#checkpoint-revert).
 
+An OpenCode instance with a Server URL also has "Only BiBCode uses this server"
+(`exclusiveServer`, default off, read from the instance's `config`). It changes
+nothing about sessions: it only lets another chat's file restore in a shared
+checkout proceed once a probe of that OpenCode 2 server shows it quiet. See
+[Shared checkouts](./rpc-and-orchestration.md#shared-checkouts).
+
 The OpenCode driver speaks two wires. OpenCode 1.x serves the V1 server API;
 OpenCode 2 replaced it with `/api/*` routes and answers V1 GET paths with its
 web UI as HTTP 200, so the adapter identifies the API before use

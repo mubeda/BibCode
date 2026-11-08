@@ -84,7 +84,7 @@ function writingReasonLine(title: string, reason: CheckpointRevertWritingReason)
     case "unobservable":
       return `BiBCode can't tell whether ${title} is still working. Stop its session, then revert.`;
     case "unmanagedServer":
-      return `${title} runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout.`;
+      return `"${title}" uses an OpenCode server that other apps may also use, so BiBCode can't make sure it has stopped working in this checkout.`;
     case "startingSession":
       return `${title} is starting its session. Try the revert again in a moment.`;
     case "unresolvableCheckout":
