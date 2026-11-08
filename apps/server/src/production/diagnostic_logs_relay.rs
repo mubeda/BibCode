@@ -1318,7 +1318,9 @@ mod tests {
             .await
             .expect("first");
         assert!(matches!(
-            relay.start(RelayRequest::for_test("Workstation", false)).await,
+            relay
+                .start(RelayRequest::for_test("Workstation", false))
+                .await,
             Err(EndReason::Busy)
         ));
     }

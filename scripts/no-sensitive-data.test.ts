@@ -21,6 +21,8 @@ const BANNED_HASHES: ReadonlySet<string> = new Set([
   "d741ae075d1c842bc61c2dd281cb880a1f04074bfb373ad8bc7b737383965d03",
   "3a29c3568756ecd1ab63f2e56d8158f300d9bf19bc11b6cbae8ff3cb74bd5416",
   "e4d23a0e5044537a137a57d7727b721c993e893e357068bf23bbbff0cfe4992e",
+  "19e37c4dfe9a2e1570be1f4cbafca76f3ed757231c0865e02465c909d916b1d1",
+  "970ec274ca867815174ebe4eff19282000f9495a6c7254e94991d1fb4dc3df30",
 ]);
 
 const SKIPPED_NAMES = new Set(["pnpm-lock.yaml", "Cargo.lock", "package-lock.json", "yarn.lock"]);
