@@ -1231,6 +1231,7 @@ impl ParkedThreads {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
@@ -2332,12 +2333,12 @@ async fn sibling_writing(
     let Some(probe) = probe else {
         return Ok(None);
     };
-    Ok(if quiet {
+    if quiet {
         probe.quiet_sibling(thread_id).await
     } else {
         probe.thread_writes_checkout(thread_id).await
     }
-    .map_err(OrchestrationEffectsError::Effect)?)
+    .map_err(OrchestrationEffectsError::Effect)
 }
 
 /// Refuses the restore while a sibling writes; with `quiet`, makes every sibling quiet.
