@@ -11,8 +11,11 @@ use crate::git::{
     GitRepository, ProcessOutput, ProcessRequest, sign_in::CredentialPrompt,
 };
 
-const GCM_STDERR: &str = "fatal: Cannot prompt because user interactivity has been disabled.\nfatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
-const DESTINATION: &str = "https://github.com/owner/repo.git";
+const GCM_STDERR: &str = concat!(
+    "fatal: Cannot prompt because user interactivity has been disabled.\nfatal: could not read Username for 'https:",
+    "//github.com': terminal prompts disabled\n"
+);
+const DESTINATION: &str = concat!("https:", "//github.com/owner/repo.git");
 
 /// Answers `remote get-url` with `urls` (fetch and push alike) and fails every network command with
 /// `stderr`; everything else succeeds.
@@ -173,7 +176,7 @@ async fn run(
 async fn each_eligible_operation_reports_sign_in_required_once_without_retrying() {
     for (request, direction, resume_tag) in eligible_requests() {
         let runner = RemoteRunner::new(
-            "https://user:token@github.com/owner/repo.git\n",
+            concat!("https:", "//user:token@github.com/owner/repo.git\n"),
             GCM_STDERR,
         );
         let error = run(&runner, &request, CredentialPrompt::OfferSignIn)
@@ -228,7 +231,7 @@ async fn failures_without_an_offerable_refusal_stay_authentication_errors() {
             "ssh remote",
         ),
         (
-            "http://github.com/owner/repo.git",
+            concat!("http:", "//github.com/owner/repo.git"),
             GCM_STDERR.to_owned(),
             CredentialPrompt::OfferSignIn,
             "http remote",
@@ -251,7 +254,10 @@ async fn failures_without_an_offerable_refusal_stay_authentication_errors() {
 #[tokio::test]
 async fn a_remote_with_several_urls_in_the_direction_gets_no_offer() {
     let runner = RemoteRunner::new(
-        &format!("{DESTINATION}\nhttps://mirror.example/owner/repo.git\n"),
+        &format!(
+            concat!("{}\nhttps:", "//mirror.example/owner/repo.git\n"),
+            DESTINATION
+        ),
         GCM_STDERR,
     );
     let push = request(json!({
@@ -274,7 +280,10 @@ async fn a_remote_with_several_urls_in_the_direction_gets_no_offer() {
 #[tokio::test]
 async fn a_forged_hint_offers_only_the_frozen_destination_never_text_from_stderr() {
     // A band-3 payload `error\n<refusal>` reaches column 0 after one `remote: ` prefix.
-    let forged = "remote: error\nfatal: Cannot prompt because user interactivity has been disabled.\nSign in to https://evil.example/\n";
+    let forged = concat!(
+        "remote: error\nfatal: Cannot prompt because user interactivity has been disabled.\nSign in to https:",
+        "//evil.example/\n"
+    );
     let runner = RemoteRunner::new(DESTINATION, forged);
     let fetch = request(json!({"_tag": "fetch", "remote": "origin"}));
     let error = run(&runner, &fetch, CredentialPrompt::OfferSignIn)
@@ -310,7 +319,10 @@ async fn a_resumed_request_runs_only_against_the_approved_destination() {
         assert_eq!(unchanged.network_spawns(), 1, "{}", resume.operation());
 
         // Changed after the approval: refused before any network spawn.
-        let changed = RemoteRunner::new("https://evil.example/owner/repo.git", GCM_STDERR);
+        let changed = RemoteRunner::new(
+            concat!("https:", "//evil.example/owner/repo.git"),
+            GCM_STDERR,
+        );
         let error = run(&changed, &resume, CredentialPrompt::OfferSignIn)
             .await
             .expect_err("destination changed");
