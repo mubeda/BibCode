@@ -175,7 +175,7 @@ impl PullRequestsService {
                 if allow_stale {
                     self.restore_recorded_hosts().await;
                 }
-                let pending = match context::resolve_pending_scope(
+                let pending = match context::resolve_login_scope(
                     &self.runner,
                     cwd,
                     &DiscoveredHosts::default(),
@@ -583,7 +583,7 @@ impl PullRequestsService {
             Duration::from_secs(60),
             c,
             |c| async move {
-                let pending = context::resolve_pending_scope(
+                let pending = context::resolve_login_scope(
                     &self.runner,
                     cwd,
                     &DiscoveredHosts::default(),
