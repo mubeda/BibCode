@@ -544,7 +544,9 @@ describe("PipelinesListView columns", () => {
     press(separator("Resize Stages column"), "End");
     press(separator("Resize Created by column"), "Home");
     expect(rootGrid()).toBe("144px minmax(240px,496px) minmax(96px,96px) minmax(72px,360px) 104px");
-    expect(localStorage.getItem("bibcode:pipelines-list-pipeline-width")).toBe("496");
+    expect(
+      localStorage.getItem("bibcode:pipelines-list-pipeline-width:github.com/owner/repo"),
+    ).toBe("496");
     await act(async () => root.unmount());
     root = createRoot(container);
     await render();
@@ -570,6 +572,48 @@ describe("PipelinesListView columns", () => {
     localStorage.setItem("bibcode:pipelines-list-stages-width", "1");
     await render();
     expect(rootGrid()).toBe("144px minmax(240px,960px) minmax(96px,160px) minmax(72px,72px) 104px");
+    error.mockRestore();
+  });
+
+  it("keeps each repository's widths and hidden columns, starting from the global choice", async () => {
+    localStorage.setItem("bibcode:pipelines-list-pipeline-width", "400");
+    localStorage.setItem("bibcode:pipelines-list-hidden-columns", JSON.stringify(["author"]));
+    const other = moduleValue({ ...gitlabContext, repository: "group/other" });
+    await render();
+    expect(rootGrid()).toBe("144px minmax(240px,400px) minmax(72px,160px) 104px");
+    press(separator("Resize Pipeline column"), "ArrowRight");
+    await act(async () =>
+      container
+        .querySelector<HTMLElement>('[aria-label="Choose columns"]')!
+        .dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    );
+    const author = [...document.querySelectorAll('[role="menuitemcheckbox"]')].find(
+      (candidate) => candidate.textContent === "Created by",
+    ) as HTMLElement;
+    await act(async () => author.click());
+    expect(rootGrid()).toBe(
+      "144px minmax(240px,416px) minmax(96px,160px) minmax(72px,160px) 104px",
+    );
+    // Another repository, in the same mounted panel, still starts from the global choice.
+    await render({ value: other });
+    expect(rootGrid()).toBe("144px minmax(240px,400px) minmax(72px,160px) 104px");
+    expect(localStorage.getItem("bibcode:pipelines-list-pipeline-width")).toBe("400");
+    expect(localStorage.getItem("bibcode:pipelines-list-hidden-columns")).toBe('["author"]');
+    await render();
+    expect(rootGrid()).toBe(
+      "144px minmax(240px,416px) minmax(96px,160px) minmax(72px,160px) 104px",
+    );
+  });
+
+  it("falls back to the global choice for a corrupt or out-of-range repository value", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    localStorage.setItem("bibcode:pipelines-list-author-width", "200");
+    localStorage.setItem("bibcode:pipelines-list-hidden-columns", JSON.stringify(["stages"]));
+    localStorage.setItem("bibcode:pipelines-list-pipeline-width:github.com/owner/repo", "99999");
+    localStorage.setItem("bibcode:pipelines-list-author-width:github.com/owner/repo", "{not json");
+    localStorage.setItem("bibcode:pipelines-list-hidden-columns:github.com/owner/repo", '["nope"]');
+    await render();
+    expect(rootGrid()).toBe("144px minmax(240px,960px) minmax(96px,200px) 104px");
     error.mockRestore();
   });
 
@@ -608,7 +652,9 @@ describe("PipelinesListView columns", () => {
     ) as HTMLElement;
     expect(item.getAttribute("aria-checked")).toBe("true");
     await act(async () => item.click());
-    expect(localStorage.getItem("bibcode:pipelines-list-hidden-columns")).toBe('["stages"]');
+    expect(
+      localStorage.getItem("bibcode:pipelines-list-hidden-columns:github.com/owner/repo"),
+    ).toBe('["stages"]');
     expect(rootGrid()).toBe("144px minmax(240px,480px) minmax(96px,160px) 104px");
     expect(container.querySelector('ol[aria-label="Stages"]')).toBeNull();
   });
@@ -656,7 +702,9 @@ describe("PipelinesListView columns", () => {
       (candidate) => candidate.textContent === "Duration and age",
     ) as HTMLElement;
     await act(async () => item.click());
-    expect(localStorage.getItem("bibcode:pipelines-list-hidden-columns")).toBe('["timing"]');
+    expect(
+      localStorage.getItem("bibcode:pipelines-list-hidden-columns:github.com/owner/repo"),
+    ).toBe('["timing"]');
     const row = container.querySelector('[role="row"][aria-label]')!;
     expect(row.textContent).not.toContain("4m 12s");
     expect(row.textContent).toContain("Failed");

@@ -1035,7 +1035,8 @@ which happy-dom cannot lay out (its tests pin classes, custom properties and
 persistence). In a packaged build with a project that has pipelines, check the
 list and a pipeline page at about 600, 900 and 1600 px of panel width: columns
 line up across rows with and without Retry or Cancel, a column edge resizes by
-drag and by arrow keys and survives a reload, and stage columns fill the page.
+drag and by arrow keys and survives a reload, a second repository keeps its own
+widths and hidden columns, and stage columns fill the page.
 
 `PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
 must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`

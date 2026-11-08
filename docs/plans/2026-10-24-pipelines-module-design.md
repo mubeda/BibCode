@@ -1191,13 +1191,18 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   its icon. Actions has a fixed 104 px track, so rows with and without Retry
   or Cancel align. Pipeline, Created by and Stages resize at ≥ 1100 px through
   vertical separators in the header (8 px hit area, arrow keys, Home, End,
-  double-click reset), each a `useResizableWidth` stored globally under
-  `bibcode:pipelines-list-<column>-width` and painted through the custom
-  property, so a drag re-renders no row. Pipeline, Created by and Stages
+  double-click reset), each a `useResizableWidth` stored per repository under
+  `bibcode:pipelines-list-<column>-width:<host>/<repository>` (issue #321) and
+  painted through the custom property, so a drag re-renders no row. A
+  repository with no width of its own, or a corrupt one, starts from the
+  global key (#285's single setting, now only read) and then the built-in
+  default; stored values are clamped to the column's bounds. Pipeline, Created by and Stages
   tracks are `minmax(min, width)`, so widths that add up to more than the
   panel shrink toward their minimums and Actions always stays inside the row.
   A header menu hides Created by, Stages or the duration and age text under
-  Status (`bibcode:pipelines-list-hidden-columns`). The table carries
+  Status (`bibcode:pipelines-list-hidden-columns:<host>/<repository>`, with
+  the same global fallback). The list root is keyed by the repository, so a
+  switch reads the other repository's choice. The table carries
   `aria-rowcount` (the host's total plus the header, or -1 when capped) and
   each row `aria-rowindex` (header is 1). Not built: sorting (the list input
   has no sort field and GitLab and GitHub order the pages).
