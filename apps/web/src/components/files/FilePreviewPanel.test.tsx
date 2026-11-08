@@ -421,6 +421,17 @@ vi.mock("~/components/ui/toggle", () => ({
   },
 }));
 
+vi.mock("~/components/ui/button", () => ({
+  Button: ({ children, ...props }: Record<string, unknown> & { children?: React.ReactNode }) => {
+    ui.record("Button", { children, ...props });
+    return (
+      <button type="button" aria-label={props["aria-label"] as string | undefined}>
+        {children}
+      </button>
+    );
+  },
+}));
+
 vi.mock("~/components/ui/tooltip", () => ({
   Tooltip: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
   TooltipTrigger: ({
@@ -947,7 +958,7 @@ describe("show in files", () => {
     const markup = renderPanel(baseProps());
     expect(markup).toContain('aria-label="Show in Files"');
 
-    (ui.byLabel("Toggle", "Show in Files").onPressedChange as () => void)();
+    (ui.byLabel("Button", "Show in Files").onClick as () => void)();
     expect(reveal).toHaveBeenCalledWith(threadRef, "src/app.ts");
     reveal.mockRestore();
   });

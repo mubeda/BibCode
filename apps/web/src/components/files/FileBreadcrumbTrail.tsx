@@ -33,7 +33,7 @@ export default function FileBreadcrumbTrail({
           ) : (
             <button
               type="button"
-              className="max-w-40 truncate rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              className="max-w-40 cursor-pointer truncate rounded-sm px-1 py-1 text-muted-foreground outline-none hover:text-foreground hover:underline focus-visible:ring-2 focus-visible:ring-ring"
               title={`Show ${crumb.path || projectName} in Files`}
               onClick={() => onReveal(crumb.path)}
             >
