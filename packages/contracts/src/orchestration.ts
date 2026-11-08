@@ -36,6 +36,7 @@ export const ORCHESTRATION_WS_METHODS = {
   subscribeThread: "orchestration.subscribeThread",
   listOlderThreads: "orchestration.listOlderThreads",
   getThreadShells: "orchestration.getThreadShells",
+  previewCheckpointRevert: "orchestration.previewCheckpointRevert",
 } as const;
 
 export const ProviderApprovalPolicy = Schema.Literals([
@@ -1223,11 +1224,21 @@ const ThreadUserInputRespondCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/**
+ * What a checkpoint revert restores (#279): files and conversation (`full`, the default), or
+ * the conversation only, which leaves the working tree as it is.
+ */
+export const CheckpointRevertMode = Schema.Literals(["full", "conversationOnly"]);
+export type CheckpointRevertMode = typeof CheckpointRevertMode.Type;
+
 const ThreadCheckpointRevertCommand = Schema.Struct({
   type: Schema.Literal("thread.checkpoint.revert"),
   commandId: CommandId,
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  mode: Schema.optionalKey(CheckpointRevertMode),
+  /** `previewCheckpointRevert`'s token, acknowledging what other chats changed. */
+  siblingChangesToken: Schema.optionalKey(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 
@@ -1654,6 +1665,8 @@ const ThreadUserInputResponseRequestedPayload = Schema.Struct({
 export const ThreadCheckpointRevertRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  mode: CheckpointRevertMode.pipe(Schema.withDecodingDefault(Effect.succeed("full" as const))),
+  siblingChangesToken: Schema.optionalKey(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 
@@ -2022,6 +2035,61 @@ export type OrchestrationGetFullThreadDiffInput = typeof OrchestrationGetFullThr
 export const OrchestrationGetFullThreadDiffResult = ThreadTurnDiff;
 export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullThreadDiffResult.Type;
 
+export const OrchestrationPreviewCheckpointRevertInput = Schema.Struct({
+  threadId: ThreadId,
+  turnCount: NonNegativeInt,
+});
+export type OrchestrationPreviewCheckpointRevertInput =
+  typeof OrchestrationPreviewCheckpointRevertInput.Type;
+
+/** Why another chat in the checkout keeps a file restore from running now. */
+export const CheckpointRevertWritingReason = Schema.Literals([
+  "turn",
+  "startingTurn",
+  "backgroundWork",
+  "checkpointPending",
+  "unobservable",
+  "unmanagedServer",
+  "startingSession",
+  "unresolvableCheckout",
+]);
+export type CheckpointRevertWritingReason = typeof CheckpointRevertWritingReason.Type;
+
+/**
+ * What a revert would do (#279). Advisory: the server checks everything again under the
+ * checkout's lock before it changes anything.
+ */
+export const OrchestrationPreviewCheckpointRevertResult = Schema.Struct({
+  writingSiblings: Schema.Array(
+    Schema.Struct({
+      threadId: ThreadId,
+      title: Schema.String,
+      reason: CheckpointRevertWritingReason,
+    }),
+  ),
+  /** Every path a file restore rewrites or deletes; empty when no other chat shares the checkout. */
+  restoredPaths: Schema.Array(Schema.String),
+  siblingChanges: Schema.Struct({
+    /** Changed since this chat's last turn, so by someone else. */
+    paths: Schema.Array(Schema.String),
+    turns: Schema.Array(
+      Schema.Struct({
+        threadId: ThreadId,
+        title: Schema.String,
+        turns: NonNegativeInt,
+        /** `null` when the turn reported no files (a side chat). */
+        files: Schema.NullOr(Schema.Array(Schema.String)),
+      }),
+    ),
+  }),
+  /** `null` only when no other chat shares the checkout. */
+  siblingChangesToken: Schema.NullOr(Schema.String),
+  conversationRewind: Schema.Literals(["available", "filesOnlyProvider", "rewindRestoresFiles"]),
+  headFallbackRefused: Schema.Boolean,
+});
+export type OrchestrationPreviewCheckpointRevertResult =
+  typeof OrchestrationPreviewCheckpointRevertResult.Type;
+
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
   paged: Schema.optionalKey(Schema.Literal(true)),
@@ -2104,6 +2172,10 @@ export const OrchestrationRpcSchemas = {
     input: OrchestrationGetThreadShellsInput,
     output: OrchestrationGetThreadShellsResult,
   },
+  previewCheckpointRevert: {
+    input: OrchestrationPreviewCheckpointRevertInput,
+    output: OrchestrationPreviewCheckpointRevertResult,
+  },
 } as const;
 
 export class OrchestrationGetSnapshotError extends Schema.TaggedError<OrchestrationGetSnapshotError>()(
@@ -2141,6 +2213,14 @@ export class OrchestrationThreadInUseError extends Schema.TaggedError<Orchestrat
 
 export class OrchestrationGetTurnDiffError extends Schema.TaggedError<OrchestrationGetTurnDiffError>()(
   "OrchestrationGetTurnDiffError",
+  {
+    message: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+export class OrchestrationPreviewCheckpointRevertError extends Schema.TaggedError<OrchestrationPreviewCheckpointRevertError>()(
+  "OrchestrationPreviewCheckpointRevertError",
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),

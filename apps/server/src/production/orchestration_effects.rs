@@ -1499,6 +1499,72 @@ async fn remove_temporary_index(path: PathBuf) {
     }
 }
 
+/// A test pause at a capture's ref 0 update in one checkout, after its commit is fixed and
+/// before `update-ref` runs. Checkpoint Git runs no hooks, so tests hold the update here.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HeldRefZeroUpdate {
+    commit: std::sync::Mutex<Option<String>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl HeldRefZeroUpdate {
+    /// The commit the held update is to publish, once it is held.
+    pub(crate) async fn entered(&self) -> String {
+        loop {
+            let entered = self.entered.notified();
+            if let Some(commit) = self.commit.lock().unwrap().clone() {
+                return commit;
+            }
+            entered.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+static REF_ZERO_UPDATE_GATES: std::sync::Mutex<Vec<(PathBuf, Arc<HeldRefZeroUpdate>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds the next ref 0 update of a capture in the checkout `cwd` until released.
+#[cfg(test)]
+pub(crate) fn hold_ref_zero_update(cwd: &Path) -> Arc<HeldRefZeroUpdate> {
+    let held = Arc::new(HeldRefZeroUpdate::default());
+    REF_ZERO_UPDATE_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((cwd.to_path_buf(), held.clone()));
+    held
+}
+
+#[cfg(test)]
+async fn pause_ref_zero_update(cwd: &Path, reference: &str, commit: &str) {
+    if !reference.ends_with("/turn/0") {
+        return;
+    }
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let held = {
+        let mut gates = REF_ZERO_UPDATE_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = gates
+            .iter()
+            .position(|(gated, _)| canonical(gated) == canonical(cwd));
+        index.map(|index| gates.remove(index).1)
+    };
+    if let Some(held) = held {
+        *held.commit.lock().unwrap() = Some(commit.to_owned());
+        held.entered.notify_waiters();
+        held.release.notified().await;
+    }
+}
+
 /// Test gates that hold the removal of temporary indexes under a Git directory.
 #[cfg(test)]
 static TEMPORARY_INDEX_REMOVAL_GATES: std::sync::Mutex<Vec<(PathBuf, Arc<tokio::sync::Notify>)>> =
@@ -2391,13 +2457,13 @@ async fn sibling_changes(
             .into_iter()
             .find(|turn| turn.checkpoint_turn_count == Some(1))
             .map(|turn| turn.started_at.unwrap_or(turn.requested_at))
-            .unwrap_or_default()
+            .unwrap_or_else(|| BEFORE_ANY_TURN.to_owned())
     } else {
         checkpoints
             .iter()
             .find(|checkpoint| checkpoint.checkpoint_turn_count == turn_count)
             .map(|checkpoint| checkpoint.completed_at.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|| BEFORE_ANY_TURN.to_owned())
     };
     let until = newest.map_or_else(now_iso, |checkpoint| checkpoint.completed_at.clone());
     let titles = scan
@@ -2555,6 +2621,9 @@ async fn changed_paths(
         .map(str::to_owned)
         .collect())
 }
+
+/// The lower bound of the event read when the target's time is unknown.
+const BEFORE_ANY_TURN: &str = "1970-01-01T00:00:00Z";
 
 /// A shared checkout's state a planned file restore checks again before its rewind.
 struct SharedRestore {
@@ -3466,6 +3535,8 @@ async fn capture_checkpoint_with_cancellation(
         )
         .await?
         .stdout;
+        #[cfg(test)]
+        pause_ref_zero_update(cwd, &reference, commit.trim()).await;
         run_git(
             cwd,
             git_command,
@@ -3782,6 +3853,10 @@ fn outcome_id(tag: &str, request: Option<&str>) -> String {
         None => server_id(tag),
     }
 }
+
+#[cfg(test)]
+#[path = "shared_checkout_restore_tests.rs"]
+mod shared_checkout_restore_tests;
 
 #[cfg(test)]
 mod tests {

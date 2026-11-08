@@ -35617,3 +35617,7 @@ printf '2.1.0 (Claude Code)\n'
         assert!(cmd_index < powershell_index);
     }
 }
+
+#[cfg(test)]
+#[path = "restore_guard_supervisor_tests.rs"]
+mod restore_guard_supervisor_tests;
