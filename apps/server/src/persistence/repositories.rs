@@ -1885,6 +1885,7 @@ impl Repositories {
     /// The events of `thread_ids` that end a turn with its files (`thread.turn-diff-completed`)
     /// or start one (`thread.session-set` running), that occurred after `after` and no later
     /// than `until`. Read from the append-only event log, which no revert or deletion changes.
+    /// Times compare as instants: stored ones may or may not carry fractional seconds.
     pub async fn list_turn_events_between(
         &self,
         thread_ids: Vec<String>,
@@ -1899,7 +1900,7 @@ impl Repositories {
                 let mut statement = connection.prepare(
                     "SELECT event_id, stream_id, event_type, payload_json FROM orchestration_events \
                      WHERE aggregate_kind = 'thread' AND stream_id IN (SELECT value FROM json_each(?1)) \
-                     AND occurred_at > ?2 AND occurred_at <= ?3 \
+                     AND julianday(occurred_at) > julianday(?2) AND julianday(occurred_at) <= julianday(?3) \
                      AND (event_type = 'thread.turn-diff-completed' OR (event_type = 'thread.session-set' \
                           AND json_extract(payload_json, '$.session.status') = 'running')) \
                      ORDER BY sequence",

@@ -220,6 +220,8 @@ import {
   OrchestrationThreadInUseError,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetFullThreadDiffInput,
+  OrchestrationPreviewCheckpointRevertError,
+  OrchestrationPreviewCheckpointRevertInput,
   OrchestrationGetSnapshotError,
   OrchestrationListOlderThreadsError,
   OrchestrationGetTurnDiffError,
@@ -2015,6 +2017,15 @@ export const WsOrchestrationGetTurnDiffRpc = Rpc.make(ORCHESTRATION_WS_METHODS.g
   ]),
 });
 
+export const WsOrchestrationPreviewCheckpointRevertRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.previewCheckpointRevert,
+  {
+    payload: OrchestrationPreviewCheckpointRevertInput,
+    success: OrchestrationRpcSchemas.previewCheckpointRevert.output,
+    error: Schema.Union([OrchestrationPreviewCheckpointRevertError, EnvironmentRpcError]),
+  },
+);
+
 export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
   ORCHESTRATION_WS_METHODS.getFullThreadDiff,
   {
@@ -2480,6 +2491,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,
+  WsOrchestrationPreviewCheckpointRevertRpc,
   WsOrchestrationReplayEventsRpc,
   WsOrchestrationGetThreadHistoryPageRpc,
   WsOrchestrationGetArchivedShellSnapshotRpc,
