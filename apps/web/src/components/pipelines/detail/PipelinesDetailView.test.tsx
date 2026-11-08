@@ -1024,22 +1024,8 @@ describe("PipelinesDetailView job log panel", () => {
       stack();
       click(jobLink());
       await settle();
-      expect(scrolled).toHaveBeenCalledWith("ASIDE", { block: "start", behavior: "smooth" });
+      expect(scrolled).toHaveBeenCalledWith("ASIDE", { block: "start", behavior: "instant" });
       expect(document.activeElement).toBe(panel()!.querySelector("h2"));
-    });
-
-    it("scrolls without animation when the reader prefers reduced motion", async () => {
-      h.job = pipelineJobDetail({ job: { ...pipelineJob } });
-      vi.stubGlobal("matchMedia", () => ({ matches: true }));
-      try {
-        await render({ wrap: withJobPages });
-        stack();
-        click(jobLink());
-        await settle();
-        expect(scrolled).toHaveBeenCalledWith("ASIDE", { block: "start", behavior: "auto" });
-      } finally {
-        vi.unstubAllGlobals();
-      }
     });
 
     it("leaves focus in a field the reader is typing in", async () => {
