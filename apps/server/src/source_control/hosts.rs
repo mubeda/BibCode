@@ -187,7 +187,10 @@ mod tests {
         let workstation = "https://code.example.test/example-group/sample-project.git";
         assert_eq!(hosts.identify(workstation), IdentifiedProvider::Unknown);
         hosts.record("Code.Example.Test", ProviderKind::Gitlab);
-        for remote in [workstation, "git@code.example.test:example-group/sample-project.git"] {
+        for remote in [
+            workstation,
+            "git@code.example.test:example-group/sample-project.git",
+        ] {
             let IdentifiedProvider::Recorded(info) = hosts.identify(remote) else {
                 panic!("expected recorded host: {remote}");
             };

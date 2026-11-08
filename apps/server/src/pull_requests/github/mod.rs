@@ -656,7 +656,7 @@ mode=$(cat mode)
 case "$1 $2" in
   'api user') arrive "$mode"
     if [ "$mode" = fail ]; then sleep 0.3; echo 'HTTP 401: Bad credentials' >&2; exit 1; fi
-    echo '{"login":"mubeda","name":""}' ;;
+    echo '{"login":"test-user","name":""}' ;;
   'api repos/example/repository') arrive "$mode"
     if [ "$mode" = fail ]; then echo 'HTTP 404: Not Found' >&2; exit 1; fi
     cat repository.json ;;
@@ -676,7 +676,7 @@ esac"#,
         };
         let c = CancellationToken::new();
         let context = host.context(&scope, &c).await.unwrap();
-        assert_eq!(context.account.login, "mubeda");
+        assert_eq!(context.account.login, "test-user");
         assert_eq!(context.repository_permission, RepositoryPermission::Admin);
 
         fs::write(s.path("mode"), "fail").unwrap();
@@ -726,7 +726,7 @@ esac"#,
             "gh",
             r#"printf '%s\n' "$*" >> calls
 case "$1 $2" in
-  'api user') echo '{"login":"mubeda","name":""}' ;;
+  'api user') echo '{"login":"test-user","name":""}' ;;
   'api repos/example/repository') cat repository.json ;;
   'api graphql') cat > graphql-input; cat graphql.json ;;
   'api repos/example/repository/labels?per_page=100') cat labels.json ;;
@@ -779,7 +779,7 @@ esac"#,
             .find(|line| line.starts_with("pr list"))
             .unwrap();
         assert!(search.contains("--repo github.com/example/repository"));
-        assert!(search.contains("author:mubeda"));
+        assert!(search.contains("author:test-user"));
         assert!(search.contains("label:\"needs review\""));
         assert!(search.contains("sort:comments-desc"));
         assert!(

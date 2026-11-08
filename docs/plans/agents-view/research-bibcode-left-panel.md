@@ -1,7 +1,7 @@
 # Research: BibCode left panel, search, and connected environments — groundwork for an "Agents" view
 
 Date: 2026-08-31. Read-only research against worktree `develop-3` (branch
-`mubeda/develop-3`, clean tree). All paths are repo-relative; `path:line`
+`test-user/develop-3`, clean tree). All paths are repo-relative; `path:line`
 citations were verified against current source. CodeGraph was initialized and
 synced in this worktree before research.
 

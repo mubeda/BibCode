@@ -151,7 +151,7 @@ async fn pull_requests_github_detail_merged_admin_can_revert_known_merge_commit(
     detail["mergeStateStatus"] = json!("UNKNOWN");
     detail["mergeable"] = json!("UNKNOWN");
     detail["mergedAt"] = json!("2026-09-20T00:00:00Z");
-    detail["mergedBy"] = json!({"login":"mubeda"});
+    detail["mergedBy"] = json!({"login":"test-user"});
     fs::write(s.path("detail.json"), detail.to_string()).unwrap();
     let mut viewer: Value =
         serde_json::from_str(&fs::read_to_string(s.path("viewer.json")).unwrap()).unwrap();
@@ -166,7 +166,7 @@ async fn pull_requests_github_detail_merged_admin_can_revert_known_merge_commit(
     assert!(!p.merge.permission.allowed);
     assert_eq!(
         raw.detail_without_permissions.merged_by.unwrap().login,
-        "mubeda"
+        "test-user"
     );
 }
 

@@ -57720,9 +57720,9 @@ Received: "<div></div>"
 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/15]⎯
 
  FAIL  apps/web/src/components/pullRequests/detail/PullRequestsMergeBox.test.tsx > PullRequestsMergeBox > shows merged author/time and Revert, and closed requests have no merge controls
-AssertionError: expected '<div></div>' to contain 'Merged by mubeda'
+AssertionError: expected '<div></div>' to contain 'Merged by test-user'
 
-Expected: "Merged by mubeda"
+Expected: "Merged by test-user"
 Received: "<div></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsMergeBox.test.tsx:30:20
@@ -57886,12 +57886,12 @@ note: You are running `vp test` as a Vite+ built-in command. If you meant to run
 ⎯⎯⎯⎯⎯⎯ Failed Tests 22 ⎯⎯⎯⎯⎯⎯⎯
 
  FAIL  apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts > headerSentence > uses GitHub's author, count and base/head order
-AssertionError: expected '' to be 'mubeda wants to merge 3 commits into …' // Object.is equality
+AssertionError: expected '' to be 'test-user wants to merge 3 commits into …' // Object.is equality
 
 - Expected
 + Received
 
-- mubeda wants to merge 3 commits into main from feature
+- test-user wants to merge 3 commits into main from feature
 
  ❯ apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts:6:127
       4| import { comment, context, detail, event, file, gitlabContext, review,…
@@ -57904,12 +57904,12 @@ AssertionError: expected '' to be 'mubeda wants to merge 3 commits into …' // 
 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/22]⎯
 
  FAIL  apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts > headerSentence > uses GitLab's source/target order
-AssertionError: expected '' to be 'mubeda requested to merge feature int…' // Object.is equality
+AssertionError: expected '' to be 'test-user requested to merge feature int…' // Object.is equality
 
 - Expected
 + Received
 
-- mubeda requested to merge feature into main
+- test-user requested to merge feature into main
 
  ❯ apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts:7:119
       5| describe("headerSentence", () => {
@@ -58641,7 +58641,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58657,7 +58657,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58673,7 +58673,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58689,7 +58689,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58936,7 +58936,7 @@ AssertionError: expected '' to contain '1234567'
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsCommits.test.tsx:17:96
      15|     try {
      16|       await act(async () => root.render(<PullRequestsCommits commits={…
-     17|       for (const text of ["1234567", "Fix the tests", "mubeda"]) expec…
+     17|       for (const text of ["1234567", "Fix the tests", "test-user"]) expec…
        |                                                                                                ^
      18|       expect(container.querySelector("time")?.dateTime).toBe(commit.au…
      19|       expect(container.querySelector("img")).toBeNull();
@@ -59177,7 +59177,7 @@ Failed to read theme preference for bibcode:theme. {
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'updated the request'
 
 Expected: "updated the request"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> function Object() { [native code] } <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> function Object() { [native code] } <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59291,7 +59291,7 @@ AssertionError: expected undefined to be defined
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'requested review from alice'
 
 Expected: "requested review from alice"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> review_requested alice <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> review_requested alice <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59302,7 +59302,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'marked ready for review'
 
 Expected: "marked ready for review"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> ready_for_review <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> ready_for_review <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59313,7 +59313,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'converted to draft'
 
 Expected: "converted to draft"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> converted_to_draft <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> converted_to_draft <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59324,7 +59324,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'force-pushed the head branch'
 
 Expected: "force-pushed the head branch"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> head_ref_force_pushed <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> head_ref_force_pushed <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59335,7 +59335,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'updated the request: Host activity'
 
 Expected: "updated the request: Host activity"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> unknown Host activity <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> unknown Host activity <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -95660,7 +95660,7 @@ AssertionError: expected 'src/a b#é.ts:3–4ResolvedOutdated@@ -3…' not to co
 - Thread comment
 + src/a b#é.ts:3–4ResolvedOutdated@@ -3 +3 @@
 + -old
-+ +newMmubeda16h agoeditedThread comment👍 2Write access is required for this action.Add reactionWrite access is required for this action.Lines 3–4ApplyWrite access is required for this action.CopyWrite access is required for this action.-old+newUnresolve threadWrite access is required for this action.Reply to threadWritePreviewWrite access is required for this action.ReplyWrite access is required for this action.
++ +newMtest-user16h agoeditedThread comment👍 2Write access is required for this action.Add reactionWrite access is required for this action.Lines 3–4ApplyWrite access is required for this action.CopyWrite access is required for this action.-old+newUnresolve threadWrite access is required for this action.Reply to threadWritePreviewWrite access is required for this action.ReplyWrite access is required for this action.
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:33:46
      31|     const view = await mount(<PullRequestsTimelineItem {...props} perm…

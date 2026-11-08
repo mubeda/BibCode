@@ -6,7 +6,7 @@
 
 - Repository: BiBCode (`https://github.com/mubeda/BibCode.git`)
 - Remote: `origin`; remote branch `develop`
-- Branch or requested revision: local `mubeda/develop`; remote-server range
+- Branch or requested revision: local `test-user/develop`; remote-server range
   `3b1864eff4b5e476bf725910fc84c11f34b31c1a..71cd7fc3f0e19e04ea8cccb11e6092146496e42e`
 - Local HEAD: `71cd7fc3f0e19e04ea8cccb11e6092146496e42e` was the final tested product/test
   commit. The later documentation-only commit containing the final report and

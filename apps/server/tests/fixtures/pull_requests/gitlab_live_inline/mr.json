@@ -19,35 +19,35 @@
   "downvotes": 0,
   "author": {
     "id": 4,
-    "username": "mubeda",
+    "username": "test-user",
     "public_email": "",
     "name": "Test User",
     "state": "active",
     "locked": false,
     "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
-    "web_url": "https://code.example.test/mubeda"
+    "web_url": "https://code.example.test/test-user"
   },
   "assignees": [
     {
       "id": 4,
-      "username": "mubeda",
+      "username": "test-user",
       "public_email": "",
       "name": "Test User",
       "state": "active",
       "locked": false,
       "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
-      "web_url": "https://code.example.test/mubeda"
+      "web_url": "https://code.example.test/test-user"
     }
   ],
   "assignee": {
     "id": 4,
-    "username": "mubeda",
+    "username": "test-user",
     "public_email": "",
     "name": "Test User",
     "state": "active",
     "locked": false,
     "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
-    "web_url": "https://code.example.test/mubeda"
+    "web_url": "https://code.example.test/test-user"
   },
   "reviewers": [],
   "source_project_id": 72,

@@ -99,7 +99,7 @@ impl ProviderStub {
         write_json(
             root,
             "gh-auth.json",
-            &json!({"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"mubeda"}]}}),
+            &json!({"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"test-user"}]}}),
         );
         fs::write(root.join("glab-auth"), "gitlab.com\n  x HTTP 401\ngit.acme.example\n  ✓ Logged in to git.acme.example as alice\n").unwrap();
         fs::write(
@@ -155,7 +155,7 @@ case "$1 $2" in
   'auth status')
     if [ -e "$FIXTURE_DIR/gh-unauthenticated" ]; then echo 'You are not logged into any GitHub hosts' >&2; exit 1; fi
     cat "$FIXTURE_DIR/gh-auth.json" ;;
-  'api user') echo '{"login":"mubeda","name":""}' ;;
+  'api user') echo '{"login":"test-user","name":""}' ;;
   'api graphql')
     cat > "$FIXTURE_DIR/graphql-input"
     if [ -e "$FIXTURE_DIR/rate-limited" ]; then echo 'API rate limit exceeded TOKEN secret' >&2; exit 1; fi

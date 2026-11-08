@@ -719,7 +719,7 @@ mod tests {
 
     const GH: &str = r#"case "$1 $2" in
       '--version ') echo 'gh version 2.97.0' ;;
-      'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"mubeda"}]}}' ;;
+      'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"test-user"}]}}' ;;
       *) exit 64 ;;
     esac"#;
     const GLAB: &str = r#"case "$1 $2" in
@@ -932,7 +932,7 @@ esac"#,
 printf 'gh %s\n' "$*" >> calls
 case "$1 $2" in
   '--version ') echo 'gh version 2.97.0' ;;
-  'auth status') arrive discovery 2; echo '{{"hosts":{{"github.com":[{{"state":"success","active":true,"host":"github.com","login":"mubeda"}}]}}}}' ;;
+  'auth status') arrive discovery 2; echo '{{"hosts":{{"github.com":[{{"state":"success","active":true,"host":"github.com","login":"test-user"}}]}}}}' ;;
   *) exit 64 ;;
 esac"#
             );
@@ -990,7 +990,7 @@ esac"#
         let gh = r#"printf 'gh %s\n' "$*" >> calls
 case "$1 $2" in
   '--version ') echo 'gh version 2.97.0' ;;
-  'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"mubeda"}]}}' ;;
+  'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"test-user"}]}}' ;;
   *) exit 64 ;;
 esac"#;
         let glab = r#"printf 'glab %s\n' "$*" >> calls
