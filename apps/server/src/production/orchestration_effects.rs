@@ -2614,7 +2614,7 @@ async fn run_git(
     environment.extend_from_slice(env);
     // No hook runs for BiBCode's own refs, and no fsmonitor starts for a temporary index. On
     // native Windows `/dev/null` is an ordinary path on the current drive.
-    let hooks = format!("core.hooksPath={}", crate::git::clone_policy::NULL_DEVICE);
+    let hooks = format!("core.hooksPath={}", crate::git::clone_policy::NO_HOOKS);
     let overrides = ["-c", hooks.as_str(), "-c", "core.fsmonitor=false"];
     ProcessRunner
         .run(

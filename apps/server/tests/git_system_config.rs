@@ -862,7 +862,9 @@ async fn a_system_hooks_path_runs_no_hook_during_capture_restore_or_ref_deletion
 }
 
 /// `\dev\null\reference-transaction` on the checkout's drive, which a `/dev/null` hook path
-/// would name on native Windows. Removes what it created when dropped.
+/// would name on native Windows, and `nul\reference-transaction` in the checkout and in its
+/// `.git`, which a `nul` hook path could name (made through `\\?\`, since Win32 reserves
+/// `nul`). Removes what it created when dropped.
 #[cfg(windows)]
 struct PlantedNullHook(Vec<PathBuf>);
 
@@ -875,8 +877,20 @@ impl PlantedNullHook {
             eprintln!("skipped the planted hook: {} exists", null.display());
             return None;
         }
+        let verbatim = |path: PathBuf| {
+            if path.to_string_lossy().starts_with(r"\\?\") {
+                path
+            } else {
+                PathBuf::from(format!(r"\\?\{}", path.display()))
+            }
+        };
         let mut planted = Self(Vec::new());
-        for directory in [drive.join("dev"), null.clone()] {
+        for directory in [
+            drive.join("dev"),
+            null.clone(),
+            verbatim(checkout.join("nul")),
+            verbatim(checkout.join(".git").join("nul")),
+        ] {
             if directory.exists() {
                 continue;
             }
@@ -886,7 +900,13 @@ impl PlantedNullHook {
             }
             planted.0.push(directory);
         }
-        write_marker_hook(&null, marker);
+        for directory in [
+            null,
+            verbatim(checkout.join("nul")),
+            verbatim(checkout.join(".git").join("nul")),
+        ] {
+            write_marker_hook(&directory, marker);
+        }
         Some(planted)
     }
 }

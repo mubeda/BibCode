@@ -133,10 +133,18 @@ pub(crate) fn inherited_environment() -> Vec<(OsString, OsString)> {
         .filter(|(name, _)| name.to_str().is_some_and(is_inherited))
         .collect()
 }
-/// The null device, for an empty global configuration and an empty hooks folder. Git for
-/// Windows accepts only lowercase `nul` (or `/dev/null`) as `GIT_CONFIG_GLOBAL`; `NUL` fails
-/// every command, even `git --version` (#264).
+/// The null device, for an empty global configuration and home. Git for Windows accepts only
+/// lowercase `nul` (or `/dev/null`) as `GIT_CONFIG_GLOBAL`; `NUL` fails every command, even
+/// `git --version` (#264).
 pub(crate) const NULL_DEVICE: &str = if cfg!(windows) { "nul" } else { "/dev/null" };
+/// A hooks folder no hook can be planted in. Git for Windows treats `nul/<hook>` as present
+/// and fails to spawn it, which aborts every ref update; `/dev/null` there names the
+/// plantable `\dev\null\` on the current drive. The device namespace holds no folders.
+pub(crate) const NO_HOOKS: &str = if cfg!(windows) {
+    r"\\.\nul"
+} else {
+    "/dev/null"
+};
 const OPERATION: &str = "GitVcsDriver.clone";
 
 const NOT_HTTPS: &str = "BiBCode clones for an agent from https:// URLs, such as https://github.com/owner/repo, and from ssh:// URLs when the agent may use terminals. git://, file://, local paths and other transports are refused; clone it in BiBCode yourself to use them.";
@@ -615,7 +623,7 @@ fn ssh_not_allowed(url: &str, target: &Target) -> CloneRefusal {
 /// redirect, LFS smudge, submodule, proxy, hook or fsmonitor. The `http.*` settings stay on an
 /// SSH clone, where they are harmless.
 fn isolated_arguments(protocol: &str, fixture_protocol: Option<&str>) -> Vec<String> {
-    let hooks = format!("core.hooksPath={NULL_DEVICE}");
+    let hooks = format!("core.hooksPath={NO_HOOKS}");
     ["protocol.allow=never", protocol]
         .into_iter()
         .chain(fixture_protocol)
@@ -1115,6 +1123,54 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn the_null_values_are_the_ones_each_platforms_git_accepts() {
+        if cfg!(windows) {
+            assert_eq!((NULL_DEVICE, NO_HOOKS), ("nul", r"\\.\nul"));
+        } else {
+            assert_eq!((NULL_DEVICE, NO_HOOKS), ("/dev/null", "/dev/null"));
+        }
+    }
+
+    /// A ref update under `core.hooksPath=NO_HOOKS` succeeds and runs no hook. With `nul`, Git
+    /// for Windows fails to spawn `nul/reference-transaction` and aborts the update.
+    #[test]
+    fn a_ref_update_without_hooks_succeeds() {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", &format!("core.hooksPath={NO_HOOKS}")])
+                .args(args)
+                .current_dir(repository.path())
+                .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git starts")
+        };
+        for args in [
+            &["init", "-q", "."][..],
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+            &["update-ref", "refs/bibcode/probe", "HEAD"],
+        ] {
+            let output = git(args);
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     fn leaf(name: &str) -> CloneLeaf {
         crate::git::clone_destination_leaf("https://example.com/repo.git", Some(name))
             .expect("a folder name")
@@ -1324,7 +1380,7 @@ pub(crate) mod tests {
             "http.curloptResolve=github.com:443:140.82.112.3",
             "http.proxy=",
             "core.fsmonitor=false",
-            &format!("core.hooksPath={NULL_DEVICE}"),
+            &format!("core.hooksPath={NO_HOOKS}"),
         ] {
             assert!(settings.contains(&expected), "{expected} in {settings:?}");
         }
@@ -1749,7 +1805,7 @@ pub(crate) mod tests {
             "submodule.recurse=false",
             "filter.lfs.smudge=",
             "core.fsmonitor=false",
-            &format!("core.hooksPath={NULL_DEVICE}"),
+            &format!("core.hooksPath={NO_HOOKS}"),
         ] {
             assert!(settings.contains(&expected), "{expected} in {settings:?}");
         }
