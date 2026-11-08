@@ -12,7 +12,8 @@ use crate::{
     git::ProcessError,
     source_control::{
         IdentifiedProvider, ProviderKind, parse_github_auth_status, parse_gitlab_auth_status,
-        provider_install_hint, remote_host, remote_repository_path,
+        provider_install_hint, remote_names_web_port, remote_repository_path, remote_web_host,
+        serving_host,
     },
 };
 
@@ -226,6 +227,8 @@ pub(super) struct RemoteScope {
     cwd: PathBuf,
     host: String,
     repository: String,
+    /// The origin as written, to match configured hosts (see `host_serves_remote`).
+    remote: String,
 }
 
 impl RemoteScope {
@@ -290,7 +293,15 @@ pub(super) fn scope_from_remote(
     remote: &str,
     identified: &IdentifiedProvider,
 ) -> Result<RemoteAdmission, Unavailable> {
-    let Some(host) = remote_host(remote) else {
+    // identify builds a recorded host's base URL from its recorded spelling, port included.
+    let recorded = match identified {
+        IdentifiedProvider::Recorded(info) => info.base_url.strip_prefix("https://"),
+        _ => None,
+    };
+    let Some(host) = recorded
+        .map(str::to_owned)
+        .or_else(|| remote_web_host(remote))
+    else {
         return Err(Unavailable::new(
             "no_remote",
             "This checkout has no hosted origin remote.",
@@ -301,6 +312,7 @@ pub(super) fn scope_from_remote(
         cwd: cwd.into(),
         host,
         repository: remote_repository_path(remote).unwrap_or_default(),
+        remote: remote.to_owned(),
     };
     // Unknown hosts still need CLI discovery before provider admission.
     let provider = match identified {
@@ -380,60 +392,61 @@ async fn resolve_existing_checkout_scope(
         Err(failure) => return Err(process_unavailable(&failure, "git", None)),
     };
     let recorded = runner.provider_hosts();
-    if read == ContextRead::Rescan
-        && let Some(host) = remote_host(&remote)
-    {
-        recorded.forget(&host);
+    if read == ContextRead::Rescan {
+        recorded.forget_remote(&remote);
     }
     let (scope, authentication) = match scope_from_remote(
         cwd,
         &remote,
         &recorded.identify(&remote),
     )? {
-        RemoteAdmission::Named(scope) => (scope, ScopeAuthentication::Named),
+        RemoteAdmission::Named(scope) => named_scope(runner, scope, &remote, c).await,
         RemoteAdmission::Recorded(scope) => (scope, ScopeAuthentication::Recorded),
-        RemoteAdmission::Unidentified(remote_scope) => {
-            let discovery =
-                if discovered_hosts.github.is_empty() && discovered_hosts.gitlab.is_empty() {
-                    discover_hosts(runner, &remote_scope, c).await?
-                } else {
-                    Discovery {
-                        hosts: discovered_hosts.clone(),
-                        github_status: None,
-                        gitlab_status: None,
-                    }
-                };
-            let hosts = &discovery.hosts;
-            let host = &remote_scope.host;
-            let provider = if hosts
-                .github
-                .iter()
-                .any(|configured| configured.eq_ignore_ascii_case(host))
-            {
-                PullRequestsProvider::Github
-            } else if hosts
-                .gitlab
-                .iter()
-                .any(|configured| configured.eq_ignore_ascii_case(host))
-            {
-                PullRequestsProvider::Gitlab
+        RemoteAdmission::Unidentified(mut remote_scope) => {
+            let probed = discovered_hosts.github.is_empty() && discovered_hosts.gitlab.is_empty();
+            let mut discovery = if probed {
+                discover_hosts(runner, &remote_scope, c).await?
             } else {
+                Discovery {
+                    hosts: discovered_hosts.clone(),
+                    github_status: None,
+                    gitlab_status: None,
+                }
+            };
+            let mut matched = configured_host(&discovery.hosts, &remote_scope);
+            if matched.is_none()
+                && probed
+                && let Some(text) = unpinned_gitlab_status(runner, &remote_scope, c).await?
+            {
+                discovery.hosts.gitlab = parse_gitlab_auth_status(&text)
+                    .into_iter()
+                    .map(|host| host.host)
+                    .collect();
+                discovery.gitlab_status = Some(text);
+                matched = configured_host(&discovery.hosts, &remote_scope);
+            }
+            let hosts = &discovery.hosts;
+            let Some((provider, configured)) = matched else {
+                let host = &remote_scope.host;
+                // glab answered, so GitLab is set up here; gh alone points to GitHub.
+                let (first, second) =
+                    if discovery.gitlab_status.is_some() || !hosts.gitlab.is_empty() {
+                        ("glab", "gh")
+                    } else {
+                        ("gh", "glab")
+                    };
                 let mut unavailable = remote_scope.unavailable(
                     "unknown_host",
                     format!(
-                        "`{host}` is not a configured GitHub or GitLab host on this environment. Run `gh auth login --hostname {host}` or `glab auth login --hostname {host}` there, then rescan."
+                        "`{host}` is not a configured GitHub or GitLab host on this environment. Run `{first} auth login --hostname {host}` or `{second} auth login --hostname {host}` there, then rescan."
                     ),
                     ProviderKind::Unknown,
                 );
-                let command = if hosts.gitlab.is_empty() {
-                    "gh"
-                } else {
-                    "glab"
-                };
-                unavailable.auth_command = Some(format!("{command} auth login --hostname {host}"));
-                recorded.forget(host);
+                unavailable.auth_command = Some(format!("{first} auth login --hostname {host}"));
+                recorded.forget_remote(&remote);
                 return Err(unavailable);
             };
+            remote_scope.host = configured;
             let status = match provider {
                 PullRequestsProvider::Github => discovery.github_status,
                 PullRequestsProvider::Gitlab => discovery.gitlab_status,
@@ -448,6 +461,102 @@ async fn resolve_existing_checkout_scope(
         scope,
         authentication,
     })
+}
+
+/// A GitLab host named over SSH or scp (`git@gitlab.example.test:group/project.git`)
+/// may be configured only with its web port (`gitlab.example.test:8929`). The bare
+/// name's login check runs first, the probe authentication runs anyway; its answer is
+/// reused and the host recorded, so later reads of a recorded bare name (snapshot reads
+/// included) spawn nothing. Only when it fails does glab, unpinned, list every host once.
+async fn named_scope(
+    runner: &HostCommandRunner,
+    scope: HostScope,
+    remote: &str,
+    c: &CancellationToken,
+) -> (HostScope, ScopeAuthentication) {
+    let provider = PullRequestsProvider::Gitlab;
+    if scope.provider != provider
+        || remote_names_web_port(remote)
+        || runner.provider_hosts().provider(&scope.host) == Some(ProviderKind::Gitlab)
+    {
+        return (scope, ScopeAuthentication::Named);
+    }
+    let bare = runner
+        .probe(
+            &scope,
+            &["auth", "status", "--hostname", scope.host.as_str()],
+            c,
+        )
+        .await
+        .or_else(ProcessFailure::into_output);
+    match bare {
+        Ok(output) => {
+            let text = status_text(provider, &output);
+            if status_authenticated(provider, &text, &scope.host) {
+                return (scope, ScopeAuthentication::Discovered(Some(text)));
+            }
+        }
+        Err(_) => return (scope, ScopeAuthentication::Named),
+    }
+    let mut every_host = scope.clone();
+    every_host.host.clear();
+    let Ok(text) = discovery_probe(runner, &every_host, c).await else {
+        return (scope, ScopeAuthentication::Named);
+    };
+    let hosts: Vec<String> = parse_gitlab_auth_status(&text)
+        .into_iter()
+        .map(|host| host.host)
+        .collect();
+    match serving_host(hosts.iter().map(String::as_str), remote) {
+        Some(host) if host != scope.host => (
+            HostScope {
+                host: host.to_owned(),
+                ..scope
+            },
+            ScopeAuthentication::Discovered(Some(text)),
+        ),
+        _ => (scope, ScopeAuthentication::Named),
+    }
+}
+
+/// The provider and configured host serving this remote: the same host, or for an SSH
+/// or scp remote, whose port is not the web port, a configured host of the same name
+/// (`host` for `host:8929`). GitHub wins a tie, as it always has.
+fn configured_host(
+    hosts: &DiscoveredHosts,
+    remote: &RemoteScope,
+) -> Option<(PullRequestsProvider, String)> {
+    [
+        (PullRequestsProvider::Github, &hosts.github),
+        (PullRequestsProvider::Gitlab, &hosts.gitlab),
+    ]
+    .into_iter()
+    .find_map(|(provider, configured)| {
+        serving_host(configured.iter().map(String::as_str), &remote.remote)
+            .map(|host| (provider, host.to_owned()))
+    })
+}
+
+/// A pinned `GITLAB_HOST` makes glab list only that exact host spelling, while glab may
+/// store this remote's host with a port: the web port an SSH or scp remote does not
+/// know (`host:8929`), or a written default port (`host:443`). When the pinned answer
+/// placed no host, glab is asked once more with an empty `GITLAB_HOST`, which pins
+/// nothing, so it lists every configured host. Only an unplaced host pays for it.
+async fn unpinned_gitlab_status(
+    runner: &HostCommandRunner,
+    remote: &RemoteScope,
+    c: &CancellationToken,
+) -> Result<Option<String>, Unavailable> {
+    let mut probe = remote.admit(PullRequestsProvider::Gitlab);
+    probe.host.clear();
+    match discovery_probe(runner, &probe, c).await {
+        Ok(text) => Ok(Some(text)),
+        Err(failure) if c.is_cancelled() => Err(remote.rescope(
+            process_unavailable(&failure, cli(PullRequestsProvider::Gitlab), None),
+            ProviderKind::Unknown,
+        )),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Both CLIs' configured hosts, plus each probe's status text. Probes run with the
@@ -1094,5 +1203,128 @@ esac"#;
             .await
             .unwrap_err();
         assert_eq!(u.into_context().unwrap_err().code, "timeout");
+    }
+
+    /// #332: glab keeps a self-hosted instance on a non-default web port as `host:port`
+    /// and lists it only when `GITLAB_HOST` is that exact host or unset. HTTP remotes
+    /// match it with their port; SSH and scp ports are not the web port, so those
+    /// remotes match it by name and the scope takes the configured host.
+    #[tokio::test]
+    async fn pull_requests_matches_a_configured_host_on_a_web_port() {
+        const GLAB: &str = r#"printf '%s|%s\n' "$GITLAB_HOST" "$*" >> calls
+case "$1 $2" in
+  '--version ') echo 'glab 1.126.0' ;;
+  'auth status')
+    if [ -z "$GITLAB_HOST" ] || [ "$GITLAB_HOST" = localhost:8929 ]; then
+      printf 'localhost:8929\n  ✓ Logged in to localhost:8929 as test-user (keyring)\n'
+    else printf '  x %s has not been authenticated with glab\n' "$GITLAB_HOST" >&2; exit 1; fi ;;
+  *) exit 64 ;;
+esac"#;
+        for (remote, expected) in [
+            (
+                "http://localhost:8929/group/project.git",
+                Ok("localhost:8929"),
+            ),
+            (
+                "ssh://git@localhost:2224/group/project.git",
+                Ok("localhost:8929"),
+            ),
+            ("git@localhost:group/project.git", Ok("localhost:8929")),
+            ("https://localhost/group/project.git", Err("localhost")),
+            (
+                "http://localhost:9999/group/project.git",
+                Err("localhost:9999"),
+            ),
+        ] {
+            let s = TestSandbox::new("pr-web-port");
+            let runner = runner(&s, Some(remote), GH, GLAB);
+            let result = resolve_scope(
+                &runner,
+                s.root(),
+                &DiscoveredHosts::default(),
+                &CancellationToken::new(),
+            )
+            .await;
+            match expected {
+                Ok(host) => {
+                    let scope = result.unwrap_or_else(|u| panic!("{remote}: {u:?}"));
+                    assert_eq!(scope.provider, PullRequestsProvider::Gitlab, "{remote}");
+                    assert_eq!(scope.host, host, "{remote}");
+                    assert_eq!(scope.repository, "group/project", "{remote}");
+                }
+                Err(host) => {
+                    let unavailable = result.unwrap_err();
+                    assert_eq!(unavailable.code, "unknown_host", "{remote}");
+                    assert_eq!(
+                        unavailable.auth_command,
+                        Some(format!("glab auth login --hostname {host}")),
+                        "{remote}"
+                    );
+                    assert!(
+                        unavailable.message.starts_with(&format!(
+                            "`{host}` is not a configured GitHub or GitLab host on this environment. Run `glab auth login --hostname {host}`"
+                        )),
+                        "{remote}: {}",
+                        unavailable.message
+                    );
+                }
+            }
+        }
+    }
+
+    /// #332 round 2: a named GitLab host over scp, an IPv6 SSH remote and a written
+    /// default port each find the host glab lists with a port. A named host whose bare
+    /// name is configured keeps it, with one shared login probe and no unpinned one.
+    #[tokio::test]
+    async fn pull_requests_named_ipv6_and_default_port_remotes_find_the_configured_port() {
+        const GLAB: &str = r#"set -f
+printf '%s|%s\n' "$GITLAB_HOST" "$*" >> calls
+listed='gitlab.example.test:8929 [::1]:8929 h.example.test:443 gitlab.bare.test'
+block() { printf '%s\n  ✓ Logged in to %s as test-user\n' "$1" "$1"; }
+case "$1 $2" in
+  '--version ') echo 'glab 1.126.0' ;;
+  'auth status')
+    want=${4:-$GITLAB_HOST}
+    if [ -z "$want" ]; then for h in $listed; do block "$h"; done; exit 0; fi
+    for h in $listed; do if [ "$h" = "$want" ]; then block "$h"; exit 0; fi; done
+    printf '  x %s has not been authenticated with glab\n' "$want" >&2; exit 1 ;;
+  *) exit 64 ;;
+esac"#;
+        for (remote, host) in [
+            (
+                "git@gitlab.example.test:group/project.git",
+                "gitlab.example.test:8929",
+            ),
+            ("ssh://git@[::1]:2224/group/project.git", "[::1]:8929"),
+            (
+                "https://h.example.test:443/group/project.git",
+                "h.example.test:443",
+            ),
+            ("git@gitlab.bare.test:group/project.git", "gitlab.bare.test"),
+        ] {
+            let s = TestSandbox::new("pr-named-port");
+            let runner = runner(&s, Some(remote), GH, GLAB);
+            let scope = resolve_scope(
+                &runner,
+                s.root(),
+                &DiscoveredHosts::default(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|u| panic!("{remote}: {u:?}"));
+            assert_eq!(scope.provider, PullRequestsProvider::Gitlab, "{remote}");
+            assert_eq!(scope.host, host, "{remote}");
+            if host == "gitlab.bare.test" {
+                let calls = std::fs::read_to_string(s.path("calls")).unwrap();
+                assert!(!calls.lines().any(|line| line == "|auth status"), "{calls}");
+                assert_eq!(
+                    calls
+                        .matches("auth status --hostname gitlab.bare.test")
+                        .count(),
+                    1,
+                    "{calls}"
+                );
+            }
+        }
     }
 }

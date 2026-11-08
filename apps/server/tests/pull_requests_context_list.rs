@@ -1111,3 +1111,70 @@ async fn pull_requests_rpc_registry_round_trips_context_list_and_typed_failure()
     server.shutdown();
     server.join().await.unwrap();
 }
+
+/// #332 against a real GitLab, such as the local Docker kit on `localhost:8929`:
+/// `pullRequests.getContext`, `pullRequests.list` and `pipelines.list` through the
+/// real `glab`, `gh` and `git` on `PATH`. Set `BIBCODE_LIVE_GITLAB_CHECKOUT` to a
+/// clone of the kit's project and `BIBCODE_LIVE_GITLAB_HOST` to the host glab lists
+/// (with `GLAB_CONFIG_DIR` pointing at the kit's isolated glab config).
+#[tokio::test]
+async fn pull_requests_live_gitlab_on_a_web_port_loads_context_requests_and_pipelines() {
+    let (Ok(checkout), Ok(host)) = (
+        std::env::var("BIBCODE_LIVE_GITLAB_CHECKOUT"),
+        std::env::var("BIBCODE_LIVE_GITLAB_HOST"),
+    ) else {
+        return;
+    };
+    let state = TempDir::new().unwrap();
+    // The hermetic guard admits only test-owned executables; these hand over to `PATH`.
+    let [gh, glab] = ["gh", "glab"].map(|cli| {
+        let path = state.path().join(cli);
+        fs::write(&path, format!("#!/bin/sh\nexec {cli} \"$@\"\n")).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    });
+    let runner = HostCommandRunner::new(state.path().join("state")).with_commands(gh, glab, "git");
+    let service = PullRequestsService::with_runner(runner);
+    let services = ConfiguredPullRequestsRpcServices {
+        service: service.clone(),
+        repositories: None,
+        worktrees: None,
+    };
+    let context = services
+        .read_unary(
+            rpc_request("pullRequests.getContext", json!({"cwd":checkout})),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(context["status"], "available", "{context}");
+    assert_eq!(context["provider"], "gitlab", "{context}");
+    assert_eq!(context["host"], host, "{context}");
+    let query = json!({"cwd":checkout,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null});
+    let page = services
+        .read_unary(
+            rpc_request("pullRequests.list", query),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(page["rows"].is_array(), "{page}");
+    let pipelines = service
+        .pipelines()
+        .list(
+            serde_json::from_value(json!({"cwd":checkout,"scope":"all","ref":null,"workflowId":null,"cursor":null,"refresh":"user"})).unwrap(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pipelines.rows.is_empty(),
+        "the kit's project has pipelines"
+    );
+    eprintln!(
+        "live {host}: context {}, {} open requests, {} pipelines",
+        context["status"],
+        page["rows"].as_array().map_or(0, Vec::len),
+        pipelines.rows.len()
+    );
+}
