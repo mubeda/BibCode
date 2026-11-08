@@ -96,6 +96,12 @@ fn in_processes(
                 .env("GIT_CONFIG_GLOBAL", root.path().join("global.gitconfig"))
                 .env("PATH", search_path(std::slice::from_ref(&bin)))
                 .env(ROOT, root.path());
+            // Git for Windows puts its exec path, then its own `bin` with a bundled git-lfs,
+            // ahead of `PATH` for the commands it runs; an exec path of `bin` puts the fake
+            // first. Every command these tests run is built in.
+            if cfg!(windows) && bin.join(executable_name("git-lfs")).exists() {
+                command.env("GIT_EXEC_PATH", &bin);
+            }
         });
     }
     None
@@ -1109,10 +1115,6 @@ async fn a_new_capture_stores_an_lfs_pointer() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    windows,
-    ignore = "Git for Windows runs its bundled git-lfs ahead of PATH"
-)]
 async fn a_full_content_blob_restores_unchanged_with_lfs_configured() {
     let Some((_, phase, root)) = in_processes(
         "a_full_content_blob_restores_unchanged_with_lfs_configured",
@@ -1201,10 +1203,6 @@ async fn an_unread_policy_keeps_checkpoints_on_the_inherited_system_file() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    windows,
-    ignore = "Git for Windows runs its bundled git-lfs ahead of PATH"
-)]
 async fn a_failed_lfs_smudge_fails_the_restore_under_required() {
     let Some((_, phase, root)) = in_processes(
         "a_failed_lfs_smudge_fails_the_restore_under_required",
