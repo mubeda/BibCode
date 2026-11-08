@@ -834,7 +834,8 @@ export default function FileBrowserPanel({
       } finally {
         restoringSelectionRef.current = false;
       }
-      model.scrollToPath(key, { offset: "nearest" });
+      // The click that asked for this left a tab that is gone now; keep the keyboard on the tree.
+      model.scrollToPath(key, { offset: "nearest", focus: true });
     }
     clearFilesReveal(threadRef, revealRequest.requestId);
   }, [clearFilesReveal, entryKinds, model, revealRequest, threadRef]);

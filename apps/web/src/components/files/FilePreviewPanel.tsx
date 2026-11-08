@@ -41,6 +41,7 @@ import { cn } from "~/lib/utils";
 import { canPreviewAnyUrlInRuntime } from "~/previewStateStore";
 import { resolvePathLinkTarget } from "~/terminal-links";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import { Button } from "~/components/ui/button";
 import { Toggle } from "~/components/ui/toggle";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
@@ -943,16 +944,15 @@ export default function FilePreviewPanel({
           <Tooltip>
             <TooltipTrigger
               render={
-                <Toggle
+                <Button
                   className="shrink-0"
-                  pressed={false}
-                  onPressedChange={() => showInFiles(relativePath)}
+                  onClick={() => showInFiles(relativePath)}
                   aria-label="Show in Files"
                   variant="ghost"
-                  size="sm"
+                  size="icon-sm"
                 >
                   <FolderSearch className="size-3.5" />
-                </Toggle>
+                </Button>
               }
             />
             <TooltipPopup>Show in Files</TooltipPopup>
