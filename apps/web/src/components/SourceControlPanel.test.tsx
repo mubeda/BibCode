@@ -934,6 +934,80 @@ describe("SourceControlPanel", () => {
     expect(captured.createPullRequest).toBeNull();
   });
 
+  const failPushWithSignIn = () =>
+    testState.runAction.mockImplementationOnce(
+      async (input: { actionId: string; onProgress: (event: Record<string, unknown>) => void }) => {
+        input.onProgress({
+          actionId: input.actionId,
+          cwd: "/repo",
+          action: "push",
+          kind: "action_failed",
+          phase: "push",
+          message: "Authentication failed.",
+          signIn: {
+            remote: "origin",
+            destination: "https://gitlab.test/team/repo.git",
+            host: "gitlab.test",
+            direction: "push",
+            resume: { actionId: input.actionId, cwd: "/repo", action: "push" },
+          },
+        });
+        return AsyncResult.failure(Cause.fail(new Error("Authentication failed.")));
+      },
+    );
+
+  it("opens the merge request review after a sign-in resumes its publishing push (#325)", async () => {
+    testState.statusQuery.data = status({
+      refName: "feature/test",
+      hasUpstream: false,
+      aheadCount: 1,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    failPushWithSignIn();
+    const props = buildProps();
+    render(props);
+    buttonsByText("Push & create MR")[0]?.onClick?.();
+    await flushPromises();
+    render(props);
+    expect(captured.createPullRequest).toBeNull();
+    for (const effect of hooks.effects) effect();
+    const offer = testState.signInOffer.mock.calls.at(-1)?.[0] as { onSignedIn: () => void };
+    offer.onSignedIn();
+    await flushPromises();
+    render(props);
+    expect(testState.runAction).toHaveBeenCalledTimes(2);
+    expect(testState.runAction).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: "push" }),
+    );
+    expect(captured.createPullRequest).toMatchObject({
+      open: true,
+      scope: { environmentId: props.threadRef.environmentId, cwd: props.gitCwd },
+    });
+  });
+
+  it("keeps the review closed when a sign-in resumes a plain push", async () => {
+    testState.statusQuery.data = status({
+      refName: "feature/test",
+      hasUpstream: false,
+      aheadCount: 1,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    failPushWithSignIn();
+    const props = buildProps();
+    render(props);
+    const push = captured.menuItems.find((item) => flattenText(item.children) === "Push");
+    expect(push).toBeDefined();
+    push?.onClick?.();
+    await flushPromises();
+    for (const effect of hooks.effects) effect();
+    const offer = testState.signInOffer.mock.calls.at(-1)?.[0] as { onSignedIn: () => void };
+    offer.onSignedIn();
+    await flushPromises();
+    render(props);
+    expect(testState.runAction).toHaveBeenCalledTimes(2);
+    expect(captured.createPullRequest).toBeNull();
+  });
+
   it("uses the shared workspace guard instead of starting Git work", () => {
     const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
     const markup = render(buildProps({ workspaceUnavailable: reason }));
