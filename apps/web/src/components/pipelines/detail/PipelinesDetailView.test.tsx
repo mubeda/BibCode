@@ -415,7 +415,7 @@ describe("PipelinesDetailView actions", () => {
       input: { cwd: "/repo", target: { _tag: "job", id: 998 }, action: "retry" },
     });
     expect(h.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId" as const,
       params: { environmentId: "env", projectId: "p", pipelineId: "4821", jobId: "1001" },
       search: {},
     });
@@ -934,7 +934,7 @@ describe("PipelinesDetailView stage columns", () => {
 describe("PipelinesDetailView job log panel", () => {
   const jobPageLinks = {
     jobLink: (jobId: number) => ({
-      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId" as const,
       params: { environmentId: "env", projectId: "p", pipelineId: "4821", jobId: String(jobId) },
     }),
   };

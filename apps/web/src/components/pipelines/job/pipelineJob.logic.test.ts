@@ -213,7 +213,7 @@ describe("jobLogSource", () => {
       kind: "on_host",
       source: { _tag: "unavailable", reason: "live_on_host", url: running.url },
     });
-    const queued = pipelineJob({ status: "pending", terminal: false, startedAt: null });
+    const queued = pipelineJob({ status: "queued", terminal: false, startedAt: null });
     expect(jobLogSource(queued, null, false).source).toEqual({
       _tag: "unavailable",
       reason: "not_started",
