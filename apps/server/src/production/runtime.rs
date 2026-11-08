@@ -1772,6 +1772,8 @@ fn review_git(build: impl Fn(&mut Command)) -> crate::process::SpawnPlan {
     crate::process::SpawnPlan::new(Path::new("git"), |program| {
         let mut command = Command::new(program);
         configure_background_command(&mut command);
+        // The shared policy: no system textconv, filter, fsmonitor or hook, and no prompt.
+        command.envs(crate::git::git_read_environment());
         build(&mut command);
         crate::process::isolate_appimage_environment(&mut command);
         command
@@ -4787,6 +4789,28 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         command.spawn().expect("git starts")
+    }
+
+    /// Review diffs and untracked listings take the shared system-configuration policy (#283).
+    #[tokio::test]
+    async fn review_git_runs_under_the_shared_git_environment() {
+        let command = review_git(|command| {
+            command.arg("diff");
+        })
+        .start(
+            |command| std::future::ready(Ok::<_, std::io::Error>(command)),
+            |_| None,
+        )
+        .await
+        .unwrap();
+        let environment: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+            .collect();
+        for variable in crate::git::git_read_environment() {
+            assert!(environment.contains(&variable), "{variable:?} missing");
+        }
     }
 
     #[tokio::test]

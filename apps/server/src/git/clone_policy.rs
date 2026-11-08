@@ -136,7 +136,7 @@ pub(crate) fn inherited_environment() -> Vec<(OsString, OsString)> {
 /// The null device, for an empty global configuration and an empty hooks folder. Git for
 /// Windows accepts only lowercase `nul` (or `/dev/null`) as `GIT_CONFIG_GLOBAL`; `NUL` fails
 /// every command, even `git --version` (#264).
-const NULL_DEVICE: &str = if cfg!(windows) { "nul" } else { "/dev/null" };
+pub(crate) const NULL_DEVICE: &str = if cfg!(windows) { "nul" } else { "/dev/null" };
 const OPERATION: &str = "GitVcsDriver.clone";
 
 const NOT_HTTPS: &str = "BiBCode clones for an agent from https:// URLs, such as https://github.com/owner/repo, and from ssh:// URLs when the agent may use terminals. git://, file://, local paths and other transports are refused; clone it in BiBCode yourself to use them.";
