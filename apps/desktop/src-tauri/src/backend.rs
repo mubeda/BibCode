@@ -5405,6 +5405,8 @@ exit /b 9
             .build(mock_context(noop_assets()))
             .expect("mock app");
         let port = free_test_port();
+        // Another test process walks onto the port while the old server stops (#338).
+        let (mut claimer, claimed) = crate::test_support::claim_port_from_another_process(port);
         let supervisor =
             BackendSupervisor::with_backend_port_resolver(Arc::new(SequenceBackendPortResolver {
                 ports: Mutex::new(VecDeque::from([port])),
@@ -5433,6 +5435,9 @@ exit /b 9
             .expect("the restart waits for the old server")
             .expect("a replacement server is running");
         assert_eq!(restarted.port, port);
+        assert!(!claimed, "another test process took the reserved port");
+        claimer.kill().ok();
+        claimer.wait().expect("port claimer exits");
 
         supervisor
             .stop(BackendShutdownConfig::default())
