@@ -13207,8 +13207,9 @@ impl SupervisorRevertProbe<'_> {
         Ok(match self.route(thread_id).await {
             Ok(Some((_, _, true))) => Some(WritingReason::UnmanagedServer),
             Ok(_) => None,
-            // Without settings BiBCode cannot launch the thread, and cannot tell its server.
-            Err(_) => None,
+            // An instance disabled or removed since may still name an external server that
+            // keeps working, so a sibling whose provider BiBCode cannot resolve is not quiet.
+            Err(_) => Some(WritingReason::Unobservable),
         })
     }
 }

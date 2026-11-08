@@ -12383,32 +12383,6 @@ async fn a_ref_a_revert_could_not_delete_is_never_the_next_turns_checkpoint() {
         )
         .await
         .unwrap();
-    // The project's default thread shares the checkout, so the scratch edit is an outside
-    // change the revert acknowledges with the token its refusal carries (#279).
-    let token = timeout(CHECKPOINT_RPC_INTEGRATION_DEADLINE, async {
-        loop {
-            if let Ok(event) = events.recv().await
-                && event.event.payload["activity"]["kind"] == "checkpoint.revert.failed"
-                && let Some(token) =
-                    event.event.payload["activity"]["payload"]["siblingChangesToken"].as_str()
-            {
-                return token.to_owned();
-            }
-        }
-    })
-    .await
-    .expect("the revert is refused with a token");
-    session
-        .engine
-        .dispatch(
-            serde_json::from_value(json!({
-                "type":"thread.checkpoint.revert", "commandId":"revert-new-acknowledged",
-                "threadId":"t1", "turnCount":2, "siblingChangesToken":token, "createdAt":NOW
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
     wait_for_event(&mut events, |event| {
         event.event.event_type == "thread.reverted" && event.event.payload["turnCount"] == 2
     })

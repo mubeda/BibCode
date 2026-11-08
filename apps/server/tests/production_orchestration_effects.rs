@@ -715,24 +715,6 @@ async fn a_turn_without_its_baseline_is_ready_without_a_diff_and_can_be_reverted
         }),
     )
     .await;
-    // The project's default thread shares the checkout, so the edit since turn 2 is an outside
-    // change the revert must acknowledge with the token its refusal carries (#279).
-    let refused = wait_for_event(&mut events, "thread.activity-appended", |event| {
-        event.event.payload["activity"]["kind"] == "checkpoint.revert.failed"
-    })
-    .await;
-    let token = refused.event.payload["activity"]["payload"]["siblingChangesToken"]
-        .as_str()
-        .expect("the refusal carries the token")
-        .to_owned();
-    dispatch(
-        &engine,
-        json!({
-            "type":"thread.checkpoint.revert", "commandId":"revert-2-acknowledged", "threadId":"t1",
-            "turnCount":2, "siblingChangesToken":token, "createdAt":NOW
-        }),
-    )
-    .await;
     wait_for_event(&mut events, "thread.reverted", |event| {
         event.event.payload["threadId"] == "t1" && event.event.payload["turnCount"] == 2
     })

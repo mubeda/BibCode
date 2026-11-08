@@ -3819,7 +3819,11 @@ work, so it is guarded (#279).
 - **Siblings.** Every other non-deleted thread, in any project, whose stored
   directory lies inside the checkout's top level and resolves to the same key. A
   candidate whose directory is gone or that Git cannot resolve refuses the
-  restore ("BiBCode can't tell whether ... works in this checkout").
+  restore ("BiBCode can't tell whether ... works in this checkout"). A thread
+  that never started a provider session and has no turn (such as a project's
+  untouched default thread) cannot have written a file: it does not make the
+  checkout shared, is not suspended and needs no token, but the restore still
+  holds it, so its first message waits.
 - **Gate.** `OrchestrationEngine` keeps one in-memory read/write lock per key.
   Each turn delivery and compaction holds it shared, after its thread
   reservation, from before its claim until the provider has the turn. A file
@@ -3834,9 +3838,10 @@ work, so it is guarded (#279).
   keyed before a repository change still counts), its provider session is
   launching, or its last turn's checkpoint is still being recorded. The
   supervisor adds: background work reported recently, work BiBCode cannot see
-  (Cursor, Grok, or Chat Activity off), and an OpenCode instance with a
+  (Cursor, Grok, or Chat Activity off), an OpenCode instance with a
   `serverUrl`, live or suspended, because BiBCode cannot prove an external
-  server quiet.
+  server quiet, and a suspended session whose provider instance no longer
+  resolves (it may have named such a server).
 - **Quiet siblings.** Under the gate the restore marks every sibling, then the
   supervisor suspends each live, idle sibling session through the idle
   suspension path. `launch_session`, where every provider driver is created,
@@ -3851,8 +3856,8 @@ work, so it is guarded (#279).
   confirmed").
 - **Turn 0.** The `HEAD` fallback for a missing ref 0 is refused when siblings
   exist, because `clean -fd` would discard their uncommitted work. A project's
-  default thread lives on its root, so a thread on the project root always has
-  that sibling.
+  default thread lives on its root, but while it never started it does not
+  count.
 
 The warning reads only evidence no sibling action removes: Git, through one
 temporary index as a capture uses, and the append-only event log.
@@ -3868,7 +3873,9 @@ shared checkout proceeds only when its token matches the one recomputed under
 the gate. A request without a token (an older client) proceeds only when no
 outside change exists. Otherwise the refusal carries the new token in its
 activity payload. The preview is advisory, runs Git, and is in
-`is_long_running`.
+`is_long_running`. It needs `orchestration:operate`, as a revert does: its
+`git add` into a temporary index runs the repository's clean filters, which can
+run commands on the host.
 
 #### Conversation-only rewind
 

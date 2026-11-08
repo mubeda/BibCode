@@ -2251,6 +2251,30 @@ struct SiblingScan {
     unresolvable: Vec<Sibling>,
     /// Deleted threads that shared the checkout, whose turns still count as outside changes.
     deleted: Vec<String>,
+    /// Threads of the checkout that never started a provider session and have no turns, so
+    /// they cannot have written a file (Mauro, #279 Q1). They do not make the checkout shared,
+    /// but a restore still holds them, so a first message waits for it.
+    dormant: Vec<String>,
+}
+
+/// Whether the thread never started a provider session and has no turn.
+async fn never_started(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+) -> Result<bool, OrchestrationEffectsError> {
+    let repositories = engine.repositories();
+    Ok(repositories
+        .get_thread_session(thread_id.to_owned())
+        .await?
+        .is_none()
+        && repositories
+            .get_provider_session_runtime(thread_id.to_owned())
+            .await?
+            .is_none()
+        && repositories
+            .list_turns_by_thread(thread_id.to_owned())
+            .await?
+            .is_empty())
 }
 
 /// Lists the other threads of `own`'s checkout. Only a thread whose stored folder lies inside
@@ -2281,6 +2305,14 @@ async fn checkout_siblings(
             || folder.starts_with(&format!("{}/", own.top_key))
             || folder.starts_with(&format!("{}\\", own.top_key));
         if !inside {
+            continue;
+        }
+        if !thread.deleted && never_started(engine, &thread.thread_id).await? {
+            if let Ok(key) = checkout_key(&directory, cancellation).await
+                && key.key == own.key
+            {
+                scan.dormant.push(thread.thread_id);
+            }
             continue;
         }
         match checkout_key(&directory, cancellation).await {
@@ -2681,10 +2713,42 @@ async fn plan_shared_restore(
     )
     .await?;
     if scan.siblings.is_empty() {
-        return match revision {
-            Some(_) => Ok((fallback_to_head, None)),
-            None => Err(missing_checkpoint(turn_count)),
+        let Some(revision) = revision else {
+            return Err(missing_checkpoint(turn_count));
         };
+        // A chat that never started cannot be writing, but its first message waits.
+        if let Err(conflict) = restore.hold_threads(&scan.dormant) {
+            return Err(hold_conflict(thread_id, &scan, conflict));
+        }
+        // No other chat works here now, but a deleted one may have changed files since the
+        // target: those still need acknowledging.
+        if !scan.deleted.is_empty() {
+            let changes = sibling_changes(
+                engine,
+                cwd,
+                thread_id,
+                turn_count,
+                &revision,
+                checkpoints,
+                &scan,
+                cancellation,
+            )
+            .await?;
+            if !changes.turns.is_empty() {
+                acknowledge_sibling_changes(thread_id, turn_count, &changes, token)?;
+                return Ok((
+                    fallback_to_head,
+                    Some(SharedRestore {
+                        siblings: Vec::new(),
+                        target_commit: changes.target_commit,
+                        current_tree: changes.current_tree,
+                        tree_start: changes.tree_start,
+                        event_ids: changes.event_ids,
+                    }),
+                ));
+            }
+        }
+        return Ok((fallback_to_head, None));
     }
     let Some(revision) = revision else {
         if turn_count == 0 {
@@ -2694,27 +2758,14 @@ async fn plan_shared_restore(
         }
         return Err(missing_checkpoint(turn_count));
     };
-    let sibling_ids = scan
+    let held = scan
         .siblings
         .iter()
         .map(|sibling| sibling.thread_id.clone())
+        .chain(scan.dormant.iter().cloned())
         .collect::<Vec<_>>();
-    if let Err(conflict) = restore.hold_threads(&sibling_ids) {
-        let (thread, reason) = match conflict {
-            crate::orchestration::engine::RestoreHoldConflict::Launching(thread) => {
-                (thread, WritingReason::StartingSession)
-            }
-            crate::orchestration::engine::RestoreHoldConflict::Admitted(thread) => {
-                (thread, WritingReason::StartingTurn)
-            }
-        };
-        let title = scan
-            .siblings
-            .iter()
-            .find(|sibling| sibling.thread_id == thread)
-            .map_or("another chat", |sibling| sibling.title.as_str());
-        tracing::warn!(thread_id, sibling_thread_id = %thread, ?reason, "a file restore was refused: another chat in its checkout is starting");
-        return Err(OrchestrationEffectsError::Effect(reason.detail(title)));
+    if let Err(conflict) = restore.hold_threads(&held) {
+        return Err(hold_conflict(thread_id, &scan, conflict));
     }
     refuse_writing_siblings(engine, probe, thread_id, &scan.siblings, true).await?;
     let changes = sibling_changes(
@@ -2728,24 +2779,7 @@ async fn plan_shared_restore(
         cancellation,
     )
     .await?;
-    let expected = changes.token();
-    let acknowledged = match token {
-        Some(token) => token == expected,
-        // An older client sends no token; it may restore only what this thread changed.
-        None => !changes.outside_changes(),
-    };
-    if !acknowledged {
-        tracing::warn!(
-            thread_id,
-            "a file restore was refused: files changed outside the chat that the request did not acknowledge"
-        );
-        return Err(OrchestrationEffectsError::Refused {
-            detail: format!(
-                "Files in this checkout changed since turn {turn_count}, outside this chat. Review them and revert again."
-            ),
-            sibling_changes_token: expected,
-        });
-    }
+    acknowledge_sibling_changes(thread_id, turn_count, &changes, token)?;
     Ok((
         false,
         Some(SharedRestore {
@@ -2756,6 +2790,57 @@ async fn plan_shared_restore(
             event_ids: changes.event_ids,
         }),
     ))
+}
+
+/// Refuses the restore unless `token` acknowledges the outside changes (an older client, with
+/// no token, may restore only when there are none).
+fn acknowledge_sibling_changes(
+    thread_id: &str,
+    turn_count: i64,
+    changes: &SiblingChanges,
+    token: Option<&str>,
+) -> Result<(), OrchestrationEffectsError> {
+    let expected = changes.token();
+    let acknowledged = match token {
+        Some(token) => token == expected,
+        None => !changes.outside_changes(),
+    };
+    if acknowledged {
+        return Ok(());
+    }
+    tracing::warn!(
+        thread_id,
+        "a file restore was refused: files changed outside the chat that the request did not acknowledge"
+    );
+    Err(OrchestrationEffectsError::Refused {
+        detail: format!(
+            "Files in this checkout changed since turn {turn_count}, outside this chat. Review them and revert again."
+        ),
+        sibling_changes_token: expected,
+    })
+}
+
+/// The refusal for a held thread that is launching a session or has a turn admitted.
+fn hold_conflict(
+    thread_id: &str,
+    scan: &SiblingScan,
+    conflict: crate::orchestration::engine::RestoreHoldConflict,
+) -> OrchestrationEffectsError {
+    let (thread, reason) = match conflict {
+        crate::orchestration::engine::RestoreHoldConflict::Launching(thread) => {
+            (thread, WritingReason::StartingSession)
+        }
+        crate::orchestration::engine::RestoreHoldConflict::Admitted(thread) => {
+            (thread, WritingReason::StartingTurn)
+        }
+    };
+    let title = scan
+        .siblings
+        .iter()
+        .find(|sibling| sibling.thread_id == thread)
+        .map_or("another chat", |sibling| sibling.title.as_str());
+    tracing::warn!(thread_id, sibling_thread_id = %thread, ?reason, "a file restore was refused: another chat in its checkout is starting");
+    OrchestrationEffectsError::Effect(reason.detail(title))
 }
 
 /// Why turn 0's `HEAD` fallback is refused on a shared checkout (Mauro, decision D).
@@ -2883,7 +2968,7 @@ pub(crate) async fn preview_checkpoint_revert(
     )
     .await?;
     let head_fallback_refused = shared && turn_count == 0 && revision.is_none();
-    let changes = match (&revision, shared) {
+    let changes = match (&revision, shared || !scan.deleted.is_empty()) {
         (Some(revision), true) => Some(
             sibling_changes(
                 engine,
@@ -2899,6 +2984,8 @@ pub(crate) async fn preview_checkpoint_revert(
         ),
         _ => None,
     };
+    // A deleted chat's changes count only when it changed files since the target.
+    let changes = changes.filter(|changes| shared || !changes.turns.is_empty());
     let conversation_rewind = match probe {
         Some(probe) => probe
             .conversation_rewind(thread_id)

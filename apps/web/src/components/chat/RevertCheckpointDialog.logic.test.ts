@@ -5,7 +5,12 @@ import {
 } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildRevertCheckpointDialog } from "./RevertCheckpointDialog.logic";
+import {
+  buildRevertCheckpointDialog,
+  type PendingRevert,
+  pendingRevertFor,
+} from "./RevertCheckpointDialog.logic";
+import { EnvironmentId } from "@bibcode/contracts";
 
 const codex = { driver: ProviderDriverKind.make("codex"), supportsConversationRewind: true };
 const claude = {
@@ -152,5 +157,30 @@ describe("buildRevertCheckpointDialog", () => {
     expect(buildRevertCheckpointDialog({ turnCount: 1, provider: null, preview: null }).title).toBe(
       "Revert to checkpoint 1?",
     );
+  });
+});
+
+describe("pendingRevertFor", () => {
+  const laptop = EnvironmentId.make("laptop");
+  const threadA = { environmentId: laptop, threadId: ThreadId.make("a") };
+  const threadB = { environmentId: laptop, threadId: ThreadId.make("b") };
+  const pending: PendingRevert = {
+    ...threadA,
+    turnCount: 3,
+    model: buildRevertCheckpointDialog({ turnCount: 3, provider: codex, preview: preview() }),
+  };
+
+  it("shows the dialog only on the thread it was opened for", () => {
+    expect(pendingRevertFor(pending, threadA)).toBe(pending);
+    // Switched to thread B while A's preview was in flight: A's dialog never shows on B, so
+    // its choice can't revert B to A's turn.
+    expect(pendingRevertFor(pending, threadB)).toBeNull();
+    expect(pendingRevertFor(pending, null)).toBeNull();
+    expect(
+      pendingRevertFor(pending, {
+        environmentId: EnvironmentId.make("server"),
+        threadId: ThreadId.make("a"),
+      }),
+    ).toBeNull();
   });
 });
