@@ -27,13 +27,32 @@ const NAME_CLASS = "min-w-0 flex-1 break-words @max-[257px]/stage:truncate";
 const ROW_CLASS =
   "flex min-h-9 min-w-0 items-center gap-2 rounded-md px-2 text-sm hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring";
 
-/** The job's own page: in BiBCode once the view provides one, on the host until then. */
+/**
+ * The job's own page: in BiBCode once the view provides one, on the host until then.
+ * Where the view shows logs in place, a plain click opens the job's log there instead.
+ */
 function JobLink({ job, children }: { job: PipelinesJob; children: ReactNode }) {
-  const route = usePipelineLinks().jobLink(job.id);
-  const className = cn(ROW_CLASS, "flex-1 no-underline");
+  const { jobLink, selectJob, selectedJobId } = usePipelineLinks();
+  const route = jobLink(job.id);
+  const selected = selectedJobId === job.id;
+  const className = cn(ROW_CLASS, "flex-1 no-underline", selected && "bg-accent");
   if (route !== null)
     return (
-      <Link {...route} className={className}>
+      <Link
+        {...route}
+        className={className}
+        aria-current={selected ? "true" : undefined}
+        onClick={
+          selectJob === undefined
+            ? undefined
+            : (event) => {
+                const modified = event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+                if (event.button !== 0 || modified) return;
+                event.preventDefault();
+                selectJob(job.id);
+              }
+        }
+      >
         {children}
       </Link>
     );
