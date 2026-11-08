@@ -2833,8 +2833,22 @@ async fn an_endpoint_paired_with_a_named_client_survives_its_relay_exiting() {
         named["pairedClientName"], "builder",
         "named with no run live"
     );
-    // Re-saving the stored id (the on/off toggle) still pairs.
-    paired_endpoint(&harness, "Named", "nc_builder").await;
+    // The on/off toggle re-saves the endpoint with its stored id: it stays paired.
+    for enabled in [false, true] {
+        let saved = harness
+            .call(
+                "upsert",
+                json!({ "id": named["id"], "name": "Named", "url": harness.receiver.url, "enabled": enabled, "eventTypes": [events::THREAD_STATUS_CHANGED], "pairedClientId": named["pairedClientId"] }),
+            )
+            .await
+            .unwrap()["endpoint"]
+            .clone();
+        assert_eq!(saved["id"], named["id"], "the same endpoint");
+        let listed = endpoint_state(&harness, &named["id"]).await;
+        assert_eq!(listed["enabled"], enabled, "{listed}");
+        assert_eq!(listed["pairedClientId"], "nc_builder", "{listed}");
+        assert_eq!(listed["pairedClientName"], "builder", "{listed}");
+    }
     harness.webhooks.shutdown().await;
 }
 
