@@ -53,6 +53,8 @@ enum Stage {
     Prepare,
     /// Step 7: the provider rewinds.
     Rollback,
+    /// After the Git restore, the workspace refreshes.
+    Refresh,
 }
 
 #[derive(Default)]
@@ -144,7 +146,10 @@ impl OrchestrationEffectCallbacks for Provider {
     }
 
     fn refresh_workspace<'a>(&'a self, _cwd: &'a Path) -> BoxEffectFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.at(Stage::Refresh).await;
+            Ok(())
+        })
     }
 
     fn revert_probe(&self) -> Option<Box<dyn RevertProbe + '_>> {
@@ -1151,6 +1156,52 @@ async fn a_sibling_execution_after_the_rewind_skips_the_file_restore() {
     );
     assert_eq!(fixture.provider.rewinds(), 1);
     assert_eq!(fixture.tracked(), "two\n", "files untouched");
+    streams_closed(&server).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_sibling_execution_during_the_restore_is_reported_and_the_restore_stands() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, None).await;
+    let mut trips = fence.trips();
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    // Paused right after Git restored the files: a start seen now came during the restore.
+    let gate = fixture.provider.pause_at(Stage::Refresh);
+    let mut events = fixture.engine.subscribe_events();
+    let outcome = fixture.request_revert("a", 1, "full", None).await;
+    entered(&gate).await;
+    server.push(&started(ROOT, None));
+    fence_tripped(&mut trips).await;
+    gate.release.notify_one();
+    outcome.await.unwrap().unwrap();
+    let warning = timeout(WAIT, async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event
+                .event
+                .payload
+                .pointer("/activity/kind")
+                .and_then(Value::as_str)
+                == Some("checkpoint.revert.sibling-started")
+            {
+                return event.event.payload["activity"].clone();
+            }
+        }
+    })
+    .await
+    .expect("the warning is recorded");
+    assert_eq!(warning["tone"], "warning");
+    assert_eq!(
+        detail(&warning["payload"]),
+        "Files were restored, but Panel, Codex's OpenCode server started working during the restore. Check Panel, Codex's changes."
+    );
+    assert_eq!(fixture.tracked(), "one\n", "the restore stands");
     streams_closed(&server).await;
     fixture.shutdown().await;
 }

@@ -67,6 +67,7 @@
               "binaryPath": "opencode",
               "serverUrl": "",
               "serverPassword": "",
+              "exclusiveServer": false,
               "customModels": []
             }
           },
