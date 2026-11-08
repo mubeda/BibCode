@@ -128,6 +128,16 @@ pub(crate) trait GitProcessRunner: Send + Sync {
     }
 }
 
+/// A chosen Source Control push of the current branch (see
+/// [`GitRepository::plan_current_branch_push`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentBranchPush {
+    pub branch: String,
+    /// The remote `args` contact.
+    pub remote: String,
+    args: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitManagerCommitOutcome {
     pub sha: Option<String>,
@@ -5859,6 +5869,37 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, GitCommandError> {
+        let push = self.plan_current_branch_push(cwd, cancellation).await?;
+        self.run_current_branch_push(cwd, &push, cancellation)
+            .await?;
+        Ok(push.branch)
+    }
+
+    /// Runs exactly the push [`Self::plan_current_branch_push`] chose.
+    pub(crate) async fn run_current_branch_push(
+        &self,
+        cwd: &Path,
+        push: &CurrentBranchPush,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.for_bounded_transfer()
+            .run(
+                "GitVcsDriver.pushCurrentBranch",
+                cwd,
+                &push.args,
+                cancellation,
+            )
+            .await
+    }
+
+    /// The push Source Control runs for the current branch and the remote it contacts. The
+    /// push itself, the sign-in offer and a resumed push's destination check (#325) all use
+    /// this one choice, so a check can never validate one remote while Git pushes to another.
+    pub(crate) async fn plan_current_branch_push(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<CurrentBranchPush, GitCommandError> {
         let branch = self.current_ref(cwd, cancellation).await?.ok_or_else(|| {
             simple_error(
                 "GitVcsDriver.pushCurrentBranch",
@@ -5875,33 +5916,59 @@ impl GitRepository {
                 cancellation,
             )
             .await?;
-        let args = if upstream.exit_code != 0 {
-            vec![
+        let (remote, args) = if upstream.exit_code != 0 {
+            let args = vec![
                 "push".into(),
                 "--set-upstream".into(),
                 "origin".into(),
                 branch.clone(),
-            ]
+            ];
+            ("origin".to_owned(), args)
         } else if let Some(remote) = self
             .renamed_upstream_remote(cwd, &branch, cancellation)
             .await?
         {
             // Publish under the local name and track it, so status compares with the branch
             // that was pushed. A non-fast-forward is still refused: nothing forces.
-            vec![
+            let args = vec![
                 "push".into(),
                 "--set-upstream".into(),
                 "--".into(),
-                remote,
+                remote.clone(),
                 format!("refs/heads/{branch}:refs/heads/{branch}"),
-            ]
+            ];
+            (remote, args)
         } else {
-            strings(&["push"])
+            // A bare push goes where Git resolves the branch's push remote: `pushRemote`,
+            // `remote.pushDefault`, the upstream's remote, then `origin`.
+            let remote = self
+                .execute_read(
+                    "GitVcsDriver.pushCurrentBranch.pushRemote",
+                    cwd,
+                    &[
+                        "for-each-ref".into(),
+                        "--format=%(push:remotename)".into(),
+                        format!("refs/heads/{branch}"),
+                    ],
+                    true,
+                    cancellation,
+                )
+                .await?
+                .stdout
+                .trim()
+                .to_owned();
+            let remote = if remote.is_empty() {
+                "origin".to_owned()
+            } else {
+                remote
+            };
+            (remote, strings(&["push"]))
         };
-        self.for_bounded_transfer()
-            .run("GitVcsDriver.pushCurrentBranch", cwd, &args, cancellation)
-            .await?;
-        Ok(branch)
+        Ok(CurrentBranchPush {
+            branch,
+            remote,
+            args,
+        })
     }
 
     /// The remote to publish `branch` to when its upstream has another name (#157), such as a

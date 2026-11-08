@@ -157,13 +157,12 @@ pub async fn resolve_destination(
     }
 }
 
-/// The remote a bare `git pull` (fetch) or `git push` (push) of the current branch contacts,
-/// as Git resolves it (`%(upstream:remotename)`, `%(push:remotename)`). A push with no
-/// configured remote goes to `origin`, as Source Control's push does.
-pub async fn current_branch_remote(
+/// The remote `vcs.pull`'s bare `git pull` contacts: the current branch's upstream remote
+/// (`%(upstream:remotename)`), which `pull_current_branch` requires. A push picks its remote
+/// with `GitRepository::plan_current_branch_push` instead.
+pub async fn upstream_remote(
     repository: &GitRepository,
     cwd: &Path,
-    direction: SignInDirection,
     cancellation: &CancellationToken,
 ) -> Option<String> {
     let head = repository
@@ -179,10 +178,7 @@ pub async fn current_branch_remote(
         )
         .await
         .ok()?;
-    let format = match direction {
-        SignInDirection::Fetch => "--format=%(upstream:remotename)",
-        SignInDirection::Push => "--format=%(push:remotename)",
-    };
+    let format = "--format=%(upstream:remotename)";
     let remote = repository
         .run(
             "GitManager.signIn.branchRemote",
@@ -199,11 +195,7 @@ pub async fn current_branch_remote(
         .stdout
         .trim()
         .to_owned();
-    if !remote.is_empty() {
-        Some(remote)
-    } else {
-        (direction == SignInDirection::Push).then(|| "origin".to_owned())
-    }
+    (!remote.is_empty()).then_some(remote)
 }
 
 /// One sign-in at a time per server.

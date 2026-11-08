@@ -463,3 +463,108 @@ fn eligibility_needs_the_flag_and_the_desktop_subject() {
     ));
     assert!(!sign_in_eligible(true, &context(None)));
 }
+
+impl RealCheckout {
+    fn git(&self, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.path)
+            .env("GIT_CONFIG_GLOBAL", &self.global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn without_upstream(&self) {
+        self.git(&["config", "--unset", "branch.main.remote"]);
+        self.git(&["config", "--unset", "branch.main.merge"]);
+    }
+}
+
+const FORK: &str = "https://git.example.test/fork/repo.git";
+/// A case name, the configuration it applies, and the remote the push must contact.
+type PushCase<'a> = (&'a str, &'a dyn Fn(&RealCheckout), &'a str);
+
+/// The push's remote is chosen once; the check, the offer and the push agree on it.
+#[tokio::test]
+async fn the_planned_push_remote_is_the_one_git_pushes_to() {
+    let cases: [PushCase; 4] = [
+        (
+            "pushRemote without an upstream pushes --set-upstream origin",
+            &|checkout| {
+                checkout.without_upstream();
+                checkout.git(&["config", "branch.main.pushRemote", "fork"]);
+            },
+            "origin",
+        ),
+        (
+            "remote.pushDefault with an upstream of the same name",
+            &|checkout| checkout.git(&["config", "remote.pushDefault", "fork"]),
+            "fork",
+        ),
+        (
+            "an upstream on another remote",
+            &|checkout| {
+                checkout.git(&["remote", "add", "upstream", FORK]);
+                checkout.git(&["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+                checkout.git(&["config", "branch.main.remote", "upstream"]);
+            },
+            "upstream",
+        ),
+        ("no upstream", &RealCheckout::without_upstream, "origin"),
+    ];
+    for (case, configure, expected) in cases {
+        let checkout = real_checkout();
+        checkout.git(&["remote", "add", "fork", FORK]);
+        configure(&checkout);
+        let runner = NetworkRunner::real(GCM_STDERR, false, &checkout);
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let push = repository
+            .plan_current_branch_push(&checkout.path, &CancellationToken::new())
+            .await
+            .expect("plan");
+        assert_eq!(push.remote, expected, "{case}");
+        let input: super::StackedActionInput = serde_json::from_value(
+            json!({ "actionId": "a1", "cwd": checkout.path, "action": "push" }),
+        )
+        .expect("input");
+        assert_eq!(
+            super::stacked_push_remote(&repository, &input, &CancellationToken::new())
+                .await
+                .as_deref(),
+            Some(expected),
+            "{case}"
+        );
+    }
+}
+
+/// With no upstream and `pushRemote=fork`, the push goes to `origin`; approving the fork's URL
+/// must not let the resumed push through to an unchecked `origin`.
+#[tokio::test]
+async fn a_resumed_push_validates_the_remote_it_pushes_to() {
+    let checkout = real_checkout();
+    checkout.git(&["remote", "add", "fork", FORK]);
+    checkout.without_upstream();
+    checkout.git(&["config", "branch.main.pushRemote", "fork"]);
+    for (expected, spawns) in [(FORK, 0), (DESTINATION, 1)] {
+        let runner = NetworkRunner::real("fatal: unrelated\n", false, &checkout);
+        let events = stacked_events(
+            &services(&runner, true),
+            json!({
+                "actionId": "a1", "cwd": checkout.path, "action": "push",
+                "expectedDestination": expected,
+            }),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        let failed = events.last().expect("terminal event");
+        assert_eq!(failed["kind"], "action_failed", "{failed}");
+        assert_eq!(
+            *runner.network_spawns.lock().expect("spawns"),
+            spawns,
+            "{expected}: {failed}"
+        );
+    }
+}
