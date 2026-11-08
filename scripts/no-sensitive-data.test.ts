@@ -69,9 +69,12 @@ function findBanned(text: string, banned: ReadonlySet<string> = BANNED_HASHES): 
 /** Short SHA plus banned hash for each commit whose message holds a banned token. */
 function findBannedInCommits(log: string, banned: ReadonlySet<string> = BANNED_HASHES): string[] {
   const findings: string[] = [];
-  for (const record of log.split("\x01")) {
-    const [sha = "", message = ""] = record.trim().split("\x00");
-    const hit = findBanned(message, banned);
+  // The log is NUL-separated: SHA, message, SHA, message, ... Git forbids NUL inside
+  // a message, so no message can swallow the next record.
+  const parts = log.split("\0");
+  for (let index = 0; index + 1 < parts.length; index += 2) {
+    const sha = parts[index]?.trim() ?? "";
+    const hit = findBanned(parts[index + 1] ?? "", banned);
     if (sha && hit) findings.push(`${sha.slice(0, 10)}: commit message matches banned hash ${hit}`);
   }
   return findings;
@@ -131,11 +134,14 @@ describe("sensitive data guard", () => {
 
   it("flags a banned token in a commit message log and names only the commit", () => {
     const banned = new Set([sha256("samplevalue")]);
-    const log = "aaaaaaaaaaaa\0fix: clean\n\x01bbbbbbbbbbbb\0chore: SampleValue slipped in\n\x01";
+    const log = "aaaaaaaaaaaa\0fix: clean\n\0bbbbbbbbbbbb\0chore: SampleValue slipped in\n\0";
     expect(findBannedInCommits(log, banned)).toEqual([
       `bbbbbbbbbb: commit message matches banned hash ${sha256("samplevalue").slice(0, 8)}`,
     ]);
     expect(findBannedInCommits("", banned)).toEqual([]);
+    // A \x01 inside a message must not hide a later banned token.
+    const sneaky = "cccccccccccc\0ok \x01 then SampleValue\n\0";
+    expect(findBannedInCommits(sneaky, banned)).toHaveLength(1);
   });
 
   // CI sets BIBCODE_SENSITIVE_RANGE (e.g. base..head) so every commit a pull
@@ -146,7 +152,7 @@ describe("sensitive data guard", () => {
     () => {
       const log = NodeChildProcess.execFileSync(
         "git",
-        ["log", String(range), "--format=%H%x00%B%x01"],
+        ["log", "-z", String(range), "--format=%H%x00%B"],
         { cwd: REPOSITORY_ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
       );
       const findings = findBannedInCommits(log);

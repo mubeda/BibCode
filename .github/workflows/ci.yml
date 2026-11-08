@@ -68,10 +68,12 @@ jobs:
           mkdir "$RUNNER_TEMP/gitleaks"
           tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
 
-      # --redact keeps matched values out of the public job log.
+      # --redact keeps matched values out of the public job log. Git hides merge
+      # diffs by default; first-parent shows what a merge changed against its first
+      # parent (conflict resolutions) without limiting which commits are walked.
       - name: Gitleaks
         run: |
-          "$RUNNER_TEMP/gitleaks/gitleaks" git --log-opts="$BIBCODE_SENSITIVE_RANGE" \
+          "$RUNNER_TEMP/gitleaks/gitleaks" git --log-opts="--diff-merges=first-parent $BIBCODE_SENSITIVE_RANGE" \
             --config .gitleaks.toml --redact --exit-code 1
 
       # Runs here, not in Check: this job already has the full history and the
