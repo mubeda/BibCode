@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased]
+
+### Checkpoints and Git
+
+- A file restore in a checkout that other chats share is refused while one of them is writing, warns about their changes before restoring, and holds their turns from planning to completion. **Rewind conversation only** rewinds a chat without touching the working tree. (#279)
+- A restore can proceed beside a chat on an external OpenCode 2 server you mark **Only BiBCode uses this server**; BiBCode refuses if it sees that server working. (#326)
+- Every BiBCode Git call uses a curated system Git configuration: checkpoints run no system hooks, filters or textconv, LFS files restore and check out with real content, and background fetches never open a credential window. On Windows, clones and checkpoints use Git-for-Windows-safe null paths. (#283, #264)
+- On the desktop app, a Git Manager or Source Control fetch, pull or push that needs Git Credential Manager offers a sign-in for the named destination, capped at 10 minutes. Source Control pull and push can be cancelled. (#325)
+
+### MCP and access
+
+- `bibcode mcp --client <name>` keeps an agent's retries, panels and paired webhook endpoint across restarts. Revoke or Stop ends that identity; an idle named client is listed with Revoke, and Take over sticks to it until Hand back. (#280, #324)
+- Access-change events are sent under the auth lock, so a revoked client no longer reappears in Settings. (#294)
+
+### Files and pipelines
+
+- Opening a file uses its own tab and keeps the Files tab with its open folders and selection. Folder crumbs are clickable, and **Show in Files** reveals the file. (#288, #323)
+- The pipeline list has an aligned header, resizable and hideable columns and a "+N" stage overflow; widths are remembered per repository. The pipeline page's stages fill the panel, can wrap, open a job's log beside them, and GitLab pipelines that use `needs` can group jobs by dependency. (#285, #286, #321, #322)
+
+### Reliability
+
+- `bibcode storage restore --resume` checks each staged file's size and SHA-256 before finishing an interrupted restore. The recovery journal is now version 3; a version-2 restore journal is refused with a documented manual recovery. (#289)
+- A desktop stop no longer waits for an outside agent's in-flight MCP `wait_for_thread`. (Refs #303)
+- Server startup runs provider and tool version probes concurrently. (#318)
+
+### Docs, CI and tests
+
+- The README shows light and dark screenshots, a feature overview and the bibcode.dev link; CI checks Markdown links. (#291, #320)
+- The macOS crash smoke logs its build time; the CI guide describes its settings. (#295)
+- Load-sensitive queue, client-runtime, desktop, job log parse and Windows server tests no longer depend on machine speed, and Cursor and Grok oversized-output recovery is covered. (#263, #264, #316, #319, #327, #328)
+
 ## [v0.15.2] - 2026-11-05
 
 BiBCode v0.15.2 fixes chat and diff interactions, provider compatibility, and diagnostics. This release includes the fixes from PR #308, PR #314, and issue #316 since v0.15.1.

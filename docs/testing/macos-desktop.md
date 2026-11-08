@@ -725,6 +725,23 @@ A simulator BiBCode booted that stays `Booted`, a simulator booted before the
 run that BiBCode shut down, a stuck touch, or a blank screen without a
 fallback fails the run.
 
+## Git sign-in (#325)
+
+Run on macOS with GCM installed. Also confirm GCM detects a desktop session when Git runs under the packaged app. With only `osxkeychain`, no approval appears and the authentication error is unchanged. The steps are checks 14 to 18 of the
+[sign-in design](../plans/2026-11-07-git-manager-interactive-sign-in-design.md#tests).
+
+1. Git Manager **Fetch** shows the approval naming the right host and remote.
+   **Sign in** opens GCM's window. Finishing it completes the fetch, and a second
+   fetch needs no sign-in.
+2. Repeat for **Push** and for Source Control commit and push. **Cancel** while the
+   window is open closes the attempt; leaving it for 10 minutes times out with
+   nothing fetched or pushed.
+3. The same fetch from the `/mcp` `git_fetch` tool, a WSL server and a paired
+   browser fail with the authentication error and open no window.
+4. Record whether GCM's refusal reaches Git's stderr at the start of a line and
+   whether `ls-remote` and the dry-run push store the credential. If either
+   differs, file an issue: the detection or the probe must change.
+
 ## Process-group cleanup
 
 Capture PID, PPID, process group, start time, executable, and command line for
