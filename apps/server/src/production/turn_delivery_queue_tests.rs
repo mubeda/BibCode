@@ -3251,27 +3251,17 @@ async fn reverts_past_the_preparation_bound_restore_in_request_order_before_late
     quiet(&mut routes).await;
 
     callbacks.release.add_permits(1);
-    // Each revert runs Git several times, so on a loaded host the five together can outlast one
-    // WAKE_WAIT. Each must follow the last within it instead, and a failed revert fails at once.
-    for reverted in 1..=THREADS.len() {
-        timeout(WAKE_WAIT, async {
-            loop {
-                let event = events.recv().await.unwrap();
-                let activity = &event.event.payload["activity"];
-                match event.event.event_type.as_str() {
-                    "thread.reverted" => return,
-                    "thread.activity-appended"
-                        if activity["kind"] == "checkpoint.revert.failed" =>
-                    {
-                        panic!("a revert failed: {}", activity["payload"]["detail"])
-                    }
-                    _ => {}
-                }
+    timeout(WAKE_WAIT, async {
+        let mut reverted = 0;
+        while reverted < THREADS.len() {
+            let event = events.recv().await.unwrap();
+            if event.event.event_type == "thread.reverted" {
+                reverted += 1;
             }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("revert {reverted} of {} is never recorded", THREADS.len()));
-    }
+        }
+    })
+    .await
+    .expect("every revert is recorded");
     received(&mut routes, "e-after").await;
 
     assert_eq!(
