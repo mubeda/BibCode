@@ -183,7 +183,16 @@ fn redacted_actor(actor: &Value) -> Option<Value> {
     };
     let kind = actor.get("kind")?.as_str().filter(|kind| is_id(kind))?;
     let client_id = actor.get("clientId")?.as_str().filter(|id| is_id(id))?;
-    Some(json!({ "kind": kind, "clientId": client_id }))
+    let mut kept = json!({ "kind": kind, "clientId": client_id });
+    // A named client's id (#280); never its name, which is the client's own text.
+    if let Some(named) = actor
+        .get("namedClientId")
+        .and_then(Value::as_str)
+        .filter(|id| is_id(id))
+    {
+        kept["namedClientId"] = named.into();
+    }
+    Some(kept)
 }
 
 /// A new, reopened, or severity-changed finding: `finding: { id, count, lastSeen }`.

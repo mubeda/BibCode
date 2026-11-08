@@ -425,6 +425,10 @@ fn public_repository_api_inventory_is_explicit() {
         "revoke_auth_pairing_link",
         "cancel_auth_pairing_offer",
         "revoke_auth_session",
+        "revoke_auth_session_and_identity",
+        "count_active_auth_pairing_links",
+        "has_mcp_named_clients",
+        "create_named_mcp_pairing_link",
         "revoke_pending_auth_session",
         "revoke_pending_auth_sessions",
         "revoke_other_auth_sessions",
@@ -1844,6 +1848,7 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
         reach: None,
         off_host: None,
         mcp_access: None,
+        mcp_named_client: None,
     };
     let later_pairing = AuthPairingLink {
         id: "pairing-b".to_owned(),
@@ -2011,6 +2016,7 @@ async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
         mcp_access: None,
+        mcp_named_client: None,
     };
     repositories
         .create_auth_pairing_link_with_offer(
@@ -2379,6 +2385,7 @@ fn pairing_offer_link(index: usize) -> AuthPairingLink {
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
         mcp_access: None,
+        mcp_named_client: None,
     }
 }
 
@@ -2401,6 +2408,7 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
             reach: Some("another-device".to_owned()),
             off_host: Some(true),
             mcp_access: None,
+            mcp_named_client: None,
         })
         .await
         .expect("pairing insert");
@@ -2532,7 +2540,8 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
     let mut revoked_others = repositories
         .revoke_other_auth_sessions("session-a".to_owned(), FUTURE.to_owned())
         .await
-        .expect("other sessions revoked");
+        .expect("other sessions revoked")
+        .sessions;
     revoked_others.sort();
     assert_eq!(revoked_others, ["session-c"]);
     assert_eq!(
@@ -2550,6 +2559,7 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
             .revoke_other_auth_sessions("session-a".to_owned(), FUTURE.to_owned())
             .await
             .expect("revoke others is idempotent")
+            .sessions
             .is_empty()
     );
     assert!(

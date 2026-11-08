@@ -389,12 +389,27 @@ pass. A fixture whose repository production Git reads (a revert, a checkpoint,
 a worktree removal) pins `core.autocrlf=false` in the repository's own
 configuration, because the test's `IsolatedGitConfig` reaches only the commands
 the fixture runs itself. The pin is still required: the packaged app's Git reads
-the system line-ending keys
-([Git process environment](../architecture/rpc-and-orchestration.md#git-process-environment)),
-but test servers never install that policy and keep `GIT_CONFIG_NOSYSTEM=1`,
-while checkpoints read the full system configuration. The repository pin beats
-both. `apps/server/tests/git_system_line_endings.rs` covers the policy with a
-fixture `GIT_CONFIG_SYSTEM` file, never the host's.
+a curated subset of the system configuration (line endings, `core.symlinks`,
+`core.fscache`, `core.longpaths`, a recognized LFS filter, well-known credential
+helpers and the TLS keys;
+[Git process environment](../architecture/rpc-and-orchestration.md#git-process-environment)),
+but test servers never install that policy, so `git_environment()` keeps
+`GIT_CONFIG_NOSYSTEM=1` while checkpoints read the full system configuration
+with hooks off. The repository pin beats both.
+`apps/server/tests/git_system_config.rs` covers the policy with a fixture
+`GIT_CONFIG_SYSTEM` file and a compiled fake `git-lfs`, never the host's.
+
+Two native checks need Git for Windows with its default system LFS filter and
+Git Credential Manager, and go in the execution report:
+
+1. Revert a thread in a repository with an LFS-tracked file across turns that
+   changed it. The file comes back with its real content, not pointer text.
+2. Start a worktree thread from a private HTTPS repository's freshly fetched
+   base branch with LFS files, once with `http.sslBackend=schannel` and once
+   with `openssl`. The bootstrap fetch authenticates with the stored credential
+   and no window opens, and the worktree holds real LFS content. Remove the
+   credential from Git Credential Manager and repeat: the fetch fails with an
+   authentication error in the work log, and still no window opens.
 
 `bibcode-server` library tests run on a Windows development machine, and these
 Windows behaviors decide how a fixture is written:

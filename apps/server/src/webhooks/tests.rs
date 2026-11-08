@@ -2750,3 +2750,149 @@ async fn an_upsert_without_status_kinds_keeps_them_and_null_clears_them() {
     assert!(store.endpoint(&id).await.unwrap().unwrap().revision > revision);
     harness.webhooks.shutdown().await;
 }
+
+/// Named clients (#280): `runs` live `mcp-client` sessions of the named client `nc_builder`,
+/// and the unnamed session `unnamed`.
+async fn seed_named_runs(harness: &Harness, runs: &[&str]) {
+    let runs: Vec<String> = runs.iter().map(|run| (*run).to_owned()).collect();
+    harness
+        .database
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES ('nc_builder', 'builder', '2026-11-07T00:00:00Z')",
+                [],
+            )?;
+            for run in runs.iter().map(String::as_str).chain(["unnamed"]) {
+                let named = (run != "unnamed").then_some("nc_builder");
+                connection.execute(
+                    "INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, issued_at, expires_at, mcp_named_client_id) VALUES (?1, 'mcp-client', '[]', 'mcp', ?2, '2026-11-07T00:00:00Z', '2099-01-01T00:00:00Z', ?3)",
+                    rusqlite::params![run, format!("MCP · {run}"), named],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn paired_endpoint(harness: &Harness, name: &str, client: &str) -> Value {
+    harness
+        .call(
+            "upsert",
+            json!({ "name": name, "url": harness.receiver.url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED], "pairedClientId": client }),
+        )
+        .await
+        .unwrap()["endpoint"]
+        .clone()
+}
+
+async fn endpoint_state(harness: &Harness, id: &Value) -> Value {
+    let listed = harness.call("list", json!({})).await.unwrap();
+    listed["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|endpoint| endpoint["id"] == *id)
+        .cloned()
+        .expect("endpoint listed")
+}
+
+async fn relay_exits(harness: &Harness, session_id: &str) {
+    assert!(
+        harness
+            .repositories
+            .revoke_mcp_credential(session_id.to_owned(), "2026-11-07T00:00:01Z".to_owned())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_paired_with_a_named_client_survives_its_relay_exiting() {
+    let harness = Harness::new().await;
+    seed_named_runs(&harness, &["run-1"]).await;
+    let named = paired_endpoint(&harness, "Named", "run-1").await;
+    assert_eq!(
+        named["pairedClientId"], "nc_builder",
+        "paired with the identity"
+    );
+    assert_eq!(named["pairedClientName"], "builder");
+    let unnamed = paired_endpoint(&harness, "Unnamed", "unnamed").await;
+    assert_eq!(unnamed["pairedClientName"], "MCP · unnamed");
+
+    relay_exits(&harness, "run-1").await;
+    relay_exits(&harness, "unnamed").await;
+    // Once the unnamed endpoint is off, the dispatcher has reconciled past both exits.
+    eventually("the unnamed endpoint to turn off", async || {
+        endpoint_state(&harness, &unnamed["id"]).await["disabledReason"] == "client-revoked"
+    })
+    .await;
+    let named = endpoint_state(&harness, &named["id"]).await;
+    assert_eq!(named["enabled"], true, "{named}");
+    assert_eq!(
+        named["pairedClientName"], "builder",
+        "named with no run live"
+    );
+    // The on/off toggle re-saves the endpoint with its stored id: it stays paired.
+    for enabled in [false, true] {
+        let saved = harness
+            .call(
+                "upsert",
+                json!({ "id": named["id"], "name": "Named", "url": harness.receiver.url, "enabled": enabled, "eventTypes": [events::THREAD_STATUS_CHANGED], "pairedClientId": named["pairedClientId"] }),
+            )
+            .await
+            .unwrap()["endpoint"]
+            .clone();
+        assert_eq!(saved["id"], named["id"], "the same endpoint");
+        let listed = endpoint_state(&harness, &named["id"]).await;
+        assert_eq!(listed["enabled"], enabled, "{listed}");
+        assert_eq!(listed["pairedClientId"], "nc_builder", "{listed}");
+        assert_eq!(listed["pairedClientName"], "builder", "{listed}");
+    }
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_revoking_a_named_clients_row_disables_its_endpoints_and_ends_every_run() {
+    let harness = Harness::new().await;
+    seed_named_runs(&harness, &["run-1", "run-2"]).await;
+    let named = paired_endpoint(&harness, "Named", "run-2").await;
+    let revoked = harness
+        .repositories
+        .revoke_auth_session_and_identity("run-1".to_owned(), "2026-11-07T00:00:01Z".to_owned())
+        .await
+        .unwrap();
+    let mut sessions = revoked.sessions;
+    sessions.sort();
+    assert_eq!(sessions, ["run-1", "run-2"]);
+    eventually("the named endpoint to turn off", async || {
+        endpoint_state(&harness, &named["id"]).await["disabledReason"] == "client-revoked"
+    })
+    .await;
+    let refused = harness
+        .call(
+            "upsert",
+            json!({ "name": "Again", "url": harness.receiver.url, "enabled": true, "eventTypes": [events::THREAD_STATUS_CHANGED], "pairedClientId": "nc_builder" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused["reason"], "invalid",
+        "an ended identity cannot be paired"
+    );
+    harness.webhooks.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_paired_with_an_unnamed_relay_turns_off_when_it_exits() {
+    let harness = Harness::new().await;
+    seed_named_runs(&harness, &[]).await;
+    let unnamed = paired_endpoint(&harness, "Unnamed", "unnamed").await;
+    assert_eq!(unnamed["pairedClientId"], "unnamed");
+    relay_exits(&harness, "unnamed").await;
+    eventually("the unnamed endpoint to turn off", async || {
+        endpoint_state(&harness, &unnamed["id"]).await["disabledReason"] == "client-revoked"
+    })
+    .await;
+    harness.webhooks.shutdown().await;
+}

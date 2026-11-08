@@ -78,6 +78,18 @@ pub(crate) fn supports_conversation_rewind(provider: &str) -> bool {
     matches!(provider, "codex" | "opencode")
 }
 
+/// Whether the provider's conversation rewind leaves the working tree alone, so a
+/// conversation-only revert can use it (#279). Codex's `thread/revert` never touches files and
+/// OpenCode 2 stages its revert with `"files": false`; OpenCode 1's `/session/{id}/revert`
+/// restores its file snapshots in the same call.
+pub(crate) fn rewind_keeps_files(provider: &str, api_version: u32) -> bool {
+    match provider {
+        "codex" => true,
+        "opencode" => api_version >= 2,
+        _ => false,
+    }
+}
+
 // The one refusal policy. Every driver builds the sentence an undelivered turn shows from these
 // helpers. `option` is the option's label where the driver has one, otherwise its id.
 

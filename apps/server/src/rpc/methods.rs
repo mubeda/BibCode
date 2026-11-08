@@ -103,6 +103,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("orchestration.getThreadShells"),
     read_unary("orchestration.getTurnDiff"),
     read_unary("orchestration.listOlderThreads"),
+    read_unary("orchestration.previewCheckpointRevert"),
     read_unary("orchestration.replayEvents"),
     read_stream("orchestration.subscribeShell"),
     read_stream("orchestration.subscribeThread"),

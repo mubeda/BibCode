@@ -11,6 +11,7 @@ import {
   ClientOrchestrationCommand,
   DispatchResult,
   ModelSelection,
+  OrchestrationActor,
   OrchestrationCheckpointSummary,
   OrchestrationCommand,
   OrchestrationEvent,
@@ -35,6 +36,7 @@ import {
   ThreadMetaUpdatedPayload,
   ThreadTurnStartCommand,
   ThreadCreatedPayload,
+  ThreadCheckpointRevertRequestedPayload,
   ThreadTurnDiff,
   ThreadTurnDiffCompletedPayload,
   ThreadTurnStartRequestedPayload,
@@ -657,6 +659,43 @@ it.effect("decodes the canonical default thread returned by project creation", (
     assert.strictEqual(result.threadId, "default-thread-1");
   }),
 );
+
+const decodeRevertRequestedPayload = Schema.decodeUnknownEffect(
+  ThreadCheckpointRevertRequestedPayload,
+);
+const decodeClientCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+
+describe("checkpoint revert mode (#279)", () => {
+  it.effect("decodes a revert request event without a mode as a full revert", () =>
+    Effect.gen(function* () {
+      const payload = yield* decodeRevertRequestedPayload({
+        threadId: "thread-1",
+        turnCount: 2,
+        createdAt: "2026-11-07T00:00:00.000Z",
+      });
+      assert.strictEqual(payload.mode, "full");
+    }),
+  );
+
+  it.effect("takes a conversation-only mode and a sibling-changes token on the command", () =>
+    Effect.gen(function* () {
+      const command = yield* decodeClientCommand({
+        type: "thread.checkpoint.revert",
+        commandId: "cmd-1",
+        threadId: "thread-1",
+        turnCount: 1,
+        mode: "conversationOnly",
+        siblingChangesToken: "abc",
+        createdAt: "2026-11-07T00:00:00.000Z",
+      });
+      assert.strictEqual(command.type, "thread.checkpoint.revert");
+      if (command.type === "thread.checkpoint.revert") {
+        assert.strictEqual(command.mode, "conversationOnly");
+        assert.strictEqual(command.siblingChangesToken, "abc");
+      }
+    }),
+  );
+});
 
 function getOptionValue(
   options: ReadonlyArray<{ id: string; value: unknown }> | undefined,
@@ -1906,5 +1945,21 @@ describe("shell cap and resume wire (#223)", () => {
       revision: "r",
       activityAges: { t1: 1200 },
     });
+  });
+});
+
+const decodeActor = Schema.decodeUnknownSync(OrchestrationActor);
+
+describe("OrchestrationActor across versions", () => {
+  it("decodes an actor with and without a named client", () => {
+    expect(decodeActor({ kind: "mcp-client", clientId: "s1", label: "MCP · a" })).toEqual({
+      kind: "mcp-client",
+      clientId: "s1",
+      label: "MCP · a",
+    });
+    expect(
+      decodeActor({ kind: "mcp-client", clientId: "s1", label: null, namedClientId: "nc_1" })
+        .namedClientId,
+    ).toBe("nc_1");
   });
 });

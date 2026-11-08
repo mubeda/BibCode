@@ -35,9 +35,9 @@ use crate::persistence::{
     AuthAuthoritySnapshot as PersistedAuthAuthoritySnapshot,
     AuthPairingLink as PersistedPairingLink, AuthPairingOffer as PersistedPairingOffer,
     AuthSession as PersistedAuthSession, AuthSessionClient as PersistedAuthSessionClient,
-    AuthSessionDeliveryState, McpOAuthAuthorization, McpOAuthCodeExchange, McpOAuthExchangeOutcome,
-    McpOAuthRefreshOutcome, McpOAuthRefreshRotation, NewAuthPairingOffer, NewAuthSession,
-    PersistenceError, Repositories,
+    AuthSessionDeliveryState, McpNamedClient, McpOAuthAuthorization, McpOAuthCodeExchange,
+    McpOAuthExchangeOutcome, McpOAuthRefreshOutcome, McpOAuthRefreshRotation, NewAuthPairingOffer,
+    NewAuthSession, PersistenceError, Repositories, RevokedAccess,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -132,6 +132,8 @@ pub(crate) struct AuthTestHooks {
     pub(crate) after_consume: std::sync::Mutex<Option<TestHold>>,
     /// After the session row commits, before the cache holds it.
     pub(crate) after_session_insert: std::sync::Mutex<Option<TestHold>>,
+    /// Immediately before issuance sends its ClientUpserted, wherever that send sits (#294).
+    pub(crate) before_session_upsert_event: std::sync::Mutex<Option<TestHold>>,
     /// Gives `mcp-client` sessions random ids, as a server before #281 did.
     pub(crate) random_mcp_session_ids: AtomicBool,
 }
@@ -322,6 +324,8 @@ struct AuthGrantMetadata {
     /// An `mcp-client` grant's pairing link: its session takes this id, so a relay that never
     /// heard back can revoke it, and a revoked link fences the insert (#281).
     mcp_link_id: Option<String>,
+    /// The named client (#280) the grant's link carried.
+    mcp_named_client: Option<McpNamedClient>,
 }
 
 struct AuthSessionIssuanceMetadata {
@@ -435,6 +439,8 @@ struct SessionRecord {
     /// every other session.
     mcp_resource: Option<String>,
     delivery_state: AuthSessionDeliveryState,
+    /// The named client (#280) this `mcp-client` session is a run of.
+    mcp_named_client: Option<McpNamedClient>,
 }
 
 #[derive(Clone)]
@@ -453,6 +459,8 @@ struct PairingRecord {
     off_host: Option<bool>,
     /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
     mcp_access: Option<String>,
+    /// The named client (#280) an `mcp-client` link signs a run of in.
+    mcp_named_client: Option<McpNamedClient>,
 }
 
 struct Grant {
@@ -469,6 +477,8 @@ struct Grant {
     /// host's own WebView exchanges it on every load and after every backend
     /// restart, so a new exchange supersedes the sessions it minted before.
     desktop_bootstrap: bool,
+    /// The named client (#280) of an `mcp-client` link.
+    mcp_named_client: Option<McpNamedClient>,
 }
 
 pub struct IssuedSession {
@@ -489,6 +499,10 @@ pub(crate) struct McpClientCredential {
     pub(crate) resource: Option<String>,
     /// A person took this agent over: its read-only access is theirs until Hand back.
     pub(crate) taken_over: bool,
+    /// The session's Authorized clients label.
+    pub(crate) label: Option<String>,
+    /// The named client (#280) this session is a run of.
+    pub(crate) named_client_id: Option<String>,
 }
 
 /// The tokens of a remote MCP grant, as the token endpoint returns them.
@@ -798,8 +812,10 @@ impl AuthService {
         (revision, pairings, sessions, pending)
     }
 
-    fn emit_access_change(&self, change: AuthAccessChange) {
-        emit_access_change_on(&self.access_events, &self.access_revision, change);
+    /// Sends `change` while the caller still holds the state lock that made it, so the
+    /// channel order is the state order (#294). `held` proves the lock is held.
+    fn emit_access_change(&self, held: &AuthState, change: AuthAccessChange) {
+        emit_access_change_on(held, &self.access_events, &self.access_revision, change);
     }
 
     fn ensure_authority_watcher(&self) {
@@ -862,20 +878,19 @@ impl AuthService {
                                     .transpose();
                                 match (
                                     snapshot_expiry,
-                                    reconcile_authority_snapshot(&state, snapshot, generation)
-                                        .await,
+                                    reconcile_authority_snapshot(
+                                        &state,
+                                        &access_events,
+                                        &access_revision,
+                                        snapshot,
+                                        generation,
+                                    )
+                                    .await,
                                 ) {
-                                    (Ok(snapshot_expiry), Ok(Some(changes))) => {
+                                    (Ok(snapshot_expiry), Ok(true)) => {
                                         observed_revision = Some(snapshot_revision);
                                         reconciled_generation = Some(generation);
                                         next_expiry_ms = snapshot_expiry;
-                                        for change in changes {
-                                            emit_access_change_on(
-                                                &access_events,
-                                                &access_revision,
-                                                change,
-                                            );
-                                        }
                                     }
                                     (Err(error), _) | (_, Err(error)) => {
                                         tracing::error!(
@@ -883,7 +898,7 @@ impl AuthService {
                                             "failed to decode durable auth authority snapshot"
                                         );
                                     }
-                                    (Ok(_), Ok(None)) => {}
+                                    (Ok(_), Ok(false)) => {}
                                 }
                             }
                             Err(PersistenceError::WorkerUnavailable) => {
@@ -1067,6 +1082,7 @@ impl AuthService {
                     off_host: grant.off_host,
                     mcp_access: grant.mcp_access,
                     mcp_link_id,
+                    mcp_named_client: grant.mcp_named_client,
                 },
                 delivery_state,
             },
@@ -1094,18 +1110,13 @@ impl AuthService {
         &self,
         token: &str,
     ) -> Result<McpClientCredential, AuthError> {
-        let (principal, access, resource, taken_over) = self
-            .authenticate_session_token_with_resource(token, SessionTransport::Plain)
+        let credential = self
+            .authenticate_session_record(token, SessionTransport::Plain)
             .await?;
-        if principal.subject != MCP_CLIENT_SUBJECT {
+        if credential.principal.subject != MCP_CLIENT_SUBJECT {
             return Err(AuthError::InvalidCredential);
         }
-        Ok(McpClientCredential {
-            principal,
-            access,
-            resource,
-            taken_over,
-        })
+        Ok(credential)
     }
 
     async fn authenticate_session_token(
@@ -1113,17 +1124,16 @@ impl AuthService {
         token: &str,
         surface: SessionTransport,
     ) -> Result<(Principal, Option<String>), AuthError> {
-        let (principal, access, _, _) = self
-            .authenticate_session_token_with_resource(token, surface)
-            .await?;
-        Ok((principal, access))
+        let credential = self.authenticate_session_record(token, surface).await?;
+        Ok((credential.principal, credential.access))
     }
 
-    async fn authenticate_session_token_with_resource(
+    /// The principal of `token`, with what its session's cached record says about it.
+    async fn authenticate_session_record(
         &self,
         token: &str,
         surface: SessionTransport,
-    ) -> Result<(Principal, Option<String>, Option<String>, bool), AuthError> {
+    ) -> Result<McpClientCredential, AuthError> {
         let claims: SessionClaims = self
             .signer
             .verify(token)
@@ -1164,11 +1174,8 @@ impl AuthService {
         {
             return Err(AuthError::InvalidCredential);
         }
-        let access = record.mcp_access.clone();
-        let resource = record.mcp_resource.clone();
-        let taken_over = record.mcp_access_hand_back.is_some();
-        Ok((
-            Principal {
+        Ok(McpClientCredential {
+            principal: Principal {
                 session_id: claims.sid,
                 subject: claims.sub,
                 method: claims.method,
@@ -1176,10 +1183,15 @@ impl AuthService {
                 proof_key_thumbprint: claims.jkt,
                 expires_at_ms: claims.exp,
             },
-            access,
-            resource,
-            taken_over,
-        ))
+            access: record.mcp_access.clone(),
+            resource: record.mcp_resource.clone(),
+            taken_over: record.mcp_access_hand_back.is_some(),
+            label: record.client.label.clone(),
+            named_client_id: record
+                .mcp_named_client
+                .as_ref()
+                .map(|named| named.id.clone()),
+        })
     }
 
     pub async fn verify_dpop(
@@ -1364,13 +1376,11 @@ impl AuthService {
             )))
         };
         state.sessions.insert(session_id.to_owned(), refreshed);
-        if change.is_some() {
+        if let Some(change) = change {
             state.bump_authority_generation();
+            self.emit_access_change(&state, change);
         }
         drop(state);
-        if let Some(change) = change {
-            self.emit_access_change(change);
-        }
         self.ensure_authority_watcher();
         Ok(())
     }
@@ -1381,12 +1391,12 @@ impl AuthService {
         cancel_live_connections(&mut state, session_id);
         if removed {
             state.bump_authority_generation();
-        }
-        drop(state);
-        if removed {
-            self.emit_access_change(AuthAccessChange::ClientRemoved {
-                session_id: session_id.to_owned(),
-            });
+            self.emit_access_change(
+                &state,
+                AuthAccessChange::ClientRemoved {
+                    session_id: session_id.to_owned(),
+                },
+            );
         }
     }
 
@@ -1551,6 +1561,7 @@ impl AuthService {
             off_host,
             mcp_access,
             mcp_link_id: _,
+            mcp_named_client: _,
         } = metadata;
         let _issuance = self.issuance.lock().await;
         if scopes.is_empty()
@@ -1615,6 +1626,7 @@ impl AuthService {
             reach,
             off_host,
             mcp_access,
+            mcp_named_client: None,
         };
         let view = record.view();
         if let Some(repositories) = &self.repositories {
@@ -1652,10 +1664,10 @@ impl AuthService {
                         None
                     };
                     state.bump_authority_generation();
-                    drop(state);
                     if let Some(change) = access_change {
-                        self.emit_access_change(change);
+                        self.emit_access_change(&state, change);
                     }
+                    drop(state);
                     self.ensure_authority_watcher();
                     return Ok(PairingIssuance::Existing(offer));
                 }
@@ -1680,8 +1692,8 @@ impl AuthService {
             );
         }
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::PairingLinkUpserted(view));
         drop(state);
-        self.emit_access_change(AuthAccessChange::PairingLinkUpserted(view));
         self.ensure_authority_watcher();
         Ok(PairingIssuance::Reserved(PairingCredentialResult {
             id,
@@ -1725,7 +1737,6 @@ impl AuthService {
     ) -> Result<PairingOfferReplay, AuthError> {
         let observed_at = now_ms();
         let lookup_key = (principal_id.to_owned(), key.to_owned());
-        let mut access_change = None;
         if let Some(repositories) = &self.repositories {
             let recovered_pairing_id = repositories
                 .recover_pending_auth_pairing_offer(
@@ -1742,12 +1753,13 @@ impl AuthService {
                 state.pairing_offer_idempotency.remove(&lookup_key);
                 let removed = state.pairings.remove(&pairing_id).is_some();
                 state.bump_authority_generation();
-                drop(state);
                 if removed {
-                    self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
-                        id: pairing_id,
-                    });
+                    self.emit_access_change(
+                        &state,
+                        AuthAccessChange::PairingLinkRemoved { id: pairing_id },
+                    );
                 }
+                drop(state);
                 self.ensure_authority_watcher();
                 return Ok(PairingOfferReplay::Fresh);
             }
@@ -1760,6 +1772,7 @@ impl AuthService {
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
             let mut state = self.state.lock().await;
+            let mut access_change = None;
             match persisted {
                 Some(authority) => {
                     let offer = authority.offer;
@@ -1787,9 +1800,9 @@ impl AuthService {
                 }
             }
             state.bump_authority_generation();
-        }
-        if let Some(change) = access_change {
-            self.emit_access_change(change);
+            if let Some(change) = access_change {
+                self.emit_access_change(&state, change);
+            }
         }
         let mut state = self.state.lock().await;
         state
@@ -1916,7 +1929,7 @@ impl AuthService {
             };
             (cancelled, offer_id)
         };
-        let removed = {
+        {
             let mut state = self.state.lock().await;
             let removed = cancelled_pairing_id
                 .as_ref()
@@ -1931,13 +1944,15 @@ impl AuthService {
                 },
             );
             state.bump_authority_generation();
-            removed
-        };
-        if self.repositories.is_some()
-            && cancelled
-            && let Some(pairing) = removed
-        {
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing.id });
+            if self.repositories.is_some()
+                && cancelled
+                && let Some(pairing) = removed
+            {
+                self.emit_access_change(
+                    &state,
+                    AuthAccessChange::PairingLinkRemoved { id: pairing.id },
+                );
+            }
         }
         Ok(cancelled)
     }
@@ -2004,8 +2019,11 @@ impl AuthService {
             let mut state = self.state.lock().await;
             state.pairings.remove(id);
             state.bump_authority_generation();
+            self.emit_access_change(
+                &state,
+                AuthAccessChange::PairingLinkRemoved { id: id.to_owned() },
+            );
             drop(state);
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: id.to_owned() });
             return Ok(true);
         }
         let mut state = self.state.lock().await;
@@ -2019,8 +2037,8 @@ impl AuthService {
         let id = pairing.id.clone();
         state.pairings.remove(&id);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::PairingLinkRemoved { id });
         drop(state);
-        self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id });
         Ok(true)
     }
 
@@ -2180,6 +2198,7 @@ impl AuthService {
             mcp_access_hand_back: None,
             mcp_resource: Some(authorization.resource.clone()),
             delivery_state: AuthSessionDeliveryState::Active,
+            mcp_named_client: None,
         };
         let outcome = repositories
             .exchange_mcp_oauth_code(
@@ -2210,8 +2229,8 @@ impl AuthService {
         let mut state = self.state.lock().await;
         state.sessions.insert(record.session_id.clone(), record);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         self.ensure_authority_watcher();
         Ok(McpOAuthMint::Minted(McpOAuthTokens {
             access_token,
@@ -2311,8 +2330,8 @@ impl AuthService {
         }
         state.pending_mcp = pending;
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::PendingMcpAuthorizations);
         drop(state);
-        self.emit_access_change(AuthAccessChange::PendingMcpAuthorizations);
         self.ensure_authority_watcher();
         Ok(())
     }
@@ -2419,8 +2438,8 @@ impl AuthService {
             shutdown.cancel();
         }
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         Ok(McpAccessChange::Changed)
     }
 
@@ -2448,10 +2467,13 @@ impl AuthService {
         state.sessions.remove(session_id);
         cancel_live_connections(&mut state, session_id);
         state.bump_authority_generation();
+        self.emit_access_change(
+            &state,
+            AuthAccessChange::ClientRemoved {
+                session_id: session_id.to_owned(),
+            },
+        );
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientRemoved {
-            session_id: session_id.to_owned(),
-        });
         Ok(true)
     }
 
@@ -2545,20 +2567,15 @@ impl AuthService {
         let revoked_at = now_ms();
         if let Some(repositories) = &self.repositories {
             let revoked = repositories
-                .revoke_auth_session(target_session_id.to_owned(), format_iso(revoked_at))
+                .revoke_auth_session_and_identity(
+                    target_session_id.to_owned(),
+                    format_iso(revoked_at),
+                )
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
-            if revoked {
-                let mut state = self.state.lock().await;
-                state.sessions.remove(target_session_id);
-                cancel_live_connections(&mut state, target_session_id);
-                state.bump_authority_generation();
-                drop(state);
-                self.emit_access_change(AuthAccessChange::ClientRemoved {
-                    session_id: target_session_id.to_owned(),
-                });
-            }
-            return Ok(revoked);
+            let changed = revoked != RevokedAccess::default();
+            self.forget_revoked(revoked).await;
+            return Ok(changed);
         }
         let mut state = self.state.lock().await;
         let Some(session) = state.sessions.get_mut(target_session_id) else {
@@ -2572,31 +2589,50 @@ impl AuthService {
         state.sessions.remove(&session_id);
         cancel_live_connections(&mut state, &session_id);
         state.bump_authority_generation();
+        self.emit_access_change(&state, AuthAccessChange::ClientRemoved { session_id });
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
         Ok(true)
+    }
+
+    /// Drops what a person's revoke ended from the cache, ends its live connections and sends
+    /// each removal under the same lock (#294). A named client's runs and links go too (#280).
+    async fn forget_revoked(&self, revoked: RevokedAccess) {
+        if revoked == RevokedAccess::default() {
+            return;
+        }
+        for client_id in &revoked.named_clients {
+            tracing::info!(named_client_id = %client_id, "ended a named MCP client's identity");
+        }
+        let mut state = self.state.lock().await;
+        for session_id in &revoked.sessions {
+            state.sessions.remove(session_id);
+            cancel_live_connections(&mut state, session_id);
+        }
+        let pairings = revoked
+            .pairings
+            .into_iter()
+            .filter(|id| state.pairings.remove(id).is_some())
+            .collect::<Vec<_>>();
+        state.bump_authority_generation();
+        for session_id in revoked.sessions {
+            self.emit_access_change(&state, AuthAccessChange::ClientRemoved { session_id });
+        }
+        for id in pairings {
+            self.emit_access_change(&state, AuthAccessChange::PairingLinkRemoved { id });
+        }
+        drop(state);
     }
 
     pub async fn revoke_other_clients(&self, current_session_id: &str) -> Result<usize, AuthError> {
         let now = now_ms();
         if let Some(repositories) = &self.repositories {
-            let removed_session_ids = repositories
+            let revoked = repositories
                 .revoke_other_auth_sessions(current_session_id.to_owned(), format_iso(now))
                 .await
                 .map_err(|error| AuthError::Internal(error.to_string()))?;
-            let mut state = self.state.lock().await;
-            for session_id in &removed_session_ids {
-                state.sessions.remove(session_id);
-                cancel_live_connections(&mut state, session_id);
-            }
-            state.bump_authority_generation();
-            drop(state);
-            for session_id in &removed_session_ids {
-                self.emit_access_change(AuthAccessChange::ClientRemoved {
-                    session_id: session_id.clone(),
-                });
-            }
-            return Ok(removed_session_ids.len());
+            let count = revoked.sessions.len();
+            self.forget_revoked(revoked).await;
+            return Ok(count);
         }
         let mut state = self.state.lock().await;
         let mut revoked = 0;
@@ -2612,10 +2648,10 @@ impl AuthService {
             cancel_live_connections(&mut state, session_id);
         }
         state.bump_authority_generation();
-        drop(state);
         for session_id in removed_session_ids {
-            self.emit_access_change(AuthAccessChange::ClientRemoved { session_id });
+            self.emit_access_change(&state, AuthAccessChange::ClientRemoved { session_id });
         }
+        drop(state);
         Ok(revoked)
     }
 
@@ -2683,6 +2719,11 @@ impl AuthService {
             .entry(session_id.to_owned())
             .or_default()
             .insert(connection_id, shutdown);
+        // Sent under the lock; the persistence below is best-effort and does not gate the event.
+        self.emit_access_change(
+            &state,
+            AuthAccessChange::ClientUpserted(Box::new(view.clone())),
+        );
         drop(state);
         let guard = AuthenticatedConnectionGuard {
             auth: self.clone(),
@@ -2701,7 +2742,6 @@ impl AuthService {
         {
             tracing::error!(%error, %session_id, "failed to persist session connection time");
         }
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         Ok(guard)
     }
 
@@ -2719,15 +2759,10 @@ impl AuthService {
         if !disconnected {
             return;
         }
-        let view = if let Some(session) = state.sessions.get_mut(session_id) {
+        if let Some(session) = state.sessions.get_mut(session_id) {
             session.connected_count = session.connected_count.saturating_sub(1);
-            Some(session.view(false))
-        } else {
-            None
-        };
-        drop(state);
-        if let Some(view) = view {
-            self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
+            let view = session.view(false);
+            self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         }
     }
 
@@ -2749,6 +2784,7 @@ impl AuthService {
                     off_host,
                     mcp_access,
                     mcp_link_id,
+                    mcp_named_client,
                 },
             delivery_state,
         } = metadata;
@@ -2798,6 +2834,7 @@ impl AuthService {
             mcp_access_hand_back: None,
             mcp_resource: None,
             delivery_state,
+            mcp_named_client,
         };
         {
             let mut state = self.state.lock().await;
@@ -2858,8 +2895,10 @@ impl AuthService {
         let mut state = self.state.lock().await;
         state.sessions.insert(session_id.clone(), record);
         state.bump_authority_generation();
+        #[cfg(test)]
+        reach_hold(&self.test_hooks.before_session_upsert_event).await;
+        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
         drop(state);
-        self.emit_access_change(AuthAccessChange::ClientUpserted(Box::new(view)));
         self.ensure_authority_watcher();
         if let Some(guard) = &mut pending_issuance_guard {
             guard.disarm();
@@ -2896,6 +2935,7 @@ impl AuthService {
                     mcp_access: None,
                     pairing_id: None,
                     desktop_bootstrap: true,
+                    mcp_named_client: None,
                 })
             } else {
                 Err(AuthError::InvalidCredential)
@@ -2917,10 +2957,13 @@ impl AuthService {
             let mut state = self.state.lock().await;
             state.pairings.remove(&pairing.id);
             state.bump_authority_generation();
+            self.emit_access_change(
+                &state,
+                AuthAccessChange::PairingLinkRemoved {
+                    id: pairing.id.clone(),
+                },
+            );
             drop(state);
-            self.emit_access_change(AuthAccessChange::PairingLinkRemoved {
-                id: pairing.id.clone(),
-            });
             return Ok(Grant {
                 scopes: pairing.scopes,
                 subject: pairing.subject,
@@ -2930,6 +2973,7 @@ impl AuthService {
                 mcp_access: pairing.mcp_access,
                 pairing_id: Some(pairing.id),
                 desktop_bootstrap: false,
+                mcp_named_client: pairing.mcp_named_client,
             });
         }
 
@@ -2960,9 +3004,13 @@ impl AuthService {
             mcp_access: pairing.mcp_access.clone(),
             pairing_id: Some(pairing_id.clone()),
             desktop_bootstrap: false,
+            mcp_named_client: pairing.mcp_named_client.clone(),
         };
+        self.emit_access_change(
+            &state,
+            AuthAccessChange::PairingLinkRemoved { id: pairing_id },
+        );
         drop(state);
-        self.emit_access_change(AuthAccessChange::PairingLinkRemoved { id: pairing_id });
         Ok(grant)
     }
 }
@@ -2996,6 +3044,7 @@ impl SessionRecord {
             mcp_access: self.mcp_access.clone(),
             mcp_access_hand_back: self.mcp_access_hand_back.clone(),
             mcp_resource: self.mcp_resource.clone(),
+            mcp_named_client: self.mcp_named_client.clone(),
         }
     }
 }
@@ -3023,7 +3072,10 @@ fn cancel_live_connections(state: &mut AuthState, session_id: &str) {
     }
 }
 
+// The send is synchronous and never waits on a receiver (a lagging one is overwritten), so
+// sending under the state lock cannot deadlock.
 fn emit_access_change_on(
+    _held: &AuthState,
     events: &broadcast::Sender<AuthAccessEvent>,
     revision: &AtomicU64,
     change: AuthAccessChange,
@@ -3044,11 +3096,15 @@ async fn authority_has_consumers(
         || access_events.receiver_count() > 0
 }
 
+/// Converges the cache to `snapshot` and sends its changes under the same lock. `false` means a
+/// local change since `expected_generation` fenced it.
 async fn reconcile_authority_snapshot(
     state: &Mutex<AuthState>,
+    access_events: &broadcast::Sender<AuthAccessEvent>,
+    access_revision: &AtomicU64,
     snapshot: PersistedAuthAuthoritySnapshot,
     expected_generation: u64,
-) -> Result<Option<Vec<AuthAccessChange>>, AuthError> {
+) -> Result<bool, AuthError> {
     let pairings = snapshot
         .pairings
         .into_iter()
@@ -3073,7 +3129,7 @@ async fn reconcile_authority_snapshot(
         .collect::<Vec<_>>();
     let mut state = state.lock().await;
     if state.authority_generation != expected_generation {
-        return Ok(None);
+        return Ok(false);
     }
 
     let mut changes = Vec::new();
@@ -3132,7 +3188,10 @@ async fn reconcile_authority_snapshot(
     state.sessions = next_sessions;
     state.pairing_offer_idempotency = offers;
     state.pending_mcp = pending_mcp;
-    Ok(Some(changes))
+    for change in changes {
+        emit_access_change_on(&state, access_events, access_revision, change);
+    }
+    Ok(true)
 }
 
 /// A pending remote authorization as BiBCode clients show it: who asks, where it returns,
@@ -3172,6 +3231,7 @@ fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
         reach: record.reach.clone(),
         off_host: record.off_host,
         mcp_access: record.mcp_access.clone(),
+        mcp_named_client: record.mcp_named_client.clone(),
     }
 }
 
@@ -3222,6 +3282,7 @@ fn pairing_record_from_persisted(row: PersistedPairingLink) -> Result<PairingRec
         reach: row.reach,
         off_host: row.off_host,
         mcp_access: row.mcp_access,
+        mcp_named_client: row.mcp_named_client,
     })
 }
 
@@ -3310,6 +3371,7 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
         mcp_access_hand_back: row.mcp_access_hand_back,
         mcp_resource: row.mcp_resource,
         delivery_state: row.delivery_state,
+        mcp_named_client: row.mcp_named_client,
     })
 }
 
@@ -3501,6 +3563,7 @@ pub(crate) async fn issue_administrative_pairing_link(
         reach: None,
         off_host: None,
         mcp_access: None,
+        mcp_named_client: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -3558,6 +3621,7 @@ pub(crate) async fn issue_offline_share_pairing(
         reach: Some(reach),
         off_host: Some(off_host),
         mcp_access: None,
+        mcp_named_client: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -3584,6 +3648,35 @@ pub(crate) async fn issue_mcp_pairing_link(
     access: &str,
     extra_scopes: &[&str],
 ) -> Result<PairingCredentialResult, AuthError> {
+    issue_mcp_link(repositories, label, access, extra_scopes, None).await
+}
+
+/// [`issue_mcp_pairing_link`] for a run of the named client `name` (#280), labelled
+/// `MCP · <name>`: the link carries the live identity of that name, made when there is none,
+/// so the session it signs in is a run of it. The store must know named clients.
+pub(crate) async fn issue_named_mcp_pairing_link(
+    repositories: &Repositories,
+    name: &str,
+    access: &str,
+    extra_scopes: &[&str],
+) -> Result<PairingCredentialResult, AuthError> {
+    issue_mcp_link(
+        repositories,
+        format!("MCP · {name}"),
+        access,
+        extra_scopes,
+        Some(name),
+    )
+    .await
+}
+
+async fn issue_mcp_link(
+    repositories: &Repositories,
+    label: String,
+    access: &str,
+    extra_scopes: &[&str],
+    name: Option<&str>,
+) -> Result<PairingCredentialResult, AuthError> {
     if let Some(scope) = extra_scopes
         .iter()
         .find(|scope| **scope != super::model::SCOPE_TERMINAL_OPERATE)
@@ -3601,11 +3694,12 @@ pub(crate) async fn issue_mcp_pairing_link(
             .collect::<Vec<_>>(),
     );
     let now = now_ms();
+    // A count names no column, so this also works on a store from before migration 70 (#280).
     let active = repositories
-        .list_active_auth_pairing_links(format_iso(now))
+        .count_active_auth_pairing_links(format_iso(now))
         .await
         .map_err(|error| AuthError::Internal(error.to_string()))?;
-    if active.len() >= MAX_ACTIVE_PAIRINGS {
+    if active >= MAX_ACTIVE_PAIRINGS {
         return Err(AuthError::Internal(
             "active pairing capacity exceeded".to_owned(),
         ));
@@ -3624,11 +3718,20 @@ pub(crate) async fn issue_mcp_pairing_link(
         reach: None,
         off_host: None,
         mcp_access: Some(access.to_owned()),
+        mcp_named_client: None,
     };
-    repositories
-        .create_auth_pairing_link(persisted_pairing_link(&record))
-        .await
-        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    match name {
+        Some(name) => repositories
+            .create_named_mcp_pairing_link(persisted_pairing_link(&record), name.to_owned())
+            .await
+            .map(drop),
+        None => {
+            repositories
+                .create_auth_pairing_link(persisted_pairing_link(&record))
+                .await
+        }
+    }
+    .map_err(|error| AuthError::Internal(error.to_string()))?;
     Ok(PairingCredentialResult {
         id: record.id,
         credential: record.credential,
@@ -6213,6 +6316,7 @@ mod tests {
                         reach: None,
                         off_host: None,
                         mcp_access: None,
+                        mcp_named_client: None,
                     },
                 );
             }
@@ -6265,6 +6369,7 @@ mod tests {
                         mcp_access_hand_back: None,
                         mcp_resource: None,
                         delivery_state: AuthSessionDeliveryState::Active,
+                        mcp_named_client: None,
                     },
                 );
             }
@@ -6301,6 +6406,7 @@ mod tests {
                 reach: Some("another-device".to_owned()),
                 off_host: Some(true),
                 mcp_access: None,
+                mcp_named_client: None,
             },
         );
     }
@@ -6985,6 +7091,7 @@ mod tests {
                 reach: Some("another-device".to_owned()),
                 off_host: Some(true),
                 mcp_access: None,
+                mcp_named_client: None,
             })
             .await
             .expect("expiring authority row");
@@ -7447,5 +7554,328 @@ mod tests {
                 .iter()
                 .all(|client| client.session_id != link.id)
         );
+    }
+
+    /// A revoke that lands while issuance is about to send its ClientUpserted must not leave
+    /// the client in Settings: events go out in state order (#294). The hold sits right before
+    /// that send, so if the send ever moves after the unlock, the watcher reconciles inside
+    /// the hold and the late upsert resurrects the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revoke_reconciled_between_publication_and_its_event_is_removed_from_settings() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let mut events = service.subscribe_access();
+        let link = issue_mcp_pairing_link(&repositories, "MCP · gap".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        let (held, reached, resume) = test_hold();
+        *service
+            .test_hooks()
+            .before_session_upsert_event
+            .lock()
+            .unwrap() = Some(held);
+        let exchange = exchange_in_background(&service, &link.credential).await;
+        reached
+            .await
+            .expect("the session is published to the cache");
+        repositories
+            .revoke_mcp_credential(link.id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        let mut settings = std::collections::HashSet::new();
+        let mut fold = |change: &AuthAccessChange| match change {
+            AuthAccessChange::ClientUpserted(view) => {
+                settings.insert(view.session_id.clone());
+            }
+            AuthAccessChange::ClientRemoved { session_id } => {
+                settings.remove(session_id);
+            }
+            _ => {}
+        };
+        // Sending under the lock keeps the watcher out until the hold ends; a send after the
+        // unlock lets it reconcile the revoke here. Either way, give it several ticks.
+        let _ = tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 8, async {
+            loop {
+                let change = events.recv().await.expect("access events").change;
+                fold(&change);
+                if matches!(&change, AuthAccessChange::ClientRemoved { session_id } if *session_id == link.id)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        resume.send(()).unwrap();
+        exchange.await.unwrap().expect("issued");
+        // Issuance sends before it returns, so everything it sent precedes this marker.
+        let marker = issue_mcp_pairing_link(&repositories, "MCP · marker".into(), "read-only", &[])
+            .await
+            .expect("link issues");
+        tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+            loop {
+                let change = events.recv().await.expect("access events").change;
+                fold(&change);
+                if matches!(&change, AuthAccessChange::PairingLinkUpserted(view) if view.id == marker.id)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the watcher reconciled the marker");
+        // One reconcile sends its pairing changes before its session changes, all under one
+        // lock, so the rest of the marker's batch is already queued.
+        while let Ok(event) = events.try_recv() {
+            fold(&event.change);
+        }
+        assert!(
+            !settings.contains(&link.id),
+            "the access stream resurrected the revoked client"
+        );
+        assert!(
+            service
+                .list_clients("")
+                .await
+                .iter()
+                .all(|client| client.session_id != link.id)
+        );
+    }
+
+    /// Named MCP clients (#280): one identity across runs, ended only by a person.
+    mod named_clients {
+        use super::*;
+
+        async fn named_link(repositories: &Repositories, name: &str) -> PairingCredentialResult {
+            issue_named_mcp_pairing_link(repositories, name, "read-only", &[])
+                .await
+                .expect("named link issues")
+        }
+
+        async fn run(service: &AuthService, repositories: &Repositories, name: &str) -> String {
+            let link = named_link(repositories, name).await;
+            exchange_in_background(service, &link.credential)
+                .await
+                .await
+                .unwrap()
+                .expect("exchange")
+                .principal
+                .session_id
+        }
+
+        async fn named_id(repositories: &Repositories, session_id: &str) -> Option<String> {
+            repositories
+                .get_auth_session(session_id.to_owned())
+                .await
+                .unwrap()
+                .expect("session row")
+                .mcp_named_client
+                .map(|named| named.id)
+        }
+
+        async fn revoked(repositories: &Repositories, session_id: &str) -> bool {
+            repositories
+                .get_auth_session(session_id.to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|session| session.revoked_at.is_some())
+        }
+
+        #[tokio::test]
+        async fn a_named_client_revoked_before_its_link_is_consumed_gets_no_session() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            let identity = named_id(&repositories, &first).await.expect("a named run");
+            assert!(identity.starts_with("nc_"));
+            let next = named_link(&repositories, "builder").await;
+            assert!(service.revoke_client("person", &first).await.unwrap());
+            let exchanged = exchange_in_background(&service, &next.credential)
+                .await
+                .await
+                .unwrap();
+            assert!(matches!(exchanged, Err(AuthError::InvalidCredential)));
+            let fresh = run(&service, &repositories, "builder").await;
+            assert_ne!(
+                named_id(&repositories, &fresh).await.as_deref(),
+                Some(identity.as_str()),
+                "the next run starts a new identity"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_named_client_revoked_after_consumption_but_before_the_session_insert_gets_no_session()
+         {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            let next = named_link(&repositories, "builder").await;
+            let (held, reached, resume) = test_hold();
+            *service.test_hooks().after_consume.lock().unwrap() = Some(held);
+            let exchange = exchange_in_background(&service, &next.credential).await;
+            reached.await.expect("consumed");
+            assert!(service.revoke_client("person", &first).await.unwrap());
+            resume.send(()).unwrap();
+            assert!(matches!(
+                exchange.await.unwrap(),
+                Err(AuthError::InvalidCredential)
+            ));
+            assert!(
+                repositories
+                    .get_auth_session(next.id.clone())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(service.list_clients("").await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn revoking_a_named_client_revokes_its_live_sessions_and_unconsumed_links() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let mut events = service.subscribe_access();
+            let first = run(&service, &repositories, "builder").await;
+            let second = run(&service, &repositories, "builder").await;
+            assert_eq!(
+                named_id(&repositories, &first).await,
+                named_id(&repositories, &second).await,
+                "two live runs of one name share the identity"
+            );
+            let other = run(&service, &repositories, "reviewer").await;
+            let pending = named_link(&repositories, "builder").await;
+            while events.try_recv().is_ok() {}
+
+            assert!(service.revoke_client("person", &second).await.unwrap());
+
+            assert!(revoked(&repositories, &first).await);
+            assert!(revoked(&repositories, &second).await);
+            assert!(
+                !revoked(&repositories, &other).await,
+                "another name is untouched"
+            );
+            assert!(
+                repositories
+                    .list_active_auth_pairing_links(format_iso(now_ms()))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|link| link.id != pending.id),
+                "the unconsumed link is revoked"
+            );
+            let clients = service.list_clients("").await;
+            assert_eq!(
+                clients
+                    .iter()
+                    .map(|client| client.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                [other.as_str()]
+            );
+            let mut removed = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let AuthAccessChange::ClientRemoved { session_id } = event.change {
+                    removed.push(session_id);
+                }
+            }
+            removed.sort();
+            let mut expected = vec![first, second];
+            expected.sort();
+            assert_eq!(
+                removed, expected,
+                "one removal per run, sent with the revoke"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_relay_revoke_never_ends_its_named_client() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            let identity = named_id(&repositories, &first).await;
+            assert!(
+                repositories
+                    .revoke_mcp_credential(first.clone(), format_iso(now_ms()))
+                    .await
+                    .unwrap()
+            );
+            let second = run(&service, &repositories, "builder").await;
+            assert_eq!(named_id(&repositories, &second).await, identity);
+            let view = service
+                .list_clients("")
+                .await
+                .into_iter()
+                .find(|client| client.session_id == second)
+                .expect("the new run is listed");
+            assert_eq!(view.client.label.as_deref(), Some("MCP · builder"));
+            assert_eq!(
+                view.mcp_named_client.map(|named| named.name).as_deref(),
+                Some("builder")
+            );
+        }
+
+        /// Stop on the row of a run that already exited ends the identity, live runs included.
+        #[tokio::test]
+        async fn stopping_an_earlier_runs_row_ends_its_identity() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            repositories
+                .revoke_mcp_credential(first.clone(), format_iso(now_ms()))
+                .await
+                .unwrap();
+            let second = run(&service, &repositories, "builder").await;
+            let stopped = service.stop_client("person", &first).await.unwrap();
+            assert!(stopped.revoked);
+            assert!(
+                revoked(&repositories, &second).await,
+                "the live run ends too"
+            );
+        }
+
+        /// Revoke others ends each named client one of the revoked sessions was a run of.
+        #[tokio::test]
+        async fn revoke_others_ends_the_named_clients_of_the_sessions_it_revokes() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            let pending = named_link(&repositories, "builder").await;
+            assert_eq!(service.revoke_other_clients("person").await.unwrap(), 1);
+            assert!(revoked(&repositories, &first).await);
+            let exchanged = exchange_in_background(&service, &pending.credential)
+                .await
+                .await
+                .unwrap();
+            assert!(matches!(exchanged, Err(AuthError::InvalidCredential)));
+        }
+
+        /// An older relay's SQL names no migration-70 column; on a migrated store its link and
+        /// session are unnamed and its revoke works.
+        #[tokio::test]
+        async fn an_older_relays_link_and_session_on_a_migrated_store_are_unnamed() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let created_at = format_iso(now_ms());
+            let expires_at = format_iso(now_ms() + 60_000);
+            repositories
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "INSERT INTO auth_pairing_links (
+                            id, credential, method, scopes, subject, label, proof_key_thumbprint,
+                            created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access
+                         ) VALUES ('old-link', 'old-credential', 'one-time-token',
+                           '[\"orchestration:read\",\"orchestration:operate\"]', 'mcp-client',
+                           'MCP · old', NULL, ?, ?, NULL, NULL, NULL, NULL, 'read-only')",
+                        rusqlite::params![created_at, expires_at],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let session = exchange_in_background(&service, "old-credential")
+                .await
+                .await
+                .unwrap()
+                .expect("exchange");
+            assert_eq!(session.principal.session_id, "old-link");
+            assert_eq!(named_id(&repositories, "old-link").await, None);
+            assert!(
+                repositories
+                    .revoke_mcp_credential("old-link".to_owned(), format_iso(now_ms()))
+                    .await
+                    .unwrap()
+            );
+        }
     }
 }

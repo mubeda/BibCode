@@ -36,8 +36,10 @@ const SQLITE_PROGRESS_OPS: i32 = 1_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_PUBLICATION_TIME_SKEW: Duration = Duration::from_secs(60);
 pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-const JOURNAL_VERSION: u32 = 2;
+const JOURNAL_VERSION: u32 = 3;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
+/// The guide section that finishes a version-2 restore journal `--resume` refuses.
+const EARLIER_VERSION_RESTORE_GUIDE: &str = "https://github.com/mubeda/BibCode/blob/main/docs/guides/project-data-recovery.md#finish-a-restore-started-by-an-earlier-version";
 /// The command every "interrupted recovery" refusal names.
 pub const RESUME_COMMAND: &str = "bibcode storage restore --resume";
 
@@ -440,8 +442,10 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Version 2 records the staged files' identities, so `restore --resume` can tell an
-/// installed staged file from a live one that still has to be preserved.
+/// Version 3 records each staged file's identity, size and SHA-256. The identity tells an
+/// installed staged file from a live one that still has to be preserved; the content proves on
+/// resume that the file is still the one staged, since an identity survives an in-place edit
+/// and Linux reuses freed inode numbers. Version 2 recorded identities only.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecoveryJournal {
@@ -453,8 +457,35 @@ struct RecoveryJournal {
     backup_id: Option<String>,
     phase: String,
     preserved_directory: String,
-    staged_database: Option<FileIdentity>,
-    staged_marker: Option<FileIdentity>,
+    staged_database: Option<StagedFile>,
+    staged_marker: Option<StagedFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedFile {
+    #[serde(flatten)]
+    identity: FileIdentity,
+    size_bytes: u64,
+    sha256: String,
+}
+
+impl StagedFile {
+    /// Size first, so a resized file costs no hash pass; the identity is checked again after
+    /// hashing so the hashed bytes belong to the file that was matched.
+    fn content_matches(
+        &self,
+        path: &Path,
+        snapshot: &PlainPathSnapshot,
+    ) -> Result<bool, BackupError> {
+        if snapshot.size != self.size_bytes {
+            return Ok(false);
+        }
+        let (size, sha256) = database_size_and_hash(path, None, None)?;
+        Ok(size == self.size_bytes
+            && sha256 == self.sha256
+            && plain_path_snapshot(path, PlainPathKind::File)?.identity == snapshot.identity)
+    }
 }
 
 /// The result of `bibcode storage restore --resume`.
@@ -1515,7 +1546,7 @@ fn restore_backup_blocking(
     // `restore --resume`.
     debug_pause_at("journal-published");
     let preserved_directory = paths.recovery_dir().join(&journal.preserved_directory);
-    roll_forward(paths, &journal, fault)?;
+    roll_forward(paths, &journal, false, fault)?;
     Ok(RecoveryResult {
         operation_id: journal.operation_id,
         action: RecoveryAction::Restore,
@@ -1617,10 +1648,21 @@ fn stage_restore(
         backup_id: Some(backup_id.to_string()),
         phase: "preserving-live-store".to_owned(),
         preserved_directory: preserved_name,
-        staged_database: Some(
-            inspect_plain_child_file(&staging_boundary, &staged_database)?.identity,
-        ),
-        staged_marker: Some(inspect_plain_child_file(&staging_boundary, &staged_marker)?.identity),
+        // `copy_verified_database` proved the staged copy has the manifest's size and digest.
+        staged_database: Some(StagedFile {
+            identity: inspect_plain_child_file(&staging_boundary, &staged_database)?.identity,
+            size_bytes: selected.manifest.database_size_bytes,
+            sha256: selected.manifest.sha256.clone(),
+        }),
+        staged_marker: Some({
+            let identity = inspect_plain_child_file(&staging_boundary, &staged_marker)?.identity;
+            let (size_bytes, sha256) = database_size_and_hash(&staged_marker, None, None)?;
+            StagedFile {
+                identity,
+                size_bytes,
+                sha256,
+            }
+        }),
     };
     publish_journal(paths, &journal, fault, artifacts)?;
     Ok(journal)
@@ -1717,19 +1759,17 @@ fn read_marker_id(paths: &StatePaths) -> Result<Option<StorageInstanceId>, Backu
 /// Finishes a published journal: preserves every live file that is not a staged one, syncs the
 /// preserved directory, installs the staged files, then removes staging and the journal. Each
 /// step is decided from the files, so an interrupted run is finished by the next one.
+/// `verify_content` hashes each staged file before anything moves; the operation that staged
+/// them in this process passes `false`, since it has just verified those bytes.
 fn roll_forward(
     paths: &StatePaths,
     journal: &RecoveryJournal,
+    verify_content: bool,
     fault: RecoveryFault,
 ) -> Result<(), RecoveryError> {
     let refused = |detail: &str| RecoveryError::ResumeRefused {
         detail: detail.to_owned(),
     };
-    if journal.version != JOURNAL_VERSION {
-        return Err(refused(
-            "the recovery journal was written by another BiBCode version",
-        ));
-    }
     if journal.state_kind != paths.state_kind {
         return Err(refused("the recovery journal names another state kind"));
     }
@@ -1743,12 +1783,23 @@ fn roll_forward(
             "the recovery journal names an unexpected preserved directory",
         ));
     }
-    let is_restore = journal.action == RecoveryAction::Restore;
-    if is_restore != (journal.staged_database.is_some() && journal.staged_marker.is_some()) {
-        return Err(refused(
-            "the recovery journal does not record its staged files",
-        ));
-    }
+    // Each staged file with the live path it is installed at.
+    let staged = match (
+        journal.action,
+        &journal.staged_database,
+        &journal.staged_marker,
+    ) {
+        (RecoveryAction::Restore, Some(database), Some(marker)) => vec![
+            (BACKUP_FILE_NAME, &paths.database, database),
+            (MARKER_FILE_NAME, &paths.environment_id, marker),
+        ],
+        (RecoveryAction::StartEmpty, None, None) => Vec::new(),
+        _ => {
+            return Err(refused(
+                "the recovery journal does not record its staged files",
+            ));
+        }
+    };
     let root_boundary = inspect_root_directory(&paths.base_dir)?;
     let state_boundary = inspect_child_directory(&root_boundary, &paths.state_dir)?;
     let recovery_root_boundary =
@@ -1761,7 +1812,7 @@ fn roll_forward(
 
     let staging_directory = paths.recovery_staging_dir(journal.operation_id);
     let staging_boundary = if path_entry_exists(&staging_directory)? {
-        if !is_restore {
+        if staged.is_empty() {
             return Err(refused("a start-empty operation has a staging directory"));
         }
         let boundary = inspect_child_directory(&root_boundary, &staging_directory)?;
@@ -1773,15 +1824,17 @@ fn roll_forward(
                 path: staging_directory.clone(),
                 source,
             })?;
-            let expected = if entry.file_name() == OsStr::new(BACKUP_FILE_NAME) {
-                journal.staged_database
-            } else if entry.file_name() == OsStr::new(MARKER_FILE_NAME) {
-                journal.staged_marker
-            } else {
+            let Some((_, _, expected)) = staged
+                .iter()
+                .find(|(name, _, _)| entry.file_name() == OsStr::new(name))
+            else {
                 return Err(refused("the staging directory holds an unexpected entry"));
             };
             let snapshot = inspect_plain_child_file(&boundary, &entry.path())?;
-            if Some(snapshot.identity) != expected || snapshot.links != 1 {
+            if snapshot.identity != expected.identity
+                || snapshot.links != 1
+                || (verify_content && !expected.content_matches(&entry.path(), &snapshot)?)
+            {
                 return Err(refused("a staged file is not the one the journal recorded"));
             }
         }
@@ -1790,30 +1843,30 @@ fn roll_forward(
         None
     };
 
-    // Before anything moves: each staged file must be in staging (its identity checked above)
-    // or already installed in the store. Otherwise finishing would leave no database.
-    if is_restore {
-        for (name, live, identity) in [
-            (BACKUP_FILE_NAME, &paths.database, journal.staged_database),
-            (
-                MARKER_FILE_NAME,
-                &paths.environment_id,
-                journal.staged_marker,
-            ),
-        ] {
-            let in_staging =
-                staging_boundary.is_some() && path_entry_exists(&staging_directory.join(name))?;
-            let installed = path_entry_exists(live)?
-                && Some(plain_path_snapshot(live, PlainPathKind::File)?.identity) == identity;
-            if !in_staging && !installed {
-                return Err(refused(
-                    "a staged file is missing from both staging and the store",
-                ));
-            }
+    // Before anything moves: each staged file must be in staging (checked above) or already
+    // installed in the store. Otherwise finishing would leave no database.
+    for (name, live, expected) in &staged {
+        if staging_boundary.is_some() && path_entry_exists(&staging_directory.join(name))? {
+            continue;
+        }
+        let snapshot = if path_entry_exists(live)? {
+            Some(plain_path_snapshot(live, PlainPathKind::File)?)
+        } else {
+            None
+        };
+        let Some(snapshot) = snapshot.filter(|snapshot| snapshot.identity == expected.identity)
+        else {
+            return Err(refused(
+                "a staged file is missing from both staging and the store",
+            ));
+        };
+        if verify_content && !expected.content_matches(live, &snapshot)? {
+            return Err(refused(
+                "an installed staged file is not the one the journal recorded",
+            ));
         }
     }
 
-    let staged = [journal.staged_database, journal.staged_marker];
     for source in [
         paths.database.clone(),
         sqlite_sidecar_path(&paths.database, "-wal"),
@@ -1823,8 +1876,12 @@ fn roll_forward(
         if !path_entry_exists(&source)? {
             continue;
         }
+        // Only a staged file at its own live path stays; sidecars are always preserved.
         let identity = plain_path_snapshot(&source, PlainPathKind::File)?.identity;
-        if staged.contains(&Some(identity)) {
+        if staged
+            .iter()
+            .any(|(_, live, expected)| **live == source && expected.identity == identity)
+        {
             continue;
         }
         preserve_live_file(&state_boundary, &source, &preserved_boundary)?;
@@ -1952,7 +2009,7 @@ fn preserve_and_start_empty_blocking(
             return Err(error);
         }
     };
-    roll_forward(paths, &journal, fault)?;
+    roll_forward(paths, &journal, false, fault)?;
     Ok(RecoveryResult {
         operation_id: journal.operation_id,
         action: RecoveryAction::StartEmpty,
@@ -1995,7 +2052,7 @@ async fn resume_recovery_inner(
             });
         }
         let journal = read_journal(&journal_path)?;
-        let result = roll_forward(&paths, &journal, fault);
+        let result = roll_forward(&paths, &journal, true, fault);
         if let Err(error) = &result {
             tracing::warn!(
                 operation_id = %journal.operation_id,
@@ -2037,10 +2094,31 @@ fn read_journal(path: &Path) -> Result<RecoveryJournal, RecoveryError> {
         path: path.to_path_buf(),
         source,
     })?;
-    serde_json::from_slice(&bytes).map_err(|_| RecoveryError::ResumeRefused {
-        detail: "the recovery journal was written by another BiBCode version or is damaged"
-            .to_owned(),
-    })
+    let refused = |detail: &str| RecoveryError::ResumeRefused {
+        detail: detail.to_owned(),
+    };
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    let version = serde_json::from_slice::<Versioned>(&bytes)
+        .map_err(|_| {
+            refused("the recovery journal was written by another BiBCode version or is damaged")
+        })?
+        .version;
+    let journal = serde_json::from_slice::<RecoveryJournal>(&bytes).ok();
+    match (version, journal) {
+        (JOURNAL_VERSION, Some(journal)) => Ok(journal),
+        // Version 2 lacks only the staged files' contents, and a start-empty stages nothing.
+        (2, Some(journal)) if journal.action == RecoveryAction::StartEmpty => Ok(journal),
+        (2, _) => Err(refused(&format!(
+            "the recovery journal was written by an earlier BiBCode version that did not record the staged files' contents, so they cannot be verified; nothing was changed. Finish the restore by hand as {EARLIER_VERSION_RESTORE_GUIDE} describes"
+        ))),
+        (JOURNAL_VERSION, None) => Err(refused("the recovery journal is damaged")),
+        _ => Err(refused(
+            "the recovery journal was written by another BiBCode version",
+        )),
+    }
 }
 
 /// Refuses while a journal exists. Otherwise clears operations abandoned before their journal
@@ -5275,6 +5353,12 @@ mod tests {
             "extra-staging-entry",
             "staged-identity",
             "staged-marker-replaced",
+            "staged-database-edited-in-place",
+            "staged-database-appended",
+            "staged-database-same-size-replacement",
+            "staged-marker-edited-in-place",
+            "start-empty-shape-with-one-staged-file",
+            "version-2-restore",
             "staged-database-missing",
             "staged-marker-missing",
             "both-staged-missing",
@@ -5335,6 +5419,43 @@ mod tests {
                         assert_ne!(replaced, original, "{case}: the staged file has a new inode");
                     }
                 }
+                // Same identity, so only the recorded content can tell: this is what a
+                // replacement that reuses the freed inode number looks like.
+                "staged-database-edited-in-place" => {
+                    overwrite_tail_in_place(&staging.join(BACKUP_FILE_NAME));
+                }
+                "staged-marker-edited-in-place" => {
+                    overwrite_tail_in_place(&staging.join(MARKER_FILE_NAME));
+                }
+                "staged-database-appended" => {
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(staging.join(BACKUP_FILE_NAME))
+                        .expect("open staged database");
+                    file.write_all(b"appended").expect("append");
+                }
+                "staged-database-same-size-replacement" => {
+                    let staged = staging.join(BACKUP_FILE_NAME);
+                    let mut bytes = fs::read(&staged).expect("staged bytes");
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 0xff;
+                    let replacement = staging.join("replacement.tmp");
+                    fs::write(&replacement, bytes).expect("same size, other bytes");
+                    fs::rename(&replacement, &staged).expect("rename over");
+                }
+                "start-empty-shape-with-one-staged-file" => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&journal_path).expect("journal"))
+                            .expect("json");
+                    value["action"] = serde_json::json!("start-empty");
+                    value["stagedMarker"] = serde_json::Value::Null;
+                    fs::write(&journal_path, serde_json::to_vec(&value).expect("json"))
+                        .expect("malformed start-empty journal");
+                }
+                "version-2-restore" => {
+                    fs::write(&journal_path, version_2_journal(&journal_path))
+                        .expect("version-2 journal");
+                }
                 missing => {
                     if missing != "staged-marker-missing" {
                         fs::remove_file(staging.join(BACKUP_FILE_NAME)).expect("remove db");
@@ -5357,10 +5478,117 @@ mod tests {
                 matches!(error, RecoveryError::ResumeRefused { .. }),
                 "{case}: {error:?}"
             );
+            if case == "version-2-restore" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("did not record the staged files' contents"),
+                    "{error}"
+                );
+                assert!(
+                    error.to_string().contains(EARLIER_VERSION_RESTORE_GUIDE),
+                    "{error}"
+                );
+                // The anchor must name a heading the guide still has.
+                let guide = include_str!("../../../../docs/guides/project-data-recovery.md");
+                assert!(guide.contains("\n### Finish a restore started by an earlier version\n"));
+                assert!(EARLIER_VERSION_RESTORE_GUIDE.ends_with(
+                    "/docs/guides/project-data-recovery.md#finish-a-restore-started-by-an-earlier-version"
+                ));
+            }
             assert_eq!(entries(&fixture.paths.state_dir), state_before, "{case}");
             assert_eq!(entries(&staging), staging_before, "{case}");
             assert_eq!(fs::read(&journal_path).expect("journal"), journal_before);
         }
+    }
+
+    /// Overwrites the last bytes of `path` through the same file: same identity, same size.
+    fn overwrite_tail_in_place(path: &Path) {
+        use std::io::{Seek, SeekFrom};
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open in place");
+        let mut tail = [0_u8; 4];
+        file.seek(SeekFrom::End(-4)).expect("seek");
+        file.read_exact(&mut tail).expect("read tail");
+        for byte in &mut tail {
+            *byte ^= 0xff;
+        }
+        file.seek(SeekFrom::End(-4)).expect("seek");
+        file.write_all(&tail).expect("overwrite");
+        file.sync_all().expect("sync");
+    }
+
+    /// The journal at `path` rewritten in the version-2 shape: staged files by identity only.
+    fn version_2_journal(path: &Path) -> Vec<u8> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("journal")).expect("json");
+        value["version"] = serde_json::json!(2);
+        for field in ["stagedDatabase", "stagedMarker"] {
+            if let Some(staged) = value[field].as_object_mut() {
+                staged.remove("sizeBytes");
+                staged.remove("sha256");
+            }
+        }
+        serde_json::to_vec_pretty(&value).expect("json")
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_an_installed_staged_database_edited_in_place() {
+        let fixture = restore_fixture().await;
+        restore_backup_with_fault(
+            &fixture.resolved,
+            fixture.backup.manifest.backup_id,
+            RecoveryFault::AfterMoveDatabase,
+        )
+        .await
+        .expect_err("interrupted after installing the database");
+        overwrite_tail_in_place(&fixture.paths.database);
+        let state_before = entries(&fixture.paths.state_dir);
+        let live_before = fs::read(&fixture.paths.database).expect("live database");
+        let journal_before = fs::read(fixture.paths.recovery_journal()).expect("journal");
+
+        let error = resume_recovery(&fixture.resolved)
+            .await
+            .expect_err("resume refuses an edited installed database");
+
+        assert!(
+            matches!(error, RecoveryError::ResumeRefused { .. }),
+            "{error:?}"
+        );
+        assert_eq!(entries(&fixture.paths.state_dir), state_before);
+        assert_eq!(
+            fs::read(&fixture.paths.database).expect("live database"),
+            live_before
+        );
+        assert_eq!(
+            fs::read(fixture.paths.recovery_journal()).expect("journal"),
+            journal_before
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_finishes_a_version_2_start_empty_journal() {
+        let fixture = restore_fixture().await;
+        preserve_and_start_empty_with_fault(
+            &fixture.resolved,
+            RecoveryFault::AfterPreserveDatabase,
+        )
+        .await
+        .expect_err("interrupted start-empty");
+        let journal_path = fixture.paths.recovery_journal();
+        fs::write(&journal_path, version_2_journal(&journal_path)).expect("version-2 journal");
+
+        let resumed = resume_recovery(&fixture.resolved).await.expect("resume");
+
+        assert_eq!(
+            resumed.resumed.map(|result| result.action),
+            Some(RecoveryAction::StartEmpty)
+        );
+        assert!(!fixture.paths.database.exists());
+        assert!(!journal_path.exists());
     }
 
     #[tokio::test]

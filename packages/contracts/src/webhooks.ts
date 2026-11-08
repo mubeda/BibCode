@@ -80,8 +80,13 @@ export const WebhookEndpoint = Schema.Struct({
    */
   eventTypes: Schema.Array(Schema.String),
   projectId: Schema.NullOr(Schema.String),
-  /** The outside agent's session it is paired with: revoking that client disables it. */
+  /**
+   * What it is paired with: an outside agent's session, or a named client's id (#280), which
+   * outlives each run. Revoking or stopping that client disables it.
+   */
   pairedClientId: Schema.NullOr(Schema.String),
+  /** The paired client's name, or its session's label; an older server leaves this out. */
+  pairedClientName: Schema.optionalKey(Schema.NullOr(Schema.String)),
   /**
    * Whether it sends `Authorization: Bearer <token>`. The token itself is never returned;
    * an older server, which has none, leaves this out.

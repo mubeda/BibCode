@@ -734,6 +734,23 @@ fn spawn_difftool(cwd: &Path, args: &[String], log: &std::fs::File) -> std::io::
     spawn_difftool_once(cwd, args, log)
 }
 
+/// `git difftool` with `args` in `cwd`. Only the shared system-configuration variable joins
+/// it (#283), the same policy `--tool-help` lists the tools under: the prompt guards and the
+/// C locale of `git_environment()` would reach the diff app itself.
+fn difftool_command(cwd: &Path, args: &[String]) -> Command {
+    let (name, value) = crate::git::system_config::system_config_variable();
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env(name, value)
+        // Paths after `--` are literal: pathspec magic such as `:(top)` does not apply.
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 fn spawn_difftool_once(
     cwd: &Path,
     args: &[String],
@@ -741,14 +758,8 @@ fn spawn_difftool_once(
     #[cfg(windows)] breakaway: bool,
 ) -> std::io::Result<Child> {
     let stderr = log.try_clone()?;
-    let mut command = Command::new("git");
+    let mut command = difftool_command(cwd, args);
     command
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        // Paths after `--` are literal: pathspec magic such as `:(top)` does not apply.
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
@@ -933,6 +944,19 @@ environment. If run in a terminal-only session, they will fail.
             assert!(!is_valid_tool_id(id), "{id}");
         }
         assert!(!is_valid_tool_id(&"a".repeat(MAX_TOOL_ID_LEN + 1)));
+    }
+
+    #[test]
+    fn the_launched_difftool_takes_the_shared_system_configuration_variable() {
+        let command = difftool_command(Path::new("repo"), &["difftool".to_owned()]);
+        let (name, value) = crate::git::system_config::system_config_variable();
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, set)| key == name && set == Some(value.as_os_str())),
+            "{name:?} missing from the difftool launch"
+        );
     }
 
     #[test]

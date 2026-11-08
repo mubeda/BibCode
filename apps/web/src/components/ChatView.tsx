@@ -3,6 +3,7 @@ import { CENTER_PANEL_RESIZE_END_EVENT } from "~/centerPanelResize";
 import {
   type AgentSessionOpenMode,
   type ApprovalRequestId,
+  type CheckpointRevertMode,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -312,6 +313,15 @@ import {
 import { terminalEnvironment } from "../state/terminal";
 import { runOlderHistoryLoad } from "../state/olderHistoryLoad";
 import { threadEnvironment, useThreadFindLoadState, useThreadOlderHistory } from "../state/threads";
+import { orchestrationEnvironment } from "../state/orchestration";
+import { RevertCheckpointDialog } from "./chat/RevertCheckpointDialog";
+import {
+  buildRevertCheckpointDialog,
+  isSameRevertTarget,
+  type PendingRevert,
+  pendingRevertFor,
+  type RevertTarget,
+} from "./chat/RevertCheckpointDialog.logic";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
@@ -335,7 +345,6 @@ import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/Compos
 import {
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
-  buildRevertCheckpointConfirmation,
   buildThreadTurnInterruptInput,
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
@@ -1138,6 +1147,9 @@ function ChatViewContent(props: ChatViewProps) {
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
+  const previewCheckpointRevert = useAtomCommand(orchestrationEnvironment.previewCheckpointRevert, {
+    reportFailure: false,
+  });
   const compactThread = useAtomCommand(threadEnvironment.compact, { reportFailure: false });
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
@@ -1275,6 +1287,8 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
+  /** The open revert dialog, bound to the thread and turn it reverts (#279). */
+  const [pendingRevert, setPendingRevert] = useState<PendingRevert | null>(null);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
@@ -5147,10 +5161,23 @@ function ChatViewContent(props: ChatViewProps) {
     composerRef,
   ]);
 
+  // The thread on screen, read after the preview's await: a preview for a thread the person
+  // has since left is dropped.
+  const activeRevertTarget = useMemo<RevertTarget | null>(
+    () => (activeThread ? { environmentId, threadId: activeThread.id } : null),
+    [activeThread, environmentId],
+  );
+  const activeRevertTargetRef = useRef(activeRevertTarget);
+  useLayoutEffect(() => {
+    activeRevertTargetRef.current = activeRevertTarget;
+  }, [activeRevertTarget]);
+  const visiblePendingRevert = pendingRevertFor(pendingRevert, activeRevertTarget);
+
   const onRevertToTurnCount = useCallback(
     async (turnCount: number) => {
       const localApi = readLocalApi();
       if (!localApi || !activeThread || isRevertingCheckpoint) return;
+      const target: RevertTarget = { environmentId, threadId: activeThread.id };
       // Resolved before the first await: a failure lands on the thread it was for.
       const errorTarget = resolveThreadErrorTarget(activeThread.id);
 
@@ -5165,23 +5192,80 @@ function ChatViewContent(props: ChatViewProps) {
         writeThreadError(errorTarget, "Interrupt the current turn before reverting checkpoints.");
         return;
       }
-      const confirmed = await localApi.dialogs.confirm(
-        buildRevertCheckpointConfirmation({
+      // A server with the shared-checkout guard says first what other chats are doing and
+      // changed; an older one gets today's choices (#279).
+      let preview = null;
+      if (activeEnvironmentDescriptor?.capabilities.conversationOnlyRewind === true) {
+        // The preview runs Git on the server; the revert controls show it working meanwhile.
+        setIsRevertingCheckpoint(true);
+        const previewed = await previewCheckpointRevert({
+          environmentId,
+          input: { threadId: activeThread.id, turnCount },
+        });
+        setIsRevertingCheckpoint(false);
+        if (!isSameRevertTarget(target, activeRevertTargetRef.current)) {
+          return;
+        }
+        if (previewed._tag === "Success") {
+          preview = previewed.value;
+        } else if (!isAtomCommandInterrupted(previewed)) {
+          const error = squashAtomCommandFailure(previewed);
+          writeThreadError(
+            errorTarget,
+            error instanceof Error ? error.message : "Couldn't check this checkpoint.",
+          );
+          return;
+        } else {
+          return;
+        }
+      }
+      setPendingRevert({
+        ...target,
+        turnCount,
+        model: buildRevertCheckpointDialog({
           turnCount,
           provider: activeProviderStatus,
+          preview,
         }),
-      );
-      if (!confirmed) {
-        return;
-      }
+      });
+    },
+    [
+      activeThread,
+      activeEnvironmentDescriptor,
+      activeEnvironmentUnavailable,
+      activeEnvironmentUnavailableLabel,
+      activeProviderStatus,
+      environmentId,
+      isConnecting,
+      isRevertingCheckpoint,
+      isSendBusy,
+      phase,
+      previewCheckpointRevert,
+      resolveThreadErrorTarget,
+      writeThreadError,
+    ],
+  );
 
+  const onChooseRevert = useCallback(
+    async (mode: CheckpointRevertMode) => {
+      // Only the dialog of the thread on screen can be chosen, and it reverts that thread.
+      const pending = pendingRevertFor(pendingRevert, activeRevertTargetRef.current);
+      setPendingRevert(null);
+      if (!pending) return;
+      const { turnCount, model } = pending;
+      const errorTarget = resolveThreadErrorTarget(pending.threadId);
       setIsRevertingCheckpoint(true);
       writeThreadError(errorTarget, null);
       const result = await revertThreadCheckpoint({
-        environmentId,
+        environmentId: pending.environmentId,
         input: {
-          threadId: activeThread.id,
+          threadId: pending.threadId,
           turnCount,
+          // Sent only when needed, so an older server reads the command it knows.
+          ...(mode === "conversationOnly" ? { mode } : {}),
+          ...(model.siblingChangesToken === null
+            ? {}
+            : { siblingChangesToken: model.siblingChangesToken }),
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -5193,21 +5277,9 @@ function ChatViewContent(props: ChatViewProps) {
       }
       setIsRevertingCheckpoint(false);
     },
-    [
-      activeThread,
-      activeEnvironmentUnavailable,
-      activeEnvironmentUnavailableLabel,
-      activeProviderStatus,
-      environmentId,
-      isConnecting,
-      isRevertingCheckpoint,
-      isSendBusy,
-      phase,
-      revertThreadCheckpoint,
-      resolveThreadErrorTarget,
-      writeThreadError,
-    ],
+    [pendingRevert, resolveThreadErrorTarget, revertThreadCheckpoint, writeThreadError],
   );
+  const onDismissRevert = useCallback(() => setPendingRevert(null), []);
 
   const onResolveTurnDelivery = useCallback(
     async (messageId: MessageId, action: TurnDeliveryResolutionAction) => {
@@ -7669,6 +7741,11 @@ function ChatViewContent(props: ChatViewProps) {
           onClose={closeExpandedImage}
         />
       )}
+      <RevertCheckpointDialog
+        model={visiblePendingRevert?.model ?? null}
+        onChoose={onChooseRevert}
+        onDismiss={onDismissRevert}
+      />
     </div>
   );
 }
