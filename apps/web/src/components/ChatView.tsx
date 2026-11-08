@@ -5183,10 +5183,13 @@ function ChatViewContent(props: ChatViewProps) {
       // changed; an older one gets today's choices (#279).
       let preview = null;
       if (activeEnvironmentDescriptor?.capabilities.conversationOnlyRewind === true) {
+        // The preview runs Git on the server; the revert controls show it working meanwhile.
+        setIsRevertingCheckpoint(true);
         const previewed = await previewCheckpointRevert({
           environmentId,
           input: { threadId: activeThread.id, turnCount },
         });
+        setIsRevertingCheckpoint(false);
         if (previewed._tag === "Success") {
           preview = previewed.value;
         } else if (!isAtomCommandInterrupted(previewed)) {

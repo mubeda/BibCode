@@ -13185,7 +13185,11 @@ impl SupervisorRevertProbe<'_> {
             .await
             .map_err(|error| delivery_detail(&error, None))?;
         let unmanaged = route.provider == "opencode" && !route.binary.server_url.trim().is_empty();
-        Ok(Some((route.provider.clone(), route.provider_label, unmanaged)))
+        Ok(Some((
+            route.provider.clone(),
+            route.provider_label,
+            unmanaged,
+        )))
     }
 
     async fn session(&self, thread_id: &str, quiet: bool) -> Result<Option<WritingReason>, String> {
@@ -13217,11 +13221,17 @@ impl RevertProbe for SupervisorRevertProbe<'_> {
         Box::pin(self.session(thread_id, false))
     }
 
-    fn quiet_sibling<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, Option<WritingReason>> {
+    fn quiet_sibling<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, Option<WritingReason>> {
         Box::pin(self.session(thread_id, true))
     }
 
-    fn conversation_rewind<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ConversationRewind> {
+    fn conversation_rewind<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, ConversationRewind> {
         Box::pin(async move {
             let Some((provider, provider_label, _)) = self.route(thread_id).await? else {
                 return Ok(ConversationRewind::Available);

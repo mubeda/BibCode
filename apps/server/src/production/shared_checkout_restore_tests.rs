@@ -156,7 +156,10 @@ impl RevertProbe for ProbeOf<'_> {
         Box::pin(async move { Ok(self.0.writing.lock().unwrap().get(thread_id).copied()) })
     }
 
-    fn quiet_sibling<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, Option<WritingReason>> {
+    fn quiet_sibling<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, Option<WritingReason>> {
         Box::pin(async move {
             self.0.at(Stage::Quiet).await;
             let writing = self.0.writing.lock().unwrap().get(thread_id).copied();
@@ -248,7 +251,9 @@ impl Fixture {
         fixture.project("p", &fixture.repo.clone()).await;
         fixture.thread("a", "p", "Host", None).await;
         fixture.thread("b", "p", "Panel, Codex", None).await;
-        fixture.checkpoints("a", &[(1, "one\n", T1), (2, "two\n", T2)]).await;
+        fixture
+            .checkpoints("a", &[(1, "one\n", T1), (2, "two\n", T2)])
+            .await;
         fixture.session("a", "ready").await;
         fixture
     }
@@ -355,7 +360,11 @@ impl Fixture {
                         return Ok(());
                     }
                     if event.event.event_type == "thread.activity-appended"
-                        && event.event.payload.pointer("/activity/kind").and_then(Value::as_str)
+                        && event
+                            .event
+                            .payload
+                            .pointer("/activity/kind")
+                            .and_then(Value::as_str)
                             == Some("checkpoint.revert.failed")
                     {
                         return Err(event.event.payload["activity"]["payload"].clone());
@@ -411,7 +420,10 @@ fn detail(failure: &Value) -> &str {
 fn delivery(
     engine: &OrchestrationEngine,
     hold: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
-) -> (TurnDeliveryService, tokio::sync::mpsc::UnboundedReceiver<String>) {
+) -> (
+    TurnDeliveryService,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let router: DeliveryRouter = Arc::new(move |command| {
         let thread = command.aggregate_ref().1.to_owned();
@@ -432,7 +444,9 @@ fn delivery(
 }
 
 async fn send_message(engine: &OrchestrationEngine, thread: &str, id: &str) {
-    let command = command(json!({"type":"thread.turn.start", "commandId":id, "threadId":thread, "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":T3}));
+    let command = command(
+        json!({"type":"thread.turn.start", "commandId":id, "threadId":thread, "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":T3}),
+    );
     engine
         .dispatch_with_admission(
             command.clone(),
@@ -470,7 +484,10 @@ async fn not_delivered(routes: &mut tokio::sync::mpsc::UnboundedReceiver<String>
 
 async fn delivered(routes: &mut tokio::sync::mpsc::UnboundedReceiver<String>, thread: &str) {
     assert_eq!(
-        timeout(WAIT, routes.recv()).await.expect("delivery wakes").as_deref(),
+        timeout(WAIT, routes.recv())
+            .await
+            .expect("delivery wakes")
+            .as_deref(),
         Some(thread)
     );
 }
@@ -615,7 +632,11 @@ async fn reverts_of_one_checkout_still_restore_in_request_order_under_the_gate()
     while let Ok(event) = events.try_recv() {
         let thread = event.event.payload.get("threadId").and_then(Value::as_str);
         let ended = event.event.event_type == "thread.reverted"
-            || event.event.payload.pointer("/activity/kind").and_then(Value::as_str)
+            || event
+                .event
+                .payload
+                .pointer("/activity/kind")
+                .and_then(Value::as_str)
                 == Some("checkpoint.revert.failed");
         if ended && let Some(thread) = thread {
             order.push(thread.to_owned());
@@ -648,12 +669,19 @@ async fn a_symlinked_or_second_project_path_is_the_same_checkout() {
         &fixture.repo,
         &["worktree", "add", "--detach", linked.to_str().unwrap()],
     );
-    fixture.thread("w", "p", "Worktree chat", Some(&linked)).await;
+    fixture
+        .thread("w", "p", "Worktree chat", Some(&linked))
+        .await;
     fixture.session("w", "running").await;
-    fixture.revert("a", 2, "full", None).await.expect("a linked worktree is not a sibling");
+    fixture
+        .revert("a", 2, "full", None)
+        .await
+        .expect("a linked worktree is not a sibling");
     // A chat whose folder is a symlink to the checkout. (A second project on the same directory
     // is the same project: creating it returns the existing one.)
-    fixture.thread("s", "p", "Symlinked chat", Some(&link)).await;
+    fixture
+        .thread("s", "p", "Symlinked chat", Some(&link))
+        .await;
     fixture.session("s", "running").await;
     let failure = fixture
         .revert("a", 1, "full", None)
@@ -789,7 +817,10 @@ async fn a_delivery_keyed_before_the_change_still_makes_the_restore_refuse() {
         .revert("a", 1, "full", None)
         .await
         .expect_err("an admitted sibling refuses the restore");
-    assert!(detail(&failure).contains("Panel, Codex) is starting a turn"), "{failure}");
+    assert!(
+        detail(&failure).contains("Panel, Codex) is starting a turn"),
+        "{failure}"
+    );
     drop(admission);
     assert_eq!(fixture.tracked(), "two\n");
     fixture.shutdown().await;
@@ -830,7 +861,10 @@ async fn a_restore_is_refused_while_a_sibling_runs_background_work() {
         .unwrap()
         .insert("b".into(), WritingReason::BackgroundWork);
     let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
-    assert!(detail(&failure).contains("is running background work"), "{failure}");
+    assert!(
+        detail(&failure).contains("is running background work"),
+        "{failure}"
+    );
     assert_eq!(fixture.tracked(), "two\n");
     fixture.shutdown().await;
 }
@@ -843,7 +877,10 @@ async fn a_restore_is_refused_while_a_sibling_checkpoint_is_pending() {
         .hold_turns_for_checkpoint("b", "b-turn-1")
         .expect("the effects worker holds ended turns");
     let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
-    assert!(detail(&failure).contains("is still saving its checkpoint"), "{failure}");
+    assert!(
+        detail(&failure).contains("is still saving its checkpoint"),
+        "{failure}"
+    );
     assert_eq!(fixture.tracked(), "two\n");
     fixture.shutdown().await;
 }
@@ -871,7 +908,11 @@ async fn an_idle_sibling_session_is_suspended_before_the_restore() {
     fixture.revert("a", 1, "full", None).await.unwrap();
     // Made quiet in planning and checked again before the rewind.
     let quieted = fixture.provider.quieted.lock().unwrap().clone();
-    assert_eq!(quieted.iter().filter(|thread| *thread == "b").count(), 2, "{quieted:?}");
+    assert_eq!(
+        quieted.iter().filter(|thread| *thread == "b").count(),
+        2,
+        "{quieted:?}"
+    );
     assert_eq!(fixture.tracked(), "one\n");
     fixture.shutdown().await;
 }
@@ -901,7 +942,10 @@ async fn a_launch_in_flight_makes_the_restore_refuse() {
     let fixture = Fixture::new().await;
     let launch = fixture.engine.begin_session_launch("b").unwrap();
     let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
-    assert!(detail(&failure).contains("is starting its session"), "{failure}");
+    assert!(
+        detail(&failure).contains("is starting its session"),
+        "{failure}"
+    );
     drop(launch);
     // The reverse order: the restore marks the panel first, and its launch is refused.
     let gate = fixture.provider.pause_at(Stage::Prepare);
@@ -938,16 +982,25 @@ async fn an_unmanaged_opencode_sibling_refuses_the_restore() {
 #[tokio::test]
 async fn turn_zero_head_fallback_is_refused_on_a_shared_checkout() {
     let fixture = Fixture::new().await;
-    git(&fixture.repo, &["update-ref", "-d", &checkpoint_ref("a", 0)]);
+    git(
+        &fixture.repo,
+        &["update-ref", "-d", &checkpoint_ref("a", 0)],
+    );
     let failure = fixture.revert("a", 0, "full", None).await.unwrap_err();
     assert!(
         detail(&failure).contains("no starting checkpoint, and other chats share this checkout"),
         "{failure}"
     );
     assert_eq!(fixture.tracked(), "two\n");
-    assert!(fixture.provider.quieted.lock().unwrap().is_empty(), "refused before any sibling is suspended");
+    assert!(
+        fixture.provider.quieted.lock().unwrap().is_empty(),
+        "refused before any sibling is suspended"
+    );
     // Rewinding only the conversation still works.
-    fixture.revert("a", 0, "conversationOnly", None).await.unwrap();
+    fixture
+        .revert("a", 0, "conversationOnly", None)
+        .await
+        .unwrap();
     assert_eq!(fixture.tracked(), "two\n");
     fixture.shutdown().await;
 }
@@ -1004,7 +1057,10 @@ async fn a_conversation_only_rewind_leaves_the_working_tree_unchanged() {
         .await
         .unwrap();
     assert_eq!(tree_bytes(&repo), before);
-    assert_eq!(git(&repo, &["status", "--porcelain=v2", "--ignored"]), status);
+    assert_eq!(
+        git(&repo, &["status", "--porcelain=v2", "--ignored"]),
+        status
+    );
     assert_eq!(fixture.provider.rewinds(), 1, "the provider rewound");
     let checkpoints = fixture
         .engine
@@ -1021,8 +1077,14 @@ async fn a_conversation_only_rewind_leaves_the_working_tree_unchanged() {
         "the newer turn is gone"
     );
     let refs = git(&repo, &["for-each-ref", "--format=%(refname)"]);
-    assert!(!refs.contains(&checkpoint_ref("a", 2)), "the newer ref is deleted");
-    assert!(refs.contains(&checkpoint_ref("a", 1)), "the target ref is kept");
+    assert!(
+        !refs.contains(&checkpoint_ref("a", 2)),
+        "the newer ref is deleted"
+    );
+    assert!(
+        refs.contains(&checkpoint_ref("a", 1)),
+        "the target ref is kept"
+    );
     let snapshot = crate::orchestration::load_snapshot(&fixture.engine.repositories())
         .await
         .unwrap();
@@ -1048,15 +1110,17 @@ async fn a_conversation_only_rewind_runs_while_a_sibling_is_busy() {
 #[tokio::test]
 async fn a_conversation_only_rewind_is_refused_for_a_files_only_provider() {
     let fixture = Fixture::new().await;
-    *fixture.provider.rewind_support.lock().unwrap() = Some(ConversationRewind::FilesOnlyProvider {
-        provider_label: "Claude".into(),
-    });
+    *fixture.provider.rewind_support.lock().unwrap() =
+        Some(ConversationRewind::FilesOnlyProvider {
+            provider_label: "Claude".into(),
+        });
     let failure = fixture
         .revert("a", 1, "conversationOnly", None)
         .await
         .unwrap_err();
     assert!(
-        detail(&failure).contains("Claude can't rewind its conversation, so only a file restore is possible."),
+        detail(&failure)
+            .contains("Claude can't rewind its conversation, so only a file restore is possible."),
         "{failure}"
     );
     assert_eq!(fixture.provider.rewinds(), 0);
@@ -1076,7 +1140,8 @@ async fn a_conversation_only_rewind_is_refused_for_opencode_1() {
         .await
         .unwrap_err();
     assert!(
-        detail(&failure).contains("OpenCode 1 can't rewind its conversation without restoring files"),
+        detail(&failure)
+            .contains("OpenCode 1 can't rewind its conversation without restoring files"),
         "{failure}"
     );
     assert_eq!(fixture.provider.rewinds(), 0, "no rewind request is sent");
@@ -1089,7 +1154,10 @@ fn only_codex_and_opencode_2_rewind_without_touching_files() {
     assert!(crate::provider::rewind_keeps_files("opencode", 2));
     assert!(!crate::provider::rewind_keeps_files("opencode", 1));
     for provider in ["claude", "claudeAgent", "cursor", "grok"] {
-        assert!(!crate::provider::rewind_keeps_files(provider, 2), "{provider}");
+        assert!(
+            !crate::provider::rewind_keeps_files(provider, 2),
+            "{provider}"
+        );
     }
 }
 
@@ -1097,17 +1165,28 @@ fn only_codex_and_opencode_2_rewind_without_touching_files() {
 async fn sibling_changes_need_the_matching_token() {
     let fixture = Fixture::new().await;
     // The panel's turn after the host's turn 1 edited `x`.
-    fixture.diff_complete("b", 1, &["x"], "2026-08-01T00:00:01.500Z").await;
+    fixture
+        .diff_complete("b", 1, &["x"], "2026-08-01T00:00:01.500Z")
+        .await;
     let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
     assert!(
-        detail(&failure).contains("Files in this checkout changed since turn 1, outside this chat."),
+        detail(&failure)
+            .contains("Files in this checkout changed since turn 1, outside this chat."),
         "{failure}"
     );
     let token = failure["siblingChangesToken"].as_str().unwrap().to_owned();
-    assert_eq!(fixture.preview("a", 1).await["siblingChangesToken"], json!(token));
+    assert_eq!(
+        fixture.preview("a", 1).await["siblingChangesToken"],
+        json!(token)
+    );
     // A sibling turn finishing after the preview changes the token.
-    fixture.diff_complete("b", 2, &["y"], "2026-08-01T00:00:01.700Z").await;
-    let failure = fixture.revert("a", 1, "full", Some(&token)).await.unwrap_err();
+    fixture
+        .diff_complete("b", 2, &["y"], "2026-08-01T00:00:01.700Z")
+        .await;
+    let failure = fixture
+        .revert("a", 1, "full", Some(&token))
+        .await
+        .unwrap_err();
     let fresh = failure["siblingChangesToken"].as_str().unwrap().to_owned();
     assert_ne!(fresh, token);
     assert_eq!(fixture.tracked(), "two\n");
@@ -1121,15 +1200,23 @@ async fn a_sibling_conversation_only_rewind_keeps_its_changes_in_the_warning() {
     for delete_instead in [false, true] {
         let fixture = Fixture::new().await;
         fixture.checkpoints("b", &[]).await;
-        fixture.diff_complete("b", 1, &["x"], "2026-08-01T00:00:01.500Z").await;
+        fixture
+            .diff_complete("b", 1, &["x"], "2026-08-01T00:00:01.500Z")
+            .await;
         if delete_instead {
             fixture.engine.dispatch(command(json!({"type":"thread.delete", "commandId":"delete-b", "threadId":"b", "createdAt":T3}))).await.unwrap();
         } else {
             fixture.session("b", "ready").await;
-            fixture.revert("b", 0, "conversationOnly", None).await.unwrap();
+            fixture
+                .revert("b", 0, "conversationOnly", None)
+                .await
+                .unwrap();
         }
         let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
-        assert!(detail(&failure).contains("changed since turn 1"), "{failure}");
+        assert!(
+            detail(&failure).contains("changed since turn 1"),
+            "{failure}"
+        );
         let preview = fixture.preview("a", 1).await;
         let turns = preview["siblingChanges"]["turns"].as_array().unwrap();
         assert_eq!(turns.len(), 1, "{preview}");
@@ -1159,7 +1246,10 @@ async fn an_edit_absorbed_into_a_later_checkpoint_is_listed_as_restored() {
     fixture.diff_complete("a", 3, &[], T3).await;
     let preview = fixture.preview("a", 1).await;
     assert!(
-        preview["restoredPaths"].as_array().unwrap().contains(&json!("x")),
+        preview["restoredPaths"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("x")),
         "{preview}"
     );
     assert_eq!(preview["siblingChanges"]["paths"], json!([]));
@@ -1174,7 +1264,10 @@ async fn a_content_change_with_the_same_paths_changes_the_token() {
     let first = fixture.preview("a", 1).await;
     std::fs::write(fixture.repo.join("notes.txt"), "second\n").unwrap();
     let second = fixture.preview("a", 1).await;
-    assert_eq!(first["siblingChanges"]["paths"], second["siblingChanges"]["paths"]);
+    assert_eq!(
+        first["siblingChanges"]["paths"],
+        second["siblingChanges"]["paths"]
+    );
     assert_ne!(first["siblingChangesToken"], second["siblingChangesToken"]);
     fixture.shutdown().await;
 }
@@ -1198,7 +1291,11 @@ async fn a_change_after_confirming_is_caught_before_the_rewind() {
         "{failure}"
     );
     assert_ne!(failure["siblingChangesToken"], json!(token));
-    assert_eq!(fixture.provider.rewinds(), 0, "the provider was not rewound");
+    assert_eq!(
+        fixture.provider.rewinds(),
+        0,
+        "the provider was not rewound"
+    );
     assert_eq!(fixture.tracked(), "two\n");
     fixture.shutdown().await;
 }
@@ -1207,9 +1304,10 @@ async fn a_change_after_confirming_is_caught_before_the_rewind() {
 async fn preview_reports_writing_siblings_changes_and_rewind_support() {
     let fixture = Fixture::new().await;
     fixture.session("b", "running").await;
-    *fixture.provider.rewind_support.lock().unwrap() = Some(ConversationRewind::RewindRestoresFiles {
-        provider_label: "OpenCode 1".into(),
-    });
+    *fixture.provider.rewind_support.lock().unwrap() =
+        Some(ConversationRewind::RewindRestoresFiles {
+            provider_label: "OpenCode 1".into(),
+        });
     let preview = fixture.preview("a", 1).await;
     assert_eq!(
         preview["writingSiblings"],

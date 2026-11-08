@@ -1880,11 +1880,14 @@ impl CheckoutTurnFence {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         checkouts.retain(|_, gate| gate.strong_count() > 0);
-        checkouts.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let gate = Arc::new(tokio::sync::RwLock::new(()));
-            checkouts.insert(key.to_owned(), Arc::downgrade(&gate));
-            gate
-        })
+        checkouts
+            .get(key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let gate = Arc::new(tokio::sync::RwLock::new(()));
+                checkouts.insert(key.to_owned(), Arc::downgrade(&gate));
+                gate
+            })
     }
 }
 

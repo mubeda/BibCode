@@ -3964,6 +3964,12 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   `checkpoint.revert.files-only` (files restored, conversation kept), or
   `checkpoint.revert.failed` (`McpCheckpointRevertError` with the worker's detail).
   Reading the log rather than the live stream also answers a receipt replay.
+  `mode: "conversationOnly"` and `siblingChangesToken` pass through to the command
+  (#279). A file restore first runs the revert preview without the supervisor: a
+  writing sibling is `McpTurnRunningError` naming it, and an unacknowledged outside
+  change is `McpSharedCheckoutChangedError` with `restoredPaths`, `siblingChanges` and
+  the token in its structured error. A worker refusal that carries a token comes back
+  the same way. A preview that cannot run leaves the refusal to the worker.
 - **Waiting.** `wait_for_thread` subscribes to `subscribe_events()` before its first
   read, keeps only the thread's events, re-reads at most once per 100 ms burst, and
   returns when the selected turn settles (or, without `messageId`, the thread is

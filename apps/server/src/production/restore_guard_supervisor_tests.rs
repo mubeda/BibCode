@@ -55,7 +55,10 @@ impl Fixture {
         std::fs::create_dir(&settings_root).unwrap();
         let mut settings = ProviderSettingsState::default();
         for (instance, config) in [
-            ("opencode-external", json!({"serverUrl":"http://127.0.0.1:4773"})),
+            (
+                "opencode-external",
+                json!({"serverUrl":"http://127.0.0.1:4773"}),
+            ),
             ("opencode-owned", json!({})),
         ] {
             settings.provider_instances.insert(
@@ -96,7 +99,12 @@ impl Fixture {
         }
     }
 
-    fn launch(&self, thread: &str, provider: &str, endpoint: Option<&str>) -> ProviderLaunchRequest {
+    fn launch(
+        &self,
+        thread: &str,
+        provider: &str,
+        endpoint: Option<&str>,
+    ) -> ProviderLaunchRequest {
         let mut request = removal_test_support::launch(thread, self.cwd.clone());
         request.provider = provider.to_owned();
         request.endpoint = endpoint.map(str::to_owned);
@@ -146,11 +154,18 @@ async fn an_idle_sibling_session_is_suspended_and_no_path_reopens_it_during_the_
     for context_handoff in [false, true] {
         let error = fixture
             .supervisor
-            .launch_with_context_handoff(fixture.launch("t1", "claude", None), context_handoff, None, false)
+            .launch_with_context_handoff(
+                fixture.launch("t1", "claude", None),
+                context_handoff,
+                None,
+                false,
+            )
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("Another chat in this checkout is restoring files"),
+            error
+                .to_string()
+                .contains("Another chat in this checkout is restoring files"),
             "{error}"
         );
     }
@@ -296,9 +311,7 @@ async fn a_launch_in_flight_makes_the_restore_refuse() {
     let mut restore = fixture.engine.hold_checkout_for_restore("checkout").await;
     assert_eq!(
         restore.hold_threads(&["t1".to_owned()]),
-        Err(crate::orchestration::engine::RestoreHoldConflict::Launching(
-            "t1".to_owned()
-        ))
+        Err(crate::orchestration::engine::RestoreHoldConflict::Launching("t1".to_owned()))
     );
     release.notify_one();
     launch.await.unwrap().unwrap();
