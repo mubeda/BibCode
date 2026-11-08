@@ -16,7 +16,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
-import { ChevronRight, FolderTree, Globe2, LoaderCircle } from "lucide-react";
+import { FolderSearch, FolderTree, Globe2, LoaderCircle } from "lucide-react";
 import * as Schema from "effect/Schema";
 import {
   type RefObject,
@@ -33,6 +33,7 @@ import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPre
 import ChatMarkdown from "~/components/ChatMarkdown";
 import { OpenInPicker } from "~/components/chat/OpenInPicker";
 import { useClientSettings } from "~/hooks/useSettings";
+import { useRightPanelStore } from "~/rightPanelStore";
 import { useTheme } from "~/hooks/useTheme";
 import { getLocalStorageItem, setLocalStorageItem } from "~/hooks/useLocalStorage";
 import { resolveDiffThemeName } from "~/lib/diffRendering";
@@ -56,6 +57,7 @@ import { projectEnvironment } from "~/state/projects";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 
+import FileBreadcrumbTrail from "./FileBreadcrumbTrail";
 import FileBrowserPanel from "./FileBrowserPanel";
 import {
   type FileCommentAnnotationEntry,
@@ -842,6 +844,10 @@ export default function FilePreviewPanel({
     () => (relativePath ? fileBreadcrumbs(projectName, relativePath) : []),
     [projectName, relativePath],
   );
+  const showInFiles = useCallback(
+    (path: string) => useRightPanelStore.getState().revealInFiles(threadRef, path),
+    [threadRef],
+  );
   const onFilePostRender = useFileLineReveal(relativePath, revealLine, revealRequestId);
 
   useEffect(() => {
@@ -899,30 +905,11 @@ export default function FilePreviewPanel({
             className="min-w-0 flex-1 rounded-none"
             data-file-breadcrumbs
           >
-            <div className="flex h-full w-max min-w-full items-center text-xs">
-              {breadcrumbs.map((crumb, index) => (
-                <div
-                  key={crumb.path || "project"}
-                  className="flex min-w-0 shrink-0 items-center"
-                  data-current-file-crumb={crumb.kind === "file"}
-                >
-                  {index > 0 ? (
-                    <ChevronRight className="mx-1 size-3.5 shrink-0 text-muted-foreground/60" />
-                  ) : null}
-                  <span
-                    className={cn(
-                      "max-w-40 truncate",
-                      crumb.kind === "file"
-                        ? "font-medium text-foreground"
-                        : "text-muted-foreground",
-                    )}
-                    title={crumb.path || projectName}
-                  >
-                    {crumb.label}
-                  </span>
-                </div>
-              ))}
-            </div>
+            <FileBreadcrumbTrail
+              breadcrumbs={breadcrumbs}
+              projectName={projectName}
+              onReveal={showInFiles}
+            />
           </ScrollArea>
           {absolutePath && environmentId === primaryEnvironmentId ? (
             <OpenInPicker
@@ -953,6 +940,23 @@ export default function FilePreviewPanel({
               <TooltipPopup>Open file in preview browser</TooltipPopup>
             </Tooltip>
           ) : null}
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Toggle
+                  className="shrink-0"
+                  pressed={false}
+                  onPressedChange={() => showInFiles(relativePath)}
+                  aria-label="Show in Files"
+                  variant="ghost"
+                  size="sm"
+                >
+                  <FolderSearch className="size-3.5" />
+                </Toggle>
+              }
+            />
+            <TooltipPopup>Show in Files</TooltipPopup>
+          </Tooltip>
           <Tooltip>
             <TooltipTrigger
               render={

@@ -29,10 +29,6 @@ vi.mock("~/browser/openFileInPreview", () => ({
 vi.mock("~/editorPreferences", () => ({ usePreferredEditor: () => [null] }));
 vi.mock("~/hooks/useTheme", () => ({ useTheme: () => ({ resolvedTheme: "dark" as const }) }));
 vi.mock("~/previewStateStore", () => ({ canPreviewAnyUrlInRuntime: () => false }));
-vi.mock("~/rightPanelStore", () => ({
-  useRightPanelStore: (selector: (state: Record<string, unknown>) => unknown) =>
-    selector({ remapFileSurfaces: vi.fn(), closeFileSurfacesUnder: vi.fn() }),
-}));
 vi.mock("~/state/assets", () => ({ assetEnvironment: { createUrl: { label: "createUrl" } } }));
 vi.mock("~/state/environments", () => ({
   useEnvironment: () => null,
@@ -71,6 +67,7 @@ vi.mock("./projectFilesQueryState", () => ({
   }),
 }));
 
+import { useRightPanelStore } from "~/rightPanelStore";
 import FileBrowserPanel, {
   fileTreeViewMemorySize,
   resetFileTreeViewMemory,
@@ -128,6 +125,7 @@ describe("FileBrowserPanel with the real tree", () => {
   beforeEach(() => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     resetFileTreeViewMemory();
+    useRightPanelStore.setState({ byThreadKey: {}, filesReveal: {} });
     onOpenFile.mockReset();
     container = document.createElement("div");
     document.body.append(container);
@@ -184,5 +182,47 @@ describe("FileBrowserPanel with the real tree", () => {
     await act(async () => root.unmount());
     root = createRoot(container);
     expect(fileTreeViewMemorySize()).toBe(32);
+  });
+
+  it("reveals a requested path: opens its folders, selects it, and does not open a file", async () => {
+    await mount();
+    expect(row("src/a.ts")).toBeNull();
+
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "src/a.ts"));
+    await settle();
+
+    expect(row("src/a.ts")!.getAttribute("data-item-selected")).not.toBeNull();
+    expect(row("docs/readme.md")).toBeNull();
+    expect(onOpenFile).not.toHaveBeenCalled();
+    expect(useRightPanelStore.getState().filesReveal).toEqual({});
+  });
+
+  it("selects a requested folder and moves the selection off the previous row", async () => {
+    await mount();
+    await click("src/");
+    await click("src/b.ts");
+    onOpenFile.mockClear();
+
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "docs"));
+    await settle();
+
+    expect(row("docs/")!.getAttribute("data-item-selected")).not.toBeNull();
+    expect(row("src/b.ts")!.getAttribute("data-item-selected")).toBeNull();
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("applies a request made before the Files tab mounted, over the remembered view", async () => {
+    await mount();
+    await click("src/");
+    await click("src/b.ts");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+
+    useRightPanelStore.getState().revealInFiles(threadRef, "docs/readme.md");
+    await mount();
+
+    expect(row("docs/readme.md")!.getAttribute("data-item-selected")).not.toBeNull();
+    expect(row("src/b.ts")!.getAttribute("data-item-selected")).toBeNull();
+    expect(useRightPanelStore.getState().filesReveal).toEqual({});
   });
 });

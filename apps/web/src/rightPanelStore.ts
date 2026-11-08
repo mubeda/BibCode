@@ -96,8 +96,21 @@ export interface ThreadRightPanelState {
 
 type GenericRightPanelKind = Exclude<RightPanelKind, "file" | "terminal" | "pullRequest">;
 
+/** A request to show a workspace path in the Files tree. Transient: never persisted. */
+export interface FilesRevealRequest {
+  /** Workspace-relative path of a file or folder; "" shows the tree with nothing selected. */
+  readonly path: string;
+  readonly requestId: number;
+}
+
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  /** The pending reveal per thread; the mounted Files tree applies it, then clears it. */
+  filesReveal: Record<string, FilesRevealRequest>;
+  /** Opens (or reopens) the Files tab and asks its tree to select `relativePath`. */
+  revealInFiles: (ref: ScopedThreadRef, relativePath: string) => void;
+  /** Drops the request once handled; a newer request for the same thread is kept. */
+  clearFilesReveal: (ref: ScopedThreadRef, requestId: number) => void;
   open: (ref: ScopedThreadRef, kind: GenericRightPanelKind) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
   /** Opens `ref`'s Diff surface on `threadId`'s diff: a chat panel's, in its host's panel. */
@@ -436,6 +449,30 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set) => ({
       byThreadKey: {},
+      filesReveal: {},
+      revealInFiles: (ref, relativePath) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          return {
+            byThreadKey: updateThread(state.byThreadKey, key, (current) =>
+              upsertSurface(current, singletonSurface("files")),
+            ),
+            filesReveal: {
+              ...state.filesReveal,
+              [key]: {
+                path: relativePath.replace(/^\/+|\/+$/g, ""),
+                requestId: (state.filesReveal[key]?.requestId ?? 0) + 1,
+              },
+            },
+          };
+        }),
+      clearFilesReveal: (ref, requestId) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          if (state.filesReveal[key]?.requestId !== requestId) return state;
+          const { [key]: _handled, ...rest } = state.filesReveal;
+          return { filesReveal: rest };
+        }),
       open: (ref, kind) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
