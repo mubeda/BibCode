@@ -5,10 +5,11 @@ import {
   type PipelinesChanged,
   type PipelinesDetail,
   type PipelinesGetInput,
+  type PipelinesJobDetail,
   type PipelinesSnapshot,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
-import { act, createRef, useReducer, type ReactNode } from "react";
+import { act, createRef, useReducer, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DEFAULT_PIPELINES_FILTERS, usePipelinesStore } from "../../../pipelinesStore";
@@ -21,6 +22,7 @@ import {
 } from "../../repositoryModule/RepositoryModule";
 import { buildPipelinesListInput } from "../list/pipelinesList.logic";
 import { pipelinesModule } from "../pipelinesModule";
+import { pipelineJobDetail } from "../job/testFixtures";
 import { pipelineDetail, pipelineJob } from "../testFixtures";
 import { PipelineLinksProvider } from "./PipelineLinks";
 
@@ -39,6 +41,10 @@ const h = vi.hoisted(() => ({
   changed: null as PipelinesChanged | null,
   streamFailed: false,
   get: vi.fn((args: { input: PipelinesGetInput }) => ({ kind: "get", ...args })),
+  job: null as PipelinesJobDetail | null,
+  jobChanges: [] as (number | null)[],
+  jobError: null as PullRequestsOperationError | null,
+  getJob: vi.fn((args: { input: unknown }) => ({ kind: "getJob", ...args })),
   readSnapshot: vi.fn((args: { input: unknown }) => ({ kind: "readSnapshot", ...args })),
   subscribe: vi.fn((args: { input: unknown }) => ({ kind: "subscribe", ...args })),
   requestTimerRead: vi.fn(),
@@ -51,6 +57,7 @@ const h = vi.hoisted(() => ({
 vi.mock("../../../state/pipelines", () => ({
   pipelinesEnvironment: {
     get: h.get,
+    getJob: h.getJob,
     readSnapshot: h.readSnapshot,
     subscribe: h.subscribe,
     requestTimerRead: h.requestTimerRead,
@@ -90,6 +97,26 @@ vi.mock("../../../state/query", () => ({
         isPending: false,
         refresh: read,
         revalidate: read,
+        requiresRetry: false,
+      };
+    }
+    if (atom !== null && atom.kind === "getJob") {
+      const jobError = h.jobError;
+      if (jobError && !h.failures.has(jobError))
+        h.failures.set(jobError, { _tag: "Failure", cause: Cause.fail(jobError) });
+      // The open hides a cached answer until it is read again: a read answers anew.
+      const readJob = () => {
+        if (jobError) h.failures.delete(jobError);
+        if (h.job) h.job = { ...h.job };
+        publish();
+      };
+      return {
+        data: h.job,
+        emission: jobError ? h.failures.get(jobError) : { _tag: "Success", value: h.job },
+        error: jobError?.message ?? null,
+        isPending: false,
+        refresh: readJob,
+        revalidate: readJob,
         requiresRetry: false,
       };
     }
@@ -134,16 +161,17 @@ vi.mock("@tanstack/react-router", () => ({
     to,
     params,
     children,
-    className,
+    search: _search,
+    ...rest
   }: {
     to: string;
     params?: Record<string, string>;
+    search?: unknown;
     children: ReactNode;
-    className?: string;
   }) => (
     <a
+      {...rest}
       data-route={to}
-      className={className}
       href={Object.entries(params ?? {}).reduce(
         (path, [name, value]) => path.replace(`$${name}`, value),
         to,
@@ -154,6 +182,27 @@ vi.mock("@tanstack/react-router", () => ({
   ),
 }));
 vi.mock("../../../lib/openPullRequestLink", () => ({ useOpenPrLink: () => vi.fn() }));
+// The log itself has its own tests; here it shows which log the panel asked for.
+vi.mock("../log/JobLog", () => {
+  const Part = ({ children }: { children?: ReactNode }) => <>{children ?? null}</>;
+  return {
+    JobLog: {
+      Provider: ({ source, children }: { source: unknown; children: ReactNode }) => (
+        <div data-log-source={JSON.stringify(source)}>{children}</div>
+      ),
+      Toolbar: Part,
+      Search: Part,
+      TimestampsToggle: Part,
+      WrapToggle: Part,
+      SectionsToggle: Part,
+      ScrollButtons: Part,
+      RawLink: Part,
+      LoadEarlier: Part,
+      Lines: Part,
+      Status: Part,
+    },
+  };
+});
 
 import { PipelinesDetailView, type PipelinesDetailViewHandle } from "./PipelinesDetailView";
 
@@ -192,6 +241,23 @@ async function settle() {
     for (const answer of h.inflight.splice(0)) answer();
   });
 }
+/** The view with its `?job=` held as the route would: each change a new search. */
+function RoutedView({ attempt }: { attempt: number | null }) {
+  const [jobId, setJobId] = useState<number | null>(null);
+  return (
+    <PipelinesDetailView
+      ref={handle}
+      pipelineId={4821}
+      attempt={attempt}
+      jobId={jobId}
+      onJobChange={(next) => {
+        h.jobChanges.push(next);
+        setJobId(next);
+      }}
+      onBackoffChange={vi.fn()}
+    />
+  );
+}
 async function render(
   options: {
     provider?: "gitlab" | "github";
@@ -201,14 +267,7 @@ async function render(
     actions?: boolean;
   } = {},
 ) {
-  const view = (
-    <PipelinesDetailView
-      ref={handle}
-      pipelineId={4821}
-      attempt={options.attempt ?? null}
-      onBackoffChange={vi.fn()}
-    />
-  );
+  const view = <RoutedView attempt={options.attempt ?? null} />;
   const value = moduleValue(
     options.provider === "github" ? githubContext : gitlabContext,
     options.actions ? null : SERVER_TOO_OLD,
@@ -278,6 +337,7 @@ beforeEach(() => {
   h.streamFailed = false;
   for (const mock of [
     h.get,
+    h.getJob,
     h.readSnapshot,
     h.subscribe,
     h.requestTimerRead,
@@ -287,6 +347,9 @@ beforeEach(() => {
   ])
     mock.mockClear();
   h.inflight = [];
+  h.job = null;
+  h.jobError = null;
+  h.jobChanges = [];
   setVisibility("visible");
 });
 afterEach(async () => {
@@ -364,7 +427,7 @@ describe("PipelinesDetailView actions", () => {
       input: { cwd: "/repo", target: { _tag: "job", id: 998 }, action: "retry" },
     });
     expect(h.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId" as const,
       params: { environmentId: "env", projectId: "p", pipelineId: "4821", jobId: "1001" },
       search: {},
     });
@@ -843,6 +906,33 @@ describe("PipelinesDetailView stage columns", () => {
     error.mockRestore();
   });
 
+  it("wraps stages onto more rows instead of scrolling sideways, and remembers it", async () => {
+    await render();
+    const wrap = [...container.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent?.trim() === "Wrap stages",
+    )!;
+    expect(wrap.getAttribute("aria-pressed")).toBe("false");
+    // Only beside the stages: stacked stages never scroll sideways.
+    expect(wrap.className).toContain("hidden");
+    expect(wrap.className).toContain("@min-[720px]/pipeline:inline-flex");
+    await act(async () => wrap.click());
+    expect(wrap.getAttribute("aria-pressed")).toBe("true");
+    expect(stageList().className).toContain("@min-[720px]/pipeline:flex-wrap");
+    expect(stageList().className).not.toContain("overflow-x-auto");
+    expect(localStorage.getItem("bibcode:pipelines-stage-wrap")).toBe("true");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await render();
+    expect(stageList().className).toContain("@min-[720px]/pipeline:flex-wrap");
+    localStorage.setItem("bibcode:pipelines-stage-wrap", "oops");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await render();
+    expect(stageList().className).toContain("@min-[720px]/pipeline:overflow-x-auto");
+    error.mockRestore();
+  });
+
   it("keeps the full job name in a tooltip, wrapped until its column is at the minimum", async () => {
     await render();
     const name = container.querySelector('[title="rspec"]')!;
@@ -850,5 +940,170 @@ describe("PipelinesDetailView stage columns", () => {
     expect(name.className).toContain("@max-[257px]/stage:truncate");
     expect(name.className.split(" ")).not.toContain("truncate");
     expect(name.closest("ol > li")!.className).toContain("@container/stage");
+  });
+});
+
+describe("PipelinesDetailView job log panel", () => {
+  const jobPageLinks = {
+    jobLink: (jobId: number) => ({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId" as const,
+      params: { environmentId: "env", projectId: "p", pipelineId: "4821", jobId: String(jobId) },
+    }),
+  };
+  const withJobPages = (view: ReactNode) => (
+    <PipelineLinksProvider value={jobPageLinks}>{view}</PipelineLinksProvider>
+  );
+  const panel = () => container.querySelector<HTMLElement>("aside[aria-labelledby]");
+  const jobLink = () => link("rspec2m 0s");
+  const click = (element: HTMLElement, init: MouseEventInit = {}) => {
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0, ...init });
+    act(() => {
+      element.dispatchEvent(event);
+    });
+    return event;
+  };
+
+  it("opens a job's log beside the stages on a plain click, and its page on a modified one", async () => {
+    h.job = pipelineJobDetail({ job: { ...pipelineJob }, rawLogUrl: null });
+    await render({ wrap: withJobPages });
+    expect(panel()).toBeNull();
+    expect(click(jobLink(), { metaKey: true }).defaultPrevented).toBe(false);
+    expect(click(jobLink(), { button: 1 }).defaultPrevented).toBe(false);
+    expect(panel()).toBeNull();
+    expect(click(jobLink()).defaultPrevented).toBe(true);
+    await settle();
+    const aside = panel()!;
+    const heading = aside.querySelector("h2")!;
+    expect(heading.textContent).toBe("rspecFailed");
+    expect(document.activeElement).toBe(heading);
+    expect(jobLink().getAttribute("aria-current")).toBe("true");
+    expect(
+      [...aside.querySelectorAll("a")].find((a) => a.textContent === "Open job page")!.href,
+    ).toContain("/project/env/p/pipelines/4821/jobs/998");
+    expect(
+      JSON.parse(aside.querySelector("[data-log-source]")!.getAttribute("data-log-source")!),
+    ).toEqual({ _tag: "complete", jobId: 998, attempt: null });
+    expect(h.getJob).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: { cwd: "/repo", jobId: 998, refresh: "user" },
+    });
+  });
+
+  it("lays the stages and the log side by side on a wide page only while a log is open", async () => {
+    h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+    await render({ wrap: withJobPages });
+    // The page root is the `pipeline` container; its first child lays out stages and log.
+    const layout = () => container.querySelector(".\\@container\\/pipeline")!.firstElementChild!;
+    expect(layout().className).not.toContain("@min-[960px]/pipeline:flex-row");
+    click(jobLink());
+    await settle();
+    expect(layout().className).toContain("@min-[960px]/pipeline:flex-row");
+    expect(panel()!.className).toContain("@min-[960px]/pipeline:w-[45%]");
+    // Below the wide step the log sits under the stages at a fixed height.
+    expect(panel()!.className).toContain("h-[70vh]");
+  });
+
+  it("closes the log with Close or Escape and gives focus back to the job's row", async () => {
+    h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+    await render({ wrap: withJobPages });
+    click(jobLink());
+    await settle();
+    await act(async () => button("Close log").click());
+    expect(panel()).toBeNull();
+    expect(document.activeElement).toBe(jobLink());
+    expect(jobLink().getAttribute("aria-current")).toBeNull();
+    // Each open and close goes through the route's `?job=`.
+    expect(h.jobChanges).toEqual([998, null]);
+    click(jobLink());
+    await settle();
+    act(() => {
+      panel()!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+      );
+    });
+    expect(panel()).toBeNull();
+    expect(document.activeElement).toBe(jobLink());
+  });
+
+  it("says when the job cannot be read, and keeps the stages", async () => {
+    h.jobError = operationError("forbidden", "Forbidden");
+    await render({ wrap: withJobPages });
+    click(jobLink());
+    await settle();
+    expect(panel()!.querySelector('[role="alert"]')!.textContent).toContain(
+      "You can't view this job.",
+    );
+    expect(panel()!.querySelector("[data-log-source]")).toBeNull();
+    expect(container.querySelector('[aria-label="Stages"]')).not.toBeNull();
+  });
+
+  it("opens jobs on the host, with no log panel, where the view has no job page", async () => {
+    await render();
+    expect(click(jobLink()).defaultPrevented).toBe(false);
+    expect(panel()).toBeNull();
+  });
+});
+
+describe("PipelinesDetailView job dependencies", () => {
+  /** compile (dag, no needs) and rspec (dag, needs compile): two layers, as GitLab draws them. */
+  function needsDetail(fields: "known" | "absent" = "known") {
+    const detail = pipelineDetail({ usesNeeds: true });
+    if (fields === "absent") return detail;
+    return {
+      ...detail,
+      stages: detail.stages!.map((stage) => ({
+        ...stage,
+        groups: stage.groups.map((group) => ({
+          ...group,
+          jobs: group.jobs.map((job) => ({
+            ...job,
+            scheduling: "dag" as const,
+            needs: job.name === "rspec" ? ["compile"] : [],
+          })),
+        })),
+      })),
+    };
+  }
+  const grouping = () => container.querySelector('[aria-labelledby="pipeline-job-grouping-label"]');
+  const headers = () =>
+    [...container.querySelectorAll('[aria-label="Stages"] > li h3')].map(
+      (h3) => h3.querySelector(".truncate")?.textContent,
+    );
+
+  it("says what each job needs, grouped by stage until asked otherwise", async () => {
+    h.detail = needsDetail();
+    await render();
+    expect(grouping()).not.toBeNull();
+    expect(headers()).toEqual(["build", "test"]);
+    expect(container.querySelector('[title="rspec"]')!.textContent).toBe("rspecNeeds: compile");
+    expect(container.querySelector('[title="compile"]')!.textContent).toBe("compile");
+  });
+
+  it("groups jobs by their dependencies when chosen, and falls back on a corrupt choice", async () => {
+    localStorage.setItem("bibcode:pipelines-job-grouping", '"needs"');
+    h.detail = needsDetail();
+    await render();
+    expect(headers()).toEqual(["Layer 1", "Layer 2"]);
+    localStorage.setItem("bibcode:pipelines-job-grouping", "oops");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await render();
+    expect(headers()).toEqual(["build", "test"]);
+    error.mockRestore();
+  });
+
+  it("offers no grouping when the server or stored copy leaves the fields out", async () => {
+    localStorage.setItem("bibcode:pipelines-job-grouping", '"needs"');
+    h.detail = needsDetail("absent");
+    await render();
+    expect(grouping()).toBeNull();
+    expect(headers()).toEqual(["build", "test"]);
+  });
+
+  it("offers no grouping for a pipeline that does not use needs", async () => {
+    h.detail = { ...needsDetail(), usesNeeds: false };
+    await render();
+    expect(grouping()).toBeNull();
   });
 });

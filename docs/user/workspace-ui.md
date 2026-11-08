@@ -1364,8 +1364,11 @@ The list opens on the copy BiBCode last stored for that filter, then the
 host's current page. A header names the columns (Status, Pipeline, Created by,
 Stages, Actions) and stays in place while the rows scroll. On a wide panel
 drag the edge of the Pipeline, Created by or Stages header (or focus it and use
-the arrow keys, Home and End; double-click resets) to resize it; the widths
-are remembered. The columns button in the header hides Created by, Stages or the duration and age under Status.
+the arrow keys, Home and End; double-click resets) to resize it. The columns
+button in the header hides Created by, Stages or the duration and age under
+Status. Widths and hidden columns are remembered for each repository; a
+repository you have not changed uses the choice you made before this setting
+was per repository, or the defaults.
 As the panel narrows, Created by hides first, then the stage icons shrink to
 as many as fit followed by a "+3" count (hover it for the names), then Status
 shrinks to its icon. Each row shows the status with its duration and age
@@ -1409,12 +1412,20 @@ on a wide panel, stacked on a narrow one. The columns grow to fill the panel up
 to a maximum width, and the row scrolls sideways only when the stages do not
 fit at 256 px each; drag the edge of the first column, or use the arrow keys,
 Home and End on it, to change that maximum for all columns (double-click
-resets); it is remembered. Each stage
+resets); it is remembered. **Wrap stages** above them puts the stages that do
+not fit on more rows instead of scrolling sideways; it is remembered too. Each stage
 shows its status, name and job count; each job its status, name and
 duration. A parallel group such as `rspec 3` is one row that expands to its
 jobs, a trigger job links to its **Downstream pipeline**, and a job that
 failed but was allowed to fail shows a warning instead of a failure. Choosing
-a job opens its job page in BiBCode (below). When GitLab returns only the first 100 jobs of a
+a job opens its log beside the stages (below them on a narrow panel), with
+**Open job page** for its details and **Close** (or Escape) to put it away;
+Ctrl-, Cmd- or middle-click a job to open its job page in BiBCode (below)
+instead. The open log is part of the page's address, so Back closes it and a
+copied link opens it again. On a GitLab pipeline that uses `needs`, each job
+lists what it needs ("Needs: build, lint"), and **Group jobs by** switches
+between **Stage** and **Job dependencies**, which puts each job one column
+after the jobs it waits for; it is remembered. When GitLab returns only the first 100 jobs of a
 stage, the page says so and links to the full pipeline; an account that
 cannot see the jobs keeps the header and is told so. A pipeline you cannot
 view, or one that no longer exists, says that on the page, with **Open on

@@ -10,6 +10,13 @@ import { pipelineJobLink } from "../job/pipelineJobRoute";
 export interface PipelineLinks {
   /** An in-app job page, or `null` to open the host's job page instead. */
   readonly jobLink: (jobId: number) => ToOptions | null;
+  /**
+   * Shows a job's log in place: a plain click on an in-app job link calls it instead
+   * of navigating (a modified click still opens the page). Absent where no log panel is.
+   */
+  readonly selectJob?: (jobId: number) => void;
+  /** The job whose log is shown, marked on its row. */
+  readonly selectedJobId?: number | null;
 }
 
 /** Outside a pipeline page, a job opens on the host. */

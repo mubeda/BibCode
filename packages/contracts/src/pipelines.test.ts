@@ -108,6 +108,34 @@ describe("Pipelines contracts", () => {
     expect(grouped.stages?.[0]?.groups[0]?.jobs[0]?.id).toBe(998);
   });
 
+  it("decodes a job's scheduling and needs as absent, null or known", () => {
+    const decodeJob = (extra: object) =>
+      decodeDetail({
+        revision: 9,
+        pipeline: row,
+        commit: { sha: "abc1234", title: null, url: null },
+        totalJobs: 1,
+        stages: [
+          {
+            name: "test",
+            status: "failed",
+            warnings: false,
+            groups: [{ name: "rspec", size: 1, status: "failed", jobs: [{ ...job, ...extra }] }],
+          },
+        ],
+        truncated: false,
+        usesNeeds: true,
+        artifacts: [],
+      }).stages![0]!.groups[0]!.jobs[0]!;
+    expect(decodeJob({}).needs).toBeUndefined();
+    expect(decodeJob({ scheduling: null, needs: null }).needs).toBeNull();
+    expect(decodeJob({ scheduling: "dag", needs: ["build"] })).toMatchObject({
+      scheduling: "dag",
+      needs: ["build"],
+    });
+    expect(() => decodeJob({ scheduling: "soon" })).toThrow();
+  });
+
   it("decodes a job detail and both log variants", () => {
     const jobDetail = decodeJobDetail({
       revision: 3,

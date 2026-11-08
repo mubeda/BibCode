@@ -164,6 +164,7 @@ function PipelinesPages({
     setCursors((previous) => [...previous, nextCursor]);
   };
   const repositoryPermission = context.repositoryPermission;
+  const repository = `${context.host}/${context.repository}`;
   const renderRow = useCallback(
     ({ item, index }: { item: PipelinesRow; index: number }) => (
       <PipelinesListRow
@@ -194,7 +195,11 @@ function PipelinesPages({
       revision={firstQuery.data?.revision ?? null}
       onSettled={onActionSettled}
     >
-      <PipelinesColumnsRoot className="@container flex min-h-0 flex-1 flex-col">
+      <PipelinesColumnsRoot
+        key={repository}
+        repository={repository}
+        className="@container flex min-h-0 flex-1 flex-col"
+      >
         {message !== null ? (
           <div role="alert" className="space-y-2 border-b border-border p-4 text-sm">
             <p>{message}</p>
