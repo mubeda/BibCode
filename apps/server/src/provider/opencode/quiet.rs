@@ -19,7 +19,7 @@ use super::{
     OpenCodeServerApi, activity::MAX_LINEAGE_DEPTH, probe_server_api, sse::OpenCodeSseDecoder,
 };
 
-/// Mauro's decision 4: one budget covers every probe of one restore, across all siblings.
+/// The maintainer's decision 4: one budget covers every probe of one restore, across all siblings.
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(10);
 /// Each request's own bound, as the adapter's delivery lookups.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);

@@ -22,8 +22,8 @@ afterEach(() => {
 
 describe("/settings/diagnostics", () => {
   it("keeps only a non-empty environment search param", () => {
-    expect(validateDiagnosticsSearch({ environment: "luna", junk: "x" })).toEqual({
-      environment: "luna",
+    expect(validateDiagnosticsSearch({ environment: "workstation", junk: "x" })).toEqual({
+      environment: "workstation",
     });
     expect(validateDiagnosticsSearch({ environment: "" })).toEqual({});
     expect(validateDiagnosticsSearch({ environment: 3 })).toEqual({});
@@ -34,12 +34,12 @@ describe("/settings/diagnostics", () => {
     const Component = Route.options.component;
     if (typeof Component !== "function") throw new Error("Route component is not registered.");
     const navigate = vi.fn();
-    vi.spyOn(Route, "useSearch").mockReturnValue({ environment: "luna" } as never);
+    vi.spyOn(Route, "useSearch").mockReturnValue({ environment: "workstation" } as never);
     vi.spyOn(Route, "useNavigate").mockReturnValue(navigate as never);
 
     renderToStaticMarkup(<Component />);
 
-    expect(captured.props).toMatchObject({ profilerEnvironmentId: EnvironmentId.make("luna") });
+    expect(captured.props).toMatchObject({ profilerEnvironmentId: EnvironmentId.make("workstation") });
     const change = captured.props!.onProfilerEnvironmentChange as (
       environmentId: EnvironmentId | null,
     ) => void;

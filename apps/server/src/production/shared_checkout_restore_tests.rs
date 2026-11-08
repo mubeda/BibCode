@@ -1283,7 +1283,7 @@ async fn turn_zero_head_fallback_is_refused_on_a_shared_checkout() {
     fixture.shutdown().await;
 }
 
-/// Mauro (#279 Q1): a chat that never started a provider session and has no turns cannot have
+/// The maintainer (#279 Q1): a chat that never started a provider session and has no turns cannot have
 /// written a file, so it neither refuses the restore nor needs the token, and it is not
 /// suspended. A restore still holds it: its first message waits for the restore.
 #[tokio::test]

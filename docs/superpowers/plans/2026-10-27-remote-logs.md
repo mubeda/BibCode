@@ -29,7 +29,7 @@ server's identity, so even a correct bundle could not say where it came from.
    `DiagnosticBundleIdentity { environment_id, label, server_version }` to
    `DiagnosticBundleService::new`; write `manifest.json` first; slugged file
    name; `includes_crash_dumps` reflects the request. Failing tests first:
-   manifest fields, slug (`"Local"`, `"ai-server"`, `"Mauro's Mac 🍎"`, empty,
+   manifest fields, slug (`"Local"`, `"ai-server"`, `"Test User's Mac 🍎"`, empty,
    60-char label), name passes the client regex. Update the existing
    integration tests that enumerate entries or match the name:
    `apps/server/tests/diagnostic_bundle.rs` and

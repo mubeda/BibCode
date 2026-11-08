@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{GitRepository, ProcessOutput};
 
-/// Mauro's cap on a pending sign-in (M2).
+/// The maintainer's cap on a pending sign-in (M2).
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// GCM's refusal when interaction is disabled (`AuthenticationBase.cs`), lowercased.

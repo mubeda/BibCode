@@ -603,7 +603,7 @@ mod tests {
     fn file_name_label_is_a_bounded_ascii_slug() {
         assert_eq!(file_name_label("Local"), "local");
         assert_eq!(file_name_label("ai-server"), "ai-server");
-        assert_eq!(file_name_label("Mauro's Mac 🍎"), "mauro-s-mac");
+        assert_eq!(file_name_label("Test User's Mac 🍎"), "test-user-s-mac");
         assert_eq!(file_name_label("  --  "), "server");
         assert_eq!(file_name_label("日本"), "server");
         let cut = file_name_label(&format!("{} tail", "x".repeat(39)));

@@ -1,6 +1,6 @@
 # Checkpoints: Restore Files Beside a Quiet External OpenCode Server
 
-Status: Approved 2026-11-07 (Mauro pre-approval; reviewed by Codex and advisor). Issue #326, a follow-up to #279
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #326, a follow-up to #279
 ([`2026-11-07-shared-checkout-restore-guard-design.md`](./2026-11-07-shared-checkout-restore-guard-design.md),
 approved, on branch `worktree-agent-acfdd3a967c39b8d0` at the time of writing). BiBCode
 line references are to `e222d340ff`. OpenCode references are to the source read for this
@@ -29,7 +29,7 @@ Rewind only the conversation instead. If only BiBCode uses that server, turn on 
 uses this server" in Settings → Providers → OpenCode." The fence is also checked once more
 after step 7's tree capture, immediately before the provider rewind.
 
-**Revision 1 (2026-11-07)** records Mauro's answers (see
+**Revision 1 (2026-11-07)** records the maintainer's answers (see
 [Decisions recorded](#decisions-recorded)) and answers Codex's review of `ac16d0da05`
 (see [Review findings and resolutions](#review-findings-and-resolutions)). It reframes the
 probe and fence as best-effort detection, widens the statement to cover schedules and
@@ -59,12 +59,12 @@ starts work on that server. **That statement is the guarantee.** The probe (the 
 session tree is idle with nothing pending) and the event-stream fence (checked before each
 irreversible step) are best-effort detection of a false statement: they refuse or report
 what they see, and cannot exclude a start they do not see. Anything the probe cannot read
-refuses. OpenCode 1 keeps refusing. Mauro accepted this, knowing the residual risk is a
+refuses. OpenCode 1 keeps refusing. The maintainer accepted this, knowing the residual risk is a
 false statement.
 
 ## Decisions recorded
 
-Mauro, 2026-11-07, through the coordinator:
+The maintainer, 2026-11-07, through the coordinator:
 
 1. The opt-in `exclusiveServer` statement is accepted as the basis for lifting the
    refusal; the residual risk is a false statement.
@@ -113,7 +113,7 @@ which BiBCode cannot check. That is why the guarantee has to be the person's sta
 
 | Option                                                                                                             | For                                                                                                                               | Against                                                                                                                                                                      |
 | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **(A)** Keep #279's refusal. Improve the copy to name the fix (clear Server URL so BiBCode starts its own server). | No code, no risk. Correct by the evidence above.                                                                                  | The issue's case stays blocked. Mauro's workflow with a long-running external server keeps only "Rewind conversation only".                                                  |
+| **(A)** Keep #279's refusal. Improve the copy to name the fix (clear Server URL so BiBCode starts its own server). | No code, no risk. Correct by the evidence above.                                                                                  | The issue's case stays blocked. The maintainer's workflow with a long-running external server keeps only "Rewind conversation only".                                                  |
 | **(B)** Probe automatically for every unmanaged sibling.                                                           | No setting.                                                                                                                       | No guarantee: another client's prompt, a plugin or another process can start work unseen. A restore would overwrite that work. Breaks the issue's "otherwise keep refusing". |
 | **(C) chosen:** (B) only for an instance marked "Only BiBCode uses this server", OpenCode 2 only.                  | A true statement leaves only starters the probe can see. The probe and fence catch some false statements. The default stays safe. | Rests on a statement BiBCode cannot verify. One setting field (a contracts schema change). Uses experimental OpenCode 2 routes, so a server without them refuses.            |
 | **(D)** Interrupt the sibling's session before restoring.                                                          | Stops a running turn.                                                                                                             | Interrupt is not a lock; work can start again at once. Destroys the sibling's work instead of protecting it.                                                                 |
@@ -277,7 +277,7 @@ gate wait up to the probe budget longer, on top of #279's existing hold.
 | Trip before `restore_checkpoint`       | The existing unrestored error with this cause: "The conversation was rewound, but the files could not be restored: Panel's OpenCode server started working. Revert again when it finishes."                                                                                                       |
 | Trip after `restore_checkpoint`        | "Files were restored, but Panel's OpenCode server started working during the restore. Check Panel's changes."                                                                                                                                                                                     |
 
-Mauro's decision 3: the refusal names the setting. Its condition ("If nothing but BiBCode
+The maintainer's decision 3: the refusal names the setting. Its condition ("If nothing but BiBCode
 uses that server") comes first so the sentence states what the setting asserts before
 where to find it, rather than offering it as a way past the dialog.
 
@@ -366,7 +366,7 @@ it; no new event or finding.
   2 minor releases. Every unreadable answer refuses, so drift makes the guard stricter,
   not looser. The fixture-based tests pin today's shapes.
 - **Source read once.** OpenCode behaviour above is from one `dev` commit (2.2.5) and the
-  v1.19.5 tag; 2.0.x and 2.1.x were not diffed. The live check covers the version Mauro
+  v1.19.5 tag; 2.0.x and 2.1.x were not diffed. The live check covers the version the maintainer
   runs.
 - **Unverified items** carried from the research: whether v2 permission and question waits
   always sit inside the execution (inferred from `form.ts`); whether interrupt cancels every

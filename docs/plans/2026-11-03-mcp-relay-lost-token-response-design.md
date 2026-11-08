@@ -1,6 +1,6 @@
 # MCP Relay: Revoking a Credential Whose Token Response Was Lost
 
-Status: Approved by Mauro 2026-11-03 (revision 2). Issue #281. Verified at `30622da46436` (`v015/batch`). Line
+Status: Approved by the maintainer 2026-11-03 (revision 2). Issue #281. Verified at `30622da46436` (`v015/batch`). Line
 references are to that commit. No product code is written until this design is approved.
 
 **Revision 1 (2026-11-03)** answers the first Codex review (REVISE, five P2 findings). See

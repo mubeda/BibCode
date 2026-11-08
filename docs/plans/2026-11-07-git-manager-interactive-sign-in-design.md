@@ -1,6 +1,6 @@
 # Git Manager Sign-In on a Local Desktop
 
-Status: Approved 2026-11-07 (Mauro pre-approval; Codex reviewed revisions 0–2, advisor
+Status: Approved 2026-11-07 (the maintainer pre-approval; Codex reviewed revisions 0–2, advisor
 reviewed).
 
 Issue #325, a follow-up of #283
@@ -9,7 +9,7 @@ Issue #325, a follow-up of #283
 `e222d340ff` plus the accepted #283 branch), on macOS with Git 2.56.0. Line references are
 to that commit. No product code is written until this design is approved.
 
-**Revision 1 (2026-11-07)** records Mauro's answers to revision 0's five questions and
+**Revision 1 (2026-11-07)** records the maintainer's answers to revision 0's five questions and
 answers the first Codex review. The retry inside the operation is gone: a person now
 approves a sign-in that names the remote and its host, and the sign-in runs as its own
 short Git command outside every lock, capped at 10 minutes. See
@@ -31,7 +31,7 @@ Acceptance, from the issue: this note is approved first; then tests for each mod
 
 ## Decisions
 
-Mauro's answers (2026-11-07):
+The maintainer's answers (2026-11-07):
 
 - **M1.** Tag push and remote-branch delete get the sign-in too.
 - **M2.** A pending sign-in is capped at 10 minutes. Then BiBCode kills the Git process
@@ -217,7 +217,7 @@ SSH remotes stay out of scope. `SSH_ASKPASS_REQUIRE=never` blocks the askpass di
 | (C) Revision 0: retry the operation inside its lock when stderr contains GCM's message                                                                                                                                                                                                              | No new RPC.                                                                                                                                                                                       | A remote can print the message through sideband text and force a second push. The sign-in holds the project lock and the status mutation guard, so status reads stop. A 10-minute cap (M2) on the whole retry would also cut long transfers after sign-in. |
 | **(D) recommended:** the operation fails with `sign-in-required` on a line-anchored GCM refusal; the person approves the named destination; `git.signIn` runs a short authenticating command outside every lock with a 10-minute cap; the panel sends the resume request, bound to that destination | The cap measures the sign-in alone. No lock or status gate is held while a window is open. The person sees where they sign in before anything opens. A stored credential never reaches this path. | A new RPC, a new outcome and one approval click. A sign-in can succeed while the rerun then fails (for example a read-only token for a push); the rerun reports that as today.                                                                             |
 | (E) Sign in through `git credential fill`, then `approve`                                                                                                                                                                                                                                           | No probe request.                                                                                                                                                                                 | BiBCode would hold the secret in memory and pipe it between processes, and would have to reproduce Git's URL resolution (`pushurl`, `insteadOf`, `credential.useHttpPath`).                                                                                |
-| (F) A BiBCode askpass dialog for every helper                                                                                                                                                                                                                                                       | `osxkeychain` users could sign in too.                                                                                                                                                            | Rejected by Mauro (M3).                                                                                                                                                                                                                                    |
+| (F) A BiBCode askpass dialog for every helper                                                                                                                                                                                                                                                       | `osxkeychain` users could sign in too.                                                                                                                                                            | Rejected by the maintainer (M3).                                                                                                                                                                                                                                    |
 
 Eligibility alternatives:
 
@@ -226,7 +226,7 @@ Eligibility alternatives:
 | A payload flag set by the toolbar                                                                                                                   | Any caller can set a field, including the `/mcp` tools.                                                                                                                                    |
 | `required_scope` or administrative scopes                                                                                                           | MCP clients and paired devices can hold the same scopes.                                                                                                                                   |
 | Derive "local desktop" from `mode == Desktop && desktop_bootstrap_token.is_some() && !desktop_wsl_transport` (the `maintenance.rs:633-649` pattern) | Correct today, but a future launch path that reuses the bootstrap file descriptor (for example over SSH) would become eligible without anyone deciding it. The explicit flag fails closed. |
-| Treat a loopback `bibcode serve` as local                                                                                                           | Rejected by Mauro (M4).                                                                                                                                                                    |
+| Treat a loopback `bibcode serve` as local                                                                                                           | Rejected by the maintainer (M4).                                                                                                                                                                    |
 
 ## Design
 
@@ -746,6 +746,6 @@ Codex narrow check of revision 2. Two findings, both checked against Git v2.51.0
 | P2 8 | A URL-specific global `http.<url>.followRedirects=true` beats the generic `-c` key.          | Confirmed: `http.c` L1305-1321 collects `http.*` through `urlmatch_config_entry`, and `cmp_matches` (`urlmatch.c` L544-554) prefers the closer match. | **Fixed.** The probe also sets `http.<destination>.followRedirects=false`; it matches most closely and wins ties as the last entry. Test 5.                                    |
 | P2 9 | `get-url --push` prints only the first push URL, but `git push <remote>` visits all of them. | Confirmed: `builtin/push.c` L435-444 loops over every push URL.                                                                                       | **Fixed.** Detection, `git.signIn` and the resume check count URLs with `--all` and offer or accept a sign-in only for a remote with exactly one URL in the direction. Test 5. |
 
-## Questions only Mauro can answer
+## Questions only the maintainer can answer
 
 None open. Revision 0's five questions are answered (M1 to M5).

@@ -77,7 +77,7 @@ const primary = Effect.fn("TestRelay.primary")(function* (client: Partial<WsRpcP
 const CANDIDATES = [
   { environmentId: "primary", label: "This Mac", connected: true },
   { environmentId: "remote:omarchy", label: "Omarchy", connected: true },
-  { environmentId: "remote:luna", label: "Luna", connected: false },
+  { environmentId: "remote:workstation", label: "Workstation", connected: false },
   { environmentId: "remote:twin-a", label: "Twin", connected: true },
   { environmentId: "remote:twin-b", label: "twin ", connected: true },
 ];
@@ -105,9 +105,9 @@ describe("resolveRelayEnvironment", () => {
   });
 
   it("never stands in another environment for one that is not connected", () => {
-    expect(resolveRelayEnvironment("Luna", CANDIDATES)).toMatchObject({
+    expect(resolveRelayEnvironment("Workstation", CANDIDATES)).toMatchObject({
       kind: "not-connected",
-      message: "Luna is not connected in BiBCode. Reconnect it, then try again.",
+      message: "Workstation is not connected in BiBCode. Reconnect it, then try again.",
     });
   });
 });

@@ -1054,12 +1054,12 @@ describe("DiagnosticsSettingsPanel profiler section", () => {
     const onChange = vi.fn();
     const markup = renderToStaticMarkup(
       <DiagnosticsSettingsPanel
-        profilerEnvironmentId={EnvironmentId.make("luna")}
+        profilerEnvironmentId={EnvironmentId.make("workstation")}
         onProfilerEnvironmentChange={onChange}
       />,
     );
 
-    expect(markup).toContain('data-selected-environment="luna"');
+    expect(markup).toContain('data-selected-environment="workstation"');
     expect(markup).toContain('data-reports-selection="true"');
   });
 
@@ -1084,12 +1084,12 @@ describe("DiagnosticsSettingsPanel diagnostic log download", () => {
     const onChange = vi.fn();
     const markup = renderToStaticMarkup(
       <DiagnosticsSettingsPanel
-        profilerEnvironmentId={EnvironmentId.make("luna")}
+        profilerEnvironmentId={EnvironmentId.make("workstation")}
         onProfilerEnvironmentChange={onChange}
       />,
     );
 
-    expect(markup).toContain('data-logs-environment="luna"');
+    expect(markup).toContain('data-logs-environment="workstation"');
     expect(markup).toContain('data-logs-reports-selection="true"');
   });
 });

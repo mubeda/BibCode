@@ -1,6 +1,6 @@
 # Codex stdout LineTooLong closes delivery (#316)
 
-Status: **Self-approved by Mauro** (explicit “approve yourself” for this defect, 2026-11-06 ART). Design for issue [#316](https://github.com/mubeda/BibCode/issues/316). Verified against `origin/main` at `2101b2cde9` (post v0.15.2 chore merge); transport path unchanged from v0.15.1 for this mechanism.
+Status: **Self-approved by the maintainer** (explicit “approve yourself” for this defect, 2026-11-06 ART). Design for issue [#316](https://github.com/mubeda/BibCode/issues/316). Verified against `origin/main` at `2101b2cde9` (post v0.15.2 chore merge); transport path unchanged from v0.15.1 for this mechanism.
 
 ## Problem
 

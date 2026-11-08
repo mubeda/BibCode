@@ -1,6 +1,6 @@
 # Git: Honouring the System Line-Ending Settings
 
-Status: Approved by Mauro 2026-11-03 (revision 2). Issue #282. Verified at `30622da46436` (`v015/batch`) on
+Status: Approved by the maintainer 2026-11-03 (revision 2). Issue #282. Verified at `30622da46436` (`v015/batch`) on
 Windows 11 with Git `2.56.0.windows.4`. Line references are to that commit. No product code
 is written until this design is approved.
 
@@ -437,7 +437,7 @@ Implemented in `apps/server/src/git/system_line_endings.rs`, with the integratio
 
 ## Amendment (2026-11-07, issue #283)
 
-Mauro decided on 2026-11-07 that the curated system configuration of
+The maintainer decided on 2026-11-07 that the curated system configuration of
 [`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md)
 applies to every BiBCode Git call. This partly reverses the Outcome above. The rest of
 this document is kept as it was approved.

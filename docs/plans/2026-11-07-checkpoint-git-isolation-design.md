@@ -1,6 +1,6 @@
 # Checkpoints and Bootstrap: One Git Isolation Policy
 
-Status: Approved 2026-11-07 (Mauro pre-approval; reviewed by Codex and advisor).
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor).
 Implemented 2026-11-07 in `apps/server/src/git/system_config.rs`, `git_environment_inheriting_unread()`
 and the checkpoint and bootstrap spawns of `orchestration_effects.rs`, with the test plan in
 `apps/server/tests/git_system_config.rs`; the Windows-only parts and the CI steps are not yet run.
@@ -12,13 +12,13 @@ product code is written until this design is approved. Companion: #279
 ([`2026-11-07-shared-checkout-restore-guard-design.md`](./2026-11-07-shared-checkout-restore-guard-design.md))
 changes the same file and assumes this environment. One implementer builds #283 first.
 
-**Revision 1 (2026-11-07)** records Mauro's decisions and answers the first Codex review.
+**Revision 1 (2026-11-07)** records the maintainer's decisions and answers the first Codex review.
 See [Review findings and resolutions](#review-findings-and-resolutions).
 
-- Mauro, decision A: the curated system set applies to every BiBCode Git call, not only
+- The maintainer, decision A: the curated system set applies to every BiBCode Git call, not only
   checkpoints and bootstrap. This partly reverses #282, whose design now carries an
   amendment note.
-- Mauro, decision B: the background bootstrap fetch never opens a credential window. It
+- The maintainer, decision B: the background bootstrap fetch never opens a credential window. It
   fails with an authentication error instead.
 - A system LFS group BiBCode does not recognize no longer drops silently. The whole
   policy is then `Unread`, so every caller keeps today's behaviour, and the legacy
@@ -117,7 +117,7 @@ expanded content.
 | (A) Status quo: checkpoints and bootstrap inherit the whole system file                                                                                           | No change; LFS works.                                                                                                                                                                                   | A system `core.hooksPath` runs a `reference-transaction` hook on every capture; system textconv, filters and includes reach checkpoints; the bootstrap fetch has no prompt guards, so Git Credential Manager can open a window from a server process. Two policies remain.          |
 | (B) Checkpoints and bootstrap use today's `git_environment()` unchanged                                                                                           | One policy, one line per spawn.                                                                                                                                                                         | On Git for Windows an old pointer checkpoint restores as pointer text, and new captures store whole LFS files in the object database. The bootstrap fetch loses the system credential helper, so an HTTPS fetch of a private repository fails for most Windows and Apple Git users. |
 | (C) Checkpoints write pointers themselves (`GIT_LFS_SKIP_SMUDGE`, or an LFS-aware capture)                                                                        | Independent of the host.                                                                                                                                                                                | Restore still needs the smudge to give real files. Reimplements LFS.                                                                                                                                                                                                                |
-| **(D) recommended:** extend the #282 keys-only file with canonical LFS, symlink, Windows performance and credential-helper keys, and route every spawn through it | One policy for all spawns, worktrees included. Captures and restores match the person's Git and old checkpoints. Only canonical tokens are written, so no hook, include or arbitrary command can enter. | `git_environment()` callers gain LFS, TLS keys and a credential helper, which #282 kept out. That is a behaviour change for the Git manager (see [Effect on other callers](#effect-on-other-callers)); Mauro accepted it (decision A).                                              |
+| **(D) recommended:** extend the #282 keys-only file with canonical LFS, symlink, Windows performance and credential-helper keys, and route every spawn through it | One policy for all spawns, worktrees included. Captures and restores match the person's Git and old checkpoints. Only canonical tokens are written, so no hook, include or arbitrary command can enter. | `git_environment()` callers gain LFS, TLS keys and a credential helper, which #282 kept out. That is a behaviour change for the Git manager (see [Effect on other callers](#effect-on-other-callers)); the maintainer accepted it (decision A).                                              |
 
 ## Decision: option (D)
 
@@ -175,7 +175,7 @@ state picks the behaviour whose failure can be recovered from:
 
 The prompt guards apply in every state.
 
-### Authentication and prompts (Mauro, decision B)
+### Authentication and prompts (the maintainer, decision B)
 
 Today every `git_environment()` call sets `GCM_INTERACTIVE=never`, `GIT_TERMINAL_PROMPT=0`,
 `GIT_ASKPASS=` and `SSH_ASKPASS_REQUIRE=never` (`git/repository.rs:7911-7924`). The Git
@@ -193,7 +193,7 @@ After this change:
   credential through the kept helper, or fails, and `bootstrap_process_error`
   (`:468-478`) puts Git's redacted stderr in the work log.
 - **User-initiated Git manager actions** (fetch, pull, push) keep today's guards: they use
-  the kept helper's stored credentials for the first time, and never prompt. Mauro allowed
+  the kept helper's stored credentials for the first time, and never prompt. The maintainer allowed
   them to prompt. Letting them prompt is a separate change and not in this design: it
   would need `GCM_INTERACTIVE=auto` on those calls only, and only where the server runs on
   the person's own desktop, because a remote or WSL server has no window to show
@@ -465,13 +465,13 @@ passing unchanged: its helper is a `!` command and its filter is not `lfs`.
 ## Risks
 
 - **Git manager behaviour change** (credential helper, TLS keys, LFS in status and
-  worktrees). Mauro accepted it (decision A).
+  worktrees). The maintainer accepted it (decision A).
 - **Prune** (above): not verified.
 - **A recognized LFS group whose `git-lfs` is missing**: restore fails as it does today.
 - **`http.sslCAInfo` written by the installer**: reported by Codex, not verified here. The
   key is kept either way.
 
-## Questions only Mauro can answer
+## Questions only the maintainer can answer
 
 1. Should user-initiated Git manager fetch, pull and push be allowed to open a Git
    Credential Manager sign-in on a local desktop server? Today they never prompt, and this
