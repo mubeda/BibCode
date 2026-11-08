@@ -347,10 +347,10 @@ function fakeEnvironment(
   };
 }
 
-/** The primary "Work Server" plus a second environment, "Luna", on its own settings and status. */
-function withLuna(luna = fakeEnvironment("Luna")): FakeEnvironment {
-  h.environments = [h.environment!, luna];
-  return luna;
+/** The primary "Work Server" plus a second environment, "Workstation", on its own settings and status. */
+function withWorkstation(workstation = fakeEnvironment("Workstation")): FakeEnvironment {
+  h.environments = [h.environment!, workstation];
+  return workstation;
 }
 
 async function pick(environment: FakeEnvironment) {
@@ -721,11 +721,11 @@ describe("ProfilerSection", () => {
   });
 
   describe("environment selection", () => {
-    const lunaId = "environment-Luna";
+    const workstationId = "environment-Workstation";
 
     it("hides the selector while only one environment is connected", async () => {
-      const luna = withLuna(fakeEnvironment("Luna", "offline"));
-      expect(luna.connection.phase).toBe("offline");
+      const workstation = withWorkstation(fakeEnvironment("Workstation", "offline"));
+      expect(workstation.connection.phase).toBe("offline");
 
       const container = await render();
 
@@ -733,14 +733,14 @@ describe("ProfilerSection", () => {
     });
 
     it("offers every environment, defaulting to the primary", async () => {
-      withLuna();
+      withWorkstation();
 
       const container = await render();
 
       expect(container.querySelector("[data-select]")).not.toBeNull();
       expect(
         [...container.querySelectorAll("[data-item]")].map((item) => item.textContent),
-      ).toEqual(["Work Server", "Luna"]);
+      ).toEqual(["Work Server", "Workstation"]);
       expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe(
         "Work Server",
       );
@@ -748,12 +748,12 @@ describe("ProfilerSection", () => {
 
     it("switches the setting, status and findings to the selected environment", async () => {
       h.settingsByEnvironment[ENVIRONMENT_ID] = false;
-      h.settingsByEnvironment[lunaId] = true;
-      const luna = withLuna();
-      h.statusByEnvironment[lunaId] = {
+      h.settingsByEnvironment[workstationId] = true;
+      const workstation = withWorkstation();
+      h.statusByEnvironment[workstationId] = {
         data: status({
           eventCount: 42,
-          findings: [finding({ title: "Luna finding" })],
+          findings: [finding({ title: "Workstation finding" })],
         }),
         emission: { _tag: "Success" },
         error: null,
@@ -765,41 +765,41 @@ describe("ProfilerSection", () => {
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
         "false",
       );
-      expect(container.textContent).not.toContain("Luna finding");
+      expect(container.textContent).not.toContain("Workstation finding");
 
-      await pick(luna);
+      await pick(workstation);
 
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
       expect(container.textContent).toContain("42 events");
-      expect(container.textContent).toContain("Luna finding");
+      expect(container.textContent).toContain("Workstation finding");
 
       await click(container.querySelector('[role="switch"]') as HTMLElement);
-      expect(h.updates).toEqual([{ environmentId: lunaId, patch: { enableProfiler: false } }]);
+      expect(h.updates).toEqual([{ environmentId: workstationId, patch: { enableProfiler: false } }]);
       expect(
-        (h.statusByEnvironment[lunaId] as { revalidate: ReturnType<typeof vi.fn> }).revalidate,
+        (h.statusByEnvironment[workstationId] as { revalidate: ReturnType<typeof vi.fn> }).revalidate,
       ).toHaveBeenCalledTimes(1);
       expect(h.statusQuery.revalidate).not.toHaveBeenCalled();
     });
 
     it("starts on the environment the status bar pointed at", async () => {
-      h.settingsByEnvironment[lunaId] = true;
-      const luna = withLuna();
+      h.settingsByEnvironment[workstationId] = true;
+      const workstation = withWorkstation();
 
       const container = await render({
-        initialEnvironmentId: EnvironmentId.make(luna.environmentId),
+        initialEnvironmentId: EnvironmentId.make(workstation.environmentId),
       });
 
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
-      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe("Luna");
+      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe("Workstation");
     });
 
     it("keeps Open folder to the primary, and Export bundle to servers that can send it", async () => {
-      const luna = withLuna();
+      const workstation = withWorkstation();
       const container = await render();
       expect(buttonByText(container, "Open folder").disabled).toBe(false);
       expect(buttonByText(container, "Export bundle").disabled).toBe(false);
 
-      await pick(luna);
+      await pick(workstation);
 
       expect(buttonByText(container, "Open folder").disabled).toBe(true);
       expect(buttonByText(container, "Export bundle").disabled).toBe(true);
@@ -807,8 +807,8 @@ describe("ProfilerSection", () => {
         (popup) => popup.textContent,
       );
       expect(reasons).toEqual([
-        "The profiler folder is on Luna. Use bibcode profiler on that machine.",
-        "Luna runs an older BiBCode server that cannot send its logs. Update it to download them here.",
+        "The profiler folder is on Workstation. Use bibcode profiler on that machine.",
+        "Workstation runs an older BiBCode server that cannot send its logs. Update it to download them here.",
       ]);
       await click(buttonByText(container, "Export bundle"));
       expect(h.downloadCalls).toHaveLength(0);
@@ -816,14 +816,14 @@ describe("ProfilerSection", () => {
       const checkbox = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
       expect(checkbox.disabled).toBe(true);
       expect(document.getElementById(checkbox.getAttribute("aria-describedby")!)?.textContent).toBe(
-        "Luna runs an older BiBCode server that cannot send its logs. Update it to download them here.",
+        "Workstation runs an older BiBCode server that cannot send its logs. Update it to download them here.",
       );
     });
 
     it("exports a remote environment's bundle over its own connection", async () => {
-      const luna = withLuna(fakeEnvironment("Luna", "connected", true, true));
+      const workstation = withWorkstation(fakeEnvironment("Workstation", "connected", true, true));
       const container = await render();
-      await pick(luna);
+      await pick(workstation);
 
       const exportButton = buttonByText(container, "Export bundle");
       expect(exportButton.disabled).toBe(false);
@@ -831,7 +831,7 @@ describe("ProfilerSection", () => {
         (popup) => popup.textContent,
       );
       expect(reasons).toEqual([
-        "The profiler folder is on Luna. Use Export bundle here, or bibcode profiler on that machine.",
+        "The profiler folder is on Workstation. Use Export bundle here, or bibcode profiler on that machine.",
       ]);
       await click(container.querySelector('input[type="checkbox"]') as HTMLInputElement);
       await click(buttonByText(container, "Export bundle"));
@@ -841,7 +841,7 @@ describe("ProfilerSection", () => {
           frontendLog: "frontend snapshot\n",
           options: {
             includeCrashDumps: true,
-            environment: { environmentId: luna.environmentId, label: "Luna" },
+            environment: { environmentId: workstation.environmentId, label: "Workstation" },
           },
         },
       ]);
@@ -852,12 +852,12 @@ describe("ProfilerSection", () => {
       h.downloadGate = new Promise<void>((resolve) => {
         release = resolve;
       });
-      const luna = withLuna();
+      const workstation = withWorkstation();
       const container = await render();
       await click(buttonByText(container, "Export bundle"));
       expect(h.downloadCalls).toHaveLength(1);
 
-      await pick(luna);
+      await pick(workstation);
       await act(async () => {
         h.selectProps!.onValueChange(ENVIRONMENT_ID);
       });
@@ -869,27 +869,27 @@ describe("ProfilerSection", () => {
     });
 
     it("reports a pick so the route can keep it", async () => {
-      const luna = withLuna();
+      const workstation = withWorkstation();
       await render();
 
-      await pick(luna);
+      await pick(workstation);
 
-      expect(h.selections).toEqual([EnvironmentId.make(luna.environmentId)]);
+      expect(h.selections).toEqual([EnvironmentId.make(workstation.environmentId)]);
     });
 
     it("shows the connected environment while the primary is offline", async () => {
-      h.settingsByEnvironment[lunaId] = true;
+      h.settingsByEnvironment[workstationId] = true;
       h.environment = { ...h.environment!, connection: { phase: "offline" } };
-      withLuna();
+      withWorkstation();
 
-      const luna = h.environments[1]!;
+      const workstation = h.environments[1]!;
       const container = await render();
 
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
       // The page's environment is the primary, which is down: say so, name the stand-in, and
       // offer the picker so the stand-in can be chosen for real (the logs row follows it).
       expect(container.querySelector("[data-settings-row]")!.textContent).toContain(
-        "Work Server is not connected. Showing Luna.",
+        "Work Server is not connected. Showing Workstation.",
       );
       expect(container.querySelector("[data-select]")).not.toBeNull();
       expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe(
@@ -898,32 +898,32 @@ describe("ProfilerSection", () => {
       expect(
         container.querySelector(`[data-item="${ENVIRONMENT_ID}"]`)!.getAttribute("data-disabled"),
       ).toBe("true");
-      // Luna is not the primary, so the folder stays with the primary.
+      // Workstation is not the primary, so the folder stays with the primary.
       expect(buttonByText(container, "Open folder").disabled).toBe(true);
 
-      await pick(luna);
-      expect(h.selections).toEqual([EnvironmentId.make(luna.environmentId)]);
-      // Luna is now the page's environment and the only one to choose, so it is just named.
+      await pick(workstation);
+      expect(h.selections).toEqual([EnvironmentId.make(workstation.environmentId)]);
+      // Workstation is now the page's environment and the only one to choose, so it is just named.
       const row = container.querySelector("[data-settings-row]")!;
-      expect(row.textContent).toContain("Luna");
+      expect(row.textContent).toContain("Workstation");
       expect(row.textContent).not.toContain("is not connected");
     });
 
     it.each(["connecting", "reconnecting"])(
       "keeps a link to an environment that is %s",
       async (phase) => {
-        h.settingsByEnvironment[lunaId] = true;
-        const luna = withLuna(fakeEnvironment("Luna", phase));
-        const container = await render({ initialEnvironmentId: EnvironmentId.make(lunaId) });
+        h.settingsByEnvironment[workstationId] = true;
+        const workstation = withWorkstation(fakeEnvironment("Workstation", phase));
+        const container = await render({ initialEnvironmentId: EnvironmentId.make(workstationId) });
 
         // Meanwhile the primary shows, the page says so, and the link survives.
         expect(h.selections).toEqual([]);
-        expect(container.textContent).toContain("Luna is not connected. Showing Work Server.");
+        expect(container.textContent).toContain("Workstation is not connected. Showing Work Server.");
         expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
           "false",
         );
 
-        h.environments = [h.environment!, { ...luna, connection: { phase: "connected" } }];
+        h.environments = [h.environment!, { ...workstation, connection: { phase: "connected" } }];
         await rerender(container);
 
         expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
@@ -933,7 +933,7 @@ describe("ProfilerSection", () => {
     );
 
     it("keeps a choice while the environment catalog is still loading", async () => {
-      withLuna();
+      withWorkstation();
       h.catalogReady = false;
 
       await render({ initialEnvironmentId: EnvironmentId.make("environment-Unknown") });
@@ -942,31 +942,31 @@ describe("ProfilerSection", () => {
     });
 
     it("keeps a chosen environment through a disconnect, showing the primary meanwhile", async () => {
-      h.settingsByEnvironment[lunaId] = true;
-      const luna = withLuna();
+      h.settingsByEnvironment[workstationId] = true;
+      const workstation = withWorkstation();
       const container = await render();
-      await pick(luna);
+      await pick(workstation);
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
 
-      h.environments = [h.environment!, { ...luna, connection: { phase: "offline" } }];
+      h.environments = [h.environment!, { ...workstation, connection: { phase: "offline" } }];
       await rerender(container);
       // The primary stands in and the page says so, but the choice is not dropped.
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
         "false",
       );
-      expect(container.textContent).toContain("Luna is not connected. Showing Work Server.");
-      expect(h.selections.at(-1)).toBe(EnvironmentId.make(luna.environmentId));
+      expect(container.textContent).toContain("Workstation is not connected. Showing Work Server.");
+      expect(h.selections.at(-1)).toBe(EnvironmentId.make(workstation.environmentId));
 
-      // Back online, Luna shows again without being chosen again.
-      h.environments = [h.environment!, luna];
+      // Back online, Workstation shows again without being chosen again.
+      h.environments = [h.environment!, workstation];
       await rerender(container);
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
     });
 
     it("drops a choice whose environment was removed", async () => {
-      const luna = withLuna();
+      const workstation = withWorkstation();
       const container = await render();
-      await pick(luna);
+      await pick(workstation);
 
       h.environments = [h.environment!];
       await rerender(container);

@@ -330,14 +330,14 @@ import {
 } from "./SourceControlPanel.logic";
 
 const FILES: WorkingTreeFile[] = [
-  { path: "docs/prps/PFS-1848/master-plan.md", insertions: 218, deletions: 0 },
+  { path: "docs/prps/ABC-1848/master-plan.md", insertions: 218, deletions: 0 },
   { path: "tasks.md", insertions: 139, deletions: 4 },
 ];
 
 describe("splitFilePath", () => {
   it("splits a nested path into dir and name", () => {
-    expect(splitFilePath("docs/prps/PFS-1848/master-plan.md")).toEqual({
-      dir: "docs/prps/PFS-1848",
+    expect(splitFilePath("docs/prps/ABC-1848/master-plan.md")).toEqual({
+      dir: "docs/prps/ABC-1848",
       name: "master-plan.md",
     });
   });
@@ -368,7 +368,7 @@ describe("summarizeChangeSelection", () => {
   it("reports noneSelected when every file is excluded", () => {
     const summary = summarizeChangeSelection(
       FILES,
-      new Set(["tasks.md", "docs/prps/PFS-1848/master-plan.md"]),
+      new Set(["tasks.md", "docs/prps/ABC-1848/master-plan.md"]),
     );
     expect(summary.noneSelected).toBe(true);
   });
@@ -381,7 +381,7 @@ describe("resolveCommitFilePaths", () => {
 
   it("returns the selected subset when partial", () => {
     expect(resolveCommitFilePaths(summarizeChangeSelection(FILES, new Set(["tasks.md"])))).toEqual([
-      "docs/prps/PFS-1848/master-plan.md",
+      "docs/prps/ABC-1848/master-plan.md",
     ]);
   });
 });
@@ -496,7 +496,7 @@ import { SourceControlChangesList } from "./SourceControlChangesList";
 import type { WorkingTreeFile } from "./SourceControlPanel.logic";
 
 const FILES: WorkingTreeFile[] = [
-  { path: "docs/prps/PFS-1848/master-plan.md", insertions: 218, deletions: 0 },
+  { path: "docs/prps/ABC-1848/master-plan.md", insertions: 218, deletions: 0 },
   { path: "tasks.md", insertions: 139, deletions: 4 },
 ];
 
@@ -511,7 +511,7 @@ describe("SourceControlChangesList", () => {
       />,
     );
     expect(markup).toContain("master-plan.md");
-    expect(markup).toContain("docs/prps/PFS-1848");
+    expect(markup).toContain("docs/prps/ABC-1848");
     expect(markup).toContain("+218");
     expect(markup).toContain("-4");
   });

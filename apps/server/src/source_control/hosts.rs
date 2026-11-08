@@ -184,16 +184,19 @@ mod tests {
     #[test]
     fn provider_hosts_classify_named_and_recorded_hosts_with_their_own_base_url() {
         let hosts = ProviderHosts::default();
-        let luna = "https://luna.tripunkt.de/tripunkt/customer-portal.git";
-        assert_eq!(hosts.identify(luna), IdentifiedProvider::Unknown);
-        hosts.record("Luna.Tripunkt.de", ProviderKind::Gitlab);
-        for remote in [luna, "git@luna.tripunkt.de:tripunkt/customer-portal.git"] {
+        let self_hosted = "https://code.example.test/example-group/sample-project.git";
+        assert_eq!(hosts.identify(self_hosted), IdentifiedProvider::Unknown);
+        hosts.record("Code.Example.Test", ProviderKind::Gitlab);
+        for remote in [
+            self_hosted,
+            "git@code.example.test:example-group/sample-project.git",
+        ] {
             let IdentifiedProvider::Recorded(info) = hosts.identify(remote) else {
                 panic!("expected recorded host: {remote}");
             };
             assert_eq!(info.kind, ProviderKind::Gitlab, "{remote}");
             assert_eq!(info.name, "GitLab");
-            assert_eq!(info.base_url, "https://luna.tripunkt.de");
+            assert_eq!(info.base_url, "https://code.example.test");
         }
         hosts.record("github.company.example", ProviderKind::Github);
         let IdentifiedProvider::Recorded(enterprise) =
@@ -284,12 +287,12 @@ mod tests {
             item(ProviderKind::Github, None),
             item(
                 ProviderKind::Gitlab,
-                Some(&[("luna.tripunkt.de", true), ("gitlab.com", false)]),
+                Some(&[("code.example.test", true), ("gitlab.com", false)]),
             ),
         ]));
         assert_eq!(hosts.provider("old-gitlab.example"), None);
         assert_eq!(
-            hosts.provider("luna.tripunkt.de"),
+            hosts.provider("code.example.test"),
             Some(ProviderKind::Gitlab)
         );
         assert_eq!(
@@ -305,13 +308,13 @@ mod tests {
         hosts.replace_from_discovery(&discovery(vec![item(ProviderKind::Github, Some(&[]))]));
         assert_eq!(hosts.provider("github.company.example"), None);
         assert_eq!(
-            hosts.provider("luna.tripunkt.de"),
+            hosts.provider("code.example.test"),
             Some(ProviderKind::Gitlab)
         );
         // An unrecognized GitLab answer has no host list, so its hosts stay recorded.
         hosts.replace_from_discovery(&discovery(vec![item(ProviderKind::Gitlab, None)]));
         assert_eq!(
-            hosts.provider("luna.tripunkt.de"),
+            hosts.provider("code.example.test"),
             Some(ProviderKind::Gitlab)
         );
     }

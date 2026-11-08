@@ -303,7 +303,7 @@ impl Default for EffectsOptions {
     }
 }
 
-/// Mauro's cap (#279): long enough for a delivery in flight to reach its provider.
+/// The maintainer's cap (#279): long enough for a delivery in flight to reach its provider.
 const CHECKOUT_RESTORE_ADMISSION_WAIT: Duration = Duration::from_secs(15);
 
 /// Longer than a capture's Git calls take in a large checkout, short enough that a worker that
@@ -2281,7 +2281,7 @@ struct SiblingScan {
     /// Deleted threads that shared the checkout, whose turns still count as outside changes.
     deleted: Vec<String>,
     /// Threads of the checkout that never started a provider session and have no turns, so
-    /// they cannot have written a file (Mauro, #279 Q1). They do not make the checkout shared,
+    /// they cannot have written a file (the maintainer, #279 Q1). They do not make the checkout shared,
     /// but a restore still holds them, so a first message waits for it.
     dormant: Vec<String>,
 }
@@ -2927,7 +2927,7 @@ fn hold_conflict(
     OrchestrationEffectsError::Effect(reason.detail(title))
 }
 
-/// Why turn 0's `HEAD` fallback is refused on a shared checkout (Mauro, decision D).
+/// Why turn 0's `HEAD` fallback is refused on a shared checkout (the maintainer, decision D).
 const HEAD_FALLBACK_REFUSED_DETAIL: &str = "This thread has no starting checkpoint, and other chats share this checkout, so restoring files would discard their work. Rewind only the conversation, or revert to a later turn.";
 
 /// Step 7 of the guard, on the worker right before the irreversible rewind: every sibling is

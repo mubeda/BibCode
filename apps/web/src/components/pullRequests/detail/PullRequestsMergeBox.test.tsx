@@ -66,7 +66,7 @@ describe("PullRequestsMergeBox", () => {
         context={context}
       />,
     );
-    expect(merged).toContain("Merged by mubeda");
+    expect(merged).toContain("Merged by test-user");
     expect(merged).toContain('dateTime="2026-09-20T12:00:00Z"');
     expect(merged).toContain(">Revert<");
     expect(merged).not.toContain("<select");

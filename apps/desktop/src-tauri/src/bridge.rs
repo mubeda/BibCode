@@ -3806,10 +3806,10 @@ mod tests {
                 Some(&json!({ "initialPath": "~" })),
                 None,
                 &distros,
-                Some("/home/mauro"),
+                Some("/home/user"),
             )
             .map(|path| path.to_string_lossy().into_owned()),
-            Some("\\\\wsl.localhost\\Debian\\home\\mauro".to_string())
+            Some("\\\\wsl.localhost\\Debian\\home\\user".to_string())
         );
         assert_eq!(
             resolve_wsl_pick_folder_default_path(
@@ -3851,7 +3851,7 @@ mod tests {
             wsl_unc_path_to_linux_path("\\\\wsl.localhost\\bad!name\\home"),
             None
         );
-        assert_eq!(wsl_unc_path_to_linux_path("C:\\Users\\Mauro\\repo"), None);
+        assert_eq!(wsl_unc_path_to_linux_path("C:\\Users\\user\\repo"), None);
     }
 
     #[test]

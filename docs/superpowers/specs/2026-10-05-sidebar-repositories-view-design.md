@@ -16,7 +16,7 @@ What the user asked for:
 
 - A toggle at the top of the left panel switches between the two views.
 - In the second view each repository is a read-only group card named after the
-  git project (example: `pathfinder-application-server`). It cannot be renamed,
+  git project (example: `sample-server`). It cannot be renamed,
   removed, or otherwise edited.
 - Each group holds one card per environment that has the repository. The
   environment is easy to read on the card.
@@ -61,7 +61,7 @@ and `ProjectMetaUpdatedPayload`). The server never sets it today. It will set:
 | `canonicalKey` | `<host>/<repository path>`: host lowercased, path without a trailing `.git`, nested groups kept. SSH (`git@host:a/b.git`), `ssh://` (with or without port) and HTTPS forms of one remote yield the same key. Path case is preserved. |
 | `locator` | `{ source: "git-remote", remoteName: "origin", remoteUrl: <url> }`, the URL without userinfo, query or fragment (any of which can carry a token) |
 | `rootPath` | The checkout's top level (`git rev-parse --show-toplevel`), not the common directory; required by the `repository_path` grouping mode. |
-| `name` | Last path segment (`pathfinder-application-server`). |
+| `name` | Last path segment (`sample-server`). |
 | `owner` | Path before the last segment, when present. |
 | `displayName` | Same as `name`. |
 | `provider` | Kind from the existing provider detection (`github`, `gitlab`, `azure-devops`, `bitbucket`), omitted when unknown. |

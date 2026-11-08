@@ -6,7 +6,7 @@
 
 - Repository: BiBCode (`https://github.com/mubeda/BibCode.git`)
 - Remote: `origin`; requested publication branch `develop`
-- Branch or requested revision: local `mubeda/develop`; adversarial-remediation
+- Branch or requested revision: local `test-user/develop`; adversarial-remediation
   range `e3cd9d81b4cee897fb42709f88ca9f1509c85ba1..f3eb0ab763e4a521ad5efbdccce365991f66fdfd`
 - Local HEAD: `f3eb0ab763e4a521ad5efbdccce365991f66fdfd` was the executable
   remediation HEAD during validation. The final documentation/evidence commit
@@ -33,7 +33,7 @@
   Vite+ 0.3.0, repository Vite+ 0.2.5, Vitest 4.1.10
 - Native compiler/SDK/runtime dependencies: the installed Linux development
   dependencies supported complete server and desktop test and Clippy matrices
-- Optional capabilities: Docker CLI 29.7.2 used context `pathfinder-podman` and
+- Optional capabilities: Docker CLI 29.7.2 used context `sample-podman` and
   Podman Engine 5.8.4 on Linux/amd64. Windows/WSL, macOS, signing, notarization,
   and packaged installers were unavailable.
 

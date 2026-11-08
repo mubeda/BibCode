@@ -3,13 +3,13 @@
     "id": 1,
     "user": {
       "id": 4,
-      "username": "mubeda",
+      "username": "test-user",
       "public_email": "",
-      "name": "Mauro Ubeda",
+      "name": "Test User",
       "state": "active",
       "locked": false,
-      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
-      "web_url": "https://luna.tripunkt.de/mubeda"
+      "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://code.example.test/test-user"
     },
     "created_at": "2026-09-21T12:39:18.108Z",
     "resource_type": "MergeRequest",
@@ -26,7 +26,7 @@
       "due_date": null,
       "start_date": null,
       "expired": false,
-      "web_url": "https://luna.tripunkt.de/mubeda/sourcecontroltest/-/milestones/1"
+      "web_url": "https://code.example.test/test-user/sample-project/-/milestones/1"
     },
     "action": "add",
     "state": "opened"
@@ -35,13 +35,13 @@
     "id": 2,
     "user": {
       "id": 4,
-      "username": "mubeda",
+      "username": "test-user",
       "public_email": "",
-      "name": "Mauro Ubeda",
+      "name": "Test User",
       "state": "active",
       "locked": false,
-      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
-      "web_url": "https://luna.tripunkt.de/mubeda"
+      "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://code.example.test/test-user"
     },
     "created_at": "2026-09-21T12:39:43.940Z",
     "resource_type": "MergeRequest",
@@ -58,7 +58,7 @@
       "due_date": null,
       "start_date": null,
       "expired": false,
-      "web_url": "https://luna.tripunkt.de/mubeda/sourcecontroltest/-/milestones/1"
+      "web_url": "https://code.example.test/test-user/sample-project/-/milestones/1"
     },
     "action": "remove",
     "state": "opened"

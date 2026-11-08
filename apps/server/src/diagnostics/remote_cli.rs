@@ -255,7 +255,7 @@ fn invalid_name(name: &str) -> Outcome {
     )
 }
 
-/// A name from the remote's own name: `Mauro's MacBook` becomes `mauro-s-macbook`.
+/// A name from the remote's own name: `Test User's MacBook` becomes `test-user-s-macbook`.
 fn slug(text: &str) -> String {
     let mut slug = String::new();
     for character in text.chars().flat_map(char::to_lowercase) {
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn names_come_from_the_remote_and_stay_safe() {
-        assert_eq!(slug("Mauro's MacBook Pro"), "mauro-s-macbook-pro");
+        assert_eq!(slug("Test User's MacBook Pro"), "test-user-s-macbook-pro");
         assert_eq!(slug("  ai-server  "), "ai-server");
         assert_eq!(slug("ééé"), "remote");
         assert_eq!(slug(&"x".repeat(200)).len(), MAX_NAME_LENGTH);

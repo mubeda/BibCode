@@ -1,6 +1,6 @@
 # Outside Agent Control: Webhook Auth, Stable Identity, CLI
 
-Status: Approved by Mauro 2026-11-02 (all 7 slices; named clients split into #280; Codex review, 3 rounds). Issue #271. Follows #139 and
+Status: Approved by the maintainer 2026-11-02 (all 7 slices; named clients split into #280; Codex review, 3 rounds). Issue #271. Follows #139 and
 amends one answer of the approved
 [2026-10-24 MCP design](./2026-10-24-mcp-operate-server-design.md) (see
 [Decision 2](#decision-2-a-stable-identity-across-runs)). Verified at `fd98b433068b`
@@ -45,7 +45,7 @@ whether one is set.
 **Hint: set or not set only.** The endpoint returns `bearerTokenSet: boolean` and no
 masked characters. A hint would need the value, or part of it, outside the secret store.
 A person who is unsure which key is set replaces it. Showing the last four characters is
-the alternative if Mauro prefers it. It needs a stored hint column and is still a partial
+the alternative if the maintainer prefers it. It needs a stored hint column and is still a partial
 secret in client state.
 
 ### Decision 2: a stable identity across runs
@@ -84,10 +84,10 @@ scope expression becomes "named client, else the CLI label, else the session"
 
 ## Open questions
 
-| Question (issue)                                                          | Recommendation                                                                                                                                                                                               | Needs Mauro?                                                                     |
+| Question (issue)                                                          | Recommendation                                                                                                                                                                                               | Needs the maintainer?                                                                     |
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
 | Can Bridge verify `X-BibCode-Signature` or take a URL token?              | Build P0 either way. `Authorization` is the usual receiver contract, and a URL token is unmasked. Bridge should also verify the signature, which every request keeps.                                        | **Yes**: depends on Bridge's receiver. It sets P0's urgency, not its shape.      |
-| One bearer, or custom headers? Hint?                                      | One bearer. `bearerTokenSet` only, with no hint ([Decision 1](#decision-1-the-webhook-auth-header)).                                                                                                         | Only if Bridge needs a non-`Authorization` header, or Mauro wants a last-4 hint. |
+| One bearer, or custom headers? Hint?                                      | One bearer. `bearerTokenSet` only, with no hint ([Decision 1](#decision-1-the-webhook-auth-header)).                                                                                                         | Only if Bridge needs a non-`Authorization` header, or the maintainer wants a last-4 hint. |
 | `approvals` or a new `questions` category?                                | A new `questions` category, labelled **Questions**. A question is not an approval, and the feed names them apart (`input.*`).                                                                                | No                                                                               |
 | Label scope or person-issued credential? `--client` or `clientInfo.name`? | A named client row, from `--client` only ([Decision 2](#decision-2-a-stable-identity-across-runs)), built in a later release.                                                                                | Approval of this note, and of the split                                          |
 | Was leaving `projectId` out a privacy choice?                             | No reason is recorded. The X8 payload list never had it (`2026-10-30-mcp-remaining-slices-design.md`, Payload), and `events.rs:57` states only the fact. A project id is as opaque as `threadId`, so add it. | No                                                                               |

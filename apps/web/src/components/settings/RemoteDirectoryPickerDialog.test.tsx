@@ -339,22 +339,22 @@ describe("RemoteDirectoryPickerDialog", () => {
 
   it("renders a segmented breadcrumb rail and compact folder rows", () => {
     harness.query.data = {
-      parentPath: "C:\\Users\\mauro",
-      directoryPath: "C:\\Users\\mauro",
+      parentPath: "C:\\Users\\user",
+      directoryPath: "C:\\Users\\user",
       ancestorPath: "C:\\Users",
       breadcrumbs: [
         { name: "C:\\", fullPath: "C:\\" },
         { name: "Users", fullPath: "C:\\Users" },
-        { name: "mauro", fullPath: "C:\\Users\\mauro" },
+        { name: "user", fullPath: "C:\\Users\\user" },
       ],
-      entries: [{ name: "Projects", fullPath: "C:\\Users\\mauro\\Projects" }],
+      entries: [{ name: "Projects", fullPath: "C:\\Users\\user\\Projects" }],
     };
 
     const markup = renderPicker(pickerProps({ initialPath: "~" }));
 
     expect(markup).toContain("data-directory-breadcrumb-separator");
     expect(button("Open C:\\")["aria-current"]).toBeUndefined();
-    expect(button("Open mauro")["aria-current"]).toBe("page");
+    expect(button("Open user")["aria-current"]).toBe("page");
     expect(button("Open Projects").className).toContain("justify-start");
     expect(markup).toContain("data-directory-folder-icon");
   });

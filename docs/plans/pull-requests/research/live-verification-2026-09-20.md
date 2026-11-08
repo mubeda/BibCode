@@ -16,7 +16,7 @@ output in `tasks.md`.
 
 | Tool   | Version             | Auth state on this machine                                                            |
 | ------ | ------------------- | ------------------------------------------------------------------------------------- |
-| `gh`   | 2.97.0 (2026-07-31) | Logged in to github.com as `mubeda` (keyring, https)                                  |
+| `gh`   | 2.97.0 (2026-07-31) | Logged in to github.com as `test-user` (keyring, https)                                  |
 | `glab` | 1.114.0             | Installed, **not authenticated** (gitlab.com returns 401); no company host configured |
 
 Consequence: GitLab behaviour can be unit-tested here only through fixture

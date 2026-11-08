@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{GitRepository, ProcessOutput};
 
-/// Mauro's cap on a pending sign-in (M2).
+/// The maintainer's cap on a pending sign-in (M2).
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// GCM's refusal when interaction is disabled (`AuthenticationBase.cs`), lowercased.
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn pins_only_https_destinations_without_user_information() {
         assert_eq!(
-            https_destination("https://mauro:token@github.com/owner/repo.git"),
+            https_destination("https://user:token@github.com/owner/repo.git"),
             Some((DESTINATION.to_owned(), "github.com".to_owned()))
         );
         assert_eq!(

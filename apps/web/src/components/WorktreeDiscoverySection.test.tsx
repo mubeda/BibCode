@@ -488,13 +488,13 @@ describe("WorktreeDiscoverySection", () => {
   ] as const)(
     "renders parent-once compact candidates with stable trailing actions in the %s",
     async (_mode, visibility) => {
-      const hotfixPath = "/Users/admin/conductor/workspaces/pathfinder-hotfix";
-      const reviewPath = "/Users/admin/conductor/workspaces/pathfinder-review";
+      const hotfixPath = "/Users/admin/conductor/workspaces/sample-hotfix";
+      const reviewPath = "/Users/admin/conductor/workspaces/sample-review";
       const alphaPath = "/Users/admin/orca/workspaces/alpha";
       const candidates = [
-        candidate(reviewPath, "hotfix/PFS-1817"),
+        candidate(reviewPath, "hotfix/ABC-1817"),
         candidate(alphaPath, "alpha"),
-        candidate(hotfixPath, "hotfix/PFS-1817"),
+        candidate(hotfixPath, "hotfix/ABC-1817"),
       ];
       testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot(candidates));
 
@@ -519,8 +519,8 @@ describe("WorktreeDiscoverySection", () => {
       );
       expect(candidateRows).toHaveLength(3);
       const expectedCopy = [
-        ["hotfix/PFS-1817pathfinder-hotfix", hotfixPath],
-        ["hotfix/PFS-1817pathfinder-review", reviewPath],
+        ["hotfix/ABC-1817sample-hotfix", hotfixPath],
+        ["hotfix/ABC-1817sample-review", reviewPath],
         ["alpha", alphaPath],
       ] as const;
 
@@ -533,7 +533,7 @@ describe("WorktreeDiscoverySection", () => {
         expect(copy?.className).toContain("overflow-hidden");
         expect(copy?.tabIndex).toBe(0);
         expect(copy?.getAttribute("aria-label")).toBe(
-          `Full worktree path for ${index < 2 ? "hotfix/PFS-1817" : "alpha"} in ${LOCAL_ACCESSIBLE_SCOPE}: ${path}`,
+          `Full worktree path for ${index < 2 ? "hotfix/ABC-1817" : "alpha"} in ${LOCAL_ACCESSIBLE_SCOPE}: ${path}`,
         );
         expect(copy?.querySelector<HTMLElement>("span")?.className.split(/\s+/)).toEqual(
           expect.arrayContaining(["block", "max-w-full", "truncate"]),

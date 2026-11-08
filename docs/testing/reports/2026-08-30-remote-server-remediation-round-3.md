@@ -12,7 +12,7 @@ recorded in `docs/plans/remote-servers/2026-08-30-remediation-round-3-design.md`
 
 - Repository: BibCode (`/work/workspaces/orca/BibCode/develop`, linked worktree)
 - Remote: origin (GitHub)
-- Branch or requested revision: `mubeda/develop`
+- Branch or requested revision: `test-user/develop`
 - Local HEAD: `a90b0ad9` (revision validated by the final clean full-suite
   run; the report commit itself lands one commit above)
 - Remote HEAD: `8487ce78` (round-2 final) at validation time; the round was
@@ -45,7 +45,7 @@ recorded in `docs/plans/remote-servers/2026-08-30-remediation-round-3-design.md`
 - Required commits: round-2 base `0e4767b5..8487ce78` present; round-3 work
   committed on top (see Publication state)
 - Ancestry result for each commit: all round-3 commits are linear descendants
-  of `8487ce78` on `mubeda/develop`
+  of `8487ce78` on `test-user/develop`
 - Inputs that were unavailable: none
 
 ## Focused validation

@@ -226,7 +226,7 @@ beforeEach(() => {
   subscription.readers.clear();
   environmentState.environments = [
     { environmentId: "primary", label: "Local" },
-    { environmentId: "remote-1", label: "Luna" },
+    { environmentId: "remote-1", label: "Workstation" },
   ];
   environmentState.reads = 0;
 });
@@ -310,7 +310,7 @@ describe("SlowRequestsIndicator", () => {
     expect(items[0]?.querySelector("time")?.textContent).toBe(
       formatTimestamp(FIRST_STARTED_AT, DEFAULT_CLIENT_SETTINGS.timestampFormat),
     );
-    expect(items[1]?.querySelector("div")?.textContent).toBe("git.status · Luna");
+    expect(items[1]?.querySelector("div")?.textContent).toBe("git.status · Workstation");
     expect(items[1]?.querySelector("time")?.textContent).toBe(
       formatTimestamp(SECOND_STARTED_AT, DEFAULT_CLIENT_SETTINGS.timestampFormat),
     );

@@ -10960,7 +10960,7 @@ mod tests {
                 ),
                 (
                     "GitVcsDriver.remoteProvider".into(),
-                    process_output("https://luna.tripunkt.de/tripunkt/customer-portal.git\n"),
+                    process_output("https://code.example.test/example-group/sample-project.git\n"),
                 ),
             ]),
             requests: Mutex::new(Vec::new()),
@@ -10973,7 +10973,7 @@ mod tests {
 
         assert_eq!(read().await.unwrap().source_control_provider, None);
         hosts.record(
-            "luna.tripunkt.de",
+            "code.example.test",
             crate::source_control::ProviderKind::Gitlab,
         );
         assert_eq!(
@@ -10981,7 +10981,7 @@ mod tests {
             Some(super::SourceControlProviderInfo {
                 kind: crate::git::ProviderKind::Gitlab,
                 name: "GitLab".into(),
-                base_url: "https://luna.tripunkt.de".into(),
+                base_url: "https://code.example.test".into(),
             })
         );
         assert_eq!(runner.count_arg("status"), 2, "only Git ran");

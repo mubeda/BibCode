@@ -1,6 +1,6 @@
 # MCP clone: SSH agent clones pinned to the checked address (#217)
 
-Status: Approved by Mauro 2026-11-02 (option A1; Codex review, 3 rounds)
+Status: Approved by the maintainer 2026-11-02 (option A1; Codex review, 3 rounds)
 Revisions 1 and 2 answer Codex's REVISE reviews (see [Revision 1](#revision-1-codex-review),
 [Revision 2](#revision-2-codex-round-2)); Codex approved the third round.
 Issue: #217. Follows #139 slice X6 and its Revision 4 (`docs/plans/2026-10-30-mcp-remaining-slices-design.md`,
@@ -377,7 +377,7 @@ seen failing against today's `NOT_HTTPS` refusal, each isolation test with the o
 
 Not hermetic (each needs a real sshd, agent or CA), so manual steps:
 `docs/testing/cross-platform-validation.md` gains "agent SSH clone" on Windows (both agent
-kinds), Linux and macOS against one of the user's `SourceControlTest` repositories with a key
+kinds), Linux and macOS against one of the user's `sample-project` repositories with a key
 loaded, plus:
 
 - unknown host: the refusal, then the printed command, then a successful retry (port 22, and a

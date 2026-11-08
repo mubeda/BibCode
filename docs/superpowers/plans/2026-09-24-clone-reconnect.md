@@ -74,7 +74,7 @@ Repository requirements (AGENTS.md, controller brief):
 - New lifecycle tests must be shown to go **red against a deliberately broken variant**. Each such test names the break in its task's "Red evidence" table. The implementer applies the break temporarily, runs the test, records the failing assertion in the ledger, and restores the code before continuing.
 - TypeScript tests follow the repository lint rules: no `Effect.runSync`/`runPromise` in tests (`bibcode/no-manual-effect-runtime-in-tests`; use `it.effect` and `Effect.promise`), and Schema decoders are compiled at module scope (`bibcode/no-inline-schema-compile`).
 - `vp check`, `vp run typecheck`, `cargo fmt --all --check`, `cargo clippy -p bibcode-server --all-targets -- -D warnings` must pass. Run `vp run check:contracts` whenever contracts or fixtures change.
-- `apps/web` React changes: review against `vercel-react-best-practices` (`/home/mauro/.agents/skills/vercel-react-best-practices/SKILL.md`) **and** `UI.md`, and report both. An agent without the skill reports that review as "not run".
+- `apps/web` React changes: review against `vercel-react-best-practices` (`/home/user/.agents/skills/vercel-react-best-practices/SKILL.md`) **and** `UI.md`, and report both. An agent without the skill reports that review as "not run".
 - Living docs and `docs/testing/` runbooks change in the same change as the behaviour they describe (AGENTS.md "Testing Runbook Maintenance").
 - `packages/contracts` stays schema-only.
 - Playwright live verification of every UI state change, against an isolated dev server (`BIBCODE_PORT_OFFSET`, its own `BIBCODE_HOME`). **Never use port 3773** (the user's desktop app).
@@ -6568,7 +6568,7 @@ Record the scenario results, durations, exact copy, and screenshot names in the 
 
 - [ ] **Step 1: `vercel-react-best-practices` review**
 
-Read `/home/mauro/.agents/skills/vercel-react-best-practices/SKILL.md` (and its `AGENTS.md` or `rules/`). Review the changed parts of `useAddProjectWorkflow.ts` and `AddProjectSteps.tsx`. Check at least:
+Read `/home/user/.agents/skills/vercel-react-best-practices/SKILL.md` (and its `AGENTS.md` or `rules/`). Review the changed parts of `useAddProjectWorkflow.ts` and `AddProjectSteps.tsx`. Check at least:
 - no state derived in effects;
 - stable callbacks (`cancelClone` has an empty dependency list and reads refs; `submitClone`'s dependency list includes `selectedHost.label`);
 - no new re-render cascade from `onProgress` (it sets state only when the phase or notice changes);

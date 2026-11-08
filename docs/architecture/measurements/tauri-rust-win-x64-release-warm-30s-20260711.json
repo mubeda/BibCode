@@ -71,7 +71,7 @@
     {
       "pid": 50392,
       "processName": "powershell.exe",
-      "command": "\"powershell.exe\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\Users\\mauro\\AppData\\Roaming\\npm\\codex.ps1 -s read-only -a untrusted app-server",
+      "command": "\"powershell.exe\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\Users\\user\\AppData\\Roaming\\npm\\codex.ps1 -s read-only -a untrusted app-server",
       "privateBytes": 0,
       "workingSetBytes": 18014208,
       "mainWindowTitle": ""

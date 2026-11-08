@@ -6,7 +6,7 @@
 
 - Repository: BiBCode (`https://github.com/mubeda/BibCode.git`)
 - Remote: `origin`; requested publication branch `develop`
-- Branch or requested revision: local `mubeda/develop`; remediation range
+- Branch or requested revision: local `test-user/develop`; remediation range
   `0e4767b5e8678a756377bb7f0071f98049e88dc0..65af2c1084e3c8f87eb0269cdac18ba3f056de3c`
 - Executable HEAD: `d0acdfb841112b350b438eaa2b1cd34a21b6ae97`
   supplied the server, desktop, web, contracts, and client-runtime source used
@@ -38,7 +38,7 @@
 - Native compiler/SDK/runtime dependencies: installed Linux development
   dependencies supported the complete server and desktop test, build, and
   Clippy matrices
-- Optional capabilities: Docker CLI 29.7.2 used context `pathfinder-podman` and
+- Optional capabilities: Docker CLI 29.7.2 used context `sample-podman` and
   Podman Engine 5.8.4 with `crun` 1.28 on Linux/amd64. Windows/WSL, macOS,
   signing, notarization, and packaged installers were unavailable.
 

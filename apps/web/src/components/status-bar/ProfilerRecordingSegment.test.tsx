@@ -88,7 +88,7 @@ afterEach(async () => {
 
 describe("ProfilerRecordingSegment", () => {
   it("renders nothing when no environment records", async () => {
-    h.environments = [environment("Local"), environment("Luna")];
+    h.environments = [environment("Local"), environment("Workstation")];
 
     const container = await render();
 
@@ -117,7 +117,7 @@ describe("ProfilerRecordingSegment", () => {
   it("shows the segment and lists every recording environment", async () => {
     h.environments = [
       environment("Local", { enableProfiler: true }),
-      environment("Luna"),
+      environment("Workstation"),
       environment("Build box", { enableProfiler: true }),
     ];
 
@@ -139,7 +139,7 @@ describe("ProfilerRecordingSegment", () => {
   it("opens Diagnostics with the first recording environment selected", async () => {
     h.environments = [
       environment("Local"),
-      environment("Luna", { enableProfiler: true }),
+      environment("Workstation", { enableProfiler: true }),
       environment("Build box", { enableProfiler: true }),
     ];
     const container = await render();
@@ -150,7 +150,7 @@ describe("ProfilerRecordingSegment", () => {
 
     expect(h.navigate).toHaveBeenCalledWith({
       to: "/settings/diagnostics",
-      search: { environment: "env-Luna" },
+      search: { environment: "env-Workstation" },
     });
   });
 

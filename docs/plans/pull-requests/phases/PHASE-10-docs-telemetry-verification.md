@@ -77,8 +77,8 @@ The packaged spec is written/typechecked, not browser-executed. Row 10 stays
 
 ### Coordinator steps
 
-- [x] **Step 10.8: GitHub end to end** _(read-only pass, checkout and all host writes done 2026-09-21 on mubeda/SourceControlTest)_ (Playwright, browser mode, `mubeda/BibCode` + `openai/codex` read-only): list, filters, detail tabs, files, comment/edit/react/delete, inline review + suggestion, label with undo, checkout into a worktree, permission reasons on the read-only repo, settings switch. Screenshots into the coordinator scratchpad; results into `handoff.md`.
-- [x] **Step 10.9: GitLab end to end** _(done 2026-09-21 on luna.tripunkt.de/mubeda/sourcecontroltest, GitLab 19.3.2)_ — requires the requester's company server or a gitlab.com token. Until it runs, `tasks.md` keeps Phase 10 `in_progress` with the line "GitLab e2e pending: needs a GitLab host with an authenticated `glab`", exactly as the Git Manager plan kept its Phase 17 open.
+- [x] **Step 10.8: GitHub end to end** _(read-only pass, checkout and all host writes done 2026-09-21 on test-user/sample-project)_ (Playwright, browser mode, `mubeda/BibCode` + `openai/codex` read-only): list, filters, detail tabs, files, comment/edit/react/delete, inline review + suggestion, label with undo, checkout into a worktree, permission reasons on the read-only repo, settings switch. Screenshots into the coordinator scratchpad; results into `handoff.md`.
+- [x] **Step 10.9: GitLab end to end** _(done 2026-09-21 on code.example.test/test-user/sample-project, GitLab 19.3.2)_ — requires the requester's company server or a gitlab.com token. Until it runs, `tasks.md` keeps Phase 10 `in_progress` with the line "GitLab e2e pending: needs a GitLab host with an authenticated `glab`", exactly as the Git Manager plan kept its Phase 17 open.
 - [x] **Step 10.10: Fill `handoff.md`** (what shipped, files by layer, deviations, TODOs, how to verify, recommended review order).
 
 ---

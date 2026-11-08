@@ -1,9 +1,9 @@
 # Checkpoints: Guard a Shared Checkout's File Restore, and Rewind Only the Conversation
 
-Status: Approved 2026-11-07 (Mauro pre-approval; reviewed by Codex and advisor). Issue #279, split from #265
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #279, split from #265
 ([`2026-11-02-side-chats-design.md`](./2026-11-02-side-chats-design.md), "Review findings
 and resolutions", round 2, finding 7). Verified at `e222d340ff` (`main` after v0.15.2).
-Line references are to that commit. No product code is written until Mauro approves this
+Line references are to that commit. No product code is written until the maintainer approves this
 design (the issue's design gate). Companion: #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md))
 changes the Git environment of the same checkpoint commands and lands first.
@@ -18,7 +18,7 @@ text below:
   reservation is held. Confirmed by the coordinator: a delivery waiting at the gate holds
   its reservation but cannot write, and counting it would refuse every restore a waiting
   message meets, which defeats the planning-interval gate.
-- A thread that never started a provider session and has no turn is not a sibling (Mauro,
+- A thread that never started a provider session and has no turn is not a sibling (the maintainer,
   Q1: it cannot have written a file). The restore still holds it, so its first message waits.
 - The preview needs `orchestration:operate`, not read: its temporary-index `git add` runs
   the repository's clean filters, which can run host commands (Codex review).
@@ -29,7 +29,7 @@ text below:
 - Test 5 uses a short configurable wait (`EffectsOptions::checkout_restore_admission_wait`)
   instead of a paused clock, which production Git's child processes would advance.
 
-**Revision 1 (2026-11-07)** records Mauro's decisions (C, D, and the gate's scope) and
+**Revision 1 (2026-11-07)** records the maintainer's decisions (C, D, and the gate's scope) and
 answers the first Codex review. See [Review findings and resolutions](#review-findings-and-resolutions).
 It changes these things:
 
@@ -39,7 +39,7 @@ It changes these things:
 - A conversation-only rewind requires a provider rewind that keeps files.
 - The sibling-change warning reads Git and the event log, not turn rows.
 
-**Revision 2 (2026-11-07)** records Mauro's round 3 answers and answers Codex round 2.
+**Revision 2 (2026-11-07)** records the maintainer's round 3 answers and answers Codex round 2.
 It changes these things:
 
 - Siblings on an external OpenCode server refuse the restore.
@@ -150,13 +150,13 @@ overwrites what that turn writes.
 
 ## Decisions recorded
 
-- **Mauro, decision C:** **Rewind conversation only** is a secondary action in every revert
+- **The maintainer, decision C:** **Rewind conversation only** is a secondary action in every revert
   dialog, and every file-restore refusal points to it.
-- **Mauro, decision D:** turn 0's `HEAD` fallback is refused on a shared checkout.
-- **Mauro, on Codex #279 finding 5:** the gate covers the whole planning interval. Other
+- **The maintainer, decision D:** turn 0's `HEAD` fallback is refused on a shared checkout.
+- **The maintainer, on Codex #279 finding 5:** the gate covers the whole planning interval. Other
   chats in the checkout may wait a few seconds while the reverting chat's provider cold
   starts.
-- **Mauro, round 3:**
+- **The maintainer, round 3:**
   - (a) Git manager actions keep today's no-prompt behaviour; interactive sign-in is a
     follow-up (recorded in #283).
   - (b) The sibling-change warning stays warn and confirm.
@@ -415,7 +415,7 @@ confirmed. Review them and revert again." This adds one capture-sized Git read t
 restore. What remains is a terminal or editor writing in the moments between that read
 and `git restore`, outside anything BiBCode can hold.
 
-### Turn 0 on a shared checkout (Mauro, decision D)
+### Turn 0 on a shared checkout (the maintainer, decision D)
 
 When ref 0 is missing, turn 0 falls back to `HEAD` (`:1920-1922`). With `clean -fd` that
 discards every uncommitted change in the checkout, including idle siblings' work. With at
@@ -730,9 +730,9 @@ Contracts and web:
 - Replacing the native confirm changes a desktop dialog into an in-app one. The in-app
   dialog must keep keyboard focus and Escape behaviour (`AlertDialog` does).
 
-## Questions only Mauro can answer
+## Questions only the maintainer can answer
 
-None open. Mauro answered round 3's questions (see "Decisions recorded").
+None open. The maintainer answered round 3's questions (see "Decisions recorded").
 
 ## Review findings and resolutions
 
@@ -745,7 +745,7 @@ source; each was checked again here at `e222d340ff`.
 | P1 #2 | Provider-started turns bypass delivery and can begin after the last check.             | Confirmed: `providerStarted` and self-started turns (`provider_runtime.rs:12098-12105`, `opencode/runtime.rs:2871-2877`).                                | **Fixed.** Every sibling is made quiet under the gate: an idle live session is suspended, a session that cannot be suspended safely refuses the restore, and the supervisor refuses to launch or reopen a session for a held sibling by any path (delivery, compaction, rewind, reconciliation). Compaction also takes admission. Tests 11 and 12. |
 | P1 #3 | A sibling's conversation-only rewind deletes the turn rows the warning reads.          | Confirmed: `thread.reverted` deletes newer `projection_turns` (`engine.rs:8310-8318`).                                                                   | **Fixed.** The warning reads Git (changes since this thread's last turn) and the append-only event log, which no sibling action deletes. Test 19.                                                                                                                                                                                                  |
 | P1 #4 | The lexical, project-scoped key misses symlinks, case and other projects.              | Confirmed: `normalize_host_path_lexically` in `order` (`:926-930`); siblings were read per project.                                                      | **Fixed.** One physical key, `canonical_worktree_path_key`, already used by workspace availability, for the gate, siblings (all projects) and `tails`. Test 7.                                                                                                                                                                                     |
-| P2 #5 | Steps 1 to 3 of revision 1 left admission open during preparation.                     | Confirmed against revision 1.                                                                                                                            | **Fixed by Mauro's decision.** The gate covers the whole planning interval; the #129 order and the lock order are kept. Tests 1 to 3 pause inside planning.                                                                                                                                                                                        |
+| P2 #5 | Steps 1 to 3 of revision 1 left admission open during preparation.                     | Confirmed against revision 1.                                                                                                                            | **Fixed by the maintainer's decision.** The gate covers the whole planning interval; the #129 order and the lock order are kept. Tests 1 to 3 pause inside planning.                                                                                                                                                                                        |
 
 Codex review, round 2, of revision 1. Each finding was checked in source at `e222d340ff`.
 

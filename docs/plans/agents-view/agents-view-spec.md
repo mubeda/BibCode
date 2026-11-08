@@ -1,7 +1,7 @@
 # Agents View — Design Specification
 
 Status: approved and implemented (v1 approved 2026-08-31 and shipped on
-`mubeda/develop-3`; the §7 v2 revision was confirmed by the user on
+`test-user/develop-3`; the §7 v2 revision was confirmed by the user on
 2026-09-01). This document is the AGENTS.md-required design record for the
 feature: alternatives and trade-offs were settled in user interviews (decision
 logs below).

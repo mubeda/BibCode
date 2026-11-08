@@ -26,7 +26,7 @@ describe("PullRequestsCommits", () => {
     };
     try {
       await act(async () => root.render(<PullRequestsCommits commits={{ commits: [commit] }} />));
-      for (const text of ["1234567", "Fix the tests", "mubeda"])
+      for (const text of ["1234567", "Fix the tests", "test-user"])
         expect(container.textContent).toContain(text);
       expect(container.querySelector("time")?.dateTime).toBe(commit.authoredAt);
       expect(container.querySelector("img")).toBeNull();

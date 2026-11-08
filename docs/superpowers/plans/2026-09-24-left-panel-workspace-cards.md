@@ -3682,15 +3682,15 @@ These mirror the projects in `Main.dc.html`:
 ```bash
 R=$L/repos
 G="git -c user.name=Fixture -c user.email=fixture@example.invalid"
-for spec in customer-portal:develop pathfinder-application-server:alpha pathfinder-docker-manager:master agent-bridges:main; do
+for spec in sample-project:develop sample-server:alpha sample-docker:master agent-bridges:main; do
   name=${spec%%:*}; branch=${spec##*:}
   $G init -q -b "$branch" "$R/$name" && $G -C "$R/$name" commit -q --allow-empty -m "Initial commit"
 done
-$G -C $R/customer-portal worktree add -q -b fix-TRI-150 $R/wt/fix-TRI-150
-$G -C $R/customer-portal worktree add -q -b chore/pdf-renderer $R/wt/pdf-renderer
-$G -C $R/pathfinder-application-server worktree add -q -b feature/search-index $R/wt/search-index
-$G -C $R/pathfinder-docker-manager worktree add -q -b chore/pin-images $R/wt/pin-images
-$G -C $R/pathfinder-docker-manager worktree add -q -b plan/queue $R/wt/queue
+$G -C $R/sample-project worktree add -q -b fix-TRI-150 $R/wt/fix-TRI-150
+$G -C $R/sample-project worktree add -q -b chore/pdf-renderer $R/wt/pdf-renderer
+$G -C $R/sample-server worktree add -q -b feature/search-index $R/wt/search-index
+$G -C $R/sample-docker worktree add -q -b chore/pin-images $R/wt/pin-images
+$G -C $R/sample-docker worktree add -q -b plan/queue $R/wt/queue
 echo "invoice fix in progress" > $R/wt/fix-TRI-150/NOTES.md
 ```
 
@@ -3791,9 +3791,9 @@ import { launch, newId, nowIso, origin, pair, rpc, L } from "./lib.mjs";
 
 const R = `${L}/repos`;
 const projects = [
-  "customer-portal",
-  "pathfinder-application-server",
-  "pathfinder-docker-manager",
+  "sample-project",
+  "sample-server",
+  "sample-docker",
   "agent-bridges",
 ];
 const titles = {
@@ -3856,7 +3856,7 @@ Run it, then add one more worktree that stays hidden, and hide it through the UI
 
 ```bash
 cd $L && L=$L node setup.mjs
-git -c user.name=Fixture -c user.email=fixture@example.invalid -C $L/repos/pathfinder-application-server worktree add -q -b feature/hidden $L/repos/wt/hidden
+git -c user.name=Fixture -c user.email=fixture@example.invalid -C $L/repos/sample-server worktree add -q -b feature/hidden $L/repos/wt/hidden
 cd $L && L=$L node --input-type=module -e '
 import { launch, origin } from "./lib.mjs";
 const { context, page } = await launch();
@@ -3908,7 +3908,7 @@ const focused = () => page.evaluate(() => (document.activeElement?.textContent ?
 const focusedTestId = () => page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? null);
 
 // 1. The hover strip leads with ⋯ and uses + for New worktree.
-const header = page.locator('button[data-sidebar="menu-button"]', { hasText: "customer-portal" });
+const header = page.locator('button[data-sidebar="menu-button"]', { hasText: "sample-project" });
 await header.hover();
 // Base UI tooltip triggers render the buttons directly, so the strip's first button is ⋯.
 const firstInStrip = await page.$eval(
@@ -3982,7 +3982,7 @@ check("primary row menu", JSON.stringify(primaryMenu) === JSON.stringify(["Open 
 await page.keyboard.press("Escape");
 
 // 6. The hidden-worktree count on an expanded project.
-await page.locator('button[data-sidebar="menu-button"]', { hasText: "pathfinder-application-server" }).click({ button: "right" });
+await page.locator('button[data-sidebar="menu-button"]', { hasText: "sample-server" }).click({ button: "right" });
 await page.waitForSelector('[role="menu"]');
 const hiddenMenu = (await menuOutline())[0] ?? [];
 check("Show Hidden Worktrees (1)", hiddenMenu.includes("Show Hidden Worktrees (1)"), hiddenMenu);
@@ -4944,16 +4944,16 @@ describe("resolveWorkspaceCardBranchTooltip", () => {
       resolveWorkspaceCardBranchTooltip({
         branch: "fix-TRI-150",
         worktreePath: "/repos/wt/fix-TRI-150",
-        checkoutPath: "/repos/customer-portal",
+        checkoutPath: "/repos/sample-project",
       }),
     ).toBe("Worktree: fix-TRI-150 (fix-TRI-150)");
     expect(
       resolveWorkspaceCardBranchTooltip({
         branch: "develop",
         worktreePath: null,
-        checkoutPath: "/repos/customer-portal",
+        checkoutPath: "/repos/sample-project",
       }),
-    ).toBe("Checkout: customer-portal (develop)");
+    ).toBe("Checkout: sample-project (develop)");
     expect(
       resolveWorkspaceCardBranchTooltip({ branch: "develop", worktreePath: null, checkoutPath: null }),
     ).toBe("develop");
@@ -8852,7 +8852,7 @@ const codex = (model) => ({ instanceId: "codex", model });
 
 export const STATES = {
   // Idle with a session line: no latest turn, so no completion can read as unseen.
-  "default:customer-portal": (s) => ({
+  "default:sample-project": (s) => ({
     session: session(s.id, "ready", "claudeAgent"),
     latestTurn: null,
     conversationPreview: preview({ assistantMessage: "Reviewed the release checklist" }),
@@ -8874,7 +8874,7 @@ export const STATES = {
     modelSelection: codex("gpt-5-codex"),
     latestUserMessageAt: minutesAgo(18),
   }),
-  "default:pathfinder-application-server": (s) => ({
+  "default:sample-server": (s) => ({
     hasPendingApprovals: true,
     session: session(s.id, "running", "claudeAgent"),
     latestTurn: turn(`turn-${s.id}`, "running", 1, null),
@@ -9157,12 +9157,12 @@ await page.waitForTimeout(500);
 
 // Glyphs, lines and indicators for every fixture card.
 const expected = [
-  { key: "primary:customer-portal", kind: "idle", title: "develop", session: true },
+  { key: "primary:sample-project", kind: "idle", title: "develop", session: true },
   { key: "Fix invoice date format", kind: "working", pr: "!57", dirty: true, session: true },
   { key: "Upgrade PDF renderer", kind: "done", pr: "!54", unread: true, session: true },
-  { key: "primary:pathfinder-application-server", kind: "approval", title: "alpha", session: true },
+  { key: "primary:sample-server", kind: "approval", title: "alpha", session: true },
   { key: "Search index rebuild", kind: "input", pr: "!12", more: "2 more chats", session: true },
-  { key: "primary:pathfinder-docker-manager", kind: "idle", title: "master", session: false },
+  { key: "primary:sample-docker", kind: "idle", title: "master", session: false },
   { key: "Pin base images", kind: "failed", session: true },
   { key: "Queue migration plan", kind: "plan", pr: "#31", session: true },
 ];
@@ -9300,7 +9300,7 @@ const primaryXPath = page.locator('//*[@data-thread-item="true"][.//span[normali
 check("e2e XPath finds the primary card", (await primaryXPath.count()) === 1);
 await primaryXPath.first().click();
 await page.waitForTimeout(1_000);
-check("primary card becomes active", (await card("primary:customer-portal").locator('button[aria-current="page"]').count()) === 1);
+check("primary card becomes active", (await card("primary:sample-project").locator('button[aria-current="page"]').count()) === 1);
 
 writeFileSync(`${L}/logs/step2-${theme}.json`, JSON.stringify(results, null, 2));
 console.log(`step2 ${theme}: ${failures.length === 0 ? "PASS" : `FAIL ${failures.join(", ")}`}`);
@@ -9324,12 +9324,12 @@ Open (Read) each pair and record a verdict in the ledger:
 
 | Live crop (`$L/shots/`) | Mockup crop (`$L/shots/`) |
 | --- | --- |
-| `step2-light-card-primary-customer-portal.png` | `mockup-main-light-card-develop.png` |
+| `step2-light-card-primary-sample-project.png` | `mockup-main-light-card-develop.png` |
 | `step2-light-card-fix-invoice-date-format.png` | `mockup-main-light-card-fix-invoice-date-format.png` |
 | `step2-light-card-upgrade-pdf-renderer.png` | `mockup-main-light-card-upgrade-pdf-renderer.png` |
-| `step2-light-card-primary-pathfinder-application-server.png` | `mockup-main-light-card-alpha.png` |
+| `step2-light-card-primary-sample-server.png` | `mockup-main-light-card-alpha.png` |
 | `step2-light-card-search-index-rebuild.png` | `mockup-main-light-card-search-index-rebuild.png` |
-| `step2-light-card-primary-pathfinder-docker-manager.png` | `mockup-main-light-card-master.png` |
+| `step2-light-card-primary-sample-docker.png` | `mockup-main-light-card-master.png` |
 | `step2-light-card-pin-base-images.png` | `mockup-main-light-card-pin-base-images.png` |
 | `step2-light-card-queue-migration-plan.png` | `mockup-states-card-plan-ready-to-review.png` |
 | `step2-light-sidebar-hover.png` | `mockup-main-light.png` |
@@ -10064,10 +10064,10 @@ Review the patch at /tmp/claude-1000/-work-workspaces-orca-BibCode-main-3/2c4f97
 Read the common rules at /tmp/claude-1000/-work-workspaces-orca-BibCode-main-3/2c4f97f1-0ee1-4c37-b2bb-432255e2f351/scratchpad/codex/codex-common.md first.
 Use docs/superpowers/specs/2026-09-24-left-panel-workspace-cards-design.md and the implementation plan's Controller rulings (2026-09-24) as the requirements. Inspect current source to verify each finding. Review correctness, lifecycle, React and UI.md compliance and behavioural tests. Limit findings to the baseline-to-final patch; leave other agents' work alone. Read-only review: do not edit, start servers/browsers, commit or contact real remotes.
 REVIEW
-node /home/mauro/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs task --background --prompt-file "$S/leftpanel-review.md"
+node /home/user/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs task --background --prompt-file "$S/leftpanel-review.md"
 ```
 
-Substitute the recorded hashes and exact file paths in the diff command before running it. Expected: the patch contains only the recorded scoped delta, and the companion prints a job id. Poll `node /home/mauro/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs status <job-id>` through the controller, then read `node /home/mauro/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs result <job-id>`. Verify each finding against source; fix valid findings with tests and rerun affected gates. Record the review result and every disposition. A launch error is a reported blocker, never a silent review substitution.
+Substitute the recorded hashes and exact file paths in the diff command before running it. Expected: the patch contains only the recorded scoped delta, and the companion prints a job id. Poll `node /home/user/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs status <job-id>` through the controller, then read `node /home/user/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs result <job-id>`. Verify each finding against source; fix valid findings with tests and rerun affected gates. Record the review result and every disposition. A launch error is a reported blocker, never a silent review substitution.
 
 - [ ] **Step 7: Final diff review**
 

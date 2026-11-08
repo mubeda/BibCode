@@ -76,7 +76,7 @@ On a systemd-coredump system, the reliable unprivileged path is `coredumpctl --j
 **Permissions**
 
 - "All users are granted access to their private per-user journals. However, by default, only root and users who are members of a few special groups are granted access to the system journal and the journals of other users. Members of the groups 'systemd-journal', 'adm', and 'wheel' can read all journal files." — [journalctl(1)](https://man7.org/linux/man-pages/man1/journalctl.1.html)
-- **[Local probe]** `/var/lib/systemd/coredump` is `drwxr-xr-x root root`. Each core file is `-rw-r-----+ root root` with the ACL `user:mauro:r--`, so the crashing user can read their own compressed core (`.zst`) without privilege. The tmpfiles rule is `d /var/lib/systemd/coredump 0755 root root 2w`, which means **cores are aged out after 2 weeks** by systemd-tmpfiles.
+- **[Local probe]** `/var/lib/systemd/coredump` is `drwxr-xr-x root root`. Each core file is `-rw-r-----+ root root` with the ACL `user:user:r--`, so the crashing user can read their own compressed core (`.zst`) without privilege. The tmpfiles rule is `d /var/lib/systemd/coredump 0755 root root 2w`, which means **cores are aged out after 2 weeks** by systemd-tmpfiles.
 - The kernel runs the systemd-coredump handler in privileged mode. It hands off to the socket-activated, unprivileged `systemd-coredump@.service` for processing. — [systemd-coredump(8)](https://man7.org/linux/man-pages/man8/systemd-coredump.8.html)
 
 **Storage disabled and limits (coredump.conf(5))**

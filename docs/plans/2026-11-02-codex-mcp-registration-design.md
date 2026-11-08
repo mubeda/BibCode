@@ -1,6 +1,6 @@
 # Codex MCP Registration Collision (#273)
 
-Status: Approved by Mauro 2026-11-02 (option A; Codex review rounds 1-3). Design for issue 273,
+Status: Approved by the maintainer 2026-11-02 (option A; Codex review rounds 1-3). Design for issue 273,
 verified against `main` at `fd98b4330` with codex-cli 0.166.0.
 
 ## Problem

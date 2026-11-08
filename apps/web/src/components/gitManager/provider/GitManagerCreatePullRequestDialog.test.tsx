@@ -1025,14 +1025,14 @@ describe("GitManagerCreatePullRequestDialog", () => {
       sourceControlProvider: {
         kind: "gitlab",
         name: "GitLab",
-        baseUrl: "https://luna.tripunkt.de",
+        baseUrl: "https://code.example.test",
       },
     });
     await renderDialog();
 
     expect(document.body.textContent).toContain("Create merge request");
     expect(document.body.textContent).toContain("Review the merge request before it is created.");
-    expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
+    expect(text("create-pr-repository")).toBe("GitLab · https://code.example.test");
     expect(
       document.querySelector('[data-testid="create-pr-summary"]')?.getAttribute("aria-label"),
     ).toBe("Merge request details");
@@ -1098,17 +1098,17 @@ describe("GitManagerCreatePullRequestDialog", () => {
   });
 
   it("shows the host Pull Requests identified while the status has not named it", async () => {
-    const providerHint = { kind: "gitlab", baseUrl: "https://luna.tripunkt.de" } as const;
+    const providerHint = { kind: "gitlab", baseUrl: "https://code.example.test" } as const;
     h.status = null;
     await renderDialog(vi.fn(), vi.fn(), providerHint);
-    expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
+    expect(text("create-pr-repository")).toBe("GitLab · https://code.example.test");
     expect(button("Create merge request").parentElement?.getAttribute("title")).toBe(
       "Reading repository status…",
     );
 
     h.status = status({ sourceControlProvider: undefined });
     await renderDialog(vi.fn(), vi.fn(), providerHint);
-    expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
+    expect(text("create-pr-repository")).toBe("GitLab · https://code.example.test");
     // The server validates the provider when creating, so the review does not block.
     await chooseTarget("main");
     const primary = button("Publish and create merge request");

@@ -347,7 +347,7 @@ describe("resolveCreatePullRequestReview", () => {
       sourceControlProvider: {
         kind: "gitlab",
         name: "GitLab",
-        baseUrl: "https://luna.tripunkt.de",
+        baseUrl: "https://code.example.test",
       },
       hasWorkingTreeChanges: true,
     });
@@ -363,7 +363,7 @@ describe("resolveCreatePullRequestReview", () => {
   });
 
   it("lets the Pull Requests panel's identified host stand in for a status without one", () => {
-    const providerHint = { kind: "gitlab", baseUrl: "https://luna.tripunkt.de" } as const;
+    const providerHint = { kind: "gitlab", baseUrl: "https://code.example.test" } as const;
     const hinted = resolveCreatePullRequestReview({
       status: status({ sourceControlProvider: undefined }),
       latestCommit: null,
@@ -372,7 +372,7 @@ describe("resolveCreatePullRequestReview", () => {
     expect(hinted.provider).toEqual({
       kind: "gitlab",
       name: "GitLab",
-      baseUrl: "https://luna.tripunkt.de",
+      baseUrl: "https://code.example.test",
     });
     // The server validates the provider when creating; the review does not block.
     expect(hinted.blockedReason).toBeNull();
@@ -390,7 +390,7 @@ describe("create pull request progress", () => {
   it("names a GitLab merge request with its reference in every phase", () => {
     const gitlab = {
       ...review,
-      provider: { kind: "gitlab", name: "GitLab", baseUrl: "https://luna.tripunkt.de" } as const,
+      provider: { kind: "gitlab", name: "GitLab", baseUrl: "https://code.example.test" } as const,
     };
     expect(presentCreatePullRequestProgress(REVIEW_PROGRESS, gitlab).primaryLabel).toBe(
       "Publish and create merge request",

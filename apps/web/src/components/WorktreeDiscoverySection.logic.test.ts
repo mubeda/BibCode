@@ -130,14 +130,14 @@ describe("WorktreeDiscoverySection presentation logic", () => {
         projectId: ProjectId.make("project-main"),
         candidates: [
           candidate(
-            "/Users/admin/conductor/workspaces/pathfinder-review",
-            "hotfix/PFS-1817",
+            "/Users/admin/conductor/workspaces/sample-review",
+            "hotfix/ABC-1817",
             "1111111",
           ),
           candidate("/Users/admin/orca/workspaces/alpha", "alpha", "2222222"),
           candidate(
-            "/Users/admin/conductor/workspaces/pathfinder-hotfix",
-            "hotfix/PFS-1817",
+            "/Users/admin/conductor/workspaces/sample-hotfix",
+            "hotfix/ABC-1817",
             "3333333",
           ),
         ],
@@ -148,8 +148,8 @@ describe("WorktreeDiscoverySection presentation logic", () => {
       {
         parentDirectory: "/Users/admin/conductor/workspaces",
         candidates: [
-          { label: "hotfix/PFS-1817", discriminator: "pathfinder-hotfix" },
-          { label: "hotfix/PFS-1817", discriminator: "pathfinder-review" },
+          { label: "hotfix/ABC-1817", discriminator: "sample-hotfix" },
+          { label: "hotfix/ABC-1817", discriminator: "sample-review" },
         ],
       },
       {
@@ -160,22 +160,22 @@ describe("WorktreeDiscoverySection presentation logic", () => {
   });
 
   it("derives a duplicate discriminator from Windows separators without changing the path", () => {
-    const reviewPath = "C:\\Users\\admin\\workspaces\\pathfinder-review";
+    const reviewPath = "C:\\Users\\admin\\workspaces\\sample-review";
     const groups = buildWorktreeDiscoveryGroups([
       {
         environmentId: EnvironmentId.make("environment-main"),
         environmentLabel: "This device",
         projectId: ProjectId.make("project-main"),
         candidates: [
-          candidate("C:\\Users\\admin\\workspaces\\pathfinder-hotfix", "hotfix/PFS-1817", null),
-          candidate(reviewPath, "hotfix/PFS-1817", null),
+          candidate("C:\\Users\\admin\\workspaces\\sample-hotfix", "hotfix/ABC-1817", null),
+          candidate(reviewPath, "hotfix/ABC-1817", null),
         ],
       },
     ]);
 
     expect(groups[0]?.parentGroups[0]?.candidates).toMatchObject([
-      { discriminator: "pathfinder-hotfix" },
-      { candidate: { path: reviewPath }, discriminator: "pathfinder-review" },
+      { discriminator: "sample-hotfix" },
+      { candidate: { path: reviewPath }, discriminator: "sample-review" },
     ]);
   });
 

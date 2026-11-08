@@ -6,7 +6,7 @@
 
 - Repository: BiBCode (`https://github.com/mubeda/BibCode.git`)
 - Remote: `origin`; remote branch `develop`
-- Branch or requested revision: local `mubeda/develop`; remote-server range
+- Branch or requested revision: local `test-user/develop`; remote-server range
   `3b1864eff4b5e476bf725910fc84c11f34b31c1a..71cd7fc3f0e19e04ea8cccb11e6092146496e42e`
 - Local HEAD: `71cd7fc3f0e19e04ea8cccb11e6092146496e42e` was the final tested product/test
   commit. The later documentation-only commit containing the final report and
@@ -40,7 +40,7 @@
 - Native compiler/SDK/runtime dependencies: GCC 16.2.1; the installed Linux
   desktop development dependencies were sufficient for complete server and
   desktop Rust tests and Clippy. No native package build was requested or run.
-- Optional capabilities: Docker CLI 29.7.2 used context `pathfinder-podman`;
+- Optional capabilities: Docker CLI 29.7.2 used context `sample-podman`;
   its server was Podman 5.8.4 on Fedora 44, Linux/amd64. Windows/WSL/MSVC,
   macOS/Xcode, signing, notarization, and native installers were unavailable.
 
@@ -176,7 +176,7 @@ credential-variable unsetting, cleanup, and the three filtered absence checks.
 No command interpolation or credential value is retained in this report.
 
 - Runtime: Docker CLI 29.7.2, API downgraded to 1.44, context
-  `pathfinder-podman`; Podman Engine 5.8.4, `crun` 1.28, Linux/amd64 on Fedora 44. This is not a Docker Engine daemon and is reported as such.
+  `sample-podman`; Podman Engine 5.8.4, `crun` 1.28, Linux/amd64 on Fedora 44. This is not a Docker Engine daemon and is reported as such.
 - Server image: `debian:trixie-slim`,
   `sha256:e426a54f50cc4cf82dd5cab8ba8426ed02c391840cb5a62dfd987542dbabea3b`,
   Linux/amd64, 81,081,546 bytes.

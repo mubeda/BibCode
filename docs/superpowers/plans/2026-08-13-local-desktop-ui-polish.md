@@ -734,8 +734,8 @@ expect(groups[0]?.parentGroups).toMatchObject([
   {
     parentDirectory: "/Users/admin/conductor/workspaces",
     candidates: [
-      { label: "hotfix/PFS-1817", discriminator: "pathfinder-hotfix" },
-      { label: "hotfix/PFS-1817", discriminator: "pathfinder-review" },
+      { label: "hotfix/ABC-1817", discriminator: "sample-hotfix" },
+      { label: "hotfix/ABC-1817", discriminator: "sample-review" },
     ],
   },
   {

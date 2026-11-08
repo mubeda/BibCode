@@ -1937,7 +1937,7 @@ from `apps/web`.
     SSH agent and key. Run it on Windows twice (once with the OpenSSH Authentication Agent
     service and `SSH_AUTH_SOCK` unset, once with an MSYS `ssh-agent` or `ssh-pageant` whose
     `SSH_AUTH_SOCK` the server inherits), on Linux and on macOS, against one of your
-    `SourceControlTest` repositories, with its key loaded (`ssh-add`) and the host in
+    `sample-project` repositories, with its key loaded (`ssh-add`) and the host in
     `~/.ssh/known_hosts`. Turn **Terminals** on at Full access and connect the agent with
     terminals.
     1. **The gate.** Ask an agent connected without terminals to clone

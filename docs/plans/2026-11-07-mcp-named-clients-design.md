@@ -1,6 +1,6 @@
 # MCP Named Clients: One Identity Across Runs
 
-Status: Approved 2026-11-07 (Mauro pre-approval; reviewed by Codex and advisor). Issue #280.
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #280.
 Verified at `e222d340ff` (`main` after v0.15.2). Line references are to that commit.
 
 **Implemented 2026-11-07 (lane L12).** Corrections to this note, recorded here:
@@ -13,7 +13,7 @@ found that a stored request past its 24 hours was still replayed until a later i
 it; reads of `mcp_tool_requests` now skip rows past the window.
 
 **Revision 1 (2026-11-07)** answers the Codex review (two P2 findings, see
-[Review findings and resolutions](#review-findings-and-resolutions)) and records Mauro's
+[Review findings and resolutions](#review-findings-and-resolutions)) and records the maintainer's
 answers to the four open questions as decisions 5, 7, 8 and 9.
 
 This note makes the
@@ -100,7 +100,7 @@ token is stored. Without `--client`, nothing changes.
 5. **Every person action that removes a named client's row ends the identity.** Revoke,
    Stop (also on the row of an earlier run that exited) and Revoke others. This matches
    `docs/reference/webhooks.md:62-64`, which already says Revoke and Stop turn the paired
-   endpoint off. Mauro confirmed 2026-11-07.
+   endpoint off. The maintainer confirmed 2026-11-07.
 6. **Webhooks need no new event.** A pairing to a named client stores the named id in
    `paired_session_id`; `orphaned_pairings` treats that id as orphaned only when the named
    client is revoked or missing. Every person revoke already emits `ClientRemoved`, which
@@ -108,14 +108,14 @@ token is stored. Without `--client`, nothing changes.
    "a session id or a named client id".
 7. **No idle row.** (Replaced by [Revision 2](#revision-2-idle-rows-and-take-over-across-runs-324).) A named client with no live run has no Authorized clients row, so it
    cannot be revoked from there. Its paired endpoints stay on until edited in Webhooks,
-   and the next `--client` run brings its row back. Mauro confirmed 2026-11-07; an idle
+   and the next `--client` run brings its row back. The maintainer confirmed 2026-11-07; an idle
    row is a follow-up.
 8. **Take over does not carry to the next run.** (Replaced by [Revision 2](#revision-2-idle-rows-and-take-over-across-runs-324).) A restarted agent escapes a Take over
    today because its new run is a new session; named clients do not make that worse.
-   Mauro confirmed 2026-11-07: out of scope, a follow-up (the named row would store the
+   The maintainer confirmed 2026-11-07: out of scope, a follow-up (the named row would store the
    hand-back level).
 9. **An earlier run still running a turn keeps its own row.** It is not folded into the
-   live run's row; Stop on it ends the whole identity. Mauro confirmed 2026-11-07.
+   live run's row; Stop on it ends the whole identity. The maintainer confirmed 2026-11-07.
 10. **The relay's SQL works on stores one migration apart.** An unnamed relay touches no
     column or table that migration 70 adds, so it works against a migration-69 store. The
     named path checks for `mcp_named_clients` first. See [Mixed versions](#mixed-versions).
@@ -404,7 +404,7 @@ Both are designed in [Revision 2](#revision-2-idle-rows-and-take-over-across-run
 
 ## Revision 2: idle rows and Take over across runs (#324)
 
-Status: Approved 2026-11-07 (Mauro pre-approval; reviewed by Codex and advisor). Mauro's
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). The maintainer's
 answers: Q1 both surfaces, Q2 to Q5 as recommended, migration 71. Verified on the integration branch
 at `85fcbe4b3`, which contains this note's implementation and #294.
 
