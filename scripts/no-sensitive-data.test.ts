@@ -130,7 +130,8 @@ describe("sensitive data guard", () => {
       }
     }
     expect(findings, findings.slice(0, 200).join("\n")).toEqual([]);
-  });
+    // Hashes every token of every tracked file: seconds locally, longer on a CI runner.
+  }, 120_000);
 
   it("flags a banned token in a commit message log and names only the commit", () => {
     const banned = new Set([sha256("samplevalue")]);

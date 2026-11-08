@@ -774,9 +774,12 @@ describe("ProfilerSection", () => {
       expect(container.textContent).toContain("Workstation finding");
 
       await click(container.querySelector('[role="switch"]') as HTMLElement);
-      expect(h.updates).toEqual([{ environmentId: workstationId, patch: { enableProfiler: false } }]);
+      expect(h.updates).toEqual([
+        { environmentId: workstationId, patch: { enableProfiler: false } },
+      ]);
       expect(
-        (h.statusByEnvironment[workstationId] as { revalidate: ReturnType<typeof vi.fn> }).revalidate,
+        (h.statusByEnvironment[workstationId] as { revalidate: ReturnType<typeof vi.fn> })
+          .revalidate,
       ).toHaveBeenCalledTimes(1);
       expect(h.statusQuery.revalidate).not.toHaveBeenCalled();
     });
@@ -790,7 +793,9 @@ describe("ProfilerSection", () => {
       });
 
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
-      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe("Workstation");
+      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe(
+        "Workstation",
+      );
     });
 
     it("keeps Open folder to the primary, and Export bundle to servers that can send it", async () => {
@@ -918,7 +923,9 @@ describe("ProfilerSection", () => {
 
         // Meanwhile the primary shows, the page says so, and the link survives.
         expect(h.selections).toEqual([]);
-        expect(container.textContent).toContain("Workstation is not connected. Showing Work Server.");
+        expect(container.textContent).toContain(
+          "Workstation is not connected. Showing Work Server.",
+        );
         expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
           "false",
         );
