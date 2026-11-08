@@ -3066,6 +3066,13 @@ mod tests {
         let executable =
             release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
         let fixture = compiled_cursor_update_fixture().await;
+        // On macOS the first exec of a new file waits for a system check, which a loaded host
+        // can hold back past a probe's 10 s timeout or for good (#335). A hard link is the
+        // compiled file, which has run once already. Nothing writes to it: on macOS, an exec
+        // of a file another process holds open for writing is killed.
+        #[cfg(target_os = "macos")]
+        std::fs::hard_link(&fixture.executable, &executable).expect("link Cursor fixture");
+        #[cfg(not(target_os = "macos"))]
         crate::test_support::executable_fixture::copy_executable(&fixture.executable, &executable);
         executable
     }
@@ -3077,11 +3084,11 @@ mod tests {
     static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
         OnceCell::const_new();
 
-    /// Runs the fixture, relaunching a run that has not finished in 10 s. Under load, macOS can
-    /// leave the exec of a freshly copied binary launched-suspended for good: the process never
+    /// Runs a test fixture, relaunching a run that has not finished in 10 s. Under load, macOS
+    /// can leave the first exec of a new file launched-suspended for good: the process never
     /// runs its first instruction (`vmmap` reports it launched-suspended), and only a new launch
-    /// gets past it (#329). Every fixture command is idempotent, so a relaunch is safe.
-    async fn run_compiled_cursor_update_fixture(
+    /// gets past it (#329). Every fixture command run here is idempotent, so a relaunch is safe.
+    async fn run_fixture(
         executable: &Path,
         argument: &str,
     ) -> std::io::Result<std::process::Output> {
@@ -3108,7 +3115,7 @@ mod tests {
             .map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "compiled Cursor update fixture did not become executable",
+                    "fixture did not become executable",
                 )
             })??;
             let attempt = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -3119,7 +3126,7 @@ mod tests {
                 Err(_) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "compiled Cursor update fixture did not finish",
+                        "fixture did not finish",
                     ));
                 }
             }
@@ -3150,6 +3157,10 @@ mod tests {
                     "compile Cursor update fixture: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
+                // The first exec of the new file is the slow one; take it here, with relaunch.
+                run_fixture(&executable, "about")
+                    .await
+                    .expect("first run of the compiled Cursor fixture");
                 CompiledCursorUpdateFixture {
                     _root: root,
                     executable,
@@ -3168,18 +3179,18 @@ mod tests {
             .await
             .expect("write next Cursor version");
 
-        let before = run_compiled_cursor_update_fixture(&executable, "about")
+        let before = run_fixture(&executable, "about")
             .await
             .expect("run Cursor about before update");
         assert_eq!(
             String::from_utf8_lossy(&before.stdout).trim(),
             r#"{"cliVersion":"2026.06.19-653a7fb"}"#
         );
-        let update = run_compiled_cursor_update_fixture(&executable, "update")
+        let update = run_fixture(&executable, "update")
             .await
             .expect("run Cursor update");
         assert!(update.status.success());
-        let after = run_compiled_cursor_update_fixture(&executable, "about")
+        let after = run_fixture(&executable, "about")
             .await
             .expect("run Cursor about after update");
         assert_eq!(
@@ -3188,7 +3199,26 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cursor_update_fixtures_are_the_compiled_file_that_already_ran() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("Cursor fixture directory");
+        let executable = write_cursor_update_fixture(directory.path()).await;
+        let compiled = compiled_cursor_update_fixture().await;
+        assert_eq!(
+            std::fs::metadata(&executable).expect("fixture").ino(),
+            std::fs::metadata(&compiled.executable)
+                .expect("compiled fixture")
+                .ino(),
+            "a copy is a new file, whose first exec a loaded host can hold back for good"
+        );
+    }
+
+    // Linux refuses the exec with ETXTBSY. macOS has no such error: it kills a process that
+    // runs a file another holds open for writing, so there is nothing to retry (#335).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn compiled_cursor_update_fixture_retries_a_busy_executable() {
         let directory = tempfile::tempdir().expect("Cursor fixture directory");
@@ -3203,7 +3233,7 @@ mod tests {
             drop(writable);
         });
 
-        let output = run_compiled_cursor_update_fixture(&executable, "about")
+        let output = run_fixture(&executable, "about")
             .await
             .expect("busy Cursor fixture becomes executable");
         assert!(output.status.success());
@@ -3301,7 +3331,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("state directory");
         let sandbox = crate::test_support::TestSandbox::new("startup-probes");
         let control = scheduler_control(&temp).await;
-        let (setup, _stub, stub_state) = crate::production::tool_maintenance::tests::stub_setup(
+        let (setup, stub, stub_state) = crate::production::tool_maintenance::tests::stub_setup(
             &sandbox,
             Duration::from_secs(5),
         )
@@ -3332,6 +3362,14 @@ mod tests {
         settings["providerInstances"]["opencode"]["config"]["binaryPath"] =
             json!(provider.to_string_lossy());
         let tools = control.tools_with(setup);
+        // The first exec of a new script waits for a system check that a loaded macOS host can
+        // hold back past the 10 s probe timeout (#335). Take it here, where a run relaunches; an
+        // argument that neither fixture knows makes each exit at once without logging.
+        for fixture in [&provider, &stub] {
+            run_fixture(fixture, "warm-up")
+                .await
+                .expect("first run of a probe fixture");
+        }
 
         // A starved host can keep a probe's child from starting before the 10 s probe timeout
         // ends it. A run in which either never started says nothing about overlap, so it is

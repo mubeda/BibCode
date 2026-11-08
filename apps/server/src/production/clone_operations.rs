@@ -760,12 +760,13 @@ mod tests {
     use crate::{
         git::{
             BoxGitProcessFuture, CloneLeaf, GitProcessRunner, GitRepository, ProcessError,
-            ProcessRequest, ProcessRunner, clone_destination_leaf,
+            ProcessOutput, ProcessRequest, ProcessRunner, clone_destination_leaf,
         },
         maintenance::{RpcAdmissionGate, RpcMutability},
     };
 
     const DEADLINE: Duration = Duration::from_secs(20);
+    const MISSING_REPOSITORY: &str = "missing.git";
 
     /// Stands in for `git clone` around the real command. The transfer waits until the test
     /// releases it or the clone is cancelled. Flags inject a held cancellation, a replaced
@@ -784,6 +785,10 @@ mod tests {
         replace_on_cancel: AtomicBool,
         /// Panic inside the transfer.
         panic_on_clone: AtomicBool,
+        /// Once released, answer as Git would without starting it: a clone of
+        /// [`Harness::missing_url`] fails and any other succeeds. A loaded host can hold real
+        /// Git back for longer than a test's outcome retention (#335).
+        answer_without_git: AtomicBool,
     }
 
     impl HeldCloneRunner {
@@ -797,6 +802,7 @@ mod tests {
                 release_cancelled: Semaphore::new(0),
                 replace_on_cancel: AtomicBool::new(false),
                 panic_on_clone: AtomicBool::new(false),
+                answer_without_git: AtomicBool::new(false),
             }
         }
     }
@@ -842,7 +848,31 @@ mod tests {
                         permit.expect("the release semaphore stays open").forget();
                     }
                 }
-                ProcessRunner.run(request, cancellation).await
+                if !self.answer_without_git.load(Ordering::SeqCst) {
+                    return ProcessRunner.run(request, cancellation).await;
+                }
+                let missing = request
+                    .args
+                    .iter()
+                    .any(|argument| argument.to_string_lossy().ends_with(MISSING_REPOSITORY));
+                if missing {
+                    let stderr = "fatal: repository does not exist";
+                    return Err(ProcessError::NonZeroExit {
+                        operation: request.operation,
+                        exit_code: 128,
+                        stdout_length: 0,
+                        stderr_length: stderr.len(),
+                        stdout: "".into(),
+                        stderr: stderr.into(),
+                    });
+                }
+                Ok(ProcessOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
             })
         }
     }
@@ -878,7 +908,7 @@ mod tests {
     impl Harness {
         /// A `file://` URL with no repository behind it: Git fails at once when released.
         fn missing_url(&self) -> String {
-            file_url(&self.base.join("missing.git"))
+            file_url(&self.base.join(MISSING_REPOSITORY))
         }
     }
 
@@ -1305,6 +1335,11 @@ mod tests {
             retained: 2,
             ..Limits::default()
         });
+        // Outcomes expire on the wall clock, so nothing between them may wait on real Git.
+        harness
+            .runner
+            .answer_without_git
+            .store(true, Ordering::SeqCst);
         let missing = harness.missing_url();
         for leaf in ["first", "second"] {
             let failing = spawn_clone(&harness, request(&harness, &missing, leaf));

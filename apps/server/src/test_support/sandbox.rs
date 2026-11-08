@@ -132,56 +132,19 @@ impl TestSandbox {
         command
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .envs(environment.iter().map(|(name, value)| (*name, *value)))
-            .env("BIBCODE_TEST_ISOLATED_CASE", case)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("BIBCODE_TEST_ISOLATED_CASE", case);
         for name in removed {
             command.env_remove(name);
         }
-        let mut child = command.spawn().expect("run isolated fixture case");
-        let mut stdout = child.stdout.take().expect("isolated child stdout");
-        let mut stderr = child.stderr.take().expect("isolated child stderr");
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout
-                .read_to_end(&mut bytes)
-                .expect("read isolated child stdout");
-            bytes
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr
-                .read_to_end(&mut bytes)
-                .expect("read isolated child stderr");
-            bytes
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let (status, timed_out) = loop {
-            if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
-                break (status, false);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                break (
-                    child.wait().expect("reap timed-out isolated fixture case"),
-                    true,
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        let stdout = stdout_reader.join().expect("join isolated stdout reader");
-        let stderr = stderr_reader.join().expect("join isolated stderr reader");
+        let (output, timed_out) =
+            run_until_deadline(command, ISOLATED_CASE_START_BOUND, ISOLATED_CASE_RUN_BOUND);
         assert!(
             !timed_out,
             "isolated fixture case timed out:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        Output {
-            status,
-            stdout,
-            stderr,
-        }
+        output
     }
 
     pub(crate) fn is_isolated_case(case: &str, test_name: &str) -> bool {
@@ -257,6 +220,125 @@ impl TestSandbox {
 
     pub(crate) fn maximum_active_fixtures(&self) -> usize {
         self.maximum.load(Ordering::Acquire)
+    }
+}
+
+const ISOLATED_CASE_START_BOUND: Duration = Duration::from_secs(60);
+const ISOLATED_CASE_RUN_BOUND: Duration = Duration::from_secs(10);
+
+/// Runs `command` with piped output. It gets `run_bound` from its first stdout byte (libtest
+/// prints its header before any test runs) and is killed at that point, or at `start_bound`
+/// if it never writes. A loaded macOS host can hold a child back for tens of seconds before
+/// it runs at all (#335), so the run bound does not count that wait. `true` when killed.
+fn run_until_deadline(
+    mut command: Command,
+    start_bound: Duration,
+    run_bound: Duration,
+) -> (Output, bool) {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run isolated fixture case");
+    let mut stdout = child.stdout.take().expect("isolated child stdout");
+    let mut stderr = child.stderr.take().expect("isolated child stderr");
+    let (started_sender, started) = std::sync::mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let read = stdout.read(&mut chunk).expect("read isolated child stdout");
+            if read == 0 {
+                break bytes;
+            }
+            if bytes.is_empty() {
+                let _ = started_sender.send(Instant::now());
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .expect("read isolated child stderr");
+        bytes
+    });
+    let mut deadline = Instant::now() + start_bound;
+    let mut waiting_for_start = true;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
+            break (status, false);
+        }
+        if waiting_for_start && let Ok(started_at) = started.try_recv() {
+            waiting_for_start = false;
+            deadline = started_at + run_bound;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (
+                child.wait().expect("reap timed-out isolated fixture case"),
+                true,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let stdout = stdout_reader.join().expect("join isolated stdout reader");
+    let stderr = stderr_reader.join().expect("join isolated stderr reader");
+    (
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+    )
+}
+
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use std::{process::Command, time::Duration};
+
+    use super::run_until_deadline;
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn a_case_that_starts_late_gets_its_whole_run_bound() {
+        // A loaded host can hold a child back before it runs at all (#335).
+        let (output, timed_out) = run_until_deadline(
+            shell("sleep 1; echo started; sleep 0.1; echo done"),
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+        );
+        assert!(!timed_out, "a late start is not a hang: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "started\ndone\n");
+    }
+
+    #[test]
+    fn a_case_that_hangs_after_starting_is_killed_at_its_run_bound() {
+        let (output, timed_out) = run_until_deadline(
+            shell("echo started; exec sleep 30"),
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+        );
+        assert!(timed_out);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "started\n");
+    }
+
+    #[test]
+    fn a_case_that_never_starts_is_killed_at_its_start_bound() {
+        let (output, timed_out) = run_until_deadline(
+            shell("exec sleep 30"),
+            Duration::from_millis(500),
+            Duration::from_secs(30),
+        );
+        assert!(timed_out);
+        assert!(output.stdout.is_empty());
     }
 }
 
