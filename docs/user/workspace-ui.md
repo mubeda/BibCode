@@ -1405,7 +1405,8 @@ on a wide panel, stacked on a narrow one. The columns grow to fill the panel up
 to a maximum width, and the row scrolls sideways only when the stages do not
 fit at 256 px each; drag the edge of the first column, or use the arrow keys,
 Home and End on it, to change that maximum for all columns (double-click
-resets); it is remembered. Each stage
+resets); it is remembered. **Wrap stages** above them puts the stages that do
+not fit on more rows instead of scrolling sideways; it is remembered too. Each stage
 shows its status, name and job count; each job its status, name and
 duration. A parallel group such as `rspec 3` is one row that expands to its
 jobs, a trigger job links to its **Downstream pipeline**, and a job that

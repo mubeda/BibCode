@@ -1260,8 +1260,12 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   separators, `shared/PipelineColumnSeparator.tsx`), stored globally under
   `bibcode:pipelines-stage-width` and painted as `--pipeline-stage-max`.
   A job name wraps while its stage column is wider than the minimum and
-  truncates (with its full name as the tooltip) only at 256 px. Wrapping
-  stages onto more rows, an inline log panel and a `needs` view are not built. A column has the stage icon, name and
+  truncates (with its full name as the tooltip) only at 256 px. A **Wrap
+  stages** toggle above the wide row (issue #322, `aria-pressed`, stored
+  globally under `bibcode:pipelines-stage-wrap`, a corrupt value reads as off)
+  swaps the row's sideways scroll for `flex-wrap`, so stages that do not fit at
+  256 px move to more rows; it is hidden below 720 px, where stages stack. An
+  inline log panel and a `needs` view are not built. A column has the stage icon, name and
   job count; a job row is a full-width link to the job route: icon, name,
   duration, and one trailing action (Retry, Cancel or Play). A parallel group
   (`size > 1`) is one row "rspec 3" that expands to its jobs. A trigger job
