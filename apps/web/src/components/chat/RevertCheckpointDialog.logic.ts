@@ -122,7 +122,11 @@ export function buildRevertCheckpointDialog(input: {
         ? writingReasonLine(blocked.title, blocked.reason)
         : "This thread has no starting checkpoint, and other chats share this checkout, so restoring files would discard their work.";
     return {
-      title: "Can't restore files right now",
+      // A missing starting checkpoint is not a passing state, so it does not say "right now".
+      title:
+        blocked === undefined
+          ? `Can't restore files to checkpoint ${turnCount}`
+          : "Can't restore files right now",
       description: canRewindOnly ? `${reason} ${REWIND_ONLY_OFFER}` : reason,
       restoredPaths: [],
       outsideChanges: [],

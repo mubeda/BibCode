@@ -36,10 +36,7 @@ export const RevertCheckpointDialog = memo(function RevertCheckpointDialog(props
             <AlertDialogDescription>{model.description}</AlertDialogDescription>
             {model.outsideChanges.length > 0 && (
               <div className="text-sm text-muted-foreground">
-                <p>
-                  Other chats in this checkout changed files since then. Reverting files undoes
-                  these too:
-                </p>
+                <p>Files changed outside this chat since then. Reverting files undoes these too:</p>
                 <ul className="mt-1 list-disc ps-5">
                   {model.outsideChanges.map((line) => (
                     <li key={line} className="break-words">

@@ -121,7 +121,7 @@ describe("buildRevertCheckpointDialog", () => {
       provider: codex,
       preview: preview({ headFallbackRefused: true }),
     });
-    expect(model.title).toBe("Can't restore files right now");
+    expect(model.title).toBe("Can't restore files to checkpoint 0");
     expect(model.description).toContain("no starting checkpoint");
     expect(labels(model)).toEqual(["Rewind conversation only"]);
   });
