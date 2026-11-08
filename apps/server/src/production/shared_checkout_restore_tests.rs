@@ -651,6 +651,7 @@ async fn reverts_of_one_checkout_still_restore_in_request_order_under_the_gate()
 }
 
 /// Whether the file system under `dir` ignores case: create `a`, look for `A`.
+#[cfg(unix)]
 fn case_insensitive(dir: &Path) -> bool {
     let probe = dir.join("case-probe-a");
     std::fs::write(&probe, "").unwrap();
