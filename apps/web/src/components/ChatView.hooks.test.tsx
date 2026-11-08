@@ -485,6 +485,13 @@ vi.mock("./chat/ExpandedImageDialog", () => ({
   },
 }));
 
+vi.mock("./chat/RevertCheckpointDialog", () => ({
+  RevertCheckpointDialog: (props: Record<string, unknown>) => {
+    h.capture("revertCheckpointDialog", props);
+    return <div data-mock="revert-checkpoint-dialog" />;
+  },
+}));
+
 vi.mock("./chat/PanelLayoutControls", () => ({
   PanelLayoutControls: (props: Record<string, unknown>) => {
     h.capture("panelLayoutControls", props);
@@ -714,20 +721,21 @@ const HOST_STATE = {
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  maximizedRightPanelThreadKey: { index: 8, expectInitial: isNull },
-  terminalFocusRequestId: { index: 13, expectInitial: (value: unknown) => value === 0 },
-  pullRequestDialogState: { index: 14, expectInitial: isNull },
+  pendingRevert: { index: 8, expectInitial: isNull },
+  maximizedRightPanelThreadKey: { index: 9, expectInitial: isNull },
+  terminalFocusRequestId: { index: 14, expectInitial: (value: unknown) => value === 0 },
+  pullRequestDialogState: { index: 15, expectInitial: isNull },
   pendingUserInputAnswersByRequestId: {
-    index: 11,
+    index: 12,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
   attachmentPreviewHandoffByMessageId: {
-    index: 15,
+    index: 16,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  composerOverlayElement: { index: 19, expectInitial: isNull },
+  composerOverlayElement: { index: 20, expectInitial: isNull },
 } as const;
 
 function seedHostState(name: keyof typeof HOST_STATE, value: unknown): void {
@@ -853,7 +861,12 @@ function makeEnvironmentPresentation(
 ): TestEnvironmentPresentation {
   const defaultServerConfig = {
     providers: [codexProvider],
-    environment: { label: "Local", platform: { os: "linux" as const, arch: "x64" as const } },
+    environment: {
+      label: "Local",
+      platform: { os: "linux" as const, arch: "x64" as const },
+      // An older server: the revert dialog opens without a shared-checkout preview.
+      capabilities: { conversationOnlyRewind: false },
+    },
   };
   return {
     environmentId,
@@ -1986,13 +1999,13 @@ describe("ChatView effects (captured and run manually)", () => {
       getBoundingClientRect: () => ({ height: 42 }),
     };
     seedHostState("composerOverlayElement", overlayElement);
-    h.stateSeeds.set(20, { value: 42, expectInitial: (value) => value === 0 });
+    h.stateSeeds.set(21, { value: 42, expectInitial: (value) => value === 0 });
     vi.stubGlobal("ResizeObserver", undefined);
 
     renderServerRoute();
     const cleanups = runEffects();
 
-    expect(h.setStateCalls.some((call) => call.index === 20 && call.applied === 42)).toBe(true);
+    expect(h.setStateCalls.some((call) => call.index === 21 && call.applied === 42)).toBe(true);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2187,8 +2200,8 @@ describe("ChatView effects (captured and run manually)", () => {
     vi.stubGlobal("ResizeObserver", undefined);
     seedHostState("composerOverlayElement", { getBoundingClientRect: () => ({ height: 40 }) });
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
-    // The height is set (state 20) but this render, and its captured props, still hold 0.
-    expect(h.setStateCalls.some((call) => call.index === 20 && call.applied === 40)).toBe(true);
+    // The height is set (state 21) but this render, and its captured props, still hold 0.
+    expect(h.setStateCalls.some((call) => call.index === 21 && call.applied === 40)).toBe(true);
     onAnchorReady(messageId, 2);
     list.scrollNode.fire("scrollend");
 
@@ -2392,7 +2405,7 @@ describe("ChatView effects (captured and run manually)", () => {
         value: false,
         expectInitial: (value) => value === true,
       });
-      h.stateSeeds.set(20, { value: 80, expectInitial: (value) => value === 0 });
+      h.stateSeeds.set(21, { value: 80, expectInitial: (value) => value === 0 });
       renderServerRoute();
       const timeline = capturedProps("messagesTimeline");
       expect(timeline["followsEnd"], layout).toBe(false);
@@ -6963,17 +6976,26 @@ describe("ChatView checkpoint revert", () => {
     seedConnectedServerThread(threadWithTurn());
   }
 
-  it("confirms and reverts to the checkpoint for a user message", async () => {
-    seedRevertContext();
-    const confirms: string[] = [];
-    h.localApi = {
-      dialogs: {
-        confirm: (message: string) => {
-          confirms.push(message);
-          return Promise.resolve(true);
-        },
+  function pendingRevertFixture(siblingChangesToken: string | null = null) {
+    return {
+      environmentId,
+      threadId,
+      turnCount: 2,
+      model: {
+        title: "Revert",
+        description: "",
+        restoredPaths: [],
+        outsideChanges: [],
+        actions: [],
+        dismissLabel: "Cancel",
+        siblingChangesToken,
       },
     };
+  }
+
+  it("opens the revert dialog for a user message instead of reverting", async () => {
+    seedRevertContext();
+    h.localApi = {};
     renderServerRoute();
 
     const timeline = capturedProps("messagesTimeline");
@@ -6988,26 +7010,42 @@ describe("ChatView checkpoint revert", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(confirms).toHaveLength(1);
-    const revertCalls = commandCallsFor("thread.revertCheckpoint");
-    expect(revertCalls).toHaveLength(1);
-    expect((revertCalls[0]!.input as { input: { turnCount: number } }).input.turnCount).toBe(2);
+    expect(commandCallsFor("thread.revertCheckpoint")).toHaveLength(0);
+    const opened = setStateCallsFor("pendingRevert");
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.applied).toMatchObject({ environmentId, threadId, turnCount: 2 });
   });
 
-  it("does not revert when the confirmation is declined", async () => {
+  it("reverts to the checkpoint the dialog was opened for when a mode is chosen", async () => {
     seedRevertContext();
-    h.localApi = {
-      dialogs: { confirm: () => Promise.resolve(false) },
-    };
+    seedHostState("pendingRevert", pendingRevertFixture("token-1"));
     renderServerRoute();
 
-    const timeline = capturedProps("messagesTimeline");
-    (timeline["onRevertUserMessage"] as (messageId: MessageId) => void)(userMessageId);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    const dialog = capturedProps("revertCheckpointDialog");
+    expect(dialog["model"]).toMatchObject({ siblingChangesToken: "token-1" });
+    await (dialog["onChoose"] as (mode: "full" | "conversationOnly") => Promise<void>)(
+      "conversationOnly",
+    );
+
+    const revertCalls = commandCallsFor("thread.revertCheckpoint");
+    expect(revertCalls).toHaveLength(1);
+    expect((revertCalls[0]!.input as { input: unknown }).input).toEqual({
+      threadId,
+      turnCount: 2,
+      mode: "conversationOnly",
+      siblingChangesToken: "token-1",
+    });
+  });
+
+  it("does not revert when the dialog is dismissed", () => {
+    seedRevertContext();
+    seedHostState("pendingRevert", pendingRevertFixture());
+    renderServerRoute();
+
+    (capturedProps("revertCheckpointDialog")["onDismiss"] as () => void)();
 
     expect(commandCallsFor("thread.revertCheckpoint")).toHaveLength(0);
+    expect(setStateCallsFor("pendingRevert").at(-1)!.applied).toBeNull();
   });
 
   it("blocks reverting while the environment is unavailable", async () => {
@@ -7041,16 +7079,14 @@ describe("ChatView checkpoint revert", () => {
 
   it("surfaces revert failures on the thread", async () => {
     seedRevertContext();
-    h.localApi = { dialogs: { confirm: () => Promise.resolve(true) } };
+    seedHostState("pendingRevert", pendingRevertFixture());
     h.commandResults["thread.revertCheckpoint"] = () =>
       AsyncResult.failure(Cause.fail(new Error("revert refused")));
     renderServerRoute();
 
-    const timeline = capturedProps("messagesTimeline");
-    (timeline["onRevertUserMessage"] as (messageId: MessageId) => void)(userMessageId);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await (capturedProps("revertCheckpointDialog")["onChoose"] as (mode: "full") => Promise<void>)(
+      "full",
+    );
 
     const errorWrites = h.setStateCalls.filter(
       (call) =>
