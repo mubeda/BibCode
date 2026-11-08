@@ -75,7 +75,7 @@ When a parsed GitLab detail has `uses_needs == true`, `GitLabHost::detail`
 fills each job's `scheduling` and `needs` from a per-pipeline map:
 
 1. Look up `(lowercased host, repository, pipeline_id)` in a bounded in-memory
-   cache on the GitLab host (64 pipelines, oldest evicted first). A hit costs
+   cache on the GitLab host (the 64 most recently used pipelines). A hit costs
    no host call.
 2. On a miss, send `PipelinesGitLabNeeds`:
    `project(fullPath) { pipeline(id) { jobs(first: 50, after) { pageInfo
@@ -103,13 +103,13 @@ commit is out of scope.
 
 ### Failure modes
 
-| Case                                                              | Behavior                                                                                                                            |
-| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Needs read fails (network, 5xx, invalid answer, rate limited)     | The detail returns with both fields `None` on every job; `tracing::warn!` names the operation; not cached, so a later read retries. |
-| GitLab refuses a field (`Field doesn't exist`, an older GitLab)   | Same, and the host joins a "no needs read" set for the process lifetime, as `pipelines_baseline` does for list fields.              |
-| Cancelled                                                         | Propagates like every other pipelines read.                                                                                         |
-| Page cap reached with displayed jobs missing                      | Those jobs stay unknown; the rest are filled.                                                                                       |
-| A need names a job not displayed (optional need, truncated group) | Kept as text; layering ignores it.                                                                                                  |
+| Case                                                                                                                 | Behavior                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Needs read fails (network, 5xx, invalid answer, rate limited)                                                        | The detail returns with both fields `None` on every job; `tracing::warn!` names the operation; not cached, so a later read retries. |
+| GitLab refuses a field (`Field doesn't exist`, an older GitLab; `glab` exits nonzero, so its body or stderr is read) | Same, and the host joins a "no needs read" set for the process lifetime, as `pipelines_baseline` does for list fields.              |
+| Cancelled                                                                                                            | Propagates like every other pipelines read.                                                                                         |
+| Page cap reached with displayed jobs missing                                                                         | Those jobs stay unknown; the rest are filled.                                                                                       |
+| A need names a job not displayed (optional need, truncated group)                                                    | Kept as text; layering ignores it.                                                                                                  |
 
 ## Web rendering
 
@@ -120,7 +120,8 @@ commit is out of scope.
   older servers, stored rows without the fields, and pipelines without `needs`
   never show it.
 - **Job dependencies** reuses `PipelineStageColumns` with pseudo-stages built
-  by a pure function in `pipelineDetail.logic.ts`. A job's layer:
+  by a pure function in `pipelineDetail.logic.ts`, job by job; a parallel group
+  whose jobs land in different layers is split across them. A job's layer:
   - `dag`: 0 with no displayed needs, otherwise one more than the highest layer
     of the displayed jobs it needs;
   - `stage` or unknown: one more than the highest layer of every job in the

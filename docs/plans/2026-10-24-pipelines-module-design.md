@@ -1272,14 +1272,17 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   and null when unknown. `GitLabHost::detail` reads them with a separate
   `PipelinesGitLabNeeds` query, paged until every displayed job is found
   (at most 40 pages of 50), once per pipeline: an in-memory cache keyed by
-  lowercased host, repository and pipeline id holds 64 pipelines, so poller
-  ticks add no reads. A failed read leaves every job unknown and retries on the
-  next read; a GitLab without the fields is not asked again. A job missing from
+  lowercased host, repository and pipeline id holds the 64 most recently used
+  pipelines, so poller ticks add no reads. A failed read leaves every job
+  unknown and retries on the next read; a GitLab without the fields (an
+  unknown-field answer, which `glab` reports with a nonzero exit) is not asked
+  again. A job missing from
   the read stays unknown. When some job's scheduling is known, a **Group jobs
   by** select (Stage, Job dependencies; `bibcode:pipelines-job-grouping`)
-  sits before **Wrap stages**. Job dependencies lays groups out in "Layer n"
-  columns: a `dag` group one layer after the latest group it needs, a `stage`
-  or unknown group one layer after every group of the earlier stages. Each job
+  sits before **Wrap stages**. Job dependencies lays jobs out in "Layer n"
+  columns: a `dag` job one layer after the latest job it needs, a `stage` or
+  unknown job one layer after every job of the earlier stages; a parallel
+  group whose jobs land in different layers is split across them. Each job
   row shows "Needs: a, b" in either grouping.
 - **Inline job log (issue #322):** on the pipeline page a plain click on a job
   row opens that job's log in a panel beside the stages
