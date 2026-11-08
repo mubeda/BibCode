@@ -814,11 +814,26 @@ export default function FileBrowserPanel({
 
   // A breadcrumb or "Show in Files" asked for a path: open its folders, select it, scroll to it.
   // Runs after the path effect above so a request that beats the entry list waits for it.
+  const listPending = entriesQuery.isPending;
+  const revalidateEntries = entriesQuery.revalidate;
+  const refreshedForRevealRef = useRef<number | null>(null);
   useEffect(() => {
-    if (revealRequest === undefined || !treeLoadedRef.current) return;
+    if (revealRequest === undefined || !treeLoadedRef.current || listPending) return;
     const target = revealRequest.path;
     const kind = entryKinds.get(target);
+    if (
+      kind === undefined &&
+      target !== "" &&
+      refreshedForRevealRef.current !== revealRequest.requestId
+    ) {
+      // The list may predate the file (just created): read it again once, and decide on that.
+      refreshedForRevealRef.current = revealRequest.requestId;
+      revalidateEntries();
+      return;
+    }
     if (kind !== undefined) {
+      // A search that hides non-matches would select the row out of sight.
+      if (model.isSearchOpen() || model.getSearchValue() !== "") model.closeSearch();
       const key = kind === "directory" ? `${target}/` : target;
       // Selecting would open a file again, and a request must not replace the Files tab.
       restoringSelectionRef.current = true;
@@ -838,7 +853,15 @@ export default function FileBrowserPanel({
       model.scrollToPath(key, { offset: "nearest", focus: true });
     }
     clearFilesReveal(threadRef, revealRequest.requestId);
-  }, [clearFilesReveal, entryKinds, model, revealRequest, threadRef]);
+  }, [
+    clearFilesReveal,
+    entryKinds,
+    listPending,
+    model,
+    revalidateEntries,
+    revealRequest,
+    threadRef,
+  ]);
 
   // A native listener: the rows live in the tree's shadow root, where React finds no fiber to
   // deliver a click to. The tree reports a selection only when it changes, so a click on the row

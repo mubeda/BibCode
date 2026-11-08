@@ -57,11 +57,17 @@ vi.mock("~/state/use-atom-query-runner", () => ({ useAtomQueryRunner: () => vi.f
 vi.mock("../ui/toast", () => ({ stackedThreadToast: vi.fn(), toastManager: { add: vi.fn() } }));
 vi.mock("./FileEntryDialog", () => ({ default: () => null }));
 vi.mock("./FileTreeContextMenu", () => ({ default: () => null }));
+// The list the mocked query serves; a test swaps it to model a refresh landing later.
+const listState = vi.hoisted(() => ({
+  entries: [] as ProjectEntry[],
+  pending: false,
+  revalidate: undefined as unknown as ReturnType<typeof import("vite-plus/test").vi.fn>,
+}));
 vi.mock("./projectFilesQueryState", () => ({
   useFileTreeEntries: () => ({
-    data: { entries, truncated: false },
-    isPending: false,
-    revalidate: vi.fn(),
+    data: { entries: listState.entries, truncated: false },
+    isPending: listState.pending,
+    revalidate: listState.revalidate,
     refresh: vi.fn(),
     error: null,
   }),
@@ -125,6 +131,9 @@ describe("FileBrowserPanel with the real tree", () => {
   beforeEach(() => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     resetFileTreeViewMemory();
+    listState.entries = entries;
+    listState.pending = false;
+    listState.revalidate = vi.fn();
     useRightPanelStore.setState({ byThreadKey: {}, filesReveal: {} });
     onOpenFile.mockReset();
     container = document.createElement("div");
@@ -224,5 +233,71 @@ describe("FileBrowserPanel with the real tree", () => {
     expect(row("docs/readme.md")!.getAttribute("data-item-selected")).not.toBeNull();
     expect(row("src/b.ts")!.getAttribute("data-item-selected")).toBeNull();
     expect(useRightPanelStore.getState().filesReveal).toEqual({});
+  });
+
+  it("keeps a request for a file the list does not have yet, and selects it once a refresh brings it", async () => {
+    await mount();
+    const created = [...entries, { path: "src/new.ts", kind: "file" } as ProjectEntry];
+
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "src/new.ts"));
+    await settle();
+    // Not in the list: ask for a fresh one, and keep the request while it is on its way.
+    expect(listState.revalidate).toHaveBeenCalledTimes(1);
+    expect(useRightPanelStore.getState().filesReveal).not.toEqual({});
+
+    listState.entries = created;
+    await mount();
+    expect(row("src/new.ts")!.getAttribute("data-item-selected")).not.toBeNull();
+    expect(useRightPanelStore.getState().filesReveal).toEqual({});
+  });
+
+  it("drops a request whose path a fresh list still lacks, after one refresh", async () => {
+    await mount();
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "gone.ts"));
+    await settle();
+    expect(listState.revalidate).toHaveBeenCalledTimes(1);
+
+    // The refresh lands with the same entries.
+    listState.entries = [...entries];
+    await mount();
+    expect(useRightPanelStore.getState().filesReveal).toEqual({});
+    expect(listState.revalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits while the list is pending instead of consuming the request", async () => {
+    listState.pending = true;
+    await mount();
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "src/a.ts"));
+    await settle();
+    expect(useRightPanelStore.getState().filesReveal).not.toEqual({});
+    expect(listState.revalidate).not.toHaveBeenCalled();
+
+    listState.pending = false;
+    await mount();
+    expect(row("src/a.ts")!.getAttribute("data-item-selected")).not.toBeNull();
+  });
+
+  it("clears an active search so a revealed path that does not match is visible", async () => {
+    await mount();
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>("[aria-label='Search workspace files']")!.click(),
+    );
+    await settle();
+    const input = container
+      .querySelector("file-tree-container")!
+      .shadowRoot!.querySelector<HTMLInputElement>("input");
+    expect(input, "search input").not.toBeNull();
+    await act(async () => {
+      input!.value = "readme";
+      input!.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    });
+    await settle();
+    expect(row("src/")).toBeNull();
+
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "src/a.ts"));
+    await settle();
+
+    expect(row("src/a.ts")).not.toBeNull();
+    expect(row("src/a.ts")!.getAttribute("data-item-selected")).not.toBeNull();
   });
 });
