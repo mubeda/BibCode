@@ -3077,31 +3077,53 @@ mod tests {
     static COMPILED_CURSOR_UPDATE_FIXTURE: OnceCell<CompiledCursorUpdateFixture> =
         OnceCell::const_new();
 
+    /// Runs the fixture, relaunching a run that has not finished in 10 s. Under load, macOS can
+    /// leave the exec of a freshly copied binary launched-suspended for good: the process never
+    /// runs its first instruction (`vmmap` reports it launched-suspended), and only a new launch
+    /// gets past it (#329). Every fixture command is idempotent, so a relaunch is safe.
     async fn run_compiled_cursor_update_fixture(
         executable: &Path,
         argument: &str,
     ) -> std::io::Result<std::process::Output> {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                match tokio::process::Command::new(executable)
-                    .arg(argument)
-                    .output()
-                    .await
-                {
-                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = tokio::time::timeout_at(deadline, async {
+                loop {
+                    match tokio::process::Command::new(executable)
+                        .arg(argument)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                    {
+                        Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        result => return result,
                     }
-                    result => return result,
+                }
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "compiled Cursor update fixture did not become executable",
+                )
+            })??;
+            let attempt = tokio::time::Instant::now() + Duration::from_secs(10);
+            match tokio::time::timeout_at(attempt.min(deadline), child.wait_with_output()).await {
+                Ok(output) => return output,
+                // Dropping the unfinished wait kills the child.
+                Err(_) if tokio::time::Instant::now() < deadline => {}
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "compiled Cursor update fixture did not finish",
+                    ));
                 }
             }
-        })
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "compiled Cursor update fixture did not become executable",
-            )
-        })?
+        }
     }
 
     async fn compiled_cursor_update_fixture() -> &'static CompiledCursorUpdateFixture {
@@ -3286,14 +3308,25 @@ mod tests {
         .await;
         let log = stub_state.join("probe-log");
         std::fs::write(&log, "").expect("probe log");
-        std::fs::write(stub_state.join("probe-delay"), "1").expect("probe delay");
+        // Each probe logs its start, then waits for the other's before it logs its end. Probes
+        // that overlap end as soon as both have started, however late a loaded host starts the
+        // second (#329); serial probes give up after about 5 s, inside the 10 s probe timeout,
+        // and log start, end, start, end.
+        let rendezvous = format!(
+            "echo start >> '{log}'\n\
+             n=0\n\
+             while [ $n -lt 50 ]; do\n\
+             c=0; while read -r line; do [ \"$line\" = start ] && c=$((c + 1)); done < '{log}'\n\
+             [ $c -ge 2 ] && break\n\
+             sleep 0.1; n=$((n + 1))\n\
+             done\n\
+             echo end >> '{log}'\n",
+            log = log.display()
+        );
+        std::fs::write(stub_state.join("probe-hook"), &rendezvous).expect("probe hook");
         let provider = sandbox.executable_script(
-            "slow-opencode",
-            &format!(
-                "case \"$1\" in --version) echo start >> '{log}'; sleep 1; echo end >> '{log}'; \
-                 echo 1.0.0;; esac",
-                log = log.display()
-            ),
+            "overlapping-opencode",
+            &format!("case \"$1\" in --version) {rendezvous}echo 1.0.0;; esac"),
             "",
         );
         let mut settings = control.settings.read().await.clone();
@@ -3630,7 +3663,9 @@ mod tests {
             payload.clone(),
             CancellationToken::new(),
         ));
-        let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+        // A hang guard, not a timing assertion (#329): a loaded host can start the child seconds
+        // late, and discovery's own 10 s probe timeout ends it before this bound anyway.
+        let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await
                     && let Ok(pid) = raw.parse()
