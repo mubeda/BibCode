@@ -2842,19 +2842,23 @@ async fn captured_in(
     thread: &str,
     turn_count: i64,
 ) -> crate::persistence::ProjectionCheckpoint {
+    let last = std::sync::Mutex::new(None);
     timeout(WAKE_WAIT, async {
         loop {
-            if let Some(checkpoint) = checkpoint_in(engine, thread, turn_count)
-                .await
-                .filter(|checkpoint| checkpoint.status == "ready")
-            {
-                return checkpoint;
+            let checkpoint = checkpoint_in(engine, thread, turn_count).await;
+            if let Some(checkpoint) = checkpoint.as_ref().filter(|c| c.status == "ready") {
+                return checkpoint.clone();
             }
+            // A capture that failed (`error`) is a product signal, not a slow host.
+            *last.lock().unwrap() = checkpoint;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{thread}'s turn {turn_count} is never captured"))
+    .unwrap_or_else(|_| {
+        let last = last.lock().unwrap();
+        panic!("{thread}'s turn {turn_count} is never captured; last record: {last:?}")
+    })
 }
 
 /// Waits for a `checkpoint.capture.failed` activity of `turn_id` on thread `t`.
@@ -3247,17 +3251,27 @@ async fn reverts_past_the_preparation_bound_restore_in_request_order_before_late
     quiet(&mut routes).await;
 
     callbacks.release.add_permits(1);
-    timeout(WAKE_WAIT, async {
-        let mut reverted = 0;
-        while reverted < THREADS.len() {
-            let event = events.recv().await.unwrap();
-            if event.event.event_type == "thread.reverted" {
-                reverted += 1;
+    // Each revert runs Git several times, so on a loaded host the five together can outlast one
+    // WAKE_WAIT. Each must follow the last within it instead, and a failed revert fails at once.
+    for reverted in 1..=THREADS.len() {
+        timeout(WAKE_WAIT, async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let activity = &event.event.payload["activity"];
+                match event.event.event_type.as_str() {
+                    "thread.reverted" => return,
+                    "thread.activity-appended"
+                        if activity["kind"] == "checkpoint.revert.failed" =>
+                    {
+                        panic!("a revert failed: {}", activity["payload"]["detail"])
+                    }
+                    _ => {}
+                }
             }
-        }
-    })
-    .await
-    .expect("every revert is recorded");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("revert {reverted} of {} is never recorded", THREADS.len()));
+    }
     received(&mut routes, "e-after").await;
 
     assert_eq!(
