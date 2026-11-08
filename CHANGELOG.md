@@ -6,7 +6,7 @@
 
 - A file restore in a checkout that other chats share is refused while one of them is writing, warns about their changes before restoring, and holds their turns from planning to completion. **Rewind conversation only** rewinds a chat without touching the working tree. (#279)
 - A restore can proceed beside a chat on an external OpenCode 2 server you mark **Only BiBCode uses this server**; BiBCode refuses if it sees that server working. (#326)
-- Every BiBCode Git call uses a curated system Git configuration: checkpoints run no system hooks, filters or textconv, LFS files restore and check out with real content, and background fetches never open a credential window. On Windows, clones and checkpoints use Git-for-Windows-safe null paths. (#283, #264)
+- BiBCode's Git calls read only a curated set of system Git settings (line endings, symlinks, a recognized Git LFS filter, known credential helpers, TLS settings), so checkpoints run no system hooks, other filters or textconv, LFS files restore and check out with real content, and background fetches never open a credential window. When the system configuration cannot be read or holds an unrecognized LFS setup, checkpoints fall back to inheriting it as before. On Windows, clones and checkpoints use Git-for-Windows-safe null paths. (#283, #264)
 - On the desktop app, a Git Manager or Source Control fetch, pull or push that needs Git Credential Manager offers a sign-in for the named destination, capped at 10 minutes. Source Control pull and push can be cancelled. (#325)
 
 ### MCP and access
