@@ -1,7 +1,6 @@
 # Git Manager Sign-In on a Local Desktop
 
-Status: Approved 2026-11-07 (Mauro pre-approval; Codex reviewed revision 0, advisor
-reviewed revision 1).
+Status: Proposed — awaiting coordinator confirmation.
 
 Issue #325, a follow-up of #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md),
@@ -14,6 +13,11 @@ answers the first Codex review. The retry inside the operation is gone: a person
 approves a sign-in that names the remote and its host, and the sign-in runs as its own
 short Git command outside every lock, capped at 10 minutes. See
 [Review findings and resolutions](#review-findings-and-resolutions).
+
+**Revision 2 (2026-11-07)** answers the Codex review of revision 1. The GCM line is an
+untrusted hint; the destination is frozen at failure time, the sign-in probe runs where no
+URL rewrite can apply, and every resumed request is bound to the approved destination. A
+branch delete resumes its remote step only.
 
 ## Goal
 
@@ -51,19 +55,22 @@ Design decisions:
    `force-push`, `tag-push`, `remote-branch-delete` and `branch-delete` with
    `deleteRemote`; Source Control `vcs.pull` and the push step of `git.runStackedAction`.
 4. **Operations never prompt.** Every operation keeps today's non-interactive environment.
-   When it fails, and Git's stderr has a line that starts with GCM's refusal, an eligible
-   operation fails with a new `sign-in-required` outcome that names the remote, its URL
-   host and the direction (fetch or push). Nothing is retried automatically.
+   When it fails, and Git's stderr has a line that starts with GCM's refusal (an untrusted
+   hint), an eligible operation fails with a new `sign-in-required` outcome that names the
+   remote, its frozen effective URL and the direction (fetch or push). Nothing is retried
+   automatically.
 5. **The person approves a named destination.** The panel asks "Sign in to
    `github.com/owner/repo` for remote `origin`?". Only a click on Sign in starts the
    sign-in.
 6. **The sign-in is its own command.** A new unary RPC, `git.signIn`, runs one short Git
    command against the approved URL with `GCM_INTERACTIVE` left unset: `git ls-remote` for
-   fetch, `git push --dry-run` for push. Git stores the credential when that request
+   fetch, `git push --dry-run` for push. It runs in an empty BiBCode-owned repository and
+   refuses when a URL rewrite could change the destination. Git stores the credential when that request
    authenticates. It holds no project lock and no status mutation guard. It is capped at
    10 minutes (M2). One sign-in runs at a time per server.
-7. **Then the operation runs again, non-interactively.** After a successful sign-in the
-   panel reruns the original operation, which now finds the stored credential.
+7. **Then the operation resumes, non-interactively.** After a successful sign-in the
+   panel sends the resume request the failure named, bound to the approved destination.
+   It now finds the stored credential.
 
 ## Current behaviour
 
@@ -190,9 +197,11 @@ Sources: GCM at tag v3.0.2 (2026-10-26) and Git at v2.51.0. Base URLs:
 Only GCM reads `GCM_INTERACTIVE`. For every other helper this design changes nothing: the
 sign-in offer appears only after GCM's own refusal line.
 
-Git copies the remote's sideband messages to stderr with a `remote: ` prefix on every line
-(`sideband.c` L180-220 at v2.51.0, reported by the Codex review), so a remote can print any
-text, including GCM's message, but never at the start of a line.
+Git copies the remote's band-2 sideband messages to stderr with a `remote: ` prefix on
+every line ([`sideband.c` L180-220](https://github.com/git/git/blob/v2.51.0/sideband.c#L180-L220)),
+but its band-3 error path prefixes the payload once
+([L170-178](https://github.com/git/git/blob/v2.51.0/sideband.c#L170-L178)). A remote can
+therefore put any text, including GCM's message, at the start of a stderr line.
 
 SSH remotes stay out of scope. `SSH_ASKPASS_REQUIRE=never` blocks the askpass dialog, but
 `ssh` still reads a key passphrase from `/dev/tty` when the server has one
@@ -200,14 +209,14 @@ SSH remotes stay out of scope. `SSH_ASKPASS_REQUIRE=never` blocks the askpass di
 
 ## Alternatives
 
-| Option                                                                                                                                                                                                                                                               | For                                                                                                                                                                                               | Against                                                                                                                                                                                                                                                    |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| (A) Status quo: never prompt (#283 decision B)                                                                                                                                                                                                                       | No change.                                                                                                                                                                                        | The person must sign in with their own Git first; the issue rejects this.                                                                                                                                                                                  |
-| (B) Relax `GCM_INTERACTIVE` on the first attempt of an eligible call                                                                                                                                                                                                 | One process per operation.                                                                                                                                                                        | The UI cannot tell a sign-in wait from a slow transfer, and the sign-in would hold the project lock and the status gate. A helper that is not GCM gains nothing.                                                                                           |
-| (C) Revision 0: retry the operation inside its lock when stderr contains GCM's message                                                                                                                                                                               | No new RPC.                                                                                                                                                                                       | A remote can print the message through sideband text and force a second push. The sign-in holds the project lock and the status mutation guard, so status reads stop. A 10-minute cap (M2) on the whole retry would also cut long transfers after sign-in. |
-| **(D) recommended:** the operation fails with `sign-in-required` on a line-anchored GCM refusal; the person approves the named destination; `git.signIn` runs a short authenticating command outside every lock with a 10-minute cap; the panel reruns the operation | The cap measures the sign-in alone. No lock or status gate is held while a window is open. The person sees where they sign in before anything opens. A stored credential never reaches this path. | A new RPC, a new outcome and one approval click. A sign-in can succeed while the rerun then fails (for example a read-only token for a push); the rerun reports that as today.                                                                             |
-| (E) Sign in through `git credential fill`, then `approve`                                                                                                                                                                                                            | No probe request.                                                                                                                                                                                 | BiBCode would hold the secret in memory and pipe it between processes, and would have to reproduce Git's URL resolution (`pushurl`, `insteadOf`, `credential.useHttpPath`).                                                                                |
-| (F) A BiBCode askpass dialog for every helper                                                                                                                                                                                                                        | `osxkeychain` users could sign in too.                                                                                                                                                            | Rejected by Mauro (M3).                                                                                                                                                                                                                                    |
+| Option                                                                                                                                                                                                                                                                                              | For                                                                                                                                                                                               | Against                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (A) Status quo: never prompt (#283 decision B)                                                                                                                                                                                                                                                      | No change.                                                                                                                                                                                        | The person must sign in with their own Git first; the issue rejects this.                                                                                                                                                                                  |
+| (B) Relax `GCM_INTERACTIVE` on the first attempt of an eligible call                                                                                                                                                                                                                                | One process per operation.                                                                                                                                                                        | The UI cannot tell a sign-in wait from a slow transfer, and the sign-in would hold the project lock and the status gate. A helper that is not GCM gains nothing.                                                                                           |
+| (C) Revision 0: retry the operation inside its lock when stderr contains GCM's message                                                                                                                                                                                                              | No new RPC.                                                                                                                                                                                       | A remote can print the message through sideband text and force a second push. The sign-in holds the project lock and the status mutation guard, so status reads stop. A 10-minute cap (M2) on the whole retry would also cut long transfers after sign-in. |
+| **(D) recommended:** the operation fails with `sign-in-required` on a line-anchored GCM refusal; the person approves the named destination; `git.signIn` runs a short authenticating command outside every lock with a 10-minute cap; the panel sends the resume request, bound to that destination | The cap measures the sign-in alone. No lock or status gate is held while a window is open. The person sees where they sign in before anything opens. A stored credential never reaches this path. | A new RPC, a new outcome and one approval click. A sign-in can succeed while the rerun then fails (for example a read-only token for a push); the rerun reports that as today.                                                                             |
+| (E) Sign in through `git credential fill`, then `approve`                                                                                                                                                                                                                                           | No probe request.                                                                                                                                                                                 | BiBCode would hold the secret in memory and pipe it between processes, and would have to reproduce Git's URL resolution (`pushurl`, `insteadOf`, `credential.useHttpPath`).                                                                                |
+| (F) A BiBCode askpass dialog for every helper                                                                                                                                                                                                                                                       | `osxkeychain` users could sign in too.                                                                                                                                                            | Rejected by Mauro (M3).                                                                                                                                                                                                                                    |
 
 Eligibility alternatives:
 
@@ -250,27 +259,81 @@ message or a focus request only (`packages/contracts/src/uiIntents.ts:94`).
 
 ### Detecting that GCM needs the person
 
-An eligible operation's network command runs as today. It reports `sign-in-required` only
-when all of these hold:
+The trigger is an untrusted hint. It decides only whether the panel offers a sign-in.
+Every security property rests on eligibility, the person's approval of a frozen
+destination, and the checks in [Freezing the destination](#freezing-the-destination).
+
+An eligible operation's network command runs as today. It reports `sign-in-required` when
+all of these hold:
 
 1. It exited non-zero and was not cancelled.
 2. A line of its stderr starts with GCM's refusal,
    `fatal: Cannot prompt because user interactivity has been disabled.`, compared without
-   case after stripping a trailing `\r`. Remote sideband lines start with `remote: `, so a remote cannot produce this line. GCM writes
-   it to the stderr it shares with Git.
-3. The remote's URL in the operation's direction, read with `git remote get-url <remote>`
-   (fetch) or `git remote get-url --push <remote>` (push), which apply `insteadOf` and
-   `pushInsteadOf`, parses as an `https://` URL. Its user name and password parts are
-   dropped. Any other scheme, including SSH and `http://`, reports today's authentication
-   error.
+   case after stripping a trailing `\r`.
+3. The remote's effective URL in the operation's direction (below) is an `https://` URL.
+   Any other scheme, including SSH and `http://`, reports today's authentication error.
 
-The outcome carries `{ remote, url, host, direction }`, where `url` is the parsed URL
-without user information. Operations with several remote steps (a branch delete with
-`deleteRemote`) report it for the step that failed.
+A remote can forge the line. Band-2 sideband text gets a `remote: ` prefix on every line,
+but Git's band-3 error path adds the prefix only once before the whole payload
+([`sideband.c` L170-178](https://github.com/git/git/blob/v2.51.0/sideband.c#L170-L178)), so
+a payload `error\nfatal: Cannot prompt because user interactivity has been disabled.`
+puts the line at column 0. A local hook can print it too. A forged hint can only make the
+approval appear. That approval names the frozen destination BiBCode resolved, which the
+remote does not choose, and the person can answer Not now. The sign-in that follows
+contacts only that destination.
 
-A local hook (for example `pre-push`) can also print a line at column 0. That can only make
-the approval appear. The person still sees the real destination, and the sign-in that
-follows changes only `GCM_INTERACTIVE`.
+The outcome carries `{ remote, destination, host, direction, resume }`:
+
+- `destination` is the frozen effective URL without user information.
+- `resume` is the request the panel sends after a sign-in (see [Rerun](#rerun)).
+
+### Freezing the destination
+
+The effective URL is what `git remote get-url <remote>` (fetch) or
+`git remote get-url --push <remote>` (push) prints. Git expands `url.<base>.insteadOf` and
+`url.<base>.pushInsteadOf` there
+([git-remote](https://git-scm.com/docs/git-remote#Documentation/git-remote.txt-emget-urlem)),
+once, with the longest matching prefix
+([`remote.c` L42-66](https://github.com/git/git/blob/v2.51.0/remote.c#L42-L66)). The
+value is the one the operation's own network step uses, because both read the same
+remote. Its user name and password parts are dropped before it is shown or stored.
+
+A URL passed to Git as an argument is rewritten again: `remote_get` turns an unknown name
+into an anonymous remote through `add_url_alias`
+([`remote.c` L799](https://github.com/git/git/blob/v2.51.0/remote.c#L799)), which applies
+`insteadOf` and then `pushInsteadOf` to it
+([L84-100](https://github.com/git/git/blob/v2.51.0/remote.c#L84-L100)). With rules A to B
+and B to C, `get-url` prints B and a command given B contacts C. So `git.signIn` pins the
+destination this way:
+
+1. **A neutral repository.** The probe runs in a new empty repository that BiBCode
+   creates with `git init -q` in a `0700` directory under its state directory and removes
+   afterwards. The checkout's repository configuration, which an agent working there can
+   edit, does not apply. Only the person's global configuration and the curated system
+   file from #283 do.
+2. **No rewrite may match.** In that repository, right before the probe, BiBCode reads
+   `git config --includes -z --get-regexp '^url\..*\.(insteadof|pushinsteadof)$'`. If any
+   value is a prefix of the destination, the sign-in is refused with
+   `GitSignInRewrittenError`: "Git rewrites this remote's address
+   (`url.<base>.insteadOf`), so BiBCode cannot show where the sign-in goes. Sign in with
+   your own Git." With no matching prefix, `alias_url` returns nothing and Git uses the
+   destination unchanged.
+3. **HTTPS only, enforced by Git.** The probe sets `GIT_ALLOW_PROTOCOL=https`, which Git
+   checks against the transport of the final URL
+   ([`transport.c` L1114-1131](https://github.com/git/git/blob/v2.51.0/transport.c#L1114-L1131)).
+4. **No redirects.** The probe adds `-c http.followRedirects=false`, so a server at the
+   destination cannot send the request, and the credential prompt, to another host
+   ([git-config `http.followRedirects`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpfollowRedirects)).
+
+What stays open: the person's global configuration (or a file it includes) could change
+between step 2 and the probe. Whoever can write that file can already set
+`credential.helper` to any program, which every BiBCode Git call then runs, so the window
+gives them nothing new.
+
+Cost: repository-level credential settings (`credential.useHttpPath`,
+`credential.<url>.*` in the checkout's `.git/config`) do not apply to the sign-in. If they
+change which credential Git looks up, the rerun asks again and the panel shows the error
+in [Rerun](#rerun).
 
 ### Approval
 
@@ -284,8 +347,8 @@ The panel shows the destination before anything opens:
 
 The text shows host and path, never user information or query. A long path is shortened
 in the middle; the host is never shortened. An agent may have rewritten the remote URL
-before the click; this is why the dialog shows the URL BiBCode resolved at failure time,
-and why `git.signIn` checks it again.
+before the click; this is why the dialog shows the destination BiBCode froze at failure
+time, and why `git.signIn` and the rerun check it again.
 
 ### `git.signIn`
 
@@ -294,33 +357,39 @@ context, and added to `is_long_running` (`diagnostics/profiler/latency.rs:106`) 
 waits on a person. It is not run in a spawned task, so an interrupt drops it and the
 supervised drop guard kills its process group or Job.
 
-Input: `{ projectId, cwd, remote, direction, url }`, where `url` is the one the person
-approved. Steps:
+Input: `{ projectId, cwd, remote, direction, destination }`, where `destination` is the one
+the person approved. Steps:
 
 1. Refuse unless `sign_in_eligible`. The error is `GitSignInUnavailableError`.
 2. Validate `cwd` as `gitManager.runOperation` does (project ownership, workspace
    admission).
-3. Resolve the remote's URL again in that direction. If it differs from `url`, refuse with
-   `GitSignInDestinationChangedError` carrying the new URL; the panel asks again.
+3. Resolve the remote's effective URL again in `cwd`. If it differs from `destination`,
+   refuse with `GitSignInDestinationChangedError` carrying the new one; the panel asks
+   again.
 4. Take the server's single sign-in slot. If another sign-in is pending, refuse with
    `GitSignInBusyError` ("Another sign-in is open. Finish or cancel it first.").
-5. Run one Git command in `cwd`, with the resolved URL as an argument, never the remote
-   name, so a URL changed after step 3 cannot redirect it:
-   - fetch: `git ls-remote <url> HEAD`, which keeps the output to one line;
-   - push: `git push --dry-run --no-verify --porcelain <url> HEAD:refs/heads/<current branch>`, or
-     `HEAD` alone on a detached head. A dry run contacts the receive-pack service, which
-     authenticates, and sends no objects. `--no-verify` keeps a `pre-push` hook from running
-     twice; the real push still runs it.
-     It runs with `git_environment()` minus its `GCM_INTERACTIVE` entry, the
+5. Create the neutral repository and run the rewrite check
+   ([Freezing the destination](#freezing-the-destination), steps 1 and 2).
+6. Run one Git command in the neutral repository, with `destination` as the URL argument:
+   - fetch: `git ls-remote <destination> HEAD`, which keeps the output to one line;
+   - push:
+     `git push --dry-run --no-verify --porcelain <destination> :refs/heads/bibcode-sign-in-<uuid>`.
+     A push connects to the receive-pack service, which
+     authenticates, before it matches refspecs, so a dry-run delete of a branch that does
+     not exist authenticates and changes nothing. It needs no local commits, so it works in
+     the empty repository. `--no-verify` keeps hooks out.
+     It runs with `git_environment()` minus its `GCM_INTERACTIVE` entry, plus
+     `GIT_ALLOW_PROTOCOL=https` and `http.followRedirects=false`, the
      `for_network_transfer()` configuration, and a 10-minute timeout instead of 24 hours.
-6. Answer `signedIn` when the command authenticated: exit 0, or a push refusal that is not
-   an authentication failure (for example non-fast-forward). Answer `failed` with the
+7. Answer `signedIn` when the command authenticated: exit 0, or a push that failed only
+   because the probe branch does not exist on the remote. Answer `failed` with the
    classified message otherwise, `timedOut` after 10 minutes, and `cancelled` on interrupt.
+   Remove the neutral repository in every case.
 
 Git sends `store` to every helper after a request authenticates, so the credential is saved
 before the probe ends. A public repository that needs no sign-in to read answers
 `signedIn` for fetch without storing anything; the rerun then succeeds without one. For
-push the dry run asks for write access, so the stored credential is the one the push needs.
+push the probe asks for write access, so the stored credential is the one the push needs.
 
 Environment of the sign-in command:
 
@@ -330,6 +399,7 @@ Environment of the sign-in command:
 | `GIT_TERMINAL_PROMPT`                 | `0`        | `0`                | Blocks Git's `/dev/tty` prompt and GCM's terminal fallback.                                                                                            |
 | `GIT_ASKPASS`, `SSH_ASKPASS`          | empty      | empty              | No askpass program.                                                                                                                                    |
 | `SSH_ASKPASS_REQUIRE`                 | `never`    | `never`            | SSH unchanged.                                                                                                                                         |
+| `GIT_ALLOW_PROTOCOL`                  | inherited  | `https`            | The final URL must be HTTPS.                                                                                                                           |
 | `GIT_CONFIG_SYSTEM`, `LC_ALL`, `LANG` | as #283    | as #283            | Same curated system file and stable messages.                                                                                                          |
 
 `git_environment()` and `prompt_guard_environment()` stay unchanged for every other caller.
@@ -337,11 +407,26 @@ The sign-in environment is one function beside them in `git/repository.rs`.
 
 ### Rerun
 
-After `signedIn`, the panel reruns the request it started: the same
-`gitManager.runOperation` payload or `vcs.pull`. A stacked action reruns without the commit
-it already made (`git_vcs.rs:3378` lists each action's phases): `commit_push` and `push`
-rerun as `push`, `commit_push_pr` and `create_pr` rerun as `create_pr` (push, then pull
-request). The rerun is an ordinary non-interactive call.
+After `signedIn`, the panel sends the outcome's `resume` request, never a request it builds
+itself:
+
+- Fetch, pull, push, publish-branch, force-push, tag-push and remote-branch-delete resume
+  as the same request.
+- A branch delete with `deleteRemote` already deleted the local branch before its remote
+  step failed (`operations.rs:1299-1329`). It resumes as `remote-branch-delete` with the
+  remote and remote branch of that failed step.
+- `vcs.pull` resumes as `vcs.pull`.
+- A stacked action resumes without the commit it already made (`git_vcs.rs:3378` lists
+  each action's phases): `commit_push` and `push` resume as `push`, `commit_push_pr` and
+  `create_pr` as `create_pr` (push, then pull request).
+
+Every resume request carries `expectedDestination`, the approved destination. Right before
+its network step, the operation resolves the remote's effective URL in its direction, under
+the project lock and status guard it already holds, and fails with
+`destination-changed` if it differs. The field can only add a refusal, so any caller may
+send it. The resumed call is an ordinary non-interactive call, so a configuration change
+racing that check can only send a non-interactive request elsewhere, as any operation
+can today; it can never open a prompt.
 If it reports `sign-in-required` again, the panel shows the error "Signed in, but Git
 Credential Manager still asked to sign in. Sign in with your own Git, then try again." and
 does not offer a second sign-in in a row.
@@ -406,7 +491,7 @@ bounded transfer. M5 needs one before a sign-in can be offered there.
   cancellation invariants near line 5380). That document changes in the same patch.
 - Both keep `for_bounded_transfer()` (10 minutes); Cancel is added, the bound stays.
 - **Sign-in.** On an eligible session both report `sign-in-required` the same way:
-  `vcs.pull` as a typed error `GitSignInRequiredError { remote, url, host, direction }`,
+  `vcs.pull` as a typed error `GitSignInRequiredError { remote, destination, host, direction, resume }`,
   the stacked action as an optional `signIn` object on `action_failed`. The panel shows
   the same approval and calls the same `git.signIn`.
 
@@ -432,11 +517,11 @@ bounded transfer. M5 needs one before a sign-in can be offered there.
 Contracts (`packages/contracts`):
 
 - The existing `failed` event of `GitManagerOperationEvent` uses code `sign-in-required`
-  and gains an optional `signIn { remote, url, host, direction }` object, the same shape as
+  and gains an optional `signIn { remote, destination, host, direction, resume }` object, the same shape as
   on `action_failed`. `StreamSchema` needs no change. Only the in-process server sends it,
   to the desktop app's own WebView, which ships in the same build.
 - `vcs.pull` gains `GitSignInRequiredError`; `action_failed` gains an optional `signIn`.
-- `git.signIn` input and result schemas, and its three errors. Its client command sets no
+- `git.signIn` input and result schemas, and its four errors. Its client command sets no
   `timeoutMs` (`packages/client-runtime/src/state/runtime.ts:925`), so the server's
   10-minute cap decides, as for `vcs.pull`.
 
@@ -463,11 +548,14 @@ The implementation is reviewed against `UI.md` and `vercel-react-best-practices`
   `git.signIn` among its methods.
 - No prompt is reachable from a remote client: paired sessions have their own subjects, and
   remote and WSL servers never set the flag.
-- A remote cannot trigger the offer: its sideband text never starts a stderr line.
+- A remote or a local hook can forge the hint. That only shows an approval naming the
+  frozen destination, which the person can decline.
 - An agent that rewrites a remote URL cannot redirect an approved sign-in: the dialog shows
-  the resolved URL, `git.signIn` compares it again, and the command uses the URL string,
-  not the remote name.
-- Only `https://` destinations get a sign-in.
+  the frozen destination, `git.signIn` compares it again, and the probe runs in a neutral
+  repository where no `insteadOf` or `pushInsteadOf` value matches it, with redirects off.
+- A resumed operation refuses a destination that changed since the approval.
+- Only `https://` destinations get a sign-in, and `GIT_ALLOW_PROTOCOL=https` enforces it
+  on the final URL.
 - The desktop bootstrap credential stays in the desktop process. The implementer confirms
   that no spawned process (terminals, providers, Git) receives it in its environment; this
   design does not change that.
@@ -489,19 +577,29 @@ Rust, `apps/server`:
 2. Detection: a recording runner returns GCM's refusal line for fetch, pull, push,
    publish-branch, force-push, tag-push, remote-branch-delete and branch-delete with
    `deleteRemote`. With `OfferSignIn` and an `https://` remote each fails with
-   `sign-in-required` carrying remote, URL without user information, host and direction.
-   Exactly one network spawn, no retry.
+   `sign-in-required` carrying remote, destination without user information, host,
+   direction and `resume`. Exactly one network spawn, no retry. A branch delete's `resume`
+   is `remote-branch-delete` for the failed remote step.
 3. Detection negatives, each giving today's `authentication`: the same text after
    `remote: `; an "Authentication failed" stderr without the line (osxkeychain);
-   "permission denied (publickey)"; an SSH or `http://` remote; `Never`.
+   "permission denied (publickey)"; an SSH or `http://` remote; `Never`. Forged hints from a
+   multiline band-3 payload (`remote: error` then the GCM line at column 0) and inside a
+   protocol-error message still produce `sign-in-required` only on an eligible session,
+   and its destination is the frozen effective URL, never text from stderr.
 4. `git.signIn` environment: no `GCM_INTERACTIVE`, and `GIT_TERMINAL_PROMPT=0`,
-   `GIT_ASKPASS=`, `SSH_ASKPASS=`, `SSH_ASKPASS_REQUIRE=never`; arguments are
-   `ls-remote <url> HEAD` or `push --dry-run --no-verify --porcelain <url> <refspec>` with the URL,
-   never the remote name.
+   `GIT_ASKPASS=`, `SSH_ASKPASS=`, `SSH_ASKPASS_REQUIRE=never`, `GIT_ALLOW_PROTOCOL=https`,
+   `http.followRedirects=false`; the working directory is the neutral repository; the
+   arguments are `ls-remote <destination> HEAD` or
+   `push --dry-run --no-verify --porcelain <destination> :refs/heads/bibcode-sign-in-<uuid>`,
+   never the remote name. The neutral repository is removed after every outcome.
 5. `git.signIn` refusals: ineligible session (flag off, paired principal, no principal, MCP
-   principal with administrative scopes through `invoke_local`); URL changed since the
-   approval; a second concurrent sign-in.
-6. `git.signIn` outcomes: exit 0 and a non-fast-forward dry run answer `signedIn`; an
+   principal with administrative scopes through `invoke_local`); destination changed
+   since the approval; a second concurrent sign-in; a global `insteadOf` or
+   `pushInsteadOf` value that prefixes the destination (the A to B, B to C chain), and the
+   same value in the checkout's own `.git/config`, which the neutral repository ignores
+   and so does not refuse.
+6. `git.signIn` outcomes: exit 0 and a dry-run delete refused because the probe branch does
+   not exist answer `signedIn`; an
    authentication failure answers `failed`; a runner that never exits answers `timedOut`
    at the configured cap (the test injects a short cap) and its process is killed; an
    interrupt answers `cancelled` and kills it.
@@ -511,13 +609,16 @@ Rust, `apps/server`:
    `sign-in-required`; with the flag off, a paired principal, no principal, and an MCP
    principal through `invoke_local_stream`, the same failure is today's `authentication`
    and no `sign-in-required` is sent.
-9. Source Control: `vcs.pull` interrupted mid-transfer kills its Git process and ends with
-   the cancelled error; `git.runStackedAction` cancelled in its push phase keeps the commit
-   and sends the "Push cancelled" failure; both report `sign-in-required` on an eligible
-   session only.
-10. `ServerConfig`: `interactive_git_sign_in` is false by default, from `bibcode serve`, and
+9. Resume: each `resume` request with `expectedDestination` succeeds when the destination
+   is unchanged, and fails with `destination-changed` before any network spawn when the
+   remote's URL was changed after the approval.
+10. Source Control: `vcs.pull` interrupted mid-transfer kills its Git process and ends with
+    the cancelled error; `git.runStackedAction` cancelled in its push phase keeps the commit
+    and sends the "Push cancelled" failure; both report `sign-in-required` on an eligible
+    session only.
+11. `ServerConfig`: `interactive_git_sign_in` is false by default, from `bibcode serve`, and
     from a WSL bootstrap; `server_config_for_launch` sets it.
-11. Profiler: each `git.signIn` outcome emits one `git.signInEnded` with no remote, URL,
+12. Profiler: each `git.signIn` outcome emits one `git.signInEnded` with no remote, URL,
     host or output; `is_long_running("git.signIn")` is true.
 
 Contracts and web:
@@ -526,8 +627,9 @@ Contracts and web:
     and the `git.signIn` schemas.
 13. Git Manager and Source Control component tests: the approval names host, path and
     remote; Not now gives the authentication error; Sign in shows the waiting state with
-    Cancel; `signedIn` reruns the original request once, and a stacked action reruns as
-    `push` or `create_pr` without a second commit; a second `sign-in-required` after
+    Cancel; `signedIn` sends the outcome's `resume` request once with
+    `expectedDestination`, a stacked action resumes as `push` or `create_pr` without a
+    second commit, and a branch delete resumes as `remote-branch-delete`; a second `sign-in-required` after
     a sign-in shows the error without a new offer; the Source Control Cancel appears only while
     pulling and in the push phase.
 
@@ -586,6 +688,17 @@ found. Each finding was checked against the source.
 | P2 1 | Remote sideband text can contain GCM's message and force a retry and a misleading banner, even with only `osxkeychain`. Ask the person to approve a named destination; an agent can rewrite the URL first. | Accepted: revision 0 matched the message anywhere in stderr.                                | **Fixed.** No automatic retry. Detection needs a line starting with GCM's refusal, which sideband lines (`remote: ` prefix) cannot produce. The person approves "Sign in to host/path for remote X"; `git.signIn` re-resolves the URL, refuses if it changed, and passes the URL string to Git. Only `https://`. Tests 2, 3, 4, 5. |
 | P2 2 | An abandoned sign-in holds `begin_mutation`, which closes the status read gate and owns the mutation mutex (`status_owner.rs:507-540`); Source Control mutations take it too (`git_vcs.rs:801-843`).       | Confirmed in `begin_mutation`.                                                              | **Fixed by redesign.** The sign-in is its own RPC with no project lock and no status guard; the operation released both when it failed and revalidates on rerun. Blocked callers are listed in [Locks while a sign-in is open](#locks-while-a-sign-in-is-open); test 7.                                                            |
 | P2 3 | Cancel cannot promise nothing was stored: GCM OAuth persists refresh tokens before returning, Entra registers an MSAL cache, and a group or Job kill does not close an OS broker window.                   | Accepted; the generic provider line numbers come from the review and were not re-read here. | **Fixed.** [Cancellation and timeout](#cancellation-and-timeout) says cancel stops BiBCode's processes and the probe, not authentication, and names the browser tab and the broker window. The research section is corrected.                                                                                                      |
+
+Codex review (gpt-6.1-sol, high) of revision 1 at `832ff8488`. The desktop gates, the single
+sign-in slot and the Source Control pull cancel were confirmed. Four findings, each checked
+against Git's source at v2.51.0 and BiBCode at `c079af0048`.
+
+| #    | Finding                                                                                                                                                               | Checked                                                                                                                                                                  | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P2 4 | The line-start trigger can still be forged: band-3 sideband prefixes its payload once.                                                                                | Confirmed: `sideband.c` L170-178 adds one `remote: ` before the whole band-3 payload.                                                                                    | **Fixed by framing.** The trigger is an untrusted hint. A forged one only shows an approval naming the frozen destination, which the person can decline. Test 3 adds the multiline band-3 and protocol-error cases.                                                                                                                                                                                                                                                |
+| P2 5 | Passing the URL to `git.signIn` does not pin the destination: Git rewrites an explicit URL argument again, so A to B and B to C contacts C and can defeat HTTPS-only. | Confirmed: `remote.c` L799 sends an unknown name through `add_url_alias` (L93-100), which applies `insteadOf` and `pushInsteadOf` once with the longest prefix (L42-66). | **Fixed.** [Freezing the destination](#freezing-the-destination): the probe runs in an empty BiBCode-owned repository, refuses when any `insteadOf` or `pushInsteadOf` value prefixes the destination, sets `GIT_ALLOW_PROTOCOL=https` (`transport.c` L1114-1131) and `http.followRedirects=false`. The remaining window needs write access to the person's global Git configuration, which already allows running any program as `credential.helper`. Tests 4, 5. |
+| P2 6 | Replaying a branch delete cannot finish the remote deletion, because the local branch is already gone.                                                                | Confirmed: `operations.rs:1299-1329` deletes the local branch before the remote step.                                                                                    | **Fixed.** The failure carries `resume: remote-branch-delete` for the failed remote step. Tests 2, 13.                                                                                                                                                                                                                                                                                                                                                             |
+| P2 7 | The automatic rerun is not bound to the approved destination.                                                                                                         | Accepted: revision 1 rebuilt the request without the destination.                                                                                                        | **Fixed.** The panel sends the server-provided `resume` request with `expectedDestination`; the operation re-resolves its effective URL under its lock right before the network step and fails with `destination-changed` on any difference. Test 9.                                                                                                                                                                                                               |
 
 ## Questions only Mauro can answer
 
