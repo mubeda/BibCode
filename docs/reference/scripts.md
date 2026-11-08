@@ -71,6 +71,11 @@ state kind.
 - `vp run release:smoke`: exercise release versioning and lockfile generation.
 - `vp run check:dependency-ledger`: validate the machine-consumed dependency
   upgrade ledger.
+- `scripts/gitlab-local-test/{up,seed,pipelines,down}.sh`: a throwaway local
+  GitLab CE and runner in Docker for GitLab-dependent tests, with an isolated
+  `glab` config; see the `gitlab-local-test` skill
+  ([docs/skills/gitlab-local-test](../skills/gitlab-local-test/SKILL.md)). State and
+  credentials live in `BIBCODE_TEST_GITLAB_STATE_DIR`, outside the repository.
 - `node scripts/check-markdown-links.ts [file ...]`: check that every relative
   link, image, and `#anchor` in the given Markdown files (default `README.md`)
   points to an existing file or heading. It skips external URLs, so run a

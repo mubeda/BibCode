@@ -1,0 +1,51 @@
+# BiBCode pipelines UI test template (#285, #286, #321, #322). POSIX shell only.
+stages: [build, test, deploy]
+
+default:
+  tags: [bibcode-local]
+
+build-app:
+  stage: build
+  script: [echo "build app", sleep 5]
+
+build-docs:
+  stage: build
+  script: [echo "build docs", sleep 3]
+
+unit-tests-with-a-very-long-job-name-to-check-wrapping-and-truncation:
+  stage: test
+  needs: [build-app]
+  parallel: 2
+  script: [echo "unit shard", sleep 4]
+
+lint:
+  stage: test
+  needs: []
+  script: [echo "lint"]
+
+integration:
+  stage: test
+  script: [echo "integration (stage-scheduled)", sleep 2]
+
+deploy-preview:
+  stage: deploy
+  needs: [unit-tests-with-a-very-long-job-name-to-check-wrapping-and-truncation, build-docs]
+  script: [echo "deploy preview"]
+
+flaky-on-purpose:
+  stage: deploy
+  allow_failure: true
+  script: [echo "this job fails on purpose", exit 1]
+
+manual-gate:
+  stage: deploy
+  when: manual
+  allow_failure: true
+  script: [echo "manual gate"]
+
+# Keeps a pipeline running for ~2 minutes; only starts when BIBCODE_LONG=1 (see pipelines.sh).
+long-running:
+  stage: deploy
+  rules:
+    - if: $BIBCODE_LONG == "1"
+  script: [echo "long job start", sleep 120, echo "long job end"]
