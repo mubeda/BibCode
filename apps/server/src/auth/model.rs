@@ -277,6 +277,10 @@ pub struct ClientSessionView {
     /// server was reached on, which **Remote agents** shows when the app's own is not HTTPS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_resource: Option<String>,
+    /// The named client (#280) this outside agent's session is a run of: it keeps its
+    /// identity across runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_named_client: Option<crate::persistence::McpNamedClient>,
 }
 
 /// A remote MCP authorization waiting for a person (#139, slice R), as the **Requests to

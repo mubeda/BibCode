@@ -368,6 +368,8 @@ export const OrchestrationActor = Schema.Struct({
   kind: Schema.Literal("mcp-client"),
   clientId: TrimmedNonEmptyString,
   label: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** The named client (#280) whose run `clientId` is: its identity across runs. */
+  namedClientId: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type OrchestrationActor = typeof OrchestrationActor.Type;
 

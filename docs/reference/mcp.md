@@ -103,7 +103,7 @@ What the relay does, in order:
    on the recorded port, or a forwarder from another address, fails the proof.
 3. **Mints its own credential** on the first request, directly in the data root's store: an
    `mcp-client` session labelled `MCP · <clientInfo.name>` (the name your `initialize`
-   sends), with the scopes and ceiling described in
+   sends), or `MCP · <name>` with `--client <name>`, with the scopes and ceiling described in
    [The credential](#the-credential). The token lives only in the relay's memory: never in
    argv, the environment, a file or a log.
 4. **Relays** each request as `POST /mcp` with the bearer, and each response back as one
@@ -120,6 +120,32 @@ What the relay does, in order:
    middle of a sign-in is cleaned up only by a relay from v0.15 or later. When
    `<state>/mcp-clients/` cannot be written, the sign-in fails ("Could not record this MCP
    connection in …") and no credential is sent.
+
+### Named clients: `--client <name>`
+
+`bibcode mcp --client <name>` signs each run in as one named client, so a restarted agent
+keeps:
+
+- its `clientRequestId` retries: a retry with the same id after a restart, within 24 hours
+  of the first call, replays the stored request or recorded outcome and does not run the
+  work again;
+- the panels and threads its earlier runs opened (`send_panel_message`'s ownership rule);
+- a webhook endpoint paired with it, which stays on when a run exits.
+
+The name is trimmed and must be 1 to 60 characters with no control characters; anything
+else exits 1 before any credential exists ("Choose a client name of 1 to 60 characters with
+no control characters."). It applies to the stdio server only: with `authorize`, `call` or
+`tools` it is a usage error (exit 1). Against an older BiBCode whose store has no named
+clients, the relay exits 1 before any credential exists ("Update BiBCode to use --client:
+this server does not know named clients yet.").
+
+Each run still mints its own credential, revokes it when it exits, and is swept if it
+crashes; none of that ends the identity, and no token is stored. Two runs with one name at
+once share their retries and each has its own Authorized clients row. A person's **Revoke**
+or **Stop** on any of its rows ends the identity: every run of it is revoked, its paired
+endpoints turn off (`client-revoked`), and the next run with that name starts a new
+identity. An agent without `--client`, even one whose `clientInfo.name` matches, never joins
+a named client's scope. A named client with no run live has no Authorized clients row.
 
 Limits: one stdio line is at most 4 MiB (a longer line is skipped and answered with a
 JSON-RPC parse error); connecting times out after 5 s and one request after 120 s (longer
@@ -225,7 +251,8 @@ and signs in as `bibcode mcp` does, with its own credential labelled
 
 Each run mints a new credential, but every `bibcode thread` run shares one `clientRequestId`
 scope, so the `--request-id` retry above works across runs. Only the "thread this agent
-opened or last drove" rule of `send_panel_message` does not carry over between runs.
+opened or last drove" rule of `send_panel_message` does not carry over between runs (it does
+for a [named client](#named-clients---client-name)).
 
 ### One tool from a shell: `bibcode mcp call` and `bibcode mcp tools`
 
@@ -620,7 +647,8 @@ It never holds `access:read`, `access:write`, `relay:*`, `review:write` or
 `diagnostics:read`, so an agent cannot change settings, manage clients or webhooks, pair
 devices or reach the relay. The credential is accepted only on `/mcp`. Each running relay
 shows as one row in **Settings → Agents → Agent integrations → Authorized clients**
-(`MCP · <agent name>`), and that row's **Revoke** ends it.
+(`MCP · <agent name>`), and that row's **Revoke** ends it. For a
+[named client](#named-clients---client-name) it ends the identity and every run of it.
 
 ### Access levels
 
@@ -788,8 +816,9 @@ Codex stops a tool call after 60 seconds by default, which is why one wait lasts
 ### Retries and `clientRequestId`
 
 A tool that changes something takes an optional `clientRequestId` when a repeat could do
-the work twice. It is a string you choose, 1 to 256 characters, kept per credential for 24
-hours. A tool works in one of three ways; each tool's **Retries** line says which:
+the work twice. It is a string you choose, 1 to 256 characters, kept for 24 hours per
+credential, or per [named client](#named-clients---client-name) across its runs. A tool
+works in one of three ways; each tool's **Retries** line says which:
 
 - **Receipt-backed** (thread, worktree, approval and panel tools). The first call stores the
   engine commands it builds; a retry with the same id dispatches those same commands, and
@@ -813,7 +842,8 @@ Rules for both keyed kinds:
 - The same id with any different argument is `idempotency_conflict`. Use a new id for a new
   request.
 - The id is bound to the credential: another connection, or a new `bibcode mcp` process,
-  does not see it.
+  does not see it. A run of the same named client (`--client`) does, and so does every
+  `bibcode thread` run.
 - A call cancelled while its keyed work goes on answers `McpCancelledError`; call again with
   the same id to get the outcome.
 - After 24 hours the id starts a new request.
@@ -972,7 +1002,9 @@ indicator, or **Agents** in Agent integrations):
   `McpOutcomeUnknownError`, `reason: "revoked"`), and interrupts each running turn that the
   agent's own message started. The agent's next call fails: over stdio
   `McpCredentialRefusedError`, over HTTP a 401. Restarting its MCP server signs in again,
-  which the person may then revoke.
+  which the person may then revoke. For a named client, Stop on any of its rows (also the
+  row of an earlier run that exited) ends the identity: it revokes every run and interrupts
+  the turns each run started.
 - **Take over** makes the agent read-only without revoking it: reads still work, every
   change is refused with `McpAccessCeilingError` ("A person took over this agent; it is
   read-only until they hand it back."), owned work stops (`reason: "revoked"`), and an
@@ -1373,7 +1405,7 @@ Starts a new thread in a project with a first prompt and returns its `threadId` 
 | `interactionMode`    | string | no       | `default` or `plan`; default `default`                                                             | Plan mode makes the provider plan before acting.                                                              |
 | `attachments`        | array  | no       | see Attachments below                                                                              | Files for the provider.                                                                                       |
 | `purpose`            | string | no       | at most 200 characters                                                                             | See family rules.                                                                                             |
-| `clientRequestId`    | string | no       | 1 to 256 characters; remembered 24 hours per MCP connection                                        | Retry id.                                                                                                     |
+| `clientRequestId`    | string | no       | 1 to 256 characters; remembered 24 hours per MCP connection, or per named client                   | Retry id.                                                                                                     |
 
 **Attachments** (the same for `send_message`): an array of at most 8 objects `{ name, mimeType, data }`, all three non-empty strings and no other keys. `data` is base64. `mimeType` is lowercased; `image/png`, `image/jpeg`, `image/gif` and `image/webp` are sent as images; any other `image/*` type is refused; every non-image type is sent as a file. The total decoded size is at most 3 MiB (3,145,728 bytes) per call. Because a whole request, including the JSON-RPC envelope and base64 overhead, must fit in 4 MiB (the HTTP body or one stdio line), the usable total is a little under 3 MiB in practice; a stdio line over 4 MiB is a parse error before the tool runs (and the HTTP body is held to the same size). Larger files must be sent another way. Each attachment is staged through the upload service under this MCP session before the turn is sent.
 

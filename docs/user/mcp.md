@@ -60,7 +60,10 @@ page, register it by hand:
 
 For Codex, replace `claude mcp add` with `codex mcp add`. For a data root other than
 `~/.bibcode`, add `--base-dir <root>`. To connect with less than the environment allows, add
-`--access read-only` (or `approval-required`, `auto-accept-edits`).
+`--access read-only` (or `approval-required`, `auto-accept-edits`). To let a restarted agent
+keep its retries, its panels and a paired webhook endpoint, add `--client <name>` with a
+name of your choice; **Revoke** or **Stop** on its row ends that identity, and its next run
+starts fresh.
 
 Over SSH no tunnel is needed: `bibcode mcp` runs on the remote host and talks to that host's
 own loopback server.
