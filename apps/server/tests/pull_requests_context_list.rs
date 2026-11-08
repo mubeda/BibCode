@@ -1149,6 +1149,50 @@ async fn pull_requests_and_pipelines_snapshot_reads_of_a_named_ssh_host_spawn_no
     assert_eq!(f.calls("glab"), "", "identity reads spawned glab");
 }
 
+/// #332: glab knows a named HTTPS host only as `gitlab.tls.test:443`. Signing in places
+/// the scope there and stores rows under that host; the identity-only path that snapshot
+/// reads and subscriptions take reuses the recorded spelling, so it finds those rows.
+#[tokio::test]
+async fn pull_requests_named_host_on_a_written_default_port_keeps_its_snapshot_host() {
+    let origin = "https://gitlab.tls.test/team/sub/repo.git";
+    let f = Fixture::new(Some(origin)).await;
+    fs::write(
+        f.root.path().join("glab-auth"),
+        "gitlab.tls.test:443\n  ✓ Logged in to gitlab.tls.test:443 as alice\n",
+    )
+    .unwrap();
+    let database = bibcode_server::persistence::Database::open_in_memory()
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            Ok(bibcode_server::persistence::run_migrations(
+                connection, None,
+            )?)
+        })
+        .await
+        .unwrap();
+    let service = PullRequestsService::with_runner(f.runner.clone()).with_database(database);
+    let c = CancellationToken::new();
+    let context = serde_json::to_value(
+        service
+            .context(&f.cwd, ContextRead::Open, &c)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(context["host"], "gitlab.tls.test:443", "{context}");
+    service.list(&f.cwd, f.query(), &c).await.unwrap();
+    let snapshot = service
+        .read_snapshot(
+            serde_json::from_value(json!({"cwd":f.cwd,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"number":null,"tab":null})).unwrap(),
+            &c,
+        )
+        .await
+        .unwrap();
+    assert!(snapshot.list.is_some(), "the snapshot read missed the rows");
+}
+
 /// #332 against a real GitLab, such as the local Docker kit on `localhost:8929`:
 /// `pullRequests.getContext`, `pullRequests.list` and `pipelines.list` through the
 /// real `glab`, `gh` and `git` on `PATH`. Set `BIBCODE_LIVE_GITLAB_CHECKOUT` to a
