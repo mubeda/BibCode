@@ -2039,6 +2039,12 @@ it.
   operation tag, never the path. The per-worktree repeat window lives only in
   memory, and the evidence carries the worktree with the home directory as
   `~`. A refused request, a lost workspace, and a cancellation raise nothing.
+- **Git sign-in (#325).** Each `git.signIn` that ran its probe writes one
+  `git.signInEnded` event with its direction, outcome (`signedIn`, `failed`,
+  `timedOut` at the 10-minute cap, or `cancelled`) and wait time. It records no
+  remote, URL, host, user name or Git output. `git.signIn` is long-running, so
+  it raises no `rpc.slow`, and its 660 s hang budget (the cap plus cleanup)
+  raises `rpc.hang` only for a sign-in that outlives its cap.
 
 ### Profiler off
 
