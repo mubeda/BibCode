@@ -106,11 +106,11 @@ token is stored. Without `--client`, nothing changes.
    client is revoked or missing. Every person revoke already emits `ClientRemoved`, which
    wakes the dispatcher. The column keeps its name (no table rebuild) and is documented as
    "a session id or a named client id".
-7. **No idle row.** A named client with no live run has no Authorized clients row, so it
+7. **No idle row.** (Replaced by [Revision 2](#revision-2-idle-rows-and-take-over-across-runs-324).) A named client with no live run has no Authorized clients row, so it
    cannot be revoked from there. Its paired endpoints stay on until edited in Webhooks,
    and the next `--client` run brings its row back. The maintainer confirmed 2026-11-07; an idle
    row is a follow-up.
-8. **Take over does not carry to the next run.** A restarted agent escapes a Take over
+8. **Take over does not carry to the next run.** (Replaced by [Revision 2](#revision-2-idle-rows-and-take-over-across-runs-324).) A restarted agent escapes a Take over
    today because its new run is a new session; named clients do not make that worse.
    The maintainer confirmed 2026-11-07: out of scope, a follow-up (the named row would store the
    hand-back level).
@@ -396,9 +396,240 @@ No profiler event or finding changes.
 
 ## Follow-ups (recorded, not in this slice)
 
+Both are designed in [Revision 2](#revision-2-idle-rows-and-take-over-across-runs-324), issue #324.
+
 - An Authorized clients row for an idle named client, so it can be revoked with no run
   live (decision 7).
 - Take over carrying to the next run of a named client (decision 8).
+
+## Revision 2: idle rows and Take over across runs (#324)
+
+Status: proposed 2026-11-07 (lane L16), awaiting review. Verified on the integration branch
+at `85fcbe4b3`, which contains this note's implementation and #294.
+
+Revision 2 replaces decisions 7 and 8. Everything else in this note stands.
+
+### Outcome
+
+1. A named client with no live run has a row in Settings → Authorized clients and in
+   Settings → Agents. Its **Revoke** ends the identity exactly as Revoke on a run's row
+   does: [Ending an identity](#ending-an-identity), paired endpoints off as `client-revoked`,
+   the next run starts a new identity.
+2. **Take over** on any run of a named client takes over the identity. Every live run goes
+   read-only, and every later run starts read-only, until a person presses **Hand back** on
+   a run's row or ends the identity.
+
+### What the code does today (verified at `85fcbe4b3`)
+
+| Area                | Behaviour                                                                                                                                                                                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authorized clients  | `access_snapshot` (`auth/service.rs:776-813`) and `list_clients` (`:2045-2058`) list live sessions only. `ShareTab.tsx:985-993` renders `clientSessions` from the stream snapshot.                                                                    |
+| Stream              | `auth/rpc.rs:33-101` sends a snapshot, then deltas. `PendingMcpAuthorizations` goes out as a whole snapshot so a client that predates it still decodes (`:58-74`). The web reducer replaces the whole payload on `snapshot` (`client-runtime/src/state/auth.ts:33`). |
+| Authority cache     | `load_auth_authority_snapshot` (`repositories.rs:2070-2150`) loads live links, sessions and pending authorizations. `reconcile_authority_snapshot` (`service.rs:3103-3190`) diffs them into `AuthState` and emits under its lock.                     |
+| Revoke              | `revoke_session` (`service.rs:2566-2595`) runs `revoke_auth_session_and_identity`, then `forget_revoked` (`:2599-2624`) emits `ClientRemoved` and `PairingLinkRemoved` under the lock. With no session and no link it emits nothing.              |
+| Revoke input        | `AuthRevokeClientSessionInput.sessionId` is `AuthSessionId`, a branded `TrimmedNonEmptyString` (`baseSchemas.ts:34-54`). Any `nc_…` id decodes.                                                                                                  |
+| Webhooks wake       | `webhooks.wake_on(auth.subscribe_access())` (`production/runtime.rs:779`) wakes on every access event, so any emitted change triggers `reconcile_pairings`.                                                                                        |
+| Take over           | `set_mcp_access` (`service.rs:2374-2442`): `read-only` stores the replaced level in `mcp_access_hand_back`; any other level must equal it. One session, `set_auth_session_mcp_access` (`repositories.rs:2549-2571`). The relay's link carries the run's own `mcp_access`. |
+
+### Domain terms
+
+- **Idle named client.** A named client with `revoked_at IS NULL` and no live session that
+  carries its id. The UI computes it: named clients minus `clientSessions[].mcpNamedClient.id`.
+- **Taken over identity.** A named client with `taken_over_at` set. Each run's session still
+  holds its own `mcp_access` and `mcp_access_hand_back`; the identity flag decides what a new
+  run's session starts with.
+
+### Decisions
+
+- **R2-1. The snapshot carries live named clients; there is no new delta event.**
+  `AuthAccessSnapshot` gains `mcpNamedClients: optionalKey(Array({ id, name, createdAt }))`.
+  A change goes out as a whole snapshot through a new `AuthAccessChange::McpNamedClients`,
+  handled in the stream like `PendingMcpAuthorizations`. Older web clients decode it and
+  ignore the key. Rejected: `namedClientUpserted`/`Removed` deltas, which an older client's
+  `Schema.Union` refuses.
+- **R2-2. The UI derives idleness.** The list only changes when an identity is created or
+  ended. A run starting or exiting is already a `clientUpserted` or `clientRemoved` delta,
+  and the web recomputes idle rows from the two arrays. Rejected: a server-computed idle list,
+  which would need a snapshot on every run start and exit.
+- **R2-3. Revoke on an idle row reuses `POST /api/auth/clients/revoke`.** `sessionId` may be a
+  live named client id (`nc_` plus a UUID, never equal to a session id). `revoke_session`
+  dispatches it to `revoke_mcp_named_client`. No new route, HTTP API entry or client function.
+  This follows decision 6, where `pairedClientId` already holds either kind of id. Rejected:
+  a separate `/api/auth/named-clients/revoke`, which adds a route in `http.rs`, an
+  `environmentHttp.ts` endpoint and a web function for one call.
+- **R2-4. `Revoke others` also ends idle named clients.** It removes every other row, and
+  decision 5 says a person action that removes a named client's row ends the identity.
+  (Open question Q2.)
+- **R2-5. The identity stores a flag, not a level.** `mcp_named_clients.taken_over_at`. A new
+  run's hand-back level is its own link's `mcp_access`. This keeps `set_mcp_access`'s rule
+  that Hand back never raises a session above what it was paired with. Rejected: storing the
+  level replaced, which can exceed the next run's `--access`.
+- **R2-6. Take over and Hand back apply to the identity.** On a named session, both update
+  the flag and every live session of that identity in one transaction. Unnamed sessions are
+  unchanged.
+- **R2-7. A read-only run of a taken-over identity starts plain read-only.** Its session gets
+  `mcp_access = 'read-only'` and no hand-back, as today. The identity stays taken over; a
+  later run with a higher level starts read-only with Hand back offered. No API change.
+  (Open question Q4.)
+- **R2-8. Release happens on a run's row.** An idle row offers Revoke only. Hand back needs a
+  run, because the level it restores is that run's own. (Open question Q5.)
+
+### Persistence (migration 71, or the next free id at merge)
+
+```sql
+ALTER TABLE mcp_named_clients ADD COLUMN taken_over_at TEXT;
+```
+
+- Guarded by `table_has_column`, like migration 70's `ALTER`s. No backfill.
+- Migration 70 is not released, but the integration branch has run it, so this is a new
+  migration rather than an edit of 70.
+- `load_auth_authority_snapshot` also reads `SELECT client_id, name, created_at, taken_over_at
+  FROM mcp_named_clients WHERE revoked_at IS NULL ORDER BY created_at, client_id` into a
+  `#[serde(skip)]` field, the same shape as `pending_mcp_authorizations`.
+- Mixed versions (decision 10) still hold one migration apart. The relay's named mint names
+  its columns (`repositories.rs:2394`), and `revoke_mcp_credential` and the sweep name no
+  column of `mcp_named_clients`. The session-insert clamp below runs in the server, which
+  always matches its store.
+
+### Server
+
+**Cache.** `AuthState` gains `named_clients: HashMap<String, NamedClientRecord { id, name,
+created_at_ms, taken_over }>`. `reconcile_authority_snapshot` replaces it and pushes
+`AuthAccessChange::McpNamedClients` when the `(id, name, created_at)` set differs. A relay's
+mint of a new identity bumps the authority revision, so the watcher picks it up within one
+tick.
+
+**Revoke.** `revoke_session(id)`: when `id` starts with `nc_`, run the existing
+`revoke_mcp_named_client_on` cascade in its own `Immediate` transaction. `RevokedAccess`
+already returns `named_clients`. `forget_revoked` removes them from `state.named_clients` and,
+under the same guard, emits `McpNamedClients` after the `ClientRemoved` and
+`PairingLinkRemoved` it already sends. That event is what wakes the webhook dispatcher for an
+idle identity, which has no `ClientRemoved`. `revoke_other_clients` also ends every live
+named client (R2-4) in its transaction. `revoke_client`'s current-session check is unchanged,
+since a named id is never the current session.
+
+**Take over and Hand back.** `set_mcp_access` on a session with a named client:
+
+1. Take over: `UPDATE mcp_named_clients SET taken_over_at = ? WHERE client_id = ? AND
+   revoked_at IS NULL`, then for each live session of the identity the same rule as today
+   (keep an existing hand-back, else store the current level unless it is `read-only`),
+   `RETURNING session_id, mcp_access, mcp_access_hand_back`.
+2. Hand back: the requested level must equal the target session's hand-back, as today. Then
+   clear `taken_over_at` and set every live session of the identity that has a hand-back to
+   `mcp_access = mcp_access_hand_back, mcp_access_hand_back = NULL`, `RETURNING` the same.
+3. Under the state lock: apply the returned rows and the flag to the cache, cancel each
+   session's live connections, bump the generation, emit one `ClientUpserted` per session.
+
+**New run's session.** `create_fenced_mcp_auth_session` reads the link's named client's
+`taken_over_at` in its transaction. When set and the row's `mcp_access` is not `read-only`,
+it writes `mcp_access = 'read-only', mcp_access_hand_back = <the link's level>`. It returns
+the effective pair, and `issue_session_from_grant` puts that on the cached record before it
+emits `ClientUpserted`.
+
+**Ordering.** Without a lock, this interleaving leaves a stale level in the cache: the
+session insert commits, Take over commits and updates the cached sessions it knows, then
+issuance publishes its record at the paired level. The watcher would correct it within one
+tick, but that window is in the unsafe direction. So `AuthService` gains one
+`tokio::sync::Mutex<()>`, `mcp_access_order`. A named issuance holds it from the fenced insert
+to the cache publication; `set_mcp_access` holds it from its transaction to its cache update.
+Both are rare person or sign-in actions. Revoke keeps today's watcher convergence, because a
+stale cached revoked session already fails authentication through the store fence.
+
+### Contracts (`packages/contracts`)
+
+- `auth.ts` `AuthAccessSnapshot.mcpNamedClients: Schema.optionalKey(Schema.Array(
+  Schema.Struct({ id: TrimmedNonEmptyString, name: Schema.String, createdAt:
+  Schema.DateTimeUtc })))`. Doc comment: live named clients, so a client can list the idle
+  ones; absent from servers before #324.
+- `AuthRevokeClientSessionInput.sessionId` doc comment: a session id, or a live named
+  client's id to end an idle identity.
+- Rust mirror in `auth/model.rs` and `authRustParity.test.ts`.
+
+### UI
+
+- One hook in `apps/web/src/state/mcpActivity.ts`, `usePrimaryIdleNamedClients()`: named
+  clients from the snapshot minus those with a live session.
+- `ShareTab.tsx` Authorized clients: an idle row per idle named client after the session rows.
+  Label `MCP · <name>`, grey dot, secondary line "Not running · Keeps its identity across
+  runs", **Revoke** with the title "Ends this agent's identity. Its paired webhooks turn off,
+  and its next run starts fresh." (the existing `ENDS_IDENTITY` text). The pending text is
+  "Revoking…", as for sessions. `Revoke others` stays enabled while an idle row exists.
+- `McpAgentsPanel.tsx`: the same idle row with Revoke only. An exited run's "Revoked · N turns
+  running" row stays separate (decision 9), so one identity can show both; their secondary
+  lines tell them apart.
+- A run row of a taken-over identity shows "Taken over (was <level>)" from its own hand-back,
+  as today. A read-only run shows "Read only" (R2-7). `McpAgentIndicator.tsx` is unchanged.
+- Implementation reviews these against `UI.md`, `vercel-react-best-practices` and the
+  `impeccable` audit.
+
+### Failure, restart and concurrency
+
+| Case                                             | Behaviour                                                                                                                                       |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Server restarts while an identity is taken over  | `taken_over_at` and each session's level are in SQLite. The cache loads them. The next run starts read-only.                                    |
+| Run exits while taken over                       | Its session is revoked by the relay; the flag stays on the identity.                                                                            |
+| Revoke on an idle row while a run signs in       | The cascade revokes its link, so the fence refuses the session ([Ordering argument](#ordering-argument)).                                       |
+| Revoke on an idle row that a run just made live  | The cascade revokes that run too. The person meant to end the identity.                                                                         |
+| Two live runs, Take over on one                  | Both go read-only and both have their live work cancelled. Hand back on either restores both.                                                   |
+| Take over or Hand back racing a new run          | Serialized by `mcp_access_order`; both orders end with the cache equal to SQLite.                                                               |
+| Revoke of an unknown or ended `nc_` id           | `revoke_session` returns `false`, so the route answers as for an unknown session.                                                              |
+| Missed `McpNamedClients` notice                  | The next snapshot (lag, reconnect, or the watcher's next change) carries the whole list.                                                        |
+| Older web client                                 | Ignores `mcpNamedClients`; it shows no idle row, as before.                                                                                     |
+| Downgrade after migration 71                     | An older server refuses the store (ledger not a prefix). An older relay works, as decision 10 says.                                             |
+
+### Tests
+
+| Acceptance                                         | Test                                                                                               | File                                      |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| Idle client listed after its run exits             | `a_named_client_whose_run_exited_stays_in_the_access_snapshot`                                     | `auth/service.rs` tests                   |
+| Revoke on the idle id ends it                      | `revoking_an_idle_named_client_by_its_id_ends_the_identity_and_sends_a_snapshot`                   | same                                      |
+| Revoke others ends idle identities                 | `revoke_others_ends_idle_named_clients`                                                            | same                                      |
+| Idle Revoke turns endpoints off                    | `revoking_an_idle_named_client_disables_its_paired_endpoints`                                      | `webhooks/tests.rs`                       |
+| Take over carries to the next run                  | `a_taken_over_named_clients_next_run_starts_read_only_with_its_own_hand_back`                      | `auth/service.rs` tests                   |
+| Take over reaches every live run                   | `taking_over_one_run_takes_over_every_live_run_of_the_identity`                                    | same                                      |
+| Hand back releases the identity                    | `hand_back_on_one_run_releases_the_identity_and_every_live_run`                                    | same                                      |
+| Read-only run of a taken-over identity             | `a_read_only_run_of_a_taken_over_identity_has_no_hand_back`                                        | same                                      |
+| Race with a new run                                | `take_over_while_a_named_run_publishes_leaves_the_cache_read_only` (`after_session_insert` hold)   | same                                      |
+| Restart                                            | `a_taken_over_identity_survives_a_restart`                                                         | same                                      |
+| Agent sees it                                      | `a_named_agent_restarted_after_take_over_is_refused_a_mutation`                                    | `production/mcp_tools_tests/attribution.rs` |
+| Unnamed unchanged                                  | keep the existing Take over and Hand back tests                                                    | `auth/service.rs`, `oauth_flow_tests.rs`  |
+| Migration                                          | `migration_71_adds_taken_over_at_to_named_clients`                                                 | `persistence/migrations.rs`               |
+| Contracts                                          | snapshot decodes with and without `mcpNamedClients`; Rust parity                                   | `packages/contracts/src/auth.test.ts`     |
+| UI                                                 | idle row with Revoke in Authorized clients and Agents; no idle row when a run is live              | `ShareTab` test, `McpAgentsPanel.test.tsx` |
+
+### Files to change
+
+- `apps/server/src/persistence/migrations.rs`, `persistence/repositories.rs`: migration 71,
+  named clients in the authority snapshot, the session-insert clamp, the identity-wide access
+  update, `revoke_other_auth_sessions` ending idle identities, revoke by named id.
+- `apps/server/src/auth/service.rs`, `auth/model.rs`, `auth/rpc.rs`: cache, change, snapshot
+  field, `revoke_session` dispatch, `set_mcp_access`, `mcp_access_order`, tests.
+- `apps/server/src/production/mcp_tools_tests/attribution.rs`, `webhooks/tests.rs`: tests only.
+- `packages/contracts/src/auth.ts` and tests.
+- `apps/web/src/state/mcpActivity.ts`, `components/settings/remote-servers/ShareTab.tsx`,
+  `components/settings/McpAgentsPanel.tsx` and tests.
+- Docs: `docs/reference/mcp.md` (Stop, Take over and Hand back; the named-client section),
+  `docs/reference/webhooks.md` if its Revoke paragraph needs the idle row, `docs/user/mcp.md`.
+
+### Profiler, crash and trace coverage
+
+No new child process, binary mode, RPC method, HTTP route, worktree removal path or service.
+Revoke still runs in `/api/auth/clients/revoke` and Take over in `/api/auth/clients/mcp-access`.
+The existing `tracing::info!` for an ended identity covers the idle path; Take over of an
+identity adds one `tracing::info!` with the named id and session count, never the name.
+
+### Open questions for review
+
+1. **Q1. Surfaces.** Idle rows go in both Authorized clients (`ShareTab.tsx`, the issue's
+   wording) and Agents (`McpAgentsPanel.tsx`). Recommended: both. `ShareTab.tsx` and
+   `state/mcpActivity.ts` are outside this lane's listed files; confirm they are this lane's.
+2. **Q2. Revoke others.** It ends idle named clients too (R2-4). Recommended: yes.
+3. **Q3. Migration id.** 71, if no other lane adds one. Recommended: the coordinator assigns.
+4. **Q4. Read-only runs.** A read-only run of a taken-over identity shows plain "Read only"
+   and offers no Hand back (R2-7). Recommended: yes; Take over has no effect on a run that
+   cannot write.
+5. **Q5. Release with no run.** The idle row offers Revoke only, not Hand back (R2-8).
+   Recommended: yes.
 
 ## Review findings and resolutions
 
