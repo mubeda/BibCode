@@ -279,7 +279,7 @@ describe("job log parser", () => {
     expect(capped.matches.length).toBe(SEARCH_MATCH_CAP);
   });
 
-  it("parses a 100,000-line, 8 MiB log with sections and colors within its bound", () => {
+  it("parses a 100,000-line, 8 MiB log in time linear in its size", () => {
     const lines: string[] = [];
     let bytes = 0;
     for (let index = 0; bytes < 8 * 1024 * 1024 || lines.length < 100_000; index += 1) {
@@ -293,24 +293,31 @@ describe("job log parser", () => {
       bytes += utf8Length(line) + 1;
     }
     const text = `${lines.join("\n")}\n`;
-    // The fastest of up to three runs times the parser rather than a busy runner's
-    // scheduling: a v0.14.0 release preflight measured one run at 1,025 ms.
-    const boundMs = 1_000;
-    let elapsed = Number.POSITIVE_INFINITY;
-    let model = load("");
-    let layout = model.layout();
-    for (let attempt = 0; attempt < 3 && elapsed >= boundMs; attempt += 1) {
+    // A quarter of the log, cut at a section boundary so both inputs have the same shape.
+    const quarter = `${lines.slice(0, Math.floor(lines.length / 4 / 500) * 500).join("\n")}\n`;
+    const parse = (input: string) => {
       const started = performance.now();
-      model = load(text);
-      layout = model.layout();
-      elapsed = Math.min(elapsed, performance.now() - started);
+      const model = load(input);
+      const layout = model.layout();
+      return { model, layout, ms: performance.now() - started };
+    };
+    // The ratio of the fastest runs, not a wall-clock bound, so a loaded machine slows
+    // both sides alike (#319). Linear time gives about 4, quadratic time about 16; the
+    // gate sits between them. Runs alternate so a burst of load cannot hit one side only.
+    const ratioBound = 8;
+    parse(quarter); // warms the JIT so the first timed run is not the slow one
+    let small = Number.POSITIVE_INFINITY;
+    let large = Number.POSITIVE_INFINITY;
+    let full = parse(text);
+    for (let round = 0; round < 6 && (round < 2 || large / small >= ratioBound); round += 1) {
+      small = Math.min(small, parse(quarter).ms);
+      full = parse(text);
+      large = Math.min(large, full.ms);
     }
-    const search = model.search("(13 ms)");
-    expect(layout.lineCount).toBeGreaterThanOrEqual(100_000);
-    expect(layout.sections.length).toBeGreaterThan(190);
+    const search = full.model.search("(13 ms)");
+    expect(full.layout.lineCount).toBeGreaterThanOrEqual(100_000);
+    expect(full.layout.sections.length).toBeGreaterThan(190);
     expect(search.matches.length).toBeGreaterThan(900);
-    // Measured at about 160 ms (parse and layout) on an Apple-silicon Mac. CI runners
-    // are several times slower; the gate is twice a slow runner's expected time.
-    expect(elapsed).toBeLessThan(boundMs);
-  });
+    expect(large / small).toBeLessThan(ratioBound);
+  }, 300_000);
 });

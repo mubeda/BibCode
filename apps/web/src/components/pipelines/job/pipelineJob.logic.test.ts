@@ -4,6 +4,7 @@ import {
   findPipelineJob,
   formatBytes,
   gitlabArtifactLinks,
+  jobLogSource,
   jobSnapshotInput,
   pipelineJobActions,
   relatedStages,
@@ -184,5 +185,43 @@ describe("job page logic", () => {
     expect(stepDurationSeconds(step)).toBe(86);
     expect(stepDurationSeconds({ ...step, completedAt: null })).toBeNull();
     expect(stepDurationSeconds({ ...step, startedAt: "not a time" })).toBeNull();
+  });
+});
+
+describe("jobLogSource", () => {
+  const running = pipelineJob({ status: "running", terminal: false, finishedAt: null });
+  it("reads a finished job's log by its attempt, and an erased one not at all", () => {
+    expect(jobLogSource(pipelineJob(), pipelineJobDetail({ attempt: 2 }), false)).toEqual({
+      kind: "complete",
+      source: { _tag: "complete", jobId: 998, attempt: 2 },
+    });
+    expect(jobLogSource(pipelineJob(), pipelineJobDetail({ erased: true }), true).source).toEqual({
+      _tag: "unavailable",
+      reason: "erased",
+      url: null,
+    });
+    expect(jobLogSource(null, null, true)).toEqual({ kind: null, source: null });
+  });
+  it("follows a running GitLab job, and leaves a running GitHub job's log on GitHub", () => {
+    expect(jobLogSource(running, null, true).source).toEqual({
+      _tag: "live",
+      jobId: 998,
+      attempt: null,
+      started: true,
+    });
+    expect(jobLogSource(running, pipelineJobDetail(), false)).toEqual({
+      kind: "on_host",
+      source: { _tag: "unavailable", reason: "live_on_host", url: running.url },
+    });
+    const queued = pipelineJob({ status: "queued", terminal: false, startedAt: null });
+    expect(jobLogSource(queued, null, false).source).toEqual({
+      _tag: "unavailable",
+      reason: "not_started",
+      url: null,
+    });
+  });
+  it("waits for GitHub's job read, which names the attempt, before reading a log", () => {
+    expect(jobLogSource(pipelineJob(), null, false)).toEqual({ kind: "complete", source: null });
+    expect(jobLogSource(pipelineJob(), null, true).source).not.toBeNull();
   });
 });

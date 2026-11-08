@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { Columns3Icon } from "lucide-react";
 import { createContext, useContext, useMemo, type CSSProperties, type ReactNode } from "react";
-import { useLocalStorage } from "~/hooks/useLocalStorage";
+import { getLocalStorageItem, useLocalStorage } from "~/hooks/useLocalStorage";
 import { useResizableWidth, type UseResizableWidthOptions } from "~/hooks/useResizableWidth";
 import { Button } from "../../ui/button";
 import { Menu, MenuCheckboxItem, MenuPopup, MenuTrigger } from "../../ui/menu";
@@ -25,15 +25,32 @@ export const AUTHOR_CELL_CLASS = "hidden @min-[1100px]:block";
 const HIDDEN_KEY = "bibcode:pipelines-list-hidden-columns";
 const HiddenSchema = Schema.Array(Schema.Literals(["author", "stages", "timing"]));
 const NO_HIDDEN: readonly PipelinesColumnId[] = [];
+const WidthSchema = Schema.Finite;
+
+/** A repository's own key: the global key, which stays the fallback, plus host and path. */
+const repositoryKey = (globalKey: string, repository: string) => `${globalKey}:${repository}`;
+
+/** The global choice (#285's single setting) a repository with no choice of its own starts from. */
+function readGlobal<T, E>(key: string, schema: Schema.Codec<T, E>): T | null {
+  try {
+    return getLocalStorageItem(key, schema);
+  } catch {
+    return null;
+  }
+}
 
 const columnWidth = (
   column: keyof typeof COLUMN_BOUNDS,
-): Pick<UseResizableWidthOptions, "storageKey" | "defaultWidth" | "minWidth" | "maxWidth"> => ({
-  storageKey: `bibcode:pipelines-list-${column}-width`,
-  defaultWidth: COLUMN_BOUNDS[column].default,
-  minWidth: COLUMN_BOUNDS[column].min,
-  maxWidth: COLUMN_BOUNDS[column].max,
-});
+  repository: string,
+): Pick<UseResizableWidthOptions, "storageKey" | "defaultWidth" | "minWidth" | "maxWidth"> => {
+  const globalKey = `bibcode:pipelines-list-${column}-width`;
+  return {
+    storageKey: repositoryKey(globalKey, repository),
+    defaultWidth: readGlobal(globalKey, WidthSchema) ?? COLUMN_BOUNDS[column].default,
+    minWidth: COLUMN_BOUNDS[column].min,
+    maxWidth: COLUMN_BOUNDS[column].max,
+  };
+};
 
 interface ColumnResize {
   readonly width: number;
@@ -60,20 +77,37 @@ export function useShownColumns() {
 }
 
 /**
- * The list root. It owns the persisted column widths and visibility and paints them as
- * custom properties, so `children` (passed in whole) are not re-rendered by a drag.
+ * The list root. It owns the column widths and visibility, persisted per repository with
+ * the global choice as the fallback, and paints them as custom properties, so `children` (passed in whole) are not re-rendered by a drag.
  */
 export function PipelinesColumnsRoot({
+  repository,
   className,
   children,
 }: {
+  /** Host and path of the repository, whose widths and hidden columns these are. Key the root by it. */
+  readonly repository: string;
   readonly className: string;
   readonly children: ReactNode;
 }) {
-  const pipeline = useResizableWidth({ ...columnWidth("pipeline"), edge: "right" });
-  const author = useResizableWidth({ ...columnWidth("author"), edge: "right" });
-  const stages = useResizableWidth({ ...columnWidth("stages"), edge: "right" });
-  const [hiddenList, setHiddenList] = useLocalStorage(HIDDEN_KEY, NO_HIDDEN, HiddenSchema);
+  // Read storage once per repository, not on every drag frame.
+  const options = useMemo(
+    () => ({
+      pipeline: columnWidth("pipeline", repository),
+      author: columnWidth("author", repository),
+      stages: columnWidth("stages", repository),
+    }),
+    [repository],
+  );
+  const pipeline = useResizableWidth({ ...options.pipeline, edge: "right" });
+  const author = useResizableWidth({ ...options.author, edge: "right" });
+  const stages = useResizableWidth({ ...options.stages, edge: "right" });
+  const globalHidden = useMemo(() => readGlobal(HIDDEN_KEY, HiddenSchema) ?? NO_HIDDEN, []);
+  const [hiddenList, setHiddenList] = useLocalStorage(
+    repositoryKey(HIDDEN_KEY, repository),
+    globalHidden,
+    HiddenSchema,
+  );
   const hidden = useMemo(() => new Set(hiddenList), [hiddenList]);
   const templates = pipelinesGridTemplates(
     { pipeline: pipeline.width, author: author.width, stages: stages.width },

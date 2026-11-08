@@ -32,16 +32,20 @@ const HOST_NAMES = { github: "GitHub", gitlab: "GitLab" } as const;
 interface PipelineRoute {
   readonly pipelineId: number;
   readonly attempt: number | null;
+  /** The job whose log shows beside the stages (`?job=`). */
+  readonly jobId: number | null;
 }
 
 function AvailablePipelines({
   filters,
   onFiltersChange,
   pipeline,
+  onJobChange,
 }: {
   filters: PipelinesFilters;
   onFiltersChange: (filters: PipelinesFilters) => void;
   pipeline: PipelineRoute | null;
+  onJobChange: (jobId: number | null) => void;
 }) {
   const {
     context,
@@ -102,6 +106,8 @@ function AvailablePipelines({
             ref={viewRef}
             pipelineId={pipeline.pipelineId}
             attempt={pipeline.attempt}
+            jobId={pipeline.jobId}
+            onJobChange={onJobChange}
             onBackoffChange={setBackedOff}
           />
         </PipelineLinksProvider>
@@ -121,11 +127,13 @@ export function PipelinesPanel({
   search,
   pipelineId,
   attempt = null,
+  jobId = null,
 }: {
   projectRef: ScopedProjectRef;
   search?: PipelinesRouteSearch;
   pipelineId?: number;
   attempt?: number | null;
+  jobId?: number | null;
 }) {
   const navigate = useNavigate();
   const storedFilters = usePipelinesStore(
@@ -142,8 +150,8 @@ export function PipelinesPanel({
     firstPagePrefetch,
   });
   const pipeline = useMemo(
-    () => (pipelineId === undefined ? null : { pipelineId, attempt }),
-    [attempt, pipelineId],
+    () => (pipelineId === undefined ? null : { pipelineId, attempt, jobId }),
+    [attempt, jobId, pipelineId],
   );
   // A copied link or Back opens on the route's filters; remember them for the project.
   useEffect(() => {
@@ -164,10 +172,32 @@ export function PipelinesPanel({
     },
     [environmentId, navigate, projectId],
   );
+  // Opening or closing a log is a history step, so Back undoes it; switching between
+  // logs replaces the step instead of stacking one per job.
+  const setJob = useCallback(
+    (next: number | null) => {
+      if (pipelineId === undefined) return;
+      void navigate({
+        to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
+        params: { environmentId, projectId, pipelineId: String(pipelineId) },
+        search: {
+          ...(attempt === null ? {} : { attempt }),
+          ...(next === null ? {} : { job: next }),
+        },
+        replace: jobId !== null && next !== null,
+      });
+    },
+    [attempt, environmentId, jobId, navigate, pipelineId, projectId],
+  );
   return (
     <RepositoryModule.Provider value={shell}>
       <RepositoryModule.Gate>
-        <AvailablePipelines filters={filters} onFiltersChange={setFilters} pipeline={pipeline} />
+        <AvailablePipelines
+          filters={filters}
+          onFiltersChange={setFilters}
+          pipeline={pipeline}
+          onJobChange={setJob}
+        />
       </RepositoryModule.Gate>
     </RepositoryModule.Provider>
   );

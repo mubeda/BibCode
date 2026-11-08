@@ -165,6 +165,21 @@ pub fn pipeline_detail_query(baseline: bool) -> String {
     )
 }
 
+/// One page of a pipeline's jobs with how GitLab schedules each and what it
+/// needs, read once per pipeline that uses `needs`. Kept out of the detail
+/// document, which every poller tick sends.
+pub const PIPELINE_NEEDS_QUERY: &str =
+    "query PipelinesGitLabNeeds($projectPath:ID!, $id:CiPipelineID!, $first:Int!, $after:String) {
+  project(fullPath:$projectPath) {
+    pipeline(id:$id) {
+      jobs(first:$first, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { name schedulingType needs { nodes { name } } }
+      }
+    }
+  }
+}";
+
 pub fn override_requested_changes(project: &str, iid: u64) -> String {
     format!(
         "mutation PullRequestsOverrideRequestedChanges {{ mergeRequestUpdate(input: {{ projectPath: {}, iid: {}, overrideRequestedChanges: true }}) {{ errors }} }}",

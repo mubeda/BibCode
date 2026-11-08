@@ -216,6 +216,20 @@ pub struct Job {
     pub permissions: JobPermissions,
     pub url: Option<String>,
     pub downstream_url: Option<String>,
+    /// GitLab `schedulingType`; `None` when unknown (GitHub, no `needs`, a failed read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<Scheduling>,
+    /// Names of the jobs a `dag` job needs; `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<Vec<String>>,
+}
+
+/// How GitLab starts a job: `Dag` after its `needs`, `Stage` after earlier stages.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Scheduling {
+    Dag,
+    Stage,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

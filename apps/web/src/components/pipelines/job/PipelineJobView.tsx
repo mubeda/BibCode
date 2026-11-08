@@ -41,7 +41,7 @@ import { PermissionButton } from "../../ui/permission-button";
 import { Skeleton } from "../../ui/skeleton";
 import { PipelineActions, type PipelineActionOutcome } from "../actions/PipelineActions";
 import { pipelineActionDestination } from "../actions/pipelineActions.logic";
-import { JobLog, type JobLogSource } from "../log/JobLog";
+import { JobLog } from "../log/JobLog";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
@@ -50,6 +50,7 @@ import { PipelineJobDetails } from "./PipelineJobDetails";
 import { PipelineJobSteps } from "./PipelineJobSteps";
 import {
   findPipelineJob,
+  jobLogSource,
   jobSnapshotInput,
   pipelineJobActions,
   shownJob,
@@ -66,7 +67,7 @@ const GITHUB_JOB_PAGE_RUN_FACTOR = 3;
 const NO_STEPS: PipelinesJobDetail["steps"] = [];
 const isOperationError = Schema.is(PullRequestsOperationError);
 
-function operationError(query: EnvironmentQueryView<unknown>) {
+export function operationError(query: EnvironmentQueryView<unknown>) {
   const failure =
     query.emission._tag === "Failure" ? squashAtomCommandFailure(query.emission) : null;
   return isOperationError(failure) ? failure : null;
@@ -256,40 +257,7 @@ export function PipelineJobView({
     refreshAll,
   );
 
-  const erased = jobDetail?.erased ?? false;
-  const started = job !== null && (job.startedAt !== null || job.status === "running");
-  // GitHub serves a job's log once it completes; until then its own page has it.
-  const sourceKind =
-    job === null
-      ? null
-      : erased
-        ? "erased"
-        : job.terminal
-          ? "complete"
-          : isGitlab
-            ? "live"
-            : started
-              ? "on_host"
-              : "not_started";
-  // The log is keyed by the job's attempt, which GitHub's job read names: wait for it,
-  // so the log is read once.
-  const logAttempt = jobDetail?.attempt ?? null;
-  const waitsForAttempt = !isGitlab && jobDetail === null;
-  const jobUrl = job?.url ?? null;
-  const source: JobLogSource | null =
-    sourceKind === null
-      ? null
-      : sourceKind === "erased"
-        ? { _tag: "unavailable", reason: "erased", url: null }
-        : sourceKind === "on_host"
-          ? { _tag: "unavailable", reason: "live_on_host", url: jobUrl }
-          : sourceKind === "not_started"
-            ? { _tag: "unavailable", reason: "not_started", url: null }
-            : waitsForAttempt
-              ? null
-              : sourceKind === "live"
-                ? { _tag: "live", jobId, attempt: logAttempt, started }
-                : { _tag: "complete", jobId, attempt: logAttempt };
+  const { kind: sourceKind, source } = jobLogSource(job, jobDetail, isGitlab);
   const steps = jobDetail?.steps ?? NO_STEPS;
   const { environmentId: routeEnvironmentId, projectId } = projectRef;
   const onLineLink = useCallback(
@@ -620,7 +588,7 @@ function JobBody({ details, inPlaceOfLog }: { details: ReactNode; inPlaceOfLog: 
   );
 }
 
-function JobReadError({
+export function JobReadError({
   error,
   hostName,
   url,
