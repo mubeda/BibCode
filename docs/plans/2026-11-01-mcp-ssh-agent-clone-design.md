@@ -377,7 +377,7 @@ seen failing against today's `NOT_HTTPS` refusal, each isolation test with the o
 
 Not hermetic (each needs a real sshd, agent or CA), so manual steps:
 `docs/testing/cross-platform-validation.md` gains "agent SSH clone" on Windows (both agent
-kinds), Linux and macOS against one of the user's `SourceControlTest` repositories with a key
+kinds), Linux and macOS against one of the user's `sample-project` repositories with a key
 loaded, plus:
 
 - unknown host: the refusal, then the printed command, then a successful retry (port 22, and a

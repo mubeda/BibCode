@@ -57,7 +57,7 @@ Repository requirements (AGENTS.md, briefs):
 - Broader checks across package or runtime boundaries: `vp test` for the changed TS packages, the affected Rust test binaries, `vp run check:contracts` whenever RPC contracts or wire fixtures change.
 - `vp check` and `vp run typecheck` must pass.
 - Rust: `cargo fmt --all --check` and `cargo clippy -p bibcode-server --all-targets -- -D warnings`.
-- `apps/web` React changes: review against `vercel-react-best-practices` (`/home/mauro/.agents/skills/vercel-react-best-practices/SKILL.md`, its `AGENTS.md` or `rules/`) **and** against `UI.md`; report both results, or mark a review "not run".
+- `apps/web` React changes: review against `vercel-react-best-practices` (`/home/user/.agents/skills/vercel-react-best-practices/SKILL.md`, its `AGENTS.md` or `rules/`) **and** against `UI.md`; report both results, or mark a review "not run".
 - Living docs and `docs/testing/` runbooks change in the same task as the behavior they describe; otherwise state they were "reviewed and remain accurate".
 - `packages/contracts` stays schema-only (schemas, tagged errors, message getters; no services, layers, or middleware classes).
 - **Playwright live verification for every UI change** (user rule), against an isolated dev server: `BIBCODE_PORT_OFFSET=<unique n>`, its own `BIBCODE_HOME`, pairing through the server's startup token (`bibcode pairing offer` cannot target a dev data root).
@@ -10147,9 +10147,9 @@ Fix accepted findings, re-run the affected focused tests and gates, and checkpoi
 Run the review in the background, then collect it:
 
 ```bash
-node /home/mauro/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs review --scope working-tree
-node /home/mauro/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs status
-node /home/mauro/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs result
+node /home/user/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs review --scope working-tree
+node /home/user/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs status
+node /home/user/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs result
 ```
 
 - Run the first command with `run_in_background: true`. Poll `status` until the job completes, then read `result`.

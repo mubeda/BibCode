@@ -15,7 +15,7 @@ no Computer Use surface was available in this session.
 - Repository: `mubeda/BibCode` (checkout `C:\Users\admin\Projects\GitHub\BibCode`)
 - Remote: `origin`
 - Branch or requested revision: `main`
-- Local HEAD: `e87efa97` (Merge pull request #14 from mubeda/main-2) plus the
+- Local HEAD: `e87efa97` (Merge pull request #14 from test-user/main-2) plus the
   uncommitted working tree described under Source changes
 - Remote HEAD: not queried
 - Merge base and ahead/behind: not queried
@@ -30,7 +30,7 @@ no Computer Use surface was available in this session.
 ## Native environment
 
 - Operating system and release/build: Windows 11 Pro 10.0.26100 (Parallels
-  guest, interactive account `maurorodrig988d\admin`, `LOCALAPPDATA` under
+  guest, interactive account `winvm-host\admin`, `LOCALAPPDATA` under
   `C:\Users\admin`)
 - Architecture: ARM64 (`PROCESSOR_ARCHITECTURE=ARM64`)
 - Kernel: NT 10.0.26100

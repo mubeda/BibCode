@@ -67,20 +67,19 @@ mod tests {
     #[test]
     fn equivalent_remote_forms_share_one_canonical_key() {
         for remote in [
-            "git@gitlab.internal.pathfinder.app:tripunkt/pathfinder-application-server.git",
-            "https://gitlab.internal.pathfinder.app/tripunkt/pathfinder-application-server.git",
-            "ssh://git@GitLab.Internal.Pathfinder.App:2222/tripunkt/pathfinder-application-server",
-            "https://user@gitlab.internal.pathfinder.app:8443/tripunkt/pathfinder-application-server.git/",
+            "git@gitlab.example.test:example-group/sample-server.git",
+            "https://gitlab.example.test/example-group/sample-server.git",
+            "ssh://git@GitLab.Example.Test:2222/example-group/sample-server",
+            "https://user@gitlab.example.test:8443/example-group/sample-server.git/",
         ] {
             let identity = repository_identity(remote, "/work/repo").expect(remote);
             assert_eq!(
-                identity["canonicalKey"],
-                "gitlab.internal.pathfinder.app/tripunkt/pathfinder-application-server",
+                identity["canonicalKey"], "gitlab.example.test/example-group/sample-server",
                 "{remote}"
             );
-            assert_eq!(identity["name"], "pathfinder-application-server");
-            assert_eq!(identity["displayName"], "pathfinder-application-server");
-            assert_eq!(identity["owner"], "tripunkt");
+            assert_eq!(identity["name"], "sample-server");
+            assert_eq!(identity["displayName"], "sample-server");
+            assert_eq!(identity["owner"], "example-group");
             assert_eq!(identity["provider"], "gitlab");
             assert_eq!(identity["rootPath"], "/work/repo");
             assert_eq!(identity["locator"]["source"], "git-remote");

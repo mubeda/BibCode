@@ -64,7 +64,7 @@ vi.mock("~/components/ui/popover", () => ({
 }));
 
 vi.mock("../../state/entities", () => ({
-  useProject: () => ({ id: "project-current", title: "pathfinder-docker" }),
+  useProject: () => ({ id: "project-current", title: "sample-docker" }),
 }));
 
 vi.mock("../../state/environments", () => ({
@@ -438,7 +438,7 @@ describe("GitManagerToolbar", () => {
     const markup = renderToolbar();
 
     expect(markup).toContain('data-testid="git-manager-project"');
-    expect(markup).toContain("pathfinder-docker");
+    expect(markup).toContain("sample-docker");
     expect(markup).toContain('title="/opaque/main"');
     expect(markup).toContain('data-testid="git-manager-environment"');
     expect(markup).toContain("ai-server");

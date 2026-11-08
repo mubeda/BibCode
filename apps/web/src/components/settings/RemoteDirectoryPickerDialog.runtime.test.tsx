@@ -719,13 +719,13 @@ describe("RemoteDirectoryPickerDialog runtime behavior", () => {
   it("shows the canonical resolved path without changing the active browse request", async () => {
     h.responses.set("environment-one:~", {
       data: {
-        parentPath: "C:\\Users\\mauro",
-        directoryPath: "C:\\Users\\mauro",
+        parentPath: "C:\\Users\\user",
+        directoryPath: "C:\\Users\\user",
         ancestorPath: "C:\\Users",
         breadcrumbs: [
           { name: "C:\\", fullPath: "C:\\" },
           { name: "Users", fullPath: "C:\\Users" },
-          { name: "mauro", fullPath: "C:\\Users\\mauro" },
+          { name: "user", fullPath: "C:\\Users\\user" },
         ],
         entries: [],
       },
@@ -742,7 +742,7 @@ describe("RemoteDirectoryPickerDialog runtime behavior", () => {
     expect(
       document.body.querySelector<HTMLInputElement>('input[aria-label="Server directory path"]')
         ?.value,
-    ).toBe("C:\\Users\\mauro");
+    ).toBe("C:\\Users\\user");
     expect(document.body.querySelectorAll("[data-directory-breadcrumb-separator]")).toHaveLength(2);
   });
 

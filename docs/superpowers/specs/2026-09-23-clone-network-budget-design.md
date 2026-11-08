@@ -5,7 +5,7 @@ Status: **Approved by the user on 2026-09-23** (recommended options).
 ## Problem and evidence
 
 User report (remote Fedora server): cloning
-`https://luna.tripunkt.de/tripunkt/customer-portal.git` into `/work/tripunkt`
+`https://code.example.test/example-group/sample-project.git` into `/work/example-group`
 ran for a while, then the dialog re-enabled without closing. Pressing Clone
 again created a project whose primary branch showed `(unknown)`, and the Git
 Manager showed no branches.

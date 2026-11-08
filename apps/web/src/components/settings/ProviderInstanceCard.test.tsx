@@ -541,7 +541,7 @@ describe("version advisory", () => {
             startedAt: NOW,
             finishedAt: NOW,
             message:
-              "Update completed, but C:\\Users\\mauro\\.local\\bin\\claude.exe still reports 2.1.225; expected 2.1.226.",
+              "Update completed, but C:\\Users\\user\\.local\\bin\\claude.exe still reports 2.1.225; expected 2.1.226.",
             output: "Successfully updated from 2.1.225 to version 2.1.226",
           },
         }),
@@ -549,7 +549,7 @@ describe("version advisory", () => {
       onRecheck,
     } as Props);
 
-    expect(markup).toContain("C:\\Users\\mauro\\.local\\bin\\claude.exe");
+    expect(markup).toContain("C:\\Users\\user\\.local\\bin\\claude.exe");
     expect(markup).toContain("still reports 2.1.225; expected 2.1.226");
     expect(markup).toContain("Successfully updated from 2.1.225 to version 2.1.226");
 

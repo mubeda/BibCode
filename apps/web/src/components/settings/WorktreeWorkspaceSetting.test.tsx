@@ -421,7 +421,7 @@ describe("WorktreeWorkspaceSetting", () => {
     await rerender(setting);
 
     await invoke(button("Browse"), "onClick");
-    await invoke(latest(harness.pickers), "onSelect", "C:\\Users\\mauro\\WORKTR~1");
+    await invoke(latest(harness.pickers), "onSelect", "C:\\Users\\user\\WORKTR~1");
 
     harness.settingsByEnvironment.set("host-one", {
       ...DEFAULT_UNIFIED_SETTINGS,
@@ -433,13 +433,13 @@ describe("WorktreeWorkspaceSetting", () => {
         _tag: "Success",
         value: {
           ...DEFAULT_UNIFIED_SETTINGS,
-          worktreeBaseDirectory: "C:\\Users\\mauro\\Worktrees",
+          worktreeBaseDirectory: "C:\\Users\\user\\Worktrees",
         },
       });
       await Promise.resolve();
     });
 
-    expect(latest(harness.draftInputs).value).toBe("C:\\Users\\mauro\\Worktrees");
+    expect(latest(harness.draftInputs).value).toBe("C:\\Users\\user\\Worktrees");
 
     harness.settingsByEnvironment.set("host-one", {
       ...DEFAULT_UNIFIED_SETTINGS,

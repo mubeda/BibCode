@@ -18,14 +18,14 @@ describe("EnvironmentCardHeader", () => {
           statusLabel: "Connected",
           available: true,
         }}
-        workspaceRoot="/work/tripunkt/pathfinder-application-server"
+        workspaceRoot="/work/example-group/sample-server"
       />,
     );
     expect(markup).toContain('data-testid="environment-card-header-env-ai"');
     expect(markup).toContain("ai-server");
     expect(markup).toContain("Connected");
     expect(markup).toContain("AS");
-    expect(markup).toContain("/work/tripunkt/pathfinder-application-server");
+    expect(markup).toContain("/work/example-group/sample-server");
   });
 
   it("shows the monitor icon instead of avatar text for the local environment", () => {

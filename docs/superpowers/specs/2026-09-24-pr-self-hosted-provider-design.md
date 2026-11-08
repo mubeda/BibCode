@@ -7,17 +7,17 @@ round-3/4/5 rewrites that still await user confirmation.
 ## Problem and evidence
 
 User report (macOS client, remote Linux server, self-hosted GitLab
-`luna.tripunkt.de`): the Pull Requests panel renders slowly, also when the
+`code.example.test`): the Pull Requests panel renders slowly, also when the
 branch combo changes, and **New merge request** opens a dialog that says
 "Repository: Not detected" with "No supported source-control provider was found
 for this repository's remote." Reproduced on an isolated dev server with a clone
-of `https://luna.tripunkt.de/mubeda/sourcecontroltest.git`, a local-only branch,
+of `https://code.example.test/test-user/sample-project.git`, a local-only branch,
 and a PATH shim timing every `glab`/`gh`/`git` call:
 
 - `provider_info` in `apps/server/src/git/repository.rs` recognises GitLab only
   when the origin URL contains the substring `gitlab`, with a hard-coded
   `https://gitlab.com` base URL. Status, sidebar summaries, the Git Manager
-  pane and the create dialog therefore see no provider for `luna.tripunkt.de`,
+  pane and the create dialog therefore see no provider for `code.example.test`,
   while the Pull Requests module resolves it from the CLIs' configured hosts.
   Changing only the origin URL to a host containing `gitlab` flips the dialog to
   "GitLab · https://gitlab.com".
@@ -233,7 +233,7 @@ design. The first five entries originated in round 3:
   an origin remote: "Add an origin remote to create a pull request."
 - Opened from Pull Requests, the dialog receives the panel's provider and host
   as a hint. While status has not named the host (cold or stale), the
-  Repository cell shows the hinted host ("GitLab · https://luna.tripunkt.de")
+  Repository cell shows the hinted host ("GitLab · https://code.example.test")
   and creation is not blocked; the server validates the provider. Without a
   hint the dialog says "change request" until status answers; after it answers,
   a missing provider says "pull request".
@@ -300,7 +300,7 @@ design. The first five entries originated in round 3:
   `pullRequests`. The neutral shared permission button
   retains disabled reasons and accessible descriptions for both consumers.
 - Contracts: `vp run check:contracts`. Live: Loop 1 shows
-  "GitLab · https://luna.tripunkt.de"; Loop 2 before/after timings.
+  "GitLab · https://code.example.test"; Loop 2 before/after timings.
 
 ## Documentation to update
 

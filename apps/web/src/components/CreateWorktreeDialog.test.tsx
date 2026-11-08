@@ -1542,7 +1542,7 @@ if (browserRuntime) {
     });
 
     it("closes the branch list on a pick and shows the branch in the field (#151)", async () => {
-      testState.refs = [{ name: "main" }, { name: "feature-PFS-2272-alpha" }];
+      testState.refs = [{ name: "main" }, { name: "feature-ABC-2272-alpha" }];
       const { container, root } = await mountDialog();
       const rowsNamed = (name: string) =>
         Array.from(container.querySelectorAll("button")).filter(
@@ -1554,17 +1554,17 @@ if (browserRuntime) {
         container,
         "input[placeholder='Search branches']",
       );
-      await React.act(async () => requiredButton(container, "feature-PFS-2272-alpha").click());
+      await React.act(async () => requiredButton(container, "feature-ABC-2272-alpha").click());
 
-      expect(sourceInput.value).toBe("feature-PFS-2272-alpha");
+      expect(sourceInput.value).toBe("feature-ABC-2272-alpha");
       expect(rowsNamed("main")).toHaveLength(0);
-      expect(rowsNamed("feature-PFS-2272-alpha")).toHaveLength(0);
+      expect(rowsNamed("feature-ABC-2272-alpha")).toHaveLength(0);
       expect(document.activeElement).toBe(sourceInput);
       expect(requiredButton(container, "Create worktree").disabled).toBe(false);
 
       // Editing the field drops the pick and brings the list back.
       await setInputValue(sourceInput, "feature");
-      expect(rowsNamed("feature-PFS-2272-alpha")).toHaveLength(1);
+      expect(rowsNamed("feature-ABC-2272-alpha")).toHaveLength(1);
       expect(requiredButton(container, "Create worktree").disabled).toBe(true);
 
       await React.act(async () => root.unmount());

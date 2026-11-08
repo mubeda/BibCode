@@ -5,7 +5,7 @@ passed. Packaged-app and unavailable skill-review evidence remain unverified.
 
 ## Scope and findings
 
-Validated on Linux in the existing dirty checkout of `mubeda/main`, HEAD
+Validated on Linux in the existing dirty checkout of `test-user/main`, HEAD
 `dc5d6d3852572317d0f1fff461b98e69c43ed23a`. Earlier authorized fixes remain
 preserved. No commit, installation, push, or forge mutation was performed.
 

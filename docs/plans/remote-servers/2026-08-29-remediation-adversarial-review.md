@@ -414,7 +414,7 @@ one `it.each` with two rows — `Sidebar.test.tsx:4081` contributes 4 and
 Every claimed count reproduced exactly: **8,565 passed / 29 skipped** across 615 files, **333 desktop**,
 **1,713 server unit** (2,810 total across 59 targets including doc-tests), **3/3 interop**, **1/1 Docker
 smoke**, **1,999 formatted / 1,412 linted**, **11/11 typecheck targets**, `cargo fmt` clean. Docker is
-podman-backed (CLI 29.7.2, context `pathfinder-podman`, Podman 5.8.4), matching the report's own
+podman-backed (CLI 29.7.2, context `sample-podman`, Podman 5.8.4), matching the report's own
 disclosure. Cleanup verified: three filtered listings empty, both `inspect` calls fail, zero surviving
 `bibcode` binary processes.
 

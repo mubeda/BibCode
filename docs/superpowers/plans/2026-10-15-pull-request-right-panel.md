@@ -23,7 +23,7 @@ Effect atoms (`useEnvironmentQuery`), Tailwind 4 container queries, Vite+ test
 
 ## Global Constraints
 
-- Repository root: `/work/workspaces/orca/BibCode/makara`, branch `mubeda/pr-right-panel`.
+- Repository root: `/work/workspaces/orca/BibCode/makara`, branch `test-user/pr-right-panel`.
 - `vp` is not on PATH: run `node scripts/run-local-vp.mjs <args>` from the repo root.
 - Web unit tests: `cd apps/web && node ../../scripts/run-local-vp.mjs test run --project unit <files>`.
 - Lint is warning-free and `vp check` fails on any warning (`lint.options.denyWarnings`); no `oxlint-disable` comments.

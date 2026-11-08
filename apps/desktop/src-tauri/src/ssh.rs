@@ -4335,11 +4335,11 @@ mod tests {
     fn preserves_windows_backslashes_in_quoted_include_paths() {
         assert_eq!(
             split_directive_args(
-                r#"Include "C:\Users\mauro\.ssh\config dir\team.conf" # trailing comment"#,
+                r#"Include "C:\Users\user\.ssh\config dir\team.conf" # trailing comment"#,
             ),
             Ok(vec![
                 "Include".to_string(),
-                r"C:\Users\mauro\.ssh\config dir\team.conf".to_string(),
+                r"C:\Users\user\.ssh\config dir\team.conf".to_string(),
             ])
         );
     }

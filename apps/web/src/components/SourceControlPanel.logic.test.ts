@@ -18,14 +18,14 @@ import {
 } from "./SourceControlPanel.logic";
 
 const FILES: WorkingTreeFile[] = [
-  { path: "docs/prps/PFS-1848/master-plan.md", insertions: 218, deletions: 0 },
+  { path: "docs/prps/ABC-1848/master-plan.md", insertions: 218, deletions: 0 },
   { path: "tasks.md", insertions: 139, deletions: 4 },
 ];
 
 describe("splitFilePath", () => {
   it("splits a nested path into dir and name", () => {
-    expect(splitFilePath("docs/prps/PFS-1848/master-plan.md")).toEqual({
-      dir: "docs/prps/PFS-1848",
+    expect(splitFilePath("docs/prps/ABC-1848/master-plan.md")).toEqual({
+      dir: "docs/prps/ABC-1848",
       name: "master-plan.md",
     });
   });

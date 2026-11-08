@@ -4860,21 +4860,21 @@ exit /b 9
     fn builds_local_server_launch_plan() {
         let config = local_test_config(3773);
         let plan =
-            BackendLaunchPlan::local(PathBuf::from("C:/Users/mauro/.bibcode"), config.clone());
+            BackendLaunchPlan::local(PathBuf::from("C:/Users/user/.bibcode"), config.clone());
 
         assert_eq!(plan.log_path, None);
         assert!(matches!(
             plan.target,
-            BackendLaunchTarget::InProcess { ref base_dir, .. } if base_dir == &PathBuf::from("C:/Users/mauro/.bibcode")
+            BackendLaunchTarget::InProcess { ref base_dir, .. } if base_dir == &PathBuf::from("C:/Users/user/.bibcode")
         ));
 
         let logged_plan = plan.with_log_path(PathBuf::from(
-            "C:/Users/mauro/.bibcode/dev/logs/server-child.log",
+            "C:/Users/user/.bibcode/dev/logs/server-child.log",
         ));
         assert_eq!(
             logged_plan.log_path,
             Some(PathBuf::from(
-                "C:/Users/mauro/.bibcode/dev/logs/server-child.log"
+                "C:/Users/user/.bibcode/dev/logs/server-child.log"
             ))
         );
     }
@@ -4885,8 +4885,8 @@ exit /b 9
         let server_config = server_config_for_launch(
             ResolvedDataRoot {
                 source: DataRootSource::Cli,
-                requested: PathBuf::from("C:/Users/mauro/.bibcode"),
-                effective: PathBuf::from("C:/Users/mauro/.bibcode"),
+                requested: PathBuf::from("C:/Users/user/.bibcode"),
+                effective: PathBuf::from("C:/Users/user/.bibcode"),
                 is_filesystem_alias: false,
             },
             &config,
@@ -4896,7 +4896,7 @@ exit /b 9
         assert_eq!(server_config.port, 3773);
         assert_eq!(
             server_config.base_dir,
-            PathBuf::from("C:/Users/mauro/.bibcode")
+            PathBuf::from("C:/Users/user/.bibcode")
         );
         assert_eq!(
             server_config.desktop_bootstrap_token.as_deref(),
@@ -4946,7 +4946,7 @@ exit /b 9
             data_root: "/srv/bibcode data".to_string(),
         })
         .with_log_path(PathBuf::from(
-            "C:/Users/mauro/.bibcode/dev/logs/server-child-wsl-Ubuntu.log",
+            "C:/Users/user/.bibcode/dev/logs/server-child-wsl-Ubuntu.log",
         ));
 
         assert_eq!(plan.config.environment_id, "wsl:Ubuntu");
@@ -4995,7 +4995,7 @@ exit /b 9
         assert_eq!(
             plan.log_path,
             Some(PathBuf::from(
-                "C:/Users/mauro/.bibcode/dev/logs/server-child-wsl-Ubuntu.log"
+                "C:/Users/user/.bibcode/dev/logs/server-child-wsl-Ubuntu.log"
             ))
         );
     }
@@ -5017,7 +5017,7 @@ exit /b 9
     fn local_environment_bootstraps_include_parallel_primary_and_wsl_slots() {
         let supervisor = BackendSupervisor::new();
         let primary = BackendLaunchPlan::local(
-            PathBuf::from("C:/Users/mauro/.bibcode"),
+            PathBuf::from("C:/Users/user/.bibcode"),
             local_test_config(3773),
         );
         let wsl = BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
@@ -5065,7 +5065,7 @@ exit /b 9
     fn current_run_config_prefers_primary_slot_when_secondary_exists() {
         let supervisor = BackendSupervisor::new();
         let primary = BackendLaunchPlan::local(
-            PathBuf::from("C:/Users/mauro/.bibcode"),
+            PathBuf::from("C:/Users/user/.bibcode"),
             local_test_config(3773),
         );
         let wsl = BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {

@@ -2,7 +2,7 @@
 
 **Last touched:** 2026-09-21 14:30 UTC (coordinator, after live acceptance)
 **Branch:** main-3 (worktree `/work/workspaces/orca/BibCode/main-3`, base commit `1bbc8d1a`)
-**Status:** all phases accepted, including live acceptance on GitHub (`mubeda/SourceControlTest`) and the company GitLab (`luna.tripunkt.de/mubeda/sourcecontroltest`, GitLab 19.3.2). Committed on `main-3` as `e807bb01` plus a vocabulary follow-up; not merged into `main`.
+**Status:** all phases accepted, including live acceptance on GitHub (`test-user/sample-project`) and the company GitLab (`code.example.test/test-user/sample-project`, GitLab 19.3.2). Committed on `main-3` as `e807bb01` plus a vocabulary follow-up; not merged into `main`.
 
 ## What this iteration delivered
 

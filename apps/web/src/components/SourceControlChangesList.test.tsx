@@ -20,7 +20,7 @@ function renderList(
 }
 
 const FILES: WorkingTreeFile[] = [
-  { path: "docs/prps/PFS-1848/master-plan.md", insertions: 218, deletions: 0 },
+  { path: "docs/prps/ABC-1848/master-plan.md", insertions: 218, deletions: 0 },
   { path: "tasks.md", insertions: 139, deletions: 4 },
 ];
 
@@ -63,7 +63,7 @@ describe("SourceControlChangesList", () => {
   it("renders each file's name under its folder header with +/- counts", () => {
     const markup = renderList({ files: FILES });
     expect(markup).toContain("master-plan.md");
-    expect(markup).toContain("docs/prps/PFS-1848");
+    expect(markup).toContain("docs/prps/ABC-1848");
     expect(markup).toContain("+218");
     expect(markup).toContain("-4");
   });
@@ -71,14 +71,14 @@ describe("SourceControlChangesList", () => {
   it("groups files under expandable folder headers, root first", () => {
     const markup = renderList({ files: FILES });
     expect(markup).toContain('title="Repository root"');
-    expect(markup).toContain('title="docs/prps/PFS-1848"');
+    expect(markup).toContain('title="docs/prps/ABC-1848"');
     // The section header and both folder headers are expanded.
     expect(markup.match(/aria-expanded="true"/g)).toHaveLength(3);
-    expect(markup.indexOf("Repository root")).toBeLessThan(markup.indexOf("docs/prps/PFS-1848"));
-    expect(markup).toContain('aria-label="docs/prps/PFS-1848, 1 file"');
+    expect(markup.indexOf("Repository root")).toBeLessThan(markup.indexOf("docs/prps/ABC-1848"));
+    expect(markup).toContain('aria-label="docs/prps/ABC-1848, 1 file"');
     // The path is isolated with <bdi>, so no bidi control characters end up in
     // the text the user can select and copy.
-    expect(markup).toContain('<bdi dir="ltr">docs/prps/PFS-1848</bdi>');
+    expect(markup).toContain('<bdi dir="ltr">docs/prps/ABC-1848</bdi>');
     expect(markup).not.toContain("\u200e");
   });
 
@@ -87,7 +87,7 @@ describe("SourceControlChangesList", () => {
     // Only the section header expands; no folder headers render.
     expect(markup.match(/aria-expanded/g)).toHaveLength(1);
     expect(markup).not.toContain("Repository root");
-    expect(markup).toContain("docs/prps/PFS-1848");
+    expect(markup).toContain("docs/prps/ABC-1848");
     expect(markup).toContain("master-plan.md");
     // The directory keeps a readable floor and yields the rest to the name,
     // which is never capped.
@@ -97,7 +97,7 @@ describe("SourceControlChangesList", () => {
 
   it("renders a folder header checkbox that stages the whole folder", () => {
     const markup = renderList({ files: FILES, checked: () => false });
-    expect(markup).toContain('aria-label="Stage all files in docs/prps/PFS-1848"');
+    expect(markup).toContain('aria-label="Stage all files in docs/prps/ABC-1848"');
     expect(markup).toContain('aria-label="Stage all files in the repository root"');
   });
 

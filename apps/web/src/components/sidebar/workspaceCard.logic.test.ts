@@ -143,16 +143,16 @@ describe("resolveWorkspaceCardBranchTooltip", () => {
       resolveWorkspaceCardBranchTooltip({
         branch: "fix-TRI-150",
         worktreePath: "/repos/wt/fix-TRI-150",
-        checkoutPath: "/repos/customer-portal",
+        checkoutPath: "/repos/sample-project",
       }),
     ).toBe("Worktree: fix-TRI-150 (fix-TRI-150)");
     expect(
       resolveWorkspaceCardBranchTooltip({
         branch: "develop",
         worktreePath: null,
-        checkoutPath: "/repos/customer-portal",
+        checkoutPath: "/repos/sample-project",
       }),
-    ).toBe("Checkout: customer-portal (develop)");
+    ).toBe("Checkout: sample-project (develop)");
     expect(
       resolveWorkspaceCardBranchTooltip({
         branch: "develop",

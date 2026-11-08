@@ -85,8 +85,8 @@ Risk: Medium (wide surface; every later phase compiles against these types). Eff
 	      parents: ["0ecd0de1111111111111111111111111111111111", "b58fe80222222222222222222222222222222222"],
 	      refs: [{ name: "develop", kind: "local-branch" }],
 	      subject: "Merge branch 'feature' into develop",
-	      authorName: "mubeda",
-	      authorEmail: "mauro.ubeda@example.invalid",
+	      authorName: "test-user",
+	      authorEmail: "test.user@example.invalid",
 	      authoredAtMs: 1_780_000_000_000,
 	      committedAtMs: 1_780_000_000_000,
 	    });

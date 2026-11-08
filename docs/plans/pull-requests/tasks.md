@@ -65,7 +65,7 @@ _(The coordinator appends one entry per phase review: verdict, findings, fix rou
 - **Phase 08 — completed after round 1 (2026-09-21 07:05, coordinator).** Host gates: module 373 tests / 48 files, `vp run typecheck`, `vp check` 0 errors. Playwright (read-only, profile-pr2) on openai/codex#35882 as read-only viewer and mubeda/BibCode#14 (merged, own repo): every write control disabled with the server reason on #35882 and no method select; editors, base picker, people/label/milestone pickers and overflow menu open on #14; title draft survives reload; no `pullRequests.runAction` sent; no console errors; no external requests. Round 1 fixed: overflow items rendered inline through `Button` (now standard stacked menu rows), draft toggle shown disabled on merged/closed (now omitted), merge box repeating a lone readiness reason. Live write acceptance (edit/label undo/milestone/lock/merge/revert) stays with Phase 10 pending the designated repository. Fix rounds: 1.
 - **Phase 09 — completed after round 2 (2026-09-21 08:55, coordinator).** Host gates: checkout suite 31, lib pull_requests 151, git lib 273, worktree catalog 57, context/list 18, rpc_wire 13, web pullRequests+gitManager+state 791 tests / 111 files, typecheck, `vp check` 0 errors. Live (dev server, scratch clone of mubeda/BibCode, #14): split button and targets; Checkout completed with the success toast and "Open Git Manager there"; "New worktree…" created a managed worktree visible in the sidebar and in the targets. Round 1 (data loss): closing the browser mid-checkout had killed `gh pr checkout` mid-write (11,350 files deleted, stale `index.lock`); after the fix, closing at 800 ms left the tree untouched and closing at 1200–3500 ms always ended with `main-2` checked out, clean tree, no lock. Round 2: occupied matching branch now yields `<head>-pr-<n>` (`main-2-pr-14` observed) per spec § 8.5; the permanent "Loading worktrees…" label (Effect stream atoms keep `waiting: true`) fixed for both the Pull Requests and Git Manager toolbars. Fix rounds: 2.
 - **Phase 10 — Codex part accepted; phase stays `in_progress` (2026-09-21 09:45, coordinator).** Host gates: fmt, clippy `-D warnings`, full server suite (68 targets; only 3 pre-existing `provider_terminal` timing tests fail under `-j 2` and pass individually, files untouched), tripwires 9, web telemetry 14, web module 418, `vp run test` graph (same server flake), `vp check` 0 errors, typecheck. Docs reviewed: `workspace-ui.md` § Pull Requests, `source-control-providers.md` (matrix, inventory, self-hosted setup) match the verified behaviour. Step 10.8 done for the read-only GitHub pass (`pw/e2e-github-readonly.mjs`, `shots-e2e/`: BibCode Closed 13, filters, detail tabs with `tab` param, files with viewed state, codex Open 169 / Closed 16389, settings switch and host lines, no console errors, no external requests) and for checkout (Phase 09); live writes remain pending a designated repository. Step 10.9 pending (GitLab host). Step 10.10 done: `handoff.md` filled.
-- **Phase 10 — live acceptance done on both hosts (2026-09-21 14:10, coordinator).** Repositories designated by the requester: `mubeda/SourceControlTest` (GitHub, admin) and `luna.tripunkt.de/mubeda/sourcecontroltest` (self-hosted GitLab 19.3.2, owner; `glab` logged in from the stored git credential). Drivers `pw/live-github.mjs` and `pw/live-gitlab.mjs` (STEPS env) drove the UI and verified every write through the host API. GitHub PR #4: comment, 👍 reaction, label with Undo, milestone set/clear, assignee, lock (resolved)/unlock, title, draft/ready, inline review comment with suggestion, single inline comment, review submitted as Comment, thread resolve, merge (merge commit, custom subject, delete branch), revert → PR #5, close/reopen/close. GitLab !1: note, thumbsup award, label with Undo, milestone set/clear, assignee, lock/unlock, title, draft/ready, approve, revoke, inline suggestion posted and applied with a commit message (branch commit verified), merge with custom subject/body through the REST path (merge commit title verified, source branch removed), revert → !3, close/reopen; !2: checkout into the clone, delete. Request changes stayed disabled (author is not a listed reviewer; host rule) and the reviewer picker was empty (author excluded, single member). Live round 1 fixed `glab --input` lacking `Content-Type: application/json` (REST 415 / GraphQL "Unexpected end of document" on both gitlab.com and the company host) and the picker window after Undo; live round 2 fixed GraphQL note ids of subclasses (`gid://gitlab/DiffNote/…`) that broke the whole timeline once an inline note existed, and added a 30-second bounded context cache (14 → 7 processes per warm GitLab action). Remaining copy nit: the GitLab merge confirmation is titled "Merge pull request" instead of the host vocabulary. Fix rounds in Phase 10: 2.
+- **Phase 10 — live acceptance done on both hosts (2026-09-21 14:10, coordinator).** Repositories designated by the requester: `test-user/sample-project` (GitHub, admin) and `code.example.test/test-user/sample-project` (self-hosted GitLab 19.3.2, owner; `glab` logged in from the stored git credential). Drivers `pw/live-github.mjs` and `pw/live-gitlab.mjs` (STEPS env) drove the UI and verified every write through the host API. GitHub PR #4: comment, 👍 reaction, label with Undo, milestone set/clear, assignee, lock (resolved)/unlock, title, draft/ready, inline review comment with suggestion, single inline comment, review submitted as Comment, thread resolve, merge (merge commit, custom subject, delete branch), revert → PR #5, close/reopen/close. GitLab !1: note, thumbsup award, label with Undo, milestone set/clear, assignee, lock/unlock, title, draft/ready, approve, revoke, inline suggestion posted and applied with a commit message (branch commit verified), merge with custom subject/body through the REST path (merge commit title verified, source branch removed), revert → !3, close/reopen; !2: checkout into the clone, delete. Request changes stayed disabled (author is not a listed reviewer; host rule) and the reviewer picker was empty (author excluded, single member). Live round 1 fixed `glab --input` lacking `Content-Type: application/json` (REST 415 / GraphQL "Unexpected end of document" on both gitlab.com and the company host) and the picker window after Undo; live round 2 fixed GraphQL note ids of subclasses (`gid://gitlab/DiffNote/…`) that broke the whole timeline once an inline note existed, and added a 30-second bounded context cache (14 → 7 processes per warm GitLab action). Remaining copy nit: the GitLab merge confirmation is titled "Merge pull request" instead of the host vocabulary. Fix rounds in Phase 10: 2.
 - **Phase 10 — completed (2026-09-21 14:30, coordinator).** Live round 3 routed the merge confirmation title, missing/stale-head hints and checkout/list aria labels through the host vocabulary; verified live on GitLab !3 ("Merge merge request | Merge now into main. …", dialog cancelled) and by 428 web module tests, typecheck and `vp check`. GitHub and GitLab end-to-end acceptance are complete; the feature is committed on `main-3` (`e807bb01` plus the round 3 follow-up). Fix rounds in Phase 10: 3.
 - **Phase 06 — changes_requested, round 1 (2026-09-21 04:30, coordinator).** Codex's final turn hung after writing the handoff (same pattern as Phase 04); cancelled and reviewed from disk. Host gates green: module 273, full web 6463 passed / 22 skipped, typecheck, `vp check`; the server edits this phase made (`minimized` on thread comments, `isMinimized` in the three GitHub thread/comment queries, `reviewPosted`/`failed[].body` in the result) pass fmt, clippy, `--lib pull_requests` 143, `pull_requests_detail_reads` 21, `pull_requests_review_actions` 30, `rpc_wire` 13, and the three changed GitHub queries execute live on openai/codex #35882. Browser verification on the rebuilt dev server against #35882 (READ viewer): comment box enabled with Write/Preview and a draft that survives reload, 32 reaction toggles, Reply/Resolve on threads, "Review · N pending comments" bar, review popover with Comment/Approve/Request changes enabled and Revoke/Remove disabled with the GitHub reason, Submit disabled until a summary or comment exists, Dismiss review disabled with the branch-rule reason, Merge disabled with the write-access reason, line-number click opens the inline composer with Insert suggestion / Add review comment / Add single comment, a pending comment shows in the bar and the card and survives reload; no external requests (evidence: scratchpad `shots-pr06/`). No write was submitted (no designated repository). Finding: (1) React console error on the conversation tab: "Base UI: A component that acts as a button expected a non-<button> because the `nativeButton` prop is false" — a Base UI trigger/item renders a native `<button>` through `render` while `nativeButton` is false (candidates: the reaction menu trigger and items in `PullRequestsReactions.tsx`, the comment actions menu in `PullRequestsCommentActions.tsx`). Observation for Phase 08: the merge box on a repository where the viewer cannot merge shows a "No default merge method" select; Phase 08 owns the merge controls.
 - **Phase 05 — completed (2026-09-21 02:50, coordinator).** Host gates green: fmt, clippy, `--lib pull_requests` 143, `pull_requests_review_actions` 28, `pull_requests_detail_reads` 21, `pull_requests_context_list` 18, `rpc_wire` 13 (the listener tests Codex's sandbox could not run), contracts 636, `vp check`. Live validation of the eight new GraphQL documents: GitHub `MinimizeCommentInput{subjectId,classifier}` / `UnminimizeCommentInput{subjectId}` / `ResolveReviewThreadInput{threadId}` / `UnresolveReviewThreadInput{threadId}`, payload fields and the `OUTDATED` classifier confirmed by introspection, `REVIEW_THREAD_STATE` executed on openai/codex #35882's thread (`isResolved: false`); GitLab `mergeRequestRequestChanges`, `mergeRequestDestroyRequestedChanges`, `mergeRequestReviewerRereview` present on gitlab.com with inputs `{projectPath, iid[, userId]}` and payload `{errors, mergeRequest}`. Code review: bodies via stdin (`gh … --body-file -`, `gh api --input -`) or the private temp file (`glab api --input`), stale-head check before any host call, permission pre-check without side effects, `ReviewSubmitted { landed, failed }` on both hosts. No write was executed against a real host (no designated repository yet). Fix rounds: 0.
@@ -19975,7 +19975,7 @@ The Step 02.15 mutation proof failed exactly the required settings-off and expli
 
 ##### React and UI reviews
 
-All changed React components/hooks were reviewed against the available [vercel-react-best-practices skill](/home/mauro/.agents/skills/vercel-react-best-practices/SKILL.md) and root [UI.md](../../../UI.md). A fresh read-only reviewer independently checked the implementation; the primary agent verified and fixed every finding in one red → green correction pass and reviewed the added hook/restoration changes afterward.
+All changed React components/hooks were reviewed against the available [vercel-react-best-practices skill](/home/user/.agents/skills/vercel-react-best-practices/SKILL.md) and root [UI.md](../../../UI.md). A fresh read-only reviewer independently checked the implementation; the primary agent verified and fixed every finding in one red → green correction pass and reviewed the added hook/restoration changes afterward.
 
 | Reviewed surface                                                      | React evidence                                                                                                                                                                                                          | UI.md evidence                                                                                                                                                                            |
 | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -38716,7 +38716,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ---- pull_requests_review_fix_gitlab_scalar_and_array_detail_are_typed_errors stdout ----
 
-thread 'pull_requests_review_fix_gitlab_scalar_and_array_detail_are_typed_errors' (460) panicked at /home/mauro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/value/index.rs:102:18:
+thread 'pull_requests_review_fix_gitlab_scalar_and_array_detail_are_typed_errors' (460) panicked at /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/value/index.rs:102:18:
 cannot access key "diff_refs" in JSON string
 
 ---- pull_requests_review_fix_gitlab_native_suggestion_appliable_is_normalized stdout ----
@@ -47838,7 +47838,7 @@ Anchor format: **`?tab=files#file=<encodeURIComponent(path)>`**. Files decodes o
 
 ##### React and UI.md reviews
 
-Every changed production React component and hook was reviewed against the [vercel-react-best-practices skill](/home/mauro/.agents/skills/vercel-react-best-practices/SKILL.md), including `rerender-memo`, `rerender-dependencies`, `rerender-derived-state-no-effect`, `rerender-no-inline-components`, `bundle-dynamic-imports`, `client-localstorage-schema`, `js-index-maps`, and immutable sorting rules. Every user-visible change was separately reviewed against root [UI.md](../../../UI.md). A fresh read-only reviewer inspected the same work; its findings were checked against source and reproduced before correction.
+Every changed production React component and hook was reviewed against the [vercel-react-best-practices skill](/home/user/.agents/skills/vercel-react-best-practices/SKILL.md), including `rerender-memo`, `rerender-dependencies`, `rerender-derived-state-no-effect`, `rerender-no-inline-components`, `bundle-dynamic-imports`, `client-localstorage-schema`, `js-index-maps`, and immutable sorting rules. Every user-visible change was separately reviewed against root [UI.md](../../../UI.md). A fresh read-only reviewer inspected the same work; its findings were checked against source and reproduced before correction.
 
 | Reviewed surface                                  | React review evidence                                                                                                                                                                                                                          | UI.md review evidence                                                                                                                                                                                                       |
 | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -57720,9 +57720,9 @@ Received: "<div></div>"
 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/15]⎯
 
  FAIL  apps/web/src/components/pullRequests/detail/PullRequestsMergeBox.test.tsx > PullRequestsMergeBox > shows merged author/time and Revert, and closed requests have no merge controls
-AssertionError: expected '<div></div>' to contain 'Merged by mubeda'
+AssertionError: expected '<div></div>' to contain 'Merged by test-user'
 
-Expected: "Merged by mubeda"
+Expected: "Merged by test-user"
 Received: "<div></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsMergeBox.test.tsx:30:20
@@ -57886,12 +57886,12 @@ note: You are running `vp test` as a Vite+ built-in command. If you meant to run
 ⎯⎯⎯⎯⎯⎯ Failed Tests 22 ⎯⎯⎯⎯⎯⎯⎯
 
  FAIL  apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts > headerSentence > uses GitHub's author, count and base/head order
-AssertionError: expected '' to be 'mubeda wants to merge 3 commits into …' // Object.is equality
+AssertionError: expected '' to be 'test-user wants to merge 3 commits into …' // Object.is equality
 
 - Expected
 + Received
 
-- mubeda wants to merge 3 commits into main from feature
+- test-user wants to merge 3 commits into main from feature
 
  ❯ apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts:6:127
       4| import { comment, context, detail, event, file, gitlabContext, review,…
@@ -57904,12 +57904,12 @@ AssertionError: expected '' to be 'mubeda wants to merge 3 commits into …' // 
 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/22]⎯
 
  FAIL  apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts > headerSentence > uses GitLab's source/target order
-AssertionError: expected '' to be 'mubeda requested to merge feature int…' // Object.is equality
+AssertionError: expected '' to be 'test-user requested to merge feature int…' // Object.is equality
 
 - Expected
 + Received
 
-- mubeda requested to merge feature into main
+- test-user requested to merge feature into main
 
  ❯ apps/web/src/components/pullRequests/detail/pullRequestsDetail.logic.test.ts:7:119
       5| describe("headerSentence", () => {
@@ -58641,7 +58641,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58657,7 +58657,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58673,7 +58673,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58689,7 +58689,7 @@ Received: "<div></div>"
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:14:18
      12|   it.each([[comment, "A comment"], [review, "approved these changes"],…
      13|     const html = renderToStaticMarkup(<PullRequestsTimelineItem {...pr…
-     14|     expect(html).toContain(text); expect(html).toContain("mubeda"); ex…
+     14|     expect(html).toContain(text); expect(html).toContain("test-user"); ex…
        |                  ^
      15|   });
      16|   it("shows edited comments and read-only reactions", () => {
@@ -58936,7 +58936,7 @@ AssertionError: expected '' to contain '1234567'
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsCommits.test.tsx:17:96
      15|     try {
      16|       await act(async () => root.render(<PullRequestsCommits commits={…
-     17|       for (const text of ["1234567", "Fix the tests", "mubeda"]) expec…
+     17|       for (const text of ["1234567", "Fix the tests", "test-user"]) expec…
        |                                                                                                ^
      18|       expect(container.querySelector("time")?.dateTime).toBe(commit.au…
      19|       expect(container.querySelector("img")).toBeNull();
@@ -59177,7 +59177,7 @@ Failed to read theme preference for bibcode:theme. {
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'updated the request'
 
 Expected: "updated the request"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> function Object() { [native code] } <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> function Object() { [native code] } <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59291,7 +59291,7 @@ AssertionError: expected undefined to be defined
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'requested review from alice'
 
 Expected: "requested review from alice"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> review_requested alice <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> review_requested alice <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59302,7 +59302,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'marked ready for review'
 
 Expected: "marked ready for review"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> ready_for_review <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> ready_for_review <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59313,7 +59313,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'converted to draft'
 
 Expected: "converted to draft"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> converted_to_draft <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> converted_to_draft <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59324,7 +59324,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'force-pushed the head branch'
 
 Expected: "force-pushed the head branch"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> head_ref_force_pushed <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> head_ref_force_pushed <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -59335,7 +59335,7 @@ Received: "<div role="listitem" data-text-surface="background" class="flex items
 AssertionError: expected '<div role="listitem" data-text-surfac…' to contain 'updated the request: Host activity'
 
 Expected: "updated the request: Host activity"
-Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>mubeda</span></span> unknown Host activity <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
+Received: "<div role="listitem" data-text-surface="background" class="flex items-start gap-2 px-3 py-4 text-sm"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-dot mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true"><circle cx="12" cy="12" r="1"></circle><circle cx="12" cy="12" r="10"></circle></svg><p><span class="inline-flex items-center gap-1.5"><span>test-user</span></span> unknown Host activity <time dateTime="2026-09-20T09:00:00Z" title="2026-09-20T09:00:00Z" class="text-xs text-muted-foreground">14h ago</time></p></div>"
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:24:18
 
@@ -95660,7 +95660,7 @@ AssertionError: expected 'src/a b#é.ts:3–4ResolvedOutdated@@ -3…' not to co
 - Thread comment
 + src/a b#é.ts:3–4ResolvedOutdated@@ -3 +3 @@
 + -old
-+ +newMmubeda16h agoeditedThread comment👍 2Write access is required for this action.Add reactionWrite access is required for this action.Lines 3–4ApplyWrite access is required for this action.CopyWrite access is required for this action.-old+newUnresolve threadWrite access is required for this action.Reply to threadWritePreviewWrite access is required for this action.ReplyWrite access is required for this action.
++ +newMtest-user16h agoeditedThread comment👍 2Write access is required for this action.Add reactionWrite access is required for this action.Lines 3–4ApplyWrite access is required for this action.CopyWrite access is required for this action.-old+newUnresolve threadWrite access is required for this action.Reply to threadWritePreviewWrite access is required for this action.ReplyWrite access is required for this action.
 
  ❯ apps/web/src/components/pullRequests/detail/PullRequestsTimelineItem.test.tsx:33:46
      31|     const view = await mount(<PullRequestsTimelineItem {...props} perm…
@@ -106831,7 +106831,7 @@ Phase 09 may add Checkout in the header without changing merge ownership. Phase 
 
 ##### React and UI.md reviews
 
-All changed production React components/hooks were reviewed against the [vercel-react-best-practices skill](/home/mauro/.agents/skills/vercel-react-best-practices/SKILL.md), including effect dependencies, derived state, deferred store reads, stable selection identity, memoized data and versioned local storage. Every visible change was separately reviewed against root [UI.md](../../../UI.md). One fresh read-only reviewer performed the independent review mandated by the execution/review skills; it made no edits or browser runs.
+All changed production React components/hooks were reviewed against the [vercel-react-best-practices skill](/home/user/.agents/skills/vercel-react-best-practices/SKILL.md), including effect dependencies, derived state, deferred store reads, stable selection identity, memoized data and versioned local storage. Every visible change was separately reviewed against root [UI.md](../../../UI.md). One fresh read-only reviewer performed the independent review mandated by the execution/review skills; it made no edits or browser runs.
 
 | Surface                     | React evidence                                                                                                                       | UI.md evidence                                                                                                                                                                            |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

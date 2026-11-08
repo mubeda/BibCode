@@ -83,7 +83,7 @@ Risk: High (new Git parsing, shared registries, guard policy that the whole UI t
 	```rust
 	#[test]
 	fn parses_a_merge_commit_record_with_two_parents_and_decorations() {
-	    let raw = "9569e81eda50\u{1f}9569e81\u{1f}0ecd0de b58fe80\u{1f}mubeda\u{1f}m@example.invalid\u{1f}1780000000\u{1f}1780000001\u{1f}HEAD -> develop, tag: v1.2.0, origin/develop\u{1f}Merge branch 'x'\u{1e}";
+	    let raw = "9569e81eda50\u{1f}9569e81\u{1f}0ecd0de b58fe80\u{1f}test-user\u{1f}m@example.invalid\u{1f}1780000000\u{1f}1780000001\u{1f}HEAD -> develop, tag: v1.2.0, origin/develop\u{1f}Merge branch 'x'\u{1e}";
 	    let commits = parse_commit_graph_records(raw, &["origin".to_owned()]);
 	    let commit = commits.first().expect("one commit");
 	    assert_eq!(commit.parents.len(), 2);

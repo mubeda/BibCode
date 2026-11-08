@@ -71,7 +71,7 @@ in chat, command output, source control, or repository files.
 - Store its passphrase separately in
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 - Write the requested recoverable private-key backup to
-  `C:\Users\mauro\Downloads\bibcode-updater.key`.
+  `C:\Users\user\Downloads\bibcode-updater.key`.
 - Refuse to overwrite an existing key backup at that path.
 - The user must preserve the passphrase separately from the key backup.
 

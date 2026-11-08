@@ -5,10 +5,10 @@ describe("pullRequestsHostAddress", () => {
   it("takes the host's address from the repository URL the server reported", () => {
     expect(
       pullRequestsHostAddress({
-        webUrl: "https://luna.tripunkt.de/group/repo",
-        host: "luna.tripunkt.de",
+        webUrl: "https://code.example.test/group/repo",
+        host: "code.example.test",
       }),
-    ).toBe("https://luna.tripunkt.de");
+    ).toBe("https://code.example.test");
   });
 
   it("keeps the scheme and port a self-hosted instance uses", () => {

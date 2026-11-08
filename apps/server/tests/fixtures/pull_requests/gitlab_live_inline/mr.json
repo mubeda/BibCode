@@ -19,35 +19,35 @@
   "downvotes": 0,
   "author": {
     "id": 4,
-    "username": "mubeda",
+    "username": "test-user",
     "public_email": "",
-    "name": "Mauro Ubeda",
+    "name": "Test User",
     "state": "active",
     "locked": false,
-    "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
-    "web_url": "https://luna.tripunkt.de/mubeda"
+    "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
+    "web_url": "https://code.example.test/test-user"
   },
   "assignees": [
     {
       "id": 4,
-      "username": "mubeda",
+      "username": "test-user",
       "public_email": "",
-      "name": "Mauro Ubeda",
+      "name": "Test User",
       "state": "active",
       "locked": false,
-      "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
-      "web_url": "https://luna.tripunkt.de/mubeda"
+      "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
+      "web_url": "https://code.example.test/test-user"
     }
   ],
   "assignee": {
     "id": 4,
-    "username": "mubeda",
+    "username": "test-user",
     "public_email": "",
-    "name": "Mauro Ubeda",
+    "name": "Test User",
     "state": "active",
     "locked": false,
-    "avatar_url": "https://luna.tripunkt.de/uploads/-/system/user/avatar/4/avatar.png",
-    "web_url": "https://luna.tripunkt.de/mubeda"
+    "avatar_url": "https://code.example.test/uploads/-/system/user/avatar/4/avatar.png",
+    "web_url": "https://code.example.test/test-user"
   },
   "reviewers": [],
   "source_project_id": 72,
@@ -70,8 +70,8 @@
   "force_remove_source_branch": true,
   "prepared_at": "2026-09-21T11:47:21.623Z",
   "reference": "!1",
-  "references": { "short": "!1", "relative": "!1", "full": "mubeda/sourcecontroltest!1" },
-  "web_url": "https://luna.tripunkt.de/mubeda/sourcecontroltest/-/merge_requests/1",
+  "references": { "short": "!1", "relative": "!1", "full": "test-user/sample-project!1" },
+  "web_url": "https://code.example.test/test-user/sample-project/-/merge_requests/1",
   "time_stats": {
     "time_estimate": 0,
     "total_time_spent": 0,

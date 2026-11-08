@@ -176,7 +176,7 @@ async fn run(
 async fn each_eligible_operation_reports_sign_in_required_once_without_retrying() {
     for (request, direction, resume_tag) in eligible_requests() {
         let runner = RemoteRunner::new(
-            concat!("https:", "//mauro:token@github.com/owner/repo.git\n"),
+            concat!("https:", "//user:token@github.com/owner/repo.git\n"),
             GCM_STDERR,
         );
         let error = run(&runner, &request, CredentialPrompt::OfferSignIn)
