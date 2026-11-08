@@ -2809,7 +2809,10 @@ async fn plan_shared_restore(
                 cancellation,
             )
             .await?;
-            if !changes.turns.is_empty() {
+            // Turns in the window are not the only outside work: a deleted chat can
+            // write after this thread's last checkpoint, past the event window, and
+            // those paths are what `git clean` would delete.
+            if changes.outside_changes() {
                 acknowledge_sibling_changes(thread_id, turn_count, &changes, token)?;
                 return Ok((
                     fallback_to_head,
@@ -3090,8 +3093,9 @@ pub(crate) async fn preview_checkpoint_revert(
         ),
         _ => None,
     };
-    // A deleted chat's changes count only when it changed files since the target.
-    let changes = changes.filter(|changes| shared || !changes.turns.is_empty());
+    // A deleted chat counts when it has turns in the window or files changed since
+    // this thread's last checkpoint. Either one is work a restore would discard.
+    let changes = changes.filter(|changes| shared || changes.outside_changes());
     let conversation_rewind = match probe {
         Some(probe) => probe
             .conversation_rewind(thread_id)

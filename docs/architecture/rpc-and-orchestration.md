@@ -3970,9 +3970,12 @@ conversation-rewind support and `siblingChangesToken`: the SHA-256 of the
 target commit, the current tree id and the sorted event ids. A full revert on a
 shared checkout proceeds only when its token matches the one recomputed under
 the gate. A request without a token (an older client) proceeds only when no
-outside change exists. Otherwise the refusal carries the new token in its
-activity payload. The preview is advisory, runs Git, and is in
-`is_long_running`. It needs `orchestration:operate`, as a revert does: its
+outside change exists. A checkout whose other chats are all deleted still
+counts: their turns in that window, and any files changed since this thread's
+last checkpoint, are outside changes. When the token is missing or stale, the
+refusal carries the new token in its activity payload. The preview is advisory,
+runs Git, and is in `is_long_running`. It needs `orchestration:operate`, as a
+revert does: its
 `git add` into a temporary index runs the repository's clean filters, which can
 run commands on the host.
 

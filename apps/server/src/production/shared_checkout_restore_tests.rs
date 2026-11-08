@@ -1542,6 +1542,41 @@ async fn a_sibling_conversation_only_rewind_keeps_its_changes_in_the_warning() {
 }
 
 #[tokio::test]
+async fn a_deleted_chat_file_change_since_the_last_turn_needs_the_token() {
+    let fixture = Fixture::new().await;
+    // B's only session event is before A's turn 1, so the event window has no sibling turn.
+    // The file was written after A's last checkpoint: a restore would delete it.
+    fixture.engine.dispatch(command(json!({"type":"thread.delete", "commandId":"delete-b", "threadId":"b", "createdAt":T_LAST}))).await.unwrap();
+    std::fs::write(fixture.repo.join("notes.txt"), "kept by a deleted chat\n").unwrap();
+    let preview = fixture.preview("a", 1).await;
+    assert_eq!(preview["siblingChanges"]["paths"], json!(["notes.txt"]));
+    assert_eq!(preview["siblingChanges"]["turns"], json!([]));
+    let token = preview["siblingChangesToken"]
+        .as_str()
+        .expect("a deleted chat's later files still need acknowledging")
+        .to_owned();
+    let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
+    assert!(
+        detail(&failure).contains("changed since turn 1"),
+        "{failure}"
+    );
+    assert_eq!(failure["siblingChangesToken"], json!(token));
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join("notes.txt")).unwrap(),
+        "kept by a deleted chat\n",
+        "the unacknowledged restore must not delete the file"
+    );
+    assert_eq!(fixture.tracked(), "two\n");
+    fixture.revert("a", 1, "full", Some(&token)).await.unwrap();
+    assert!(
+        !fixture.repo.join("notes.txt").exists(),
+        "the acknowledged restore still cleans the file"
+    );
+    assert_eq!(fixture.tracked(), "one\n");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_terminal_edit_since_the_last_turn_is_listed() {
     let fixture = Fixture::new().await;
     std::fs::write(fixture.repo.join("notes.txt"), "from a terminal\n").unwrap();
