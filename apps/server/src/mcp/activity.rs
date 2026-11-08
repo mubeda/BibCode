@@ -748,6 +748,8 @@ pub(crate) struct RunningTurn {
     pub(crate) turn_id: Option<String>,
     pub(crate) client_id: String,
     pub(crate) label: Option<String>,
+    /// The named client (#280) of the session that started it.
+    pub(crate) named_client_id: Option<String>,
 }
 
 /// The running turns attributed to an outside agent, to `client_id`'s only when given.
@@ -757,7 +759,8 @@ pub(crate) struct RunningTurn {
 /// Only running turns are read, through `idx_projection_turns_running`; `CROSS JOIN` keeps
 /// them the outer loop, so each thread and message is a primary-key lookup.
 const RUNNING_TURNS_SQL: &str = "SELECT turn.thread_id, turn.turn_id,
-       json_extract(message.actor_json, '$.clientId'), json_extract(message.actor_json, '$.label')
+       json_extract(message.actor_json, '$.clientId'), json_extract(message.actor_json, '$.label'),
+       json_extract(message.actor_json, '$.namedClientId')
   FROM projection_turns AS turn
   CROSS JOIN projection_threads AS thread
   CROSS JOIN projection_thread_messages AS message
@@ -782,6 +785,7 @@ fn attributed_running_turns(
                 turn_id: row.get(1)?,
                 client_id: row.get(2)?,
                 label: row.get(3)?,
+                named_client_id: row.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -791,14 +795,19 @@ fn attributed_running_turns(
 /// The presence list with each agent's running attributed turns counted in: an agent with one
 /// is active (and `running`) however long ago it last called, so Stop stays in reach.
 fn merge_active(presence: Vec<Value>, turns: &[RunningTurn]) -> Vec<Value> {
-    let mut counts: Vec<(&str, Option<&str>, usize)> = Vec::new();
+    let mut counts: Vec<(&str, Option<&str>, Option<&str>, usize)> = Vec::new();
     for turn in turns {
         match counts
             .iter_mut()
             .find(|(client, ..)| *client == turn.client_id)
         {
             Some((.., count)) => *count += 1,
-            None => counts.push((&turn.client_id, turn.label.as_deref(), 1)),
+            None => counts.push((
+                &turn.client_id,
+                turn.label.as_deref(),
+                turn.named_client_id.as_deref(),
+                1,
+            )),
         }
     }
     let mut active: Vec<Value> = presence
@@ -815,15 +824,20 @@ fn merge_active(presence: Vec<Value>, turns: &[RunningTurn]) -> Vec<Value> {
             entry
         })
         .collect();
-    for (client, label, count) in counts {
+    for (client, label, named, count) in counts {
         if !active.iter().any(|entry| entry["clientId"] == client) {
-            active.push(json!({
+            let mut entry = json!({
                 "clientId": client,
                 "label": label,
                 "lastCallAt": null,
                 "running": true,
                 "runningTurns": count,
-            }));
+            });
+            // A revoked run of a named client (#280): Stop on its row ends the identity.
+            if let Some(named) = named {
+                entry["namedClientId"] = named.into();
+            }
+            active.push(entry);
         }
     }
     active

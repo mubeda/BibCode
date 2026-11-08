@@ -143,7 +143,10 @@ function McpAgentList({
               Revoked · {turnsText(entry.runningTurns)}
             </div>
           </div>
-          {stopButton(entry.clientId)}
+          {stopButton(
+            entry.clientId,
+            entry.namedClientId === undefined ? undefined : ENDS_IDENTITY,
+          )}
         </li>
       ))}
       {clients.map((client) => {
