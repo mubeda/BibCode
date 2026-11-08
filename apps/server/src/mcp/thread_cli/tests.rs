@@ -572,6 +572,7 @@ fn options(root: &Path) -> RelayOptions {
         dev_url: None,
         url: None,
         access: None,
+        client: None,
     }
 }
 

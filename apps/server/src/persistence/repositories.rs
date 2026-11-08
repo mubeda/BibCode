@@ -2287,6 +2287,59 @@ impl Repositories {
     ) -> Result<Vec<AuthPairingLink>> {
         self.database.call(move |connection| collect(connection, &(PAIRING_SELECT.to_owned() + " WHERE revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? ORDER BY created_at DESC, id DESC"), [now], decode_pairing_link)).await
     }
+    /// How many pairing links are live, as [`Self::list_active_auth_pairing_links`] lists
+    /// them. The relay checks capacity with it: it names no column a later migration added, so
+    /// it also works on a store from before migration 70 (#280).
+    pub async fn count_active_auth_pairing_links(&self, now: Timestamp) -> Result<usize> {
+        self.database
+            .call(move |connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM auth_pairing_links WHERE revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ?",
+                    [now],
+                    |row| row.get(0),
+                )?;
+                Ok(usize::try_from(count).unwrap_or(usize::MAX))
+            })
+            .await
+    }
+    /// Whether this store knows named MCP clients (migration 70, #280).
+    pub async fn has_mcp_named_clients(&self) -> Result<bool> {
+        self.database
+            .call(|connection| table_has_named_clients(connection))
+            .await
+    }
+    /// Inserts `row` as a run of the live named client `name` (#280), in one transaction: the
+    /// live identity of that name, made when there is none, then the link carrying its id.
+    /// Returns the identity.
+    pub async fn create_named_mcp_pairing_link(
+        &self,
+        mut row: AuthPairingLink,
+        name: String,
+    ) -> Result<McpNamedClient> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                // The conflict target repeats the partial index's `WHERE`.
+                transaction.execute(
+                    "INSERT INTO mcp_named_clients (client_id, name, created_at) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(name) WHERE revoked_at IS NULL DO NOTHING",
+                    params![format!("nc_{}", uuid::Uuid::new_v4()), name, row.created_at],
+                )?;
+                let id: String = transaction.query_row(
+                    "SELECT client_id FROM mcp_named_clients WHERE name = ? AND revoked_at IS NULL",
+                    [&name],
+                    |row| row.get(0),
+                )?;
+                let named = McpNamedClient { id, name };
+                row.mcp_named_client = Some(named.clone());
+                insert_auth_pairing_link_on(&transaction, &row)?;
+                bump_auth_authority_revision_on(&transaction)?;
+                transaction.commit()?;
+                Ok(named)
+            })
+            .await
+    }
     pub async fn revoke_auth_pairing_link(
         &self,
         id: String,
@@ -2365,6 +2418,16 @@ impl Repositories {
                     return Ok(false);
                 }
                 insert_auth_session_on(&transaction, &row, None)?;
+                // The run of a named client (#280) takes its link's identity. Ending an
+                // identity revokes its links, so the fence above refuses a run of an ended one.
+                if table_has_named_clients(&transaction)? {
+                    transaction.execute(
+                        "UPDATE auth_sessions SET mcp_named_client_id = \
+                         (SELECT mcp_named_client_id FROM auth_pairing_links WHERE id = ?1) \
+                         WHERE session_id = ?2",
+                        params![link_id, row.session_id],
+                    )?;
+                }
                 bump_auth_authority_revision_on(&transaction)?;
                 transaction.commit()?;
                 Ok(true)
@@ -2460,6 +2523,57 @@ impl Repositories {
                     .optional()?
                     .is_some();
                 if revoked {
+                    bump_auth_authority_revision_on(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(revoked)
+            })
+            .await
+    }
+    /// A person's revoke of session `session_id`. When it is a run of a named client (#280),
+    /// revoked or not, it ends that identity instead, with every run and link of it, in the
+    /// same transaction.
+    pub async fn revoke_auth_session_and_identity(
+        &self,
+        session_id: String,
+        revoked_at: Timestamp,
+    ) -> Result<RevokedAccess> {
+        self.database
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let named: Option<String> = if table_has_named_clients(&transaction)? {
+                    transaction
+                        .query_row(
+                            "SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = ?",
+                            [&session_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten()
+                } else {
+                    None
+                };
+                let mut revoked = RevokedAccess::default();
+                match &named {
+                    Some(client_id) => revoke_mcp_named_client_on(
+                        &transaction,
+                        client_id,
+                        &revoked_at,
+                        &mut revoked,
+                    )?,
+                    None => revoked.sessions.extend(
+                        transaction
+                            .query_row(
+                                "UPDATE auth_sessions SET revoked_at = ? \
+                                 WHERE session_id = ? AND revoked_at IS NULL RETURNING session_id",
+                                params![revoked_at, session_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?,
+                    ),
+                }
+                if revoked != RevokedAccess::default() {
                     bump_auth_authority_revision_on(&transaction)?;
                 }
                 transaction.commit()?;
@@ -2582,18 +2696,36 @@ impl Repositories {
             })
             .await
     }
+    /// Revokes every live session but `current_session_id`, and ends each named client (#280)
+    /// one of them was a run of, with its links, in the same transaction.
     pub async fn revoke_other_auth_sessions(
         &self,
         current_session_id: String,
         revoked_at: Timestamp,
-    ) -> Result<Vec<String>> {
+    ) -> Result<RevokedAccess> {
         self.database.call(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let revoked = {
-                let mut statement = transaction.prepare("UPDATE auth_sessions SET revoked_at = ? WHERE session_id <> ? AND revoked_at IS NULL RETURNING session_id")?;
-                statement.query_map(params![revoked_at,current_session_id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let sql = if table_has_named_clients(&transaction)? {
+                "UPDATE auth_sessions SET revoked_at = ? WHERE session_id <> ? AND revoked_at IS NULL RETURNING session_id, mcp_named_client_id"
+            } else {
+                "UPDATE auth_sessions SET revoked_at = ? WHERE session_id <> ? AND revoked_at IS NULL RETURNING session_id, NULL"
             };
-            if !revoked.is_empty() {
+            let rows = {
+                let mut statement = transaction.prepare(sql)?;
+                statement.query_map(params![revoked_at,current_session_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut revoked = RevokedAccess::default();
+            let mut identities = Vec::new();
+            for (session_id, identity) in rows {
+                revoked.sessions.push(session_id);
+                if let Some(identity) = identity && !identities.contains(&identity) {
+                    identities.push(identity);
+                }
+            }
+            for identity in identities {
+                revoke_mcp_named_client_on(&transaction, &identity, &revoked_at, &mut revoked)?;
+            }
+            if revoked != RevokedAccess::default() {
                 bump_auth_authority_revision_on(&transaction)?;
             }
             transaction.commit()?;
@@ -3446,6 +3578,24 @@ pub struct AuthPairingLink {
     pub off_host: Option<bool>,
     /// The MCP access ceiling of an `mcp-client` credential; `None` for every other kind.
     pub mcp_access: Option<String>,
+    /// The named client (#280) an `mcp-client` link signs a run of in; `None` when unnamed.
+    #[serde(default)]
+    pub mcp_named_client: Option<McpNamedClient>,
+}
+/// A named MCP client (#280): the durable, non-secret identity `bibcode mcp --client <name>`
+/// keeps across runs. `id` is `nc_` plus a UUID, so it never equals a session id.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct McpNamedClient {
+    pub id: String,
+    pub name: String,
+}
+/// What a person's revoke ended, ids only.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RevokedAccess {
+    pub sessions: Vec<String>,
+    pub pairings: Vec<String>,
+    /// The named clients it ended (#280).
+    pub named_clients: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewAuthPairingOffer {
@@ -3697,6 +3847,9 @@ pub struct AuthSession {
     /// `None` for every other session.
     #[serde(default)]
     pub mcp_resource: Option<String>,
+    /// The named client (#280) whose run this `mcp-client` session is; `None` when unnamed.
+    #[serde(default)]
+    pub mcp_named_client: Option<McpNamedClient>,
 }
 
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
@@ -3716,11 +3869,11 @@ const PROJECTION_STATE_LIST: &str = "SELECT projector, last_applied_sequence, up
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
-const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access FROM auth_pairing_links";
+const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access, mcp_named_client_id, (SELECT name FROM mcp_named_clients WHERE client_id = auth_pairing_links.mcp_named_client_id) FROM auth_pairing_links";
 const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
 const PAIRING_OFFER_BY_KEY_SQL: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? AND principal_id = ? AND idempotency_key = ?";
-const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_access_hand_back, mcp_resource FROM auth_sessions";
+const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access, mcp_named_client_id, (SELECT name FROM mcp_named_clients WHERE client_id = auth_pairing_links.mcp_named_client_id)";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access, mcp_access_hand_back, mcp_resource, mcp_named_client_id, (SELECT name FROM mcp_named_clients WHERE client_id = auth_sessions.mcp_named_client_id) FROM auth_sessions";
 
 const MCP_OAUTH_CLIENT_SELECT: &str = "SELECT client_id, client_name, redirect_uris_json, source_key, created_at, approved_at, last_used_at FROM mcp_oauth_clients";
 const MCP_OAUTH_AUTHORIZATION_SELECT: &str = "SELECT a.id, a.user_code, a.client_id, a.redirect_uri, a.code_challenge, a.state, a.resource, a.scopes, a.origin, a.source_key, a.status_cookie_hash, a.status, a.approved_access, a.approved_scopes, a.code_hash, a.code_expires_at, a.session_id, a.created_at, a.expires_at, c.client_name FROM mcp_oauth_authorizations AS a LEFT JOIN mcp_oauth_clients AS c ON c.client_id = a.client_id";
@@ -4176,26 +4329,75 @@ where
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 fn insert_auth_pairing_link_on(connection: &Connection, row: &AuthPairingLink) -> Result<()> {
-    connection.execute(
+    // The column is named only for a named link, so an unnamed relay's insert also works on a
+    // store from before migration 70 (#280).
+    let named_id = row.mcp_named_client.as_ref().map(|named| named.id.as_str());
+    let (named_column, named_value) = if named_id.is_some() {
+        (", mcp_named_client_id", ", ?")
+    } else {
+        ("", "")
+    };
+    let mut statement = connection.prepare(&format!(
         "INSERT INTO auth_pairing_links (
             id, credential, method, scopes, subject, label, proof_key_thumbprint,
-            created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
-        params![
-            row.id,
-            row.credential,
-            row.method,
-            encode_json(&row.scopes)?,
-            row.subject,
-            row.label,
-            row.proof_key_thumbprint,
-            row.created_at,
-            row.expires_at,
-            row.reach,
-            row.off_host,
-            row.mcp_access,
-        ],
+            created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access{named_column}
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?{named_value})"
+    ))?;
+    let scopes = encode_json(&row.scopes)?;
+    let mut values: Vec<&dyn rusqlite::ToSql> = vec![
+        &row.id,
+        &row.credential,
+        &row.method,
+        &scopes,
+        &row.subject,
+        &row.label,
+        &row.proof_key_thumbprint,
+        &row.created_at,
+        &row.expires_at,
+        &row.reach,
+        &row.off_host,
+        &row.mcp_access,
+    ];
+    if let Some(named_id) = &named_id {
+        values.push(named_id);
+    }
+    statement.execute(values.as_slice())?;
+    Ok(())
+}
+/// Ends named client `client_id` (#280) on `connection`: its row, every pairing link carrying
+/// it, consumed or not, so neither an exchange nor a fenced insert succeeds, and every live
+/// session of it. Adds what it revoked to `revoked`.
+fn revoke_mcp_named_client_on(
+    connection: &Connection,
+    client_id: &str,
+    revoked_at: &str,
+    revoked: &mut RevokedAccess,
+) -> Result<()> {
+    let ended = connection.execute(
+        "UPDATE mcp_named_clients SET revoked_at = ?1 WHERE client_id = ?2 AND revoked_at IS NULL",
+        params![revoked_at, client_id],
     )?;
+    if ended > 0 {
+        revoked.named_clients.push(client_id.to_owned());
+    }
+    let mut links = connection.prepare_cached(
+        "UPDATE auth_pairing_links SET revoked_at = ?1 \
+         WHERE mcp_named_client_id = ?2 AND revoked_at IS NULL RETURNING id",
+    )?;
+    revoked.pairings.extend(
+        links
+            .query_map(params![revoked_at, client_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?,
+    );
+    let mut sessions = connection.prepare_cached(
+        "UPDATE auth_sessions SET revoked_at = ?1 \
+         WHERE mcp_named_client_id = ?2 AND revoked_at IS NULL RETURNING session_id",
+    )?;
+    revoked.sessions.extend(
+        sessions
+            .query_map(params![revoked_at, client_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?,
+    );
     Ok(())
 }
 fn auth_authority_revision_on(connection: &Connection) -> Result<u64> {
@@ -4312,6 +4514,8 @@ pub struct ActivityChangeRow {
     pub thread_id: Option<String>,
     pub outcome: String,
     pub target_json: String,
+    /// The named client (#280) the session was a run of.
+    pub named_client_id: Option<String>,
 }
 
 /// One snapshot of both logs after a `changes_since` cursor.
@@ -4427,9 +4631,10 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
     let activity_limit = i64::try_from(query.activity_limit).unwrap_or(i64::MAX);
     let activity = {
         let mut statement = connection.prepare_cached(
-            "SELECT activity_id, occurred_at, session_id, label, tool, thread_id, outcome, target_json \
-             FROM mcp_activity WHERE activity_id > ?1 AND (?2 IS NULL OR thread_id = ?2) \
-             ORDER BY activity_id LIMIT ?3",
+            "SELECT a.activity_id, a.occurred_at, a.session_id, a.label, a.tool, a.thread_id, a.outcome, a.target_json, s.mcp_named_client_id \
+             FROM mcp_activity AS a LEFT JOIN auth_sessions AS s ON s.session_id = a.session_id \
+             WHERE a.activity_id > ?1 AND (?2 IS NULL OR a.thread_id = ?2) \
+             ORDER BY a.activity_id LIMIT ?3",
         )?;
         statement
             .query_map(
@@ -4444,6 +4649,7 @@ fn read_change_feed(connection: &Connection, query: &ChangeFeedQuery) -> Result<
                         thread_id: row.get(5)?,
                         outcome: row.get(6)?,
                         target_json: row.get(7)?,
+                        named_client_id: row.get(8)?,
                     })
                 },
             )?
@@ -4991,7 +5197,20 @@ fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
         reach: row.get(11)?,
         off_host: row.get(12)?,
         mcp_access: row.get(13)?,
+        mcp_named_client: decode_named_client(row, 14)?,
     })
+}
+fn decode_named_client(row: &Row<'_>, id_at: usize) -> rusqlite::Result<Option<McpNamedClient>> {
+    let id: Option<String> = row.get(id_at)?;
+    let name: Option<String> = row.get(id_at + 1)?;
+    Ok(id.zip(name).map(|(id, name)| McpNamedClient { id, name }))
+}
+fn table_has_named_clients(connection: &Connection) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_named_clients')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 fn decode_pairing_offer(row: &Row<'_>) -> rusqlite::Result<AuthPairingOffer> {
     Ok(AuthPairingOffer {
@@ -5031,6 +5250,7 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         mcp_access_hand_back: row.get(18)?,
         delivery_state: row.get(16)?,
         mcp_resource: row.get(19)?,
+        mcp_named_client: decode_named_client(row, 20)?,
     })
 }
 

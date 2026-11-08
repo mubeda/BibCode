@@ -1009,7 +1009,15 @@ function EndpointForm({
           </Select>
         </div>
         {isPrimary ? (
-          <PairedClientSelect value={pairedClientId} onChange={setPairedClientId} />
+          <PairedClientSelect
+            value={pairedClientId}
+            stored={
+              endpoint?.pairedClientId == null
+                ? null
+                : { id: endpoint.pairedClientId, name: endpoint.pairedClientName ?? null }
+            }
+            onChange={setPairedClientId}
+          />
         ) : null}
       </div>
       {error === null ? null : <ErrorLine text={error} />}
@@ -1025,17 +1033,31 @@ function EndpointForm({
   );
 }
 
-/** The outside agent an endpoint follows: revoking it turns the endpoint off. */
+/**
+ * The outside agent an endpoint follows: revoking it turns the endpoint off. A named client
+ * (`bibcode mcp --client`) is offered once, by its id, so the pairing outlives each run; one
+ * with no run live stays offered under the name the server stored.
+ */
 function PairedClientSelect({
   value,
+  stored,
   onChange,
 }: {
   readonly value: string | null;
+  readonly stored: { readonly id: string; readonly name: string | null } | null;
   readonly onChange: (next: string | null) => void;
 }) {
   const clients = usePrimaryMcpClients();
-  const label = (sessionId: string) =>
-    clients.find((client) => client.sessionId === sessionId)?.client.label ?? "MCP agent";
+  // Each id once, by its label: two live runs of one named client are one option.
+  const options = new Map<string, string>();
+  for (const client of clients) {
+    const id = client.mcpNamedClient?.id ?? client.sessionId;
+    if (!options.has(id)) {
+      options.set(id, client.mcpNamedClient?.name ?? client.client.label ?? "MCP agent");
+    }
+  }
+  if (stored?.name != null && !options.has(stored.id)) options.set(stored.id, stored.name);
+  const label = (id: string) => options.get(id) ?? "MCP agent";
   return (
     <div className="space-y-1">
       <span className="text-xs font-medium text-foreground">Paired MCP client</span>
@@ -1050,14 +1072,17 @@ function PairedClientSelect({
           <SelectItem hideIndicator value={NO_PROJECT}>
             None
           </SelectItem>
-          {clients.map((client) => (
-            <SelectItem hideIndicator key={client.sessionId} value={client.sessionId}>
-              {client.client.label ?? "MCP agent"}
+          {[...options].map(([id, optionLabel]) => (
+            <SelectItem hideIndicator key={id} value={id}>
+              {optionLabel}
             </SelectItem>
           ))}
         </SelectPopup>
       </Select>
-      <p className="text-xs text-muted-foreground">Revoking that client turns this endpoint off.</p>
+      <p className="text-xs text-muted-foreground">
+        Revoking or stopping that client turns this endpoint off. A named client's endpoint stays on
+        across its restarts.
+      </p>
     </div>
   );
 }
