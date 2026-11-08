@@ -1041,6 +1041,19 @@ describe("PipelinesDetailView job log panel", () => {
       expect(document.activeElement).toBe(field);
     });
 
+    it("leaves focus on an open picker or combobox when the panel mounts late", async () => {
+      h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+      await render({ wrap: withJobPages });
+      stack();
+      const picker = document.createElement("button");
+      picker.setAttribute("role", "combobox");
+      container.append(picker);
+      picker.focus();
+      click(jobLink());
+      await settle();
+      expect(document.activeElement).toBe(picker);
+    });
+
     it("does not scroll when the log sits beside the stages", async () => {
       h.job = pipelineJobDetail({ job: { ...pipelineJob } });
       await render({ wrap: withJobPages });
