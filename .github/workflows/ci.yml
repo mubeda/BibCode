@@ -430,10 +430,9 @@ jobs:
 
       # The release symbol profile from release.yml: unstripped, with line tables, a dSYM on
       # macOS and a GNU build-id on Linux. CRASH_SMOKE_OUT keeps the dump after the test.
-      # 16 codegen units with the shipped ThinLTO kept: the shipped single unit gave rustc one
-      # core for the whole bibcode-server optimisation. The planted frames are #[inline(never)],
-      # and the symbol format, line tables and unwind tables do not depend on the unit count.
-      # The step logs its elapsed seconds so cold and warm runs can be compared.
+      # LTO off and 16 codegen units: the shipped thin-LTO single unit kept macos-26 on one
+      # core. The planted frames are #[inline(never)], and the symbol format, line tables and
+      # unwind tables do not depend on either setting. The step logs its elapsed seconds.
       - name: Crash the smoke binary
         shell: bash
         env:
@@ -441,7 +440,7 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
-          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
           case "$RUNNER_OS" in
             Linux) export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1" ;;
             macOS) export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed ;;

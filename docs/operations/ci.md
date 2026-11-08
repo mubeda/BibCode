@@ -184,16 +184,19 @@ the merge.
   store, and the stack walk as the `crash-smoke-<os>` artifact. The Windows
   ARM64 dump path stays disabled, so the job has no Windows ARM64 row; the
   `macos-26` row is ARM64.
-  The crash step adds `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to that profile
-  and keeps the shipped `lto = "thin"`, optimisation, line tables and packed
-  dSYM. With the shipped single codegen unit, rustc spent most of the build
-  optimising the `bibcode-server` crate on one core: the crash step took 40 to
-  79 minutes on `macos-26` and one run reached the job limit. The planted
-  frames are `#[inline(never)]`, and the symbol format, line tables, and unwind
-  tables do not depend on the unit count, so the smoke still proves the release
-  symbol path. `Cargo.toml`'s shipped profile and the job timeout are
-  unchanged. The step prints its elapsed seconds as a `::notice::`.
-  Measured result: to be filled in from the cold-cache and warm-cache `ci:full` runs.
+  The crash step adds `CARGO_PROFILE_RELEASE_LTO=off` and
+  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to that profile; optimisation, line
+  tables, symbols and the packed dSYM stay. With the shipped thin-LTO single
+  codegen unit, rustc spent most of the build optimising the `bibcode-server`
+  crate on one core, and `macos-26` runs took 40 to 79 minutes or hit the
+  90-minute limit. Commit `546648ee5f` added the overrides: a cold
+  `cargo test -p bibcode-server --test crash_smoke --release --no-run` pinned to
+  4 cores took 666 seconds with the shipped profile and 293 seconds with them,
+  and the job timeout is 60 minutes. The planted frames are
+  `#[inline(never)]`, and the symbol format, line tables, and unwind tables do
+  not depend on LTO or codegen units, so the smoke still proves the release
+  symbol path. `Cargo.toml`'s shipped profile is unchanged. The step prints its
+  elapsed seconds as a `::notice::`.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's
