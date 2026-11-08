@@ -891,10 +891,15 @@ function clientSession(input: {
 function accessSnapshot(input: {
   readonly pairingLinks: ReadonlyArray<AuthPairingLink>;
   readonly clientSessions: ReadonlyArray<AuthClientSession>;
+  readonly mcpNamedClients?: ReadonlyArray<unknown>;
 }) {
   return {
     type: "snapshot" as const,
-    payload: { pairingLinks: input.pairingLinks, clientSessions: input.clientSessions },
+    payload: {
+      pairingLinks: input.pairingLinks,
+      clientSessions: input.clientSessions,
+      ...(input.mcpNamedClients === undefined ? {} : { mcpNamedClients: input.mcpNamedClients }),
+    },
   };
 }
 
@@ -2572,6 +2577,39 @@ describe("Remote Servers tabs", () => {
       invoke(dialog, "onOpenChange", true);
     }
     invoke(control("button", "Done"), "onClick");
+  });
+
+  it("lists a named agent with no run live, and its Revoke ends that identity", async () => {
+    stubBrowserWindow();
+    h.primarySessionState = {
+      data: { authenticated: true, scopes: ADMIN_SCOPES, auth: { policy: "remote-reachable" } },
+    };
+    h.hasCloudConfig = false;
+    h.accessChangesQuery.data = accessSnapshot({
+      pairingLinks: [],
+      clientSessions: [
+        clientSession({ sessionId: "session-current", current: true, connected: true }),
+      ],
+      mcpNamedClients: [{ id: "nc_1", name: "builder", createdAt: RECENT }],
+    });
+
+    const markup = render(<ShareTab />);
+
+    expect(markup).toContain("MCP · builder");
+    expect(markup).toContain("Not running · Keeps its identity across runs");
+    expect(markup).not.toContain("No pairing links or client sessions.");
+    expect(control("button", "Revoke others").props.disabled).toBe(false);
+    invoke(findControls("button", "Revoke").at(-1)!, "onClick");
+    await flush();
+    expect(h.revokeServerClientSession).toHaveBeenCalledWith("nc_1");
+
+    h.toastAdd.mockClear();
+    h.revokeOtherServerClientSessions.mockResolvedValueOnce(0);
+    invoke(control("button", "Revoke others"), "onClick");
+    await flush();
+    expect(h.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Revoked 1 other client" }),
+    );
   });
 
   it("falls back to reveal dialogs when the clipboard is unavailable on a loopback host", () => {

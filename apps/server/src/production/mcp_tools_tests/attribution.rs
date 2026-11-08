@@ -801,6 +801,46 @@ async fn stop_on_a_named_clients_row_interrupts_turns_of_its_earlier_run_after_t
     harness.shutdown().await;
 }
 
+/// #324: a Take over sticks to a named client, so its restarted agent can read but not act
+/// until a person hands it back.
+#[tokio::test]
+async fn a_named_agent_restarted_after_take_over_is_refused_a_mutation() {
+    let harness = Harness::new().await;
+    let first = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    assert_eq!(
+        harness
+            .auth
+            .set_mcp_access(&first.principal.session_id, "read-only")
+            .await
+            .unwrap(),
+        McpAccessChange::Changed
+    );
+    super::threads::end_run(&harness, &first).await;
+    let second = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    assert_eq!(second.ceiling, McpAccess::ReadOnly);
+    let refused = harness.call(&second, "start_thread", basic_start()).await;
+    assert_eq!(error_tag(&refused), "McpAccessCeilingError");
+    assert_eq!(
+        refused["structuredContent"]["error"]["message"],
+        "A person took over this agent; it is read-only until they hand it back."
+    );
+    assert_eq!(
+        harness
+            .auth
+            .set_mcp_access(&second.principal.session_id, "full-access")
+            .await
+            .unwrap(),
+        McpAccessChange::Changed
+    );
+    let third = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    assert_eq!(
+        third.ceiling,
+        McpAccess::FullAccess,
+        "Hand back released it"
+    );
+    harness.shutdown().await;
+}
+
 /// Without `--client`, Stop still reaches only the stopped session's own turns.
 #[tokio::test]
 async fn stop_on_an_unnamed_session_is_unchanged() {

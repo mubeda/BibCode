@@ -63,7 +63,8 @@ For Codex, replace `claude mcp add` with `codex mcp add`. For a data root other 
 `--access read-only` (or `approval-required`, `auto-accept-edits`). To let a restarted agent
 keep its retries, its panels and a paired webhook endpoint, add `--client <name>` with a
 name of your choice; **Revoke** or **Stop** on its row ends that identity, and its next run
-starts fresh.
+starts fresh. While it is not running it keeps a "Not running" row with **Revoke**. A
+**Take over** stays on that agent across its restarts until you press **Hand back**.
 
 Over SSH no tunnel is needed: `bibcode mcp` runs on the remote host and talks to that host's
 own loopback server.

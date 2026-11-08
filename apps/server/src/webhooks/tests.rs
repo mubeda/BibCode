@@ -2883,6 +2883,30 @@ async fn a_person_revoking_a_named_clients_row_disables_its_endpoints_and_ends_e
     harness.webhooks.shutdown().await;
 }
 
+/// Revoke on an idle named client's row passes the identity's own id (#324).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_an_idle_named_client_disables_its_paired_endpoints() {
+    let harness = Harness::new().await;
+    seed_named_runs(&harness, &["run-1"]).await;
+    let named = paired_endpoint(&harness, "Named", "run-1").await;
+    relay_exits(&harness, "run-1").await;
+    let revoked = harness
+        .repositories
+        .revoke_auth_session_and_identity(
+            "nc_builder".to_owned(),
+            "2026-11-07T00:00:02Z".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.named_clients, ["nc_builder"]);
+    assert!(revoked.sessions.is_empty(), "no run was live");
+    eventually("the named endpoint to turn off", async || {
+        endpoint_state(&harness, &named["id"]).await["disabledReason"] == "client-revoked"
+    })
+    .await;
+    harness.webhooks.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_endpoint_paired_with_an_unnamed_relay_turns_off_when_it_exits() {
     let harness = Harness::new().await;

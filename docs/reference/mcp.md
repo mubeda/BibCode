@@ -145,7 +145,20 @@ once share their retries and each has its own Authorized clients row. A person's
 or **Stop** on any of its rows ends the identity: every run of it is revoked, its paired
 endpoints turn off (`client-revoked`), and the next run with that name starts a new
 identity. An agent without `--client`, even one whose `clientInfo.name` matches, never joins
-a named client's scope. A named client with no run live has no Authorized clients row.
+a named client's scope.
+
+A named client with no run live still has a row in Authorized clients and in **Agents**
+(`MCP · <name>`, "Not running"), with **Revoke** only. That Revoke ends the identity as
+above. The Revoke route takes the named client's id (`nc_` plus a UUID) in `sessionId`.
+**Revoke others** ends idle named clients too. The access stream's snapshot lists every
+named client not yet ended in `mcpNamedClients`; one that no `clientSessions` entry runs is
+idle.
+
+**Take over** on any run takes over the identity: every live run goes read-only, and each
+later run starts read-only, with Hand back offered at the level that run was started with.
+**Hand back** on any run releases the identity and restores every live run to its own level.
+A run started `read-only` has nothing to hand back and shows plain read-only. Revoking the
+identity also ends a Take over.
 
 Limits: one stdio line is at most 4 MiB (a longer line is skipped and answered with a
 JSON-RPC parse error); connecting times out after 5 s and one request after 120 s (longer
@@ -1012,6 +1025,8 @@ indicator, or **Agents** in Agent integrations):
   read-only until they hand it back."), owned work stops (`reason: "revoked"`), and an
   upload URL stops; a download URL goes on.
 - **Hand back** restores exactly the level Take over replaced.
+- For a [named client](#named-clients---client-name), Take over and Hand back apply to the
+  identity: every live run, and every later run until Hand back.
 - **Revoke** in **Authorized clients** ends the credential like Stop but leaves running
   turns alone.
 - **MCP server off** stops every agent of the environment at once without revoking anyone.

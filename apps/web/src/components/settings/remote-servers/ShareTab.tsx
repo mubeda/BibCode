@@ -5,7 +5,9 @@ import {
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
   AuthRelayWriteScope,
+  AuthSessionId,
   type AuthClientSession,
+  type AuthMcpNamedClient,
   type AuthPairingLink,
   type AdvertisedEndpoint,
 } from "@bibcode/contracts";
@@ -78,6 +80,7 @@ import {
   unlinkPrimaryEnvironment as unlinkPrimaryEnvironmentAtom,
 } from "~/cloud/linkEnvironmentAtoms";
 import { authEnvironment } from "~/state/auth";
+import { idleNamedClients } from "~/state/mcpNamedClients";
 import { useEnvironmentQuery } from "~/state/query";
 import {
   desktopNetworkAccessStateAtom,
@@ -572,14 +575,71 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
   );
 });
 
+const ENDS_NAMED_IDENTITY =
+  "Ends this agent's identity. Its paired webhooks turn off, and its next run starts fresh.";
+
+type IdleNamedClientListRowProps = {
+  namedClient: AuthMcpNamedClient;
+  presentation?: AccessSectionPresentation;
+  revokingClientSessionId: string | null;
+  onRevokeSession: (sessionId: ServerClientSessionRecord["sessionId"]) => void;
+};
+
+/**
+ * A named MCP client (`bibcode mcp --client`) with no run live (#324). It holds no access of
+ * its own, but its next run would resume it, so Revoke here ends the identity.
+ */
+const IdleNamedClientListRow = memo(function IdleNamedClientListRow({
+  namedClient,
+  presentation = "current",
+  revokingClientSessionId,
+  onRevokeSession,
+}: IdleNamedClientListRowProps) {
+  const revoking = revokingClientSessionId === namedClient.id;
+  return (
+    <div className={accessRowClassName(presentation)}>
+      <div className={ITEM_ROW_INNER_CLASSNAME}>
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="flex min-h-5 items-center gap-1.5">
+            <ConnectionStatusDot
+              tooltipText="Not running"
+              dotClassName="bg-muted-foreground/30"
+              pingClassName={null}
+            />
+            <h3 className="truncate text-sm font-medium text-foreground">
+              {namedClient.name.trim() ? `MCP · ${namedClient.name}` : "MCP agent"}
+            </h3>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Outside agent · Not running · Keeps its identity across runs
+          </p>
+        </div>
+        <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+          <Button
+            size="xs"
+            variant="destructive-outline"
+            disabled={revoking}
+            title={ENDS_NAMED_IDENTITY}
+            onClick={() => void onRevokeSession(AuthSessionId.make(namedClient.id))}
+          >
+            {revoking ? "Revoking…" : "Revoke"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
 type AuthorizedClientsHeaderActionProps = {
   clientSessions: ReadonlyArray<ServerClientSessionRecord>;
+  hasIdleNamedClients: boolean;
   isRevokingOtherClients: boolean;
   onRevokeOtherClients: () => void;
 };
 
 const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderAction({
   clientSessions,
+  hasIdleNamedClients,
   isRevokingOtherClients,
   onRevokeOtherClients,
 }: AuthorizedClientsHeaderActionProps) {
@@ -588,7 +648,8 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
       size="xs"
       variant="destructive-outline"
       disabled={
-        isRevokingOtherClients || clientSessions.every((clientSession) => clientSession.current)
+        isRevokingOtherClients ||
+        (!hasIdleNamedClients && clientSessions.every((clientSession) => clientSession.current))
       }
       onClick={() => void onRevokeOtherClients()}
     >
@@ -605,6 +666,7 @@ type PairingClientsListProps = {
   isLoading: boolean;
   pairingLinks: ReadonlyArray<ServerPairingLinkRecord>;
   clientSessions: ReadonlyArray<ServerClientSessionRecord>;
+  idleNamedClients: ReadonlyArray<AuthMcpNamedClient>;
   revokingPairingLinkId: string | null;
   revokingClientSessionId: string | null;
   onRevokePairingLink: (id: string) => void;
@@ -619,6 +681,7 @@ const PairingClientsList = memo(function PairingClientsList({
   isLoading,
   pairingLinks,
   clientSessions,
+  idleNamedClients,
   revokingPairingLinkId,
   revokingClientSessionId,
   onRevokePairingLink,
@@ -649,7 +712,20 @@ const PairingClientsList = memo(function PairingClientsList({
         />
       ))}
 
-      {pairingLinks.length === 0 && clientSessions.length === 0 && !isLoading ? (
+      {idleNamedClients.map((namedClient) => (
+        <IdleNamedClientListRow
+          key={namedClient.id}
+          namedClient={namedClient}
+          presentation={presentation}
+          revokingClientSessionId={revokingClientSessionId}
+          onRevokeSession={onRevokeClientSession}
+        />
+      ))}
+
+      {pairingLinks.length === 0 &&
+      clientSessions.length === 0 &&
+      idleNamedClients.length === 0 &&
+      !isLoading ? (
         <div className={accessRowClassName(presentation)}>
           <p className="text-xs text-muted-foreground">No pairing links or client sessions.</p>
         </div>
@@ -991,6 +1067,10 @@ export function ShareTab({
       ),
     );
   }, [authAccessChanges.data]);
+  const desktopIdleNamedClients = useMemo(() => {
+    const event = authAccessChanges.data;
+    return idleNamedClients(event?.type === "snapshot" ? event.payload : undefined);
+  }, [authAccessChanges.data]);
   const isLocalBackendNetworkAccessible = desktopServerExposureState?.mode === "network-accessible";
   const trimmedTailscaleServePortInput = tailscaleServePortInput.trim();
   const parsedTailscaleServePort = Number(trimmedTailscaleServePortInput);
@@ -1132,8 +1212,10 @@ export function ShareTab({
   const handleRevokeOtherDesktopClients = useCallback(async () => {
     setIsRevokingOtherDesktopClients(true);
     setDesktopAccessManagementMutationError(null);
+    // Idle named clients end too, but the server counts sessions only.
+    const idleCount = desktopIdleNamedClients.length;
     try {
-      const revokedCount = await revokeOtherServerClientSessions();
+      const revokedCount = (await revokeOtherServerClientSessions()) + idleCount;
       onAccessRevoked?.();
       toastManager.add({
         type: "success",
@@ -1153,7 +1235,7 @@ export function ShareTab({
     } finally {
       setIsRevokingOtherDesktopClients(false);
     }
-  }, [onAccessRevoked]);
+  }, [desktopIdleNamedClients.length, onAccessRevoked]);
   const visibleDesktopPairingLinks = desktopPairingLinks;
   const tailscaleHttpsEndpoint = useMemo(
     () => desktopAdvertisedEndpoints.find(isTailscaleHttpsEndpoint) ?? null,
@@ -1260,6 +1342,7 @@ export function ShareTab({
         isLoading={isLoadingDesktopAccessManagement}
         pairingLinks={visibleDesktopPairingLinks}
         clientSessions={desktopClientSessions}
+        idleNamedClients={desktopIdleNamedClients}
         revokingPairingLinkId={revokingDesktopPairingLinkId}
         revokingClientSessionId={revokingDesktopClientSessionId}
         onRevokePairingLink={handleRevokeDesktopPairingLink}
@@ -1302,6 +1385,7 @@ export function ShareTab({
             headerAction={
               <AuthorizedClientsHeaderAction
                 clientSessions={desktopClientSessions}
+                hasIdleNamedClients={desktopIdleNamedClients.length > 0}
                 isRevokingOtherClients={isRevokingOtherDesktopClients}
                 onRevokeOtherClients={handleRevokeOtherDesktopClients}
               />
