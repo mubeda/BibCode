@@ -12,6 +12,12 @@ For ongoing issue batches and repeated validation failures, use
 | Replan after two rounds without accepted evidence.                                                    | The same checker requires a revised premise and its evidence.                                                          |
 | Measure progress by accepted requirements and closed issues, preserve scope, and keep analysis brief. | The skill defines these judgment rules. Unit counts and commits are supporting evidence only.                          |
 
+This repository is run by agents end to end. Plan only work an agent can finish
+and verify itself (scripts, tests, WebDriver E2E, CLI profilers, the local Docker
+labs). When an issue can only be done by a person at a GUI or device, look for an
+automatable route first; if none exists, close it as not planned with the reason
+instead of handing manual steps to the user.
+
 The checker uses fresh observations supplied by the agent. It does not grant
 permissions, replace native validation, or waive the completion rules below.
 
