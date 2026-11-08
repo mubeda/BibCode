@@ -7902,12 +7902,23 @@ pub(super) fn git_boolean(value: &str) -> Option<bool> {
 
 pub(crate) fn git_environment() -> Vec<(OsString, OsString)> {
     let mut environment = prompt_guard_environment();
-    environment.insert(2, super::system_line_endings::system_config_variable());
+    environment.insert(2, super::system_config::system_config_variable());
+    environment
+}
+
+/// [`git_environment`] for checkpoints: while the policy is
+/// [`super::system_config::Policy::Unread`] it sets no system-configuration variable, so
+/// Git reads the inherited system file, as checkpoints always did.
+pub(crate) fn git_environment_inheriting_unread() -> Vec<(OsString, OsString)> {
+    let mut environment = prompt_guard_environment();
+    if let Some(variable) = super::system_config::inheriting_system_config_variable() {
+        environment.insert(2, variable);
+    }
     environment
 }
 
 /// [`git_environment`] without its system-configuration variable, for the probe that
-/// reads the system configuration ([`super::system_line_endings`]).
+/// reads the system configuration ([`super::system_config`]).
 pub(super) fn prompt_guard_environment() -> Vec<(OsString, OsString)> {
     [
         ("GCM_INTERACTIVE", "never"),

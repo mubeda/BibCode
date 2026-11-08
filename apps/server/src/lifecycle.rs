@@ -235,7 +235,7 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
-        crate::git::system_line_endings::log_install_warnings();
+        crate::git::system_config::log_install_warnings();
         if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
             tracing::info!(
                 static_dir = %static_dir.display(),
