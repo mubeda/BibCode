@@ -819,3 +819,23 @@ async fn stop_on_an_unnamed_session_is_unchanged() {
     assert_eq!(stop_interrupts(&harness, &theirs).await, 0);
     harness.shutdown().await;
 }
+
+/// #280: an exited named run whose turn still runs is listed with its named client, so the
+/// Agents panel can say that Stop on it ends the identity.
+#[tokio::test]
+async fn an_exited_named_runs_running_turn_lists_its_named_client() {
+    let harness = Harness::new().await;
+    let first = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &first, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-named").await;
+    super::threads::end_run(&harness, &first).await;
+    let activity = crate::mcp::activity::McpActivity::new(harness.repositories.database().clone());
+    let active = activity.active_now().await;
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0]["clientId"], first.principal.session_id.as_str());
+    assert_eq!(
+        active[0]["namedClientId"].as_str(),
+        first.named_client_id.as_deref()
+    );
+    harness.shutdown().await;
+}

@@ -141,6 +141,28 @@ describe("McpAgentsPanel", () => {
     expect(button(unnamed, "Revoke").title).toBe("");
   });
 
+  it("warns that Stop on a revoked named run ends its identity", async () => {
+    h.active = [
+      {
+        clientId: "s-old",
+        label: "MCP · builder",
+        lastCallAt: null,
+        running: true,
+        runningTurns: 1,
+        namedClientId: "nc_1",
+      },
+      { clientId: "s-2", label: "Codex", lastCallAt: null, running: true, runningTurns: 1 },
+    ];
+    const container = await render();
+    const rows = [...container.querySelectorAll("li")];
+    const named = rows.find((row) => row.textContent?.includes("MCP · builder"))!;
+    const unnamed = rows.find((row) => row.textContent?.includes("Codex"))!;
+    expect(button(named, "Stop").title).toBe(
+      "Ends this agent's identity. Its paired webhooks turn off, and its next run starts fresh.",
+    );
+    expect(button(unnamed, "Stop").title).toBe("");
+  });
+
   it("hands a taken-over agent back to the level it had", async () => {
     h.clients = [client({ mcpAccess: "read-only", mcpAccessHandBack: "full-access" })];
     const container = await render();

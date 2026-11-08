@@ -1110,20 +1110,13 @@ impl AuthService {
         &self,
         token: &str,
     ) -> Result<McpClientCredential, AuthError> {
-        let (principal, record) = self
+        let credential = self
             .authenticate_session_record(token, SessionTransport::Plain)
             .await?;
-        if principal.subject != MCP_CLIENT_SUBJECT {
+        if credential.principal.subject != MCP_CLIENT_SUBJECT {
             return Err(AuthError::InvalidCredential);
         }
-        Ok(McpClientCredential {
-            principal,
-            access: record.mcp_access,
-            resource: record.mcp_resource,
-            taken_over: record.mcp_access_hand_back.is_some(),
-            label: record.client.label,
-            named_client_id: record.mcp_named_client.map(|named| named.id),
-        })
+        Ok(credential)
     }
 
     async fn authenticate_session_token(
@@ -1131,16 +1124,16 @@ impl AuthService {
         token: &str,
         surface: SessionTransport,
     ) -> Result<(Principal, Option<String>), AuthError> {
-        let (principal, record) = self.authenticate_session_record(token, surface).await?;
-        Ok((principal, record.mcp_access))
+        let credential = self.authenticate_session_record(token, surface).await?;
+        Ok((credential.principal, credential.access))
     }
 
-    /// The principal of `token`, and its session's cached record.
+    /// The principal of `token`, with what its session's cached record says about it.
     async fn authenticate_session_record(
         &self,
         token: &str,
         surface: SessionTransport,
-    ) -> Result<(Principal, SessionRecord), AuthError> {
+    ) -> Result<McpClientCredential, AuthError> {
         let claims: SessionClaims = self
             .signer
             .verify(token)
@@ -1181,9 +1174,8 @@ impl AuthService {
         {
             return Err(AuthError::InvalidCredential);
         }
-        let record = record.clone();
-        Ok((
-            Principal {
+        Ok(McpClientCredential {
+            principal: Principal {
                 session_id: claims.sid,
                 subject: claims.sub,
                 method: claims.method,
@@ -1191,8 +1183,15 @@ impl AuthService {
                 proof_key_thumbprint: claims.jkt,
                 expires_at_ms: claims.exp,
             },
-            record,
-        ))
+            access: record.mcp_access.clone(),
+            resource: record.mcp_resource.clone(),
+            taken_over: record.mcp_access_hand_back.is_some(),
+            label: record.client.label.clone(),
+            named_client_id: record
+                .mcp_named_client
+                .as_ref()
+                .map(|named| named.id.clone()),
+        })
     }
 
     pub async fn verify_dpop(
