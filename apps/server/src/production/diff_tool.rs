@@ -1087,8 +1087,13 @@ environment. If run in a terminal-only session, they will fail.
         }
     }
 
+    /// A launcher whose window outlasts any start, so `open` returns once a tool that ends
+    /// at once has ended, and its calls and exit code are final however slow the host is.
     fn launcher() -> DiffToolLauncher {
-        DiffToolLauncher::new(ProcessAttributionRegistry::new())
+        DiffToolLauncher::with_launch_window(
+            ProcessAttributionRegistry::new(),
+            Duration::from_secs(60),
+        )
     }
 
     #[tokio::test]
@@ -1170,9 +1175,9 @@ environment. If run in a terminal-only session, they will fail.
         assert_eq!(reason(error).0, ReviewDiffToolFailureReason::ShuttingDown);
     }
 
-    /// A fake tool `fake` in the repository's Git config. It appends its process group, which
-    /// is its `git difftool`'s ID, to `pgids`, and the path and both sides' contents to
-    /// `calls.log`, then runs `then`.
+    /// A fake tool `fake` in the repository's Git config. It appends the path and both sides'
+    /// contents to `calls.log`, then its process group, which is its `git difftool`'s ID, to
+    /// `pgids`, then runs `then`. A recorded process group means its call is logged too.
     #[cfg(unix)]
     struct FakeTool {
         directory: TempDir,
@@ -1188,7 +1193,6 @@ environment. If run in a terminal-only session, they will fail.
                 format!(
                     r#"#!/bin/sh
 dir=$(dirname "$0")
-ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
 {{
   printf '%s\n' "$3"
   if [ -f "$1" ]; then cat "$1"; fi
@@ -1196,6 +1200,7 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
   if [ -f "$2" ]; then cat "$2"; fi
   printf '==\n'
 }} >> "$dir/calls.log"
+ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
 {then}
 "#
                 ),
@@ -1268,6 +1273,8 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
             .await
             .expect("opened");
         assert_eq!(launcher.running(), 1);
+        // The window can end before a slow host has run the tool at all.
+        wait_until("the tool started", || !tool.pgids().is_empty()).await;
         assert_eq!(tool.take_calls(), "tracked.txt\nbefore\n--\nafter\n==\n");
         let ownership = registry.freeze_and_snapshot_ownership();
         assert!(ownership.roots.is_empty(), "{ownership:?}");
@@ -1484,7 +1491,7 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
         let repository = Repository::new();
         repository.write("tracked.txt", "after\n");
         let tool = FakeTool::install(&repository, "exec sleep 30");
-        let launcher = launcher();
+        let launcher = DiffToolLauncher::new(ProcessAttributionRegistry::new());
         let input = repository.open(file("tracked.txt", None), ReviewDiffToolScope::WorkingTree);
 
         let launches = futures_util::future::join_all(
@@ -1502,6 +1509,11 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
             "{}",
             failure.message
         );
+        // A launch is open once its window ends, which can be before a slow host runs its tool.
+        wait_until("every tool started", || {
+            tool.pgids().len() >= MAX_RUNNING_DIFF_TOOLS
+        })
+        .await;
         assert_eq!(tool.pgids().len(), MAX_RUNNING_DIFF_TOOLS);
 
         // Each slot frees when its app exits.

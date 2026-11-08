@@ -227,10 +227,20 @@ impl TerminalObserverWorkerJoin {
     }
 
     fn join(self) {
+        // A test's hook holds this join until the test releases it. Off the process-wide
+        // reaper, so other tests' workers still return their slots meanwhile (#333).
         #[cfg(test)]
-        if let Some(thread_exit_hook) = self.thread_exit_hook {
-            thread_exit_hook.block_before_join();
+        if let Some(thread_exit_hook) = self.thread_exit_hook.clone() {
+            std::thread::spawn(move || {
+                thread_exit_hook.block_before_join();
+                self.finish();
+            });
+            return;
         }
+        self.finish();
+    }
+
+    fn finish(self) {
         if self.thread.join().is_err() {
             tracing::warn!("provider terminal observer worker thread panicked");
         }
@@ -2457,10 +2467,15 @@ mod tests {
             .await
             .expect("worker start event")
             .forget();
-        let returned = tokio::time::timeout(Duration::from_secs(1), slots.clone().acquire_owned())
-            .await
-            .expect("panicked worker thread was joined")
-            .expect("worker capacity remains open");
+        // Unwinding the panic out of the worker's Tokio frames costs this debug test binary
+        // about 0.4 s of CPU unloaded, so the wait is the outer hang bound, not 1 s (#333).
+        let returned = tokio::time::timeout(
+            WORKER_LIFECYCLE_INTEGRATION_DEADLINE,
+            slots.clone().acquire_owned(),
+        )
+        .await
+        .expect("panicked worker thread was joined")
+        .expect("worker capacity remains open");
         drop(returned);
 
         let replacement = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
@@ -2474,6 +2489,66 @@ mod tests {
             .spawn(async {})
             .expect("replacement worker admission");
         replacement
+            .shutdown_workers(Duration::from_secs(1), Duration::from_millis(20))
+            .await;
+    }
+
+    /// The join reaper serves the whole test process, so a join a test holds must not hold
+    /// up other tests' workers (#333).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_test_join_does_not_stall_another_generations_slot() {
+        let held_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-held".to_owned(),
+            "terminal-held".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            held_slots,
+        );
+        let hook = Arc::new(WorkerThreadExitTestHook {
+            before_completion_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            completion_release: Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+            before_exit_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            exit_release: Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
+            before_join_reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            join_release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        });
+        *held
+            .workers
+            .inner
+            .thread_exit_hook
+            .lock()
+            .expect("hook lock") = Some(hook.clone());
+        held.worker_context()
+            .spawn(async {})
+            .expect("held admission");
+        hook.before_join_reached
+            .acquire()
+            .await
+            .expect("join reached")
+            .forget();
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let other = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-other".to_owned(),
+            "terminal-other".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots.clone(),
+        );
+        other
+            .worker_context()
+            .spawn(async {})
+            .expect("other admission");
+        // A stalled reaper returns the slot only after the release below, so it never does.
+        let returned = tokio::time::timeout(
+            WORKER_LIFECYCLE_INTEGRATION_DEADLINE,
+            slots.clone().acquire_owned(),
+        )
+        .await;
+        hook.release_join();
+        drop(returned.expect("other slot returned while a join is held"));
+        held.shutdown_workers(Duration::from_secs(1), Duration::from_millis(20))
+            .await;
+        other
             .shutdown_workers(Duration::from_secs(1), Duration::from_millis(20))
             .await;
     }

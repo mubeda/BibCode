@@ -359,3 +359,20 @@ that proves two probes overlap makes each wait for the other's start rather than
 sleeping, and retries a run in which a child never started before the 10 s probe
 timeout. The device RPC harness waits longer than the boot timeout for each
 catalog frame, because a booting device sends none until it is ready (#329).
+
+Four more tests failed under load for four reasons (#333). A diff-tool launch
+counts as open once its 1 s window ends, so on a slow host `open` can return
+before the fake tool has logged its call or its process group. The test
+launcher's window now outlasts any start, so a tool that exits at once has
+exited when `open` returns. The tests that launch a tool that keeps running
+wait for its process group, which the fake tool writes after its call.
+`interrupt_turn`'s test counted every orchestration event, and turn delivery
+appends its own after `start_thread` returns, so the test now counts only
+interrupt requests. The terminal observer join reaper is one thread for the
+whole process, and a test hook that held one join there stalled every other
+test's worker for as long as that test ran. A held join now runs on its own
+thread. Last, unwinding a panic out of an observer worker's Tokio frames costs
+the debug test binary about 0.4 s of CPU on an idle Mac, against the 1 s the
+panic test allowed; it now waits the module's 5 s hang bound. The linker warns
+that the test binary's `__eh_frame` is too large for the compact unwind table,
+which is a likely reason unwinding is that slow.
