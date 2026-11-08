@@ -3593,6 +3593,24 @@ exit /b 9
         fn observation_count(&self) -> usize {
             self.observations.load(AtomicOrdering::SeqCst)
         }
+
+        /// Waits until more than `count` observations ran. A diagnostics read answers
+        /// "Measuring resource usage." once its first sample takes over a second (#327), and
+        /// that sample observes the UI after the reply; a never-called observer still fails.
+        async fn wait_for_more_than(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.observation_count() <= count {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the UI observer ran {} times, expected more than {count}",
+                    self.observation_count()
+                )
+            });
+        }
     }
 
     impl DesktopUiProcessObserver for RecordingDesktopUiProcessObserver {
@@ -3663,7 +3681,7 @@ exit /b 9
             .await
             .expect("initial in-process backend should start");
         request_process_diagnostics(&initial).await;
-        assert_eq!(observer.observation_count(), 1);
+        observer.wait_for_more_than(0).await;
 
         let initial_runtime = {
             let state = supervisor
@@ -3684,11 +3702,13 @@ exit /b 9
             .wait_for_completion()
             .await
             .expect("initial in-process backend should stop");
+        // The stopped runtime samples no more, so a later observation is the restarted one's.
+        let before_restart = observer.observation_count();
 
         supervisor.schedule_restart(plan, readiness, restart, "test restart".to_string());
         let restarted = wait_for_restart_config(&supervisor, readiness.timeout).await;
         request_process_diagnostics(&restarted).await;
-        assert_eq!(observer.observation_count(), 2);
+        observer.wait_for_more_than(before_restart).await;
 
         supervisor
             .stop(BackendShutdownConfig::default())
