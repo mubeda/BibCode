@@ -12,8 +12,7 @@ use crate::{
     git::ProcessError,
     source_control::{
         IdentifiedProvider, ProviderKind, parse_github_auth_status, parse_gitlab_auth_status,
-        provider_install_hint, remote_names_web_port, remote_repository_path, remote_web_host,
-        serving_host,
+        provider_install_hint, remote_repository_path, remote_web_host, serving_host,
     },
 };
 
@@ -131,6 +130,7 @@ pub async fn resolve_scope(
 pub(super) struct PendingScope {
     pub scope: HostScope,
     authentication: ScopeAuthentication,
+    remote: String,
 }
 
 enum ScopeAuthentication {
@@ -200,7 +200,7 @@ async fn resolve_checked_scope(
     read: ContextRead,
     c: &CancellationToken,
 ) -> Result<HostScope, Unavailable> {
-    let pending = resolve_pending_scope(runner, cwd, discovered_hosts, read, c).await?;
+    let pending = resolve_login_scope(runner, cwd, discovered_hosts, read, c).await?;
     pending.authenticate(runner, c).await?;
     Ok(pending.scope)
 }
@@ -219,6 +219,26 @@ pub(super) async fn resolve_pending_scope(
         validate_checkout(cwd).await?;
     }
     result
+}
+
+/// [`resolve_pending_scope`] for a caller about to check the login: a named GitLab host
+/// is also placed on the port glab configured it with (see `named_scope`). Snapshot and
+/// subscription reads need only the identity and stay on [`resolve_pending_scope`],
+/// which spawns no provider CLI for a named or recorded host.
+pub(super) async fn resolve_login_scope(
+    runner: &HostCommandRunner,
+    cwd: &Path,
+    discovered_hosts: &DiscoveredHosts,
+    read: ContextRead,
+    c: &CancellationToken,
+) -> Result<PendingScope, Unavailable> {
+    let mut pending = resolve_pending_scope(runner, cwd, discovered_hosts, read, c).await?;
+    if matches!(pending.authentication, ScopeAuthentication::Named) {
+        let (scope, authentication) = named_scope(runner, pending.scope, &pending.remote, c).await;
+        pending.scope = scope;
+        pending.authentication = authentication;
+    }
+    Ok(pending)
 }
 
 /// A checkout's origin before a provider is admitted: only CLI discovery can say
@@ -400,7 +420,7 @@ async fn resolve_existing_checkout_scope(
         &remote,
         &recorded.identify(&remote),
     )? {
-        RemoteAdmission::Named(scope) => named_scope(runner, scope, &remote, c).await,
+        RemoteAdmission::Named(scope) => (scope, ScopeAuthentication::Named),
         RemoteAdmission::Recorded(scope) => (scope, ScopeAuthentication::Recorded),
         RemoteAdmission::Unidentified(mut remote_scope) => {
             let probed = discovered_hosts.github.is_empty() && discovered_hosts.gitlab.is_empty();
@@ -460,14 +480,16 @@ async fn resolve_existing_checkout_scope(
     Ok(PendingScope {
         scope,
         authentication,
+        remote,
     })
 }
 
-/// A GitLab host named over SSH or scp (`git@gitlab.example.test:group/project.git`)
-/// may be configured only with its web port (`gitlab.example.test:8929`). The bare
-/// name's login check runs first, the probe authentication runs anyway; its answer is
-/// reused and the host recorded, so later reads of a recorded bare name (snapshot reads
-/// included) spawn nothing. Only when it fails does glab, unpinned, list every host once.
+/// A named GitLab host may be configured in glab under another spelling: with its web
+/// port when the origin is SSH or scp (`gitlab.example.test:8929`), or with a written
+/// default port for an HTTP(S) origin (`gitlab.example.test:443`). The scope host's own
+/// login check runs first, the probe authentication runs anyway; its answer is reused
+/// and the host recorded, so a recorded host spawns nothing here. Only when it fails
+/// does glab, unpinned, list every host once.
 async fn named_scope(
     runner: &HostCommandRunner,
     scope: HostScope,
@@ -476,7 +498,6 @@ async fn named_scope(
 ) -> (HostScope, ScopeAuthentication) {
     let provider = PullRequestsProvider::Gitlab;
     if scope.provider != provider
-        || remote_names_web_port(remote)
         || runner.provider_hosts().provider(&scope.host) == Some(ProviderKind::Gitlab)
     {
         return (scope, ScopeAuthentication::Named);
@@ -1272,14 +1293,43 @@ esac"#;
         }
     }
 
-    /// #332 round 2: a named GitLab host over scp, an IPv6 SSH remote and a written
-    /// default port each find the host glab lists with a port. A named host whose bare
-    /// name is configured keeps it, with one shared login probe and no unpinned one.
+    /// Snapshot and subscription reads resolve only the identity: an unrecorded named
+    /// GitLab host over scp spawns no glab, however often the probe cache expires.
+    #[tokio::test]
+    async fn pull_requests_identity_reads_of_an_unrecorded_named_ssh_host_spawn_no_provider_cli() {
+        let s = TestSandbox::new("pr-named-identity");
+        let glab = "printf '%s\\n' \"$*\" >> calls; exit 1";
+        let runner = runner(
+            &s,
+            Some("git@gitlab.example.test:group/project.git"),
+            GH,
+            glab,
+        );
+        for _ in 0..2 {
+            runner.clear_context_probes();
+            let pending = resolve_pending_scope(
+                &runner,
+                s.root(),
+                &DiscoveredHosts::default(),
+                ContextRead::Open,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(pending.scope.host, "gitlab.example.test");
+        }
+        assert!(!s.path("calls").exists(), "snapshot identity spawned glab");
+    }
+
+    /// #332: a named GitLab host over scp, IPv6 SSH remotes (bracketed and bare status
+    /// headers) and a named HTTPS host glab spells with `:443` each find the configured
+    /// host. A named host whose bare name is configured keeps it, with one shared login
+    /// probe and no unpinned one.
     #[tokio::test]
     async fn pull_requests_named_ipv6_and_default_port_remotes_find_the_configured_port() {
         const GLAB: &str = r#"set -f
 printf '%s|%s\n' "$GITLAB_HOST" "$*" >> calls
-listed='gitlab.example.test:8929 [::1]:8929 h.example.test:443 gitlab.bare.test'
+listed='gitlab.example.test:8929 [::1]:8929 ::2 h.example.test:443 gitlab.tls.test:443 gitlab.bare.test'
 block() { printf '%s\n  ✓ Logged in to %s as test-user\n' "$1" "$1"; }
 case "$1 $2" in
   '--version ') echo 'glab 1.126.0' ;;
@@ -1299,6 +1349,13 @@ esac"#;
             (
                 "https://h.example.test:443/group/project.git",
                 "h.example.test:443",
+            ),
+            // A bare IPv6 status header reaches the scope as glab spells it.
+            ("ssh://git@[::2]:2224/group/project.git", "::2"),
+            // A named HTTPS host glab spells with its default port.
+            (
+                "https://gitlab.tls.test/group/project.git",
+                "gitlab.tls.test:443",
             ),
             ("git@gitlab.bare.test:group/project.git", "gitlab.bare.test"),
         ] {
