@@ -21,7 +21,13 @@ in the revert plan, not on `CheckoutRestore` (outside this lane); they drop at t
 points. `quiet_sibling` also takes a `QuietRestore` carrying the reverting thread, the
 checkout and the shared deadline. `exclusiveServer` is read from the instance `config` only:
 the legacy `providers.opencode` patch was left unchanged, since nothing on the server reads
-the flag there.
+the flag there. After review, the Copy table's "Panel's OpenCode server" became "the
+OpenCode server that "Panel" uses", because real titles such as "Panel, Codex" made the
+possessive ambiguous. The unmanaged refusal now reads: ""Panel" uses an OpenCode server that
+other apps may also use, so BiBCode can't make sure it has stopped working in this checkout.
+Rewind only the conversation instead. If only BiBCode uses that server, turn on "Only BiBCode
+uses this server" in Settings → Providers → OpenCode." The fence is also checked once more
+after step 7's tree capture, immediately before the provider rewind.
 
 **Revision 1 (2026-11-07)** records the maintainer's answers (see
 [Decisions recorded](#decisions-recorded)) and answers Codex's review of `ac16d0da05`

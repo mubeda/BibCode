@@ -988,13 +988,15 @@ async fn an_unmanaged_opencode_sibling_refuses_the_restore() {
         .insert("b".into(), WritingReason::UnmanagedServer);
     let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
     assert!(
-        detail(&failure).contains("runs on an OpenCode server BiBCode doesn't manage"),
+        detail(&failure).contains(
+            "\"Panel, Codex\" uses an OpenCode server that other apps may also use, so BiBCode can't make sure it has stopped working in this checkout."
+        ),
         "{failure}"
     );
     // The refusal names the setting that states nothing else uses the server (#326).
     assert!(
         detail(&failure).ends_with(
-            "If nothing but BiBCode uses that server, turn on Only BiBCode uses this server in Settings → Providers → OpenCode."
+            "If only BiBCode uses that server, turn on \"Only BiBCode uses this server\" in Settings → Providers → OpenCode."
         ),
         "{failure}"
     );
@@ -1102,13 +1104,38 @@ async fn a_sibling_execution_after_planning_refuses_before_the_rewind() {
     let failure = outcome.await.unwrap().unwrap_err();
     assert!(
         detail(&failure).ends_with(
-            ": Panel, Codex's OpenCode server is still working in this checkout. Try the revert again when it finishes."
+            ": The OpenCode server that \"Panel, Codex\" uses is still working in this checkout. Try the revert again when it finishes."
         ),
         "{failure}"
     );
     assert_eq!(fixture.provider.rewinds(), 0, "no provider rewind");
     assert_eq!(fixture.tracked(), "two\n");
     streams_closed(&server).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_trip_after_the_step_7_sibling_check_still_refuses_before_the_rewind() {
+    let fixture = Fixture::new().await;
+    let (server, fence) = quiet_fence(&fixture, None).await;
+    // Step 7's sibling check reads the server's `pid` once and passes; the server restarts
+    // while the checkout tree is captured, so only the last look before the rewind sees it.
+    server.restart_at_info_read(server.info_reads() + 2, 101);
+    fixture
+        .provider
+        .fences
+        .lock()
+        .unwrap()
+        .insert("b".into(), fence);
+    let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
+    assert!(
+        detail(&failure).ends_with(
+            ": The OpenCode server that \"Panel, Codex\" uses is still working in this checkout. Try the revert again when it finishes."
+        ),
+        "{failure}"
+    );
+    assert_eq!(fixture.provider.rewinds(), 0, "no provider rewind");
+    assert_eq!(fixture.tracked(), "two\n");
     fixture.shutdown().await;
 }
 
@@ -1150,7 +1177,7 @@ async fn a_sibling_execution_after_the_rewind_skips_the_file_restore() {
     .expect("the unrestored revert fails");
     assert!(
         detail(&failure).ends_with(
-            ": The conversation was rewound, but the files could not be restored: Panel, Codex's OpenCode server started working. Revert again when it finishes."
+            ": The conversation was rewound, but the files could not be restored: The OpenCode server that \"Panel, Codex\" uses started working. Revert again when it finishes."
         ),
         "{failure}"
     );
@@ -1199,7 +1226,7 @@ async fn a_sibling_execution_during_the_restore_is_reported_and_the_restore_stan
     assert_eq!(warning["tone"], "warning");
     assert_eq!(
         detail(&warning["payload"]),
-        "Files were restored, but Panel, Codex's OpenCode server started working during the restore. Check Panel, Codex's changes."
+        "Files were restored, but the OpenCode server that \"Panel, Codex\" uses started working during the restore. Check that chat's changes."
     );
     assert_eq!(fixture.tracked(), "one\n", "the restore stands");
     streams_closed(&server).await;
