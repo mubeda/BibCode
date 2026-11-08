@@ -1,34 +1,57 @@
 # Checkpoints: Restore Files Beside a Quiet External OpenCode Server
 
-Status: Proposed — awaiting Codex + advisor review. Issue #326, a follow-up to #279
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). Issue #326, a follow-up to #279
 ([`2026-11-07-shared-checkout-restore-guard-design.md`](./2026-11-07-shared-checkout-restore-guard-design.md),
 approved, on branch `worktree-agent-acfdd3a967c39b8d0` at the time of writing). BiBCode
 line references are to `e222d340ff`. OpenCode references are to the source read for this
 note: OpenCode 2 at `anomalyco/opencode` `dev` commit `5a47777cc4c7` (package version 2.2.5,
 read 2026-11-07; latest release v2.2.6), and OpenCode 1 at tag `v1.19.5` (commit
 `810c0eba1a73`, the newest 1.x tag). Nothing was run against a live OpenCode server for
-this note. No product code is written until the maintainer approves.
+this note. The file name was assigned before review; the design establishes quiet only
+through the person's statement (see Outcome).
+
+**Revision 1 (2026-11-07)** records the maintainer's answers (see
+[Decisions recorded](#decisions-recorded)) and answers Codex's review of `ac16d0da05`
+(see [Review findings and resolutions](#review-findings-and-resolutions)). It reframes the
+probe and fence as best-effort detection, widens the statement to cover schedules and
+plugins, probes schedules per session, exempts the reverting session's own rewind, and
+makes 10 s the total probe budget.
 
 ## Outcome
 
 #279 refuses every host file restore in a checkout while another chat there (a "sibling")
 uses an OpenCode instance with `serverUrl` set (an "unmanaged sibling"). BiBCode does not
 own that server, and suspending BiBCode's session only stops observing it. The issue asks:
-if OpenCode's API can prove the sibling's session idle and unable to start work by itself
-for the restore's duration, use that proof and restore; otherwise keep refusing.
+if OpenCode's API can show the sibling's session idle and unable to start work by itself
+for the restore's duration, restore; otherwise keep refusing.
 
-**Finding: OpenCode's API cannot prove that.** Neither version has a lock, pause or
-prompt-admission control. Any other client of the server (TUI, web UI, another app) and
-any plugin can start work at any moment, with no prior signal. A client can only show
-"nothing is running or pending right now" and watch for a start afterwards.
+**Finding: OpenCode's API cannot establish that.** Neither version has a lock, pause or
+prompt-admission control. Any other client of the server (TUI, web UI, another app), any
+schedule and any plugin can start work at any moment, with no prior signal. A client can
+only see "nothing is running or pending right now" and watch for a start afterwards, and
+even that watch lags: OpenCode 2 registers an execution before its start event is
+published and delivered (`core/src/session/run-coordinator.ts` L82-95), and the stream's
+heartbeat is an independent 15 s timer (`server/src/handlers/event.ts` L18-25), so a start
+registered just before the last check can still be in transit while Git runs.
 
-**Decision (proposed):** keep #279's refusal as the default. Lift it only for an
-instance where the maintainer states, in a new per-instance setting, that BiBCode is the server's
-only client. For such an instance on OpenCode 2, a probe shows the sibling's session tree
-idle with nothing pending, keeps an event-stream tripwire open through the restore, and
-checks it again before each irreversible step. Anything it cannot read refuses. OpenCode 1
-keeps refusing. Whether a user statement counts as "proof" is the maintainer's call (question 1);
-if he says no, the issue closes with no product change beyond the refusal copy.
+**Decision:** keep #279's refusal as the default. Lift it only for an OpenCode 2 instance
+where the person turns on a new per-instance setting stating that nothing but BiBCode
+starts work on that server. **That statement is the guarantee.** The probe (the sibling's
+session tree is idle with nothing pending) and the event-stream fence (checked before each
+irreversible step) are best-effort detection of a false statement: they refuse or report
+what they see, and cannot exclude a start they do not see. Anything the probe cannot read
+refuses. OpenCode 1 keeps refusing. The maintainer accepted this, knowing the residual risk is a
+false statement.
+
+## Decisions recorded
+
+The maintainer, 2026-11-07, through the coordinator:
+
+1. The opt-in `exclusiveServer` statement is accepted as the basis for lifting the
+   refusal; the residual risk is a false statement.
+2. OpenCode 2 only. OpenCode 1 external servers keep refusing.
+3. The refusal for an unmanaged sibling names the "Only BiBCode uses this server" setting.
+4. The probe budget of 10 s is accepted (total across siblings, below).
 
 ## What OpenCode's API offers (verified in source)
 
@@ -65,15 +88,15 @@ terminals (`/api/shell`, `/api/pty`, persistent PTYs; v1 `/pty`), and the file A
 (`POST /api/experimental/fs/write`). All are started by a client.
 
 Three rows say **No**. Those starters are only excluded if nobody else uses the server,
-which BiBCode cannot check. That is why the proof needs a statement from the maintainer.
+which BiBCode cannot check. That is why the guarantee has to be the person's statement.
 
 ## Options
 
 | Option                                                                                         | For                                                                                                       | Against                                                                                                                                                                         |
 | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **(A)** Keep #279's refusal. Improve the copy to name the fix (clear Server URL so BiBCode starts its own server). | No code, no risk. Correct by the evidence above.                                                          | The issue's case stays blocked. The maintainer's workflow with a long-running external server keeps only "Rewind conversation only".                                                     |
-| **(B)** Probe automatically for every unmanaged sibling.                                         | No setting.                                                                                               | Not a proof: another client's prompt, a plugin or another process can start work unseen. A restore would overwrite that work. Breaks the issue's "otherwise keep refusing".      |
-| **(C) proposed:** (B) only for an instance marked "Only BiBCode uses this server", OpenCode 2 only. | Every remaining starter is visible to the probe or trips the event fence. The default stays safe.         | Rests on a statement BiBCode cannot verify. One setting field (a contracts schema change). Uses experimental OpenCode 2 routes, so a server without them refuses.               |
+| **(B)** Probe automatically for every unmanaged sibling.                                         | No setting.                                                                                               | No guarantee: another client's prompt, a plugin or another process can start work unseen. A restore would overwrite that work. Breaks the issue's "otherwise keep refusing".      |
+| **(C) chosen:** (B) only for an instance marked "Only BiBCode uses this server", OpenCode 2 only. | A true statement leaves only starters the probe can see. The probe and fence catch some false statements. The default stays safe. | Rests on a statement BiBCode cannot verify. One setting field (a contracts schema change). Uses experimental OpenCode 2 routes, so a server without them refuses.               |
 | **(D)** Interrupt the sibling's session before restoring.                                       | Stops a running turn.                                                                                     | Interrupt is not a lock; work can start again at once. Destroys the sibling's work instead of protecting it.                                                                     |
 | **(E)** Ask in the revert dialog each time ("I'm sure nothing else uses this server").           | No setting.                                                                                               | Asks a question the person cannot answer at revert time (UI.md: match the mental model, safe defaults). A habit-forming checkbox in front of an overwrite.                       |
 | **(F)** Stage a revert on the sibling's OpenCode session to block background wake-ups.           | OpenCode 2 skips synthetic wakes while a revert is staged (`session.ts` L323).                            | A user prompt still wakes and commits the staged revert (`session.ts` L173). It mutates the sibling's conversation. Incidental behaviour, not a contract.                       |
@@ -89,8 +112,21 @@ A new boolean in `OpenCodeSettings` (`packages/contracts/src/settings.ts:490-530
 `exclusiveServer`, default `false`, shown after `serverPassword`:
 
 - Title: "Only BiBCode uses this server"
-- Description: "Turn on only if no OpenCode TUI, web page, other app, plugin or schedule
-  sends work to this server. Lets BiBCode restore files while another chat uses it."
+- Description: "Turn on only if nothing else starts sessions or sends prompts on this
+  server: no OpenCode TUI or web page, no other app, no schedule, and no plugin that starts
+  work on its own. BiBCode then restores files in a checkout while another chat uses this
+  server, and refuses if it sees the server working."
+
+**What a true statement excludes.** Every starter in the table above that is not a
+continuation of a BiBCode chat's own work: other clients' prompts (including another
+OpenCode process on the same database, which is another app), schedules, and plugins that
+admit input on their own. **What it does not need to exclude**, because the work belongs
+to a BiBCode chat and the probe sees it: retries and compaction (inside a running
+execution), a `/goal` continuation (inside the execution, or woken by a background job the
+probe lists), background subagent, shell and image results (job rows), and a restart
+resuming a claimed execution (`time.busy` after `time.idle`, a changed `pid`). BiBCode
+itself creates no OpenCode schedules. With a true statement, every remaining starter is
+visible to the probe before the restore; the fence is a last check, not the guarantee.
 
 It has no effect when `serverUrl` is empty: a BiBCode-started server is already managed,
 and #279 suspends its siblings. The provider instance resolution that reads `serverUrl`
@@ -98,14 +134,16 @@ and #279 suspends its siblings. The provider instance resolution that reads `ser
 
 ### The probe (OpenCode 2 only)
 
-Run for each unmanaged sibling whose instance has `exclusiveServer`, after #279 has
-suspended BiBCode's session for it. It is a short-lived client separate from any runtime,
-with the instance's URL and password, each request bounded by the existing
-`DELIVERY_LOOKUP_TIMEOUT`, and the whole probe by 10 s. Steps, in this order:
+Best-effort detection, not a guarantee. Run for each unmanaged sibling whose instance has
+`exclusiveServer`, after #279 has suspended BiBCode's session for it. It is a short-lived
+client separate from any runtime, with the instance's URL and password, each request
+bounded by the existing `DELIVERY_LOOKUP_TIMEOUT`. **One 10 s budget covers every probe of
+one restore, across all siblings**; when it runs out the restore refuses ("BiBCode can't
+read whether Panel's OpenCode server is idle"). Steps, in this order:
 
 1. `GET /api/info`. Not OpenCode 2 → refuse. Keep the `pid`.
-2. **Open the fence:** `GET /api/event`, and wait for `server.connected`. Everything that
-   starts after this frame reaches the fence.
+2. **Open the fence:** `GET /api/event`, and wait for `server.connected`. A start
+   published after this frame reaches the fence, but possibly after a delay (see Races).
 3. Find the tree: the root session id from the sibling's persisted runtime (the
    `resume_cursor` / `runtime_payload` that `suspend_idle_session` keeps,
    `provider_runtime.rs:13015-13030`; the implementer confirms which field holds it). The
@@ -121,16 +159,18 @@ with the instance's URL and password, each request bounded by the existing
 6. For each tree session: `GET /api/session/{id}/inbox` and `/form` empty, and
    `GET /api/session/{id}` with `time.busy` not after `time.idle`. A session with neither
    time has never run and counts as idle. Otherwise refuse.
-7. `GET /api/experimental/schedule`: any schedule that is not paused and targets a tree
-   session → refuse. A 404 here passes (schedules are off or absent).
+7. For each tree session: `GET /api/experimental/schedule?sessionID=<id>`. Listing is per
+   session (`sessionID` is required, `protocol/src/groups/schedule.ts` L37-41). A
+   `ForbiddenError` carrying the schedules-disabled message (`server/src/handlers/schedule.ts`
+   L14-17, L74-75) means none. Any schedule that is not paused → refuse. Any other error →
+   refuse.
 8. `GET /api/shell` and `GET /api/pty`: their response shape was not verified for this
    note. If entries carry a directory, refuse on one inside the checkout; if they do not,
-   refuse on any entry. A 404 passes; terminals other clients open are covered by the
-   statement.
+   refuse on any entry. Any error → refuse.
 
-A 404, non-JSON answer, timeout or unexpected shape at steps 1 to 6 refuses: "BiBCode
-can't read whether Panel's OpenCode server is idle." The probe never sends a prompt,
-interrupt or revert to the sibling's session.
+Any 404, non-JSON answer, timeout or unexpected shape at any step refuses: "BiBCode can't
+read whether Panel's OpenCode server is idle." A missing experimental route never counts
+as safe. The probe never sends a prompt, interrupt or revert to the sibling's session.
 
 The probe returns a `QuietFence`: the open stream, the tree ids, the checkout path and the
 `pid`. The fence **trips** on any of:
@@ -138,7 +178,12 @@ The probe returns a `QuietFence`: the open stream, the tree ids, the checkout pa
 - `session.execution.started`, `session.inbox.enqueued`, `session.synthetic`,
   `session.shell.started` or `session.revert.staged` for a tree id;
 - the same events for any other session whose `location` is inside the checkout, or that
-  carries no `location`;
+  carries no `location`, **except** the reverting thread's own OpenCode session's rewind:
+  `session.revert.staged` and `session.revert.committed` for that session id, which BiBCode
+  itself sends through `revert/stage` and `revert/commit` (`provider/opencode/runtime.rs:4185-4199`;
+  OpenCode publishes `staged` from `core/src/session/revert.ts` L50-54). The probe is
+  given that session id when the reverting thread runs OpenCode 2 on the same server. Any
+  other event from that session (an execution start) still trips;
 - a second `server.connected`, the stream ending or failing (overflow fails it), or no
   bytes for 20 s. OpenCode 2's heartbeat is an SSE comment (`: heartbeat`, every 15 s),
   which the adapter's decoder (`provider/opencode/sse.rs`) yields as no data, so the fence
@@ -147,18 +192,19 @@ The probe returns a `QuietFence`: the open stream, the tree ids, the checkout pa
 `QuietFence::check()` returns `Err` once tripped, and also re-reads `GET /api/info` and
 trips on a changed `pid`. Dropping the fence closes the stream.
 
-### Races, and how each is closed
+### Races, and what covers each
 
-| Race                                                                                                  | Closed by                                                                                                                                                                         |
+| Race                                                                                                  | Covered by                                                                                                                                                                        |
 | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A start between the status reads and the restore.                                                     | The fence opens before the reads (step 2). OpenCode 2 lists an execution in `/active` before `execution.started` is published (`run-coordinator.ts` L82-91), so a start is in the read or on the stream. |
+| A start between the status reads and the restore.                                                     | **The statement.** Detection is best effort: the fence opens before the reads (step 2), and a start registered before a read is listed in `/active`. But an execution is registered before its start event is published (`run-coordinator.ts` L82-95), so a start registered just before the last `check()` can still be in transit while Git runs. The heartbeat is an independent timer (`handlers/event.ts` L18-25) and does not flush pending events. |
 | A child finished but its result is not yet admitted to the parent.                                     | Step 5: the job row stays until the result is admitted.                                                                                                                           |
 | A background shell keeps writing after its session went idle.                                          | Step 5 (`kind: shell` row) and step 8.                                                                                                                                            |
 | Events missed while disconnected (no replay).                                                          | A disconnect, a second `server.connected` or a silent stream trips the fence.                                                                                                     |
 | The server restarts and resumes a claimed execution.                                                   | Step 6 (`time.busy` after `time.idle`), and a restart drops the stream and changes the `pid`.                                                                                     |
-| A start lands after the provider rewind (irreversible) but before `restore_checkpoint`.                | A second check immediately before `restore_checkpoint` (below). The Git restore is what would overwrite sibling work, so it is skipped and the revert ends as a failure after rollback. |
-| A start lands during `restore_checkpoint` itself (milliseconds of `restore`, `clean -fd`, `reset`).    | Not preventable. Under the statement there is no known starter left; a trip here is reported after the restore so the person can check that chat's files.                          |
-| Another client's prompt, a plugin, another process on the same database.                               | **Only the statement.** The fence catches a violation that starts after step 2, but only reports it.                                                                              |
+| A start seen after the provider rewind (irreversible) but before `restore_checkpoint`.                | A second check immediately before `restore_checkpoint` (below). The Git restore is what would overwrite sibling work, so it is skipped and the revert ends through the existing unrestored completion. |
+| A start during `restore_checkpoint` itself (`restore`, `clean -fd`, `reset`).                          | Not preventable. Under a true statement there is no unseen starter left; a trip here is reported after the restore so the person can check that chat's files.                      |
+| Another client's prompt, a schedule, a plugin, another process on the same database.                  | **Only the statement.** The probe may see such work and refuse; the fence may see a later start and report it. Neither excludes it.                                               |
+| The reverting thread's own rewind on the same server publishes `session.revert.*` in the checkout.    | Exempted by session id and event type (fence rules above).                                                                                                                        |
 | OpenCode 2 location-bound routes answer for the wrong directory.                                      | The probe sends the adapter's location; a test pins which routes need it (step 3).                                                                                                 |
 | OpenCode 1: wrong-directory `{}`, `idle` before the runner ends, `prompt_async` 204 before `busy`, no job listing. | Not attempted: OpenCode 1 keeps refusing.                                                                                                                                         |
 
@@ -179,9 +225,11 @@ refuses every unmanaged sibling. Changes:
    `quiet_sibling` or the probe again; it calls `check()` on the fence, before
    `rollback_provider`. A trip refuses with nothing changed.
 4. New check point in `finish_revert`, immediately before `restore_checkpoint`
-   (`orchestration_effects.rs:2023-2165`): a tripped fence skips the Git restore. The
-   outcome is #279's existing "failure after rollback" path (conversation rewound, files
-   not restored, the person reverts again) with its own message.
+   (`orchestration_effects.rs:2023-2165`): a tripped fence skips the Git restore and
+   takes the existing unrestored completion (`orchestration_effects.rs:2090-2163`): once
+   the provider has rewound, the revert is still recorded with `ThreadRevertComplete` and
+   the error reads "The conversation was rewound, but the files could not be restored: …",
+   with the trip message as the cause. The person reverts again.
 5. After `restore_checkpoint`, one last `check()`; a trip adds a warning to the revert's
    outcome activity. It does not undo the restore.
 6. The pre-dispatch preview (`orchestration.previewCheckpointRevert`, #279) shows an
@@ -194,24 +242,25 @@ thread's provider, tens of seconds), the hand-off to the worker, the provider re
 the Git restore. The heartbeat rule above keeps a quiet fence alive through all of it.
 
 The probe holds no BiBCode lock beyond what #279 already holds at steps 5 and 7, and takes
-no thread or checkout gate, so #279's lock order is unchanged. It adds up to 10 s per
-statement-marked sibling to step 5, inside the checkout gate; deliveries waiting on the
-gate wait that much longer.
+no thread or checkout gate, so #279's lock order is unchanged. It adds at most 10 s in
+total to step 5, inside the checkout gate. #279's 15 s `CHECKOUT_RESTORE_ADMISSION_WAIT`
+bounds only acquiring the gate, not how long it is held, so deliveries waiting behind the
+gate wait up to the probe budget longer, on top of #279's existing hold.
 
 ### Copy (checked against `UI.md`)
 
 | Case                                    | Message                                                                                                                                                       |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unmanaged, no statement                 | #279's message, unchanged: "Panel, OpenCode runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead." |
+| Unmanaged, no statement (extends #279)  | "Panel, OpenCode runs on an OpenCode server BiBCode doesn't manage, so BiBCode can't make sure it has stopped working in this checkout. Rewind only the conversation instead. If nothing but BiBCode uses that server, turn on Only BiBCode uses this server in Settings → Providers → OpenCode." |
 | OpenCode 1 with the statement           | "Panel's OpenCode 1 server can't report whether it's idle. Rewind only the conversation instead."                                                              |
 | Probe sees work                         | "Panel's OpenCode server is still working in this checkout. Try the revert again when it finishes."                                                            |
 | Probe cannot read                       | "BiBCode can't read whether Panel's OpenCode server is idle. Rewind only the conversation instead."                                                           |
-| Trip before `restore_checkpoint`        | "The conversation was rewound, but files weren't restored: Panel's OpenCode server started working. Revert again when it finishes."                            |
+| Trip before `restore_checkpoint`        | The existing unrestored error with this cause: "The conversation was rewound, but the files could not be restored: Panel's OpenCode server started working. Revert again when it finishes." |
 | Trip after `restore_checkpoint`         | "Files were restored, but Panel's OpenCode server started working during the restore. Check Panel's changes."                                                 |
 
-The settings description is the only place that names the statement. Refusals do not
-suggest turning it on, so the person is not nudged into a statement made to get past a
-dialog (question 3).
+The maintainer's decision 3: the refusal names the setting. Its condition ("If nothing but BiBCode
+uses that server") comes first so the sentence states what the setting asserts before
+where to find it, rather than offering it as a way past the dialog.
 
 ## Tests
 
@@ -227,10 +276,13 @@ Probe unit tests (`provider/opencode`, new module):
 3. Job row present while `/active` is empty → refused.
 4. Non-empty inbox; pending form → refused.
 5. `time.busy` after `time.idle` → refused.
-6. Active schedule targeting the root → refused; schedule route 404 → passes.
-7. Terminal inside the checkout → refused; outside it → passes.
+6. Schedules, queried once per tree session with `sessionID`: an enabled schedule on a
+   child → refused; a paused one → passes; the schedules-disabled `ForbiddenError` → passes;
+   a 404 or any other error → refused.
+7. Terminal inside the checkout → refused; outside it → passes; route 404 → refused.
 8. Job route 404 (an older 2.x) → refused, "can't read".
-9. A route that never answers → refused within the probe bound.
+9. A route that never answers → refused within the budget. Two marked siblings whose
+   probes together exceed 10 s → refused when the shared budget runs out, not after 20 s.
 10. OpenCode 1 server (`/global/health` JSON, `/api/info` absent) → refused before any
     session read.
 11. Fence: `session.execution.started` for a tree id → trips; for a session located in
@@ -238,16 +290,25 @@ Probe unit tests (`provider/opencode`, new module):
 12. Fence: second `server.connected`, stream closed, stream silent for 20 s, `pid` changed
     at `check()` → each trips.
 13. Dropping the fence closes the connection (the server sees it end).
+14. Fence: `session.revert.staged` and `session.revert.committed` for the reverting
+    session id → do not trip; `session.execution.started` for that id → trips;
+    `session.revert.staged` for a tree id → trips.
 
 Guard tests (on top of #279's tests, same module as its 12c):
 
-14. `a_declared_exclusive_idle_opencode_sibling_allows_the_restore`: files restored.
-15. #279's 12c still passes unchanged for an instance without the statement.
-16. `a_sibling_execution_after_planning_refuses_before_the_rewind`: the event arrives
+15. `a_declared_exclusive_idle_opencode_sibling_allows_the_restore`: files restored.
+16. `the_reverting_threads_own_opencode_rewind_does_not_trip_the_fence`: the reverting
+    thread runs OpenCode 2 on the same scripted server as the marked sibling; its
+    `revert/stage` and `revert/commit` publish `session.revert.*` in the checkout; files
+    are restored.
+17. #279's 12c still passes for an instance without the statement, now with the message
+    that names the setting.
+18. `a_sibling_execution_after_planning_refuses_before_the_rewind`: the event arrives
     between step 5 and step 7 → refused, no provider rewind, no file changed.
-17. `a_sibling_execution_after_the_rewind_skips_the_file_restore`: the event arrives after
-    `rollback_provider` → conversation rewound, files untouched, the trip message.
-18. `a_refused_restore_closes_every_quiet_fence`: the scripted server sees each stream end
+19. `a_sibling_execution_after_the_rewind_skips_the_file_restore`: the event arrives after
+    `rollback_provider` → `ThreadRevertComplete` recorded, files untouched, the unrestored
+    error with the trip message.
+20. `a_refused_restore_closes_every_quiet_fence`: the scripted server sees each stream end
     on refusal and on success.
 
 Live check for the execution report, against a real OpenCode 2.2.x server with the
@@ -278,10 +339,10 @@ it; no new event or finding.
 
 ## Risks
 
-- **A false statement overwrites work.** If another client uses a server marked exclusive,
-  a prompt sent before step 2 and not yet visible (OpenCode 2 lists a woken execution
-  synchronously, so this window is small) or one sent during `restore_checkpoint` can lose
-  that turn's file changes. The fence reports what it sees.
+- **A false statement overwrites work.** This is the accepted residual risk. If another
+  client, schedule or plugin starts work on a server marked exclusive, a start whose event
+  is still in transit at the last `check()`, or one during `restore_checkpoint`, can lose
+  that turn's file changes. The probe and fence only detect what they see.
 - **Experimental routes.** Jobs, schedules and the event vocabulary may change in OpenCode
   2 minor releases. Every unreadable answer refuses, so drift makes the guard stricter,
   not looser. The fixture-based tests pin today's shapes.
@@ -293,15 +354,18 @@ it; no new event or finding.
   descendant's jobs; a possible lost prompt at OpenCode 1's loop exit. None changes the
   decision, because OpenCode 1 refuses and the probe does not interrupt.
 
-## Questions only the maintainer can answer
+## Review findings and resolutions
 
-1. Does "the maintainer states BiBCode is the only client" count as the issue's proof? If not,
-   choose (A): the issue closes with the refusal copy only.
-2. Is OpenCode 2 only acceptable, or does an OpenCode 1 external server matter to you?
-   (Supporting it needs a per-directory status read and has no pending-work listing.)
-3. Should a refusal mention the setting? The design says no, to avoid nudging a statement
-   made just to get past the dialog.
-4. Is up to 10 s of probe time per marked sibling, inside the checkout gate, acceptable?
+Codex (read-only) review of `ac16d0da05`:
+
+| #     | Finding                                                                                                   | Verified                                                                                                                                         | Resolution                                                                                                                                         |
+| ----- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1 #1 | The tripwire cannot establish quiescence: a start registered before the last check can be in transit while Git runs. | Yes: `executions.set` precedes the forked `started` hook (`run-coordinator.ts` L82-95); heartbeat is a separate `Stream.tick` merge (`event.ts` L18-25). | **Fixed.** The statement is the guarantee; probe and fence are best-effort detection. "Proof" wording removed.                                     |
+| #2    | A true statement must exclude schedules and plugins.                                                      | Yes: both start work unannounced.                                                                                                                | **Fixed.** Setting copy covers other clients, schedules and plugins that start work on their own; the doc lists what a true statement excludes.     |
+| P2 #3 | Schedule listing needs `sessionID`; disabled schedules answer Forbidden, not 404.                         | Yes: `schedule.ts` L37-41; `handlers/schedule.ts` L14-17, L74-75.                                                                                | **Fixed.** Per-session listing; disabled-Forbidden is none; any other error refuses. No missing route counts as safe.                              |
+| P2 #4 | The reverting thread's own OpenCode rewind would trip the fence.                                          | Yes: `revert/stage` and `revert/commit` (`runtime.rs:4185-4199`) publish `session.revert.staged` (`revert.ts` L50-54) in the checkout.           | **Fixed.** Exempted by session id and event type; fence test 14, guard test 16.                                                                    |
+| P2 #5 | 10 s must be the total probe budget; #279's 15 s caps acquisition, not hold time.                         | Yes.                                                                                                                                             | **Fixed.** One 10 s budget per restore; refuse on exhaustion; probe test 9.                                                                        |
+| Note  | A trip after the provider rewind uses the existing unrestored completion.                                 | Yes: `orchestration_effects.rs:2090-2163`.                                                                                                       | **Stated** in the hook, step 4.                                                                                                                    |
 
 ## Sources
 
