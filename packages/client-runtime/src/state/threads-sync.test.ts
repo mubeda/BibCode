@@ -1063,31 +1063,41 @@ describe("EnvironmentThreads", () => {
         }),
       );
 
-      it.live("reserves one request for concurrent loads even when the scheduler yields", () =>
-        Effect.gen(function* () {
-          const answer = yield* Deferred.make<void>();
-          const harness = yield* makeHarness({
-            pages: (cursor) =>
-              Deferred.await(answer).pipe(Effect.andThen(pagesOf(TWO_PAGES)(cursor))),
-          });
-          yield* opened(harness);
-          const { loadOlder } = (yield* current(harness)).olderHistory!;
-          // A yield every few operations interleaves the loads between their steps: a load that
-          // checks for one in flight and yields before reserving its own sends a second request.
-          for (let budget = 3; budget <= 24; budget += 1) {
-            yield* Ref.set(harness.pageRequests, []);
-            const loads = yield* Effect.forkChild(
-              Effect.all([loadOlder, loadOlder, loadOlder], { concurrency: "unbounded" }).pipe(
-                Effect.provideService(References.MaxOpsBeforeYield, budget),
-              ),
-            );
-            yield* Effect.sleep("30 millis");
-            expect(yield* Ref.get(harness.pageRequests), `budget ${budget}`).toEqual([FLOOR]);
-            // Interrupting the loads releases the reservation for the next round.
-            yield* Fiber.interrupt(loads);
-          }
-          yield* Deferred.succeed(answer, undefined);
-        }),
+      it.live(
+        "reserves one request for concurrent loads even when the scheduler yields",
+        () =>
+          Effect.gen(function* () {
+            const answer = yield* Deferred.make<void>();
+            const harness = yield* makeHarness({
+              pages: (cursor) =>
+                Deferred.await(answer).pipe(Effect.andThen(pagesOf(TWO_PAGES)(cursor))),
+            });
+            yield* opened(harness);
+            const { loadOlder } = (yield* current(harness)).olderHistory!;
+            // A yield every few operations interleaves the loads between their steps: a load that
+            // checks for one in flight and yields before reserving its own sends a second request.
+            for (let budget = 3; budget <= 24; budget += 1) {
+              yield* Ref.set(harness.pageRequests, []);
+              const loads = yield* Effect.forkChild(
+                Effect.all([loadOlder, loadOlder, loadOlder], { concurrency: "unbounded" }).pipe(
+                  Effect.provideService(References.MaxOpsBeforeYield, budget),
+                ),
+              );
+              // Wait on the condition (the first request recorded), not on wall-clock time, then
+              // yield enough for the other loads to reach their own request before asserting.
+              for (let spin = 0; spin < 100_000; spin += 1) {
+                if ((yield* Ref.get(harness.pageRequests)).length > 0) break;
+                yield* Effect.yieldNow;
+              }
+              for (let spin = 0; spin < 100; spin += 1) yield* Effect.yieldNow;
+              expect(yield* Ref.get(harness.pageRequests), `budget ${budget}`).toEqual([FLOOR]);
+              // Interrupting the loads releases the reservation for the next round.
+              yield* Fiber.interrupt(loads);
+            }
+            yield* Deferred.succeed(answer, undefined);
+          }),
+        // 22 rounds of forked loads; the default 5 s elapses on a loaded machine.
+        30_000,
       );
 
       it.effect("drops a page in flight when a snapshot moves the floor", () =>
