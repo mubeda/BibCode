@@ -96,6 +96,12 @@ fn in_processes(
                 .env("GIT_CONFIG_GLOBAL", root.path().join("global.gitconfig"))
                 .env("PATH", search_path(std::slice::from_ref(&bin)))
                 .env(ROOT, root.path());
+            // Git for Windows puts its exec path, then its own `bin` with a bundled git-lfs,
+            // ahead of `PATH` for the commands it runs; an exec path of `bin` puts the fake
+            // first. Every command these tests run is built in.
+            if cfg!(windows) && bin.join(executable_name("git-lfs")).exists() {
+                command.env("GIT_EXEC_PATH", &bin);
+            }
         });
     }
     None
@@ -862,7 +868,9 @@ async fn a_system_hooks_path_runs_no_hook_during_capture_restore_or_ref_deletion
 }
 
 /// `\dev\null\reference-transaction` on the checkout's drive, which a `/dev/null` hook path
-/// would name on native Windows. Removes what it created when dropped.
+/// would name on native Windows, and `nul\reference-transaction` in the checkout and in its
+/// `.git`, which a `nul` hook path could name (made through `\\?\`, since Win32 reserves
+/// `nul`). Removes what it created when dropped.
 #[cfg(windows)]
 struct PlantedNullHook(Vec<PathBuf>);
 
@@ -875,8 +883,20 @@ impl PlantedNullHook {
             eprintln!("skipped the planted hook: {} exists", null.display());
             return None;
         }
+        let verbatim = |path: PathBuf| {
+            if path.to_string_lossy().starts_with(r"\\?\") {
+                path
+            } else {
+                PathBuf::from(format!(r"\\?\{}", path.display()))
+            }
+        };
         let mut planted = Self(Vec::new());
-        for directory in [drive.join("dev"), null.clone()] {
+        for directory in [
+            drive.join("dev"),
+            null.clone(),
+            verbatim(checkout.join("nul")),
+            verbatim(checkout.join(".git").join("nul")),
+        ] {
             if directory.exists() {
                 continue;
             }
@@ -886,7 +906,20 @@ impl PlantedNullHook {
             }
             planted.0.push(directory);
         }
-        write_marker_hook(&null, marker);
+        for directory in [
+            null,
+            verbatim(checkout.join("nul")),
+            verbatim(checkout.join(".git").join("nul")),
+        ] {
+            write_marker_hook(&directory, marker);
+        }
+        // Git for Windows cannot index a reserved name, so a capture's `add -A` would fail on it.
+        let mut exclude = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(checkout.join(".git/info/exclude"))
+            .ok()?;
+        std::io::Write::write_all(&mut exclude, b"\n/nul/\n").ok()?;
         Some(planted)
     }
 }
