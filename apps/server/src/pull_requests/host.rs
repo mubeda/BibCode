@@ -546,7 +546,9 @@ impl HostCommandRunner {
 /// `gh api` and `glab api` reject `--hostname host:port` as an invalid hostname, so a
 /// host with a web port reaches them only through the pinned `GH_HOST`/`GITLAB_HOST`.
 fn api_hostname(scope: &HostScope) -> Option<&str> {
-    (crate::source_control::host_without_port(&scope.host) == scope.host)
+    crate::source_control::split_host(&scope.host)
+        .1
+        .is_none()
         .then_some(scope.host.as_str())
 }
 
