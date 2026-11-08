@@ -25,7 +25,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const T0: &str = "2026-08-01T00:00:00Z";
 const T1: &str = "2026-08-01T00:00:01Z";
 const T2: &str = "2026-08-01T00:00:02Z";
-const T3: &str = "2026-08-01T00:00:03Z";
+const T_LAST: &str = "2026-08-01T00:00:03Z";
 
 fn command(value: Value) -> OrchestrationCommand {
     serde_json::from_value(value).unwrap()
@@ -355,7 +355,7 @@ impl Fixture {
     ) -> tokio::task::JoinHandle<Result<(), Value>> {
         let mut events = self.engine.subscribe_events();
         let id = format!("revert-{}", Uuid::new_v4());
-        let mut value = json!({"type":"thread.checkpoint.revert", "commandId":id, "threadId":thread, "turnCount":turn_count, "mode":mode, "createdAt":T3});
+        let mut value = json!({"type":"thread.checkpoint.revert", "commandId":id, "threadId":thread, "turnCount":turn_count, "mode":mode, "createdAt":T_LAST});
         if let Some(token) = token {
             value["siblingChangesToken"] = json!(token);
         }
@@ -459,7 +459,7 @@ fn delivery(
 
 async fn send_message(engine: &OrchestrationEngine, thread: &str, id: &str) {
     let command = command(
-        json!({"type":"thread.turn.start", "commandId":id, "threadId":thread, "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":T3}),
+        json!({"type":"thread.turn.start", "commandId":id, "threadId":thread, "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":T_LAST}),
     );
     engine
         .dispatch_with_admission(
@@ -478,7 +478,7 @@ async fn send_message(engine: &OrchestrationEngine, thread: &str, id: &str) {
                     payload: serde_json::to_value(&command).unwrap(),
                     state: TurnDeliveryState::Pending,
                     mode: TurnDeliveryMode::Start,
-                    created_at: T3.into(),
+                    created_at: T_LAST.into(),
                 }),
             },
             || {},
@@ -1518,7 +1518,7 @@ async fn a_sibling_conversation_only_rewind_keeps_its_changes_in_the_warning() {
             .diff_complete("b", 1, &["x"], "2026-08-01T00:00:01.500Z")
             .await;
         if delete_instead {
-            fixture.engine.dispatch(command(json!({"type":"thread.delete", "commandId":"delete-b", "threadId":"b", "createdAt":T3}))).await.unwrap();
+            fixture.engine.dispatch(command(json!({"type":"thread.delete", "commandId":"delete-b", "threadId":"b", "createdAt":T_LAST}))).await.unwrap();
         } else {
             fixture.session("b", "ready").await;
             fixture
@@ -1557,7 +1557,7 @@ async fn an_edit_absorbed_into_a_later_checkpoint_is_listed_as_restored() {
     // An editor changes `x` after turn 2, and the host's turn 3 captures it.
     std::fs::write(fixture.repo.join("x"), "editor\n").unwrap();
     capture_checkpoint(&fixture.repo, "a", 3).await.unwrap();
-    fixture.diff_complete("a", 3, &[], T3).await;
+    fixture.diff_complete("a", 3, &[], T_LAST).await;
     let preview = fixture.preview("a", 1).await;
     assert!(
         preview["restoredPaths"]
