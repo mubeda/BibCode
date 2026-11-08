@@ -355,9 +355,15 @@ impl NeutralRepository {
     fn create(parent: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(parent)?;
         let path = parent.join(format!("sign-in-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         builder.create(&path)?;
         Ok(Self(path))
     }
@@ -509,9 +515,9 @@ mod tests {
         assert!(has_gcm_refusal(&format!(
             "{refusal}\r\nfatal: Authentication failed\n"
         )));
-        assert!(has_gcm_refusal(&format!(
+        assert!(has_gcm_refusal(
             "FATAL: CANNOT PROMPT because user interactivity has been disabled.\n"
-        )));
+        ));
         // A multiline band-3 payload puts the forged line at column 0; it still only offers.
         assert!(has_gcm_refusal(&format!("remote: error\n{refusal}\n")));
         assert!(!has_gcm_refusal(&format!("remote: {refusal}\n")));
