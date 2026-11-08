@@ -1179,6 +1179,28 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
 - **Toolbar:** tabs All, Running, Finished; a Branch combobox (the project's
   branches from the existing git catalog, free text accepted); on GitHub a
   Workflow select. Refresh lives in the module header.
+- **Columns (issue #285):** one CSS grid shared by a header row (outside the
+  scrolling list, `role="table"` with `columnheader`s) and every 64 px row,
+  defined once on the list root as four custom properties
+  (`--pipelines-grid-narrow|compact|medium|full`) from container-query steps
+  of the list root. Fitting order as the panel narrows: ≥ 1100 px all five
+  columns, with Pipeline capped at its width (the rest of the row stays empty
+  at the end); ≥ 900 px Created by hides; ≥ 720 px Stages folds to 64 px
+  (icons that do not fit become a "+N" count, the hidden stages stay in the
+  accessibility tree as screen-reader-only items); below 720 px Status folds to
+  its icon. Actions has a fixed 104 px track, so rows with and without Retry
+  or Cancel align. Pipeline, Created by and Stages resize at ≥ 1100 px through
+  vertical separators in the header (8 px hit area, arrow keys, Home, End,
+  double-click reset), each a `useResizableWidth` stored globally under
+  `bibcode:pipelines-list-<column>-width` and painted through the custom
+  property, so a drag re-renders no row. Pipeline, Created by and Stages
+  tracks are `minmax(min, width)`, so widths that add up to more than the
+  panel shrink toward their minimums and Actions always stays inside the row.
+  A header menu hides Created by, Stages or the duration and age text under
+  Status (`bibcode:pipelines-list-hidden-columns`). The table carries
+  `aria-rowcount` (the host's total plus the header, or -1 when capped) and
+  each row `aria-rowindex` (header is 1). Not built: sorting (the list input
+  has no sort field and GitLab and GitHub order the pages).
 - **Row, wide (≥ 720 px panel):** Status (shared icon plus label, duration
   `4m 12s`, and age "2 hours ago" with the absolute time as its title),
   Pipeline (title on the first line; `#4821` link, ref with a branch, tag or
@@ -1225,8 +1247,16 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   duration and queued time. Retry, Cancel, "Retry failed jobs" (GitHub) and
   "Open on GitLab/GitHub" on the right. GitHub shows an Attempt select when
   `attempt > 1`.
-- **Stages:** columns in GitLab's order, horizontally scrollable on wide
-  panels, stacked on narrow ones. A column has the stage icon, name and
+- **Stages:** columns in GitLab's order, stacked on narrow panels. From
+  720 px of page width each column grows from 256 px up to one shared
+  maximum (default 480 px, 256 to 960 px) and the row scrolls sideways only
+  when the stages at 256 px do not fit (issue #286). The maximum is set with
+  one separator on the first column (same primitive as the list's header
+  separators, `shared/PipelineColumnSeparator.tsx`), stored globally under
+  `bibcode:pipelines-stage-width` and painted as `--pipeline-stage-max`.
+  A job name wraps while its stage column is wider than the minimum and
+  truncates (with its full name as the tooltip) only at 256 px. Wrapping
+  stages onto more rows, an inline log panel and a `needs` view are not built. A column has the stage icon, name and
   job count; a job row is a full-width link to the job route: icon, name,
   duration, and one trailing action (Retry, Cancel or Play). A parallel group
   (`size > 1`) is one row "rspec 3" that expands to its jobs. A trigger job
