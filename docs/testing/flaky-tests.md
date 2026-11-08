@@ -388,10 +388,11 @@ which is a likely reason unwinding is that slow.
 
 Two full lib runs under 12 CPU hogs took 745 s and 1,186 s, and in each a group
 of tests that start child processes failed in the same few minutes while
-in-process tests kept passing (#335). On macOS the first exec of a new file
-waits for a system check: on a loaded Mac, a fresh copy of the compiled Cursor
-fixture or a freshly written script took about 0.17 s to run, against 0.015 s
-for a file that had run before. A few of these first execs never finish.
+in-process tests kept passing (#335). On macOS the first exec of a new file is
+slow: on a loaded Mac, a fresh copy of the compiled Cursor fixture or a freshly
+written script took about 0.17 s to run, against 0.015 s for a file that had
+run before. The cause is likely a system check of new code (`syspolicyd` was
+busy), but the logs did not confirm it. A few of these first execs never finish.
 Copies of the Cursor fixture were found hours later at `_dyld_start`,
 launched-suspended and reparented to launchd, and no other kind of process was
 found stuck that way. The Cursor fixture tests therefore hard-link the compiled
