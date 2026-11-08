@@ -1738,8 +1738,10 @@ methods, setting and fields.
   `##[group]` and `##[error]`, a chunk boundary in the middle of an escape
   sequence and of a line.
 - **Load:** a generated 100,000-line, 8 MiB fixture with sections and colors
-  parses in the worker within a recorded bound (measured on CI hardware, gate
-  at twice the measurement), and the mounted log renders fewer than 200 row
+  parses in time linear in its size: the fastest parse of the whole fixture
+  takes under eight times the fastest parse of its first quarter (about four
+  when linear, sixteen when quadratic), with no wall-clock bound, so machine
+  load cannot fail it (#319); the mounted log renders fewer than 200 row
   elements; scrolling to the end and searching a term with 5,000 matches keep
   the main thread free of tasks over 50 ms (browser test with a long-task
   observer).
