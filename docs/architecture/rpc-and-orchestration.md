@@ -342,19 +342,25 @@ without exactly one declared scope fails a server test.
 
 ## Git process environment
 
-Status, diff, the Git Manager, worktrees, refs, the watcher and the other commands built on
-`git_environment()` (`apps/server/src/git/repository.rs`) run Git noninteractively:
-`GCM_INTERACTIVE=never`, empty `GIT_ASKPASS` and `SSH_ASKPASS`,
-`SSH_ASKPASS_REQUIRE=never`, `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`. Reads add
-`GIT_OPTIONAL_LOCKS=0`.
+Status, diff, the Git Manager, worktrees, refs, the watcher, turn checkpoints, the
+bootstrap fetch and the other commands built on `git_environment()`
+(`apps/server/src/git/repository.rs`) run Git noninteractively: `GCM_INTERACTIVE=never`,
+empty `GIT_ASKPASS` and `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE=never`,
+`GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`. Reads add `GIT_OPTIONAL_LOCKS=0`. No BiBCode Git
+call opens a credential window or prompt: a fetch, pull or push uses a stored credential
+through a kept helper, or fails with an authentication error.
 
-They read only the line-ending keys of the system configuration (#282,
-[design](../plans/2026-11-03-git-system-line-endings-design.md)), so line endings match the
-person's own Git, for example Git for Windows' system `core.autocrlf=true`:
+They read one curated subset of the system configuration (#282,
+[design](../plans/2026-11-03-git-system-line-endings-design.md); #283,
+[design](../plans/2026-11-07-checkpoint-git-isolation-design.md)), so the files they write
+match the person's own Git, for example under Git for Windows' system `core.autocrlf=true`
+and LFS filter, and a fetch authenticates as the person's does:
 
-- **Probe.** Before the server starts, `git::system_line_endings::install_once` reads
-  `core.autocrlf`, `core.eol` and `core.safecrlf` with
-  `git config --system --includes -z --get-regexp`, from an empty temporary directory. The
+- **Probe.** Before the server starts, `git::system_config::install_once` reads
+  `git config --system --includes -z --get-regexp` for `core.autocrlf`, `core.eol`,
+  `core.safecrlf`, `core.symlinks`, `core.fscache`, `core.longpaths`,
+  `filter.lfs.{clean,smudge,process,required}`, `credential.helper`, `http.sslBackend` and
+  `http.sslCAInfo`, from an empty temporary directory. The
   two binaries call it, `bibcode serve` and the desktop's in-process backend, and
   `ServerRuntime::start` does not, so library and lifecycle tests keep
   `GIT_CONFIG_NOSYSTEM=1`. `bibcode serve` first resolves its data root the way startup
@@ -363,9 +369,22 @@ person's own Git, for example Git for Windows' system `core.autocrlf=true`:
 - **Includes.** Unconditional `include.path` files are followed. `includeIf` cannot be
   resolved outside a repository and is not applied.
 - **Values.** The last value of each key wins. Booleans are canonicalized as Git reads them,
-  and an invalid last value drops its key.
+  and an invalid last value drops its key. The written values are BiBCode's own constants,
+  never text copied from the system file, except one validated path:
+  - The LFS group is kept whole only when `clean` and `smudge` are present and every value
+    byte-equals one `git lfs install` writes (with or without `--skip`, or the legacy
+    `git-lfs clean %f` and `git-lfs smudge %f`), and `required` is a boolean. Any other
+    `filter.lfs.*` value makes the policy `Unread` (below).
+  - `credential.helper` is read as Git reads the list, an empty value resetting it. It is
+    kept only when every entry is `manager`, `manager-core`, `osxkeychain`, `wincred`,
+    `cache` or `store`; a path, arguments or a `!` command keep none.
+    `credential.<url>.*` is not read.
+  - `http.sslBackend` is one of `openssl`, `schannel`, `gnutls` and `secure-transport`.
+    `http.sslCAInfo` is an absolute path to an existing regular file, without control
+    characters or quotes, written as a quoted Git string with each `\` escaped.
 - **The generated file.** The canonical values are written to
-  `<state>/git/system-line-endings-<hash>.gitconfig` in the server's own state directory.
+  `<state>/git/system-config-<hash>.gitconfig` in the server's own state directory, in the
+  sections `[core]`, `[filter "lfs"]`, `[credential]` and `[http]`.
   The path loses a Windows `\\?\` verbatim prefix, which Git ignores in
   `GIT_CONFIG_SYSTEM`, and must be absolute, because Git resolves a relative one inside
   each repository. The write is atomic: a fresh `create_new` temporary name (`0600` on
@@ -375,37 +394,54 @@ person's own Git, for example Git for Windows' system `core.autocrlf=true`:
   user. The ancestors and Windows ACLs are not checked: the state directory already holds
   the database, so it is the trust boundary. Git then runs with `GIT_CONFIG_SYSTEM=<file>`
   and without `GIT_CONFIG_NOSYSTEM`. These are system-scope values, so repository and global settings
-  still win. No credential helper, hook, filter, include or URL rule from the system
-  configuration gets in.
-- **Fallback.** With no key set, the policy stays at `GIT_CONFIG_NOSYSTEM=1`, today's
-  isolation. It also stays there when any of these hold:
+  still win. No hook, include, other filter, textconv, diff or merge driver, URL rule,
+  proxy or other `http.*` key from the system configuration gets in.
+- **No kept key.** The policy is `NoSystem`: `GIT_CONFIG_NOSYSTEM=1`.
+- **Unread.** The policy is `Unread` when it is not installed (library and lifecycle
+  tests), when the system file holds an LFS group BiBCode does not recognize, or when any of
+  these hold:
   - on Unix, the child `PATH` has a relative entry, which could resolve another Git per
     directory (Windows searches it from the server's own directory, so it cannot);
   - the resolved Git is older than 2.32, which ignores `GIT_CONFIG_SYSTEM`;
   - the probe takes more than 2 s in total, and its children are killed;
   - the write or a check fails.
 
-  A failure, or an invalid value, logs one warning with no path. The probe runs before
-  logging starts, so the server logs the warnings right after it installs logging.
+  `git_environment()` and the bootstrap fetch then run with `GIT_CONFIG_NOSYSTEM=1`: their
+  worst case is a fetch that fails and can be retried, or a worktree with LFS pointers.
+  Checkpoints (`git_environment_inheriting_unread()`) set no variable and read the inherited
+  system file, as they always did, so a checkpoint captured with a system LFS filter BiBCode
+  could not read still restores real content. Their hook override (below) still applies.
+
+  A failure, an unrecognized LFS group, or an ignored value logs one warning with no path.
+  The probe runs before logging starts, so the server logs the warnings right after it
+  installs logging.
 
 - **Restart rule.** The result is fixed for the process. A desktop backend restart reuses
   it, and quitting and reopening the app, or restarting `bibcode serve`, reads the settings
   again.
 - **Known limits.** A Git downgraded below 2.32 while BiBCode runs reads the full system
   file until restart. A generated file that goes missing is ignored by Git, which is the
-  same as `GIT_CONFIG_NOSYSTEM=1`.
+  same as `GIT_CONFIG_NOSYSTEM=1`. Whether `git lfs prune` keeps objects reachable only
+  from `refs/bibcode/*` is not verified; a restore whose LFS object was pruned tries to
+  download it, as it did before.
 
-These spawns keep their own configuration:
+Checkpoint Git ([Turn checkpoints](#turn-checkpoints)) adds `-c core.hooksPath=<null
+device>` (`NUL` on Windows, `/dev/null` elsewhere, the clone policy's) and
+`-c core.fsmonitor=false` to every command, so no system, global or repository hook runs
+for BiBCode's own `refs/bibcode/*` writes, and no fsmonitor starts for its temporary index.
+Filters from global and repository configuration stay on. The bootstrap fetch takes
+`git_environment()` with no override: it updates real remote-tracking refs, so repository
+and global hooks run, as for the person's fetch.
+
+The streamed review diff and its untracked listing, workspace search's `git ls-files`
+and the pull-request service's Bitbucket remote read use `git_read_environment()`. The
+external difftool launch takes only the policy's system-configuration variable, the same
+policy its `--tool-help` listing runs under: the prompt guards and the C locale would reach
+the diff app. These spawns keep their own configuration:
 
 - The clone tools' fully isolated configuration ([Clone tools](#clone-tools)). A clone's
   LF checkout is clean for both Gits under `autocrlf=true`.
-- Turn checkpoints and the bootstrap fetch, which inherit the full system configuration,
-  so they already agree on line endings.
-- The streamed review diff, workspace search's `git ls-files` and the pull-request
-  discovery default.
-- The external difftool, whose tool definitions can live in the system configuration.
-
-Isolating checkpoints is a follow-up (#283).
+- Source-control discovery's `git --version` probe, which reads no configuration.
 
 ## VCS status and mutation coordination
 
@@ -1012,8 +1048,9 @@ that turn is recorded too. The turn-diff projector keeps a turn's `interrupted` 
 id when a checkpoint lands. A thread without its own worktree shares its
 project's checkout, so its turn's patch holds every change made in the checkout
 while the turn ran, and edits made between turns land in the next turn's patch.
-Git runs through the supervised process runner, 30 seconds per call, on the
-sequential worker, which also orders captures before the thread's next baseline
+Git runs through the supervised process runner, 30 seconds per call, with the shared
+system-configuration policy, no hooks and no fsmonitor
+([Git process environment](#git-process-environment)), on the sequential worker, which also orders captures before the thread's next baseline
 and any revert of the same checkout. Turns that ended before checkpoints were
 recorded have none, and a deleted thread's refs are not removed.
 
@@ -1175,6 +1212,8 @@ its temporary pre-image files and the user's `difftool.<tool>.cmd`.
   Paths are checked lexically by `resolve_relative` and never against the
   disk, so a deleted file, a rename's old path and a file only a base or a
   checkpoint holds are valid; they follow `--` with `GIT_LITERAL_PATHSPECS=1`.
+  The launch also takes the shared system-configuration variable
+  ([Git process environment](#git-process-environment)).
   The tool ID matches `[A-Za-z0-9][A-Za-z0-9._-]*` and is passed only as the
   value of `--tool=`. The environment adds `GIT_TERMINAL_PROMPT=0`, and the
   AppImage environment is isolated.
@@ -4495,7 +4534,8 @@ server-owned entry index per canonical workspace root, built on first use and
 retained for later requests. Concurrent cold callers share one build, and an
 invalidation generation prevents an older in-flight scan from becoming current.
 
-A Git build starts one concurrent wave of two reads with `GIT_OPTIONAL_LOCKS=0`,
+A Git build starts one concurrent wave of two reads with `git_read_environment()`
+([Git process environment](#git-process-environment)),
 request cancellation, and a workspace-index-specific ten-second post-spawn
 execution bound:
 

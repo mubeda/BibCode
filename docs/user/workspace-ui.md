@@ -256,6 +256,13 @@ clears it. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
 it.
 
+BiBCode's Git follows your system Git settings for line endings, Git LFS,
+symlinks and long paths, so a new worktree and a reverted turn hold the same
+files your own Git would write, LFS files included. It never opens a sign-in
+window. Fetches, including the one before a worktree that starts from `origin`,
+use the credentials your Git credential helper already stores, and otherwise
+fail with an authentication error; sign in with your own Git, then retry.
+
 Use Add Project to open one existing project folder, clone a Git URL, or create
 a new Git repository. It starts on the environment selected in the rail. On
 macOS and Linux desktop, it shows a **Host** selector when saved remote servers
