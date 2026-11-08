@@ -264,6 +264,22 @@ describe("FileBrowserPanel with the real tree", () => {
     expect(listState.revalidate).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes again for a later uncached request after the first one was cleared", async () => {
+    await mount();
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "src/new.ts"));
+    await settle();
+    listState.entries = [...entries, { path: "src/new.ts", kind: "file" } as ProjectEntry];
+    await mount();
+    expect(useRightPanelStore.getState().filesReveal).toEqual({});
+    expect(listState.revalidate).toHaveBeenCalledTimes(1);
+
+    // The same mounted tree, a second newly created file the cached list lacks.
+    await act(async () => useRightPanelStore.getState().revealInFiles(threadRef, "src/newer.ts"));
+    await settle();
+    expect(listState.revalidate).toHaveBeenCalledTimes(2);
+    expect(useRightPanelStore.getState().filesReveal).not.toEqual({});
+  });
+
   it("waits while the list is pending instead of consuming the request", async () => {
     listState.pending = true;
     await mount();
