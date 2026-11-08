@@ -83,6 +83,10 @@ jobs:
       - name: Check agent delivery decisions
         run: node --test scripts/check-agent-delivery.node-test.mjs
 
+      # Relative links, images and heading anchors only; external URLs are not fetched.
+      - name: Check Markdown links
+        run: vp run check:markdown-links
+
       - name: Typecheck
         run: vpr typecheck
 
@@ -334,6 +338,15 @@ jobs:
       - name: Check Windows server test targets compile
         if: matrix.platform == 'win'
         run: node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets
+
+      # Linux runs these in Test; Windows and macOS Git (LFS, hooks, NUL) differ (#283).
+      - name: Run Git system configuration tests (Windows)
+        if: matrix.platform == 'win'
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test git_system_config -j 2
+
+      - name: Run Git system configuration tests (macOS)
+        if: matrix.platform == 'mac'
+        run: cargo test -p bibcode-server --test git_system_config -j 2
 
       # build-desktop-artifact.ts --symbols runs dump_syms on the unstripped binary. Rust Cache
       # keeps ~/.cargo/bin, so a restored runner skips the compile.

@@ -634,7 +634,10 @@ Default on adds no capability. A same-user process can already run
 - **Does each stdio launch mint a new session, or reuse one?** Each launch
   mints, revokes on exit, and sweeps orphans. Nothing is stored. A stored
   token would be one more live bearer at rest, and per-launch sessions keep
-  Authorized clients showing one row per running agent.
+  Authorized clients showing one row per running agent. _Amended 2026-11-07: an
+  opt-in `bibcode mcp --client <name>` stores a token-free named identity so
+  retries, panels and webhook pairing survive restarts; see
+  [the named clients design](2026-11-07-mcp-named-clients-design.md) (#280, #324)._
 - **Approvals?** _Superseded 2026-10-30: `answer_approval` shipped without
   `anthropic/requiresUserInteraction` and without a separate opt-in; it is a destructive
   tool available at every level above read-only (remaining-slices design, Revision 2,
