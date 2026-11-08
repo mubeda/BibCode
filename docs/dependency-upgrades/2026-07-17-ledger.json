@@ -63,9 +63,9 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 261,
+        "rows": 260,
         "statuses": {
-          "green": 136,
+          "green": 135,
           "current": 78,
           "blocked": 42,
           "removed": 5
@@ -313,7 +313,7 @@
     "rustRegistry": 141,
     "rustPath": 3,
     "rustGit": 1,
-    "actions": 10,
+    "actions": 9,
     "toolchains": 9
   },
   "dependencies": [
@@ -489,20 +489,6 @@
       "cohort": "github-actions",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
-    },
-    {
-      "key": "action:gitleaks/gitleaks-action",
-      "name": "gitleaks/gitleaks-action",
-      "current": "e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e",
-      "target": "3.0.0",
-      "tag": "v3.0.0",
-      "sha": "e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e",
-      "channel": "stable",
-      "source": "https://github.com/gitleaks/gitleaks-action",
-      "cohort": "github-actions",
-      "platforms": ["linux"],
-      "status": "green",
-      "notes": "CI Secrets job; gitleaks 8.30.1 via GITLEAKS_VERSION with .gitleaks.toml; artifact upload and PR comments disabled."
     },
     {
       "key": "action:mitchellh/vouch/action/check-user",

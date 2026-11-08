@@ -97,10 +97,10 @@ Use placeholders instead: `gitlab.example.test`, `example-group/sample-project`,
 from a live API before it becomes a fixture. Test against GitLab only through the
 local Docker kit (`docs/skills/gitlab-local-test/`), never a real server.
 
-| Enforcement                                                  | What it catches                                                             |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| CI job **Secrets** (gitleaks, `.gitleaks.toml`)              | Hardcoded secrets in the commits a pull request or push adds.               |
-| `scripts/` sensitive-data guard test (`vp test run scripts`) | Banned private hosts, organization and person names, stored as hashes only. |
+| Enforcement                                                  | What it catches                                                                                     |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| CI job **Secrets** (gitleaks, `.gitleaks.toml`)              | Hardcoded secrets and banned values in every commit and commit message a pull request or push adds. |
+| `scripts/` sensitive-data guard test (`vp test run scripts`) | Banned private hosts, organization and person names, stored as hashes only.                         |
 
 If you find sensitive data already in the tree or history, stop, tell the user
 without repeating the value in public text, and replace it with placeholders in

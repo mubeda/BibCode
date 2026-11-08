@@ -64,10 +64,14 @@ the merge.
 
 ## Jobs
 
-- **Secrets** runs gitleaks 8.30.1 (`gitleaks/gitleaks-action`, pinned) over the
-  commits a pull request or push adds, with `.gitleaks.toml`. It allowlists
-  `.repos/` and the fixture hash manifests, posts no comments and uploads no
-  artifact. The repository is public; see AGENTS.md, Sensitive Data.
+- **Secrets** runs the gitleaks 8.30.1 CLI (release tarball pinned by SHA-256) over
+  every commit a pull request (`base..head`) or push (`before..sha`; the full
+  history for a new branch) adds, merged branches included, with `.gitleaks.toml`.
+  It then runs `scripts/no-sensitive-data.test.ts` with `BIBCODE_SENSITIVE_RANGE`
+  set to the same range, which checks every commit message against the hashed
+  banned values. It allowlists `.repos/` and the fixture hash manifests, posts
+  no comments and uploads no artifact. The repository is public; see AGENTS.md,
+  Sensitive Data.
 - **Check** also runs `vp run check:markdown-links` on `README.md` and the living
   docs (relative links, images and anchors; no network).
 - **Check** runs `vp check` (which fails on any lint warning), workspace
