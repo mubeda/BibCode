@@ -259,11 +259,13 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "revert_thread_to_turn" => (
-            "Reverts a thread to its checkpoint after turn turnCount (0: before its first turn). The files go back to that point, discarding the later turns' changes and anything changed since, and the provider forgets the later turns where it can. Waits up to 30 s for the result. Refused while a turn runs.",
+            "Reverts a thread to its checkpoint after turn turnCount (0: before its first turn). The files go back to that point, discarding the later turns' changes and anything changed since, and the provider forgets the later turns where it can. mode conversationOnly instead rewinds only the conversation and leaves every file as it is (Codex and OpenCode 2). Other chats can share the thread's checkout: a file restore is refused while one of them is working (McpTurnRunningError), and when files changed outside this thread it returns McpSharedCheckoutChangedError with the changes and a siblingChangesToken; repeat the call with that token, and a new clientRequestId, to restore anyway. Waits up to 30 s for the result. Refused while a turn runs.",
             object(
                 json!({
                     "threadId": thread,
                     "turnCount": { "type": "integer", "minimum": 0, "description": "The last turn to keep, as get_turn_diff numbers turns." },
+                    "mode": { "type": "string", "enum": ["full", "conversationOnly"], "description": "full (default): files and conversation. conversationOnly: the conversation only." },
+                    "siblingChangesToken": { "type": "string", "description": "The token McpSharedCheckoutChangedError returned, acknowledging those changes." },
                     "clientRequestId": request_id,
                 }),
                 &["threadId", "turnCount"],
@@ -957,14 +959,93 @@ impl ToolCall<'_> {
         ))
     }
 
+    /// The app's revert preview for a file restore (#279): refused while another chat in the
+    /// checkout writes, or while files changed outside the thread that `token` does not
+    /// acknowledge. Advisory, like the app's: the effects worker checks again under the
+    /// checkout's gate, and its supervisor-side checks reach the agent through the outcome.
+    async fn shared_checkout_precheck(
+        &self,
+        thread_id: &str,
+        turn_count: i64,
+        token: Option<&str>,
+    ) -> Result<(), Value> {
+        // A preview that cannot run (no Git checkout, say) leaves the refusal to the worker.
+        let Ok(preview) = crate::production::orchestration_effects::preview_checkpoint_revert(
+            self.control.engine(),
+            None,
+            thread_id,
+            turn_count,
+            &self.cancellation,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        if let Some(sibling) = preview["writingSiblings"]
+            .as_array()
+            .and_then(|list| list.first())
+        {
+            let title = sibling["title"].as_str().unwrap_or("Another chat");
+            let detail = serde_json::from_value::<
+                crate::production::orchestration_effects::WritingReason,
+            >(sibling["reason"].clone())
+            .map_or_else(
+                |_| format!("Another chat in this checkout ({title}) is working."),
+                |reason| reason.detail(title),
+            );
+            return Err(typed_tool_failure("McpTurnRunningError", &detail));
+        }
+        if preview["headFallbackRefused"] == json!(true) {
+            return Err(typed_tool_failure(
+                "McpCheckpointRevertError",
+                "This thread has no starting checkpoint, and other chats share this checkout, so restoring files would discard their work. Rewind only the conversation, or revert to a later turn.",
+            ));
+        }
+        let Some(expected) = preview["siblingChangesToken"].as_str() else {
+            return Ok(());
+        };
+        let outside = preview["siblingChanges"]["paths"]
+            .as_array()
+            .is_some_and(|paths| !paths.is_empty())
+            || preview["siblingChanges"]["turns"]
+                .as_array()
+                .is_some_and(|turns| !turns.is_empty());
+        let acknowledged = match token {
+            Some(token) => token == expected,
+            None => !outside,
+        };
+        if acknowledged {
+            return Ok(());
+        }
+        Err(shared_checkout_changed(
+            &format!(
+                "Files in this checkout changed since turn {turn_count}, outside this chat. Review them and call again with siblingChangesToken."
+            ),
+            expected,
+            Some(&preview),
+        ))
+    }
+
     /// Reverts a thread to the checkpoint after `turnCount`, then waits for the effects worker
     /// to record the outcome, as the UI's work log shows it.
     async fn revert_thread_to_turn(&self) -> ToolResult {
-        self.only(&["threadId", "turnCount", "clientRequestId"])?;
+        self.only(&[
+            "threadId",
+            "turnCount",
+            "mode",
+            "siblingChangesToken",
+            "clientRequestId",
+        ])?;
         let thread_id = self.required("threadId")?.to_owned();
         let turn_count = self
             .integer("turnCount")?
             .ok_or_else(|| invalid_argument("turnCount is required"))?;
+        let conversation_only = match self.string("mode")? {
+            None | Some("full") => false,
+            Some("conversationOnly") => true,
+            Some(_) => return Err(invalid_argument("mode is full or conversationOnly")),
+        };
+        let token = self.string("siblingChangesToken")?.map(str::to_owned);
         let fresh = async || {
             let thread = self.thread(&thread_id).await?;
             self.check_thread_mode(&thread.runtime_mode)?;
@@ -1008,13 +1089,24 @@ impl ToolCall<'_> {
                     ),
                 ));
             }
-            Ok(vec![json!({
+            if !conversation_only {
+                self.shared_checkout_precheck(&thread_id, turn_count, token.as_deref())
+                    .await?;
+            }
+            let mut command = json!({
                 "type": "thread.checkpoint.revert",
                 "commandId": Uuid::new_v4().to_string(),
                 "threadId": thread_id,
                 "turnCount": turn_count,
                 "createdAt": now_iso(),
-            })])
+            });
+            if conversation_only {
+                command["mode"] = json!("conversationOnly");
+            }
+            if let Some(token) = &token {
+                command["siblingChangesToken"] = json!(token);
+            }
+            Ok(vec![command])
         };
         let commands = self
             .commands("revert_thread_to_turn", Some(&thread_id), fresh)
@@ -1037,7 +1129,7 @@ impl ToolCall<'_> {
         // The provider rewound but the files were not restored; the failure's detail follows.
         let mut unrestored = false;
         loop {
-            if let Some((event_type, kind, detail, rewound_only)) = revert_outcome(
+            if let Some((event_type, kind, detail, rewound_only, changed_token)) = revert_outcome(
                 self.control.repositories(),
                 &thread_id,
                 &request,
@@ -1048,6 +1140,12 @@ impl ToolCall<'_> {
             {
                 if rewound_only {
                     unrestored = true;
+                } else if let Some(changed_token) = changed_token {
+                    return Err(shared_checkout_changed(
+                        &detail.unwrap_or_default(),
+                        &changed_token,
+                        None,
+                    ));
                 } else if kind.as_deref() == Some("checkpoint.revert.failed") {
                     return Err(typed_tool_failure(
                         "McpCheckpointRevertError",
@@ -1061,6 +1159,7 @@ impl ToolCall<'_> {
                             "reverted": true,
                             // A provider that cannot rewind keeps the later messages.
                             "conversationRewound": event_type == "thread.reverted",
+                            "filesRestored": !conversation_only,
                         }),
                         &[],
                     ));
@@ -1531,7 +1630,7 @@ async fn revert_outcome(
     thread_id: &str,
     request: &str,
     after: i64,
-) -> crate::persistence::Result<Option<(String, Option<String>, Option<String>, bool)>> {
+) -> crate::persistence::Result<Option<RevertOutcome>> {
     let thread_id = thread_id.to_owned();
     let request = format!(":{request}:");
     let unrestored = format!(
@@ -1544,7 +1643,8 @@ async fn revert_outcome(
             connection
                 .query_row(
                     "SELECT event_type, json_extract(payload_json, '$.activity.kind'), json_extract(payload_json, '$.activity.payload.detail'),
-                            substr(command_id, 1, length(?4)) = ?4 AS unrestored
+                            substr(command_id, 1, length(?4)) = ?4 AS unrestored,
+                            json_extract(payload_json, '$.activity.payload.siblingChangesToken')
                        FROM orchestration_events
                       WHERE aggregate_kind = 'thread' AND stream_id = ?1 AND sequence > ?2
                         AND instr(command_id, ?3) > 0
@@ -1553,12 +1653,28 @@ async fn revert_outcome(
                               AND json_extract(payload_json, '$.activity.kind') IN ('checkpoint.revert.failed', 'checkpoint.revert.files-only')))
                       ORDER BY unrestored, sequence LIMIT 1",
                     params![thread_id, after, request, unrestored],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .optional()
                 .map_err(Into::into)
         })
         .await
+}
+
+/// A revert's outcome: event type, activity kind, failure detail, whether it is only the
+/// rewind of an unrestored revert, and the token of a restore refused over other chats' changes.
+type RevertOutcome = (String, Option<String>, Option<String>, bool, Option<String>);
+
+/// A file restore refused until the agent acknowledges what other chats changed (#279).
+fn shared_checkout_changed(detail: &str, token: &str, preview: Option<&Value>) -> Value {
+    let mut failure = typed_tool_failure("McpSharedCheckoutChangedError", detail);
+    let error = &mut failure["structuredContent"]["error"];
+    error["siblingChangesToken"] = json!(token);
+    if let Some(preview) = preview {
+        error["restoredPaths"] = preview["restoredPaths"].clone();
+        error["siblingChanges"] = preview["siblingChanges"].clone();
+    }
+    failure
 }
 
 fn title_from(prompt: &str) -> String {

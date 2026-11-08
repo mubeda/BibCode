@@ -28,9 +28,8 @@ use crate::{
     orchestration::engine::{
         ActivityInput, BootstrapSetupInput, BootstrapSetupResult, BootstrapWorktree,
         BoxBootstrapFuture, BoxProjectCommandFuture, CheckoutRestore, OrchestrationCommand,
-        OrchestrationEngine,
-        ProjectCommandEffects, ThreadTurnBootstrapEffects, ThreadTurnReservation,
-        ThreadTurnStartBootstrapPrepareWorktree,
+        OrchestrationEngine, ProjectCommandEffects, ThreadTurnBootstrapEffects,
+        ThreadTurnReservation, ThreadTurnStartBootstrapPrepareWorktree,
     },
     persistence::{OrchestrationEvent, PersistenceError},
 };
@@ -142,7 +141,7 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 }
 
 /// Why another chat in a shared checkout keeps a file restore from running (#279).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WritingReason {
     /// Its session is running a turn.
@@ -198,9 +197,13 @@ impl WritingReason {
 pub enum ConversationRewind {
     Available,
     /// The provider cannot rewind its conversation at all (Claude, Cursor, Grok).
-    FilesOnlyProvider { provider_label: String },
+    FilesOnlyProvider {
+        provider_label: String,
+    },
     /// The provider's rewind also restores files (OpenCode 1).
-    RewindRestoresFiles { provider_label: String },
+    RewindRestoresFiles {
+        provider_label: String,
+    },
 }
 
 impl ConversationRewind {
@@ -237,13 +240,17 @@ pub trait RevertProbe: Send + Sync {
 
     /// Makes the thread quiet for a restore: suspends its live, idle session. `Some` names why
     /// it cannot be made quiet, and nothing is suspended then.
-    fn quiet_sibling<'a>(&'a self, thread_id: &'a str)
-    -> BoxEffectFuture<'a, Option<WritingReason>>;
+    fn quiet_sibling<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, Option<WritingReason>>;
 
     /// Whether the thread's provider can rewind its conversation and keep the files. Answered
     /// from the live session once `prepare_provider_rewind` reopened it.
-    fn conversation_rewind<'a>(&'a self, thread_id: &'a str)
-    -> BoxEffectFuture<'a, ConversationRewind>;
+    fn conversation_rewind<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> BoxEffectFuture<'a, ConversationRewind>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2443,7 +2450,8 @@ async fn sibling_changes(
     .stdout
     .trim()
     .to_owned();
-    let restored_paths = changed_paths(cwd, git, &target_commit, &current_tree, cancellation).await?;
+    let restored_paths =
+        changed_paths(cwd, git, &target_commit, &current_tree, cancellation).await?;
     let changed_since_last_turn = match &tree_start {
         Some(start) => changed_paths(cwd, git, start, &current_tree, cancellation).await?,
         None => Vec::new(),
@@ -2663,7 +2671,14 @@ async fn plan_shared_restore(
         ));
     }
     let fallback_to_head = turn_count == 0 && scan.siblings.is_empty();
-    let revision = checkpoint_revision(cwd, Path::new("git"), target_ref, fallback_to_head, cancellation).await?;
+    let revision = checkpoint_revision(
+        cwd,
+        Path::new("git"),
+        target_ref,
+        fallback_to_head,
+        cancellation,
+    )
+    .await?;
     if scan.siblings.is_empty() {
         return match revision {
             Some(_) => Ok((fallback_to_head, None)),
@@ -2719,7 +2734,10 @@ async fn plan_shared_restore(
         None => !changes.outside_changes(),
     };
     if !acknowledged {
-        tracing::warn!(thread_id, "a file restore was refused: files changed outside the chat that the request did not acknowledge");
+        tracing::warn!(
+            thread_id,
+            "a file restore was refused: files changed outside the chat that the request did not acknowledge"
+        );
         return Err(OrchestrationEffectsError::Refused {
             detail: format!(
                 "Files in this checkout changed since turn {turn_count}, outside this chat. Review them and revert again."
@@ -2753,11 +2771,22 @@ async fn recheck_shared_restore(
     cancellation: &CancellationToken,
 ) -> Result<(), OrchestrationEffectsError> {
     refuse_writing_siblings(engine, probe, thread_id, &shared.siblings, true).await?;
-    let tree = current_tree(cwd, Path::new("git"), shared.tree_start.as_deref(), cancellation).await?;
+    let tree = current_tree(
+        cwd,
+        Path::new("git"),
+        shared.tree_start.as_deref(),
+        cancellation,
+    )
+    .await?;
     if tree != shared.current_tree {
-        tracing::warn!(thread_id, "a file restore was refused: files changed after it was confirmed");
+        tracing::warn!(
+            thread_id,
+            "a file restore was refused: files changed after it was confirmed"
+        );
         return Err(OrchestrationEffectsError::Refused {
-            detail: "Files in this checkout changed after you confirmed. Review them and revert again.".to_owned(),
+            detail:
+                "Files in this checkout changed after you confirmed. Review them and revert again."
+                    .to_owned(),
             sibling_changes_token: sibling_changes_token(
                 &shared.target_commit,
                 &tree,
@@ -2838,7 +2867,9 @@ pub(crate) async fn preview_checkpoint_revert(
     }
     for sibling in &scan.siblings {
         if let Some(reason) = sibling_writing(engine, probe, &sibling.thread_id, false).await? {
-            writing.push(json!({"threadId": sibling.thread_id, "title": sibling.title, "reason": reason}));
+            writing.push(
+                json!({"threadId": sibling.thread_id, "title": sibling.title, "reason": reason}),
+            );
         }
     }
     let shared = !scan.siblings.is_empty() || !scan.unresolvable.is_empty();
@@ -3367,7 +3398,8 @@ async fn append_failure_activity(
                 "Checkpoint revert failed",
                 None,
                 {
-                    let mut payload = json!({"turnCount":event.event.payload.get("turnCount"),"detail":detail});
+                    let mut payload =
+                        json!({"turnCount":event.event.payload.get("turnCount"),"detail":detail});
                     if let Some(token) = sibling_changes_token {
                         payload["siblingChangesToken"] = json!(token);
                     }

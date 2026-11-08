@@ -272,7 +272,9 @@ fn register_orchestration_rpc_inner(
         "orchestration.previewCheckpointRevert",
         move |request, cancellation| {
             let (engine, provider) = preview.clone();
-            async move { preview_checkpoint_revert(&engine, provider.as_ref(), request, &cancellation).await }
+            async move {
+                preview_checkpoint_revert(&engine, provider.as_ref(), request, &cancellation).await
+            }
         },
     );
 

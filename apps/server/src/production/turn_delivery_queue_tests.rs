@@ -3232,7 +3232,11 @@ async fn reverts_past_the_preparation_bound_restore_in_request_order_before_late
                     return;
                 }
                 assert_ne!(
-                    event.event.payload.pointer("/activity/kind").and_then(Value::as_str),
+                    event
+                        .event
+                        .payload
+                        .pointer("/activity/kind")
+                        .and_then(Value::as_str),
                     Some("checkpoint.revert.failed"),
                     "a revert failed: {}",
                     event.event.payload
