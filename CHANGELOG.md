@@ -33,6 +33,7 @@
 - The macOS crash smoke logs its build time; the CI guide describes its settings. (#295)
 - Load-sensitive queue, client-runtime, desktop, job log parse and Windows server tests no longer depend on machine speed, and Cursor and Grok oversized-output recovery is covered. (#263, #264, #316, #319, #327, #328, #329)
 - Native Git watcher tests no longer fail when macOS reports fixture setup changes late under heavy load. (#330)
+- Diff tool, MCP interrupt and terminal observer tests no longer fail under CPU load: they wait for the fake tool's own output, count only interrupt events, and keep a held test join off the shared reaper. (#333)
 - CI runs a gitleaks **Secrets** job. Test fixtures and plan docs use placeholder hosts and names, and a hash-based test guard blocks private values. (#331)
 - `scripts/gitlab-local-test/` starts a throwaway GitLab CE with a runner in Docker for testing pipeline screens without a real GitLab server.
 
