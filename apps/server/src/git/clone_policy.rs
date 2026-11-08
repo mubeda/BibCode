@@ -2011,6 +2011,30 @@ pub(crate) mod tests {
         assert_eq!(https.failure_reason(old), None);
     }
 
+    /// Gives only the current user access to `folder` and to what is created in it later (files
+    /// already there keep their access). Windows OpenSSH
+    /// refuses a configuration file that another group may write, and a temp folder can grant
+    /// one (a sandbox group, say) through inheritance.
+    #[cfg(windows)]
+    fn owner_only(folder: &Path) {
+        let user = std::env::var("USERNAME").expect("USERNAME is set");
+        let status = std::process::Command::new("icacls")
+            .arg(folder)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{user}:(OI)(CI)F"),
+                "/Q",
+            ])
+            .status()
+            .expect("icacls starts");
+        assert!(
+            status.success(),
+            "icacls could not restrict {}",
+            folder.display()
+        );
+    }
+
     /// Runs `command` through the shell Git runs `GIT_SSH_COMMAND` with: a `!` alias, which
     /// Git runs as `sh -c '<command> "$@"'` with its own `sh` and `PATH` (on Windows, the
     /// bundled `/usr/bin` first, so a plain `ssh` is the client Git uses). `HOME` is `home`.
@@ -2067,6 +2091,9 @@ pub(crate) mod tests {
     #[test]
     fn real_ssh_reads_the_generated_command_as_bibcode_means_it() {
         let root = tempfile::tempdir().unwrap();
+        // Before anything is written, so every file inherits the owner-only access.
+        #[cfg(windows)]
+        owner_only(root.path());
         let home = awkward_home(root.path());
         // A person's configuration that `-F none` must keep out, under `HOME` (what MSYS ssh
         // reads) and as an explicit file (what the swapped `-F` reads).
