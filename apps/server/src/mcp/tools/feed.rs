@@ -412,6 +412,9 @@ fn activity(row: &ActivityChangeRow) -> Value {
     if let Some(thread_id) = &row.thread_id {
         entry["threadId"] = thread_id.as_str().into();
     }
+    if let Some(named) = &row.named_client_id {
+        entry["actor"]["namedClientId"] = named.as_str().into();
+    }
     entry
 }
 
@@ -419,11 +422,15 @@ fn activity(row: &ActivityChangeRow) -> Value {
 fn event_actor(json: &str) -> Option<Value> {
     let actor: Value = serde_json::from_str(json).ok()?;
     let field = |key: &str| actor.get(key).and_then(Value::as_str).map(str::to_owned);
-    Some(json!({
+    let mut kept = json!({
         "kind": field("kind")?,
         "clientId": field("clientId")?,
         "label": field("label"),
-    }))
+    });
+    if let Some(named) = field("namedClientId") {
+        kept["namedClientId"] = named.into();
+    }
+    Some(kept)
 }
 
 /// A provider's request id is passed through as it gave it, so only a plain id is returned:
@@ -582,6 +589,11 @@ pub(crate) const ERRORS: &[(&str, &str, &str)] = &[
         "McpCheckpointRevertError",
         "Reverting to a checkpoint failed; the message says why.",
         "Read the thread, fix what the message names, then retry.",
+    ),
+    (
+        "McpSharedCheckoutChangedError",
+        "Files in the thread's checkout changed outside the thread since that turn; the error lists them with a siblingChangesToken.",
+        "Review the changes, then call again with siblingChangesToken and a new clientRequestId, or use mode conversationOnly.",
     ),
     (
         "McpAttachmentExpiredError",

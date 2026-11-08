@@ -268,6 +268,13 @@ export const AuthClientSession = Schema.Struct({
   mcpAccessHandBack: Schema.optionalKey(TrimmedNonEmptyString),
   /** The `<origin>/mcp` a remote OAuth grant is bound to (#139, slice R). */
   mcpResource: Schema.optionalKey(TrimmedNonEmptyString),
+  /**
+   * The named client this outside agent's session is a run of (`bibcode mcp --client`, #280):
+   * it keeps its retries, panels and webhook pairing across runs. `name` is the agent's text.
+   */
+  mcpNamedClient: Schema.optionalKey(
+    Schema.Struct({ id: TrimmedNonEmptyString, name: Schema.String }),
+  ),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 

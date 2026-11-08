@@ -6,74 +6,78 @@
       "type": "active",
       "active": [
         {
-          "clientId": "�",
+          "clientId": "9~4Qg",
           "label": null,
-          "lastCallAt": "😀",
+          "lastCallAt": "\u0000",
           "running": false,
-          "runningTurns": 76
+          "runningTurns": 2
         },
         {
-          "clientId": "=",
-          "label": "kMN8UeV|rg",
+          "clientId": "8UeV|rgqn~",
+          "label": "toString",
           "lastCallAt": null,
-          "running": true,
-          "runningTurns": 4
-        },
-        {
-          "clientId": "�",
-          "label": null,
-          "lastCallAt": null,
-          "running": true,
-          "runningTurns": 80
+          "running": false,
+          "runningTurns": 50
         },
         {
           "clientId": "(.0s9):0#/",
           "label": null,
           "lastCallAt": null,
           "running": false,
-          "runningTurns": 53
+          "runningTurns": 53,
+          "namedClientId": "prototype"
         },
         {
-          "clientId": "prototype",
-          "label": "&:U]?./NCO",
-          "lastCallAt": null,
-          "running": true,
-          "runningTurns": 0
-        },
-        {
-          "clientId": "toString",
-          "label": "toString",
+          "clientId": "&:U]?./NCO",
+          "label": null,
           "lastCallAt": null,
           "running": false,
-          "runningTurns": 46
+          "runningTurns": 2
         },
         {
-          "clientId": "nh!82a\\M:`",
-          "label": "",
+          "clientId": "",
+          "label": null,
           "lastCallAt": null,
           "running": false,
-          "runningTurns": 32
+          "runningTurns": 46,
+          "namedClientId": "nh!82a\\M:`"
         },
         {
-          "clientId": "|8:>*",
-          "label": "_O<:m",
+          "clientId": "]",
+          "label": null,
+          "lastCallAt": null,
+          "running": false,
+          "runningTurns": 68
+        },
+        {
+          "clientId": ">* c|N_O<:",
+          "label": null,
           "lastCallAt": null,
           "running": true,
           "runningTurns": 17
         },
         {
-          "clientId": "rJZ(_Q#=cd",
-          "label": "�",
+          "clientId": "",
+          "label": null,
+          "lastCallAt": "Q#=cd\"Njr?",
+          "running": false,
+          "runningTurns": 5,
+          "namedClientId": "�"
+        },
+        {
+          "clientId": ">N)6NNX@8}",
+          "label": null,
           "lastCallAt": null,
           "running": true,
-          "runningTurns": 5
+          "runningTurns": 95,
+          "namedClientId": "|ZM)Ljm^y"
         },
         {
           "clientId": "�",
-          "label": "HB>N)6NN",
-          "lastCallAt": null,
-          "running": false,
-          "runningTurns": 97
+          "label": "-1",
+          "lastCallAt": "+dy-",
+          "running": true,
+          "runningTurns": 71
         }
       ]
     }

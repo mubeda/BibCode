@@ -374,6 +374,20 @@ describe("WebhooksTab", () => {
     expect(h.calls[2]!.request.input.bearerToken).toBeNull();
   });
 
+  it("names an idle named client's pairing and saves its id back unchanged", async () => {
+    h.settings = { enableWebhooks: true };
+    h.endpoints = [endpoint({ pairedClientId: "nc_1", pairedClientName: "builder" })];
+    const container = await render();
+    await act(async () => button(container, "Edit").click());
+    const trigger = container.querySelector('[aria-label="Paired MCP client"]')!;
+    expect(trigger.textContent).toBe("builder");
+    expect(container.textContent).toContain(
+      "A named client's endpoint stays on across its restarts.",
+    );
+    await act(async () => submitButton(container).click());
+    expect(h.calls[0]!.request.input.pairedClientId).toBe("nc_1");
+  });
+
   it("asks for the token again when the URL changes", async () => {
     h.settings = { enableWebhooks: true };
     h.endpoints = [endpoint({ bearerTokenSet: true })];

@@ -601,7 +601,7 @@ impl ToolCall<'_> {
     }
 
     fn claim(&self, key: &RequestKey) -> Claimed {
-        let id = (key.session_id.clone(), key.client_request_id.clone());
+        let id = (key.scope.clone(), key.client_request_id.clone());
         let mut claims = self
             .control
             .inner
@@ -622,16 +622,15 @@ impl ToolCall<'_> {
     }
 
     async fn read_row(&self, key: &RequestKey) -> Result<Option<Row>, Value> {
-        let (session_id, client_request_id) =
-            (key.session_id.clone(), key.client_request_id.clone());
+        let (scope, client_request_id) = (key.scope.clone(), key.client_request_id.clone());
         self.control
             .repositories()
             .database()
             .call(move |connection| {
                 Ok(connection
                     .query_row(
-                        "SELECT tool, arguments_digest, state, outcome_json FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ?",
-                        params![session_id, client_request_id],
+                        "SELECT tool, arguments_digest, state, outcome_json FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ? AND created_at >= ?",
+                        params![scope, client_request_id, super::control::request_row_cutoff()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?)
@@ -651,7 +650,7 @@ impl ToolCall<'_> {
                 prune_request_rows(&transaction)?;
                 let inserted = transaction.execute(
                     "INSERT OR IGNORE INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at, state) VALUES (?, ?, ?, ?, ?, ?, 'running')",
-                    params![key.session_id, key.client_request_id, key.tool, key.digest, payload, now_iso()],
+                    params![key.scope, key.client_request_id, key.tool, key.digest, payload, now_iso()],
                 )?;
                 transaction.commit()?;
                 Ok(inserted == 1)
@@ -690,12 +689,12 @@ async fn settle(
     state: &'static str,
     outcome: String,
 ) -> crate::persistence::Result<bool> {
-    let (session_id, client_request_id) = (key.session_id.clone(), key.client_request_id.clone());
+    let (scope, client_request_id) = (key.scope.clone(), key.client_request_id.clone());
     database
         .call(move |connection| {
             let updated = connection.execute(
                 "UPDATE mcp_tool_requests SET state = ?, outcome_json = ? WHERE session_id = ? AND client_request_id = ? AND state = 'running'",
-                params![state, outcome, session_id, client_request_id],
+                params![state, outcome, scope, client_request_id],
             )?;
             Ok(updated == 1)
         })

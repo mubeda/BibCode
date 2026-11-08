@@ -227,6 +227,63 @@ change anything by hand. With no journal, `--resume` clears a restore that was
 stopped before it changed anything, or reports that there is nothing to
 resume.
 
+Before it moves anything, `--resume` checks that each staged file still has the
+size and SHA-256 recorded in the journal. If a staged file changed after the
+restore started, `--resume` refuses and changes nothing.
+
+### Finish a restore started by an earlier version
+
+BiBCode 0.15.2 and earlier wrote a version-2 journal, which does not record
+the staged files' contents. `--resume` refuses to finish a restore from such a
+journal, because it cannot prove that the staged database is still the backup.
+BiBCode then refuses to open the store, and a new restore or **Start empty**
+refuses too, until the journal is gone. Finish the restore by hand as follows.
+Each step either moves a file or stops; no step deletes data.
+
+The paths below are relative to the data root (`~/.bibcode` unless you set
+`BIBCODE_HOME` or `--base-dir`; for a WSL store, work inside the distribution).
+`<kind>` is `userdata` or `dev`, the same word as in the journal's file name,
+`.bibcode-recovery-<kind>.json`.
+
+1. Quit BiBCode and make sure no BiBCode process is running for this data root.
+2. Copy the whole data root to another disk, and keep the copy until the
+   restored store has opened and shows your projects. If anything below goes
+   wrong, that copy holds every file as it was.
+3. Open `.bibcode-recovery-<kind>.json` in a text editor and note its
+   `operationId`, `backupId` and `preservedDirectory`. Its `action` must be
+   `restore`; for `start-empty`, `--resume` finishes the operation itself.
+4. Open `backups/<kind>/<storage-id>/<backupId>/manifest.json` (one
+   `<storage-id>` folder contains that backup) and note its `sha256` and
+   `storageInstanceId`. If no folder holds that backup, stop and go to the last
+   step.
+5. Find the restored database. If `.<operationId>.recovery-staging/state.sqlite`
+   exists, it is the restored database and any `<kind>/state.sqlite` is the old
+   one. Otherwise the restore had already installed it at `<kind>/state.sqlite`.
+   Compute the restored database's SHA-256 (`shasum -a 256 <file>` on macOS,
+   `sha256sum <file>` on Linux, `Get-FileHash -Algorithm SHA256 <file>` in
+   PowerShell) and compare it with the manifest's `sha256`, ignoring letter
+   case. If they differ, stop and go to the last step.
+6. Find the restored marker the same way: `environment-id` in the staging folder
+   if it is there, otherwise `<kind>/environment-id`. It must contain the
+   manifest's `storageInstanceId`. If it does not, stop and go to the last step.
+7. Move these files from `<kind>/` into `recovery/<kind>/<preservedDirectory>/`,
+   if they exist: `state.sqlite-wal`, `state.sqlite-shm`, and `state.sqlite` and
+   `environment-id` unless step 5 or 6 found that file to be the restored one.
+   If the preserved folder already holds a file with the same name, stop and go
+   to the last step.
+8. Move `state.sqlite` and `environment-id` from
+   `.<operationId>.recovery-staging/` into `<kind>/`, if they are still there.
+9. Delete the now empty `.<operationId>.recovery-staging` folder, then delete
+   `.bibcode-recovery-<kind>.json`.
+10. Start BiBCode and check your projects. The files you moved in step 7 stay in
+    `recovery/<kind>/<preservedDirectory>/`. Delete the copy from step 2 only
+    after you have checked the restored store.
+
+If you had to stop, put back the copy from step 2 if you changed anything, and
+[open an issue](https://github.com/mubeda/BibCode/issues) with the output of
+**Export diagnostics** and the step where you stopped. Do not attach
+`state.sqlite` or other files from the data root; they hold your project data.
+
 ## Limits and unrelated leftovers
 
 The first release that creates and checks storage UUIDs cannot detect a switch

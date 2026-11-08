@@ -404,11 +404,19 @@ impl ToolCall<'_> {
     /// it opened it (its `requester`), or it sent the thread's latest user message. Another
     /// agent's panel, or a person's thread, is refused rather than named as the origin.
     async fn check_source_is_callers(&self, source: &ProjectionThread) -> Result<(), Value> {
-        let caller = self.principal.principal.session_id.as_str();
+        // The caller's session, or the named client (#280) its earlier runs share.
+        let is_callers = |actor: &Value| {
+            actor["clientId"] == self.principal.principal.session_id.as_str()
+                || self
+                    .principal
+                    .named_client_id
+                    .as_deref()
+                    .is_some_and(|named| actor["namedClientId"] == named)
+        };
         if source
             .requester
             .as_ref()
-            .is_some_and(|requester| requester["actor"]["clientId"] == caller)
+            .is_some_and(|requester| is_callers(&requester["actor"]))
         {
             return Ok(());
         }
@@ -434,7 +442,7 @@ impl ToolCall<'_> {
             .map_err(storage_failure)?;
         if last_sender
             .and_then(|actor| serde_json::from_str::<Value>(&actor).ok())
-            .is_some_and(|actor| actor["clientId"] == caller)
+            .is_some_and(|actor| is_callers(&actor))
         {
             return Ok(());
         }

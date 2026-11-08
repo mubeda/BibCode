@@ -475,6 +475,25 @@ mod tests {
     }
 
     #[test]
+    fn mcp_client_names_the_stdio_relay_only() {
+        let action = Cli::try_parse_from(["bibcode", "mcp", "--client", " builder "])
+            .expect("parse mcp --client")
+            .into_action()
+            .expect("an mcp action");
+        assert!(
+            matches!(action, CliAction::Mcp(options) if options.client.as_deref() == Some("builder"))
+        );
+        let error = Cli::try_parse_from(["bibcode", "mcp", "--client", "builder", "tools"])
+            .expect("parse mcp --client tools")
+            .into_action();
+        assert!(matches!(error, Err(ConfigError::McpClientWithSubcommand)));
+        assert!(
+            Cli::try_parse_from(["bibcode", "mcp", "--client", ""]).is_err(),
+            "a blank name is a usage error"
+        );
+    }
+
+    #[test]
     fn service_install_builds_a_spec_from_the_global_server_flags_only() {
         let executable = PathBuf::from("/usr/bin/bibcode");
         let action = Cli::try_parse_from([
@@ -797,6 +816,10 @@ pub struct McpArgs {
     /// approval-required, auto-accept-edits or full-access.
     #[arg(long, value_name = "LEVEL", value_parser = crate::mcp::relay::parse_access)]
     pub access: Option<crate::mcp::control::McpAccess>,
+    /// Sign each run in as this named client, so it keeps its retries, panels and webhook
+    /// pairing across runs. Only for the stdio server, not its subcommands.
+    #[arg(long, value_name = "NAME", value_parser = crate::mcp::relay::client_name)]
+    pub client: Option<String>,
     #[command(subcommand)]
     pub command: Option<McpSubcommand>,
 }
@@ -1108,6 +1131,8 @@ pub enum ConfigError {
     ProfilerCommandIsNotServer,
     #[error("diagnostics commands cannot be converted into a server configuration")]
     DiagnosticsCommandIsNotServer,
+    #[error("--client names the MCP server's identity; use it without authorize, call or tools")]
+    McpClientWithSubcommand,
     #[error("mcp cannot be converted into a server configuration")]
     McpCommandIsNotServer,
     #[error("thread cannot be converted into a server configuration")]
@@ -1274,6 +1299,7 @@ impl Cli {
                         McpArgs {
                             url: None,
                             access: None,
+                            client: None,
                             command: None,
                         },
                     )?,
@@ -1415,6 +1441,9 @@ pub(crate) fn mcp_action(
     mut mcp: McpArgs,
 ) -> Result<CliAction, ConfigError> {
     let command = mcp.command.take();
+    if command.is_some() && mcp.client.is_some() {
+        return Err(ConfigError::McpClientWithSubcommand);
+    }
     let options = relay_options(base_dir, dev_url, mcp)?;
     Ok(match command {
         Some(McpSubcommand::Authorize(args)) => CliAction::McpAuthorize { options, args },
@@ -1437,6 +1466,7 @@ pub(crate) fn relay_options(
         dev_url,
         url: mcp.url,
         access: mcp.access,
+        client: mcp.client,
     })
 }
 

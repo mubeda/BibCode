@@ -290,6 +290,24 @@ impl Drop for ManualFullProviderRefresh {
     }
 }
 
+/// Probes providers and tools together, so startup waits for the slowest tool version probe
+/// rather than the sum of them. Provider order is unchanged.
+async fn probe_startup_inventory(
+    settings: &Value,
+    cwd: &Path,
+    provider_maintenance: &ProviderMaintenance,
+    tools: &ToolMaintenance,
+) -> Vec<Value> {
+    let (providers, ()) = tokio::join!(
+        provider_inventory::probe(settings, None, cwd, provider_maintenance),
+        tools.refresh(update_checks_enabled(settings), cwd),
+    );
+    providers
+        .into_iter()
+        .map(|result| result.snapshot)
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeServerControl {
     config: ServerConfig,
@@ -405,12 +423,7 @@ impl NativeServerControl {
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
         let provider_maintenance = ProviderMaintenance::new();
-        let providers = provider_inventory::probe(&settings, None, &cwd, &provider_maintenance)
-            .await
-            .into_iter()
-            .map(|result| result.snapshot)
-            .collect();
-        let providers = Arc::new(RwLock::new(providers));
+        let providers = Arc::new(RwLock::new(Vec::new()));
         let (config_events, _) = broadcast::channel(32);
         let tools = ToolMaintenance::new(
             ToolSetup::production(provider_maintenance.clone(), state_directory.clone()),
@@ -419,7 +432,9 @@ impl NativeServerControl {
                 events: config_events.clone(),
             },
         );
-        tools.refresh(update_checks_enabled(&settings), &cwd).await;
+        // Nothing subscribes yet, so the tools' publish during startup reaches no one.
+        *providers.write().await =
+            probe_startup_inventory(&settings, &cwd, &provider_maintenance, &tools).await;
         Self {
             config,
             auth_descriptor,
@@ -2818,6 +2833,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "webhookBearerToken": true,
         "webhookStatusKinds": true,
         "sideChats": true,
+        "conversationOnlyRewind": true,
         "threadDeleteOnlyIfUnused": true,
     });
     // A flag is advertised only when every method it promises is registered.
@@ -3255,6 +3271,55 @@ mod tests {
         control.tools = control.tools_with(setup);
         control.tools.refresh(true, sandbox.root()).await;
         (control, stub_state)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_runs_the_provider_and_tool_version_probes_concurrently() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("startup-probes");
+        let control = scheduler_control(&temp).await;
+        let (setup, _stub, stub_state) = crate::production::tool_maintenance::tests::stub_setup(
+            &sandbox,
+            Duration::from_secs(5),
+        )
+        .await;
+        let log = stub_state.join("probe-log");
+        std::fs::write(&log, "").expect("probe log");
+        std::fs::write(stub_state.join("probe-delay"), "1").expect("probe delay");
+        let provider = sandbox.executable_script(
+            "slow-opencode",
+            &format!(
+                "case \"$1\" in --version) echo start >> '{log}'; sleep 1; echo end >> '{log}'; \
+                 echo 1.0.0;; esac",
+                log = log.display()
+            ),
+            "",
+        );
+        let mut settings = control.settings.read().await.clone();
+        settings["providerInstances"]["opencode"]["config"]["binaryPath"] =
+            json!(provider.to_string_lossy());
+        let tools = control.tools_with(setup);
+
+        probe_startup_inventory(
+            &settings,
+            sandbox.root(),
+            &control.provider_maintenance,
+            &tools,
+        )
+        .await;
+
+        let events: Vec<String> = std::fs::read_to_string(&log)
+            .expect("read probe log")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(events.len(), 4, "both probes ran: {events:?}");
+        assert_eq!(
+            events[..2],
+            ["start", "start"],
+            "both started before either ended"
+        );
     }
 
     async fn until_exists(path: &Path) {
