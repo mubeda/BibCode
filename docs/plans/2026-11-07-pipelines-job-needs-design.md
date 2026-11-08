@@ -1,7 +1,7 @@
 # Pipelines job dependencies (`needs`) view
 
-Issue #322, part 3. Status: **approved with revisions** (coordinator review
-2026-11-07, four P2 findings closed in this revision).
+Issue #322, part 3. Status: **implemented** after the coordinator's review
+(2026-11-07, four P2 findings closed in the revision).
 
 ## Goal
 

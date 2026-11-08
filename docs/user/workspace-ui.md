@@ -1414,7 +1414,11 @@ failed but was allowed to fail shows a warning instead of a failure. Choosing
 a job opens its log beside the stages (below them on a narrow panel), with
 **Open job page** for its details and **Close** (or Escape) to put it away;
 Ctrl-, Cmd- or middle-click a job to open its job page in BiBCode (below)
-instead. When GitLab returns only the first 100 jobs of a
+instead. The open log is part of the page's address, so Back closes it and a
+copied link opens it again. On a GitLab pipeline that uses `needs`, each job
+lists what it needs ("Needs: build, lint"), and **Group jobs by** switches
+between **Stage** and **Job dependencies**, which puts each job one column
+after the jobs it waits for; it is remembered. When GitLab returns only the first 100 jobs of a
 stage, the page says so and links to the full pipeline; an account that
 cannot see the jobs keeps the header and is told so. A pipeline you cannot
 view, or one that no longer exists, says that on the page, with **Open on

@@ -20,6 +20,7 @@ import {
   type Ref,
 } from "react";
 import { cn } from "../../../lib/utils";
+import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { DEFAULT_PIPELINES_FILTERS, usePipelinesStore } from "../../../pipelinesStore";
 import { pipelinesEnvironment } from "../../../state/pipelines";
 import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
@@ -32,6 +33,7 @@ import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryM
 import { keepNewestCopy, type KeptCopy } from "../../repositoryModule/snapshotDisplay.logic";
 import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
 import { PermissionButton } from "../../ui/permission-button";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
 import { Skeleton } from "../../ui/skeleton";
 import { PipelineActions, type PipelineActionOutcome } from "../actions/PipelineActions";
 import { pipelineActionDestination } from "../actions/pipelineActions.logic";
@@ -52,7 +54,9 @@ import {
   detailTimerIntervalMs,
   pipelineAttemptOptions,
   pipelineFingerprint,
+  hasJobDependencies,
   pipelineHostUrl,
+  pipelineNeedsColumns,
   pipelineStageColumns,
 } from "./pipelineDetail.logic";
 
@@ -61,6 +65,49 @@ export interface PipelinesDetailViewHandle {
 }
 
 const isOperationError = Schema.is(PullRequestsOperationError);
+const GROUPING_KEY = "bibcode:pipelines-job-grouping";
+const GroupingSchema = Schema.Literals(["stage", "needs"]);
+type JobGrouping = typeof GroupingSchema.Type;
+const GROUPING_ITEMS: readonly { readonly value: JobGrouping; readonly label: string }[] = [
+  { value: "stage", label: "Stage" },
+  { value: "needs", label: "Job dependencies" },
+];
+
+/** GitLab's "Group jobs by": stages, or layers of `needs`. Offered only when known. */
+function JobGroupingSelect({
+  value,
+  onChange,
+}: {
+  value: JobGrouping;
+  onChange: (value: JobGrouping) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <span id="pipeline-job-grouping-label">Group jobs by</span>
+      <div className="w-40">
+        <Select
+          modal={false}
+          items={GROUPING_ITEMS}
+          value={value}
+          onValueChange={(next) => {
+            if (next !== null) onChange(next);
+          }}
+        >
+          <SelectTrigger aria-labelledby="pipeline-job-grouping-label" size="sm">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectPopup>
+            {GROUPING_ITEMS.map((item) => (
+              <SelectItem key={item.value} value={item.value}>
+                {item.label}
+              </SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
+      </div>
+    </div>
+  );
+}
 const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
 const WAIT_REASON = "The host asked BiBCode to wait before reading again.";
 
@@ -160,12 +207,17 @@ function PipelineArtifacts({ detail }: { detail: PipelinesDetail }) {
 export function PipelinesDetailView({
   pipelineId,
   attempt,
+  jobId,
+  onJobChange,
   onBackoffChange,
   ref,
 }: {
   pipelineId: number;
   /** A GitHub run's earlier attempt; `null` for the latest. */
   attempt: number | null;
+  /** The job whose log shows beside the stages, from the route. */
+  jobId: number | null;
+  onJobChange: (jobId: number | null) => void;
   /** The host asked for a pause: a Refresh before it ends would only be refused. */
   onBackoffChange: (backedOff: boolean) => void;
   ref?: Ref<PipelinesDetailViewHandle> | undefined;
@@ -421,24 +473,25 @@ export function PipelinesDetailView({
         )
       : null;
   // GitHub's one column is built here; keep it stable so the memoized stages skip a re-render.
-  const columns = useMemo(
-    () => (shown === null ? null : pipelineStageColumns(shown, provider)),
-    [provider, shown],
-  );
-  // The job whose log shows beside the stages; the page is keyed by pipeline, so a
-  // different pipeline starts with none.
-  const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
+  const [grouping, setGrouping] = useLocalStorage(GROUPING_KEY, "stage", GroupingSchema);
+  const dependencies = shown !== null && hasJobDependencies(shown);
+  const byNeeds = dependencies && grouping === "needs";
+  const columns = useMemo(() => {
+    const stages = shown === null ? null : pipelineStageColumns(shown, provider);
+    return stages !== null && byNeeds ? pipelineNeedsColumns(stages) : stages;
+  }, [byNeeds, provider, shown]);
+  const selectedJobId = jobId;
   const outerLinks = usePipelineLinks();
   const links = useMemo(
-    () => ({ ...outerLinks, selectJob: setSelectedJobId, selectedJobId }),
-    [outerLinks, selectedJobId],
+    () => ({ ...outerLinks, selectJob: onJobChange, selectedJobId }),
+    [onJobChange, outerLinks, selectedJobId],
   );
   const rootRef = useRef<HTMLDivElement>(null);
   const closeLog = useCallback(() => {
     // Focus goes back to the job's row, which stays on the page.
     rootRef.current?.querySelector<HTMLElement>('a[aria-current="true"]')?.focus();
-    setSelectedJobId(null);
-  }, []);
+    onJobChange(null);
+  }, [onJobChange]);
   const logShown = selectedJobId !== null && shown !== null;
   return (
     <PipelineActions.Provider
@@ -499,6 +552,11 @@ export function PipelinesDetailView({
                       <PipelineStageColumns
                         stages={columns}
                         mutationsDisabledReason={mutationsDisabledReason}
+                        controls={
+                          dependencies ? (
+                            <JobGroupingSelect value={grouping} onChange={setGrouping} />
+                          ) : null
+                        }
                       />
                     </PipelineLinksProvider>
                   )}

@@ -9,7 +9,7 @@ import {
   type PipelinesSnapshot,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
-import { act, createRef, useReducer, type ReactNode } from "react";
+import { act, createRef, useReducer, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DEFAULT_PIPELINES_FILTERS, usePipelinesStore } from "../../../pipelinesStore";
@@ -42,6 +42,7 @@ const h = vi.hoisted(() => ({
   streamFailed: false,
   get: vi.fn((args: { input: PipelinesGetInput }) => ({ kind: "get", ...args })),
   job: null as PipelinesJobDetail | null,
+  jobChanges: [] as (number | null)[],
   jobError: null as PullRequestsOperationError | null,
   getJob: vi.fn((args: { input: unknown }) => ({ kind: "getJob", ...args })),
   readSnapshot: vi.fn((args: { input: unknown }) => ({ kind: "readSnapshot", ...args })),
@@ -240,6 +241,23 @@ async function settle() {
     for (const answer of h.inflight.splice(0)) answer();
   });
 }
+/** The view with its `?job=` held as the route would: each change a new search. */
+function RoutedView({ attempt }: { attempt: number | null }) {
+  const [jobId, setJobId] = useState<number | null>(null);
+  return (
+    <PipelinesDetailView
+      ref={handle}
+      pipelineId={4821}
+      attempt={attempt}
+      jobId={jobId}
+      onJobChange={(next) => {
+        h.jobChanges.push(next);
+        setJobId(next);
+      }}
+      onBackoffChange={vi.fn()}
+    />
+  );
+}
 async function render(
   options: {
     provider?: "gitlab" | "github";
@@ -249,14 +267,7 @@ async function render(
     actions?: boolean;
   } = {},
 ) {
-  const view = (
-    <PipelinesDetailView
-      ref={handle}
-      pipelineId={4821}
-      attempt={options.attempt ?? null}
-      onBackoffChange={vi.fn()}
-    />
-  );
+  const view = <RoutedView attempt={options.attempt ?? null} />;
   const value = moduleValue(
     options.provider === "github" ? githubContext : gitlabContext,
     options.actions ? null : SERVER_TOO_OLD,
@@ -338,6 +349,7 @@ beforeEach(() => {
   h.inflight = [];
   h.job = null;
   h.jobError = null;
+  h.jobChanges = [];
   setVisibility("visible");
 });
 afterEach(async () => {
@@ -901,8 +913,8 @@ describe("PipelinesDetailView stage columns", () => {
     )!;
     expect(wrap.getAttribute("aria-pressed")).toBe("false");
     // Only beside the stages: stacked stages never scroll sideways.
-    expect(wrap.parentElement!.className).toContain("hidden");
-    expect(wrap.parentElement!.className).toContain("@min-[720px]/pipeline:flex");
+    expect(wrap.className).toContain("hidden");
+    expect(wrap.className).toContain("@min-[720px]/pipeline:inline-flex");
     await act(async () => wrap.click());
     expect(wrap.getAttribute("aria-pressed")).toBe("true");
     expect(stageList().className).toContain("@min-[720px]/pipeline:flex-wrap");
@@ -1000,6 +1012,8 @@ describe("PipelinesDetailView job log panel", () => {
     expect(panel()).toBeNull();
     expect(document.activeElement).toBe(jobLink());
     expect(jobLink().getAttribute("aria-current")).toBeNull();
+    // Each open and close goes through the route's `?job=`.
+    expect(h.jobChanges).toEqual([998, null]);
     click(jobLink());
     await settle();
     act(() => {
@@ -1027,5 +1041,69 @@ describe("PipelinesDetailView job log panel", () => {
     await render();
     expect(click(jobLink()).defaultPrevented).toBe(false);
     expect(panel()).toBeNull();
+  });
+});
+
+describe("PipelinesDetailView job dependencies", () => {
+  /** compile (dag, no needs) and rspec (dag, needs compile): two layers, as GitLab draws them. */
+  function needsDetail(fields: "known" | "absent" = "known") {
+    const detail = pipelineDetail({ usesNeeds: true });
+    if (fields === "absent") return detail;
+    return {
+      ...detail,
+      stages: detail.stages!.map((stage) => ({
+        ...stage,
+        groups: stage.groups.map((group) => ({
+          ...group,
+          jobs: group.jobs.map((job) => ({
+            ...job,
+            scheduling: "dag" as const,
+            needs: job.name === "rspec" ? ["compile"] : [],
+          })),
+        })),
+      })),
+    };
+  }
+  const grouping = () => container.querySelector('[aria-labelledby="pipeline-job-grouping-label"]');
+  const headers = () =>
+    [...container.querySelectorAll('[aria-label="Stages"] > li h3')].map(
+      (h3) => h3.querySelector(".truncate")?.textContent,
+    );
+
+  it("says what each job needs, grouped by stage until asked otherwise", async () => {
+    h.detail = needsDetail();
+    await render();
+    expect(grouping()).not.toBeNull();
+    expect(headers()).toEqual(["build", "test"]);
+    expect(container.querySelector('[title="rspec"]')!.textContent).toBe("rspecNeeds: compile");
+    expect(container.querySelector('[title="compile"]')!.textContent).toBe("compile");
+  });
+
+  it("groups jobs by their dependencies when chosen, and falls back on a corrupt choice", async () => {
+    localStorage.setItem("bibcode:pipelines-job-grouping", '"needs"');
+    h.detail = needsDetail();
+    await render();
+    expect(headers()).toEqual(["Layer 1", "Layer 2"]);
+    localStorage.setItem("bibcode:pipelines-job-grouping", "oops");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await render();
+    expect(headers()).toEqual(["build", "test"]);
+    error.mockRestore();
+  });
+
+  it("offers no grouping when the server or stored copy leaves the fields out", async () => {
+    localStorage.setItem("bibcode:pipelines-job-grouping", '"needs"');
+    h.detail = needsDetail("absent");
+    await render();
+    expect(grouping()).toBeNull();
+    expect(headers()).toEqual(["build", "test"]);
+  });
+
+  it("offers no grouping for a pipeline that does not use needs", async () => {
+    h.detail = { ...needsDetail(), usesNeeds: false };
+    await render();
+    expect(grouping()).toBeNull();
   });
 });

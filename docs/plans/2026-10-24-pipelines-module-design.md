@@ -959,7 +959,7 @@ export const PipelinesDetail = Schema.Struct({
     ),
   ),
   truncated: Schema.Boolean, // GitLab: a group over 100 jobs; GitHub: a run over 1,000 jobs
-  usesNeeds: Schema.Boolean, // reserved for the deferred dependencies view
+  usesNeeds: Schema.Boolean, // jobs then carry `scheduling` and `needs` when known (#322)
   artifacts: Schema.Array(PipelinesArtifact), // GitHub run artifacts; empty on GitLab (per job there)
 });
 export const PipelinesJobInput = Schema.Struct({
@@ -1264,15 +1264,31 @@ One row per pipeline, `LegendList` with "Load more", a fixed header:
   stages** toggle above the wide row (issue #322, `aria-pressed`, stored
   globally under `bibcode:pipelines-stage-wrap`, a corrupt value reads as off)
   swaps the row's sideways scroll for `flex-wrap`, so stages that do not fit at
-  256 px move to more rows; it is hidden below 720 px, where stages stack. A
-  `needs` view is not built.
+  256 px move to more rows; it is hidden below 720 px, where stages stack.
+- **Job dependencies (issue #322, design
+  `docs/plans/2026-11-07-pipelines-job-needs-design.md`):** on a GitLab
+  pipeline with `usesNeeds`, jobs carry `scheduling` (GitLab
+  `schedulingType`, `dag` or `stage`) and `needs` (job names), both optional
+  and null when unknown. `GitLabHost::detail` reads them with a separate
+  `PipelinesGitLabNeeds` query, paged until every displayed job is found
+  (at most 40 pages of 50), once per pipeline: an in-memory cache keyed by
+  lowercased host, repository and pipeline id holds 64 pipelines, so poller
+  ticks add no reads. A failed read leaves every job unknown and retries on the
+  next read; a GitLab without the fields is not asked again. A job missing from
+  the read stays unknown. When some job's scheduling is known, a **Group jobs
+  by** select (Stage, Job dependencies; `bibcode:pipelines-job-grouping`)
+  sits before **Wrap stages**. Job dependencies lays groups out in "Layer n"
+  columns: a `dag` group one layer after the latest group it needs, a `stage`
+  or unknown group one layer after every group of the earlier stages. Each job
+  row shows "Needs: a, b" in either grouping.
 - **Inline job log (issue #322):** on the pipeline page a plain click on a job
   row opens that job's log in a panel beside the stages
   (`detail/PipelineJobLogPanel.tsx`); a modified or middle click still opens
   the job page, whose link the row keeps. `PipelineLinks.selectJob` carries
   the click, so a view without a panel (the merge request tab) keeps links.
-  The selection is component state, keyed with the page, so it is not in the
-  URL: Back does not close it and a copied link opens the pipeline without it.
+  The selection is the pipeline route's `?job=`: opening or closing a log is a
+  history step, so Back undoes it and a copied link reopens it; switching from
+  one log to another replaces the step.
   The panel reads the job once (`pipelines.getJob`, for the attempt, erasure
   and raw log link), takes status from the page's polled detail, and picks its
   log with the job page's `jobLogSource`. Header: status, name, **Open job
@@ -2067,6 +2083,7 @@ recommended answer. Earlier questions 13 and 14 are now Engineering decisions
    a "Group jobs by: Stage / Job dependencies" switch when `usesNeeds`.
    **Recommended: (a)**; it is a second GraphQL read and a layered layout, and
    the stage view answers "what failed". `usesNeeds` is already on the wire.
+   Built later as (b) under issue #322 (see Job dependencies above).
 7. **Artifacts.** (a) Host web links only: GitLab job artifacts with
    Download and Browse links on the job page; GitHub run artifacts listed on
    the pipeline and job pages, each opening the run's page on GitHub; no

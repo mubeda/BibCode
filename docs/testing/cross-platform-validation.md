@@ -1040,7 +1040,11 @@ widths and hidden columns, and stage columns fill the page. On the pipeline
 page, **Wrap stages** moves stages that do not fit onto more rows with no
 sideways scroll, and choosing a job opens its log beside the stages at 1600 px
 (stages and log scroll separately, the log follows a running GitLab job) and
-under them at 600 px; Close and Escape return focus to the job's row.
+under them at 600 px; Close and Escape return focus to the job's row, Back
+closes the log and a copied link reopens it. On a GitLab project whose
+pipeline uses `needs`, rows show "Needs:" and **Group jobs by: Job
+dependencies** puts each job after what it needs, with stage-scheduled jobs
+after every earlier stage.
 
 `PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
 must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`
