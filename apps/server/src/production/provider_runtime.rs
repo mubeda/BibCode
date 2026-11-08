@@ -19,6 +19,7 @@ use crate::orchestration::process_ownership::{
 };
 #[cfg(not(feature = "hermetic-test-guard"))]
 use crate::process::locate_executable;
+use crate::provider::opencode::quiet::{QuietFence, QuietRefusal, QuietTarget};
 use crate::{
     activity::{
         ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
@@ -64,8 +65,8 @@ use crate::{
         connect_mcp::ConnectMcpService,
         operational_logs::ProviderOperationalLog,
         orchestration_effects::{
-            BoxEffectFuture, ConversationRewind, ProviderRewind, RevertProbe, WritingReason,
-            process_compatible_path,
+            BoxEffectFuture, ConversationRewind, ProviderRewind, QuietRestore, RevertProbe,
+            WritingReason, process_compatible_path,
         },
     },
     provider::{
@@ -731,10 +732,12 @@ enum SupervisorMessage {
         response: oneshot::Sender<Result<Option<ProviderSessionIdentity>, ProviderRuntimeError>>,
     },
     /// Whether the thread's live session writes in its checkout, for another chat's file
-    /// restore (#279); with `quiet`, suspends it when it is idle.
+    /// restore (#279); with `quiet`, suspends it when it is idle. With `exclusive`, a session on
+    /// an external OpenCode server is judged as any other: the server is probed afterwards (#326).
     SiblingSession {
         thread_id: String,
         quiet: bool,
+        exclusive: bool,
         response: oneshot::Sender<Result<SiblingSession, ProviderRuntimeError>>,
     },
     /// Whether the thread's live session rewinds its conversation without touching files;
@@ -1408,10 +1411,12 @@ impl ProviderRuntimeSupervisor {
         &self,
         thread_id: &str,
         quiet: bool,
+        exclusive: bool,
     ) -> Result<SiblingSession, ProviderRuntimeError> {
         self.request(|response| SupervisorMessage::SiblingSession {
             thread_id: thread_id.to_owned(),
             quiet,
+            exclusive,
             response,
         })
         .await
@@ -6474,6 +6479,8 @@ pub(crate) struct ResolvedProviderRouteSettings {
     binary: ProviderBinarySettingsState,
     pub(crate) environment: BTreeMap<String, String>,
     pub(crate) codex: Option<CodexRouteSettings>,
+    /// An OpenCode instance marked "Only BiBCode uses this server" (`exclusiveServer`, #326).
+    exclusive_server: bool,
 }
 
 impl ResolvedProviderRouteSettings {
@@ -6596,6 +6603,11 @@ pub(crate) async fn resolve_provider_route_settings(
         binary,
         environment,
         codex,
+        exclusive_server: provider == "opencode"
+            && instance
+                .and_then(|value| value.config.get("exclusiveServer"))
+                .and_then(Value::as_bool)
+                == Some(true),
     })
 }
 
@@ -6935,6 +6947,7 @@ async fn run_supervisor(
             SupervisorMessage::SiblingSession {
                 thread_id,
                 quiet,
+                exclusive,
                 response,
             } => {
                 let result = sibling_session(
@@ -6944,6 +6957,7 @@ async fn run_supervisor(
                     &delivery_sequences,
                     &thread_id,
                     quiet,
+                    exclusive,
                 )
                 .await;
                 let _ = response.send(result);
@@ -13304,11 +13318,12 @@ async fn sibling_session(
     delivery_sequences: &HashMap<String, ThreadDeliverySequence>,
     thread_id: &str,
     quiet: bool,
+    exclusive: bool,
 ) -> Result<SiblingSession, ProviderRuntimeError> {
     let Some(entry) = sessions.get(thread_id) else {
         return Ok(SiblingSession::None);
     };
-    if entry.launch.provider == "opencode" && entry.launch.endpoint.is_some() {
+    if entry.launch.provider == "opencode" && entry.launch.endpoint.is_some() && !exclusive {
         return Ok(SiblingSession::Writing(WritingReason::UnmanagedServer));
     }
     if !session_is_confirmed_idle(&engine.repositories(), delivery_sequences, thread_id).await? {
@@ -13348,10 +13363,18 @@ pub(crate) struct SupervisorRevertProbe<'a> {
     pub(crate) engine: &'a OrchestrationEngine,
 }
 
+/// A thread's provider as its settings name it, without launching anything.
+struct SiblingRoute {
+    provider: String,
+    provider_label: String,
+    /// The URL and password of an OpenCode server BiBCode does not manage.
+    server: Option<(String, Option<String>)>,
+    /// That server is marked "Only BiBCode uses this server" (#326).
+    exclusive: bool,
+}
+
 impl SupervisorRevertProbe<'_> {
-    /// The thread's provider and label from its settings, without launching anything, and
-    /// whether that instance names an OpenCode server BiBCode does not manage.
-    async fn route(&self, thread_id: &str) -> Result<Option<(String, String, bool)>, String> {
+    async fn route(&self, thread_id: &str) -> Result<Option<SiblingRoute>, String> {
         let Some(thread) = self
             .engine
             .repositories()
@@ -13370,33 +13393,111 @@ impl SupervisorRevertProbe<'_> {
         let route = resolve_provider_route_settings(self.settings_root, &instance_id, None)
             .await
             .map_err(|error| delivery_detail(&error, None))?;
-        let unmanaged = route.provider == "opencode" && !route.binary.server_url.trim().is_empty();
-        Ok(Some((
-            route.provider.clone(),
-            route.provider_label,
-            unmanaged,
-        )))
+        let server_url = route.binary.server_url.trim();
+        let server = (route.provider == "opencode" && !server_url.is_empty()).then(|| {
+            let password = route.binary.server_password.trim();
+            (
+                server_url.trim_end_matches('/').to_owned(),
+                (!password.is_empty()).then(|| password.to_owned()),
+            )
+        });
+        Ok(Some(SiblingRoute {
+            exclusive: server.is_some() && route.exclusive_server,
+            provider: route.provider.clone(),
+            provider_label: route.provider_label,
+            server,
+        }))
     }
 
-    async fn session(&self, thread_id: &str, quiet: bool) -> Result<Option<WritingReason>, String> {
+    /// The thread's live session, and with `quiet` suspended when idle; then, for a session
+    /// that is not live (or an exclusive one now suspended), what its settings say. `Ok` once it
+    /// is quiet, with the route of a marked external server still to probe.
+    async fn session(
+        &self,
+        thread_id: &str,
+        quiet: bool,
+    ) -> Result<Result<Option<SiblingRoute>, WritingReason>, String> {
+        let route = self.route(thread_id).await;
+        let exclusive = matches!(&route, Ok(Some(route)) if route.exclusive);
         match self
             .supervisor
-            .sibling_session(thread_id, quiet)
+            .sibling_session(thread_id, quiet, exclusive)
             .await
             .map_err(|error| delivery_detail(&error, None))?
         {
-            SiblingSession::Writing(reason) => return Ok(Some(reason)),
-            SiblingSession::Quiet => return Ok(None),
-            SiblingSession::None => {}
+            SiblingSession::Writing(reason) => return Ok(Err(reason)),
+            SiblingSession::Quiet if !exclusive => return Ok(Ok(None)),
+            SiblingSession::Quiet | SiblingSession::None => {}
         }
         // A suspended session on an external server may still be working there.
-        Ok(match self.route(thread_id).await {
-            Ok(Some((_, _, true))) => Some(WritingReason::UnmanagedServer),
-            Ok(_) => None,
+        Ok(match route {
+            Ok(Some(route)) if route.exclusive => Ok(Some(route)),
+            Ok(Some(route)) if route.server.is_some() => Err(WritingReason::UnmanagedServer),
+            Ok(_) => Ok(None),
             // An instance disabled or removed since may still name an external server that
             // keeps working, so a sibling whose provider BiBCode cannot resolve is not quiet.
-            Err(_) => Some(WritingReason::Unobservable),
+            Err(_) => Err(WritingReason::Unobservable),
         })
+    }
+
+    /// The thread's OpenCode session id, from its persisted resume cursor.
+    async fn opencode_session(&self, thread_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .engine
+            .repositories()
+            .get_provider_session_runtime(thread_id.to_owned())
+            .await
+            .map_err(|error| error.to_string())?
+            .filter(|runtime| runtime.provider_name == "opencode")
+            .and_then(|runtime| runtime.resume_cursor)
+            .as_ref()
+            .and_then(resume_string))
+    }
+
+    /// Probes a quiet sibling's marked external OpenCode server (#326).
+    async fn probe_server(
+        &self,
+        thread_id: &str,
+        route: SiblingRoute,
+        restore: &QuietRestore<'_>,
+    ) -> Result<Result<Option<QuietFence>, WritingReason>, String> {
+        let Some((endpoint, password)) = route.server else {
+            return Ok(Ok(None));
+        };
+        let refuse = |reason: WritingReason, why: &str| {
+            tracing::info!(%thread_id, ?reason, why, "an external OpenCode server was not shown quiet for a file restore");
+            Ok(Err(reason))
+        };
+        let Some(root) = self.opencode_session(thread_id).await? else {
+            return refuse(
+                WritingReason::ServerUnreadable,
+                "no OpenCode session is recorded",
+            );
+        };
+        // The reverting thread's own rewind on the same server is BiBCode's, not the sibling's.
+        let reverting = match self.route(restore.reverting_thread_id).await {
+            Ok(Some(SiblingRoute {
+                server: Some((url, _)),
+                ..
+            })) if url == endpoint => self.opencode_session(restore.reverting_thread_id).await?,
+            _ => None,
+        };
+        let target = QuietTarget {
+            endpoint: &endpoint,
+            password: password.as_deref(),
+            checkout: restore.checkout,
+            root_session_id: &root,
+            reverting_session_id: reverting.as_deref(),
+        };
+        match crate::provider::opencode::quiet::probe(&target, restore.deadline).await {
+            Ok(fence) => {
+                tracing::info!(%thread_id, "an external OpenCode server looks quiet; watching it through the file restore");
+                Ok(Ok(Some(fence)))
+            }
+            Err(QuietRefusal::OpenCode1) => refuse(WritingReason::OpenCode1Server, "OpenCode 1"),
+            Err(QuietRefusal::Working) => refuse(WritingReason::ServerWorking, "working"),
+            Err(QuietRefusal::Unreadable) => refuse(WritingReason::ServerUnreadable, "unreadable"),
+        }
     }
 }
 
@@ -13405,14 +13506,22 @@ impl RevertProbe for SupervisorRevertProbe<'_> {
         &'a self,
         thread_id: &'a str,
     ) -> BoxEffectFuture<'a, Option<WritingReason>> {
-        Box::pin(self.session(thread_id, false))
+        // A marked sibling is probed at the restore, so the preview shows it as not writing.
+        Box::pin(async move { Ok(self.session(thread_id, false).await?.err()) })
     }
 
     fn quiet_sibling<'a>(
         &'a self,
         thread_id: &'a str,
-    ) -> BoxEffectFuture<'a, Option<WritingReason>> {
-        Box::pin(self.session(thread_id, true))
+        restore: &'a QuietRestore<'a>,
+    ) -> BoxEffectFuture<'a, Result<Option<QuietFence>, WritingReason>> {
+        Box::pin(async move {
+            match self.session(thread_id, true).await? {
+                Ok(Some(route)) => self.probe_server(thread_id, route, restore).await,
+                Ok(None) => Ok(Ok(None)),
+                Err(reason) => Ok(Err(reason)),
+            }
+        })
     }
 
     fn conversation_rewind<'a>(
@@ -13420,7 +13529,12 @@ impl RevertProbe for SupervisorRevertProbe<'_> {
         thread_id: &'a str,
     ) -> BoxEffectFuture<'a, ConversationRewind> {
         Box::pin(async move {
-            let Some((provider, provider_label, _)) = self.route(thread_id).await? else {
+            let Some(SiblingRoute {
+                provider,
+                provider_label,
+                ..
+            }) = self.route(thread_id).await?
+            else {
                 return Ok(ConversationRewind::Available);
             };
             if !crate::provider::supports_conversation_rewind(&provider) {

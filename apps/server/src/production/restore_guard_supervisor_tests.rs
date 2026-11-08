@@ -6,7 +6,7 @@ use crate::{
     orchestration::EngineOptions,
     persistence::{Database, run_migrations},
     production::{
-        orchestration_effects::{ConversationRewind, RevertProbe, WritingReason},
+        orchestration_effects::{ConversationRewind, QuietRestore, RevertProbe, WritingReason},
         worktree_runtime::removal_test_support::{self, RemovalTestDriver},
     },
     server_settings::{ProviderInstanceState, ProviderSettingsState},
@@ -119,6 +119,20 @@ impl Fixture {
             engine: &self.engine,
         }
     }
+
+    /// Makes `thread` quiet for host thread `t1`'s restore; `Some` names why it is not.
+    async fn quiet(&self, thread: &str) -> Option<WritingReason> {
+        self.quiet_fence(thread).await.err()
+    }
+
+    async fn quiet_fence(&self, thread: &str) -> Result<Option<QuietFence>, WritingReason> {
+        let restore = QuietRestore {
+            reverting_thread_id: "t1",
+            checkout: &self.cwd,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        };
+        self.probe().quiet_sibling(thread, &restore).await.unwrap()
+    }
 }
 
 #[tokio::test]
@@ -129,7 +143,7 @@ async fn an_idle_sibling_session_is_suspended_and_no_path_reopens_it_during_the_
         .launch(fixture.launch("t1", "claude", None))
         .await
         .unwrap();
-    assert_eq!(fixture.probe().quiet_sibling("t1").await.unwrap(), None);
+    assert_eq!(fixture.quiet("t1").await, None);
     assert_eq!(fixture.driver.shutdowns.load(Ordering::SeqCst), 1);
     assert!(
         fixture
@@ -187,10 +201,7 @@ async fn a_running_sibling_session_writes_and_is_not_suspended() {
         .await
         .unwrap();
     fixture.engine.dispatch(serde_json::from_value(json!({"type":"thread.session.set", "commandId":"running", "threadId":"t1", "session":{"threadId":"t1", "status":"running", "providerName":"claude", "activeTurnId":"turn", "lastError":null, "updatedAt":TIME}, "createdAt":TIME})).unwrap()).await.unwrap();
-    assert_eq!(
-        fixture.probe().quiet_sibling("t1").await.unwrap(),
-        Some(WritingReason::Turn)
-    );
+    assert_eq!(fixture.quiet("t1").await, Some(WritingReason::Turn));
     assert_eq!(fixture.driver.shutdowns.load(Ordering::SeqCst), 0);
 }
 
@@ -203,10 +214,7 @@ async fn a_restore_is_refused_when_a_sibling_session_is_unobservable() {
         .launch(fixture.launch("t1", "codex", None))
         .await
         .unwrap();
-    assert_eq!(
-        fixture.probe().quiet_sibling("t1").await.unwrap(),
-        Some(WritingReason::Unobservable)
-    );
+    assert_eq!(fixture.quiet("t1").await, Some(WritingReason::Unobservable));
     assert_eq!(fixture.driver.shutdowns.load(Ordering::SeqCst), 0);
 }
 
@@ -219,7 +227,7 @@ async fn an_unmanaged_opencode_sibling_refuses_live_and_suspended() {
         .await
         .unwrap();
     assert_eq!(
-        fixture.probe().quiet_sibling("external").await.unwrap(),
+        fixture.quiet("external").await,
         Some(WritingReason::UnmanagedServer)
     );
     fixture
@@ -235,15 +243,15 @@ async fn an_unmanaged_opencode_sibling_refuses_live_and_suspended() {
         .await
         .unwrap();
     assert_eq!(
-        fixture.probe().quiet_sibling("external").await.unwrap(),
+        fixture.quiet("external").await,
         Some(WritingReason::UnmanagedServer),
         "a suspended session on an external server may still be working there"
     );
     // A session on a server BiBCode started has no live session here and is quiet.
-    assert_eq!(fixture.probe().quiet_sibling("owned").await.unwrap(), None);
+    assert_eq!(fixture.quiet("owned").await, None);
     // An instance removed from the settings may still name an external server: not quiet.
     assert_eq!(
-        fixture.probe().quiet_sibling("removed").await.unwrap(),
+        fixture.quiet("removed").await,
         Some(WritingReason::Unobservable)
     );
 }
@@ -322,6 +330,88 @@ async fn a_launch_in_flight_makes_the_restore_refuse() {
     release.notify_one();
     launch.await.unwrap().unwrap();
     assert!(restore.hold_threads(&["t1".to_owned()]).is_ok());
+}
+
+#[tokio::test]
+async fn a_marked_external_opencode_sibling_is_probed_and_left_out_of_the_preview() {
+    use crate::provider::opencode::quiet::test_server::{ROOT, ScriptedOpenCode};
+    let fixture = Fixture::new().await;
+    let server = ScriptedOpenCode::idle(&fixture.cwd).await;
+    fixture.engine.dispatch(serde_json::from_value(json!({"type":"thread.create", "commandId":"thread-marked", "threadId":"marked", "projectId":"p1", "title":"Panel", "kind":"workspace", "modelSelection":{"instanceId":"opencode-marked", "model":"m"}, "runtimeMode":"full-access", "interactionMode":"default", "branch":null, "worktreePath":null, "createdAt":TIME})).unwrap()).await.unwrap();
+    let mark = |exclusive: bool| {
+        let path = fixture.settings_root.join("settings.json");
+        let mut settings: ProviderSettingsState =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        settings.provider_instances.insert(
+            "opencode-marked".to_owned(),
+            ProviderInstanceState {
+                driver: "opencode".to_owned(),
+                enabled: true,
+                display_name: None,
+                environment: Vec::new(),
+                config: json!({"serverUrl": server.url, "exclusiveServer": exclusive}),
+            },
+        );
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    };
+    mark(true);
+    // No OpenCode session is recorded for it, so its tree cannot be read.
+    assert_eq!(
+        fixture.quiet("marked").await,
+        Some(WritingReason::ServerUnreadable)
+    );
+    fixture
+        .engine
+        .repositories()
+        .upsert_provider_session_runtime(crate::persistence::ProviderSessionRuntime {
+            thread_id: "marked".to_owned(),
+            provider_name: "opencode".to_owned(),
+            provider_instance_id: Some("opencode-marked".to_owned()),
+            adapter_key: "opencode-http".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            status: "suspended".to_owned(),
+            last_seen_at: now(),
+            resume_cursor: Some(json!({"sessionId": ROOT})),
+            runtime_payload: None,
+        })
+        .await
+        .unwrap();
+    let fence = fixture.quiet_fence("marked").await.unwrap();
+    assert!(fence.is_some(), "an idle marked server is fenced");
+    assert_eq!(server.open_streams(), 1);
+    drop(fence);
+    // The preview leaves a marked sibling to the probe at the restore.
+    assert_eq!(
+        fixture
+            .probe()
+            .thread_writes_checkout("marked")
+            .await
+            .unwrap(),
+        None
+    );
+    server.set(
+        "/api/session/active",
+        200,
+        json!({"data":{ROOT:{"type":"running"}}}),
+    );
+    assert_eq!(
+        fixture.quiet("marked").await,
+        Some(WritingReason::ServerWorking)
+    );
+    // Without the statement it refuses as before, in the restore and in the preview.
+    mark(false);
+    assert_eq!(
+        fixture.quiet("marked").await,
+        Some(WritingReason::UnmanagedServer)
+    );
+    assert_eq!(
+        fixture
+            .probe()
+            .thread_writes_checkout("marked")
+            .await
+            .unwrap(),
+        Some(WritingReason::UnmanagedServer)
+    );
 }
 
 /// A driver that cannot change its runtime mode live, so a mode change restarts the session.

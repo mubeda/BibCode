@@ -520,13 +520,22 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    exclusiveServer: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Only BiBCode uses this server",
+        description:
+          "Turn on only if nothing else starts sessions or sends prompts on this server: no OpenCode TUI or web page, no other app, no schedule, and no plugin that starts work on its own. BiBCode then restores files in a checkout while another chat uses this server, and refuses if it sees the server working.",
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit" },
+      }),
+    ),
     customModels: Schema.Array(Schema.String).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath", "serverUrl", "serverPassword"],
+    order: ["binaryPath", "serverUrl", "serverPassword", "exclusiveServer"],
   },
 );
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
