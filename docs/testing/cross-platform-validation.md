@@ -1881,7 +1881,10 @@ from `apps/web`.
     status bar's **Agent active** indicator: the turn is interrupted, a turn you started in
     another thread keeps running, and the agent's next call says its access ended. Restart
     its MCP server, press **Take over**: reads still work and its next change is refused as
-    read-only. **Hand back** restores the level it had, and its next change works.
+    read-only. **Hand back** restores the level it had, and its next change works. With
+    `--client <name>`: Take over, quit the agent and start it again; its new row is
+    **Taken over** and its first change is refused until **Hand back**. Quit it again:
+    Authorized clients shows it as "Not running" with **Revoke**, which removes the row.
 13. **A webhook delivery.** In the **Webhooks** tab turn **Webhooks** on, add an endpoint at
     a disposable public HTTPS receiver with `thread.status_changed` and a **Bearer token**,
     copy the secret, and **Send test event**: the receiver gets `webhook.test` with

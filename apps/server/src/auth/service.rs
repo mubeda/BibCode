@@ -1366,6 +1366,8 @@ impl AuthService {
         };
         // Publish only a read no local change overtook: a Take over that commits and updates
         // the cache after this read must not have its level replaced by the older row (#324).
+        // shortcut: no retry cap, since local auth changes are person or sign-in actions;
+        // add one if a hot path ever bumps the generation continuously.
         let (mut refreshed, mut state) = loop {
             let generation = self.state.lock().await.authority_generation;
             let persisted = repositories

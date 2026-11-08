@@ -568,7 +568,8 @@ BiBCode marks what an outside agent does, whoever is looking:
 - **Settings → Agents → Agent integrations → Agents** lists each authorized agent with its
   last call, tools and access, with **Take over** (or **Hand back**) and **Revoke**, and
   **Stop** while it has turns running (a revoked agent with running turns is listed as
-  **Revoked**, with Stop). Below it, **Agent activity** shows what agents changed in the last
+  **Revoked**, with Stop; a `--client` agent that is not running is listed as **Not
+  running**, with Revoke). Below it, **Agent activity** shows what agents changed in the last
   seven days, newest first, as ids and counts only (a commit, a pull request number, a file
   count), never paths, messages or output.
 - Revoke, unlike Stop, leaves running turns alone. None of these asks for confirmation: each

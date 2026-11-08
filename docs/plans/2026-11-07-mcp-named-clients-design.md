@@ -594,24 +594,24 @@ authentication wait on the `issuance` lock. Test:
 
 ### Tests
 
-| Acceptance                             | Test                                                                                                       | File                                        |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| Idle client listed after its run exits | `a_named_client_whose_run_exited_stays_in_the_access_snapshot`                                             | `auth/service.rs` tests                     |
-| Revoke on the idle id ends it          | `revoking_an_idle_named_client_by_its_id_ends_the_identity_and_sends_a_snapshot`                           | same                                        |
-| Revoke others ends idle identities     | `revoke_others_ends_idle_named_clients`                                                                    | same                                        |
-| Idle Revoke turns endpoints off        | `revoking_an_idle_named_client_disables_its_paired_endpoints`                                              | `webhooks/tests.rs`                         |
-| Take over carries to the next run      | `a_taken_over_named_clients_next_run_starts_read_only_with_its_own_hand_back`                              | `auth/service.rs` tests                     |
-| Take over reaches every live run       | `taking_over_one_run_takes_over_every_live_run_of_the_identity`                                            | same                                        |
-| Hand back releases the identity        | `hand_back_on_one_run_releases_the_identity_and_every_live_run`                                            | same                                        |
-| Read-only run of a taken-over identity | `a_read_only_run_of_a_taken_over_identity_has_no_hand_back`                                                | same                                        |
-| Race with a new run                    | `take_over_while_a_named_run_publishes_leaves_the_cache_read_only` (`after_session_insert` hold)           | same                                        |
-| Refresh racing Take over               | `a_refresh_that_read_before_take_over_does_not_restore_the_writable_level` (hold after the refresh's read) | same                                        |
-| Restart                                | `a_taken_over_identity_survives_a_restart`                                                                 | same                                        |
-| Agent sees it                          | `a_named_agent_restarted_after_take_over_is_refused_a_mutation`                                            | `production/mcp_tools_tests/attribution.rs` |
-| Unnamed unchanged                      | keep the existing Take over and Hand back tests                                                            | `auth/service.rs`, `oauth_flow_tests.rs`    |
-| Migration                              | `migration_71_adds_taken_over_at_to_named_clients`                                                         | `persistence/migrations.rs`                 |
-| Contracts                              | snapshot decodes with and without `mcpNamedClients`; Rust parity                                           | `packages/contracts/src/auth.test.ts`       |
-| UI                                     | idle row with Revoke in Authorized clients and Agents; no idle row when a run is live                      | `ShareTab` test, `McpAgentsPanel.test.tsx`  |
+| Acceptance                             | Test                                                                                                       | File                                                                                             |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Idle client listed after its run exits | `a_named_client_whose_run_exited_stays_in_the_access_snapshot`                                             | `auth/service.rs` tests                                                                          |
+| Revoke on the idle id ends it          | `revoking_an_idle_named_client_by_its_id_ends_the_identity_and_sends_a_snapshot`                           | same                                                                                             |
+| Revoke others ends idle identities     | `revoke_others_ends_idle_named_clients`                                                                    | same                                                                                             |
+| Idle Revoke turns endpoints off        | `revoking_an_idle_named_client_disables_its_paired_endpoints`                                              | `webhooks/tests.rs`                                                                              |
+| Take over carries to the next run      | `a_taken_over_named_clients_next_run_starts_read_only_with_its_own_hand_back`                              | `auth/service.rs` tests                                                                          |
+| Take over reaches every live run       | `taking_over_one_run_takes_over_every_live_run_of_the_identity`                                            | same                                                                                             |
+| Hand back releases the identity        | `hand_back_on_one_run_releases_the_identity_and_every_live_run`                                            | same                                                                                             |
+| Read-only run of a taken-over identity | `a_read_only_run_of_a_taken_over_identity_has_no_hand_back`                                                | same                                                                                             |
+| Race with a new run                    | `take_over_while_a_named_run_publishes_leaves_the_cache_read_only` (`after_session_insert` hold)           | same                                                                                             |
+| Refresh racing Take over               | `a_refresh_that_read_before_take_over_does_not_restore_the_writable_level` (hold after the refresh's read) | same                                                                                             |
+| Restart                                | `a_taken_over_identity_survives_a_restart`                                                                 | same                                                                                             |
+| Agent sees it                          | `a_named_agent_restarted_after_take_over_is_refused_a_mutation`                                            | `production/mcp_tools_tests/attribution.rs`                                                      |
+| Unnamed unchanged                      | keep the existing Take over and Hand back tests                                                            | `auth/service.rs`, `oauth_flow_tests.rs`                                                         |
+| Migration                              | `migration_71_adds_taken_over_at_to_named_clients`                                                         | `persistence/migrations.rs`                                                                      |
+| Contracts                              | snapshot decodes with and without `mcpNamedClients`; Rust parity                                           | `packages/contracts/src/auth.test.ts`                                                            |
+| UI                                     | idle row with Revoke in Authorized clients and Agents; no idle row when a run is live                      | `ConnectTab.test.tsx` (renders `ShareTab`), `McpAgentsPanel.test.tsx`, `mcpNamedClients.test.ts` |
 
 ### Files to change
 
