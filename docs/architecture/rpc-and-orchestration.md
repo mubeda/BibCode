@@ -425,8 +425,10 @@ and LFS filter, and a fetch authenticates as the person's does:
   from `refs/bibcode/*` is not verified; a restore whose LFS object was pruned tries to
   download it, as it did before.
 
-Checkpoint Git ([Turn checkpoints](#turn-checkpoints)) adds `-c core.hooksPath=<null
-device>` (`NUL` on Windows, `/dev/null` elsewhere, the clone policy's) and
+Checkpoint Git ([Turn checkpoints](#turn-checkpoints)) adds `-c core.hooksPath=<no
+hooks>` (the clone policy's `NO_HOOKS`: `\\.\nul` on Windows, `/dev/null` elsewhere; Git for
+Windows treats `nul/<hook>` as present, fails to spawn it and aborts the ref update, and
+`/dev/null` there names `\dev\null\` on the current drive) and
 `-c core.fsmonitor=false` to every command, so no system, global or repository hook runs
 for BiBCode's own `refs/bibcode/*` writes, and no fsmonitor starts for its temporary index.
 Filters from global and repository configuration stay on. The bootstrap fetch takes
