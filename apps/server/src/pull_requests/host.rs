@@ -371,13 +371,11 @@ impl HostCommandRunner {
         if let Some(method) = method {
             args.extend(["--method".into(), method.into()]);
         }
-        args.extend([
-            "-H".into(),
-            "X-GitHub-Api-Version: 2022-11-28".into(),
-            "--hostname".into(),
-            scope.host.clone().into(),
-            path.into(),
-        ]);
+        args.extend(["-H".into(), "X-GitHub-Api-Version: 2022-11-28".into()]);
+        if let Some(hostname) = api_hostname(scope) {
+            args.extend(["--hostname".into(), hostname.into()]);
+        }
+        args.push(path.into());
         let request =
             self.provider_request(scope, PullRequestsProvider::Github, &args, budget, None);
         self.execute_bytes(request, c).await
@@ -438,8 +436,11 @@ impl HostCommandRunner {
                 "--repo".into(),
                 format!("{}/{}", scope.host, scope.repository).into(),
             ]);
-        } else if !github && args.first().is_some_and(|arg| arg == "api") {
-            args.extend(["--hostname".into(), scope.host.clone().into()]);
+        } else if !github
+            && args.first().is_some_and(|arg| arg == "api")
+            && let Some(hostname) = api_hostname(scope)
+        {
+            args.extend(["--hostname".into(), hostname.into()]);
         }
         let mut env: Vec<(OsString, OsString)> = vec![("NO_COLOR".into(), "1".into())];
         if github {
@@ -540,6 +541,13 @@ impl HostCommandRunner {
             exit_code: output.exit_code,
         })
     }
+}
+
+/// `gh api` and `glab api` reject `--hostname host:port` as an invalid hostname, so a
+/// host with a web port reaches them only through the pinned `GH_HOST`/`GITLAB_HOST`.
+fn api_hostname(scope: &HostScope) -> Option<&str> {
+    (crate::source_control::host_without_port(&scope.host) == scope.host)
+        .then_some(scope.host.as_str())
 }
 
 fn body_io_error(source: std::io::Error) -> ProcessFailure {
@@ -866,6 +874,41 @@ mod tests {
             .await
             .unwrap();
         assert!(!output.stdout.contains("--repo"));
+    }
+
+    /// #332: `glab api` and `gh api` reject `--hostname host:port` ("invalid hostname");
+    /// the pinned host variable carries the port to every call instead.
+    #[tokio::test]
+    async fn pull_requests_runner_reaches_a_host_on_a_web_port() {
+        let s = TestSandbox::new("pr-runner-port");
+        let glab = s.executable_script("glab", "printf '%s\\n' \"$GITLAB_HOST|$*\"", "");
+        let gh = s.executable_script("gh", "printf '%s\\n' \"$GH_HOST|$*\"", "");
+        let runner = HostCommandRunner::new(s.path("state")).with_commands(&gh, &glab, &glab);
+        let c = CancellationToken::new();
+        let mut scope = scope(&s);
+        scope.host = "gitlab.example.test:8929".into();
+        let api = runner
+            .glab(&scope, &["api", "user"], Budget::Read, None, &c)
+            .await
+            .unwrap();
+        assert_eq!(api.stdout.trim(), "gitlab.example.test:8929|api user");
+        let mr = runner
+            .glab(&scope, &["mr", "list"], Budget::Read, None, &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            mr.stdout.trim(),
+            "gitlab.example.test:8929|mr list --repo gitlab.example.test:8929/team/sub/repo"
+        );
+        scope.provider = PullRequestsProvider::Github;
+        let api = runner
+            .gh_api_raw(&scope, "user", false, Budget::Read, &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&api.stdout).trim(),
+            "gitlab.example.test:8929|api -H X-GitHub-Api-Version: 2022-11-28 user"
+        );
     }
 
     #[tokio::test]

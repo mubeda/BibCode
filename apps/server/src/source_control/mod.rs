@@ -218,14 +218,41 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+/// A dotted name, a bracketed IPv6 address, or any name with a port (`localhost:8929`).
 fn looks_like_host(value: &str) -> bool {
-    let without_port = value
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|character| character.is_ascii_digit()))
-        .map_or(value, |(host, _)| host);
+    let without_port = host_without_port(value);
     !without_port.is_empty()
         && !without_port.contains(char::is_whitespace)
-        && (without_port.contains('.') || without_port.starts_with('['))
+        && (without_port.contains('.') || without_port.starts_with('[') || without_port != value)
+}
+
+/// A CLI-configured host (`host:8929`, `[::1]:8443`) without its numeric port.
+pub(crate) fn host_without_port(host: &str) -> &str {
+    host.rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(host, |(name, _)| name)
+}
+
+/// The host a provider CLI knows a remote by. glab and gh keep a web port in the
+/// host (`host:8929`), and only an HTTP(S) remote names that port; an SSH or scp
+/// port is the SSH port, so those remotes keep the bare name of [`remote_host`].
+pub fn remote_web_host(remote: &str) -> Option<String> {
+    let host = remote_host(remote)?;
+    let port = url::Url::parse(remote.trim())
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .and_then(|url| url.port());
+    Some(match port {
+        Some(port) if host.contains(':') => format!("[{host}]:{port}"),
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// Whether the remote's own port is its web port, as only HTTP(S) remotes' is.
+#[must_use]
+pub fn remote_names_web_port(remote: &str) -> bool {
+    url::Url::parse(remote.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 pub fn remote_host(remote: &str) -> Option<String> {
@@ -294,6 +321,83 @@ mod tests {
                 "{remote}"
             );
         }
+    }
+
+    /// #332: glab and gh key a self-hosted instance by `host:port`; only an HTTP(S)
+    /// remote names that web port, and the repository identity stays port-free.
+    #[test]
+    fn remote_web_host_keeps_only_an_http_web_port() {
+        for (remote, host, names_port) in [
+            (
+                "http://LocalHost:8929/group/project.git",
+                Some("localhost:8929"),
+                true,
+            ),
+            (
+                "https://user@gitlab.example.test:8443/a/b.git",
+                Some("gitlab.example.test:8443"),
+                true,
+            ),
+            (
+                "https://gitlab.example.test:443/a/b.git",
+                Some("gitlab.example.test"),
+                true,
+            ),
+            (
+                "https://gitlab.example.test/a/b.git",
+                Some("gitlab.example.test"),
+                true,
+            ),
+            ("http://[::1]:8929/a/b.git", Some("[::1]:8929"), true),
+            (
+                "ssh://git@gitlab.example.test:2224/a/b.git",
+                Some("gitlab.example.test"),
+                false,
+            ),
+            (
+                "git://gitlab.example.test:9418/a/b.git",
+                Some("gitlab.example.test"),
+                false,
+            ),
+            (
+                "gitlab.example.test:a/b.git",
+                Some("gitlab.example.test"),
+                false,
+            ),
+            ("/local/repo", None, false),
+        ] {
+            assert_eq!(remote_web_host(remote).as_deref(), host, "{remote}");
+            assert_eq!(remote_names_web_port(remote), names_port, "{remote}");
+        }
+        assert_eq!(
+            remote_host("http://localhost:8929/group/project.git").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(host_without_port("localhost:8929"), "localhost");
+        assert_eq!(host_without_port("[::1]:8443"), "[::1]");
+        assert_eq!(
+            host_without_port("gitlab.example.test"),
+            "gitlab.example.test"
+        );
+    }
+
+    /// glab 1.126 lists the local Docker kit's instance as `localhost:8929`: no dot, but a port.
+    #[test]
+    fn gitlab_auth_status_lists_a_dotless_host_with_a_port() {
+        let hosts = parse_gitlab_auth_status(
+            "localhost:8929\n  ✓ Logged in to localhost:8929 as test-user (keyring)\n  ✓ REST API Endpoint: http://localhost:8929/api/v4/\n",
+        );
+        assert_eq!(
+            hosts,
+            vec![GitLabAuthStatusHost {
+                host: "localhost:8929".into(),
+                account: Some("test-user".into()),
+            }]
+        );
+        assert!(
+            parse_gitlab_auth_status("localhost\n  ✓ Logged in to localhost as test-user\n")
+                .is_empty()
+        );
     }
 
     #[test]

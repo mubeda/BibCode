@@ -5,7 +5,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     ProviderInfo, ProviderKind, SourceControlDiscoveryResult, provider, provider_from_remote,
-    remote_host,
+    remote_web_host,
 };
 
 const CAPACITY: usize = 64;
@@ -93,7 +93,7 @@ impl ProviderHosts {
         if named.kind != ProviderKind::Unknown {
             return IdentifiedProvider::Named(named);
         }
-        let Some(host) = remote_host(remote) else {
+        let Some(host) = remote_web_host(remote) else {
             return IdentifiedProvider::Unknown;
         };
         let base_url = format!("https://{host}");
@@ -242,6 +242,33 @@ mod tests {
             assert_eq!(
                 (info.kind, info.base_url.as_str()),
                 (kind, base_url),
+                "{remote}"
+            );
+        }
+    }
+
+    /// #332: a host recorded with its web port (`localhost:8929`) identifies the HTTP
+    /// remote that names that port, and no other port of the same name.
+    #[test]
+    fn provider_hosts_identify_a_recorded_host_by_its_web_port() {
+        let hosts = ProviderHosts::default();
+        hosts.record("localhost:8929", ProviderKind::Gitlab);
+        let IdentifiedProvider::Recorded(info) =
+            hosts.identify("http://localhost:8929/group/project.git")
+        else {
+            panic!("expected the recorded host with its port");
+        };
+        assert_eq!(
+            (info.kind, info.base_url.as_str()),
+            (ProviderKind::Gitlab, "https://localhost:8929")
+        );
+        for remote in [
+            "http://localhost:9999/group/project.git",
+            "https://localhost/group/project.git",
+        ] {
+            assert_eq!(
+                hosts.identify(remote),
+                IdentifiedProvider::Unknown,
                 "{remote}"
             );
         }
