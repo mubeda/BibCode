@@ -3920,13 +3920,16 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
 | `git_status`                | `vcs.refreshStatus` on the thread's folder                                            | read    |
 
 - **Retries.** With a `clientRequestId`, the first call stores the commands it built
-  in `mcp_tool_requests` (`INSERT OR IGNORE`, keyed by session and id, with the
+  in `mcp_tool_requests` (`INSERT OR IGNORE`, keyed by request scope and id, with the
   argument digest). Every call with that key dispatches the stored payloads, so
   command admission replays them by receipt state; other arguments under the same
-  key get `idempotency_conflict`. Rows older than 24 h are pruned on insert. The
-  credentials labelled `CLI · bibcode thread` share one scope instead of a session
-  each, because every CLI run mints its own; the scope is resolved from
-  `auth_sessions.client_label` in the same SQLite job.
+  key get `idempotency_conflict`. Rows older than 24 h are pruned on insert. The scope
+  (`ClientPrincipal::request_scope`, computed once in `McpControl::authenticate` from the
+  cached session record) is the session's named client id (`bibcode mcp --client`,
+  #280), else `CLI · bibcode thread` for that CLI's credentials, else the session. Every
+  run of a named client or of the CLI mints its own credential, so they share one scope.
+  Stored requests, recorded outcomes, the claim map and the activity log's retry check all
+  key on it; cancellation, live controls, owned slots and presence stay per session.
 - **Recorded outcomes.** A tool whose RPC has no command receipt (Git and pull
   request writes) runs it through `ToolCall::recorded` (`mcp::outcome`). With a
   `clientRequestId` it is an owned mutation: its `mcp_tool_requests` row goes
@@ -4423,8 +4426,10 @@ them, and can move, swap or write anything there at any moment.
 Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
 
 - **Actor.** `principal_actor(context)` is `{ kind: "mcp-client", clientId, label }` for an
-  `mcp-client` principal (its session id and its Authorized clients label at dispatch time)
-  and `None` for any other. `orchestration.dispatchCommand`, `worktree.createManaged` and
+  `mcp-client` principal (its session id and its Authorized clients label at dispatch time),
+  plus `namedClientId` for a run of a named client (#280), and `None` for any other. Panel
+  ownership (`send_panel_message`) accepts either id, so a named client's next run still
+  owns what its earlier runs opened. `orchestration.dispatchCommand`, `worktree.createManaged` and
   `worktree.createPanel` attribute their `CommandAdmissionClaim` to it
   (`attribute_to`), and `process_envelope` stamps `metadata.actor` on every event the command
   plans. The actor never comes from the command, so a client cannot claim one: a public
@@ -4465,7 +4470,13 @@ Slice X1 (`mcp::activity`) makes an outside agent's work visible as its own.
   provider is told) for each running turn the agent started, and answers with
   `interrupted`, `failed` and `timedOut` (the interrupts go on after that). An `mcp-client`
   session revoked earlier is stopped too; `revoked: false` means an unknown session or a
-  revoked one that was not an agent's. The web reports `revoked: false`, any failure and a
+  revoked one that was not an agent's. A named client's run (#280) is one identity: Stop or
+  Revoke on any of its sessions, revoked or live, ends the identity
+  (`Repositories::revoke_auth_session_and_identity`: the `mcp_named_clients` row, every
+  pairing link carrying it, consumed or not, and every live session, in one transaction),
+  and Stop interrupts each running turn whose actor's `clientId` is the session or whose
+  `namedClientId` is the identity. Revoke others ends the named clients of the sessions it
+  revokes. A relay's own revoke (`revoke_mcp_credential`) never ends the identity. The web reports `revoked: false`, any failure and a
   timeout as a failed Stop. A plain revocation, such as the `bibcode thread` CLI revoking
   its own credential, interrupts nothing.
 - **Take over.** `POST /api/auth/clients/mcp-access { sessionId, access }` (`access:write`)

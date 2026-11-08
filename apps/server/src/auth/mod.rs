@@ -25,7 +25,6 @@ pub(crate) use http::{
     PROTECTED_RESOURCE_ROOT_METADATA_PATH, add_routes, auth_error_response, authenticate_websocket,
     authorize_http_request,
 };
-pub(crate) use model::ClientMetadata;
 pub(crate) use model::Principal;
 #[cfg(test)]
 pub(crate) use model::STANDARD_SCOPES;
@@ -33,6 +32,7 @@ pub(crate) use model::{
     ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, SCOPE_DIAGNOSTICS_READ, SCOPE_ORCHESTRATION_OPERATE,
     SCOPE_ORCHESTRATION_READ, SCOPE_TERMINAL_OPERATE, TOKEN_GRANT_TYPE,
 };
+pub(crate) use model::{ClientMetadata, ClientSessionView};
 pub(crate) use pairing_offer::{mint_offline_pairing_offer, validate_pairing_offer_input};
 pub(crate) use rpc::register_rpc_handlers;
 pub(crate) use scope::{ACTIVITY_READ_SCOPE, authorization_error, required_scope};
@@ -43,6 +43,6 @@ pub(crate) use service::{
     AuthError, AuthService, AuthenticatedConnectionGuard, DESKTOP_BOOTSTRAP_SUBJECT,
     MCP_CLIENT_SUBJECT, McpStopHandler, McpStopOutcome, SessionTransport, default_standard_scopes,
     diagnostics_scopes, issue_administrative_pairing_link, issue_mcp_pairing_link,
-    issue_offline_share_pairing,
+    issue_named_mcp_pairing_link, issue_offline_share_pairing,
 };
 pub(crate) use service::{format_iso, is_loopback_host, now_ms};
