@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off - Repository guard runs before any Effect runtime exists.
+// @effect-diagnostics globalConsole:off - The CLI reports broken link locations and the final result.
 
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
