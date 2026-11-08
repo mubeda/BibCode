@@ -350,3 +350,12 @@ missed its `sleep` that way on the Linux arm64 job (main, run 41789911736) and
 passed on the identical tree in the release PR's run. A standalone loop of the
 same calls on arm64 Ubuntu 22.04 missed about once in 10,000 spawns under 8
 threads, with the child still running the test binary at the miss.
+
+On macOS under load, the exec of a freshly copied compiled fixture can stay
+launched-suspended for good: the child shows 0 CPU at `_dyld_start` and
+`vmmap --summary <pid>` reports "launched-suspended". The Cursor fixture runner
+relaunches a run that has not finished in 10 s instead of waiting longer. A test
+that proves two probes overlap makes each wait for the other's start rather than
+sleeping, and retries a run in which a child never started before the 10 s probe
+timeout. The device RPC harness waits longer than the boot timeout for each
+catalog frame, because a booting device sends none until it is ready (#329).
