@@ -2120,6 +2120,20 @@ The Files surface is a full file manager for the active workspace:
 - Git-ignored files and directory roots remain visible with ignored styling,
   and the contents below an ignored directory are loaded eagerly with the rest
   of the tree.
+- A file opens in its own tab beside the Files tab, whether you click it in the
+  tree, in a diff, in a chat link or through a UI suggestion. A file that
+  already has a tab is focused, not duplicated. The Files tab stays in the
+  strip, so one click returns to the full-width tree with its expanded folders,
+  selected row as you left them, even after a visit to another tab such as Diff,
+  and scrolled to the selected row. Clicking the already selected row opens its
+  file again. Each file tab also shows the tree in a sidebar; its **Show/Hide
+  file explorer** switch is remembered for all file tabs. If you close the Files
+  tab, reopen it from the **+** menu or the sidebar.
+- A file tab leads back to the folder. Its path bar shows the project and each
+  folder as buttons; choosing one opens the Files tab with that folder revealed
+  and selected (the project button just opens the tree). **Show in Files** in the
+  file tab's header does the same for the file itself, and reopens the Files tab
+  if it was closed. Both are keyboard operable. The file stays open in its tab.
 - Opening a file shows it in the panel by its extension, before any text read.
   Text and code open in the editor. Images (PNG, JPEG, GIF, WebP, AVIF, ICO)
   show as pictures, with their pixel size and a **Fit** / **Actual size**
