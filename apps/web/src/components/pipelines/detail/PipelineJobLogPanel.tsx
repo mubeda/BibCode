@@ -14,6 +14,10 @@ import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
 
+/** Fields and open pickers (a Select trigger, a menu) that own focus until the reader leaves. */
+const INTERACTIVE_FIELD =
+  'input, textarea, select, [role="combobox"], [role="listbox"], [role="menu"], [aria-expanded="true"]';
+
 const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
 
 /**
@@ -90,7 +94,7 @@ export function PipelineJobLogPanel({
     const active = document.activeElement;
     const typing =
       active instanceof HTMLElement &&
-      (active.isContentEditable || active.matches("input, textarea, select"));
+      (active.isContentEditable || active.closest(INTERACTIVE_FIELD) !== null);
     if (!typing) heading.focus({ preventScroll: true });
   }, []);
   const status = job ? pipelineStatusText(job.status, job.warnings, job.reason) : "";

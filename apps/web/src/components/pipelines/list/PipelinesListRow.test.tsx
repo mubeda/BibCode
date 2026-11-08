@@ -36,7 +36,9 @@ vi.mock("@tanstack/react-router", () => ({
     params,
     children,
     className,
+    title,
   }: {
+    title?: string;
     to: string;
     params: Record<string, string>;
     children: React.ReactNode;
@@ -44,6 +46,7 @@ vi.mock("@tanstack/react-router", () => ({
   }) => (
     <a
       className={className}
+      title={title}
       href={Object.entries(params).reduce(
         (path, [name, value]) => path.replace(`$${name}`, value),
         to,
@@ -114,6 +117,10 @@ describe("PipelinesListRow navigation", () => {
     expect(row.className).toContain("relative");
     expect(title.className).toContain("after:absolute");
     expect(title.className).toContain("after:inset-0");
+    // The overlay hides the status cell from the pointer, so the tooltip carries its text.
+    expect(title.getAttribute("title")).toBe(
+      `Fix connection recovery\n${row.getAttribute("aria-label")!.replace(/^#\d+ /, "")}`,
+    );
     const retry = row.querySelector('[aria-label="Retry pipeline #4821"]')!;
     expect(retry.closest(".relative.z-10")).not.toBeNull();
     expect(row.querySelector('[aria-label="More actions for pipeline #4821"]')).not.toBeNull();
