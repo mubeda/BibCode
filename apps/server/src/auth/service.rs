@@ -23,9 +23,9 @@ use super::{
     },
     model::{
         ADMINISTRATIVE_SCOPES, ALL_SCOPES, AuthAccessChange, AuthAccessEvent, AuthDescriptor,
-        ClientMetadata, ClientSessionView, PairingCredentialResult, PairingLinkView,
-        PairingOfferResult, PendingMcpAuthorizationView, Principal, STANDARD_SCOPES,
-        ShareExposureState,
+        ClientMetadata, ClientSessionView, McpNamedClientView, PairingCredentialResult,
+        PairingLinkView, PairingOfferResult, PendingMcpAuthorizationView, Principal,
+        STANDARD_SCOPES, ShareExposureState,
     },
     secret_store::SecretStore,
     token::{SessionClaims, TokenError, TokenSigner, WebSocketClaims},
@@ -35,12 +35,14 @@ use crate::persistence::{
     AuthAuthoritySnapshot as PersistedAuthAuthoritySnapshot,
     AuthPairingLink as PersistedPairingLink, AuthPairingOffer as PersistedPairingOffer,
     AuthSession as PersistedAuthSession, AuthSessionClient as PersistedAuthSessionClient,
-    AuthSessionDeliveryState, McpNamedClient, McpOAuthAuthorization, McpOAuthCodeExchange,
-    McpOAuthExchangeOutcome, McpOAuthRefreshOutcome, McpOAuthRefreshRotation, NewAuthPairingOffer,
-    NewAuthSession, PersistenceError, Repositories, RevokedAccess,
+    AuthSessionDeliveryState, LiveMcpNamedClient, McpNamedClient, McpOAuthAuthorization,
+    McpOAuthCodeExchange, McpOAuthExchangeOutcome, McpOAuthRefreshOutcome, McpOAuthRefreshRotation,
+    NewAuthPairingOffer, NewAuthSession, PersistenceError, Repositories, RevokedAccess,
 };
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// Reads a session refresh makes before it keeps the cached record instead (#324).
+const MAX_REFRESH_READS: usize = 8;
 const DPOP_SESSION_TTL_MS: i64 = 60 * 60 * 1_000;
 const WEBSOCKET_TICKET_TTL_MS: i64 = 5 * 60 * 1_000;
 /// Pending pairing sessions and offer reservations older than this are crash
@@ -132,6 +134,10 @@ pub(crate) struct AuthTestHooks {
     pub(crate) after_consume: std::sync::Mutex<Option<TestHold>>,
     /// After the session row commits, before the cache holds it.
     pub(crate) after_session_insert: std::sync::Mutex<Option<TestHold>>,
+    /// After a session refresh read its row, before it takes the state lock (#324).
+    pub(crate) after_refresh_read: std::sync::Mutex<Option<TestHold>>,
+    /// Bumps the generation on every refresh read, as constant local churn would (#324).
+    pub(crate) churn_refresh: std::sync::atomic::AtomicBool,
     /// Immediately before issuance sends its ClientUpserted, wherever that send sits (#294).
     pub(crate) before_session_upsert_event: std::sync::Mutex<Option<TestHold>>,
     /// Gives `mcp-client` sessions random ids, as a server before #281 did.
@@ -251,6 +257,8 @@ struct AuthState {
     authority_generation: u64,
     /// Remote MCP authorizations waiting for a person (slice R), oldest first.
     pending_mcp: Vec<PendingMcpAuthorizationView>,
+    /// Named MCP clients not yet ended (#324), oldest first.
+    named_clients: Vec<LiveMcpNamedClient>,
 }
 
 impl AuthState {
@@ -743,6 +751,7 @@ impl AuthService {
             .iter()
             .map(pending_mcp_view)
             .collect();
+        state.named_clients = snapshot.mcp_named_clients;
         Ok(())
     }
 
@@ -810,6 +819,21 @@ impl AuthService {
             .collect();
         let revision = self.access_revision.load(Ordering::Acquire);
         (revision, pairings, sessions, pending)
+    }
+
+    /// The named MCP clients not yet ended (#324), as the access stream's snapshot lists them.
+    pub(crate) async fn named_client_views(&self) -> Vec<McpNamedClientView> {
+        self.state
+            .lock()
+            .await
+            .named_clients
+            .iter()
+            .map(|client| McpNamedClientView {
+                id: client.id.clone(),
+                name: client.name.clone(),
+                created_at: client.created_at.clone(),
+            })
+            .collect()
     }
 
     /// Sends `change` while the caller still holds the state lock that made it, so the
@@ -1344,22 +1368,48 @@ impl AuthService {
         let Some(repositories) = &self.repositories else {
             return Ok(());
         };
-        let persisted = repositories
-            .get_auth_session(session_id.to_owned())
-            .await
-            .map_err(|error| AuthError::Internal(error.to_string()))?;
-        let Some(persisted) = persisted else {
-            self.remove_cached_session(session_id).await;
-            return Err(AuthError::InvalidCredential);
+        // Publish only a read no local change overtook: a Take over that commits and updates
+        // the cache after this read must not have its level replaced by the older row (#324).
+        let mut reads = 0;
+        let (mut refreshed, mut state) = loop {
+            reads += 1;
+            let generation = self.state.lock().await.authority_generation;
+            let persisted = repositories
+                .get_auth_session(session_id.to_owned())
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()))?;
+            let Some(persisted) = persisted else {
+                self.remove_cached_session(session_id).await;
+                return Err(AuthError::InvalidCredential);
+            };
+            if persisted.revoked_at.is_some()
+                || parse_timestamp_ms(&persisted.expires_at)? <= observed_at
+            {
+                self.remove_cached_session(session_id).await;
+                return Err(AuthError::InvalidCredential);
+            }
+            let refreshed = session_record_from_persisted(persisted)?;
+            #[cfg(test)]
+            reach_hold(&self.test_hooks.after_refresh_read).await;
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut state = self.state.lock().await;
+            #[cfg(test)]
+            if self
+                .test_hooks
+                .churn_refresh
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                state.bump_authority_generation();
+            }
+            if state.authority_generation == generation {
+                break (refreshed, state);
+            }
+            if reads == MAX_REFRESH_READS {
+                // Keep the cache, which every local change keeps current, rather than spin.
+                tracing::warn!("a session refresh was overtaken on every read; kept the cache");
+                return Ok(());
+            }
         };
-        if persisted.revoked_at.is_some()
-            || parse_timestamp_ms(&persisted.expires_at)? <= observed_at
-        {
-            self.remove_cached_session(session_id).await;
-            return Err(AuthError::InvalidCredential);
-        }
-        let mut refreshed = session_record_from_persisted(persisted)?;
-        let mut state = self.state.lock().await;
         let change = if let Some(current) = state.sessions.get(session_id) {
             let previous_view = current.view(false);
             refreshed.connected_count = current.connected_count;
@@ -2348,6 +2398,13 @@ impl AuthService {
         let Some(repositories) = &self.repositories else {
             return Ok(false);
         };
+        // An identity ended earlier stays stoppable, so a later Stop still reaches its turns.
+        if session_id.starts_with(crate::persistence::NAMED_CLIENT_ID_PREFIX) {
+            return repositories
+                .mcp_named_client_is_revoked(session_id.to_owned())
+                .await
+                .map_err(|error| AuthError::Internal(error.to_string()));
+        }
         let session = repositories
             .get_auth_session(session_id.to_owned())
             .await
@@ -2408,37 +2465,66 @@ impl AuthService {
                     return Ok(McpAccessChange::NotTheHandBack);
                 }
             };
-        if let Some(repositories) = &self.repositories {
-            let updated = repositories
-                .set_auth_session_mcp_access(
+        // Issuance holds this lock from its session insert to its cache publication, so a new
+        // run of a named client cannot publish a level this change has already replaced.
+        let _issuance = self.issuance.lock().await;
+        let changed = match &self.repositories {
+            Some(repositories) => repositories
+                .set_mcp_session_access(
                     target_session_id.to_owned(),
-                    next.clone(),
-                    hand_back.clone(),
+                    access.to_owned(),
+                    format_iso(now_ms()),
                 )
                 .await
-                .map_err(|error| AuthError::Internal(error.to_string()))?;
-            if !updated {
-                return Ok(McpAccessChange::NotFound);
-            }
+                .map_err(|error| AuthError::Internal(error.to_string()))?,
+            None => vec![(target_session_id.to_owned(), Some(next), hand_back)],
+        };
+        if changed.is_empty() {
+            return Ok(McpAccessChange::NotFound);
         }
         let mut state = self.state.lock().await;
-        let Some(session) = state.sessions.get_mut(target_session_id) else {
-            return Ok(McpAccessChange::NotFound);
-        };
-        session.mcp_access = Some(next);
-        session.mcp_access_hand_back = hand_back;
-        let view = session.view(false);
-        // The session stays, so its connection guards still count themselves out.
-        for shutdown in state
-            .live_connections
+        let mut views = Vec::with_capacity(changed.len());
+        for (session_id, access, hand_back) in changed {
+            let Some(session) = state.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            session.mcp_access = access;
+            session.mcp_access_hand_back = hand_back;
+            views.push(session.view(false));
+            // The session stays, so its connection guards still count themselves out.
+            for shutdown in state
+                .live_connections
+                .get(&session_id)
+                .into_iter()
+                .flat_map(HashMap::values)
+            {
+                shutdown.cancel();
+            }
+        }
+        if let Some(named) = state
+            .sessions
             .get(target_session_id)
-            .into_iter()
-            .flat_map(HashMap::values)
+            .and_then(|session| session.mcp_named_client.clone())
         {
-            shutdown.cancel();
+            let taken_over = access == "read-only";
+            if let Some(client) = state
+                .named_clients
+                .iter_mut()
+                .find(|client| client.id == named.id)
+            {
+                client.taken_over = taken_over;
+            }
+            tracing::info!(
+                named_client_id = %named.id,
+                sessions = views.len(),
+                taken_over,
+                "changed a named MCP client's Take over"
+            );
         }
         state.bump_authority_generation();
-        self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
+        for view in views {
+            self.emit_access_change(&state, AuthAccessChange::ClientUpserted(Box::new(view)));
+        }
         drop(state);
         Ok(McpAccessChange::Changed)
     }
@@ -2613,12 +2699,23 @@ impl AuthService {
             .into_iter()
             .filter(|id| state.pairings.remove(id).is_some())
             .collect::<Vec<_>>();
+        state
+            .named_clients
+            .retain(|client| !revoked.named_clients.contains(&client.id));
+        // Sent even when the cache had not yet seen the identity: the store ended it, and the
+        // webhook dispatcher must still wake.
+        let named_changed = !revoked.named_clients.is_empty();
         state.bump_authority_generation();
         for session_id in revoked.sessions {
             self.emit_access_change(&state, AuthAccessChange::ClientRemoved { session_id });
         }
         for id in pairings {
             self.emit_access_change(&state, AuthAccessChange::PairingLinkRemoved { id });
+        }
+        // An idle identity has no ClientRemoved; this is what removes its row and wakes the
+        // webhook dispatcher to turn its paired endpoints off (#324).
+        if named_changed {
+            self.emit_access_change(&state, AuthAccessChange::McpNamedClients);
         }
         drop(state);
     }
@@ -2815,7 +2912,7 @@ impl AuthService {
             .signer
             .issue(&claims)
             .map_err(|error| AuthError::Internal(error.to_string()))?;
-        let record = SessionRecord {
+        let mut record = SessionRecord {
             session_id: session_id.clone(),
             subject: subject.clone(),
             scopes: scopes.clone(),
@@ -2860,7 +2957,7 @@ impl AuthService {
                 ));
             }
         }
-        let view = record.view(false);
+        let mut view = record.view(false);
         let mut pending_issuance_guard = (delivery_state
             == AuthSessionDeliveryState::PendingPairing)
             .then(|| PendingSessionIssuanceGuard::new(self.clone(), session_id.clone()));
@@ -2868,10 +2965,20 @@ impl AuthService {
             let row = persisted_auth_session(&record);
             let written = match &mcp_link_id {
                 // A relay or sweep may have revoked the link since its consume.
-                Some(link_id) => repositories
+                Some(link_id) => match repositories
                     .create_fenced_mcp_auth_session(row, link_id.clone())
                     .await
-                    .map_err(|error| AuthError::Internal(error.to_string()))?,
+                    .map_err(|error| AuthError::Internal(error.to_string()))?
+                {
+                    // A run of a taken-over named client starts read-only (#324).
+                    Some((_, access, hand_back)) => {
+                        record.mcp_access = access;
+                        record.mcp_access_hand_back = hand_back;
+                        view = record.view(false);
+                        true
+                    }
+                    None => false,
+                },
                 None => repositories
                     .create_auth_session(row)
                     .await
@@ -3127,6 +3234,7 @@ async fn reconcile_authority_snapshot(
         .iter()
         .map(pending_mcp_view)
         .collect::<Vec<_>>();
+    let named_clients = snapshot.mcp_named_clients;
     let mut state = state.lock().await;
     if state.authority_generation != expected_generation {
         return Ok(false);
@@ -3184,6 +3292,10 @@ async fn reconcile_authority_snapshot(
     if state.pending_mcp != pending_mcp {
         changes.push(AuthAccessChange::PendingMcpAuthorizations);
     }
+    if !same_named_clients(&state.named_clients, &named_clients) {
+        changes.push(AuthAccessChange::McpNamedClients);
+    }
+    state.named_clients = named_clients;
     state.pairings = next_pairings;
     state.sessions = next_sessions;
     state.pairing_offer_idempotency = offers;
@@ -3192,6 +3304,14 @@ async fn reconcile_authority_snapshot(
         emit_access_change_on(&state, access_events, access_revision, change);
     }
     Ok(true)
+}
+
+/// Whether two lists name the same clients; the Take over flag is not shown, so it is no change.
+fn same_named_clients(left: &[LiveMcpNamedClient], right: &[LiveMcpNamedClient]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id && left.name == right.name && left.created_at == right.created_at
+        })
 }
 
 /// A pending remote authorization as BiBCode clients show it: who asks, where it returns,
@@ -7822,6 +7942,343 @@ mod tests {
             assert!(
                 revoked(&repositories, &second).await,
                 "the live run ends too"
+            );
+        }
+
+        async fn run_at(
+            service: &AuthService,
+            repositories: &Repositories,
+            name: &str,
+            access: &str,
+        ) -> String {
+            let link = issue_named_mcp_pairing_link(repositories, name, access, &[])
+                .await
+                .expect("named link issues");
+            exchange_in_background(service, &link.credential)
+                .await
+                .await
+                .unwrap()
+                .expect("exchange")
+                .principal
+                .session_id
+        }
+
+        /// The cached access and hand-back of `session_id`, as Settings shows them.
+        async fn cached_access(
+            service: &AuthService,
+            session_id: &str,
+        ) -> (Option<String>, Option<String>) {
+            let view = service
+                .list_clients("")
+                .await
+                .into_iter()
+                .find(|client| client.session_id == session_id)
+                .expect("the session is listed");
+            (view.mcp_access, view.mcp_access_hand_back)
+        }
+
+        fn levels(access: &str, hand_back: Option<&str>) -> (Option<String>, Option<String>) {
+            (Some(access.to_owned()), hand_back.map(str::to_owned))
+        }
+
+        async fn wait_for_named_clients(
+            events: &mut broadcast::Receiver<AuthAccessEvent>,
+        ) -> Result<(), tokio::time::error::Elapsed> {
+            tokio::time::timeout(AUTHORITY_CONVERGENCE_INTERVAL * 16, async {
+                while !matches!(
+                    events.recv().await.expect("access events").change,
+                    AuthAccessChange::McpNamedClients
+                ) {}
+            })
+            .await
+        }
+
+        fn view_ids(views: &[McpNamedClientView]) -> Vec<&str> {
+            views.iter().map(|view| view.id.as_str()).collect()
+        }
+
+        /// A run exiting leaves its identity listed, so Settings can show an idle row (#324).
+        #[tokio::test]
+        async fn a_named_client_whose_run_exited_stays_in_the_access_snapshot() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let mut events = service.subscribe_access();
+            // The relay mints the identity in the store; the watcher brings it to the cache.
+            let link = named_link(&repositories, "builder").await;
+            wait_for_named_clients(&mut events)
+                .await
+                .expect("the watcher lists the new identity");
+            let views = service.named_client_views().await;
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].name, "builder");
+            let first = exchange_in_background(&service, &link.credential)
+                .await
+                .await
+                .unwrap()
+                .expect("exchange")
+                .principal
+                .session_id;
+            repositories
+                .revoke_mcp_credential(first.clone(), format_iso(now_ms()))
+                .await
+                .unwrap();
+            assert!(service.authorize_session(&first, "").await.is_err());
+            assert!(service.list_clients("").await.is_empty());
+            assert_eq!(
+                view_ids(&service.named_client_views().await),
+                view_ids(&views),
+                "the identity outlives its run"
+            );
+        }
+
+        /// Revoke on an idle row passes the named client's id and ends the identity (#324).
+        #[tokio::test]
+        async fn revoking_an_idle_named_client_by_its_id_ends_the_identity_and_sends_a_snapshot() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            let identity = named_id(&repositories, &first).await.expect("a named run");
+            repositories
+                .revoke_mcp_credential(first.clone(), format_iso(now_ms()))
+                .await
+                .unwrap();
+            let mut events = service.subscribe_access();
+            while events.try_recv().is_ok() {}
+
+            assert!(service.revoke_client("person", &identity).await.unwrap());
+
+            assert!(service.named_client_views().await.is_empty());
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event.change, AuthAccessChange::McpNamedClients)),
+                "the revoke sends the new list"
+            );
+            assert!(
+                !service.revoke_client("person", &identity).await.unwrap(),
+                "an ended identity is unknown"
+            );
+            let next = run(&service, &repositories, "builder").await;
+            assert_ne!(
+                named_id(&repositories, &next).await,
+                Some(identity),
+                "the next run starts a new identity"
+            );
+        }
+
+        /// Revoke others removes every other row, idle identities included (#324).
+        #[tokio::test]
+        async fn revoke_others_ends_idle_named_clients() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run(&service, &repositories, "builder").await;
+            let identity = named_id(&repositories, &first).await;
+            repositories
+                .revoke_mcp_credential(first.clone(), format_iso(now_ms()))
+                .await
+                .unwrap();
+            service.revoke_other_clients("person").await.unwrap();
+            assert!(service.named_client_views().await.is_empty());
+            let next = run(&service, &repositories, "builder").await;
+            assert_ne!(named_id(&repositories, &next).await, identity);
+        }
+
+        /// Take over sticks to the identity: the next run starts read-only, and Hand back
+        /// restores the level that run was paired with (#324).
+        #[tokio::test]
+        async fn a_taken_over_named_clients_next_run_starts_read_only_with_its_own_hand_back() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            assert_eq!(
+                service.set_mcp_access(&first, "read-only").await.unwrap(),
+                McpAccessChange::Changed
+            );
+            repositories
+                .revoke_mcp_credential(first.clone(), format_iso(now_ms()))
+                .await
+                .unwrap();
+            let second = run_at(&service, &repositories, "builder", "approval-required").await;
+            let expected = levels("read-only", Some("approval-required"));
+            assert_eq!(cached_access(&service, &second).await, expected);
+            let row = repositories
+                .get_auth_session(second.clone())
+                .await
+                .unwrap()
+                .expect("row");
+            assert_eq!((row.mcp_access, row.mcp_access_hand_back), expected);
+            assert_eq!(
+                service.mcp_client_access(&second).await.as_deref(),
+                Some("read-only")
+            );
+        }
+
+        #[tokio::test]
+        async fn taking_over_one_run_takes_over_every_live_run_of_the_identity() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            let second = run_at(&service, &repositories, "builder", "auto-accept-edits").await;
+            let other = run_at(&service, &repositories, "reviewer", "full-access").await;
+            service.set_mcp_access(&first, "read-only").await.unwrap();
+            assert_eq!(
+                cached_access(&service, &first).await,
+                levels("read-only", Some("full-access"))
+            );
+            assert_eq!(
+                cached_access(&service, &second).await,
+                levels("read-only", Some("auto-accept-edits"))
+            );
+            assert_eq!(
+                cached_access(&service, &other).await,
+                levels("full-access", None),
+                "another name is untouched"
+            );
+        }
+
+        #[tokio::test]
+        async fn hand_back_on_one_run_releases_the_identity_and_every_live_run() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            let second = run_at(&service, &repositories, "builder", "auto-accept-edits").await;
+            service.set_mcp_access(&first, "read-only").await.unwrap();
+            assert_eq!(
+                service
+                    .set_mcp_access(&second, "full-access")
+                    .await
+                    .unwrap(),
+                McpAccessChange::NotTheHandBack,
+                "Hand back restores only the run's own level"
+            );
+            assert_eq!(
+                service
+                    .set_mcp_access(&second, "auto-accept-edits")
+                    .await
+                    .unwrap(),
+                McpAccessChange::Changed
+            );
+            assert_eq!(
+                cached_access(&service, &first).await,
+                levels("full-access", None)
+            );
+            assert_eq!(
+                cached_access(&service, &second).await,
+                levels("auto-accept-edits", None)
+            );
+            let third = run_at(&service, &repositories, "builder", "full-access").await;
+            assert_eq!(
+                cached_access(&service, &third).await,
+                levels("full-access", None),
+                "a released identity's next run starts at its own level"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_read_only_run_of_a_taken_over_identity_has_no_hand_back() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            service.set_mcp_access(&first, "read-only").await.unwrap();
+            let reader = run_at(&service, &repositories, "builder", "read-only").await;
+            assert_eq!(
+                cached_access(&service, &reader).await,
+                levels("read-only", None)
+            );
+        }
+
+        /// A Take over that lands while a new run's row is committed but not yet published
+        /// waits for the publication, so the cache never holds the run's paired level (#324).
+        #[tokio::test]
+        async fn take_over_while_a_named_run_publishes_leaves_the_cache_read_only() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            let next = issue_named_mcp_pairing_link(&repositories, "builder", "full-access", &[])
+                .await
+                .expect("named link issues");
+            let (held, reached, resume) = test_hold();
+            *service.test_hooks().after_session_insert.lock().unwrap() = Some(held);
+            let exchange = exchange_in_background(&service, &next.credential).await;
+            reached.await.expect("the row committed");
+            let take_over = {
+                let service = service.clone();
+                let first = first.clone();
+                tokio::spawn(async move { service.set_mcp_access(&first, "read-only").await })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            resume.send(()).unwrap();
+            let second = exchange
+                .await
+                .unwrap()
+                .expect("issued")
+                .principal
+                .session_id;
+            assert_eq!(take_over.await.unwrap().unwrap(), McpAccessChange::Changed);
+            assert_eq!(
+                cached_access(&service, &second).await,
+                levels("read-only", Some("full-access"))
+            );
+        }
+
+        /// A refresh that read the writable row before a Take over committed must not put
+        /// that level back into the cache (#324, Codex review).
+        #[tokio::test]
+        async fn a_refresh_that_read_before_take_over_does_not_restore_the_writable_level() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            let (held, reached, resume) = test_hold();
+            *service.test_hooks().after_refresh_read.lock().unwrap() = Some(held);
+            let refresh = {
+                let service = service.clone();
+                let first = first.clone();
+                tokio::spawn(async move { service.mcp_client_access(&first).await })
+            };
+            reached.await.expect("the refresh read the row");
+            assert_eq!(
+                service.set_mcp_access(&first, "read-only").await.unwrap(),
+                McpAccessChange::Changed
+            );
+            resume.send(()).unwrap();
+            assert_eq!(refresh.await.unwrap().as_deref(), Some("read-only"));
+            assert_eq!(
+                cached_access(&service, &first).await,
+                levels("read-only", Some("full-access"))
+            );
+        }
+
+        /// Constant local churn cannot spin a refresh: after its reads it keeps the cache.
+        #[tokio::test]
+        async fn a_refresh_overtaken_on_every_read_keeps_the_cache() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            service
+                .test_hooks()
+                .churn_refresh
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let access =
+                tokio::time::timeout(Duration::from_secs(5), service.mcp_client_access(&first))
+                    .await
+                    .expect("the refresh gives up instead of spinning");
+            assert_eq!(access.as_deref(), Some("full-access"));
+        }
+
+        /// The flag and each run's level are in the store, so a restarted server keeps them.
+        #[tokio::test]
+        async fn a_taken_over_identity_survives_a_restart() {
+            let (service, repositories, secrets) = mcp_test_service().await;
+            let first = run_at(&service, &repositories, "builder", "full-access").await;
+            service.set_mcp_access(&first, "read-only").await.unwrap();
+            drop(service);
+            let restarted = AuthService::new_with_persistence(
+                &ServerConfig::new(".").with_bind("127.0.0.1", 3773),
+                vec![7_u8; 32],
+                SecretStore::new(secrets.path())
+                    .await
+                    .expect("secret store opens"),
+                repositories.clone(),
+            )
+            .await
+            .expect("service hydrates");
+            assert_eq!(
+                cached_access(&restarted, &first).await,
+                levels("read-only", Some("full-access"))
+            );
+            let second = run_at(&restarted, &repositories, "builder", "full-access").await;
+            assert_eq!(
+                cached_access(&restarted, &second).await,
+                levels("read-only", Some("full-access"))
             );
         }
 

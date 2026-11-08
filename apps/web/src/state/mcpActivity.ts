@@ -2,6 +2,7 @@ import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
   type AuthClientSession,
+  type AuthMcpNamedClient,
   type AuthMcpAccessLevel,
   type AuthSessionId,
   type EnvironmentId,
@@ -23,6 +24,7 @@ import {
   usePrimarySessionState,
 } from "../environments/primary";
 import { authEnvironment } from "./auth";
+import { idleNamedClients } from "./mcpNamedClients";
 import { usePrimaryEnvironment } from "./environments";
 import { useEnvironmentQuery } from "./query";
 
@@ -114,6 +116,18 @@ export function usePrimaryMcpClients(): ReadonlyArray<AuthClientSession> {
     () => sessions.filter((session) => session.subject === MCP_CLIENT_SUBJECT),
     [sessions],
   );
+}
+
+/** The primary environment's idle named MCP clients (#324). */
+export function usePrimaryIdleNamedClients(): ReadonlyArray<AuthMcpNamedClient> {
+  const access = usePrimaryAgentAccess();
+  const changes = useEnvironmentQuery(
+    access.canRead && access.environmentId !== null
+      ? authEnvironment.accessChanges({ environmentId: access.environmentId, input: null })
+      : null,
+  );
+  const snapshot = changes.data?.type === "snapshot" ? changes.data.payload : undefined;
+  return useMemo(() => idleNamedClients(snapshot), [snapshot]);
 }
 
 /** Whether a person has taken this agent over: Hand back restores the level it names. */
