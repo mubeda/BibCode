@@ -843,6 +843,33 @@ describe("PipelinesDetailView stage columns", () => {
     error.mockRestore();
   });
 
+  it("wraps stages onto more rows instead of scrolling sideways, and remembers it", async () => {
+    await render();
+    const wrap = [...container.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent?.trim() === "Wrap stages",
+    )!;
+    expect(wrap.getAttribute("aria-pressed")).toBe("false");
+    // Only beside the stages: stacked stages never scroll sideways.
+    expect(wrap.parentElement!.className).toContain("hidden");
+    expect(wrap.parentElement!.className).toContain("@min-[720px]/pipeline:flex");
+    await act(async () => wrap.click());
+    expect(wrap.getAttribute("aria-pressed")).toBe("true");
+    expect(stageList().className).toContain("@min-[720px]/pipeline:flex-wrap");
+    expect(stageList().className).not.toContain("overflow-x-auto");
+    expect(localStorage.getItem("bibcode:pipelines-stage-wrap")).toBe("true");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await render();
+    expect(stageList().className).toContain("@min-[720px]/pipeline:flex-wrap");
+    localStorage.setItem("bibcode:pipelines-stage-wrap", "oops");
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await render();
+    expect(stageList().className).toContain("@min-[720px]/pipeline:overflow-x-auto");
+    error.mockRestore();
+  });
+
   it("keeps the full job name in a tooltip, wrapped until its column is at the minimum", async () => {
     await render();
     const name = container.querySelector('[title="rspec"]')!;

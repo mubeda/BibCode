@@ -1,10 +1,19 @@
 import type { PipelinesDetailStage, PipelinesJob, PipelinesJobGroup } from "@bibcode/contracts";
 import { Link } from "@tanstack/react-router";
-import { ChevronRightIcon, CircleStopIcon, PlayIcon, RotateCcwIcon } from "lucide-react";
+import * as Schema from "effect/Schema";
+import {
+  ChevronRightIcon,
+  CircleStopIcon,
+  PlayIcon,
+  RotateCcwIcon,
+  WrapTextIcon,
+} from "lucide-react";
 import { memo, useState, type CSSProperties, type ReactNode } from "react";
+import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useResizableWidth } from "~/hooks/useResizableWidth";
 import { cn } from "../../../lib/utils";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
+import { Toggle } from "../../ui/toggle";
 import { PipelineActions } from "../actions/PipelineActions";
 import { PipelineColumnSeparator } from "../shared/PipelineColumnSeparator";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
@@ -133,6 +142,7 @@ const STAGE_MIN_WIDTH = 256;
 /** The widest a stage column grows: the user's setting, one value for every column. */
 const STAGE_WIDTH = { default: 480, min: STAGE_MIN_WIDTH, max: 960 } as const;
 const STAGE_WIDTH_KEY = "bibcode:pipelines-stage-width";
+const STAGE_WRAP_KEY = "bibcode:pipelines-stage-wrap";
 
 /**
  * One stage: its status, name and job count, then a row per job or parallel group. At
@@ -184,8 +194,9 @@ const PipelineStage = memo(function PipelineStage({
  * A pipeline's stages in the host's order: side by side on a wide panel (the `pipeline`
  * container, 720 px and up), stacked on a narrow one. Wide columns share the row, each
  * between 256 px and the user's width (a separator on the first column sets it), and
- * the row scrolls sideways only when the stages at 256 px do not fit. One tree either
- * way, so a 1,000-job run renders its rows once.
+ * the row scrolls sideways only when the stages at 256 px do not fit, or, with Wrap
+ * stages on, puts the stages that do not fit on more rows. One tree either way, so a
+ * 1,000-job run renders its rows once.
  */
 export const PipelineStageColumns = memo(function PipelineStageColumns({
   stages,
@@ -201,6 +212,7 @@ export const PipelineStageColumns = memo(function PipelineStageColumns({
     maxWidth: STAGE_WIDTH.max,
     edge: "right",
   });
+  const [wrap, setWrap] = useLocalStorage(STAGE_WRAP_KEY, false, Schema.Boolean);
   const separator = (
     <PipelineColumnSeparator
       label="Resize stage columns"
@@ -214,21 +226,35 @@ export const PipelineStageColumns = memo(function PipelineStageColumns({
     />
   );
   return (
-    <ol
-      aria-label="Stages"
-      data-text-surface="background"
-      style={{ "--pipeline-stage-max": `${width}px` } as CSSProperties}
-      className="flex min-w-0 flex-col gap-4 @min-[720px]/pipeline:flex-row @min-[720px]/pipeline:overflow-x-auto @min-[720px]/pipeline:pb-2"
-    >
-      {stages.map((stage, index) => (
-        // Stage names are unique within a pipeline; GitHub has the one "Jobs" column.
-        <PipelineStage
-          key={stage.name}
-          stage={stage}
-          mutationsDisabledReason={mutationsDisabledReason}
-          separator={index === 0 ? separator : null}
-        />
-      ))}
-    </ol>
+    <>
+      {/* Stacked stages (below 720 px) never scroll sideways, so the switch shows only beside them. */}
+      <div className="hidden justify-end @min-[720px]/pipeline:flex">
+        <Toggle size="xs" variant="outline" pressed={wrap} onPressedChange={setWrap}>
+          <WrapTextIcon aria-hidden="true" />
+          Wrap stages
+        </Toggle>
+      </div>
+      <ol
+        aria-label="Stages"
+        data-text-surface="background"
+        style={{ "--pipeline-stage-max": `${width}px` } as CSSProperties}
+        className={cn(
+          "flex min-w-0 flex-col gap-4 @min-[720px]/pipeline:flex-row",
+          wrap
+            ? "@min-[720px]/pipeline:flex-wrap"
+            : "@min-[720px]/pipeline:overflow-x-auto @min-[720px]/pipeline:pb-2",
+        )}
+      >
+        {stages.map((stage, index) => (
+          // Stage names are unique within a pipeline; GitHub has the one "Jobs" column.
+          <PipelineStage
+            key={stage.name}
+            stage={stage}
+            mutationsDisabledReason={mutationsDisabledReason}
+            separator={index === 0 ? separator : null}
+          />
+        ))}
+      </ol>
+    </>
   );
 });
