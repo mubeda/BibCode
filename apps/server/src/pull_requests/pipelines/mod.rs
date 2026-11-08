@@ -685,7 +685,7 @@ impl PipelinesService {
         c: &CancellationToken,
     ) -> Result<Admitted, Failure> {
         let runner = &self.service.runner;
-        let pending = context::resolve_pending_scope(
+        let pending = context::resolve_login_scope(
             runner,
             cwd,
             &DiscoveredHosts::default(),

@@ -218,12 +218,16 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// A dotted name, a bracketed IPv6 address, or any name with a port (`localhost:8929`).
+/// A dotted name, an IPv6 address (bracketed or bare `::1`), or any name with a port
+/// (`localhost:8929`).
 fn looks_like_host(value: &str) -> bool {
     let (name, port) = split_host(value);
     !name.is_empty()
         && !name.contains(char::is_whitespace)
-        && (name.contains('.') || value.starts_with('[') || port.is_some())
+        && (name.contains('.')
+            || value.starts_with('[')
+            || port.is_some()
+            || name.parse::<std::net::Ipv6Addr>().is_ok())
 }
 
 /// A CLI-configured host's name, without IPv6 brackets, and its port:
@@ -524,6 +528,14 @@ mod tests {
             parse_gitlab_auth_status("localhost\n  ✓ Logged in to localhost as test-user\n")
                 .is_empty()
         );
+        // A bare IPv6 header has no port to show it is a host; the address itself does.
+        let hosts: Vec<_> = parse_gitlab_auth_status(
+            "::1\n  ✓ Logged in to ::1 as test-user\nfe80::1\n  x not logged in\n",
+        )
+        .into_iter()
+        .map(|host| host.host)
+        .collect();
+        assert_eq!(hosts, ["::1", "fe80::1"]);
     }
 
     #[test]

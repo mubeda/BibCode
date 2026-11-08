@@ -1112,6 +1112,43 @@ async fn pull_requests_rpc_registry_round_trips_context_list_and_typed_failure()
     server.join().await.unwrap();
 }
 
+/// #332: snapshot and subscription reads need only the repository's identity. For an
+/// unrecorded named GitLab host over scp, whose web port only glab could tell, the
+/// Pull Requests and Pipelines `readSnapshot` and `subscribe` spawn no `glab` at all
+/// (without a database each stops right after resolving the scope).
+#[tokio::test]
+async fn pull_requests_and_pipelines_snapshot_reads_of_a_named_ssh_host_spawn_no_glab() {
+    let f = Fixture::new(Some("git@gitlab.example.test:group/project.git")).await;
+    let list = json!({"cwd":f.cwd,"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"number":null,"tab":null});
+    let pipelines = json!({"cwd":f.cwd,"scope":"all","ref":null,"workflowId":null,"cursor":null,"refresh":"user","pipelineId":null,"attempt":null,"jobId":null});
+    let c = CancellationToken::new();
+    for _ in 0..2 {
+        let _ = f
+            .service
+            .read_snapshot(serde_json::from_value(list.clone()).unwrap(), &c)
+            .await;
+        let _ = f
+            .service
+            .subscribe(serde_json::from_value(list.clone()).unwrap(), &|_| true, &c)
+            .await;
+        let _ = f
+            .service
+            .pipelines()
+            .read_snapshot(serde_json::from_value(pipelines.clone()).unwrap(), &c)
+            .await;
+        let _ = f
+            .service
+            .pipelines()
+            .subscribe(
+                serde_json::from_value(pipelines.clone()).unwrap(),
+                &|_| true,
+                &c,
+            )
+            .await;
+    }
+    assert_eq!(f.calls("glab"), "", "identity reads spawned glab");
+}
+
 /// #332 against a real GitLab, such as the local Docker kit on `localhost:8929`:
 /// `pullRequests.getContext`, `pullRequests.list` and `pipelines.list` through the
 /// real `glab`, `gh` and `git` on `PATH`. Set `BIBCODE_LIVE_GITLAB_CHECKOUT` to a
