@@ -44,6 +44,8 @@ const JOIN_LOG_CAPACITY: usize = 4096;
 const TICK: Duration = Duration::from_secs(5);
 const HANG_AFTER: Duration = Duration::from_secs(10);
 const LONG_RUNNING_HANG_AFTER: Duration = Duration::from_secs(300);
+/// `git.signIn` waits on a person for up to its 10-minute cap (#325), then kills and cleans up.
+const SIGN_IN_HANG_AFTER: Duration = Duration::from_secs(660);
 const SATURATION_METHODS: usize = 5;
 /// On Windows, where `Instant` counts suspended time, a detector tick this late means the
 /// machine slept, and a request spanning it is not measured. Elsewhere `Instant` stops during
@@ -131,6 +133,8 @@ pub fn is_long_running(method: &str) -> bool {
             | "server.subscribeDiagnosticLogsRelay"
             | "server.sendDiagnosticLogsRelayItem"
             | "vcs.pull"
+            // Waits on a person signing in with Git Credential Manager, up to 10 minutes (#325).
+            | "git.signIn"
             | "vcs.generateCommitMessage"
             | "git.resolvePullRequest"
             | "git.preparePullRequestThread"
@@ -662,7 +666,9 @@ impl InFlight {
         Self {
             method: method.to_owned(),
             started,
-            hang_after: if is_long_running(method) {
+            hang_after: if method == "git.signIn" {
+                SIGN_IN_HANG_AFTER
+            } else if is_long_running(method) {
                 LONG_RUNNING_HANG_AFTER
             } else {
                 HANG_AFTER
@@ -1244,6 +1250,8 @@ mod tests {
         assert!(!is_long_running("pipelines.subscribe"));
         // Preparing an AI Terminal runs its provider's probe, a shim's manager and codesign.
         assert!(is_long_running("terminal.open"));
+        // A Git Credential Manager sign-in waits on a person (#325).
+        assert!(is_long_running("git.signIn"));
         assert!(!is_long_running("terminal.writeInput"));
         // A test event or a redelivery waits on the person's endpoint (up to 10 s), and a
         // token change waits for the request in flight; the rest of the webhook methods read
@@ -1282,6 +1290,21 @@ mod tests {
         let hung = overdue(&mut in_flight, now);
         assert_eq!(hung.len(), 1);
         assert_eq!(hung[0].0, "updater.install");
+    }
+
+    #[test]
+    fn a_sign_in_is_not_hung_within_its_ten_minute_cap() {
+        let now = Instant::now();
+        let mut in_flight = HashMap::from([(
+            1,
+            InFlight::new("git.signIn", now - Duration::from_secs(600)),
+        )]);
+        assert!(overdue(&mut in_flight, now).is_empty());
+        let mut in_flight = HashMap::from([(
+            1,
+            InFlight::new("git.signIn", now - Duration::from_secs(661)),
+        )]);
+        assert_eq!(overdue(&mut in_flight, now).len(), 1);
     }
 
     #[test]

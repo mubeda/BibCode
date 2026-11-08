@@ -57,6 +57,14 @@ const NETWORK_TRANSFER_CONFIG: &[&str] = &[
     "-c",
     "http.lowSpeedTime=60",
 ];
+/// Reads every URL rewrite in effect, following includes (`git.signIn`, #325).
+pub(crate) const SIGN_IN_REWRITE_ARGS: &[&str] = &[
+    "config",
+    "--includes",
+    "-z",
+    "--get-regexp",
+    r"^url\..*\.(insteadof|pushinsteadof)$",
+];
 /// The fixed start of curl's low-speed abort, which Git relays on stderr.
 const CURL_LOW_SPEED_ABORT: &str = "Operation too slow";
 pub(crate) const NETWORK_TRANSFER_STALLED: &str = "The transfer stalled (under 1 KB/s for 60 seconds). Check the connection to the remote and try again.";
@@ -118,6 +126,16 @@ pub(crate) trait GitProcessRunner: Send + Sync {
     ) -> BoxGitProcessFuture<'a> {
         self.run(request, cancellation)
     }
+}
+
+/// A chosen Source Control push of the current branch (see
+/// [`GitRepository::plan_current_branch_push`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentBranchPush {
+    pub branch: String,
+    /// The remote `args` contact.
+    pub remote: String,
+    args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1603,6 +1621,61 @@ impl GitRepository {
     ) -> Result<ProcessOutput, GitCommandError> {
         self.execute(operation, cwd, args, false, cancellation)
             .await
+    }
+
+    /// [`Self::run`] that returns a non-zero exit as output, so the caller can read its stderr.
+    pub(crate) async fn run_allowing_failure(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(operation, cwd, args, true, cancellation).await
+    }
+
+    /// The `insteadOf`/`pushInsteadOf` values `git.signIn` checks in its neutral repository.
+    pub(crate) async fn git_sign_in_rewrite_values(
+        &self,
+        neutral: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute(
+            "GitManager.signIn.rewrites",
+            neutral,
+            &strings(SIGN_IN_REWRITE_ARGS),
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    /// `git.signIn`'s one probe (#325), in the neutral repository, with GCM interaction
+    /// allowed by [`sign_in_environment`] and `timeout` instead of the 24-hour bound.
+    pub(crate) async fn git_sign_in_probe(
+        &self,
+        neutral: &Path,
+        args: &[String],
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        Self {
+            command_timeout: timeout,
+            ..self.for_network_transfer()
+        }
+        .execute_with_environment(
+            "GitManager.signIn.probe",
+            neutral,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            sign_in_environment(),
+            cancellation,
+        )
+        .await
     }
 
     async fn run_read(
@@ -5796,6 +5869,37 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, GitCommandError> {
+        let push = self.plan_current_branch_push(cwd, cancellation).await?;
+        self.run_current_branch_push(cwd, &push, cancellation)
+            .await?;
+        Ok(push.branch)
+    }
+
+    /// Runs exactly the push [`Self::plan_current_branch_push`] chose.
+    pub(crate) async fn run_current_branch_push(
+        &self,
+        cwd: &Path,
+        push: &CurrentBranchPush,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.for_bounded_transfer()
+            .run(
+                "GitVcsDriver.pushCurrentBranch",
+                cwd,
+                &push.args,
+                cancellation,
+            )
+            .await
+    }
+
+    /// The push Source Control runs for the current branch and the remote it contacts. The
+    /// push itself, the sign-in offer and a resumed push's destination check (#325) all use
+    /// this one choice, so a check can never validate one remote while Git pushes to another.
+    pub(crate) async fn plan_current_branch_push(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<CurrentBranchPush, GitCommandError> {
         let branch = self.current_ref(cwd, cancellation).await?.ok_or_else(|| {
             simple_error(
                 "GitVcsDriver.pushCurrentBranch",
@@ -5812,33 +5916,59 @@ impl GitRepository {
                 cancellation,
             )
             .await?;
-        let args = if upstream.exit_code != 0 {
-            vec![
+        let (remote, args) = if upstream.exit_code != 0 {
+            let args = vec![
                 "push".into(),
                 "--set-upstream".into(),
                 "origin".into(),
                 branch.clone(),
-            ]
+            ];
+            ("origin".to_owned(), args)
         } else if let Some(remote) = self
             .renamed_upstream_remote(cwd, &branch, cancellation)
             .await?
         {
             // Publish under the local name and track it, so status compares with the branch
             // that was pushed. A non-fast-forward is still refused: nothing forces.
-            vec![
+            let args = vec![
                 "push".into(),
                 "--set-upstream".into(),
                 "--".into(),
-                remote,
+                remote.clone(),
                 format!("refs/heads/{branch}:refs/heads/{branch}"),
-            ]
+            ];
+            (remote, args)
         } else {
-            strings(&["push"])
+            // A bare push goes where Git resolves the branch's push remote: `pushRemote`,
+            // `remote.pushDefault`, the upstream's remote, then `origin`.
+            let remote = self
+                .execute_read(
+                    "GitVcsDriver.pushCurrentBranch.pushRemote",
+                    cwd,
+                    &[
+                        "for-each-ref".into(),
+                        "--format=%(push:remotename)".into(),
+                        format!("refs/heads/{branch}"),
+                    ],
+                    true,
+                    cancellation,
+                )
+                .await?
+                .stdout
+                .trim()
+                .to_owned();
+            let remote = if remote.is_empty() {
+                "origin".to_owned()
+            } else {
+                remote
+            };
+            (remote, strings(&["push"]))
         };
-        self.for_bounded_transfer()
-            .run("GitVcsDriver.pushCurrentBranch", cwd, &args, cancellation)
-            .await?;
-        Ok(branch)
+        Ok(CurrentBranchPush {
+            branch,
+            remote,
+            args,
+        })
     }
 
     /// The remote to publish `branch` to when its upstream has another name (#157), such as a
@@ -7914,6 +8044,16 @@ pub(crate) fn git_environment_inheriting_unread() -> Vec<(OsString, OsString)> {
     if let Some(variable) = super::system_config::inheriting_system_config_variable() {
         environment.insert(2, variable);
     }
+    environment
+}
+
+/// [`git_environment`] for `git.signIn`'s probe only (#325): no `GCM_INTERACTIVE`, so GCM may
+/// open its window unless the person's own setting says `never`, and Git refuses any final URL
+/// that is not HTTPS. Every other Git command keeps `GCM_INTERACTIVE=never`.
+pub(crate) fn sign_in_environment() -> Vec<(OsString, OsString)> {
+    let mut environment = git_environment();
+    environment.retain(|(key, _)| key != "GCM_INTERACTIVE");
+    environment.push(("GIT_ALLOW_PROTOCOL".into(), "https".into()));
     environment
 }
 

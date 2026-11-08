@@ -216,7 +216,7 @@ pub async fn push_tag(
     }
     repository
         .for_network_transfer()
-        .run(
+        .run_allowing_failure(
             "GitManager.tags.push",
             cwd,
             &[

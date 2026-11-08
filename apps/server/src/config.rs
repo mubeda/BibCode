@@ -76,6 +76,9 @@ pub struct ServerConfig {
     /// True only for a desktop-owned server launched through the WSL bootstrap transport.
     #[doc(hidden)]
     pub desktop_wsl_transport: bool,
+    /// Lets the desktop app's own session sign in with Git Credential Manager (#325). Only the
+    /// desktop's in-process launch sets it; no CLI flag or bootstrap key does.
+    pub interactive_git_sign_in: bool,
     pub unsafe_no_auth: bool,
     pub environment_id: String,
     pub environment_label: String,
@@ -115,6 +118,7 @@ impl ServerConfig {
             startup_pairing_offer: true,
             desktop_bootstrap_token: None,
             desktop_wsl_transport: false,
+            interactive_git_sign_in: false,
             unsafe_no_auth: false,
             environment_id: "local".to_owned(),
             environment_label: LOCAL_ENVIRONMENT_LABEL.to_owned(),
@@ -293,6 +297,22 @@ mod tests {
             .into_server_config()
             .expect("build disabled startup offer config");
         assert!(!disabled.startup_pairing_offer);
+    }
+
+    #[test]
+    fn interactive_git_sign_in_is_off_unless_the_desktop_in_process_launch_sets_it() {
+        assert!(!ServerConfig::new("/tmp/bibcode-test").interactive_git_sign_in);
+        for args in [
+            vec!["bibcode", "serve"],
+            vec!["bibcode", "serve", "--mode", "desktop"],
+            vec!["bibcode"],
+        ] {
+            let config = Cli::try_parse_from(args.clone())
+                .expect("parse CLI")
+                .into_server_config()
+                .expect("build config");
+            assert!(!config.interactive_git_sign_in, "{args:?}");
+        }
     }
 
     #[test]

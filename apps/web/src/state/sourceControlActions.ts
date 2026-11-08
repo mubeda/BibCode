@@ -180,24 +180,40 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
         })
       : null,
   );
-  const action = useCallback(async () => {
-    const target = resolveScope(scope);
-    if (target === null) {
-      return AsyncResult.failure<never, VcsActionUnavailableError>(
-        Cause.fail(
-          new VcsActionUnavailableError({
-            operation: "pull",
-            environmentId: scope.environmentId,
-            cwd: scope.cwd,
-          }),
-        ),
+  const action = useCallback(
+    async (options?: {
+      /** A pull resumed after a Git Credential Manager sign-in (#325). */
+      readonly expectedDestination?: string;
+      /** Aborting it interrupts the pull, which kills its Git process. */
+      readonly signal?: AbortSignal;
+    }) => {
+      const target = resolveScope(scope);
+      if (target === null) {
+        return AsyncResult.failure<never, VcsActionUnavailableError>(
+          Cause.fail(
+            new VcsActionUnavailableError({
+              operation: "pull",
+              environmentId: scope.environmentId,
+              cwd: scope.cwd,
+            }),
+          ),
+        );
+      }
+      return pull(
+        {
+          environmentId: target.environmentId,
+          input: {
+            cwd: target.cwd,
+            ...(options?.expectedDestination === undefined
+              ? {}
+              : { expectedDestination: options.expectedDestination }),
+          },
+        },
+        options?.signal === undefined ? undefined : { signal: options.signal },
       );
-    }
-    return pull({
-      environmentId: target.environmentId,
-      input: { cwd: target.cwd },
-    });
-  }, [pull, scope]);
+    },
+    [pull, scope],
+  );
   return useAction({
     kind: "pull",
     label: "Pulling latest changes",
@@ -310,7 +326,11 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
       pullRequestBaseBranch?: string;
       pullRequestHeadBranch?: string;
       pullRequestOptions?: GitPullRequestCreateOptions;
+      /** A push resumed after a Git Credential Manager sign-in (#325). */
+      expectedDestination?: string;
       onProgress?: (event: GitActionProgressEvent) => void;
+      /** Aborting it interrupts the action; a running push is killed. */
+      signal?: AbortSignal;
     }) => {
       if (resolveScope(scope) === null) {
         return AsyncResult.failure<never, VcsActionUnavailableError>(
@@ -323,26 +343,34 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
           ),
         );
       }
-      return runStackedAction({
-        actionId: input.actionId,
-        action: input.action,
-        ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
-        ...(input.featureBranch ? { featureBranch: true } : {}),
-        ...(input.filePaths?.length ? { filePaths: input.filePaths } : {}),
-        ...(input.commitStagedIndexAsIs ? { commitStagedIndexAsIs: true } : {}),
-        ...(input.pullRequestTitle ? { pullRequestTitle: input.pullRequestTitle } : {}),
-        ...(input.pullRequestBaseBranch !== undefined
-          ? { pullRequestBaseBranch: input.pullRequestBaseBranch }
-          : {}),
-        ...(input.pullRequestHeadBranch !== undefined
-          ? { pullRequestHeadBranch: input.pullRequestHeadBranch }
-          : {}),
-        ...(input.pullRequestBody !== undefined ? { pullRequestBody: input.pullRequestBody } : {}),
-        ...(input.pullRequestOptions !== undefined
-          ? { pullRequestOptions: input.pullRequestOptions }
-          : {}),
-        ...(input.onProgress ? { onProgress: input.onProgress } : {}),
-      });
+      return runStackedAction(
+        {
+          actionId: input.actionId,
+          action: input.action,
+          ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
+          ...(input.featureBranch ? { featureBranch: true } : {}),
+          ...(input.filePaths?.length ? { filePaths: input.filePaths } : {}),
+          ...(input.commitStagedIndexAsIs ? { commitStagedIndexAsIs: true } : {}),
+          ...(input.pullRequestTitle ? { pullRequestTitle: input.pullRequestTitle } : {}),
+          ...(input.pullRequestBaseBranch !== undefined
+            ? { pullRequestBaseBranch: input.pullRequestBaseBranch }
+            : {}),
+          ...(input.pullRequestHeadBranch !== undefined
+            ? { pullRequestHeadBranch: input.pullRequestHeadBranch }
+            : {}),
+          ...(input.pullRequestBody !== undefined
+            ? { pullRequestBody: input.pullRequestBody }
+            : {}),
+          ...(input.pullRequestOptions !== undefined
+            ? { pullRequestOptions: input.pullRequestOptions }
+            : {}),
+          ...(input.expectedDestination !== undefined
+            ? { expectedDestination: input.expectedDestination }
+            : {}),
+          ...(input.onProgress ? { onProgress: input.onProgress } : {}),
+        },
+        input.signal === undefined ? undefined : { signal: input.signal },
+      );
     },
     [runStackedAction, scope],
   );

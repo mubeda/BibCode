@@ -422,7 +422,7 @@ The same method can hold two `rpc.slow` findings, one per source.
 
 - **Severity:** `error`.
 - **Raised when:** a unary request is still running after 10 s (300 s for
-  long-running methods). It is flagged once per request.
+  long-running methods, 660 s for `git.signIn`). It is flagged once per request.
 - **Fingerprint:** `[method, "server"]`.
 - **Evidence:** `method`, `slowPart: "server"`, `elapsedSecs`.
 

@@ -6,6 +6,7 @@ mod model;
 mod parser;
 mod process;
 mod repository;
+pub mod sign_in;
 mod status_owner;
 mod summary;
 pub mod system_config;

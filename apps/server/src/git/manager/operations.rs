@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::git::sign_in::{
+    CredentialPrompt, Destination, SignInDirection, SignInRequired, has_gcm_refusal,
+    resolve_destination,
+};
 use crate::git::{
     GitCommandError, GitManagerBlockedReason, GitManagerInProgressKind, GitManagerRefsSnapshot,
     GitRepository, NETWORK_TRANSFER_STALLED, OutputPolicy, ProcessOutput, ProcessRequest,
@@ -170,6 +174,8 @@ pub enum GitManagerFailureCode {
     Cancelled,
     TimedOut,
     NetworkStalled,
+    SignInRequired,
+    DestinationChanged,
     Unknown,
 }
 
@@ -192,8 +198,18 @@ impl GitManagerFailureCode {
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed-out",
             Self::NetworkStalled => "network-stalled",
+            Self::SignInRequired => "sign-in-required",
+            Self::DestinationChanged => "destination-changed",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// The message for a failure the classifier recognizes, for `git.signIn`'s `failed` answer.
+pub(crate) fn classified_failure_message(exit_code: i32, stderr: &str) -> Option<&'static str> {
+    match classify_operation_failure(exit_code, stderr) {
+        GitManagerFailureCode::Unknown | GitManagerFailureCode::Completed => None,
+        code => Some(failure_message(code)),
     }
 }
 
@@ -243,14 +259,14 @@ pub fn classify_operation_failure(exit_code: i32, stderr: &str) -> GitManagerFai
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GitManagerCheckoutStrategy {
     Stash,
     Bring,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GitManagerResetMode {
     Hard,
@@ -268,7 +284,7 @@ impl GitManagerResetMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GitManagerPendingOperation {
     Merge,
@@ -288,7 +304,7 @@ impl GitManagerPendingOperation {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "_tag",
     rename_all = "kebab-case",
@@ -327,16 +343,24 @@ pub enum GitManagerOperationRequest {
         project_id: String,
         remote: String,
         branch: String,
+        /// A resumed request after a sign-in (#325): refuse unless the remote still has
+        /// exactly this one URL. It can only add a refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     Fetch {
         cwd: PathBuf,
         project_id: String,
         remote: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     Pull {
         cwd: PathBuf,
         project_id: String,
         remote: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     Push {
         cwd: PathBuf,
@@ -346,6 +370,8 @@ pub enum GitManagerOperationRequest {
         remote_branch: Option<String>,
         #[serde(default)]
         push_tags: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     PublishBranch {
         cwd: PathBuf,
@@ -355,6 +381,8 @@ pub enum GitManagerOperationRequest {
         remote_branch: Option<String>,
         #[serde(default)]
         push_tags: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     ForcePush {
         cwd: PathBuf,
@@ -364,6 +392,8 @@ pub enum GitManagerOperationRequest {
         remote_branch: Option<String>,
         #[serde(default)]
         push_tags: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     StashPush {
         cwd: PathBuf,
@@ -474,6 +504,8 @@ pub enum GitManagerOperationRequest {
         project_id: String,
         name: String,
         remote: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
 }
 
@@ -657,6 +689,8 @@ pub struct GitManagerOperationError {
     pub message: String,
     pub blocked: Option<Box<GitManagerBlockedReason>>,
     pub outputs: Vec<ProcessOutput>,
+    /// Set with code `sign-in-required` only (#325).
+    pub sign_in: Option<Box<SignInRequired>>,
 }
 
 pub async fn stage_partial(
@@ -967,6 +1001,7 @@ pub async fn run_branch_or_sync_operation(
     broadcaster: StatusBroadcaster,
     catalog: WorktreeCatalogService,
     request: GitManagerOperationRequest,
+    prompt: CredentialPrompt,
     cancellation: CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
@@ -1024,6 +1059,7 @@ pub async fn run_branch_or_sync_operation(
                     &locked_repository,
                     &snapshot,
                     &locked_request,
+                    prompt,
                     &operation_cancellation,
                 )
                 .await
@@ -1191,14 +1227,177 @@ fn refuse_option_like_operands(
     Ok(())
 }
 
+/// The remote a network operation contacts, its direction, and the request that resumes it
+/// after a sign-in (#325). A branch delete resumes as a delete of its remote branch only,
+/// because its local branch is already gone when the remote step fails.
+fn network_step(
+    snapshot: &GitManagerRefsSnapshot,
+    request: &GitManagerOperationRequest,
+) -> Option<(String, SignInDirection, GitManagerOperationRequest)> {
+    use GitManagerOperationRequest as Request;
+    match request {
+        Request::Fetch { remote, .. } | Request::Pull { remote, .. } => {
+            Some((remote.clone(), SignInDirection::Fetch, request.clone()))
+        }
+        Request::Push { remote, .. }
+        | Request::PublishBranch { remote, .. }
+        | Request::ForcePush { remote, .. }
+        | Request::RemoteBranchDelete { remote, .. }
+        | Request::TagPush { remote, .. } => {
+            Some((remote.clone(), SignInDirection::Push, request.clone()))
+        }
+        Request::BranchDelete {
+            cwd,
+            project_id,
+            name,
+            delete_remote: true,
+            ..
+        } => {
+            let (remote, branch) = remote_delete_target(snapshot, name)?;
+            Some((
+                remote.to_owned(),
+                SignInDirection::Push,
+                Request::RemoteBranchDelete {
+                    cwd: cwd.clone(),
+                    project_id: project_id.clone(),
+                    remote: remote.to_owned(),
+                    branch: branch.to_owned(),
+                    expected_destination: None,
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn expected_destination_mut(
+    request: &mut GitManagerOperationRequest,
+) -> Option<&mut Option<String>> {
+    use GitManagerOperationRequest as Request;
+    match request {
+        Request::Fetch {
+            expected_destination,
+            ..
+        }
+        | Request::Pull {
+            expected_destination,
+            ..
+        }
+        | Request::Push {
+            expected_destination,
+            ..
+        }
+        | Request::PublishBranch {
+            expected_destination,
+            ..
+        }
+        | Request::ForcePush {
+            expected_destination,
+            ..
+        }
+        | Request::RemoteBranchDelete {
+            expected_destination,
+            ..
+        }
+        | Request::TagPush {
+            expected_destination,
+            ..
+        } => Some(expected_destination),
+        _ => None,
+    }
+}
+
 async fn execute_branch_or_sync_operation(
+    repository: &GitRepository,
+    snapshot: &GitManagerRefsSnapshot,
+    request: &GitManagerOperationRequest,
+    prompt: CredentialPrompt,
+    cancellation: &CancellationToken,
+) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
+    let operation = request.operation();
+    refuse_option_like_operands(operation, request)?;
+    let mut network = network_step(snapshot, request);
+    // Taken from the resume copy: a later offer sets the newly frozen destination there.
+    let expected = network
+        .as_mut()
+        .and_then(|(_, _, resume)| expected_destination_mut(resume))
+        .and_then(Option::take);
+    if let (Some(expected), Some((remote, direction, _))) = (expected, &network) {
+        let current =
+            resolve_destination(repository, request.cwd(), remote, *direction, cancellation).await;
+        if !matches!(current, Destination::Offer { ref destination, .. } if *destination == expected)
+        {
+            let code = GitManagerFailureCode::DestinationChanged;
+            return Err(operation_error(
+                operation,
+                code.as_str(),
+                failure_message(code),
+            ));
+        }
+    }
+    let result = execute_operation_steps(repository, snapshot, request, cancellation).await;
+    match (result, network, prompt) {
+        (Err(error), Some(step), CredentialPrompt::OfferSignIn) => {
+            Err(offer_sign_in(repository, request.cwd(), error, step, cancellation).await)
+        }
+        (result, ..) => result,
+    }
+}
+
+/// Turns a failure whose stderr carries GCM's refusal into `sign-in-required` naming the
+/// remote's frozen destination. The refusal line is an untrusted hint: the destination comes
+/// from `git remote get-url`, never from stderr.
+async fn offer_sign_in(
+    repository: &GitRepository,
+    cwd: &Path,
+    mut error: GitManagerOperationError,
+    (remote, direction, mut resume): (String, SignInDirection, GitManagerOperationRequest),
+    cancellation: &CancellationToken,
+) -> GitManagerOperationError {
+    let refused = error
+        .outputs
+        .last()
+        .is_some_and(|output| has_gcm_refusal(&output.stderr));
+    if !refused
+        || cancellation.is_cancelled()
+        || error.code == GitManagerFailureCode::Cancelled.as_str()
+    {
+        return error;
+    }
+    match resolve_destination(repository, cwd, &remote, direction, cancellation).await {
+        Destination::Offer { destination, host } => {
+            if let Some(field) = expected_destination_mut(&mut resume) {
+                *field = Some(destination.clone());
+            }
+            let Ok(resume) = serde_json::to_value(&resume) else {
+                return error;
+            };
+            let code = GitManagerFailureCode::SignInRequired;
+            error.code = code.as_str().to_owned();
+            error.message = failure_message(code).to_owned();
+            error.sign_in = Some(Box::new(SignInRequired {
+                remote,
+                destination,
+                host,
+                direction,
+                resume,
+            }));
+        }
+        Destination::Several => {
+            error.message = format!("{} {}", error.message, direction.several_urls_message());
+        }
+        Destination::None => {}
+    }
+    error
+}
+
+async fn execute_operation_steps(
     repository: &GitRepository,
     snapshot: &GitManagerRefsSnapshot,
     request: &GitManagerOperationRequest,
     cancellation: &CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
-    refuse_option_like_operands(operation, request)?;
     let outputs = match request {
         GitManagerOperationRequest::BranchCreate {
             cwd,
@@ -1988,6 +2187,7 @@ fn require_last_success(
         message: failure_message(code).to_owned(),
         blocked: None,
         outputs,
+        sign_in: None,
     })
 }
 
@@ -2012,6 +2212,7 @@ fn require_stash_entry(
         message: failure_message(code).to_owned(),
         blocked: None,
         outputs,
+        sign_in: None,
     })
 }
 
@@ -2032,6 +2233,7 @@ fn git_command_error(
         message: failure_message(code).to_owned(),
         blocked: None,
         outputs,
+        sign_in: None,
     }
 }
 
@@ -2110,6 +2312,12 @@ const fn failure_message(code: GitManagerFailureCode) -> &'static str {
         GitManagerFailureCode::Cancelled => "The Git Manager operation was cancelled.",
         GitManagerFailureCode::TimedOut => "The Git Manager operation timed out.",
         GitManagerFailureCode::NetworkStalled => NETWORK_TRANSFER_STALLED,
+        GitManagerFailureCode::SignInRequired => {
+            "Git Credential Manager needs you to sign in before Git can reach this remote."
+        }
+        GitManagerFailureCode::DestinationChanged => {
+            "The remote's address changed after you approved the sign-in, so nothing was sent. Try again."
+        }
         GitManagerFailureCode::Unknown => "Git could not complete the requested operation.",
     }
 }
@@ -2124,6 +2332,7 @@ fn blocked_operation_error(
         message: reason.message.clone(),
         blocked: Some(Box::new(reason)),
         outputs: Vec::new(),
+        sign_in: None,
     }
 }
 
@@ -2238,6 +2447,7 @@ fn merge_into_error(
             ),
             blocked: None,
             outputs: vec![output],
+            sign_in: None,
         },
         MergeIntoError::PublishFailed(output) => GitManagerOperationError {
             operation: operation.to_owned(),
@@ -2248,6 +2458,7 @@ fn merge_into_error(
             ),
             blocked: None,
             outputs: vec![output],
+            sign_in: None,
         },
     }
 }
@@ -2259,6 +2470,7 @@ fn operation_error(operation: &str, code: &str, message: &str) -> GitManagerOper
         message: message.to_owned(),
         blocked: None,
         outputs: Vec::new(),
+        sign_in: None,
     }
 }
 
@@ -3509,6 +3721,9 @@ async fn native_trash_command(_path: &Path) -> Result<(PathBuf, Vec<OsString>), 
 }
 
 #[cfg(test)]
+mod sign_in_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         path::{Path, PathBuf},
@@ -3976,6 +4191,7 @@ mod tests {
             &GitRepository::default(),
             &snapshot,
             &request,
+            CredentialPrompt::Never,
             &CancellationToken::new(),
         )
         .await
@@ -5832,16 +6048,24 @@ mod tests {
                     project_id: "p".into(),
                     remote: remote_name.into(),
                     branch: branch.into(),
+                    expected_destination: None,
                 },
+                CredentialPrompt::Never,
                 &token,
             )
             .await
             .expect_err("refused");
             assert_eq!(refused.code, "invalid-request", "{remote_name} {branch}");
         }
-        execute_branch_or_sync_operation(&repository, &snapshot, &request, &token)
-            .await
-            .expect("the remote branch is deleted");
+        execute_branch_or_sync_operation(
+            &repository,
+            &snapshot,
+            &request,
+            CredentialPrompt::Never,
+            &token,
+        )
+        .await
+        .expect("the remote branch is deleted");
         assert_eq!(
             git(remote.path(), &["branch", "--format=%(refname:short)"]),
             "main"
