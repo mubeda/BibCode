@@ -853,7 +853,7 @@ impl GatedRewind {
 
     /// Waits until `count` held lookups have started.
     async fn held_lookups(&self, count: usize) {
-        timeout(Duration::from_secs(10), async {
+        timeout(WAKE_WAIT, async {
             loop {
                 let entered = self.held_entered_notify.notified();
                 if self.held_entered.load(std::sync::atomic::Ordering::SeqCst) >= count {
@@ -1121,7 +1121,7 @@ impl RevertFixture {
         event_type: &str,
         matches: impl Fn(&Value) -> bool,
     ) -> crate::persistence::OrchestrationEvent {
-        timeout(Duration::from_secs(10), async {
+        timeout(WAKE_WAIT, async {
             loop {
                 let event = self.events.recv().await.unwrap();
                 if event.event.event_type == event_type && matches(&event.event.payload) {
@@ -1346,9 +1346,10 @@ async fn a_first_turn_left_pending_across_a_restart_gets_its_baseline_before_del
 }
 
 /// A thread that already has its checkpoints is delivered with no workspace lookup and no Git
-/// for a baseline (#261: no added latency once the baseline exists).
+/// for a baseline (#261: no added latency once the baseline exists). Its checkout admission
+/// runs one `git rev-parse --show-toplevel` (#279), and nothing else.
 #[tokio::test]
-async fn a_turn_on_a_thread_with_checkpoints_is_delivered_without_git_or_wait() {
+async fn a_turn_on_a_thread_with_checkpoints_is_delivered_without_a_baseline_or_workspace_lookup() {
     let fixture = RevertFixture::new().await;
     fixture.rewind.hold_thread("t");
     let (service, mut routes) = service(&fixture.engine);
@@ -1482,7 +1483,7 @@ async fn first_turn_captures_never_hold_back_a_thread_that_has_its_baseline() {
     }
     let mut delivered = HashSet::new();
     while delivered.len() < threads.len() {
-        let id = timeout(Duration::from_secs(10), routes.recv())
+        let id = timeout(WAKE_WAIT, routes.recv())
             .await
             .expect("every first turn is delivered")
             .unwrap();
@@ -1525,7 +1526,7 @@ async fn first_turn_captures_after_a_bootstrap_never_hold_back_a_thread_that_has
     }
     let mut delivered = HashSet::new();
     while delivered.len() < threads.len() {
-        let id = timeout(Duration::from_secs(10), routes.recv())
+        let id = timeout(WAKE_WAIT, routes.recv())
             .await
             .expect("every bootstrapped first turn is delivered")
             .unwrap();
@@ -1621,65 +1622,36 @@ async fn a_hung_checkout_probe_is_given_up_at_the_limit() {
     fixture.shutdown().await;
 }
 
-/// Files of a `reference-transaction` hook that holds the update of a ref 0 in the checkout:
-/// Git runs it inside `update-ref`, after the commit is fixed, until `release` exists.
+/// A capture's ref 0 update in the checkout, held after its commit is fixed and before
+/// `update-ref` runs. Checkpoint Git runs no hooks (#283), so the pause is a test seam.
 struct HeldRefZeroUpdate {
-    entered: PathBuf,
-    recorded: PathBuf,
-    release: PathBuf,
+    held: Arc<crate::production::orchestration_effects::HeldRefZeroUpdate>,
+    commit: std::sync::Mutex<Option<String>>,
 }
 
 impl HeldRefZeroUpdate {
-    fn install(cwd: &Path, scratch: &Path) -> Self {
-        let held = Self {
-            entered: scratch.join("entered"),
-            recorded: scratch.join("recorded"),
-            release: scratch.join("release"),
-        };
-        let slash = |path: &Path| path.display().to_string().replace('\\', "/");
-        let hook = cwd.join(".git").join("hooks").join("reference-transaction");
-        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\ninput=$(cat)\nif [ \"$1\" = prepared ]; then\n  case \"$input\" in\n    *turn/0*)\n      printf '%s\\n' \"$input\" > '{recorded}'\n      : > '{entered}'\n      while [ ! -f '{release}' ]; do sleep 0.1; done\n      ;;\n  esac\nfi\nexit 0\n",
-                recorded = slash(&held.recorded),
-                entered = slash(&held.entered),
-                release = slash(&held.release),
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn install(cwd: &Path, _scratch: &Path) -> Self {
+        Self {
+            held: crate::production::orchestration_effects::hold_ref_zero_update(cwd),
+            commit: std::sync::Mutex::new(None),
         }
-        held
     }
 
+    /// Bounded on its own: the hold limit starts only once the update is held.
     async fn wait_entered(&self) {
-        timeout(LIVE_WRITER_LIMIT, async {
-            while !self.entered.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the ref 0 update reaches its hook");
+        let commit = timeout(WAKE_WAIT, self.held.entered())
+            .await
+            .expect("the ref 0 update reaches its pause");
+        *self.commit.lock().unwrap() = Some(commit);
     }
 
     /// The commit the held update was to publish.
     fn commit(&self) -> String {
-        let recorded = std::fs::read_to_string(&self.recorded).unwrap();
-        recorded
-            .lines()
-            .find(|line| line.contains("turn/0"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap()
-            .to_owned()
+        self.commit.lock().unwrap().clone().unwrap()
     }
 
     fn release(&self) {
-        std::fs::write(&self.release, "").unwrap();
+        self.held.release();
     }
 }
 
@@ -1876,7 +1848,7 @@ async fn a_retried_first_turn_after_an_uncertain_delivery_never_captures_a_basel
     received_after_baseline(&mut routes, "n-first").await;
     // The provider edited the checkout before the delivery became uncertain.
     std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while row(&engine, "n-first").await.state != TurnDeliveryState::Uncertain {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2068,7 +2040,7 @@ async fn a_reverting_threads_later_effects_run_after_the_revert() {
         "{}:tracked.txt",
         crate::production::orchestration_effects::checkpoint_ref("t", 5)
     );
-    let contents = timeout(Duration::from_secs(10), async {
+    let contents = timeout(WAKE_WAIT, async {
         loop {
             if let Some(contents) = fixture.git_output(&["show", &captured]) {
                 return contents;
@@ -2717,7 +2689,7 @@ async fn a_failed_capture_racing_its_expiry_never_brings_back_a_reverted_turn() 
     assert!(fixture.worker_caught_up("b").await);
     std::fs::remove_file(lock).unwrap();
 
-    let reverted = timeout(Duration::from_secs(10), async {
+    let reverted = timeout(WAKE_WAIT, async {
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -2842,24 +2814,28 @@ async fn captured_in(
     thread: &str,
     turn_count: i64,
 ) -> crate::persistence::ProjectionCheckpoint {
-    timeout(Duration::from_secs(10), async {
+    let last = std::sync::Mutex::new(None);
+    timeout(WAKE_WAIT, async {
         loop {
-            if let Some(checkpoint) = checkpoint_in(engine, thread, turn_count)
-                .await
-                .filter(|checkpoint| checkpoint.status == "ready")
-            {
-                return checkpoint;
+            let checkpoint = checkpoint_in(engine, thread, turn_count).await;
+            if let Some(checkpoint) = checkpoint.as_ref().filter(|c| c.status == "ready") {
+                return checkpoint.clone();
             }
+            // A capture that failed (`error`) is a product signal, not a slow host.
+            *last.lock().unwrap() = checkpoint;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{thread}'s turn {turn_count} is never captured"))
+    .unwrap_or_else(|_| {
+        let last = last.lock().unwrap();
+        panic!("{thread}'s turn {turn_count} is never captured; last record: {last:?}")
+    })
 }
 
 /// Waits for a `checkpoint.capture.failed` activity of `turn_id` on thread `t`.
 async fn wait_for_capture_failure(engine: &OrchestrationEngine, turn_id: &str) {
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while capture_failures(engine, turn_id).await == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2938,7 +2914,7 @@ async fn revert_to(
 ) -> Result<(), String> {
     let mut events = engine.subscribe_events();
     engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":command_id, "threadId":"t", "turnCount":turn_count, "createdAt":TIME}))).await.unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         loop {
             let event = events.recv().await.unwrap();
             let payload = &event.event.payload;
@@ -3012,7 +2988,7 @@ async fn an_expiry_during_a_taken_capture_reports_nothing_and_the_turn_is_ready(
     // The capture is taken; the hold limit passes while the worker still records it.
     tokio::time::sleep_until(ended + HOLD_LIMIT + Duration::from_millis(500)).await;
     fixture.rewind.refresh_release.notify_one();
-    let ready = timeout(Duration::from_secs(10), async {
+    let ready = timeout(WAKE_WAIT, async {
         loop {
             let checkpoint = engine
                 .repositories()
@@ -3067,7 +3043,7 @@ async fn a_stale_turn_is_never_a_revert_target_after_a_restart() {
     )
     .await
     .unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(WAKE_WAIT, async {
         while engine
             .repositories()
             .get_checkpoint("t".to_owned(), 3)
@@ -3125,7 +3101,7 @@ async fn a_stale_turn_is_never_a_revert_target_after_a_restart() {
         .unwrap();
     engine.dispatch(command(json!({"type":"thread.turn.start", "commandId":"turn-4", "threadId":"t", "message":{"messageId":"m-4", "role":"user", "text":"next", "attachments":[]}, "createdAt":TIME}))).await.unwrap();
     engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":"revert-stale", "threadId":"t", "turnCount":3, "createdAt":TIME}))).await.unwrap();
-    let refused = timeout(Duration::from_secs(10), async {
+    let refused = timeout(WAKE_WAIT, async {
         loop {
             let event = events.recv().await.unwrap();
             if event.event.event_type == "thread.activity-appended"
@@ -3234,30 +3210,47 @@ async fn reverts_past_the_preparation_bound_restore_in_request_order_before_late
     for thread in THREADS {
         engine.dispatch(command(json!({"type":"thread.checkpoint.revert", "commandId":format!("revert-{thread}"), "threadId":thread, "turnCount":1, "createdAt":TIME}))).await.unwrap();
     }
-    // Four reverts are being prepared, and the fifth already holds its chat.
-    timeout(Duration::from_secs(10), async {
-        while callbacks.prepared.lock().unwrap().len() < 4 || !engine.thread_turns_reserved("e") {
+    // #279: preparation is serialized per checkout (the permit bound applies across
+    // checkouts), so one revert is prepared while the other four hold their chats.
+    timeout(WAKE_WAIT, async {
+        while callbacks.prepared.lock().unwrap().is_empty()
+            || !THREADS
+                .iter()
+                .all(|thread| engine.thread_turns_reserved(thread))
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("four reverts are prepared and the fifth holds its chat");
+    .expect("one revert is prepared and every chat is held");
     enqueue_for(&engine, "e", "e-after", false).await;
     service.wake();
     quiet(&mut routes).await;
 
     callbacks.release.add_permits(1);
-    timeout(Duration::from_secs(10), async {
-        let mut reverted = 0;
-        while reverted < THREADS.len() {
-            let event = events.recv().await.unwrap();
-            if event.event.event_type == "thread.reverted" {
-                reverted += 1;
+    // Each revert runs Git several times after the one before it, so each gets its own wait.
+    for reverted in 0..THREADS.len() {
+        timeout(WAKE_WAIT, async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.reverted" {
+                    return;
+                }
+                assert_ne!(
+                    event
+                        .event
+                        .payload
+                        .pointer("/activity/kind")
+                        .and_then(Value::as_str),
+                    Some("checkpoint.revert.failed"),
+                    "a revert failed: {}",
+                    event.event.payload
+                );
             }
-        }
-    })
-    .await
-    .expect("every revert is recorded");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("revert {} is recorded", reverted + 1));
+    }
     received(&mut routes, "e-after").await;
 
     assert_eq!(

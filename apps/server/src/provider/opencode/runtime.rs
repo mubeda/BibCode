@@ -946,6 +946,12 @@ impl OpenCodeSessionRuntime {
         self.inner.protocol_v2.load(Ordering::SeqCst)
     }
 
+    /// The OpenCode API generation this session speaks: 2 for the `/api/*` wire, else 1. Its
+    /// rewind keeps files only on 2 (#279).
+    pub(crate) fn api_version(&self) -> u32 {
+        if self.is_v2() { 2 } else { 1 }
+    }
+
     pub async fn start(&self) -> Result<String, OpenCodeRuntimeError> {
         let session_id = if self.is_v2() {
             self.v2_create_session().await?

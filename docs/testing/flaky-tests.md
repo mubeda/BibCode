@@ -138,7 +138,8 @@ timer cannot be observed. A test must not assert that a queued turn is still pro
 delivery service runs: the service may already have promoted it. The Device tests'
 `wait_until` (`device/android/testing.rs`) polls for up to a minute for the same reason. Their
 cancelled-start test cancels once the adb log shows the server launch, which proves the forward
-exists, never after a fixed delay. A ChatView scroll-spy test waits until the send's own landing
+exists, never after a fixed delay. A fake adb that takes a second to answer `forward tcp:0` is the
+controlled counterexample: the 500 ms version fails it every run. A ChatView scroll-spy test waits until the send's own landing
 has scrolled and then stayed quiet for a number of frames, not a fixed few, and models the
 anchored turn the spec names (the sent row alone, ending inside the view). Host load alone did not
 reproduce that test; a 150 ms stall between clearing the spies and the assertions did.

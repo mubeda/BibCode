@@ -769,3 +769,73 @@ async fn create_worktree_and_a_panel_stamp_the_threads_they_create() {
     );
     fixture.shutdown().await;
 }
+
+/// #280: the earlier run's relay exited, leaving a running turn; Stop on the live run's row
+/// interrupts it, because both runs are one named client, and ends both.
+#[tokio::test]
+async fn stop_on_a_named_clients_row_interrupts_turns_of_its_earlier_run_after_the_relay_exited() {
+    let harness = Harness::new().await;
+    let first = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &first, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-earlier").await;
+    super::threads::end_run(&harness, &first).await;
+    let second = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+
+    let stopped = harness
+        .auth
+        .stop_client("person", &second.principal.session_id)
+        .await
+        .unwrap();
+    assert!(stopped.revoked);
+    assert_eq!(stopped.interrupted + stopped.failed, 1, "{stopped:?}");
+    assert_eq!(stop_interrupts(&harness, &theirs).await, 1);
+    assert!(
+        harness
+            .repositories
+            .get_auth_session(second.principal.session_id.clone())
+            .await
+            .unwrap()
+            .is_some_and(|session| session.revoked_at.is_some()),
+        "Stop ends the live run too"
+    );
+    harness.shutdown().await;
+}
+
+/// Without `--client`, Stop still reaches only the stopped session's own turns.
+#[tokio::test]
+async fn stop_on_an_unnamed_session_is_unchanged() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &agent, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-agent").await;
+    let (other, _) = harness.agent(McpAccess::FullAccess).await;
+    let stopped = harness
+        .auth
+        .stop_client("person", &other.principal.session_id)
+        .await
+        .unwrap();
+    assert!(stopped.revoked);
+    assert_eq!(stopped.interrupted + stopped.failed, 0);
+    assert_eq!(stop_interrupts(&harness, &theirs).await, 0);
+    harness.shutdown().await;
+}
+
+/// #280: an exited named run whose turn still runs is listed with its named client, so the
+/// Agents panel can say that Stop on it ends the identity.
+#[tokio::test]
+async fn an_exited_named_runs_running_turn_lists_its_named_client() {
+    let harness = Harness::new().await;
+    let first = super::threads::named_agent(&harness, "builder", McpAccess::FullAccess).await;
+    let (theirs, _) = start(&harness, &first, basic_start()).await;
+    turn_running(&harness, &theirs, "turn-named").await;
+    super::threads::end_run(&harness, &first).await;
+    let activity = crate::mcp::activity::McpActivity::new(harness.repositories.database().clone());
+    let active = activity.active_now().await;
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0]["clientId"], first.principal.session_id.as_str());
+    assert_eq!(
+        active[0]["namedClientId"].as_str(),
+        first.named_client_id.as_deref()
+    );
+    harness.shutdown().await;
+}

@@ -397,11 +397,18 @@ delivery worker: the row must fail with one attempt, one launch, and one
 ACP errors share the launch classification for Cursor and Grok. Restart recovery
 of a row left sending must stop after one oversized launch, keep the row
 uncertain across delivery-service restart, and record the same profiler class.
+The ACP regression feeds the real 128 KiB bound through the connection and checks
+the nested Closed detail that the launch classification matches. Two composed
+recovery tests start from a failed oversized launch with a healthy relaunch
+available: Retry must deliver the same row on the second launch, and Dismiss must
+release a later queued message. Both assert exactly two launches and one
+`delivery.failing` finding.
 Run:
 
 ```sh
 cargo test -p bibcode-server --lib oversized_stdout -j 2
 cargo test -p bibcode-server --lib transport_line_too_long -j 2
+cargo test -p bibcode-server --lib an_oversized_stdout_failure -j 2
 cargo test -p bibcode-server --lib mcp_catalogue -j 2
 cargo test -p bibcode-server --lib mcp_status -j 2
 ```
@@ -1029,6 +1036,13 @@ vp test run packages/client-runtime/src/state/pipelines.test.ts
 vp run typecheck
 vp check
 ```
+
+The list's column grid and the page's stage columns respond to container width,
+which happy-dom cannot lay out (its tests pin classes, custom properties and
+persistence). In a packaged build with a project that has pipelines, check the
+list and a pipeline page at about 600, 900 and 1600 px of panel width: columns
+line up across rows with and without Retry or Cancel, a column edge resizes by
+drag and by arrow keys and survives a reload, and stage columns fill the page.
 
 `PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
 must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`

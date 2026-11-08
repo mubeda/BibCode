@@ -184,7 +184,7 @@ async fn run_server(mut config: ServerConfig) -> Result<(), RunError> {
     let open_browser = !config.no_browser;
     // The absolute data root startup will use, not the requested (possibly relative) one.
     config.resolve_data_root().map_err(ServerError::from)?;
-    git::system_line_endings::install_once(&config.state_dir()).await;
+    git::system_config::install_once(&config.state_dir()).await;
     let handle = ServerRuntime::start_standalone(config).await?;
     let http_base_url = format!("http://{}", handle.local_addr());
     let browser_target = handle

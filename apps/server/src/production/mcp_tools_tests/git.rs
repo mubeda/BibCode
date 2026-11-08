@@ -1232,3 +1232,68 @@ async fn the_log_never_sees_a_path_a_commit_message_or_a_branch_name() {
     }
     child.complete();
 }
+
+/// Two local commits on top of the pushed base, so a second undo would succeed and be seen.
+async fn two_local_commits(fixture: &Fixture) {
+    for (file, summary) in [("c.txt", "First"), ("d.txt", "Second")] {
+        fixture.write(file, "x\n");
+        structured(&fixture.call("git_stage", json!({ "paths": [file] })).await);
+        structured(
+            &fixture
+                .call("git_commit", json!({ "summary": summary }))
+                .await,
+        );
+    }
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "3");
+}
+
+fn undo(request_id: &str) -> Value {
+    json!({ "threadId": THREAD, "clientRequestId": request_id })
+}
+
+/// #280: a named agent that restarts and retries its undo with the same id gets the first
+/// run's recorded outcome, and the commit before it stays.
+#[tokio::test]
+async fn a_named_agent_retrying_git_undo_commit_after_a_restart_replays_the_recorded_outcome() {
+    let fixture = fixture().await;
+    two_local_commits(&fixture).await;
+    let harness = &fixture.harness;
+    let first = super::threads::named_agent(harness, "builder", McpAccess::ApprovalRequired).await;
+    let undone = harness
+        .call(&first, "git_undo_commit", undo("undo-1"))
+        .await;
+    assert_eq!(structured(&undone)["summary"], "Second");
+    super::threads::end_run(harness, &first).await;
+
+    let second = super::threads::named_agent(harness, "builder", McpAccess::ApprovalRequired).await;
+    let replayed = harness
+        .call(&second, "git_undo_commit", undo("undo-1"))
+        .await;
+    assert_eq!(structured(&replayed), structured(&undone));
+    assert_eq!(
+        fixture.git(&["rev-list", "--count", "HEAD"]),
+        "2",
+        "undone once"
+    );
+    fixture.harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_live_runs_of_one_named_client_share_one_claim() {
+    let fixture = fixture().await;
+    two_local_commits(&fixture).await;
+    let harness = &fixture.harness;
+    let first = super::threads::named_agent(harness, "builder", McpAccess::ApprovalRequired).await;
+    let second = super::threads::named_agent(harness, "builder", McpAccess::ApprovalRequired).await;
+    let (a, b) = tokio::join!(
+        harness.call(&first, "git_undo_commit", undo("undo-2")),
+        harness.call(&second, "git_undo_commit", undo("undo-2")),
+    );
+    assert_eq!(structured(&a), structured(&b));
+    assert_eq!(
+        fixture.git(&["rev-list", "--count", "HEAD"]),
+        "2",
+        "undone once"
+    );
+    fixture.harness.shutdown().await;
+}

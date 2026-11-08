@@ -84,6 +84,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "webhookBearerToken": true,
             "webhookStatusKinds": true,
             "sideChats": true,
+            "conversationOnlyRewind": true,
             "threadDeleteOnlyIfUnused": true,
         },
     })
@@ -235,7 +236,7 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
-        crate::git::system_line_endings::log_install_warnings();
+        crate::git::system_config::log_install_warnings();
         if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
             tracing::info!(
                 static_dir = %static_dir.display(),
@@ -529,6 +530,19 @@ impl ServerRuntime {
             tokio::spawn(async move {
                 shutdown.cancelled().await;
                 gateway.shutdown().await;
+            });
+        }
+        // The same drain waits for every `/mcp` call in flight, and an outside agent's
+        // `wait_for_thread` holds one for up to 50 s (#303): end those waits when shutdown is
+        // signaled. The quiesce's later call is a no-op.
+        if let Some(mcp_control) = production_runtime
+            .as_ref()
+            .map(|runtime| runtime.mcp_control())
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown.cancelled().await;
+                mcp_control.shutdown();
             });
         }
         #[cfg(test)]

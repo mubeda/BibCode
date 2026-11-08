@@ -874,8 +874,10 @@ async fn request_reverts(engine: &OrchestrationEngine, reverts: &[(&str, i64)]) 
 }
 
 /// Two chats sharing one checkout restore in the order their reverts were asked for. The first
-/// revert's provider reopen is slow, so the second is prepared first; it still restores after
-/// the first, or the first's `git restore` and `git clean` would undo it.
+/// revert's provider reopen is slow; the second is not prepared until the first has restored
+/// (#279: one checkout's restores are prepared one at a time, under its gate), or the first's
+/// `git restore` and `git clean` would undo it. Each chat's last checkpoint matches the files
+/// it finds, so neither sees an outside change.
 #[tokio::test]
 async fn reverts_of_a_shared_checkout_restore_in_request_order() {
     let repository = initialize_repository().await;
@@ -899,8 +901,8 @@ async fn reverts_of_a_shared_checkout_restore_in_request_order() {
             ("t1", 0, None),
             ("t2", 0, None),
             ("t1", 1, Some("one\n")),
+            ("t2", 1, None),
             ("t1", 2, Some("two\n")),
-            ("t2", 1, Some("three\n")),
         ],
     )
     .await;
@@ -908,9 +910,14 @@ async fn reverts_of_a_shared_checkout_restore_in_request_order() {
     // t1 reverts to "one" (its turn 1 of 2); t2 reverts to the baseline (its turn 0 of 1).
     let mut events = engine.subscribe_events();
     request_reverts(&engine, &[("t1", 1), ("t2", 0)]).await;
-    wait_until(|| callbacks.prepared.lock().unwrap().len() == 2).await;
-    // Room for a t2 that does not wait to rewind and restore while t1 is still reopening.
+    wait_until(|| callbacks.prepared.lock().unwrap().len() == 1).await;
+    // Room for a t2 that does not wait to be prepared while t1 is still reopening.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        callbacks.prepared.lock().unwrap().as_slice(),
+        ["t1".to_owned()],
+        "the second revert was prepared before the first restored"
+    );
     callbacks.release_prepare.notify_one();
     for _ in 0..2 {
         wait_for_event(&mut events, "thread.reverted", |_| true).await;
@@ -959,28 +966,27 @@ async fn a_revert_behind_its_own_threads_revert_keeps_its_place_in_request_order
             ("t2", 0, None),
             ("t1", 1, Some("one\n")),
             ("t1", 2, Some("two\n")),
-            ("t1", 3, Some("three\n")),
             ("t2", 1, Some("four\n")),
-            ("t2", 2, Some("five\n")),
+            // Each chat's last checkpoint matches the files it finds when its turn comes, so no
+            // revert sees an outside change (#279).
+            ("t2", 2, Some("baseline\n")),
+            ("t1", 3, Some("three\n")),
         ],
     )
     .await;
 
     // A1: t1 back one turn, to "two". A2: t1 back two more, to its baseline. B1: t2 back one
-    // turn, to "four". A1's provider reopen is slow; B1's is not.
+    // turn, to "four". A1's provider reopen is slow; B1 is not prepared until A2 restored.
     let mut events = engine.subscribe_events();
     request_reverts(&engine, &[("t1", 2), ("t1", 0), ("t2", 1)]).await;
-    wait_until(|| {
-        callbacks
-            .prepared
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|id| id == "t2")
-    })
-    .await;
-    // Room for a B1 that does not wait to rewind and restore while A1 is still reopening.
+    wait_until(|| !callbacks.prepared.lock().unwrap().is_empty()).await;
+    // Room for a B1 that does not wait to be prepared while A1 is still reopening.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        callbacks.prepared.lock().unwrap().as_slice(),
+        ["t1".to_owned()],
+        "a later revert was prepared before the first restored"
+    );
     callbacks.release_prepare.notify_one();
     for _ in 0..3 {
         wait_for_event(&mut events, "thread.reverted", |_| true).await;

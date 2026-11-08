@@ -26,6 +26,7 @@ fn options(root: &Path) -> RelayOptions {
         dev_url: None,
         url: None,
         access: None,
+        client: None,
     }
 }
 
@@ -1670,4 +1671,70 @@ async fn a_client_record_holds_no_credential() {
     connection.revoke().await;
     server.shutdown();
     server.join().await.expect("server joins");
+}
+
+/// #303: a stop ends an outside agent's `wait_for_thread` at once instead of draining the HTTP
+/// call until the wait's own deadline, which held the stop for the rest of the wait.
+#[tokio::test]
+async fn a_stop_ends_a_wait_in_flight_instead_of_draining_it() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let base = format!("http://{}", server.local_addr());
+    let admin = admin_token(root.path(), &base).await;
+    dispatch(
+        &base,
+        &admin,
+        json!({
+            "type": "project.create", "commandId": "project", "projectId": "p1", "title": "P",
+            "workspaceRoot": root.path(), "createdAt": "2026-10-30T00:00:00.000Z",
+        }),
+    )
+    .await;
+    dispatch(
+        &base,
+        &admin,
+        json!({
+            "type": "thread.create", "commandId": "thread", "threadId": "t1", "projectId": "p1",
+            "title": "T", "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "approval-required", "interactionMode": "default", "branch": null,
+            "worktreePath": null, "createdAt": "2026-10-30T00:00:00.000Z",
+        }),
+    )
+    .await;
+    let mut relay = Running::start(options(root.path()));
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "a", "version": "1" },
+        }}))
+        .await;
+    relay.line().await;
+    let baseline = server.event_subscriber_count_for_test().expect("runtime");
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "wait_for_thread", "arguments": { "threadId": "t1", "messageId": "not-yet", "timeoutMs": 50_000 },
+        }}))
+        .await;
+    assert_eq!(receivers_reach(&server, baseline + 1).await, baseline + 1);
+
+    let began = std::time::Instant::now();
+    server.shutdown();
+    let join = tokio::spawn(server.join());
+    // The structural check: the wait ends as stopped, not at its deadline.
+    let answer = relay.line().await;
+    assert_eq!(answer["id"], 2, "{answer}");
+    assert_eq!(answer["result"]["isError"], true, "{answer}");
+    assert!(
+        answer.to_string().contains("McpServerStoppingError"),
+        "the wait must end because the server stops: {answer}"
+    );
+    // Headroom for a loaded host; the bug held the stop for the whole 50 s wait.
+    tokio::time::timeout(
+        Duration::from_secs(10).saturating_sub(began.elapsed()),
+        join,
+    )
+    .await
+    .expect("the stop ends well before the wait's deadline")
+    .expect("join task")
+    .expect("server joins");
+    let _ = relay.close().await;
 }

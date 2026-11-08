@@ -431,8 +431,8 @@ jobs:
       # The release symbol profile from release.yml: unstripped, with line tables, a dSYM on
       # macOS and a GNU build-id on Linux. CRASH_SMOKE_OUT keeps the dump after the test.
       # LTO off and 16 codegen units: the shipped thin-LTO single unit kept macos-26 on one
-      # core until the 90-minute timeout. The planted frames are #[inline(never)], and the
-      # symbol format, debug info, and unwind tables do not depend on either setting.
+      # core. The planted frames are #[inline(never)], and the symbol format, line tables and
+      # unwind tables do not depend on either setting. The step logs its elapsed seconds.
       - name: Crash the smoke binary
         shell: bash
         env:
@@ -445,6 +445,8 @@ jobs:
             Linux) export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1" ;;
             macOS) export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed ;;
           esac
+          start=$SECONDS
+          trap 'echo "::notice title=Crash step::${RUNNER_OS} cargo test took $((SECONDS - start)) s"' EXIT
           node scripts/run-msvc.mjs cargo test -p bibcode-server --test crash_smoke --release
 
       - name: Symbolicate the dump

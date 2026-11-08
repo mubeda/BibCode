@@ -256,6 +256,13 @@ clears it. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
 it.
 
+BiBCode's Git follows your system Git settings for line endings, Git LFS,
+symlinks and long paths, so a new worktree and a reverted turn hold the same
+files your own Git would write, LFS files included. It never opens a sign-in
+window. Fetches, including the one before a worktree that starts from `origin`,
+use the credentials your Git credential helper already stores, and otherwise
+fail with an authentication error; sign in with your own Git, then retry.
+
 Use Add Project to open one existing project folder, clone a Git URL, or create
 a new Git repository. It starts on the environment selected in the rail. On
 macOS and Linux desktop, it shows a **Host** selector when saved remote servers
@@ -1354,7 +1361,14 @@ repositories are supported: on GitHub each row is one workflow run, labeled
 like GitHub's Actions page ("CI #312").
 
 The list opens on the copy BiBCode last stored for that filter, then the
-host's current page. Each row shows the status with its duration and age
+host's current page. A header names the columns (Status, Pipeline, Created by,
+Stages, Actions) and stays in place while the rows scroll. On a wide panel
+drag the edge of the Pipeline, Created by or Stages header (or focus it and use
+the arrow keys, Home and End; double-click resets) to resize it; the widths
+are remembered. The columns button in the header hides Created by, Stages or the duration and age under Status.
+As the panel narrows, Created by hides first, then the stage icons shrink to
+as many as fit followed by a "+3" count (hover it for the names), then Status
+shrinks to its icon. Each row shows the status with its duration and age
 (hover for the exact time), the title, the pipeline number, the branch, tag or
 merge request, the short commit, badges such as **latest** or **merge
 request**, who started it, and one icon per stage (each named, for example
@@ -1391,7 +1405,11 @@ BiBCode), the job count, the duration and the queued time, with Retry, Cancel,
 **Retry failed jobs** (GitHub) and **Open on GitLab**. Each job row has one
 action where it applies: **Run** for a manual job, **Cancel** for one still
 running, **Retry** for a finished one. Below it the stages sit side by side in GitLab's order
-on a wide panel, scrolling sideways, and stacked on a narrow one. Each stage
+on a wide panel, stacked on a narrow one. The columns grow to fill the panel up
+to a maximum width, and the row scrolls sideways only when the stages do not
+fit at 256 px each; drag the edge of the first column, or use the arrow keys,
+Home and End on it, to change that maximum for all columns (double-click
+resets); it is remembered. Each stage
 shows its status, name and job count; each job its status, name and
 duration. A parallel group such as `rspec 3` is one row that expands to its
 jobs, a trigger job links to its **Downstream pipeline**, and a job that
@@ -1475,6 +1493,30 @@ re-reads the steps every 10 seconds while the window is visible (a queued job
 says it hasn't started yet). When the job
 finishes the log loads once; choosing a step then scrolls to where its output
 starts. A log past GitHub's retention says "This log has expired."
+
+### Reverting to a message
+
+**Revert to this message** on a sent message opens a dialog with named choices:
+
+- **Revert files and conversation** puts the checkout's files back to how they
+  were after that turn and removes the newer messages in the thread. It can't be
+  undone.
+- **Rewind conversation only** removes the newer messages and leaves every file
+  as it is. It is offered when the provider can rewind without touching files
+  (Codex and OpenCode 2) and the server supports it.
+- A provider that can't rewind its conversation (Claude, Cursor, Grok) offers
+  **Restore files** instead, and the newer messages stay.
+
+Other chats can work in the same checkout: the thread's panels and side chats,
+other threads on the project's root, and threads of a project on a subfolder of
+the same Git worktree. When they do, the dialog lists the files the revert
+restores and the changes other chats, terminals or editors made since that turn,
+because restoring files undoes those too. If another chat there is running a
+turn or background work, is starting, or BiBCode can't tell whether it is still
+working, the dialog says **Can't restore files right now**, names the chat, and
+offers **Rewind conversation only**. While a revert restores files, messages
+sent to the other chats in that checkout wait and are delivered after it; their
+idle provider sessions are stopped and start again with their next message.
 
 ## Right Panel
 
@@ -2120,6 +2162,20 @@ The Files surface is a full file manager for the active workspace:
 - Git-ignored files and directory roots remain visible with ignored styling,
   and the contents below an ignored directory are loaded eagerly with the rest
   of the tree.
+- A file opens in its own tab beside the Files tab, whether you click it in the
+  tree, in a diff, in a chat link or through a UI suggestion. A file that
+  already has a tab is focused, not duplicated. The Files tab stays in the
+  strip, so one click returns to the full-width tree with its expanded folders,
+  selected row as you left them, even after a visit to another tab such as Diff,
+  and scrolled to the selected row. Clicking the already selected row opens its
+  file again. Each file tab also shows the tree in a sidebar; its **Show/Hide
+  file explorer** switch is remembered for all file tabs. If you close the Files
+  tab, reopen it from the **+** menu or the sidebar.
+- A file tab leads back to the folder. Its path bar shows the project and each
+  folder as buttons; choosing one opens the Files tab with that folder revealed
+  and selected (the project button just opens the tree). **Show in Files** in the
+  file tab's header does the same for the file itself, and reopens the Files tab
+  if it was closed. Both are keyboard operable. The file stays open in its tab.
 - Opening a file shows it in the panel by its extension, before any text read.
   Text and code open in the editor. Images (PNG, JPEG, GIF, WebP, AVIF, ICO)
   show as pictures, with their pixel size and a **Fit** / **Actual size**

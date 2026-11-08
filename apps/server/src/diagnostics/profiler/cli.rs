@@ -296,6 +296,7 @@ fn desktop_thread_dispatch(args: impl IntoIterator<Item = std::ffi::OsString>) -
         crate::config::McpArgs {
             url: None,
             access: None,
+            client: None,
             command: None,
         },
     ) {
