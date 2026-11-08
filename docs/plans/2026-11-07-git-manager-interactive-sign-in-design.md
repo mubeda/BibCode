@@ -205,6 +205,10 @@ What each caller gets:
 UI intents cannot start an operation: `ui.publishIntent` carries a commit message or a
 focus request only (`packages/contracts/src/uiIntents.ts:94`).
 
+The rule follows the RPC method, not the panel. The Source Control panel's push and pull
+(`git.runStackedAction`, `vcs.pull`) stay non-interactive, so a person gets the sign-in
+from the Git Manager's Push and not from the Source Control panel's (question 5).
+
 ### The retry
 
 For an eligible operation, the network command runs as today. If it exits non-zero and its
@@ -287,7 +291,11 @@ state:
 - Text: "Finish signing in with Git Credential Manager in the window or browser page it
   opened. The {operation} continues after you sign in."
 - The spinner and Cancel stay. The state lasts until `finished` or `failed`.
-- A failed retry shows today's failure text. A cancelled one shows today's cancel text.
+- A failed retry shows a failure text the implementer writes under `UI.md`, since "Check
+  the configured credentials" reads oddly right after a sign-in. A cancelled one shows
+  today's cancel text.
+- `StreamSchema` for `gitManager.runOperation` (`rpc/session.rs:511-522`) learns the new
+  tag as a non-terminal event, although `/mcp` never receives it.
 - Nothing changes when the event never arrives, which covers every ineligible caller and
   every helper that is not GCM.
 
@@ -383,6 +391,9 @@ Native checks, added to `docs/testing/windows-desktop.md`, `macos-desktop.md` an
   it falls back to the terminal, `GIT_TERMINAL_PROMPT=0` blocks it, and the retry fails
   with today's error after the banner showed. Test 13.
 - An abandoned sign-in holds the project mutation lock until Cancel or the window closes.
+- When the person's own environment or Git configuration sets `GCM_INTERACTIVE=never` or
+  `credential.interactive=never`, the retry inherits it: the banner shows, then the
+  operation fails as today.
 
 ## Questions only the maintainer can answer
 
@@ -398,3 +409,6 @@ Native checks, added to `docs/testing/windows-desktop.md`, `macos-desktop.md` an
 4. Should a loopback `bibcode serve` used in the person's own browser count as local?
    Recommended: no; the server cannot tell whether it runs in the person's desktop
    session.
+5. Should the Source Control panel's push and pull (`git.runStackedAction`, `vcs.pull`)
+   also get the sign-in? Recommended: not now, for the same reason as question 1; they run
+   on the bounded transfer without Cancel, so they would also need a Cancel first.
