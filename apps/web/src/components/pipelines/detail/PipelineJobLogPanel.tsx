@@ -83,9 +83,9 @@ export function PipelineJobLogPanel({
     // Stacked under the stages the panel opens below the fold: bring it into view, as a
     // deep link does. Side by side it is already visible.
     const stacked = getComputedStyle(panel.parentElement ?? panel).flexDirection === "column";
-    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    if (stacked)
-      panel.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
+    // Instant, like the deep link: a smooth scroll started during mount is cut short by the
+    // layout settling (measured: it never moved), and it needs no reduced-motion branch.
+    if (stacked) panel.scrollIntoView({ block: "start", behavior: "instant" });
     // Never take focus from a field the reader is typing in (a filter, say).
     const active = document.activeElement;
     const typing =
