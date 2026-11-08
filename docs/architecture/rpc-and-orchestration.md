@@ -5187,8 +5187,8 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   clone, publish, lookup, and discovery (`vcs.clone`,
   `sourceControl.cloneRepository`, `publishRepository`, and `lookupRepository`,
   and `server.discoverSourceControl`); `vcs.pull` and `vcs.generateCommitMessage`;
-  `git.signIn`, which waits on a person for up to 10 minutes and so can still raise
-  `rpc.hang` after 300 s;
+  `git.signIn`, which waits on a person for up to 10 minutes and has its own 660 s
+  hang budget;
   `gitManager.commit`, `gitManager.getRemoteTags`, and
   `gitManager.listPullRequests`; `git.resolvePullRequest` and
   `git.preparePullRequestThread`; the pull request reads and actions
@@ -5204,7 +5204,7 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   They still emit `rpc.timing`, but never raise `rpc.slow` or count toward
   saturation.
 - **Hangs.** Each 5 s tick checks the unary requests still in flight. One past
-  its budget, 10 s or 300 s for a long-running method, raises one `rpc.hang`
+  its budget, 10 s, 300 s for a long-running method or 660 s for `git.signIn`, raises one `rpc.hang`
   finding (error) before it finishes. Streams are log-only and never hang-checked,
   because an event stream may wait any time for its first item.
 - **Saturation.** When five or more distinct methods are slow in the same tick,
