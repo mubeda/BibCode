@@ -133,8 +133,10 @@ pub(crate) fn inherited_environment() -> Vec<(OsString, OsString)> {
         .filter(|(name, _)| name.to_str().is_some_and(is_inherited))
         .collect()
 }
-/// The null device, for an empty global configuration and an empty hooks folder.
-const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+/// The null device, for an empty global configuration and an empty hooks folder. Git for
+/// Windows accepts only lowercase `nul` (or `/dev/null`) as `GIT_CONFIG_GLOBAL`; `NUL` fails
+/// every command, even `git --version` (#264).
+const NULL_DEVICE: &str = if cfg!(windows) { "nul" } else { "/dev/null" };
 const OPERATION: &str = "GitVcsDriver.clone";
 
 const NOT_HTTPS: &str = "BiBCode clones for an agent from https:// URLs, such as https://github.com/owner/repo, and from ssh:// URLs when the agent may use terminals. git://, file://, local paths and other transports are refused; clone it in BiBCode yourself to use them.";
@@ -1095,6 +1097,22 @@ pub(crate) mod tests {
                 .push(address.parse().expect("an address"));
         }
         Arc::new(MapResolver(map))
+    }
+
+    /// #264: the isolated environment is one this host's Git starts under. Git for Windows
+    /// refuses `GIT_CONFIG_GLOBAL=NUL` for every command, so agent clones failed there.
+    #[test]
+    fn the_isolated_environment_runs_this_hosts_git() {
+        let output = std::process::Command::new("git")
+            .arg("--version")
+            .envs(ClonePolicy::default().environment("https"))
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git --version failed under the clone environment: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn leaf(name: &str) -> CloneLeaf {
