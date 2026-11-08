@@ -404,7 +404,8 @@ Both are designed in [Revision 2](#revision-2-idle-rows-and-take-over-across-run
 
 ## Revision 2: idle rows and Take over across runs (#324)
 
-Status: proposed 2026-11-07 (lane L16), awaiting review. Verified on the integration branch
+Status: Approved 2026-11-07 (the maintainer pre-approval; reviewed by Codex and advisor). The maintainer's
+answers: Q1 both surfaces, Q2 to Q5 as recommended, migration 71. Verified on the integration branch
 at `85fcbe4b3`, which contains this note's implementation and #294.
 
 Revision 2 replaces decisions 7 and 8. Everything else in this note stands.
@@ -535,6 +536,17 @@ to the cache publication; `set_mcp_access` holds it from its transaction to its 
 Both are rare person or sign-in actions. Revoke keeps today's watcher convergence, because a
 stale cached revoked session already fails authentication through the store fence.
 
+**Refresh.** `refresh_session_from_repository` (`service.rs:1339-1385`) reads the session
+from SQLite before it takes the state lock, then replaces the cached record. A refresh that
+read a writable level, then paused while Take over committed and updated the cache, would
+put the writable level back, and `authenticate` builds the MCP ceiling from that cache
+(`mcp/control.rs:732-748`). This is true for unnamed sessions today too. The refresh reads
+`authority_generation` before its SQLite read and publishes only if it is unchanged under
+the lock; otherwise it reads again. Every local mutation (Take over, Hand back, revoke,
+issuance) bumps the generation under the lock, so this covers all of them without making
+authentication wait on `mcp_access_order`. Test:
+`a_refresh_that_read_before_take_over_does_not_restore_the_writable_level`.
+
 ### Contracts (`packages/contracts`)
 
 - `auth.ts` `AuthAccessSnapshot.mcpNamedClients: Schema.optionalKey(Schema.Array(
@@ -590,6 +602,7 @@ stale cached revoked session already fails authentication through the store fenc
 | Hand back releases the identity                    | `hand_back_on_one_run_releases_the_identity_and_every_live_run`                                    | same                                      |
 | Read-only run of a taken-over identity             | `a_read_only_run_of_a_taken_over_identity_has_no_hand_back`                                        | same                                      |
 | Race with a new run                                | `take_over_while_a_named_run_publishes_leaves_the_cache_read_only` (`after_session_insert` hold)   | same                                      |
+| Refresh racing Take over                           | `a_refresh_that_read_before_take_over_does_not_restore_the_writable_level` (hold after the refresh's read) | same                                      |
 | Restart                                            | `a_taken_over_identity_survives_a_restart`                                                         | same                                      |
 | Agent sees it                                      | `a_named_agent_restarted_after_take_over_is_refused_a_mutation`                                    | `production/mcp_tools_tests/attribution.rs` |
 | Unnamed unchanged                                  | keep the existing Take over and Hand back tests                                                    | `auth/service.rs`, `oauth_flow_tests.rs`  |
@@ -618,7 +631,13 @@ Revoke still runs in `/api/auth/clients/revoke` and Take over in `/api/auth/clie
 The existing `tracing::info!` for an ended identity covers the idle path; Take over of an
 identity adds one `tracing::info!` with the named id and session count, never the name.
 
-### Open questions for review
+### Review findings and resolutions (Revision 2)
+
+| #   | Finding | Verified | Resolution |
+| --- | ------- | -------- | ---------- |
+| 1   | Codex P2: `refresh_session_from_repository` can restore a writable level over Take over. | Confirmed: SQLite read at `service.rs:1347`, unlocked; cache replaced at `:1378`. | **Fixed in design.** Generation check and re-read; see **Refresh** above. |
+
+### Open questions for review (answered)
 
 1. **Q1. Surfaces.** Idle rows go in both Authorized clients (`ShareTab.tsx`, the issue's
    wording) and Agents (`McpAgentsPanel.tsx`). Recommended: both. `ShareTab.tsx` and
