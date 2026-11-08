@@ -39,7 +39,9 @@ describe("/settings/diagnostics", () => {
 
     renderToStaticMarkup(<Component />);
 
-    expect(captured.props).toMatchObject({ profilerEnvironmentId: EnvironmentId.make("workstation") });
+    expect(captured.props).toMatchObject({
+      profilerEnvironmentId: EnvironmentId.make("workstation"),
+    });
     const change = captured.props!.onProfilerEnvironmentChange as (
       environmentId: EnvironmentId | null,
     ) => void;
