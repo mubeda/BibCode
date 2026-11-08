@@ -725,7 +725,7 @@ describe("RemoteDirectoryPickerDialog runtime behavior", () => {
         breadcrumbs: [
           { name: "C:\\", fullPath: "C:\\" },
           { name: "Users", fullPath: "C:\\Users" },
-          { name: "test-user", fullPath: "C:\\Users\\user" },
+          { name: "user", fullPath: "C:\\Users\\user" },
         ],
         entries: [],
       },

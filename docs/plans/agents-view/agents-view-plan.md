@@ -884,7 +884,7 @@ and residual risk (spec §6).
   `setAgentsGroupExpanded` / `resolveAgentsGroupExpanded` (Tasks 4, 5),
   `useAgentsUnread` / `detectUnreadTransitions` (Task 6), `AgentsSection` (Tasks 5–7).
 - Line numbers cited (`Sidebar.tsx:3864`, `orchestration_rpc.rs:1011` etc.) are
-  anchors verified on 2026-08-31 against `mubeda/develop-3`; re-locate by symbol name
+  anchors verified on 2026-08-31 against `test-user/develop-3`; re-locate by symbol name
   if the file has drifted.
 
 ---

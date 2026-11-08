@@ -345,7 +345,7 @@ describe("RemoteDirectoryPickerDialog", () => {
       breadcrumbs: [
         { name: "C:\\", fullPath: "C:\\" },
         { name: "Users", fullPath: "C:\\Users" },
-        { name: "test-user", fullPath: "C:\\Users\\user" },
+        { name: "user", fullPath: "C:\\Users\\user" },
       ],
       entries: [{ name: "Projects", fullPath: "C:\\Users\\user\\Projects" }],
     };
@@ -354,7 +354,7 @@ describe("RemoteDirectoryPickerDialog", () => {
 
     expect(markup).toContain("data-directory-breadcrumb-separator");
     expect(button("Open C:\\")["aria-current"]).toBeUndefined();
-    expect(button("Open test-user")["aria-current"]).toBe("page");
+    expect(button("Open user")["aria-current"]).toBe("page");
     expect(button("Open Projects").className).toContain("justify-start");
     expect(markup).toContain("data-directory-folder-icon");
   });

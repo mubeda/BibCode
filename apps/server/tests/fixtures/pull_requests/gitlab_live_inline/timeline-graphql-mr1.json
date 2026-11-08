@@ -30,7 +30,7 @@
                     "createdAt": "2026-09-21T12:37:15Z",
                     "updatedAt": "2026-09-21T12:37:15Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -57,14 +57,14 @@
                 "nodes": [
                   {
                     "id": "gid://gitlab/Note/4034",
-                    "body": "assigned to @mubeda",
+                    "body": "assigned to @test-user",
                     "system": true,
                     "resolvable": false,
                     "resolved": false,
                     "createdAt": "2026-09-21T12:41:01Z",
                     "updatedAt": "2026-09-21T12:41:01Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -98,7 +98,7 @@
                     "createdAt": "2026-09-21T12:41:53Z",
                     "updatedAt": "2026-09-21T12:41:53Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -132,7 +132,7 @@
                     "createdAt": "2026-09-21T12:42:19Z",
                     "updatedAt": "2026-09-21T12:42:19Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -166,7 +166,7 @@
                     "createdAt": "2026-09-21T12:42:40Z",
                     "updatedAt": "2026-09-21T12:42:40Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -200,7 +200,7 @@
                     "createdAt": "2026-09-21T12:43:00Z",
                     "updatedAt": "2026-09-21T12:43:00Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -234,7 +234,7 @@
                     "createdAt": "2026-09-21T12:43:26Z",
                     "updatedAt": "2026-09-21T12:43:26Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -268,7 +268,7 @@
                     "createdAt": "2026-09-21T12:44:22Z",
                     "updatedAt": "2026-09-21T12:44:22Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -302,7 +302,7 @@
                     "createdAt": "2026-09-21T12:46:26Z",
                     "updatedAt": "2026-09-21T12:46:26Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": null,
@@ -336,7 +336,7 @@
                     "createdAt": "2026-09-21T12:47:08Z",
                     "updatedAt": "2026-09-21T12:47:08Z",
                     "author": {
-                      "username": "mubeda",
+                      "username": "test-user",
                       "name": "Test User"
                     },
                     "position": {

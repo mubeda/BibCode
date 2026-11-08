@@ -78,7 +78,7 @@ describe("PullRequestsTimelineItem", () => {
       </PullRequestsNavigationContext>,
     );
     expect(html).toContain(text);
-    expect(html).toContain("mubeda");
+    expect(html).toContain("test-user");
     expect(html).not.toContain("<img");
   });
   it("shows edited comments and read-only reactions", () => {

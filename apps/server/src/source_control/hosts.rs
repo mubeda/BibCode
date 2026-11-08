@@ -184,10 +184,13 @@ mod tests {
     #[test]
     fn provider_hosts_classify_named_and_recorded_hosts_with_their_own_base_url() {
         let hosts = ProviderHosts::default();
-        let workstation = "https://code.example.test/example-group/sample-project.git";
-        assert_eq!(hosts.identify(workstation), IdentifiedProvider::Unknown);
+        let self_hosted = "https://code.example.test/example-group/sample-project.git";
+        assert_eq!(hosts.identify(self_hosted), IdentifiedProvider::Unknown);
         hosts.record("Code.Example.Test", ProviderKind::Gitlab);
-        for remote in [workstation, "git@code.example.test:example-group/sample-project.git"] {
+        for remote in [
+            self_hosted,
+            "git@code.example.test:example-group/sample-project.git",
+        ] {
             let IdentifiedProvider::Recorded(info) = hosts.identify(remote) else {
                 panic!("expected recorded host: {remote}");
             };

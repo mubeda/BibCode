@@ -6,7 +6,7 @@
 
 - Repository: BiBCode (`https://github.com/mubeda/BibCode.git`)
 - Remote: `origin`; requested publication branch `develop`
-- Branch or requested revision: local `mubeda/develop`; remediation range
+- Branch or requested revision: local `test-user/develop`; remediation range
   `0e4767b5e8678a756377bb7f0071f98049e88dc0..65af2c1084e3c8f87eb0269cdac18ba3f056de3c`
 - Executable HEAD: `d0acdfb841112b350b438eaa2b1cd34a21b6ae97`
   supplied the server, desktop, web, contracts, and client-runtime source used

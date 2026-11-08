@@ -150,7 +150,7 @@ describe("ProfilerRecordingSegment", () => {
 
     expect(h.navigate).toHaveBeenCalledWith({
       to: "/settings/diagnostics",
-      search: { environment: "env-Luna" },
+      search: { environment: "env-Workstation" },
     });
   });
 
