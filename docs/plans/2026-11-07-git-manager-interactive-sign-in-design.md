@@ -1,6 +1,7 @@
 # Git Manager Sign-In on a Local Desktop
 
-Status: Proposed — awaiting coordinator confirmation.
+Status: Approved 2026-11-07 (Mauro pre-approval; Codex reviewed revisions 0 and 1,
+advisor reviewed revision 2).
 
 Issue #325, a follow-up of #283
 ([`2026-11-07-checkpoint-git-isolation-design.md`](./2026-11-07-checkpoint-git-isolation-design.md),
@@ -312,12 +313,14 @@ destination this way:
    edit, does not apply. Only the person's global configuration and the curated system
    file from #283 do.
 2. **No rewrite may match.** In that repository, right before the probe, BiBCode reads
-   `git config --includes -z --get-regexp '^url\..*\.(insteadof|pushinsteadof)$'`. If any
-   value is a prefix of the destination, the sign-in is refused with
+   `git config --includes -z --get-regexp '^url\..*\.(insteadof|pushinsteadof)$'`. If the
+   destination starts with any value, the sign-in is refused with
    `GitSignInRewrittenError`: "Git rewrites this remote's address
    (`url.<base>.insteadOf`), so BiBCode cannot show where the sign-in goes. Sign in with
    your own Git." With no matching prefix, `alias_url` returns nothing and Git uses the
-   destination unchanged.
+   destination unchanged. `get-url` already applied the first rewrite, so a match here
+   means a second hop, which is the case refused. The probe's system layer is the #283
+   curated file, which carries no `url.*` keys.
 3. **HTTPS only, enforced by Git.** The probe sets `GIT_ALLOW_PROTOCOL=https`, which Git
    checks against the transport of the final URL
    ([`transport.c` L1114-1131](https://github.com/git/git/blob/v2.51.0/transport.c#L1114-L1131)).
@@ -328,7 +331,8 @@ destination this way:
 What stays open: the person's global configuration (or a file it includes) could change
 between step 2 and the probe. Whoever can write that file can already set
 `credential.helper` to any program, which every BiBCode Git call then runs, so the window
-gives them nothing new.
+gives them nothing new. A rule added in that window still cannot change the scheme:
+`GIT_ALLOW_PROTOCOL=https` fails a rewrite to `ssh://` or `file://` at the transport.
 
 Cost: repository-level credential settings (`credential.useHttpPath`,
 `credential.<url>.*` in the checkout's `.git/config`) do not apply to the sign-in. If they
@@ -650,7 +654,8 @@ Native checks, added to `docs/testing/windows-desktop.md`, `macos-desktop.md` an
     authentication error as today.
 18. Confirm on each OS that GCM's line reaches Git's stderr at column 0 as "fatal: Cannot
     prompt because user interactivity has been disabled.", and that a successful
-    `ls-remote` and `push --dry-run` make Git store the credential. If either differs, the
+    `ls-remote` and the dry-run delete make Git store the credential on GitHub, GitLab and
+    Azure DevOps. If either differs, the
     detection string or the probe changes with it.
 
 ## Documents changed at implementation
@@ -677,6 +682,11 @@ Native checks, added to `docs/testing/windows-desktop.md`, `macos-desktop.md` an
 - A credential that reads but cannot write (a fetch sign-in followed by a push) makes the
   push fail; the push then offers its own sign-in, whose dry run asks for write access.
 - Cancel cannot take back a sign-in the person already finished.
+- A server that serves the receive-pack advertisement anonymously and authenticates only
+  the pushed data lets the dry-run delete answer `signedIn` without storing anything; the
+  resumed push then reports `sign-in-required` again and the panel shows "Signed in, but
+  Git Credential Manager still asked to sign in." Test 18 checks GitHub, GitLab and Azure
+  DevOps.
 
 ## Review findings and resolutions
 
