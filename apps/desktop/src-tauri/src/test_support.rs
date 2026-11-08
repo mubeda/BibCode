@@ -115,7 +115,8 @@ pub(crate) fn write_executable_fixture(path: &std::path::Path, contents: &str, m
 /// ephemeral range, and portpicker's 15000-25000 is where this suite's own
 /// fixtures bind. Walking 25000-32767 from a per-process offset stays below
 /// the ephemeral ranges (32768 on Linux, 49152 on macOS and Windows) and above
-/// portpicker. Each probe claims a candidate from a process-wide cursor,
+/// portpicker, and `claim_test_port` keeps other test processes off a port
+/// this one returned. Each probe claims a candidate from a process-wide cursor,
 /// offset by the process id. A port probed once in this process is not probed
 /// again until the cursor wraps. Each call tries at most PORT_COUNT candidates.
 pub(crate) fn free_test_port() -> u16 {
@@ -128,8 +129,66 @@ pub(crate) fn free_test_port() -> u16 {
             let offset = NEXT_OFFSET.fetch_add(1, Ordering::Relaxed) % PORT_COUNT;
             25_000 + ((process_offset + offset) % PORT_COUNT) as u16
         })
-        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .find(|port| claim_test_port(*port))
         .expect("a free port from 25000-32767")
+}
+
+/// Claims `port` for this process if it is free and no other test process
+/// claimed it. The TCP probe alone frees the port again, and the caller binds
+/// it later: an isolated scenario's walk starts a few pids past its parent's
+/// and siblings', so their walks reach the same ports, and one of them could
+/// bind (or just probe) it in between (#338). A UDP socket on the same port
+/// number, held until this process exits, marks the claim for every walker
+/// without touching the TCP port; std binds UDP without SO_REUSEADDR.
+fn claim_test_port(port: u16) -> bool {
+    static CLAIMS: std::sync::Mutex<Vec<std::net::UdpSocket>> = std::sync::Mutex::new(Vec::new());
+
+    let Ok(claim) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+        return false;
+    };
+    let free = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+    if free {
+        CLAIMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(claim);
+    }
+    free
+}
+
+const PORT_CLAIM_ENV: &str = "BIBCODE_TEST_PORT_CLAIM";
+const PORT_CLAIM_TEST: &str = "test_support::tests::claims_a_port_from_another_process";
+
+/// Starts another test process that walks onto `port` the way a parallel test
+/// process's `free_test_port` can, binding it if that walk would return it.
+/// Returns the process and whether it holds the port; it holds it until killed.
+pub(crate) fn claim_port_from_another_process(port: u16) -> (std::process::Child, bool) {
+    use std::io::BufRead as _;
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            PORT_CLAIM_TEST,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PORT_CLAIM_ENV, port.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the port claimer");
+    let stdout = child.stdout.take().expect("port claimer stdout");
+    let held = std::io::BufReader::new(stdout)
+        .lines()
+        .map(|line| line.expect("port claimer output"))
+        // libtest prints "test <name> ... " on the same line first.
+        .find_map(|line| match line.rsplit("port-claim: ").next() {
+            Some("held") => Some(true),
+            Some("skipped") => Some(false),
+            _ => None,
+        })
+        .expect("the port claimer reports its outcome");
+    (child, held)
 }
 
 /// Runs test `name` again in a process of its own, where no other test runs,
@@ -217,6 +276,23 @@ mod tests {
         assert!((25_000..=32_767).contains(&second));
         assert_ne!(first, second);
         child.complete();
+    }
+
+    /// The process behind `claim_port_from_another_process`; a no-op otherwise.
+    #[test]
+    fn claims_a_port_from_another_process() {
+        let Ok(port) = std::env::var(super::PORT_CLAIM_ENV) else {
+            return;
+        };
+        let port = port.parse().expect("a port to claim");
+        if !super::claim_test_port(port) {
+            println!("port-claim: skipped");
+            return;
+        }
+        let _held = std::net::TcpListener::bind(("127.0.0.1", port)).expect("hold the port");
+        println!("port-claim: held");
+        // Hold it until the starting test closes stdin or kills this process.
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new()).ok();
     }
 
     #[test]
