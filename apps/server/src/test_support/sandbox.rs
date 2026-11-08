@@ -132,56 +132,19 @@ impl TestSandbox {
         command
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .envs(environment.iter().map(|(name, value)| (*name, *value)))
-            .env("BIBCODE_TEST_ISOLATED_CASE", case)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("BIBCODE_TEST_ISOLATED_CASE", case);
         for name in removed {
             command.env_remove(name);
         }
-        let mut child = command.spawn().expect("run isolated fixture case");
-        let mut stdout = child.stdout.take().expect("isolated child stdout");
-        let mut stderr = child.stderr.take().expect("isolated child stderr");
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout
-                .read_to_end(&mut bytes)
-                .expect("read isolated child stdout");
-            bytes
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr
-                .read_to_end(&mut bytes)
-                .expect("read isolated child stderr");
-            bytes
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let (status, timed_out) = loop {
-            if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
-                break (status, false);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                break (
-                    child.wait().expect("reap timed-out isolated fixture case"),
-                    true,
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        let stdout = stdout_reader.join().expect("join isolated stdout reader");
-        let stderr = stderr_reader.join().expect("join isolated stderr reader");
+        let (output, timed_out) =
+            run_until_deadline(command, ISOLATED_CASE_START_BOUND, ISOLATED_CASE_RUN_BOUND);
         assert!(
             !timed_out,
             "isolated fixture case timed out:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        Output {
-            status,
-            stdout,
-            stderr,
-        }
+        output
     }
 
     pub(crate) fn is_isolated_case(case: &str, test_name: &str) -> bool {
@@ -257,6 +220,179 @@ impl TestSandbox {
 
     pub(crate) fn maximum_active_fixtures(&self) -> usize {
         self.maximum.load(Ordering::Acquire)
+    }
+}
+
+const ISOLATED_CASE_START_BOUND: Duration = Duration::from_secs(60);
+const ISOLATED_CASE_RUN_BOUND: Duration = Duration::from_secs(10);
+const ISOLATED_CASE_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Runs `command` with piped output. It gets `run_bound` from its first stdout byte (libtest
+/// prints its header before any test runs) and is killed at that point, or at `start_bound`
+/// if it never writes. A loaded macOS host can hold a child back for tens of seconds before
+/// it runs at all (#335), so the run bound does not count that wait. `true` when killed.
+///
+/// A case that outlives SIGKILL, or whose output a descendant keeps open after it exits,
+/// panics after [`ISOLATED_CASE_EXIT_GRACE`] instead of hanging the suite.
+fn run_until_deadline(
+    mut command: Command,
+    start_bound: Duration,
+    run_bound: Duration,
+) -> (Output, bool) {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run isolated fixture case");
+    let stdout_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (started_sender, started) = std::sync::mpsc::channel();
+    let (closed_sender, closed) = std::sync::mpsc::channel();
+    for (mut stream, bytes, mut started) in [
+        (
+            Box::new(child.stdout.take().expect("isolated child stdout")) as Box<dyn Read + Send>,
+            stdout_bytes.clone(),
+            Some(started_sender),
+        ),
+        (
+            Box::new(child.stderr.take().expect("isolated child stderr")),
+            stderr_bytes.clone(),
+            None,
+        ),
+    ] {
+        let closed = closed_sender.clone();
+        // Detached: a reader blocked on a pipe a descendant holds must not block the caller.
+        std::thread::spawn(move || {
+            let mut chunk = [0; 4096];
+            while let Ok(read) = stream.read(&mut chunk)
+                && read > 0
+            {
+                if let Some(started) = started.take() {
+                    let _ = started.send(Instant::now());
+                }
+                bytes
+                    .lock()
+                    .expect("isolated output buffer")
+                    .extend_from_slice(&chunk[..read]);
+            }
+            let _ = closed.send(());
+        });
+    }
+    let output_so_far = || {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout_bytes.lock().expect("isolated stdout")),
+            String::from_utf8_lossy(&stderr_bytes.lock().expect("isolated stderr"))
+        )
+    };
+    let mut deadline = Instant::now() + start_bound;
+    let mut waiting_for_start = true;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
+            break (status, false);
+        }
+        if waiting_for_start && let Ok(started_at) = started.try_recv() {
+            waiting_for_start = false;
+            deadline = started_at + run_bound;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + ISOLATED_CASE_EXIT_GRACE;
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll killed isolated case") {
+                    break status;
+                }
+                // A launched-suspended process can outlive SIGKILL (#335).
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "isolated fixture case {} did not exit after SIGKILL:\n{}",
+                    child.id(),
+                    output_so_far()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            break (status, true);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let drain_deadline = Instant::now() + ISOLATED_CASE_EXIT_GRACE;
+    for _ in 0..2 {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            closed.recv_timeout(remaining).is_ok(),
+            "isolated fixture case exited, but a process it started still holds its output open:\n{}",
+            output_so_far()
+        );
+    }
+    let take = |bytes: &Arc<std::sync::Mutex<Vec<u8>>>| {
+        std::mem::take(&mut *bytes.lock().expect("isolated output buffer"))
+    };
+    (
+        Output {
+            status,
+            stdout: take(&stdout_bytes),
+            stderr: take(&stderr_bytes),
+        },
+        timed_out,
+    )
+}
+
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use std::{process::Command, time::Duration};
+
+    use super::run_until_deadline;
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn a_case_that_starts_late_gets_its_whole_run_bound() {
+        // A loaded host can hold a child back before it runs at all (#335). The child writes
+        // nothing for at least 8 s, past a 5 s run bound counted from the spawn, and then
+        // exits right after its first byte. Real time only ever lengthens the silence.
+        let (output, timed_out) = run_until_deadline(
+            shell("sleep 8; echo started"),
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        assert!(!timed_out, "a late start is not a hang: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "started\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "still holds its output open")]
+    fn a_descendant_holding_the_output_open_fails_the_case_instead_of_hanging() {
+        run_until_deadline(
+            shell("sleep 30 & echo started"),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+    }
+
+    #[test]
+    fn a_case_that_hangs_after_starting_is_killed_at_its_run_bound() {
+        let (output, timed_out) = run_until_deadline(
+            shell("echo started; exec sleep 30"),
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+        );
+        assert!(timed_out);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "started\n");
+    }
+
+    #[test]
+    fn a_case_that_never_starts_is_killed_at_its_start_bound() {
+        let (output, timed_out) = run_until_deadline(
+            shell("exec sleep 30"),
+            Duration::from_millis(500),
+            Duration::from_secs(30),
+        );
+        assert!(timed_out);
+        assert!(output.stdout.is_empty());
     }
 }
 
