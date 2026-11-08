@@ -215,9 +215,9 @@ export default function SourceControlPanel({
   const signIn = useGitSignInFlow(environmentId);
   const offerSignIn = signIn.offer;
   const runPullRef = useRef<((resume?: VcsPullInput) => Promise<void>) | null>(null);
-  const runResumedPushRef = useRef<((resume: GitRunStackedActionInput) => Promise<void>) | null>(
-    null,
-  );
+  const runResumedPushRef = useRef<
+    ((resume: GitRunStackedActionInput, onPushed?: () => void) => Promise<void>) | null
+  >(null);
   const capabilities = useServerConfigs().get(environmentId)?.environment.capabilities;
   const pullRequestBranchSelection = capabilities?.gitPullRequestBranchSelection === true;
   const mergeAvailable =
@@ -523,10 +523,15 @@ export default function SourceControlPanel({
         const offer = push.failure()?.signIn;
         if (offer !== undefined && gitCwd !== null) {
           toastManager.close(toastId);
+          // Create MR/PR still owes its review dialog once the resumed push publishes the branch.
+          const onPushed =
+            action === "create_pr"
+              ? () => setPendingPullRequest({ scope: { environmentId, cwd: gitCwd } })
+              : undefined;
           offerSignIn({
             offer,
             cwd: gitCwd,
-            onSignedIn: () => void runResumedPushRef.current?.(offer.resume),
+            onSignedIn: () => void runResumedPushRef.current?.(offer.resume, onPushed),
             onEnded: (_code, message) =>
               toastManager.add(
                 stackedThreadToast({
@@ -588,7 +593,7 @@ export default function SourceControlPanel({
   // The push a sign-in resumed (#325), sent as the server named it: no second commit, bound
   // to the approved destination. A second refusal is not offered again.
   const runResumedPush = useCallback(
-    async (resume: GitRunStackedActionInput) => {
+    async (resume: GitRunStackedActionInput, onPushed?: () => void) => {
       const toastId = toastManager.add({
         type: "loading",
         title: "Pushing…",
@@ -634,6 +639,7 @@ export default function SourceControlPanel({
         timeout: 0,
         data: { ...threadToastData, dismissAfterVisibleMs: 10_000 },
       });
+      onPushed?.();
     },
     [reloadCommits, runAction, threadToastData],
   );
