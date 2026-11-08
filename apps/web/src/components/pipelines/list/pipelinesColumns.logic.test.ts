@@ -7,11 +7,11 @@ describe("pipelinesGridTemplates", () => {
   it("folds columns in a fixed order as the panel narrows", () => {
     const templates = pipelinesGridTemplates(widths, new Set());
     expect(templates.full).toBe(
-      "144px minmax(240px,480px) minmax(96px,160px) minmax(72px,160px) 104px",
+      "168px minmax(240px,480px) minmax(96px,160px) minmax(72px,160px) 104px",
     );
     // Created by goes first, then Stages folds short, then Status folds to its icon.
-    expect(templates.medium).toBe("144px minmax(0,1fr) 160px 104px");
-    expect(templates.compact).toBe("144px minmax(0,1fr) 64px 104px");
+    expect(templates.medium).toBe("168px minmax(0,1fr) 160px 104px");
+    expect(templates.compact).toBe("168px minmax(0,1fr) 64px 104px");
     expect(templates.narrow).toBe("24px minmax(0,1fr) 64px 104px");
   });
 
@@ -19,9 +19,9 @@ describe("pipelinesGridTemplates", () => {
     const templates = pipelinesGridTemplates(widths, new Set(["author", "stages"] as const));
     expect(templates).toEqual({
       narrow: "24px minmax(0,1fr) 104px",
-      compact: "144px minmax(0,1fr) 104px",
-      medium: "144px minmax(0,1fr) 104px",
-      full: "144px minmax(240px,480px) 104px",
+      compact: "168px minmax(0,1fr) 104px",
+      medium: "168px minmax(0,1fr) 104px",
+      full: "168px minmax(240px,480px) 104px",
     });
   });
 

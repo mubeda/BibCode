@@ -1003,6 +1003,67 @@ describe("PipelinesDetailView job log panel", () => {
     expect(panel()!.className).toContain("h-[70vh]");
   });
 
+  describe("when the log opens stacked under the stages", () => {
+    const scrolled = vi.fn();
+    const stack = () => {
+      // No stylesheet runs here, so state the narrow layout the container query gives.
+      container
+        .querySelector<HTMLElement>(".\\@container\\/pipeline")!
+        .firstElementChild!.setAttribute("style", "flex-direction: column");
+    };
+    beforeEach(() => {
+      scrolled.mockClear();
+      Element.prototype.scrollIntoView = function (this: Element, ...args: unknown[]) {
+        scrolled(this.tagName, ...args);
+      } as typeof Element.prototype.scrollIntoView;
+    });
+
+    it("scrolls the panel into view and focuses it", async () => {
+      h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+      await render({ wrap: withJobPages });
+      stack();
+      click(jobLink());
+      await settle();
+      expect(scrolled).toHaveBeenCalledWith("ASIDE", { block: "start", behavior: "smooth" });
+      expect(document.activeElement).toBe(panel()!.querySelector("h2"));
+    });
+
+    it("scrolls without animation when the reader prefers reduced motion", async () => {
+      h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+      vi.stubGlobal("matchMedia", () => ({ matches: true }));
+      try {
+        await render({ wrap: withJobPages });
+        stack();
+        click(jobLink());
+        await settle();
+        expect(scrolled).toHaveBeenCalledWith("ASIDE", { block: "start", behavior: "auto" });
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("leaves focus in a field the reader is typing in", async () => {
+      h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+      await render({ wrap: withJobPages });
+      stack();
+      const field = document.createElement("input");
+      container.append(field);
+      field.focus();
+      click(jobLink());
+      await settle();
+      expect(scrolled).toHaveBeenCalled();
+      expect(document.activeElement).toBe(field);
+    });
+
+    it("does not scroll when the log sits beside the stages", async () => {
+      h.job = pipelineJobDetail({ job: { ...pipelineJob } });
+      await render({ wrap: withJobPages });
+      click(jobLink());
+      await settle();
+      expect(scrolled).not.toHaveBeenCalled();
+    });
+  });
+
   it("closes the log with Close or Escape and gives focus back to the job's row", async () => {
     h.job = pipelineJobDetail({ job: { ...pipelineJob } });
     await render({ wrap: withJobPages });

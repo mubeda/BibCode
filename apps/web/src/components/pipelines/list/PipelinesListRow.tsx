@@ -180,7 +180,9 @@ export const PipelinesListRow = memo(function PipelinesListRow({
         <span className="hidden flex-col gap-0.5 @min-[720px]:flex">
           <span className="flex items-center gap-1.5 text-sm">
             <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
-            <span className="truncate">{status}</span>
+            <span className="truncate" title={status}>
+              {status}
+            </span>
           </span>
           {timing ? (
             <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
