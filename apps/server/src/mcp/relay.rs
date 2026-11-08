@@ -46,6 +46,11 @@ pub const DISABLED_EXIT_MESSAGE: &str = "The MCP server is turned off for this e
 pub const NO_SERVER_MESSAGE: &str =
     "No BiBCode server with MCP support is running on this data root. Start or update BiBCode.";
 pub const REVOKED_MESSAGE: &str = "BiBCode ended this MCP connection's access. Restart the MCP server in your agent to sign in again.";
+/// A store from before migration 70 has no named clients (#280).
+pub const NAMED_CLIENTS_UNKNOWN_MESSAGE: &str =
+    "Update BiBCode to use --client: this server does not know named clients yet.";
+pub const CLIENT_NAME_MESSAGE: &str =
+    "Choose a client name of 1 to 60 characters with no control characters.";
 /// `bibcode thread` signs in again on its next run.
 const CLI_REVOKED_MESSAGE: &str = "BiBCode ended this command's access (its row in Authorized clients was revoked). Run it again.";
 
@@ -58,6 +63,9 @@ pub struct RelayOptions {
     pub url: Option<Url>,
     /// A lower ceiling than the environment's `mcpServerAccess`.
     pub access: Option<McpAccess>,
+    /// `--client <name>` (#280): each run signs in as this named client, which keeps its
+    /// request ids, panels and webhook pairing across runs. Checked when the relay opens.
+    pub client: Option<String>,
 }
 
 impl RelayOptions {
@@ -73,6 +81,16 @@ pub fn parse_access(value: &str) -> Result<McpAccess, String> {
     McpAccess::parse(value).ok_or_else(|| {
         "--access is read-only, approval-required, auto-accept-edits or full-access".to_owned()
     })
+}
+
+/// A `--client` name: trimmed, 1 to 60 characters, none of them a control character.
+pub fn client_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if (1..=60).contains(&name.chars().count()) && !name.chars().any(char::is_control) {
+        Ok(name.to_owned())
+    } else {
+        Err(CLIENT_NAME_MESSAGE.to_owned())
+    }
 }
 
 /// Runs the relay on this process's stdin and stdout and returns the exit code. Errors go to
@@ -283,7 +301,8 @@ struct Relay {
 impl Connection {
     /// The setting, the access level, the record and the endpoint proof, then the orphan
     /// sweep. No credential exists until all of them pass.
-    pub(crate) async fn open(options: RelayOptions) -> Result<Self, String> {
+    pub(crate) async fn open(mut options: RelayOptions) -> Result<Self, String> {
+        options.client = options.client.as_deref().map(client_name).transpose()?;
         let paths = options.paths();
         let settings = read_settings(&paths.settings)?;
         if !settings.enabled {
@@ -516,7 +535,12 @@ impl Relay {
                 failure(protocol::rpc_error(protocol::INTERNAL_ERROR, message))
             }
         };
-        let token = match self.connection.token(|| agent_label(&message)).await {
+        let named = self.connection.options.client.as_deref();
+        let token = match self
+            .connection
+            .token(|| named.map_or_else(|| agent_label(&message), |name| format!("MCP · {name}")))
+            .await
+        {
             Ok(token) => token,
             Err(error) => return refused("McpSignInError", &error),
         };
@@ -936,14 +960,39 @@ async fn mint(
     let extra = extra_scopes(read_settings(&options.paths().settings)?, access);
     let (_guard, database) = open_store(options).await?;
     let repositories = crate::persistence::Repositories::new(database.clone());
-    let issued = crate::auth::issue_mcp_pairing_link(
-        &repositories,
-        label.to_owned(),
-        access.as_str(),
-        extra,
-    )
-    .await
-    .map_err(|error| format!("Could not issue this MCP connection's credential: {error:?}"));
+    let issued = async {
+        let issued = match options.client.as_deref() {
+            Some(name) => {
+                // An older server's store: refuse before any link exists.
+                if !repositories
+                    .has_mcp_named_clients()
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(NAMED_CLIENTS_UNKNOWN_MESSAGE.to_owned());
+                }
+                crate::auth::issue_named_mcp_pairing_link(
+                    &repositories,
+                    name,
+                    access.as_str(),
+                    extra,
+                )
+                .await
+            }
+            None => {
+                crate::auth::issue_mcp_pairing_link(
+                    &repositories,
+                    label.to_owned(),
+                    access.as_str(),
+                    extra,
+                )
+                .await
+            }
+        };
+        issued
+            .map_err(|error| format!("Could not issue this MCP connection's credential: {error:?}"))
+    }
+    .await;
     database.close().await;
     issued.map(|issued| (issued.id, issued.credential))
 }
@@ -1031,5 +1080,7 @@ fn remove_stale_temporary_record(path: &Path, pid: &str) {
     }
 }
 
+#[cfg(test)]
+mod named_tests;
 #[cfg(test)]
 mod tests;

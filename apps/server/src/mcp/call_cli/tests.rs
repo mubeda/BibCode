@@ -196,6 +196,7 @@ fn options(root: &Path, access: Option<McpAccess>) -> RelayOptions {
         dev_url: None,
         url: None,
         access,
+        client: None,
     }
 }
 

@@ -11,6 +11,7 @@ import {
   ClientOrchestrationCommand,
   DispatchResult,
   ModelSelection,
+  OrchestrationActor,
   OrchestrationCheckpointSummary,
   OrchestrationCommand,
   OrchestrationEvent,
@@ -1906,5 +1907,21 @@ describe("shell cap and resume wire (#223)", () => {
       revision: "r",
       activityAges: { t1: 1200 },
     });
+  });
+});
+
+const decodeActor = Schema.decodeUnknownSync(OrchestrationActor);
+
+describe("OrchestrationActor across versions", () => {
+  it("decodes an actor with and without a named client", () => {
+    expect(decodeActor({ kind: "mcp-client", clientId: "s1", label: "MCP · a" })).toEqual({
+      kind: "mcp-client",
+      clientId: "s1",
+      label: "MCP · a",
+    });
+    expect(
+      decodeActor({ kind: "mcp-client", clientId: "s1", label: null, namedClientId: "nc_1" })
+        .namedClientId,
+    ).toBe("nc_1");
   });
 });

@@ -404,10 +404,8 @@ impl ToolCall<'_> {
     /// The recorded outcome of `clone_id`, waiting up to `wait` while it runs: the finished
     /// result, its failure, `running`, or `unknown` for a row no process owns.
     async fn clone_outcome(&self, clone_id: &str, wait: Duration) -> ToolResult {
-        let (session_id, id) = (
-            self.principal.principal.session_id.clone(),
-            clone_id.to_owned(),
-        );
+        // Keyed as `recorded` stores it: by the request scope (#280), within its 24 hours.
+        let (scope, id) = (self.principal.request_scope.clone(), clone_id.to_owned());
         let stored: Option<(String, String)> = self
             .control
             .repositories()
@@ -415,8 +413,8 @@ impl ToolCall<'_> {
             .call(move |connection| {
                 Ok(connection
                     .query_row(
-                        "SELECT tool, commands_json FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ?",
-                        params![session_id, id],
+                        "SELECT tool, commands_json FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ? AND created_at >= ?",
+                        params![scope, id, crate::mcp::control::request_row_cutoff()],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?)

@@ -4,6 +4,8 @@
 //! `access:*` scope, so agents cannot configure webhooks. `sendTest` and `redeliver` wait on
 //! the endpoint's response, so the profiler counts them as long-running.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -87,6 +89,7 @@ fn endpoint_view(
     pending: i64,
     last_state: Option<&str>,
     dropped: i64,
+    names: &HashMap<String, String>,
 ) -> Value {
     json!({
         "id": endpoint.id,
@@ -96,6 +99,7 @@ fn endpoint_view(
         "eventTypes": endpoint.event_types,
         "projectId": endpoint.project_id,
         "pairedClientId": endpoint.paired_session_id,
+        "pairedClientName": endpoint.paired_session_id.as_ref().and_then(|id| names.get(id)),
         "bearerTokenSet": endpoint.bearer_secret.is_some(),
         "statusKinds": endpoint.status_kinds,
         "consecutiveFailures": endpoint.consecutive_failures,
@@ -258,12 +262,13 @@ impl Webhooks {
         let store = self.store();
         let endpoints = store.endpoints().await.map_err(storage)?;
         let summaries = store.summaries().await.map_err(storage)?;
+        let names = store.paired_client_names().await.map_err(storage)?;
         let endpoints: Vec<Value> = endpoints
             .iter()
             .map(|endpoint| {
                 let (pending, last, dropped) =
                     summaries.get(&endpoint.id).cloned().unwrap_or((0, None, 0));
-                endpoint_view(endpoint, pending, last.as_deref(), dropped)
+                endpoint_view(endpoint, pending, last.as_deref(), dropped, &names)
             })
             .collect();
         Ok(json!({
@@ -325,19 +330,22 @@ impl Webhooks {
             return Err(refusal("invalid", "Choose at least one event to send."));
         }
         let project_id = optional_id(input.project_id, "projectId")?;
-        let paired = optional_id(input.paired_client_id, "pairedClientId")?;
-        if let Some(session) = &paired
-            && !self
-                .store()
-                .is_live_agent_session(session)
-                .await
-                .map_err(storage)?
-        {
-            return Err(refusal(
-                "invalid",
-                "Pair the endpoint with an MCP client that is still authorized.",
-            ));
-        }
+        // A run of a named client (#280) pairs with the identity, so the pairing outlives it.
+        let paired = match optional_id(input.paired_client_id, "pairedClientId")? {
+            Some(id) => Some(
+                self.store()
+                    .pairing_target(&id)
+                    .await
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        refusal(
+                            "invalid",
+                            "Pair the endpoint with an MCP client that is still authorized.",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         let bearer = match input.bearer_token {
             Some(Some(token)) => Some(Some(bearer_token(&token)?)),
             other => other,
@@ -477,7 +485,8 @@ impl Webhooks {
             .await
             .map_err(storage)?
             .ok_or_else(not_found)?;
-        let mut result = json!({ "endpoint": endpoint_view(&stored, 0, None, 0) });
+        let names = self.store().paired_client_names().await.map_err(storage)?;
+        let mut result = json!({ "endpoint": endpoint_view(&stored, 0, None, 0, &names) });
         if let Some(secret) = secret {
             result["secret"] = secret.into();
         }
